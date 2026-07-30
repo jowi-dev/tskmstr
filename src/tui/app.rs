@@ -177,14 +177,75 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = err;
             (app, Vec::new())
         }
-        // Enter/Back/transition messages are handled once the detail and
-        // transition-menu screens exist; until then they are no-ops.
-        Msg::Enter
-        | Msg::Back
-        | Msg::TransitionsLoaded(_)
-        | Msg::TransitionsFailed(_)
-        | Msg::TransitionApplied { .. }
-        | Msg::TransitionFailed(_) => (app, Vec::new()),
+        Msg::Enter => enter(app),
+        Msg::Back => {
+            back(&mut app);
+            (app, Vec::new())
+        }
+        Msg::TransitionsLoaded(transitions) => {
+            app.transitions = transitions;
+            app.transition_selected = 0;
+            app.screen = Screen::TransitionMenu;
+            (app, Vec::new())
+        }
+        Msg::TransitionsFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::TransitionApplied { key, status } => {
+            if let Some(ticket) = app.tickets.iter_mut().find(|t| t.key == key) {
+                ticket.status = status.clone();
+            }
+            app.status_line = format!("{key} -> {status}");
+            app.screen = Screen::Detail;
+            (app, Vec::new())
+        }
+        Msg::TransitionFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+    }
+}
+
+/// Handle [`Msg::Enter`]: activate whatever is selected on the current
+/// screen.
+fn enter(mut app: App) -> (App, Vec<Cmd>) {
+    match app.screen {
+        Screen::Board => {
+            if app.selected_ticket().is_some() {
+                app.screen = Screen::Detail;
+            }
+            (app, Vec::new())
+        }
+        Screen::Detail => match app.selected_ticket() {
+            Some(ticket) => {
+                let key = ticket.key.clone();
+                (app, vec![Cmd::FetchTransitions { key }])
+            }
+            None => (app, Vec::new()),
+        },
+        Screen::TransitionMenu => {
+            let cmd = match (
+                app.selected_ticket(),
+                app.transitions.get(app.transition_selected),
+            ) {
+                (Some(ticket), Some(transition)) => Some(Cmd::ApplyTransition {
+                    key: ticket.key.clone(),
+                    transition_id: transition.id.clone(),
+                }),
+                _ => None,
+            };
+            (app, cmd.into_iter().collect())
+        }
+    }
+}
+
+/// Handle [`Msg::Back`]: step back a screen, or quit from the board.
+fn back(app: &mut App) {
+    match app.screen {
+        Screen::Board => app.quit = true,
+        Screen::Detail => app.screen = Screen::Board,
+        Screen::TransitionMenu => app.screen = Screen::Detail,
     }
 }
 
@@ -356,5 +417,197 @@ mod tests {
         assert!(app.show_help);
         let (app, _) = update(app, Msg::ToggleHelp);
         assert!(!app.show_help);
+    }
+
+    fn transition(id: &str, name: &str) -> Transition {
+        use crate::jira::types::{Status, StatusCategory};
+
+        Transition {
+            id: id.to_string(),
+            name: name.to_string(),
+            to: Status {
+                name: name.to_string(),
+                status_category: StatusCategory {
+                    key: "indeterminate".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn enter_on_board_with_selection_opens_detail() {
+        let app = board_with(vec![ticket("AX-1")], 0);
+        let (app, cmds) = update(app, Msg::Enter);
+        assert_eq!(app.screen, Screen::Detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_board_with_no_tickets_stays_on_board() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::Enter);
+        assert_eq!(app.screen, Screen::Board);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_detail_emits_fetch_transitions_and_stays_on_detail() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::Enter);
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTransitions {
+                key: "AX-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn transitions_loaded_moves_to_transition_menu() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, cmds) = update(
+            app,
+            Msg::TransitionsLoaded(vec![transition("11", "Start Progress")]),
+        );
+        assert_eq!(app.screen, Screen::TransitionMenu);
+        assert_eq!(app.transitions, vec![transition("11", "Start Progress")]);
+        assert_eq!(app.transition_selected, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn transitions_failed_sets_status_line_and_stays_on_detail() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::TransitionsFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert_eq!(app.screen, Screen::Detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_transition_menu_emits_apply_transition() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            transitions: vec![transition("11", "Start Progress")],
+            transition_selected: 0,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (_, cmds) = update(app, Msg::Enter);
+        assert_eq!(
+            cmds,
+            vec![Cmd::ApplyTransition {
+                key: "AX-1".to_string(),
+                transition_id: "11".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn transition_applied_updates_ticket_status_and_returns_to_detail() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            transitions: vec![transition("11", "In Progress")],
+            ..board_with(vec![ticket("AX-1"), ticket("AX-2")], 0)
+        };
+        let (app, cmds) = update(
+            app,
+            Msg::TransitionApplied {
+                key: "AX-1".to_string(),
+                status: "In Progress".to_string(),
+            },
+        );
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.status_line, "AX-1 -> In Progress");
+        assert_eq!(
+            app.tickets.iter().find(|t| t.key == "AX-1").unwrap().status,
+            "In Progress"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn transition_failed_sets_status_line() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::TransitionFailed("nope".to_string()));
+        assert_eq!(app.status_line, "nope");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn back_on_transition_menu_returns_to_detail() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert_eq!(app.screen, Screen::Detail);
+    }
+
+    #[test]
+    fn back_on_detail_returns_to_board() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert_eq!(app.screen, Screen::Board);
+    }
+
+    #[test]
+    fn back_on_board_quits() {
+        let app = board_with(vec![ticket("AX-1")], 0);
+        let (app, _) = update(app, Msg::Back);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn up_on_detail_scrolls_up_clamped_at_zero() {
+        let app = App {
+            screen: Screen::Detail,
+            detail_scroll: 0,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn down_on_detail_scrolls_down() {
+        let app = App {
+            screen: Screen::Detail,
+            detail_scroll: 2,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.detail_scroll, 3);
+    }
+
+    #[test]
+    fn up_and_down_on_transition_menu_move_selection_clamped() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            transitions: vec![transition("11", "A"), transition("21", "B")],
+            transition_selected: 0,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.transition_selected, 0);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.transition_selected, 1);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.transition_selected, 1);
     }
 }
