@@ -140,6 +140,16 @@ impl HttpJiraClient {
         Err(Self::error_for_status(response, status, key))
     }
 
+    /// Turn a completed response into `Ok(())`, mapping non-2xx status codes
+    /// to the appropriate [`JiraError`] variant.
+    fn parse_empty(response: reqwest::blocking::Response, key: &str) -> Result<(), JiraError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(Self::error_for_status(response, status, key))
+    }
+
     /// Build the [`JiraError`] for a non-2xx response.
     fn error_for_status(
         response: reqwest::blocking::Response,
@@ -228,8 +238,16 @@ impl JiraClient for HttpJiraClient {
         self.get_issue(&created.key)
     }
 
-    fn add_remote_link(&self, _key: &str, _link: &RemoteLinkRequest) -> Result<(), JiraError> {
-        todo!()
+    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/issue/{key}/remotelink")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&link.to_payload())
+            .send()?;
+        Self::parse_empty(response, key)
     }
 
     fn transitions(&self, _key: &str) -> Result<Vec<Transition>, JiraError> {
@@ -397,6 +415,66 @@ mod tests {
         get_mock.assert();
         assert_eq!(issue.key, "PROJ-1");
         assert_eq!(issue.fields.summary, "Fix the thing");
+    }
+
+    #[test]
+    fn add_remote_link_posts_payload() {
+        use crate::jira::types::RemoteLinkRequest;
+
+        let server = MockServer::start();
+        let link = RemoteLinkRequest {
+            url: "https://github.com/example/repo/pull/1".to_string(),
+            title: "example/repo#1".to_string(),
+        };
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue/PROJ-1/remotelink")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(link.to_payload());
+            then.status(201)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "id": 1 }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .add_remote_link("PROJ-1", &link)
+            .expect("add_remote_link should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn add_remote_link_maps_404_to_not_found_with_key() {
+        use crate::jira::types::RemoteLinkRequest;
+
+        let server = MockServer::start();
+        let link = RemoteLinkRequest {
+            url: "https://github.com/example/repo/pull/1".to_string(),
+            title: "example/repo#1".to_string(),
+        };
+
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue/PROJ-404/remotelink");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .add_remote_link("PROJ-404", &link)
+            .expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
