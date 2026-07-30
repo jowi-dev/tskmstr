@@ -64,7 +64,7 @@ impl Drop for TerminalGuard {
 /// Run the interactive board until the user quits.
 ///
 /// Enters raw mode and the alternate screen, fetches the initial ticket list,
-/// then loops: draw the current screen, wait up to [`POLL_INTERVAL`] for a key
+/// then loops: draw the current screen, wait up to `POLL_INTERVAL` for a key
 /// press, map it to a [`Msg`], run it through [`crate::tui::app::update`], and
 /// execute any resulting [`Cmd`]s. The terminal is always restored before
 /// returning, including on error.

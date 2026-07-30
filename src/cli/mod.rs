@@ -87,7 +87,7 @@ pub enum PrCmd {
 /// bootstrap prompts, the Jira API token, and yes/no confirmations.
 ///
 /// A trait (rather than concrete stdin/stdout calls) so command logic can be
-/// tested with a canned [`FakePrompter`] instead of driving a real terminal.
+/// tested with a canned `FakePrompter` instead of driving a real terminal.
 pub trait Prompter {
     /// Prompt for a line of text, showing `default` and returning it verbatim
     /// if the user answers with an empty line.
