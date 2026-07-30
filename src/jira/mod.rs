@@ -2,5 +2,6 @@
 //! to find a user's open tickets, and a plain-text-to-ADF converter for issue
 //! descriptions.
 
+pub mod adf;
 pub mod jql;
 pub mod types;
