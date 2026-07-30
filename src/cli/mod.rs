@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use clap::{Parser, Subcommand};
 
 pub mod auth;
+pub mod pr;
 pub mod ticket;
 
 /// `tm`: Jira tickets and GitHub PRs from the terminal.
