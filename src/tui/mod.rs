@@ -3,3 +3,4 @@
 //! final terminal wiring is testable without a real terminal.
 
 pub mod app;
+pub mod keymap;
