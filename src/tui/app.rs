@@ -20,6 +20,9 @@ pub struct TicketSummary {
     pub status: String,
     /// Browsable URL for the issue (`{base_url}/browse/{key}`).
     pub url: String,
+    /// Plain-text description, extracted from the issue's ADF description
+    /// via [`crate::jira::adf::adf_to_text`].
+    pub description: String,
 }
 
 /// Which screen is currently shown.
@@ -300,6 +303,7 @@ mod tests {
             summary: format!("Summary for {key}"),
             status: "To Do".to_string(),
             url: format!("https://example.atlassian.net/browse/{key}"),
+            description: format!("Description for {key}"),
         }
     }
 
