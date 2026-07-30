@@ -198,8 +198,14 @@ impl JiraClient for HttpJiraClient {
         Self::parse(response, "")
     }
 
-    fn get_issue(&self, _key: &str) -> Result<Issue, JiraError> {
-        todo!()
+    fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/issue/{key}")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .send()?;
+        Self::parse(response, key)
     }
 
     fn create_issue(&self, _req: &CreateIssueRequest) -> Result<Issue, JiraError> {
@@ -265,6 +271,59 @@ mod tests {
         mock.assert();
         assert_eq!(myself.account_id, "abc123");
         assert_eq!(myself.display_name, "Ada Lovelace");
+    }
+
+    #[test]
+    fn get_issue_returns_issue() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-1")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "Fix the thing",
+                        "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                        "description": null,
+                        "assignee": null
+                    }
+                }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let issue = client
+            .get_issue("PROJ-1")
+            .expect("get_issue should succeed");
+
+        mock.assert();
+        assert_eq!(issue.key, "PROJ-1");
+        assert_eq!(issue.fields.summary, "Fix the thing");
+    }
+
+    #[test]
+    fn get_issue_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-404");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.get_issue("PROJ-404").expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
