@@ -1,0 +1,5 @@
+//! Jira Cloud REST API client support: request/response types, the JQL used
+//! to find a user's open tickets, and a plain-text-to-ADF converter for issue
+//! descriptions.
+
+pub mod types;
