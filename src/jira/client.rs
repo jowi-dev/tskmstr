@@ -103,6 +103,12 @@ struct CreatedIssue {
     key: String,
 }
 
+/// Envelope wrapping the response body of `GET /rest/api/3/issue/{key}/transitions`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TransitionsEnvelope {
+    transitions: Vec<Transition>,
+}
+
 /// [`JiraClient`] implementation backed by `reqwest::blocking`.
 pub struct HttpJiraClient {
     ctx: JiraClientContext,
@@ -250,12 +256,27 @@ impl JiraClient for HttpJiraClient {
         Self::parse_empty(response, key)
     }
 
-    fn transitions(&self, _key: &str) -> Result<Vec<Transition>, JiraError> {
-        todo!()
+    fn transitions(&self, key: &str) -> Result<Vec<Transition>, JiraError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/issue/{key}/transitions")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .send()?;
+        let envelope: TransitionsEnvelope = Self::parse(response, key)?;
+        Ok(envelope.transitions)
     }
 
-    fn transition(&self, _key: &str, _transition_id: &str) -> Result<(), JiraError> {
-        todo!()
+    fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/issue/{key}/transitions")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "transition": { "id": transition_id } }))
+            .send()?;
+        Self::parse_empty(response, key)
     }
 
     fn search(&self, _jql: &str) -> Result<SearchResult, JiraError> {
@@ -475,6 +496,81 @@ mod tests {
             JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transitions_returns_transition_list() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-1/transitions")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "transitions": [
+                        {
+                            "id": "11",
+                            "name": "Start Progress",
+                            "to": { "name": "In Progress", "statusCategory": { "key": "indeterminate" } }
+                        }
+                    ]
+                }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let transitions = client
+            .transitions("PROJ-1")
+            .expect("transitions should succeed");
+
+        mock.assert();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].id, "11");
+    }
+
+    #[test]
+    fn transitions_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-404/transitions");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.transitions("PROJ-404").expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_posts_transition_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue/PROJ-1/transitions")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({ "transition": { "id": "31" } }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .transition("PROJ-1", "31")
+            .expect("transition should succeed");
+
+        mock.assert();
     }
 
     #[test]
