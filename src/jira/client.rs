@@ -87,6 +87,12 @@ pub trait JiraClient {
     /// tskmstr's current use (a user's own open tickets rarely exceed one
     /// page) but callers listing large result sets will need to page
     /// manually in a future revision.
+    ///
+    /// Note: the response shape for `/rest/api/3/search/jql` follows Atlassian's
+    /// documented contract (`issues` plus an optional `nextPageToken`), but has
+    /// not yet been verified against a live Jira instance (no API token was
+    /// available at implementation time). Verify end-to-end before relying on
+    /// this in production.
     fn search(&self, jql: &str) -> Result<SearchResult, JiraError>;
 
     /// Check that a project exists and is visible to the authenticated user.
@@ -279,12 +285,31 @@ impl JiraClient for HttpJiraClient {
         Self::parse_empty(response, key)
     }
 
-    fn search(&self, _jql: &str) -> Result<SearchResult, JiraError> {
-        todo!()
+    fn search(&self, jql: &str) -> Result<SearchResult, JiraError> {
+        let body = serde_json::json!({
+            "jql": jql,
+            "fields": ["summary", "status", "assignee", "description"],
+            "maxResults": 50,
+        });
+        let response = self
+            .http
+            .post(self.url("/search/jql"))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()?;
+        Self::parse(response, "")
     }
 
-    fn get_project(&self, _key: &str) -> Result<(), JiraError> {
-        todo!()
+    fn get_project(&self, key: &str) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/project/{key}")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .send()?;
+        Self::parse_empty(response, key)
     }
 }
 
@@ -571,6 +596,110 @@ mod tests {
             .expect("transition should succeed");
 
         mock.assert();
+    }
+
+    #[test]
+    fn search_posts_jql_and_returns_results() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({
+                    "jql": "assignee = currentUser()",
+                    "fields": ["summary", "status", "assignee", "description"],
+                    "maxResults": 50
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "issues": [
+                        {
+                            "key": "PROJ-1",
+                            "fields": {
+                                "summary": "First",
+                                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                                "description": null,
+                                "assignee": null
+                            }
+                        }
+                    ]
+                }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let result = client
+            .search("assignee = currentUser()")
+            .expect("search should succeed");
+
+        mock.assert();
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(result.next_page_token, None);
+    }
+
+    #[test]
+    fn search_maps_401_to_unauthorized() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Unauthorized"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .search("assignee = currentUser()")
+            .expect_err("should fail");
+
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn get_project_ok_when_visible() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/project/PROJ")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "key": "PROJ" }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .get_project("PROJ")
+            .expect("get_project should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn get_project_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/project/NOPE");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["No project could be found"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.get_project("NOPE").expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "NOPE"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
