@@ -6,3 +6,4 @@ pub mod github;
 pub mod jira;
 pub mod keychain;
 pub mod ticketing;
+pub mod tui;
