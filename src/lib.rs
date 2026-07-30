@@ -4,3 +4,4 @@ pub mod config;
 pub mod github;
 pub mod jira;
 pub mod keychain;
+pub mod ticketing;
