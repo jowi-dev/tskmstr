@@ -3,5 +3,6 @@
 //! descriptions.
 
 pub mod adf;
+pub mod client;
 pub mod jql;
 pub mod types;
