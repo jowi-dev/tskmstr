@@ -5,11 +5,14 @@
 //! `gh`/`git`-shelling-out implementation used in production. [`FakeGhCli`]
 //! is a test double for use by tests that don't want to shell out.
 //!
-//! `pr_create` and `pr_edit` are declared on the trait here but return
-//! [`GhError::Unimplemented`] from [`ShellGhCli`] until they are implemented
-//! in a later change; declaring the full trait surface up front lets
-//! [`FakeGhCli`] (used by ticketing tests written against the complete
-//! interface) exist without a second breaking change to the trait.
+//! `pr_create` and `pr_edit` shell out and then re-interpret exit
+//! code/stderr through small pure helpers, the same pattern used by
+//! `pr_view` and `current_branch`, so the interesting logic is unit
+//! testable without a real `gh` binary. There is no automated end-to-end
+//! test of [`ShellGhCli`] itself: `gh` requires a real GitHub repository and
+//! an open pull request to exercise meaningfully, so that coverage is
+//! deliberately left to manual/E2E verification rather than an `#[ignore]`d
+//! test here.
 
 use std::cell::RefCell;
 use std::process::Command;
@@ -49,11 +52,6 @@ pub enum GhError {
         /// The underlying parse error message.
         message: String,
     },
-
-    /// Temporary placeholder for `pr_create`/`pr_edit` on [`ShellGhCli`],
-    /// which are not yet implemented.
-    #[error("gh CLI operation not yet implemented")]
-    Unimplemented,
 }
 
 /// Request body for creating a pull request via `gh pr create`.
@@ -133,12 +131,40 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_create(&self, _req: &PrCreateRequest) -> Result<PrInfo, GhError> {
-        Err(GhError::Unimplemented)
+    fn pr_create(&self, req: &PrCreateRequest) -> Result<PrInfo, GhError> {
+        let output = Command::new("gh")
+            .args(pr_create_args(req))
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr create".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_create_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )?;
+
+        self.pr_view()?.ok_or_else(|| GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: None,
+            stderr: "gh pr create succeeded but no PR was found for the current branch".to_string(),
+        })
     }
 
-    fn pr_edit(&self, _number: u64, _req: &PrEditRequest) -> Result<(), GhError> {
-        Err(GhError::Unimplemented)
+    fn pr_edit(&self, number: u64, req: &PrEditRequest) -> Result<(), GhError> {
+        let output = Command::new("gh")
+            .args(pr_edit_args(number, req))
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr edit".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_edit_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 
     fn current_branch(&self) -> Result<String, GhError> {
@@ -195,6 +221,77 @@ fn interpret_pr_view_output(
 /// branch.
 fn no_pr_found(stderr: &str) -> bool {
     stderr.to_lowercase().contains("no pull requests found")
+}
+
+/// Build the argument list for `gh pr create --title ... --body ... [--base ...]`.
+fn pr_create_args(req: &PrCreateRequest) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        req.title.clone(),
+        "--body".to_string(),
+        req.body.clone(),
+    ];
+    if let Some(base) = &req.base {
+        args.push("--base".to_string());
+        args.push(base.clone());
+    }
+    args
+}
+
+/// Interpret the result of a `gh pr create ...` invocation.
+///
+/// Pure over the exit code and captured stderr; the created PR's fields are
+/// not parsed from this command's output, so only success/failure matters
+/// here.
+fn interpret_pr_create_output(exit_code: Option<i32>, stderr: &str) -> Result<(), GhError> {
+    interpret_success_or_command_error("gh pr create", exit_code, stderr)
+}
+
+/// Build the argument list for `gh pr edit <number> [--title ...] [--body ...]`.
+fn pr_edit_args(number: u64, req: &PrEditRequest) -> Vec<String> {
+    let mut args = vec!["pr".to_string(), "edit".to_string(), number.to_string()];
+    if let Some(title) = &req.title {
+        args.push("--title".to_string());
+        args.push(title.clone());
+    }
+    if let Some(body) = &req.body {
+        args.push("--body".to_string());
+        args.push(body.clone());
+    }
+    args
+}
+
+/// Interpret the result of a `gh pr edit ...` invocation.
+///
+/// Pure over the exit code and captured stderr, for the same reasons as
+/// [`interpret_pr_create_output`].
+fn interpret_pr_edit_output(exit_code: Option<i32>, stderr: &str) -> Result<(), GhError> {
+    interpret_success_or_command_error("gh pr edit", exit_code, stderr)
+}
+
+/// Shared success/failure interpretation for commands whose output carries
+/// no information beyond "it worked": exit 0 is `Ok(())`, anything else is a
+/// [`GhError::Command`] tagged with `command`.
+fn interpret_success_or_command_error(
+    command: &str,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> Result<(), GhError> {
+    match exit_code {
+        Some(0) => Ok(()),
+        Some(code) => Err(GhError::Command {
+            command: command.to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: command.to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
 }
 
 /// Interpret the result of a `git branch --show-current` invocation.
@@ -435,22 +532,65 @@ mod tests {
     }
 
     #[test]
-    fn shell_gh_cli_pr_create_and_pr_edit_are_unimplemented() {
-        let cli = ShellGhCli::new();
-        let create_req = PrCreateRequest {
-            title: "t".to_string(),
-            body: "b".to_string(),
-            base: None,
-        };
-        assert!(matches!(
-            cli.pr_create(&create_req),
-            Err(GhError::Unimplemented)
-        ));
+    fn pr_create_success_is_ok() {
+        interpret_pr_create_output(Some(0), "").unwrap();
+    }
 
-        let edit_req = PrEditRequest::default();
+    #[test]
+    fn pr_create_failure_is_a_command_error() {
+        let err =
+            interpret_pr_create_output(Some(1), "gh: a pull request already exists").unwrap_err();
+        match err {
+            GhError::Command {
+                command, stderr, ..
+            } => {
+                assert_eq!(command, "gh pr create");
+                assert!(stderr.contains("already exists"));
+            }
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_create_signal_termination_is_a_command_error() {
+        let err = interpret_pr_create_output(None, "").unwrap_err();
         assert!(matches!(
-            cli.pr_edit(1, &edit_req),
-            Err(GhError::Unimplemented)
+            err,
+            GhError::Command {
+                exit_code: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pr_edit_success_is_ok() {
+        interpret_pr_edit_output(Some(0), "").unwrap();
+    }
+
+    #[test]
+    fn pr_edit_failure_is_a_command_error() {
+        let err = interpret_pr_edit_output(Some(1), "gh: pull request not found").unwrap_err();
+        match err {
+            GhError::Command {
+                command, stderr, ..
+            } => {
+                assert_eq!(command, "gh pr edit");
+                assert!(stderr.contains("not found"));
+            }
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_edit_signal_termination_is_a_command_error() {
+        let err = interpret_pr_edit_output(None, "").unwrap_err();
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: None,
+                ..
+            }
         ));
     }
 }
