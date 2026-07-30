@@ -10,9 +10,10 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
-use crate::github::pr::{PrInfo, with_issue_key_prefix};
+use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
+use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError};
-use crate::jira::types::RemoteLinkRequest;
+use crate::jira::types::{CreateIssueRequest, RemoteLinkRequest};
 
 /// Dependencies shared by the ticketing orchestration functions.
 pub struct TicketingContext<'a> {
@@ -85,6 +86,61 @@ fn current_branch_pr(ctx: &TicketingContext) -> Result<PrInfo, TicketingError> {
             let branch = ctx.gh.current_branch()?;
             Err(TicketingError::NoPrForBranch { branch })
         }
+    }
+}
+
+/// Create a new issue in the configured default project, assigned to the
+/// configured default assignee, then associate it with `pr`.
+///
+/// Used when [`resolve_existing_key`] finds no key already associated with
+/// `pr`. The new issue's summary is `pr.title` as-is (a PR reaching this
+/// point has no key anywhere in title/body/branch, so there is no prefix to
+/// strip); its description is `pr.body` followed by the PR URL, converted to
+/// ADF.
+pub fn auto_create_and_associate(
+    ctx: &TicketingContext,
+    pr: &PrInfo,
+) -> Result<AssociateOutcome, TicketingError> {
+    let description = text_to_adf(&format!("{}\n\n{}", pr.body, pr.url));
+    let req = CreateIssueRequest {
+        project_key: ctx.config.default_project_key.clone(),
+        summary: pr.title.clone(),
+        description,
+        issue_type_name: "Task".to_string(),
+        assignee_account_id: ctx.config.default_assignee_account_id.clone(),
+    };
+    let issue = ctx.jira.create_issue(&req)?;
+    associate(ctx, &issue.key, pr)
+}
+
+/// Resolve an issue key already associated with `pr`, if any.
+///
+/// Delegates to [`find_issue_key_with_source`] for the title/body/branch
+/// precedence, then treats the result differently depending on where it came
+/// from:
+///
+/// - [`KeySource::Title`] and [`KeySource::Body`] keys are trusted without
+///   contacting Jira: the user (or a prior `tm ticket`/`tm pr create` run)
+///   wrote them deliberately.
+/// - A [`KeySource::Branch`] key is inferred from a naming convention, not
+///   authored, so it is validated with [`JiraClient::get_issue`] first.
+///   [`JiraError::NotFound`] is treated as "no key after all" (`Ok(None)`);
+///   any other Jira error propagates, since it means the check itself
+///   couldn't be completed.
+///
+/// Returns `Ok(None)` when no key is found by any means.
+pub fn resolve_existing_key(
+    jira: &dyn JiraClient,
+    pr: &PrInfo,
+) -> Result<Option<String>, TicketingError> {
+    match find_issue_key_with_source(pr) {
+        Some((key, KeySource::Title | KeySource::Body)) => Ok(Some(key)),
+        Some((key, KeySource::Branch)) => match jira.get_issue(&key) {
+            Ok(_) => Ok(Some(key)),
+            Err(JiraError::NotFound { .. }) => Ok(None),
+            Err(other) => Err(other.into()),
+        },
+        None => Ok(None),
     }
 }
 
@@ -270,5 +326,96 @@ mod tests {
             "no pr_edit call should be made when the title is already prefixed"
         );
         assert_eq!(jira.add_remote_link_calls().len(), 1);
+    }
+
+    #[test]
+    fn auto_create_and_associate_creates_issue_with_expected_fields_and_associates() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut pull_request = pr("Add the widget");
+        pull_request.body = "Implements the widget end to end.".to_string();
+
+        let outcome = auto_create_and_associate(&ctx, &pull_request).expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        let create_req = &calls[0];
+        assert_eq!(create_req.project_key, "PROJ");
+        assert_eq!(create_req.summary, "Add the widget");
+        assert_eq!(create_req.issue_type_name, "Task");
+        assert_eq!(create_req.assignee_account_id, Some("acct-1".to_string()));
+        let description = create_req.description.to_string();
+        assert!(
+            description.contains("https://github.com/example/repo/pull/42"),
+            "description should contain the PR URL: {description}"
+        );
+        assert!(
+            description.contains("Implements the widget end to end."),
+            "description should contain the PR body: {description}"
+        );
+
+        assert_eq!(outcome.issue_key, "PROJ-9");
+        assert_eq!(
+            gh.pr_edit_calls(),
+            vec![(
+                42,
+                PrEditRequest {
+                    title: Some("[PROJ-9] Add the widget".to_string()),
+                    body: None,
+                }
+            )]
+        );
+        assert_eq!(jira.add_remote_link_calls().len(), 1);
+    }
+
+    #[test]
+    fn resolve_existing_key_trusts_title_key_without_calling_jira() {
+        let jira = FakeJiraClient::new();
+        let pull_request = pr("[PROJ-1] Fix the thing");
+
+        let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
+
+        assert_eq!(key, Some("PROJ-1".to_string()));
+        // No issue was seeded, so any get_issue call would have failed with
+        // NotFound; the Ok result proves get_issue was never called.
+    }
+
+    #[test]
+    fn resolve_existing_key_validates_branch_key_that_exists() {
+        let jira = FakeJiraClient::new().with_issue("AX-372", issue("AX-372"));
+        let pull_request = pr("Fix the thing");
+
+        let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
+
+        assert_eq!(key, Some("AX-372".to_string()));
+    }
+
+    #[test]
+    fn resolve_existing_key_branch_key_not_found_is_none() {
+        let jira = FakeJiraClient::new().with_issue_not_found("AX-372");
+        let pull_request = pr("Fix the thing");
+
+        let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
+
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn resolve_existing_key_branch_key_other_error_propagates() {
+        let jira = FakeJiraClient::new().with_issue_error("AX-372", 500, "boom");
+        let pull_request = pr("Fix the thing");
+
+        let err = resolve_existing_key(&jira, &pull_request).expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, .. }) => assert_eq!(status, 500),
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
     }
 }

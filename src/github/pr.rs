@@ -24,6 +24,18 @@ pub struct PrInfo {
     pub head_ref_name: String,
 }
 
+/// Which part of a pull request an issue key resolved by
+/// [`find_issue_key_with_source`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// Found in the PR title (bracketed prefix or bare token).
+    Title,
+    /// Found in the PR body.
+    Body,
+    /// Inferred from the branch name.
+    Branch,
+}
+
 /// Find the Jira issue key (e.g. `AX-372`) associated with a pull request.
 ///
 /// Checks, in order, stopping at the first match:
@@ -37,10 +49,25 @@ pub struct PrInfo {
 ///
 /// Returns `None` if no key is found by any of these means.
 pub fn find_issue_key(pr: &PrInfo) -> Option<String> {
-    title_prefix_key(&pr.title)
-        .or_else(|| first_key_match(&pr.title))
-        .or_else(|| first_key_match(&pr.body))
-        .or_else(|| branch_key(&pr.head_ref_name))
+    find_issue_key_with_source(pr).map(|(key, _)| key)
+}
+
+/// Like [`find_issue_key`], but also reports which of the four sources the
+/// key was found in.
+///
+/// Callers that want to trust title/body keys outright but validate a
+/// branch-derived key against Jira before relying on it (branch names are
+/// inferred, not authored) need to know which case they're in; this is the
+/// only way to distinguish them, since [`find_issue_key`] collapses the
+/// result to a bare key.
+pub fn find_issue_key_with_source(pr: &PrInfo) -> Option<(String, KeySource)> {
+    if let Some(key) = title_prefix_key(&pr.title).or_else(|| first_key_match(&pr.title)) {
+        return Some((key, KeySource::Title));
+    }
+    if let Some(key) = first_key_match(&pr.body) {
+        return Some((key, KeySource::Body));
+    }
+    branch_key(&pr.head_ref_name).map(|key| (key, KeySource::Branch))
 }
 
 /// Prefix `title` with `[KEY]` unless it is already prefixed with that exact
@@ -146,6 +173,43 @@ mod tests {
             assert_eq!(
                 find_issue_key(&pr),
                 expected.map(str::to_string),
+                "title={title:?} body={body:?} branch={branch:?}"
+            );
+        }
+    }
+
+    /// (title, body, branch, expected (key, source))
+    type SourceCase<'a> = (&'a str, &'a str, &'a str, Option<(&'a str, KeySource)>);
+
+    #[test]
+    fn find_issue_key_with_source_table() {
+        let cases: &[SourceCase] = &[
+            (
+                "[AX-372] Fix the thing",
+                "mentions BX-1 too",
+                "cx-2-desc",
+                Some(("AX-372", KeySource::Title)),
+            ),
+            (
+                "Fix the thing",
+                "Resolves AX-372",
+                "cx-2-desc",
+                Some(("AX-372", KeySource::Body)),
+            ),
+            (
+                "Fix the thing",
+                "no key here",
+                "ax-372-desc",
+                Some(("AX-372", KeySource::Branch)),
+            ),
+            ("Fix the thing", "no key here", "some-branch-name", None),
+        ];
+
+        for (title, body, branch, expected) in cases {
+            let pr = pr(title, body, branch);
+            assert_eq!(
+                find_issue_key_with_source(&pr),
+                expected.map(|(key, source)| (key.to_string(), source)),
                 "title={title:?} body={body:?} branch={branch:?}"
             );
         }
