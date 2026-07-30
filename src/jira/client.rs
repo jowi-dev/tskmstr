@@ -96,6 +96,13 @@ pub trait JiraClient {
     fn get_project(&self, key: &str) -> Result<(), JiraError>;
 }
 
+/// Thin response body from `POST /rest/api/3/issue`, which returns only the
+/// new issue's identifiers, not its fields.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CreatedIssue {
+    key: String,
+}
+
 /// [`JiraClient`] implementation backed by `reqwest::blocking`.
 pub struct HttpJiraClient {
     ctx: JiraClientContext,
@@ -208,8 +215,17 @@ impl JiraClient for HttpJiraClient {
         Self::parse(response, key)
     }
 
-    fn create_issue(&self, _req: &CreateIssueRequest) -> Result<Issue, JiraError> {
-        todo!()
+    fn create_issue(&self, req: &CreateIssueRequest) -> Result<Issue, JiraError> {
+        let response = self
+            .http
+            .post(self.url("/issue"))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&req.to_payload())
+            .send()?;
+        let created: CreatedIssue = Self::parse(response, "")?;
+        self.get_issue(&created.key)
     }
 
     fn add_remote_link(&self, _key: &str, _link: &RemoteLinkRequest) -> Result<(), JiraError> {
@@ -324,6 +340,63 @@ mod tests {
             JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_issue_posts_payload_then_fetches_created_issue() {
+        use crate::jira::types::CreateIssueRequest;
+        use serde_json::json;
+
+        let server = MockServer::start();
+        let req = CreateIssueRequest {
+            project_key: "PROJ".to_string(),
+            summary: "Fix the thing".to_string(),
+            description: json!({ "type": "doc", "version": 1, "content": [] }),
+            issue_type_name: "Task".to_string(),
+            assignee_account_id: None,
+        };
+
+        let create_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(req.to_payload());
+            then.status(201)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "10001",
+                    "key": "PROJ-1",
+                    "self": "https://example.atlassian.net/rest/api/3/issue/10001"
+                }));
+        });
+        let get_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "Fix the thing",
+                        "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                        "description": { "type": "doc", "version": 1, "content": [] },
+                        "assignee": null
+                    }
+                }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let issue = client
+            .create_issue(&req)
+            .expect("create_issue should succeed");
+
+        create_mock.assert();
+        get_mock.assert();
+        assert_eq!(issue.key, "PROJ-1");
+        assert_eq!(issue.fields.summary, "Fix the thing");
     }
 
     #[test]
