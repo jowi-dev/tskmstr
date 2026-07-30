@@ -21,6 +21,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 regex = "1"
 toml = "0.8"
+rpassword = "7"
 
 [dev-dependencies]
 httpmock = "0.7"

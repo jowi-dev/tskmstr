@@ -24,6 +24,13 @@ enum IssueOutcome {
     Error { status: u16, message: String },
 }
 
+/// Canned outcome for [`FakeJiraClient::myself`].
+enum MyselfOutcome {
+    Found(Myself),
+    Unauthorized,
+    Error { status: u16, message: String },
+}
+
 /// An in-memory [`JiraClient`] test double.
 ///
 /// Issues are seeded by key via [`with_issue`](Self::with_issue),
@@ -36,6 +43,8 @@ pub struct FakeJiraClient {
     create_issue_result: RefCell<Option<Issue>>,
     create_issue_calls: RefCell<Vec<CreateIssueRequest>>,
     add_remote_link_calls: RefCell<Vec<(String, RemoteLinkRequest)>>,
+    myself_result: RefCell<Option<MyselfOutcome>>,
+    get_project_result: RefCell<Result<(), (u16, String)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -45,6 +54,8 @@ impl Default for FakeJiraClient {
             create_issue_result: RefCell::new(None),
             create_issue_calls: RefCell::new(Vec::new()),
             add_remote_link_calls: RefCell::new(Vec::new()),
+            myself_result: RefCell::new(None),
+            get_project_result: RefCell::new(Ok(())),
         }
     }
 }
@@ -99,14 +110,50 @@ impl FakeJiraClient {
     pub fn add_remote_link_calls(&self) -> Vec<(String, RemoteLinkRequest)> {
         self.add_remote_link_calls.borrow().clone()
     }
+
+    /// Seed `myself()` to return `myself`.
+    pub fn with_myself(self, myself: Myself) -> Self {
+        *self.myself_result.borrow_mut() = Some(MyselfOutcome::Found(myself));
+        self
+    }
+
+    /// Seed `myself()` to return [`JiraError::Unauthorized`].
+    pub fn with_myself_unauthorized(self) -> Self {
+        *self.myself_result.borrow_mut() = Some(MyselfOutcome::Unauthorized);
+        self
+    }
+
+    /// Seed `myself()` to return [`JiraError::Api`] with the given status and
+    /// message.
+    pub fn with_myself_error(self, status: u16, message: &str) -> Self {
+        *self.myself_result.borrow_mut() = Some(MyselfOutcome::Error {
+            status,
+            message: message.to_string(),
+        });
+        self
+    }
+
+    /// Seed `get_project(key)` to return [`JiraError::NotFound`].
+    pub fn with_get_project_not_found(self, key: &str) -> Self {
+        *self.get_project_result.borrow_mut() = Err((404, key.to_string()));
+        self
+    }
 }
 
 impl JiraClient for FakeJiraClient {
     fn myself(&self) -> Result<Myself, JiraError> {
-        Err(JiraError::Api {
-            status: 501,
-            message: "FakeJiraClient::myself is not implemented".to_string(),
-        })
+        match self.myself_result.borrow().as_ref() {
+            Some(MyselfOutcome::Found(myself)) => Ok(myself.clone()),
+            Some(MyselfOutcome::Unauthorized) => Err(JiraError::Unauthorized),
+            Some(MyselfOutcome::Error { status, message }) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+            None => Err(JiraError::Api {
+                status: 501,
+                message: "FakeJiraClient::myself is not implemented".to_string(),
+            }),
+        }
     }
 
     fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
@@ -155,8 +202,17 @@ impl JiraClient for FakeJiraClient {
         })
     }
 
-    fn get_project(&self, _key: &str) -> Result<(), JiraError> {
-        Ok(())
+    fn get_project(&self, key: &str) -> Result<(), JiraError> {
+        match self.get_project_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((404, _)) => Err(JiraError::NotFound {
+                key: key.to_string(),
+            }),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
     }
 }
 
@@ -227,6 +283,47 @@ mod tests {
 
         assert_eq!(created.key, "PROJ-2");
         assert_eq!(fake.create_issue_calls(), vec![req]);
+    }
+
+    #[test]
+    fn myself_returns_seeded_value() {
+        let fake = FakeJiraClient::new().with_myself(Myself {
+            account_id: "acct-1".to_string(),
+            display_name: "Ada Lovelace".to_string(),
+            email_address: Some("ada@example.com".to_string()),
+        });
+        let myself = fake.myself().expect("should succeed");
+        assert_eq!(myself.account_id, "acct-1");
+    }
+
+    #[test]
+    fn myself_unseeded_is_unauthorized_by_default_stub() {
+        let fake = FakeJiraClient::new();
+        let err = fake.myself().expect_err("should fail");
+        match err {
+            JiraError::Api { status, .. } => assert_eq!(status, 501),
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn myself_seeded_unauthorized() {
+        let fake = FakeJiraClient::new().with_myself_unauthorized();
+        let err = fake.myself().expect_err("should fail");
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn get_project_ok_by_default() {
+        let fake = FakeJiraClient::new();
+        fake.get_project("AX").expect("should succeed");
+    }
+
+    #[test]
+    fn get_project_seeded_not_found() {
+        let fake = FakeJiraClient::new().with_get_project_not_found("AX");
+        let err = fake.get_project("AX").expect_err("should fail");
+        assert!(matches!(err, JiraError::NotFound { key } if key == "AX"));
     }
 
     #[test]
