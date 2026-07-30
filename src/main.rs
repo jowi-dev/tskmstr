@@ -13,16 +13,11 @@ use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
 use tskmstr::ticketing::TicketingContext;
+use tskmstr::tui::event::{TuiDeps, run};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    let Some(command) = cli.command else {
-        return run_board();
-    };
-    if matches!(command, Command::Board) {
-        return run_board();
-    }
+    let command = cli.command.unwrap_or(Command::Board);
 
     match dispatch(command) {
         Ok(()) => ExitCode::SUCCESS,
@@ -31,13 +26,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// The interactive terminal board. Not yet implemented; keeps the binary
-/// honest about what it can actually do rather than silently no-op'ing.
-fn run_board() -> ExitCode {
-    println!("TUI not yet implemented");
-    ExitCode::FAILURE
 }
 
 /// Build real dependencies for `command` and run it.
@@ -50,8 +38,24 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Auth { cmd } => run_auth(cmd, &paths, &keychain, env_token),
         Command::Ticket { key } => run_ticket(&key, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
-        Command::Board => unreachable!("handled in main() before dispatch"),
+        Command::Board => run_board(&paths, &keychain, env_token),
     }
+}
+
+/// The interactive terminal board.
+fn run_board(
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let token = resolve_token(keychain, env_token)?;
+    let jira = jira_client_for(&config, &token);
+    run(TuiDeps {
+        jira,
+        base_url: config.jira_base_url,
+    })?;
+    Ok(())
 }
 
 /// The default global/repo config paths for this machine and working

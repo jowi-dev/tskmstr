@@ -46,7 +46,7 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PrCmd,
     },
-    /// Open the interactive terminal board (not yet implemented).
+    /// Open the interactive terminal board.
     Board,
 }
 

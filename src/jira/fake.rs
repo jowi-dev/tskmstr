@@ -45,6 +45,7 @@ pub struct FakeJiraClient {
     add_remote_link_calls: RefCell<Vec<(String, RemoteLinkRequest)>>,
     myself_result: RefCell<Option<MyselfOutcome>>,
     get_project_result: RefCell<Result<(), (u16, String)>>,
+    search_result: RefCell<Option<Result<SearchResult, (u16, String)>>>,
 }
 
 impl Default for FakeJiraClient {
@@ -56,6 +57,7 @@ impl Default for FakeJiraClient {
             add_remote_link_calls: RefCell::new(Vec::new()),
             myself_result: RefCell::new(None),
             get_project_result: RefCell::new(Ok(())),
+            search_result: RefCell::new(None),
         }
     }
 }
@@ -138,6 +140,19 @@ impl FakeJiraClient {
         *self.get_project_result.borrow_mut() = Err((404, key.to_string()));
         self
     }
+
+    /// Seed `search(..)` to return `result`.
+    pub fn with_search_result(self, result: SearchResult) -> Self {
+        *self.search_result.borrow_mut() = Some(Ok(result));
+        self
+    }
+
+    /// Seed `search(..)` to return [`JiraError::Api`] with the given status
+    /// and message.
+    pub fn with_search_error(self, status: u16, message: &str) -> Self {
+        *self.search_result.borrow_mut() = Some(Err((status, message.to_string())));
+        self
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -196,10 +211,17 @@ impl JiraClient for FakeJiraClient {
     }
 
     fn search(&self, _jql: &str) -> Result<SearchResult, JiraError> {
-        Ok(SearchResult {
-            issues: Vec::new(),
-            next_page_token: None,
-        })
+        match self.search_result.borrow().as_ref() {
+            None => Ok(SearchResult {
+                issues: Vec::new(),
+                next_page_token: None,
+            }),
+            Some(Ok(result)) => Ok(result.clone()),
+            Some(Err((status, message))) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
     }
 
     fn get_project(&self, key: &str) -> Result<(), JiraError> {
