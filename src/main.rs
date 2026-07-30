@@ -9,8 +9,10 @@ use clap::Parser;
 
 use tskmstr::cli::{AuthCmd, Cli, Command, RealPrompter};
 use tskmstr::config::{self, Config, ConfigPaths};
+use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
-use tskmstr::keychain::MacosKeychain;
+use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
+use tskmstr::ticketing::TicketingContext;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -52,7 +54,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 
     match command {
         Command::Auth { cmd } => run_auth(cmd, &paths, &keychain, env_token),
-        Command::Ticket { .. } => not_yet_implemented("ticket"),
+        Command::Ticket { key } => run_ticket(&key, &paths, &keychain, env_token),
         Command::Pr { .. } => not_yet_implemented("pr"),
         Command::Board => unreachable!("handled in main() before dispatch"),
     }
@@ -80,7 +82,7 @@ fn jira_client_for(config: &Config, token: &str) -> Box<dyn JiraClient> {
 fn run_auth(
     cmd: AuthCmd,
     paths: &ConfigPaths,
-    keychain: &dyn tskmstr::keychain::KeychainStore,
+    keychain: &dyn KeychainStore,
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = tskmstr::cli::auth::AuthContext {
@@ -96,5 +98,40 @@ fn run_auth(
         AuthCmd::Login => tskmstr::cli::auth::login(&ctx, &mut prompter, &mut stdout)?,
         AuthCmd::Status => tskmstr::cli::auth::status(&ctx, &mut stdout)?,
     }
+    Ok(())
+}
+
+/// Load config and build a real Jira client + `gh` wrapper, shared by
+/// `tm ticket` and `tm pr`.
+fn build_ticketing_deps(
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(Config, HttpJiraClient, ShellGhCli), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let token = resolve_token(keychain, env_token)?;
+    let jira = HttpJiraClient::new(JiraClientContext {
+        base_url: config.jira_base_url.clone(),
+        email: config.jira_email.clone(),
+        token,
+    });
+    let gh = ShellGhCli::new();
+    Ok((config, jira, gh))
+}
+
+fn run_ticket(
+    key: &str,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
+    let ctx = TicketingContext {
+        jira: &jira,
+        gh: &gh,
+        config: &config,
+    };
+    let mut stdout = std::io::stdout();
+    tskmstr::cli::ticket::run(&ctx, key, &mut stdout)?;
     Ok(())
 }
