@@ -7,6 +7,10 @@
 
 use thiserror::Error;
 
+pub mod macos;
+
+pub use macos::MacosKeychain;
+
 /// A store capable of retrieving and persisting the Jira API token.
 ///
 /// Implementations may back this with the OS keychain, a file, or (for
