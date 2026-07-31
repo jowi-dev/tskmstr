@@ -7,12 +7,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter};
+use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, TicketCmd};
 use tskmstr::config::{self, Config, ConfigPaths};
 use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
-use tskmstr::ticketing::TicketingContext;
+use tskmstr::ticketing::{CreateTicketContext, TicketingContext};
 use tskmstr::tui::event::{TuiDeps, run};
 
 fn main() -> ExitCode {
@@ -36,7 +36,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 
     match command {
         Command::Auth { cmd } => run_auth(cmd, &paths, &keychain, env_token),
-        Command::Ticket { key } => run_ticket(&key, &paths, &keychain, env_token),
+        Command::Ticket { key, cmd } => run_ticket(key, cmd, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
     }
@@ -117,21 +117,55 @@ fn build_ticketing_deps(
     Ok((config, jira, gh))
 }
 
+/// Dispatch `tm ticket <KEY>` and `tm ticket create`.
+///
+/// The two forms need different dependencies: associating a key needs the
+/// full [`TicketingContext`] (Jira + `gh` + config) to find the current
+/// branch's PR, while creating a ticket has nothing to do with a PR and
+/// only needs Jira + config (see [`CreateTicketContext`]). `key` and `cmd`
+/// are both `Option` at the clap layer so `tm ticket create` doesn't also
+/// require a positional key; exactly one of them is expected to be `Some`,
+/// which this function enforces since clap itself doesn't.
 fn run_ticket(
-    key: &str,
+    key: Option<String>,
+    cmd: Option<TicketCmd>,
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
-    let ctx = TicketingContext {
-        jira: &jira,
-        gh: &gh,
-        config: &config,
-    };
-    let mut stdout = std::io::stdout();
-    tskmstr::cli::ticket::run(&ctx, key, &mut stdout)?;
-    Ok(())
+    match (key, cmd) {
+        (Some(key), None) => {
+            let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
+            let ctx = TicketingContext {
+                jira: &jira,
+                gh: &gh,
+                config: &config,
+            };
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::run(&ctx, &key, &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Create { title, body })) => {
+            let config = config::load(paths)?;
+            let token = resolve_token(keychain, env_token)?;
+            let jira = jira_client_for(&config, &token);
+            let ctx = CreateTicketContext {
+                jira: jira.as_ref(),
+                config: &config,
+            };
+            let opts = tskmstr::cli::ticket::CreateOptions { title, body };
+            let mut prompter = RealPrompter;
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::create(&ctx, &opts, &mut prompter, &mut stdout)?;
+            Ok(())
+        }
+        (None, None) => Err(Box::new(
+            tskmstr::cli::ticket::TicketCliError::KeyOrCreateRequired,
+        )),
+        (Some(_), Some(_)) => {
+            unreachable!("clap's args_conflicts_with_subcommands rejects key and cmd together")
+        }
+    }
 }
 
 fn run_pr(

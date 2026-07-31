@@ -139,7 +139,11 @@ pub fn status(
                     "Created ticket {}: {}",
                     outcome.issue_key, outcome.issue_url
                 )?;
-                super::print_status_transition(&outcome.issue_key, &outcome.status_transition, out)?;
+                super::print_status_transition(
+                    &outcome.issue_key,
+                    &outcome.status_transition,
+                    out,
+                )?;
             }
         }
     }

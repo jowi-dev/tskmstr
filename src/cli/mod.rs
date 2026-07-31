@@ -335,9 +335,8 @@ mod tests {
     fn bare_ticket_parses_with_no_key_and_no_subcommand() {
         // clap itself doesn't reject this shape (key and cmd are both
         // optional so `args_conflicts_with_subcommands` has nothing to
-        // conflict with); the CLI layer is responsible for turning "neither
-        // given" into an actionable error. See
-        // `cli::ticket::dispatch_missing_key_or_subcommand_errors`.
+        // conflict with); `main.rs`'s dispatch is responsible for turning
+        // "neither given" into `TicketCliError::KeyOrCreateRequired`.
         let cli = Cli::try_parse_from(["tm", "ticket"]).expect("should parse");
         match cli.command {
             Some(Command::Ticket { key, cmd }) => {

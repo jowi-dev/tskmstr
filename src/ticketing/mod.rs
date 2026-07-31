@@ -783,8 +783,8 @@ mod tests {
             config: &cfg,
         };
 
-        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
-            .expect("should succeed");
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "PROJ-1").expect("should succeed");
 
         assert_eq!(
             outcome.status_transition,
@@ -816,8 +816,8 @@ mod tests {
             config: &cfg,
         };
 
-        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
-            .expect("should succeed");
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "PROJ-1").expect("should succeed");
 
         assert_eq!(outcome.status_transition, None);
         assert!(
@@ -839,8 +839,8 @@ mod tests {
             config: &cfg,
         };
 
-        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
-            .expect("should succeed");
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "PROJ-1").expect("should succeed");
 
         assert_eq!(outcome.status_transition, None);
         assert!(jira.transition_calls().is_empty());
@@ -856,8 +856,8 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", Some("Some **body**"))
-            .expect("should succeed");
+        let outcome =
+            create_ticket(&ctx, "Add the widget", Some("Some **body**")).expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(calls.len(), 1);
@@ -909,8 +909,7 @@ mod tests {
         };
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome =
-            create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+        let outcome = create_ticket(&ctx, "Add the widget", None).expect("should succeed");
 
         assert_eq!(
             outcome.status_transition,
@@ -938,7 +937,10 @@ mod tests {
 
         match outcome.status_transition {
             Some(StatusTransition::Warning(msg)) => {
-                assert!(msg.contains("In Progress"), "warning should name the target: {msg}")
+                assert!(
+                    msg.contains("In Progress"),
+                    "warning should name the target: {msg}"
+                )
             }
             other => panic!("expected Warning, got {other:?}"),
         }
