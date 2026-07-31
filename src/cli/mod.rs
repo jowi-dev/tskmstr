@@ -16,6 +16,29 @@ pub mod auth;
 pub mod pr;
 pub mod ticket;
 
+use crate::ticketing::StatusTransition;
+
+/// Print the result of a ticket's `status_on_pr`/`status_on_create`
+/// transition attempt, if one was made.
+///
+/// Prints nothing when `status_transition` is `None` (the relevant config
+/// key isn't set, the ticket was already in the target status, or the
+/// outcome came from a path that never transitions, like `tm ticket <KEY>`).
+/// Shared by `cli::pr` (auto-created and pre-existing tickets) and
+/// `cli::ticket` (`tm ticket create`) so the same "Moved ... to ..." /
+/// "warning: ..." wording appears on every path.
+pub(crate) fn print_status_transition(
+    issue_key: &str,
+    status_transition: &Option<StatusTransition>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    match status_transition {
+        Some(StatusTransition::Applied(status)) => writeln!(out, "Moved {issue_key} to {status}"),
+        Some(StatusTransition::Warning(message)) => writeln!(out, "warning: {message}"),
+        None => Ok(()),
+    }
+}
+
 /// `tm`: Jira tickets and GitHub PRs from the terminal.
 #[derive(Parser, Debug)]
 #[command(name = "tm", about = "Jira tickets and GitHub PRs from the terminal")]
@@ -35,10 +58,15 @@ pub enum Command {
         cmd: AuthCmd,
     },
     /// Associate a Jira ticket with the pull request open for the current
-    /// branch.
+    /// branch, or create a new one with `tm ticket create`.
+    #[command(args_conflicts_with_subcommands = true)]
     Ticket {
-        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
-        key: String,
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive). Omit when
+        /// using `tm ticket create`.
+        key: Option<String>,
+        /// Which ticket action to perform.
+        #[command(subcommand)]
+        cmd: Option<TicketCmd>,
     },
     /// Manage the pull request open for the current branch.
     Pr {
@@ -48,6 +76,23 @@ pub enum Command {
     },
     /// Open the interactive terminal board.
     Board,
+}
+
+/// `tm ticket` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum TicketCmd {
+    /// Create a new ticket in the configured default project, independent
+    /// of any pull request.
+    Create {
+        /// Ticket title (Jira summary). Prompted for interactively if
+        /// omitted.
+        #[arg(long)]
+        title: Option<String>,
+        /// Ticket description. Supports GitHub-flavored Markdown; omitted
+        /// entirely if not given.
+        #[arg(long)]
+        body: Option<String>,
+    },
 }
 
 /// `tm auth` subcommands.
@@ -242,7 +287,63 @@ mod tests {
     fn parses_ticket_with_key() {
         let cli = Cli::try_parse_from(["tm", "ticket", "proj-372"]).expect("should parse");
         match cli.command {
-            Some(Command::Ticket { key }) => assert_eq!(key, "proj-372"),
+            Some(Command::Ticket { key, cmd }) => {
+                assert_eq!(key, Some("proj-372".to_string()));
+                assert!(cmd.is_none());
+            }
+            other => panic!("expected Ticket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_create_with_flags() {
+        let cli = Cli::try_parse_from([
+            "tm", "ticket", "create", "--title", "Fix it", "--body", "Details",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket { key, cmd }) => {
+                assert_eq!(key, None);
+                match cmd {
+                    Some(TicketCmd::Create { title, body }) => {
+                        assert_eq!(title, Some("Fix it".to_string()));
+                        assert_eq!(body, Some("Details".to_string()));
+                    }
+                    other => panic!("expected TicketCmd::Create, got {other:?}"),
+                }
+            }
+            other => panic!("expected Ticket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_create_with_no_flags() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "create"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Create { title, body }),
+            }) => {
+                assert_eq!(title, None);
+                assert_eq!(body, None);
+            }
+            other => panic!("expected Ticket Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_ticket_parses_with_no_key_and_no_subcommand() {
+        // clap itself doesn't reject this shape (key and cmd are both
+        // optional so `args_conflicts_with_subcommands` has nothing to
+        // conflict with); the CLI layer is responsible for turning "neither
+        // given" into an actionable error. See
+        // `cli::ticket::dispatch_missing_key_or_subcommand_errors`.
+        let cli = Cli::try_parse_from(["tm", "ticket"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ticket { key, cmd }) => {
+                assert!(key.is_none());
+                assert!(cmd.is_none());
+            }
             other => panic!("expected Ticket, got {other:?}"),
         }
     }

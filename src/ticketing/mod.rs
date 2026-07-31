@@ -1,4 +1,5 @@
-//! Orchestration of ticket <-> pull request association.
+//! Orchestration of ticket <-> pull request association, and of ticket
+//! creation independent of any pull request.
 //!
 //! This module ties together [`crate::jira`] and [`crate::github`]: given a
 //! Jira issue key and the pull request open for the current branch, it makes
@@ -6,12 +7,20 @@
 //! PR. It does not itself talk to the network; all I/O goes through the
 //! [`JiraClient`] and [`GhCli`] trait objects on [`TicketingContext`].
 //!
-//! [`auto_create_and_associate`] additionally moves a freshly created ticket
-//! to [`Config::status_on_pr`], if configured, since Jira's create-issue API
-//! cannot set status directly and a ticket created because a PR is already
-//! open shouldn't sit in the workflow's initial status. This step is
-//! advisory only (see [`StatusTransition`]) and never fails the overall
-//! association.
+//! Three functions move a ticket to a configured workflow status after
+//! creating or linking it, since Jira's create-issue API can't set status
+//! directly: [`auto_create_and_associate`] (a fresh ticket auto-created
+//! because a PR is already open), [`associate_existing_ticket_for_pr_create`]
+//! (a pre-existing ticket that `tm pr create` links to a newly opened PR),
+//! and [`create_ticket`] (a fresh ticket made by `tm ticket create`, with no
+//! PR involved at all — see [`CreateTicketContext`], which deliberately has
+//! no [`GhCli`] dependency). All three share the same matching logic via
+//! [`apply_status_transition`] and the same advisory contract: a transition
+//! problem is reported as a [`StatusTransition::Warning`] and never fails the
+//! overall operation, since the ticket was already created/linked by the
+//! time a transition is attempted. [`associate_ticket`] (`tm ticket <KEY>`)
+//! never transitions a ticket's status, nor does `tm pr status`'s read-only
+//! report of an already-associated ticket.
 
 use thiserror::Error;
 
@@ -22,12 +31,25 @@ use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::types::{CreateIssueRequest, RemoteLinkRequest};
 
-/// Dependencies shared by the ticketing orchestration functions.
+/// Dependencies shared by the ticketing orchestration functions that deal
+/// with a pull request.
 pub struct TicketingContext<'a> {
     /// Jira client used to verify issues and post remote links.
     pub jira: &'a dyn JiraClient,
     /// `gh` CLI wrapper used to look up and edit the current branch's PR.
     pub gh: &'a dyn GhCli,
+    /// Resolved configuration (Jira base URL, default project, etc).
+    pub config: &'a Config,
+}
+
+/// Dependencies for [`create_ticket`].
+///
+/// Deliberately narrower than [`TicketingContext`]: `tm ticket create` has
+/// nothing to do with a pull request, so it has no [`GhCli`] dependency and
+/// works the same whether or not the current branch has one.
+pub struct CreateTicketContext<'a> {
+    /// Jira client used to create the issue and apply its status transition.
+    pub jira: &'a dyn JiraClient,
     /// Resolved configuration (Jira base URL, default project, etc).
     pub config: &'a Config,
 }
@@ -46,22 +68,24 @@ pub struct AssociateOutcome {
     pub title_updated: bool,
     /// Whether a Jira remote link was posted for the PR.
     pub remote_link_added: bool,
-    /// Outcome of attempting to move a freshly auto-created ticket to
-    /// [`Config::status_on_pr`], if configured.
+    /// Outcome of attempting to move the ticket to [`Config::status_on_pr`],
+    /// if configured.
     ///
     /// Always `None` on the `tm ticket <KEY>` path ([`associate_ticket`]),
-    /// since that path associates an existing ticket and must never change
-    /// its status. Also `None` on the auto-create path when
-    /// `status_on_pr` isn't configured.
+    /// since that path associates an existing ticket outside of `tm pr
+    /// create` and must never change its status. Also `None` when
+    /// `status_on_pr` isn't configured, or when
+    /// [`associate_existing_ticket_for_pr_create`] finds the ticket already
+    /// sitting in the target status (nothing to do, so nothing to report).
     pub status_transition: Option<StatusTransition>,
 }
 
-/// Outcome of attempting to move an auto-created ticket to the configured
-/// [`Config::status_on_pr`].
+/// Outcome of attempting to move a ticket to a configured target status
+/// ([`Config::status_on_pr`] or [`Config::status_on_create`]).
 ///
 /// This is always advisory: a transition problem never fails the overall
-/// command, since the ticket was already created and linked to the PR by
-/// the time a transition is attempted.
+/// command, since the ticket was already created (and, on the `tm pr
+/// create` paths, linked to the PR) by the time a transition is attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusTransition {
     /// The ticket was moved to the named status.
@@ -145,11 +169,93 @@ pub fn auto_create_and_associate(
         .config
         .status_on_pr
         .as_ref()
-        .map(|target| apply_status_on_pr(ctx.jira, &issue.key, target));
+        .map(|target| apply_status_transition(ctx.jira, &issue.key, target));
     associate(ctx, &issue.key, pr, status_transition)
 }
 
-/// Move a freshly auto-created issue to `target`'s workflow status.
+/// `tm pr create` with a key already carried by the PR (via title, body, or
+/// branch name, resolved by [`resolve_existing_key`]): verify `key` exists,
+/// associate it with the pull request open for the current branch, and,
+/// unlike [`associate_ticket`], apply [`Config::status_on_pr`] to it.
+///
+/// This is a separate entry point from [`associate_ticket`] specifically so
+/// that `tm ticket <KEY>` and `tm pr status`'s read-only report keep their
+/// existing never-transitions semantics, while `tm pr create` gets the new
+/// behavior. If the issue is already sitting in the target status
+/// (case-insensitive match on its current status name), the transition is
+/// skipped entirely and `status_transition` comes back `None` — there is
+/// nothing to do and nothing to report.
+///
+/// Reuses the [`JiraClient::get_issue`] call `associate_ticket` already made
+/// on this path rather than issuing a second one, since that call's response
+/// already carries the issue's current status.
+pub fn associate_existing_ticket_for_pr_create(
+    ctx: &TicketingContext,
+    key: &str,
+) -> Result<AssociateOutcome, TicketingError> {
+    let issue = ctx.jira.get_issue(key)?;
+    let pr = current_branch_pr(ctx)?;
+
+    let status_transition = ctx.config.status_on_pr.as_ref().and_then(|target| {
+        if issue.fields.status.name.eq_ignore_ascii_case(target) {
+            None
+        } else {
+            Some(apply_status_transition(ctx.jira, key, target))
+        }
+    });
+
+    associate(ctx, key, &pr, status_transition)
+}
+
+/// Outcome of successfully creating a ticket via [`create_ticket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTicketOutcome {
+    /// The newly created issue's key.
+    pub issue_key: String,
+    /// Browsable URL of the newly created issue.
+    pub issue_url: String,
+    /// Outcome of attempting to move the ticket to
+    /// [`Config::status_on_create`], if configured. `None` when it isn't.
+    pub status_transition: Option<StatusTransition>,
+}
+
+/// `tm ticket create`: create a new issue in the configured default project,
+/// assigned to the configured default assignee, with no pull request
+/// involved.
+///
+/// `body`, if given, is parsed as GitHub-flavored Markdown into the issue's
+/// ADF description; when absent, the issue is created with an empty
+/// description. If [`Config::status_on_create`] is configured, the new
+/// ticket is moved to it via [`apply_status_transition`] — the same
+/// case-insensitive matching used by the `tm pr create` paths.
+pub fn create_ticket(
+    ctx: &CreateTicketContext,
+    title: &str,
+    body: Option<&str>,
+) -> Result<CreateTicketOutcome, TicketingError> {
+    let description = text_to_adf(body.unwrap_or_default());
+    let req = CreateIssueRequest {
+        project_key: ctx.config.default_project_key.clone(),
+        summary: title.to_string(),
+        description,
+        issue_type_name: "Task".to_string(),
+        assignee_account_id: ctx.config.default_assignee_account_id.clone(),
+    };
+    let issue = ctx.jira.create_issue(&req)?;
+    let status_transition = ctx
+        .config
+        .status_on_create
+        .as_ref()
+        .map(|target| apply_status_transition(ctx.jira, &issue.key, target));
+
+    Ok(CreateTicketOutcome {
+        issue_key: issue.key.clone(),
+        issue_url: format!("{}/browse/{}", ctx.config.jira_base_url, issue.key),
+        status_transition,
+    })
+}
+
+/// Move an issue to `target`'s workflow status.
 ///
 /// Fetches the issue's available transitions and picks the first one whose
 /// target status name matches `target` case-insensitively, falling back to
@@ -158,8 +264,8 @@ pub fn auto_create_and_associate(
 /// status it leads to). Never propagates an error: any failure — no
 /// matching transition, or the transition API call itself failing — is
 /// reported as a [`StatusTransition::Warning`], since the ticket has
-/// already been created and linked by this point.
-fn apply_status_on_pr(jira: &dyn JiraClient, key: &str, target: &str) -> StatusTransition {
+/// already been created (and, where applicable, linked) by this point.
+fn apply_status_transition(jira: &dyn JiraClient, key: &str, target: &str) -> StatusTransition {
     let transitions = match jira.transitions(key) {
         Ok(transitions) => transitions,
         Err(err) => {
@@ -303,6 +409,7 @@ mod tests {
             default_project_key: "PROJ".to_string(),
             default_assignee_account_id: Some("acct-1".to_string()),
             status_on_pr: None,
+            status_on_create: None,
         }
     }
 
@@ -658,6 +765,195 @@ mod tests {
             jira.transition_calls().is_empty(),
             "associate_ticket must never transition an existing ticket"
         );
+    }
+
+    #[test]
+    fn associate_existing_ticket_for_pr_create_applies_matching_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("21", "Send to review", "In Review")],
+            );
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr("Fix the thing"))));
+        let cfg = config_with_status_on_pr("In Review");
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
+            .expect("should succeed");
+
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::Applied("In Review".to_string()))
+        );
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-1".to_string(), "21".to_string())]
+        );
+        assert_eq!(jira.add_remote_link_calls().len(), 1);
+    }
+
+    #[test]
+    fn associate_existing_ticket_for_pr_create_skips_transition_when_already_in_target_status() {
+        let mut already_in_review = issue("PROJ-1");
+        already_in_review.fields.status.name = "In Review".to_string();
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", already_in_review)
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("21", "Send to review", "In Review")],
+            );
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr("Fix the thing"))));
+        // Case-insensitive match against the ticket's current status.
+        let cfg = config_with_status_on_pr("in review");
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
+            .expect("should succeed");
+
+        assert_eq!(outcome.status_transition, None);
+        assert!(
+            jira.transition_calls().is_empty(),
+            "should not call transition when the issue is already in the target status"
+        );
+        // Association itself still happens.
+        assert_eq!(jira.add_remote_link_calls().len(), 1);
+    }
+
+    #[test]
+    fn associate_existing_ticket_for_pr_create_no_status_on_pr_never_transitions() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr("Fix the thing"))));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = associate_existing_ticket_for_pr_create(&ctx, "PROJ-1")
+            .expect("should succeed");
+
+        assert_eq!(outcome.status_transition, None);
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    fn create_ctx<'a>(jira: &'a FakeJiraClient, cfg: &'a Config) -> CreateTicketContext<'a> {
+        CreateTicketContext { jira, config: cfg }
+    }
+
+    #[test]
+    fn create_ticket_creates_issue_with_expected_fields() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+
+        let outcome = create_ticket(&ctx, "Add the widget", Some("Some **body**"))
+            .expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        let req = &calls[0];
+        assert_eq!(req.project_key, "PROJ");
+        assert_eq!(req.summary, "Add the widget");
+        assert_eq!(req.issue_type_name, "Task");
+        assert_eq!(req.assignee_account_id, Some("acct-1".to_string()));
+        let description = req.description.to_string();
+        assert!(
+            description.contains("\"strong\""),
+            "markdown body should be converted to ADF marks: {description}"
+        );
+
+        assert_eq!(outcome.issue_key, "PROJ-9");
+        assert_eq!(
+            outcome.issue_url,
+            "https://example.atlassian.net/browse/PROJ-9"
+        );
+        assert_eq!(outcome.status_transition, None);
+    }
+
+    #[test]
+    fn create_ticket_without_body_has_empty_description() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+
+        create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(
+            calls[0].description,
+            serde_json::json!({ "type": "doc", "version": 1, "content": [] })
+        );
+    }
+
+    #[test]
+    fn create_ticket_applies_status_on_create_transition() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions(
+                "PROJ-9",
+                vec![transition("11", "Start Progress", "In Progress")],
+            );
+        let cfg = Config {
+            status_on_create: Some("In Progress".to_string()),
+            ..config()
+        };
+        let ctx = create_ctx(&jira, &cfg);
+
+        let outcome =
+            create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::Applied("In Progress".to_string()))
+        );
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-9".to_string(), "11".to_string())]
+        );
+    }
+
+    #[test]
+    fn create_ticket_no_matching_transition_yields_warning_without_erroring() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions("PROJ-9", vec![]);
+        let cfg = Config {
+            status_on_create: Some("In Progress".to_string()),
+            ..config()
+        };
+        let ctx = create_ctx(&jira, &cfg);
+
+        let outcome = create_ticket(&ctx, "Add the widget", None)
+            .expect("should succeed even with no matching transition");
+
+        match outcome.status_transition {
+            Some(StatusTransition::Warning(msg)) => {
+                assert!(msg.contains("In Progress"), "warning should name the target: {msg}")
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_ticket_no_status_on_create_configured_never_transitions() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+
+        let outcome = create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+
+        assert_eq!(outcome.status_transition, None);
+        assert!(jira.transition_calls().is_empty());
     }
 
     #[test]
