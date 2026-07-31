@@ -60,10 +60,18 @@ branch name.
 
 ## TUI keybindings
 
+The board lays tickets out as columns, one per Jira status, ordered by
+status category (new, then indeterminate, then done) and alphabetically by
+status name within a category. Drilling into a ticket or its transitions
+opens a centered floating window on top of the board rather than replacing
+it, so the board stays visible behind the detail and "Move to" windows.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
+| `h` / `Left` | Move to the previous column (board only) |
+| `l` / `Right` | Move to the next column (board only) |
 | `Enter` | Drill into the selected ticket, or apply the selected transition |
 | `Esc` / `q` | Go back a screen, or quit from the board |
 | `r` | Refresh from Jira |

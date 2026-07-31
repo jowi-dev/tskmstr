@@ -3,22 +3,35 @@
 //! Nothing here reads events or performs I/O; `crate::tui::event` is the only
 //! module that touches a real terminal. That split is what lets rendering be
 //! smoke-tested with ratatui's `TestBackend`.
+//!
+//! The board is always drawn first, one bordered column per status. The
+//! detail and transition-menu screens layer centered floating windows on top
+//! of it (via [`Clear`]), so the board stays visible behind them.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::tui::app::{App, Screen};
+use crate::tui::app::{App, Column, Screen};
 
 /// Draw the current screen (and the help overlay, if shown) into `frame`.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let (body, status_area) = split_body_and_status(frame.area());
+
+    draw_board_columns(frame, app, body);
+
     match app.screen {
-        Screen::Board => draw_board(frame, app),
-        Screen::Detail => draw_detail(frame, app),
-        Screen::TransitionMenu => draw_transition_menu(frame, app),
+        Screen::Board => {}
+        Screen::Detail => draw_detail_window(frame, app),
+        Screen::TransitionMenu => {
+            draw_detail_window(frame, app);
+            draw_transition_window(frame, app);
+        }
     }
+
+    draw_status_bar(frame, status_area, &app.status_line, hint_for(app.screen));
 
     if app.show_help {
         draw_help_overlay(frame);
@@ -45,66 +58,104 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
     frame.render_widget(Paragraph::new(text), area);
 }
 
-/// The flat list index of `app`'s selected ticket across all columns
-/// concatenated in order, or `None` if there is no selection.
-///
-/// Temporary bridge for the still-flat-list board rendering; superseded by
-/// per-column rendering.
-fn flat_selected_index(app: &App) -> Option<usize> {
-    if app.columns.is_empty() {
-        return None;
+/// The key-hint text shown in the status bar for `screen`.
+fn hint_for(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Board => "h/l column  j/k move  Enter open  r refresh  o browser  ? help  q quit",
+        Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
+        Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
     }
-    let before: usize = app.columns[..app.selected_col]
-        .iter()
-        .map(|c| c.tickets.len())
-        .sum();
-    Some(before + app.selected_row)
 }
 
-/// The board screen: a list of open tickets plus a status bar.
-fn draw_board(frame: &mut Frame, app: &App) {
-    let (body, status) = split_body_and_status(frame.area());
+/// The sprint board: one bordered column per status, laid out left to right
+/// with equal widths. The selected column is highlighted, as is the
+/// selected ticket within it.
+fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
+    if app.columns.is_empty() {
+        frame.render_widget(Block::default().borders(Borders::ALL).title("Board"), area);
+        return;
+    }
 
-    let items: Vec<ListItem> = app
-        .columns
+    let column_count = app.columns.len() as u32;
+    let constraints: Vec<Constraint> = (0..column_count)
+        .map(|_| Constraint::Ratio(1, column_count))
+        .collect();
+    let areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (index, column) in app.columns.iter().enumerate() {
+        let is_selected_column = index == app.selected_col;
+        let selected_row = is_selected_column.then_some(app.selected_row);
+        draw_column(
+            frame,
+            areas[index],
+            column,
+            is_selected_column,
+            selected_row,
+        );
+    }
+}
+
+/// One column of the board: a bordered, titled list of its tickets.
+fn draw_column(
+    frame: &mut Frame,
+    area: Rect,
+    column: &Column,
+    is_selected: bool,
+    selected_row: Option<usize>,
+) {
+    let title = format!("{} ({})", column.title, column.tickets.len());
+    let border_style = if is_selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let items: Vec<ListItem> = column
+        .tickets
         .iter()
-        .flat_map(|c| c.tickets.iter())
-        .map(|t| ListItem::new(format!("{:<10} {:<14} {}", t.key, t.status, t.summary)))
+        .map(|t| ListItem::new(format!("{}  {}", t.key, t.summary)))
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Board"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(border_style),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
-    if let Some(flat_index) = flat_selected_index(app) {
-        state.select(Some(flat_index));
+    if let Some(row) = selected_row
+        && !column.tickets.is_empty()
+    {
+        state.select(Some(row));
     }
-    frame.render_stateful_widget(list, body, &mut state);
-
-    draw_status_bar(
-        frame,
-        status,
-        &app.status_line,
-        "j/k move  Enter open  r refresh  o browser  ? help  q quit",
-    );
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// The detail screen: the selected ticket's fields plus its scrollable
-/// description body.
-fn draw_detail(frame: &mut Frame, app: &App) {
-    let (body, status) = split_body_and_status(frame.area());
+/// A centered floating window (~80% wide, ~70% tall) showing the selected
+/// ticket's full detail, drawn over the board.
+fn draw_detail_window(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let title = match app.selected_ticket() {
+        Some(ticket) => format!("[{}] {}", ticket.key, ticket.summary),
+        None => "Detail".to_string(),
+    };
 
     let text = match app.selected_ticket() {
         Some(ticket) => vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", ticket.key),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(ticket.status.clone()),
-            ]),
-            Line::from(ticket.summary.clone()),
+            Line::from(vec![Span::styled(
+                ticket.status.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]),
             Line::from(ticket.url.clone()),
             Line::from(""),
             Line::from(ticket.description.clone()),
@@ -113,23 +164,18 @@ fn draw_detail(frame: &mut Frame, app: &App) {
     };
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Detail"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
-    frame.render_widget(paragraph, body);
-
-    draw_status_bar(
-        frame,
-        status,
-        &app.status_line,
-        "j/k scroll  Enter transitions  Esc back  ? help  q quit",
-    );
+    frame.render_widget(paragraph, area);
 }
 
-/// The transition menu: the list of workflow transitions available on the
+/// A smaller centered floating window (~40% wide, ~40% tall), layered on top
+/// of the detail window, listing the workflow transitions available on the
 /// selected ticket.
-fn draw_transition_menu(frame: &mut Frame, app: &App) {
-    let (body, status) = split_body_and_status(frame.area());
+fn draw_transition_window(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 40, frame.area());
+    frame.render_widget(Clear, area);
 
     let items: Vec<ListItem> = app
         .transitions
@@ -138,21 +184,14 @@ fn draw_transition_menu(frame: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Transitions"))
+        .block(Block::default().borders(Borders::ALL).title("Move to"))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
     if !app.transitions.is_empty() {
         state.select(Some(app.transition_selected));
     }
-    frame.render_stateful_widget(list, body, &mut state);
-
-    draw_status_bar(
-        frame,
-        status,
-        &app.status_line,
-        "j/k move  Enter apply  Esc back  ? help  q quit",
-    );
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// A centered overlay listing every keybinding.
@@ -161,6 +200,8 @@ fn draw_help_overlay(frame: &mut Frame) {
     let lines = vec![
         Line::from("j / Down    move down"),
         Line::from("k / Up      move up"),
+        Line::from("h / Left    previous column"),
+        Line::from("l / Right   next column"),
         Line::from("Enter       open / apply"),
         Line::from("Esc / q     back (quits from the board)"),
         Line::from("r           refresh tickets"),
@@ -171,7 +212,7 @@ fn draw_help_overlay(frame: &mut Frame) {
     ];
     let paragraph =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Help"));
-    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
@@ -216,6 +257,14 @@ mod tests {
         }
     }
 
+    fn ticket_with(key: &str, status: &str, status_category: &str) -> TicketSummary {
+        TicketSummary {
+            status: status.to_string(),
+            status_category: status_category.to_string(),
+            ..ticket(key)
+        }
+    }
+
     fn transition(id: &str, name: &str) -> Transition {
         Transition {
             id: id.to_string(),
@@ -226,6 +275,17 @@ mod tests {
                     key: "indeterminate".to_string(),
                 },
             },
+        }
+    }
+
+    fn three_column_app() -> App {
+        App {
+            columns: group_into_columns(vec![
+                ticket_with("AX-1", "To Do", "new"),
+                ticket_with("AX-2", "In Progress", "indeterminate"),
+                ticket_with("AX-3", "Done", "done"),
+            ]),
+            ..App::new()
         }
     }
 
@@ -271,6 +331,30 @@ mod tests {
     }
 
     #[test]
+    fn draws_board_with_three_columns_renders_all_column_titles() {
+        let app = three_column_app();
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("To Do (1)"));
+        assert!(text.contains("In Progress (1)"));
+        assert!(text.contains("Done (1)"));
+    }
+
+    #[test]
+    fn detail_overlay_leaves_board_column_titles_visible_and_shows_key_title() {
+        let app = App {
+            screen: Screen::Detail,
+            ..three_column_app()
+        };
+        let text = buffer_text(&render(&app));
+        // The board is still visible behind the floating detail window.
+        assert!(text.contains("To Do (1)"));
+        assert!(text.contains("In Progress (1)"));
+        assert!(text.contains("Done (1)"));
+        // The detail window itself, titled with the selected ticket's key.
+        assert!(text.contains("[AX-1] Fix the thing"));
+    }
+
+    #[test]
     fn draws_detail_with_ticket_fields_and_description() {
         let app = App {
             columns: group_into_columns(vec![ticket("AX-1")]),
@@ -278,7 +362,7 @@ mod tests {
             ..App::new()
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("AX-1"));
+        assert!(text.contains("[AX-1]"));
         assert!(text.contains("A longer description"));
     }
 
@@ -293,6 +377,17 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("Start Progress"));
         assert!(text.contains("Done"));
+    }
+
+    #[test]
+    fn transition_window_has_move_to_title() {
+        let app = App {
+            screen: Screen::TransitionMenu,
+            transitions: vec![transition("11", "Start Progress")],
+            ..three_column_app()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Move to"));
     }
 
     #[test]
