@@ -45,13 +45,30 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
     frame.render_widget(Paragraph::new(text), area);
 }
 
+/// The flat list index of `app`'s selected ticket across all columns
+/// concatenated in order, or `None` if there is no selection.
+///
+/// Temporary bridge for the still-flat-list board rendering; superseded by
+/// per-column rendering.
+fn flat_selected_index(app: &App) -> Option<usize> {
+    if app.columns.is_empty() {
+        return None;
+    }
+    let before: usize = app.columns[..app.selected_col]
+        .iter()
+        .map(|c| c.tickets.len())
+        .sum();
+    Some(before + app.selected_row)
+}
+
 /// The board screen: a list of open tickets plus a status bar.
 fn draw_board(frame: &mut Frame, app: &App) {
     let (body, status) = split_body_and_status(frame.area());
 
     let items: Vec<ListItem> = app
-        .tickets
+        .columns
         .iter()
+        .flat_map(|c| c.tickets.iter())
         .map(|t| ListItem::new(format!("{:<10} {:<14} {}", t.key, t.status, t.summary)))
         .collect();
 
@@ -60,8 +77,8 @@ fn draw_board(frame: &mut Frame, app: &App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
-    if !app.tickets.is_empty() {
-        state.select(Some(app.selected));
+    if let Some(flat_index) = flat_selected_index(app) {
+        state.select(Some(flat_index));
     }
     frame.render_stateful_widget(list, body, &mut state);
 
@@ -184,7 +201,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::jira::types::{Status, StatusCategory, Transition};
-    use crate::tui::app::TicketSummary;
+    use crate::tui::app::{TicketSummary, group_into_columns};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -235,7 +252,7 @@ mod tests {
     #[test]
     fn draws_board_with_ticket_row_and_status_bar() {
         let app = App {
-            tickets: vec![ticket("AX-1")],
+            columns: group_into_columns(vec![ticket("AX-1")]),
             status_line: "Refreshing...".to_string(),
             ..App::new()
         };
@@ -256,7 +273,7 @@ mod tests {
     #[test]
     fn draws_detail_with_ticket_fields_and_description() {
         let app = App {
-            tickets: vec![ticket("AX-1")],
+            columns: group_into_columns(vec![ticket("AX-1")]),
             screen: Screen::Detail,
             ..App::new()
         };
@@ -268,7 +285,7 @@ mod tests {
     #[test]
     fn draws_transition_menu_with_transition_names() {
         let app = App {
-            tickets: vec![ticket("AX-1")],
+            columns: group_into_columns(vec![ticket("AX-1")]),
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "Start Progress"), transition("31", "Done")],
             ..App::new()
@@ -292,7 +309,7 @@ mod tests {
     #[test]
     fn draws_help_overlay_on_top_of_detail() {
         let app = App {
-            tickets: vec![ticket("AX-1")],
+            columns: group_into_columns(vec![ticket("AX-1")]),
             screen: Screen::Detail,
             show_help: true,
             ..App::new()

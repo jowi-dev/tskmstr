@@ -27,6 +27,8 @@ pub fn map_key(_screen: &Screen, show_help: bool, key: KeyCode) -> Option<Msg> {
     match key {
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::Up),
+        KeyCode::Char('h') | KeyCode::Left => Some(Msg::Left),
+        KeyCode::Char('l') | KeyCode::Right => Some(Msg::Right),
         KeyCode::Enter => Some(Msg::Enter),
         KeyCode::Esc | KeyCode::Char('q') => Some(Msg::Back),
         KeyCode::Char('r') => Some(Msg::Refresh),
@@ -50,6 +52,21 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(map_key(&Screen::Board, false, key), Some(expected));
+        }
+    }
+
+    #[test]
+    fn navigation_keys_map_to_left_and_right_on_every_screen() {
+        let cases = [
+            (KeyCode::Char('h'), Msg::Left),
+            (KeyCode::Left, Msg::Left),
+            (KeyCode::Char('l'), Msg::Right),
+            (KeyCode::Right, Msg::Right),
+        ];
+        for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
+            for (key, ref expected) in cases.clone() {
+                assert_eq!(map_key(&screen, false, key), Some(expected.clone()));
+            }
         }
     }
 

@@ -158,6 +158,7 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
     match deps.jira.get_issue(key) {
         Ok(issue) => vec![Msg::TransitionApplied {
             key: key.to_string(),
+            status_category: issue.fields.status.status_category.key.clone(),
             status: issue.fields.status.name,
         }],
         Err(err) => vec![Msg::TransitionFailed(err.to_string())],
@@ -288,7 +289,8 @@ mod tests {
             msgs,
             vec![Msg::TransitionApplied {
                 key: "AX-1".to_string(),
-                status: "In Progress".to_string()
+                status: "In Progress".to_string(),
+                status_category: "new".to_string()
             }]
         );
     }
@@ -329,7 +331,8 @@ mod tests {
             next_page_token: None,
         });
         let app = run_cmds(App::new(), vec![Cmd::FetchTickets], &deps(jira));
-        assert_eq!(app.tickets.len(), 1);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.columns.len(), 1);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_row, 0);
     }
 }

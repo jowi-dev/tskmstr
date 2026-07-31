@@ -91,11 +91,14 @@ pub enum Screen {
 /// All state needed to render and drive the TUI.
 #[derive(Debug, Clone, Default)]
 pub struct App {
-    /// Tickets currently shown on the board.
-    pub tickets: Vec<TicketSummary>,
-    /// Index into `tickets` of the currently selected ticket. Always clamped
-    /// into bounds (`0` when `tickets` is empty).
-    pub selected: usize,
+    /// Board columns, one per status, in display order.
+    pub columns: Vec<Column>,
+    /// Index into `columns` of the currently selected column. Always clamped
+    /// into bounds (`0` when `columns` is empty).
+    pub selected_col: usize,
+    /// Index into the selected column's tickets of the currently selected
+    /// ticket. Always clamped into bounds (`0` when the column is empty).
+    pub selected_row: usize,
     /// The screen currently shown.
     pub screen: Screen,
     /// Transitions available on the selected ticket, populated when
@@ -121,7 +124,10 @@ impl App {
 
     /// The currently selected ticket, if any.
     pub fn selected_ticket(&self) -> Option<&TicketSummary> {
-        self.tickets.get(self.selected)
+        self.columns
+            .get(self.selected_col)?
+            .tickets
+            .get(self.selected_row)
     }
 }
 
@@ -132,6 +138,10 @@ pub enum Msg {
     Up,
     /// Move the current selection/scroll down.
     Down,
+    /// Move the selected board column left. Ignored on non-board screens.
+    Left,
+    /// Move the selected board column right. Ignored on non-board screens.
+    Right,
     /// Activate the current selection.
     Enter,
     /// Go back to the previous screen, or quit from the board.
@@ -158,6 +168,9 @@ pub enum Msg {
         key: String,
         /// New status name after the transition.
         status: String,
+        /// New status category key after the transition, used to regroup
+        /// the ticket into the right board column.
+        status_category: String,
     },
     /// A transition failed to apply.
     TransitionFailed(String),
@@ -203,6 +216,14 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             move_down(&mut app);
             (app, Vec::new())
         }
+        Msg::Left => {
+            move_left(&mut app);
+            (app, Vec::new())
+        }
+        Msg::Right => {
+            move_right(&mut app);
+            (app, Vec::new())
+        }
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
             (app, vec![Cmd::FetchTickets])
@@ -223,8 +244,9 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::TicketsLoaded(tickets) => {
-            app.tickets = tickets;
-            clamp_selected(&mut app);
+            let preferred_key = app.selected_ticket().map(|t| t.key.clone());
+            app.columns = group_into_columns(tickets);
+            reselect(&mut app, preferred_key);
             (app, Vec::new())
         }
         Msg::TicketsFailed(err) => {
@@ -246,10 +268,18 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = err;
             (app, Vec::new())
         }
-        Msg::TransitionApplied { key, status } => {
-            if let Some(ticket) = app.tickets.iter_mut().find(|t| t.key == key) {
+        Msg::TransitionApplied {
+            key,
+            status,
+            status_category,
+        } => {
+            let mut tickets = flatten(&app.columns);
+            if let Some(ticket) = tickets.iter_mut().find(|t| t.key == key) {
                 ticket.status = status.clone();
+                ticket.status_category = status_category;
             }
+            app.columns = group_into_columns(tickets);
+            reselect(&mut app, Some(key.clone()));
             app.status_line = format!("{key} -> {status}");
             app.screen = Screen::Detail;
             (app, Vec::new())
@@ -306,7 +336,7 @@ fn back(app: &mut App) {
 /// Move the current selection/scroll up by one, saturating at the top.
 fn move_up(app: &mut App) {
     match app.screen {
-        Screen::Board => app.selected = app.selected.saturating_sub(1),
+        Screen::Board => app.selected_row = app.selected_row.saturating_sub(1),
         Screen::Detail => app.detail_scroll = app.detail_scroll.saturating_sub(1),
         Screen::TransitionMenu => {
             app.transition_selected = app.transition_selected.saturating_sub(1);
@@ -320,8 +350,8 @@ fn move_up(app: &mut App) {
 fn move_down(app: &mut App) {
     match app.screen {
         Screen::Board => {
-            if !app.tickets.is_empty() {
-                app.selected = (app.selected + 1).min(app.tickets.len() - 1);
+            if let Some(len) = current_column_len(app) {
+                app.selected_row = (app.selected_row + 1).min(len - 1);
             }
         }
         Screen::Detail => app.detail_scroll = app.detail_scroll.saturating_add(1),
@@ -334,14 +364,83 @@ fn move_down(app: &mut App) {
     }
 }
 
-/// Clamp `selected` into the bounds of `tickets`, resetting to `0` when the
-/// list is empty.
-fn clamp_selected(app: &mut App) {
-    if app.tickets.is_empty() {
-        app.selected = 0;
-    } else if app.selected >= app.tickets.len() {
-        app.selected = app.tickets.len() - 1;
+/// Move the selected board column left by one, saturating at the first
+/// column. No-op outside [`Screen::Board`].
+fn move_left(app: &mut App) {
+    if app.screen != Screen::Board || app.columns.is_empty() {
+        return;
     }
+    app.selected_col = app.selected_col.saturating_sub(1);
+    clamp_row(app);
+}
+
+/// Move the selected board column right by one, clamping at the last
+/// column. No-op outside [`Screen::Board`].
+fn move_right(app: &mut App) {
+    if app.screen != Screen::Board || app.columns.is_empty() {
+        return;
+    }
+    app.selected_col = (app.selected_col + 1).min(app.columns.len() - 1);
+    clamp_row(app);
+}
+
+/// The number of tickets in the currently selected column, or `None` if
+/// there are no columns.
+fn current_column_len(app: &App) -> Option<usize> {
+    app.columns.get(app.selected_col).map(|c| c.tickets.len())
+}
+
+/// Clamp `selected_row` into the bounds of the currently selected column,
+/// resetting to `0` when that column is empty.
+fn clamp_row(app: &mut App) {
+    match current_column_len(app) {
+        Some(0) | None => app.selected_row = 0,
+        Some(len) if app.selected_row >= len => app.selected_row = len - 1,
+        Some(_) => {}
+    }
+}
+
+/// Flatten every column's tickets back into a single list, in column then
+/// fetch order.
+fn flatten(columns: &[Column]) -> Vec<TicketSummary> {
+    columns.iter().flat_map(|c| c.tickets.clone()).collect()
+}
+
+/// Select the ticket with key `key`, if it exists in `app.columns`. Returns
+/// whether it was found.
+fn select_by_key(app: &mut App, key: &str) -> bool {
+    for (col_index, column) in app.columns.iter().enumerate() {
+        if let Some(row_index) = column.tickets.iter().position(|t| t.key == key) {
+            app.selected_col = col_index;
+            app.selected_row = row_index;
+            return true;
+        }
+    }
+    false
+}
+
+/// Re-establish selection after `app.columns` has been rebuilt: prefer
+/// keeping `preferred_key` selected if it still exists, otherwise clamp the
+/// existing indices into the new bounds.
+fn reselect(app: &mut App, preferred_key: Option<String>) {
+    let found = preferred_key.is_some_and(|key| select_by_key(app, &key));
+    if !found {
+        clamp_selection(app);
+    }
+}
+
+/// Clamp `selected_col`/`selected_row` into the bounds of `columns`,
+/// resetting both to `0` when `columns` is empty.
+fn clamp_selection(app: &mut App) {
+    if app.columns.is_empty() {
+        app.selected_col = 0;
+        app.selected_row = 0;
+        return;
+    }
+    if app.selected_col >= app.columns.len() {
+        app.selected_col = app.columns.len() - 1;
+    }
+    clamp_row(app);
 }
 
 #[cfg(test)]
@@ -367,10 +466,11 @@ mod tests {
         }
     }
 
-    fn board_with(tickets: Vec<TicketSummary>, selected: usize) -> App {
+    fn board_with(tickets: Vec<TicketSummary>, selected_row: usize) -> App {
         App {
-            tickets,
-            selected,
+            columns: group_into_columns(tickets),
+            selected_col: 0,
+            selected_row,
             ..App::new()
         }
     }
@@ -379,7 +479,7 @@ mod tests {
     fn up_on_board_is_a_noop_when_empty() {
         let app = board_with(vec![], 0);
         let (app, cmds) = update(app, Msg::Up);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
         assert!(cmds.is_empty());
     }
 
@@ -387,7 +487,7 @@ mod tests {
     fn down_on_board_is_a_noop_when_empty() {
         let app = board_with(vec![], 0);
         let (app, cmds) = update(app, Msg::Down);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
         assert!(cmds.is_empty());
     }
 
@@ -395,23 +495,98 @@ mod tests {
     fn up_clamps_at_zero() {
         let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 0);
         let (app, _) = update(app, Msg::Up);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
     }
 
     #[test]
     fn down_clamps_at_last_index() {
         let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
         let (app, _) = update(app, Msg::Down);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_row, 1);
     }
 
     #[test]
     fn up_and_down_move_selection_within_bounds() {
         let app = board_with(vec![ticket("AX-1"), ticket("AX-2"), ticket("AX-3")], 1);
         let (app, _) = update(app, Msg::Down);
-        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected_row, 2);
         let (app, _) = update(app, Msg::Up);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_row, 1);
+    }
+
+    #[test]
+    fn left_and_right_are_noops_when_board_has_one_column() {
+        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_row, 1);
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_row, 1);
+    }
+
+    #[test]
+    fn left_and_right_move_between_columns_and_clamp() {
+        let tickets = vec![
+            ticket_with("AX-1", "To Do", "new"),
+            ticket_with("AX-2", "In Progress", "indeterminate"),
+            ticket_with("AX-3", "In Progress", "indeterminate"),
+            ticket_with("AX-4", "Done", "done"),
+        ];
+        let app = App {
+            columns: group_into_columns(tickets),
+            selected_col: 0,
+            selected_row: 0,
+            ..App::new()
+        };
+
+        // To Do (1 ticket) -> In Progress (2 tickets): row stays 0.
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_row, 0);
+
+        // Move to the second ticket in In Progress, then right into Done
+        // (1 ticket): row must clamp down to 0.
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.selected_row, 1);
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 2);
+        assert_eq!(app.selected_row, 0);
+
+        // Right again clamps at the last column.
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 2);
+
+        // Left steps back through columns.
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.selected_col, 1);
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.selected_col, 0);
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.selected_col, 0);
+    }
+
+    #[test]
+    fn left_and_right_are_noops_when_board_is_empty() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 0);
+        assert!(cmds.is_empty());
+        let (app, cmds) = update(app, Msg::Left);
+        assert_eq!(app.selected_col, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn left_and_right_are_ignored_off_the_board_screen() {
+        let app = App {
+            screen: Screen::Detail,
+            detail_scroll: 3,
+            ..board_with(vec![ticket("AX-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.detail_scroll, 3);
     }
 
     #[test]
@@ -426,8 +601,15 @@ mod tests {
     fn tickets_loaded_replaces_list_and_clamps_selected() {
         let app = board_with(vec![ticket("AX-1"), ticket("AX-2"), ticket("AX-3")], 2);
         let (app, cmds) = update(app, Msg::TicketsLoaded(vec![ticket("AX-9")]));
-        assert_eq!(app.tickets, vec![ticket("AX-9")]);
-        assert_eq!(app.selected, 0);
+        assert_eq!(
+            app.columns,
+            vec![Column {
+                title: "To Do".to_string(),
+                tickets: vec![ticket("AX-9")],
+            }]
+        );
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_row, 0);
         assert!(cmds.is_empty());
     }
 
@@ -435,8 +617,19 @@ mod tests {
     fn tickets_loaded_with_empty_list_resets_selected_to_zero() {
         let app = board_with(vec![ticket("AX-1")], 0);
         let (app, _) = update(app, Msg::TicketsLoaded(vec![]));
-        assert_eq!(app.selected, 0);
-        assert!(app.tickets.is_empty());
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.selected_row, 0);
+        assert!(app.columns.is_empty());
+    }
+
+    #[test]
+    fn tickets_loaded_preserves_selection_by_key_when_still_present() {
+        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let (app, _) = update(
+            app,
+            Msg::TicketsLoaded(vec![ticket("AX-0"), ticket("AX-2"), ticket("AX-3")]),
+        );
+        assert_eq!(app.selected_ticket().unwrap().key, "AX-2");
     }
 
     #[test]
@@ -588,15 +781,65 @@ mod tests {
             Msg::TransitionApplied {
                 key: "AX-1".to_string(),
                 status: "In Progress".to_string(),
+                status_category: "indeterminate".to_string(),
             },
         );
         assert_eq!(app.screen, Screen::Detail);
         assert_eq!(app.status_line, "AX-1 -> In Progress");
         assert_eq!(
-            app.tickets.iter().find(|t| t.key == "AX-1").unwrap().status,
+            flatten(&app.columns)
+                .iter()
+                .find(|t| t.key == "AX-1")
+                .unwrap()
+                .status,
             "In Progress"
         );
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn transition_applied_moves_ticket_across_columns_and_selection_follows_it() {
+        let tickets = vec![
+            ticket_with("AX-1", "To Do", "new"),
+            ticket_with("AX-2", "To Do", "new"),
+        ];
+        let app = App {
+            screen: Screen::TransitionMenu,
+            transitions: vec![transition("11", "Done")],
+            columns: group_into_columns(tickets),
+            selected_col: 0,
+            selected_row: 0,
+            ..App::new()
+        };
+
+        let (app, _) = update(
+            app,
+            Msg::TransitionApplied {
+                key: "AX-1".to_string(),
+                status: "Done".to_string(),
+                status_category: "done".to_string(),
+            },
+        );
+
+        // AX-1 leaves the "To Do" column (now down to just AX-2) and lands
+        // in a new "Done" column, ordered after "To Do" (new < done).
+        assert_eq!(
+            app.columns,
+            vec![
+                Column {
+                    title: "To Do".to_string(),
+                    tickets: vec![ticket_with("AX-2", "To Do", "new")],
+                },
+                Column {
+                    title: "Done".to_string(),
+                    tickets: vec![ticket_with("AX-1", "Done", "done")],
+                },
+            ]
+        );
+        // Selection follows AX-1 into its new column.
+        assert_eq!(app.selected_col, 1);
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(app.selected_ticket().unwrap().key, "AX-1");
     }
 
     #[test]
