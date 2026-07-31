@@ -31,6 +31,12 @@ enum MyselfOutcome {
     Error { status: u16, message: String },
 }
 
+/// Canned outcome for [`FakeJiraClient::transitions`] on a given key.
+enum TransitionsOutcome {
+    Found(Vec<Transition>),
+    Error { status: u16, message: String },
+}
+
 /// An in-memory [`JiraClient`] test double.
 ///
 /// Issues are seeded by key via [`with_issue`](Self::with_issue),
@@ -46,6 +52,9 @@ pub struct FakeJiraClient {
     myself_result: RefCell<Option<MyselfOutcome>>,
     get_project_result: RefCell<Result<(), (u16, String)>>,
     search_result: RefCell<Option<Result<SearchResult, (u16, String)>>>,
+    transitions_result: RefCell<HashMap<String, TransitionsOutcome>>,
+    transition_result: RefCell<Result<(), (u16, String)>>,
+    transition_calls: RefCell<Vec<(String, String)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -58,6 +67,9 @@ impl Default for FakeJiraClient {
             myself_result: RefCell::new(None),
             get_project_result: RefCell::new(Ok(())),
             search_result: RefCell::new(None),
+            transitions_result: RefCell::new(HashMap::new()),
+            transition_result: RefCell::new(Ok(())),
+            transition_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -153,6 +165,40 @@ impl FakeJiraClient {
         *self.search_result.borrow_mut() = Some(Err((status, message.to_string())));
         self
     }
+
+    /// Seed `transitions(key)` to return `transitions`.
+    pub fn with_transitions(self, key: &str, transitions: Vec<Transition>) -> Self {
+        self.transitions_result
+            .borrow_mut()
+            .insert(key.to_string(), TransitionsOutcome::Found(transitions));
+        self
+    }
+
+    /// Seed `transitions(key)` to return [`JiraError::Api`] with the given
+    /// status and message.
+    pub fn with_transitions_error(self, key: &str, status: u16, message: &str) -> Self {
+        self.transitions_result.borrow_mut().insert(
+            key.to_string(),
+            TransitionsOutcome::Error {
+                status,
+                message: message.to_string(),
+            },
+        );
+        self
+    }
+
+    /// Seed `transition(..)` to return [`JiraError::Api`] with the given
+    /// status and message.
+    pub fn with_transition_error(self, status: u16, message: &str) -> Self {
+        *self.transition_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The `(key, transition_id)` pairs passed to `transition`, in call
+    /// order.
+    pub fn transition_calls(&self) -> Vec<(String, String)> {
+        self.transition_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -202,12 +248,28 @@ impl JiraClient for FakeJiraClient {
         Ok(())
     }
 
-    fn transitions(&self, _key: &str) -> Result<Vec<Transition>, JiraError> {
-        Ok(Vec::new())
+    fn transitions(&self, key: &str) -> Result<Vec<Transition>, JiraError> {
+        match self.transitions_result.borrow().get(key) {
+            Some(TransitionsOutcome::Found(transitions)) => Ok(transitions.clone()),
+            Some(TransitionsOutcome::Error { status, message }) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+            None => Ok(Vec::new()),
+        }
     }
 
-    fn transition(&self, _key: &str, _transition_id: &str) -> Result<(), JiraError> {
-        Ok(())
+    fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
+        self.transition_calls
+            .borrow_mut()
+            .push((key.to_string(), transition_id.to_string()));
+        match self.transition_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
     }
 
     fn search(&self, _jql: &str) -> Result<SearchResult, JiraError> {
