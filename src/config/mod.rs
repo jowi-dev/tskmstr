@@ -25,6 +25,15 @@ pub struct RawConfig {
     pub default_project_key: Option<String>,
     /// Default Jira account ID to assign new tickets to.
     pub default_assignee_account_id: Option<String>,
+    /// Workflow status name to transition an auto-created ticket to, e.g.
+    /// `"In Review"`.
+    ///
+    /// Only applies to tickets created because a PR is already open (the
+    /// `tm pr create` / `tm pr status --auto-ticket` auto-create path);
+    /// associating an already-existing ticket never transitions it. When
+    /// unset, auto-created tickets are left in the workflow's initial
+    /// status.
+    pub status_on_pr: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -39,6 +48,9 @@ pub struct Config {
     pub default_project_key: String,
     /// Default Jira account ID to assign new tickets to, if configured.
     pub default_assignee_account_id: Option<String>,
+    /// Workflow status name to transition an auto-created ticket to, if
+    /// configured. See [`RawConfig::status_on_pr`] for semantics.
+    pub status_on_pr: Option<String>,
 }
 
 /// Locations to read configuration from.
@@ -159,6 +171,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         jira_email: Some(seed.jira_email.clone()),
         default_project_key: Some(seed.default_project_key.clone()),
         default_assignee_account_id: None,
+        status_on_pr: None,
     }
 }
 
@@ -212,6 +225,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
     let default_assignee_account_id = repo
         .default_assignee_account_id
         .or(global.default_assignee_account_id);
+    let status_on_pr = repo.status_on_pr.or(global.status_on_pr);
 
     let expected_path = default_global_config_path();
 
@@ -224,6 +238,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
             &expected_path,
         )?,
         default_assignee_account_id,
+        status_on_pr,
     })
 }
 
@@ -327,6 +342,7 @@ mod tests {
             jira_email: Some("global@example.com".into()),
             default_project_key: Some("GLOBAL".into()),
             default_assignee_account_id: Some("acct-global".into()),
+            status_on_pr: Some("In Review".into()),
         }
     }
 
@@ -346,6 +362,7 @@ mod tests {
             jira_email: None,
             default_project_key: Some("REPO".into()),
             default_assignee_account_id: None,
+            status_on_pr: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -354,6 +371,30 @@ mod tests {
         assert_eq!(cfg.jira_base_url, "https://global.atlassian.net");
         assert_eq!(cfg.jira_email, "global@example.com");
         assert_eq!(cfg.default_assignee_account_id, Some("acct-global".into()));
+        assert_eq!(cfg.status_on_pr, Some("In Review".into()));
+    }
+
+    #[test]
+    fn merge_repo_overrides_status_on_pr() {
+        let repo = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            default_assignee_account_id: None,
+            status_on_pr: Some("Ready for Review".into()),
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
+    }
+
+    #[test]
+    fn merge_status_on_pr_absent_from_both_is_none() {
+        let global = RawConfig {
+            status_on_pr: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.status_on_pr, None);
     }
 
     #[test]
@@ -422,6 +463,77 @@ mod tests {
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.default_project_key, "REPO");
         assert_eq!(cfg.jira_base_url, "https://global.atlassian.net");
+    }
+
+    #[test]
+    fn load_global_with_status_on_pr_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            status_on_pr = "In Review"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_pr, Some("In Review".to_string()));
+    }
+
+    #[test]
+    fn load_global_without_status_on_pr_is_none() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_pr, None);
+    }
+
+    #[test]
+    fn load_repo_overrides_status_on_pr() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            status_on_pr = "In Review"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"status_on_pr = "Ready for Review""#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_pr, Some("Ready for Review".to_string()));
     }
 
     #[test]

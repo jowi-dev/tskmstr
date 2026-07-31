@@ -128,6 +128,7 @@ fn bootstrap_config(
         jira_email: seed.jira_email,
         default_project_key: seed.default_project_key,
         default_assignee_account_id: None,
+        status_on_pr: None,
     })
 }
 

@@ -112,6 +112,7 @@ mod tests {
             jira_email: "dev@example.com".to_string(),
             default_project_key: "PROJ".to_string(),
             default_assignee_account_id: None,
+            status_on_pr: None,
         }
     }
 

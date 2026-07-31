@@ -87,11 +87,26 @@ jira_base_url = "https://example.atlassian.net"
 jira_email = "dev@example.com"
 default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
+# status_on_pr = "In Review"          # optional, see below
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
-its root; fields it doesn't set fall back to the global config. All four
-fields must resolve between the two files or `tm` refuses to run.
+its root; fields it doesn't set fall back to the global config.
+`jira_base_url`, `jira_email`, and `default_project_key` must resolve
+between the two files or `tm` refuses to run; `default_assignee_account_id`
+and `status_on_pr` are optional.
+
+`status_on_pr` names the workflow status (e.g. `"In Review"`) to move a
+ticket to when `tm pr create` or `tm pr status --auto-ticket` auto-creates
+it because a PR is already open. Jira's create-issue API can't set status
+directly, so without this setting an auto-created ticket is left in the
+workflow's initial status (typically Backlog/To Do). When set, `tm` looks
+up the new ticket's available transitions and applies the first one whose
+target status matches, case-insensitively; if none match, or the
+transition call itself fails, `tm` prints a warning and continues — the
+ticket is still created and linked to the PR either way. This only applies
+to auto-created tickets; `tm ticket <KEY>` never changes an existing
+ticket's status.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes
