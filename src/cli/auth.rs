@@ -11,12 +11,6 @@ use crate::keychain::{KeychainError, KeychainStore};
 
 use super::Prompter;
 
-/// Default Jira base URL suggested when bootstrapping a new config.
-const DEFAULT_BASE_URL: &str = "https://home-solutions.atlassian.net";
-/// Default Jira email suggested when bootstrapping a new config.
-const DEFAULT_EMAIL: &str = "joe.williams@homesolutions.com";
-/// Default Jira project key suggested when bootstrapping a new config.
-const DEFAULT_PROJECT_KEY: &str = "AX";
 /// Where to point users who need to create a Jira API token.
 const TOKEN_HELP_URL: &str = "https://id.atlassian.com/manage-profile/security/api-tokens";
 
@@ -117,10 +111,14 @@ fn bootstrap_config(
     )?;
 
     let seed = GlobalConfigSeed {
-        jira_base_url: prompter.prompt_line("Jira base URL", DEFAULT_BASE_URL)?,
-        jira_email: prompter.prompt_line("Jira email", DEFAULT_EMAIL)?,
-        default_project_key: prompter
-            .prompt_line("Default Jira project key", DEFAULT_PROJECT_KEY)?,
+        jira_base_url: prompt_required(
+            prompter,
+            out,
+            "Jira base URL (e.g. https://your-site.atlassian.net)",
+        )?,
+        jira_email: prompt_required(prompter, out, "Jira email")?,
+        default_project_key: prompt_required(prompter, out, "Default Jira project key")?
+            .to_uppercase(),
     };
     config::write_global(path, &seed)?;
     writeln!(out, "Wrote config to {}", path.display())?;
@@ -131,6 +129,24 @@ fn bootstrap_config(
         default_project_key: seed.default_project_key,
         default_assignee_account_id: None,
     })
+}
+
+/// Prompt for a line of input, re-prompting (with a short reminder) as long
+/// as the answer is empty. Used for bootstrap fields that have no sensible
+/// default and must be supplied explicitly.
+fn prompt_required(
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+    message: &str,
+) -> Result<String, AuthCliError> {
+    loop {
+        let answer = prompter.prompt_line(message, "")?;
+        let trimmed = answer.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+        writeln!(out, "This field is required.")?;
+    }
 }
 
 /// `tm auth status`: report configuration, whether a token resolves (never
@@ -187,8 +203,8 @@ mod tests {
     fn myself() -> Myself {
         Myself {
             account_id: "acct-1".to_string(),
-            display_name: "Joe Williams".to_string(),
-            email_address: Some("joe.williams@homesolutions.com".to_string()),
+            display_name: "Jane Doe".to_string(),
+            email_address: Some("dev@example.com".to_string()),
         }
     }
 
@@ -240,9 +256,9 @@ mod tests {
         config::write_global(
             path,
             &GlobalConfigSeed {
-                jira_base_url: "https://home-solutions.atlassian.net".to_string(),
-                jira_email: "joe.williams@homesolutions.com".to_string(),
-                default_project_key: "AX".to_string(),
+                jira_base_url: "https://example.atlassian.net".to_string(),
+                jira_email: "dev@example.com".to_string(),
+                default_project_key: "PROJ".to_string(),
             },
         )
         .unwrap();
@@ -266,16 +282,16 @@ mod tests {
             jira_client_factory: &factory,
         };
         let mut prompter = FakePrompter::new()
-            .with_line("https://home-solutions.atlassian.net")
-            .with_line("joe.williams@homesolutions.com")
-            .with_line("AX")
+            .with_line("https://example.atlassian.net")
+            .with_line("dev@example.com")
+            .with_line("proj")
             .with_password("super-secret-token");
         let mut out = Vec::new();
 
         login(&ctx, &mut prompter, &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Authenticated as Joe Williams (accountId acct-1)"));
+        assert!(output.contains("Authenticated as Jane Doe (accountId acct-1)"));
         assert!(output.contains("Jira API token stored in keychain."));
         assert!(output.contains("Set default assignee to acct-1 in config."));
 
@@ -286,6 +302,43 @@ mod tests {
 
         let cfg = config::load(&paths).expect("config should be loadable");
         assert_eq!(cfg.default_assignee_account_id, Some("acct-1".to_string()));
+        // Project key answer is normalized to uppercase.
+        assert_eq!(cfg.default_project_key, "PROJ");
+    }
+
+    #[test]
+    fn login_bootstrap_reprompts_on_empty_answers() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("nested/config.toml");
+        let paths = ConfigPaths {
+            global: global_path.clone(),
+            repo: None,
+        };
+        let keychain = InMemoryKeychain::empty();
+        let jira = FakeJiraClient::new().with_myself(myself());
+        let factory = factory_returning(jira);
+        let ctx = AuthContext {
+            paths: &paths,
+            keychain: &keychain,
+            env_token: None,
+            jira_client_factory: &factory,
+        };
+        let mut prompter = FakePrompter::new()
+            .with_line("") // base URL: empty, should reprompt
+            .with_line("https://example.atlassian.net")
+            .with_line("") // email: empty, should reprompt
+            .with_line("dev@example.com")
+            .with_line("") // project key: empty, should reprompt
+            .with_line("proj")
+            .with_password("super-secret-token");
+        let mut out = Vec::new();
+
+        login(&ctx, &mut prompter, &mut out).expect("should succeed");
+
+        let cfg = config::load(&paths).expect("config should be loadable");
+        assert_eq!(cfg.jira_base_url, "https://example.atlassian.net");
+        assert_eq!(cfg.jira_email, "dev@example.com");
+        assert_eq!(cfg.default_project_key, "PROJ");
     }
 
     #[test]
@@ -365,8 +418,8 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Jira API token: found (keychain)"));
-        assert!(output.contains("Jira auth: OK (Joe Williams)"));
-        assert!(output.contains("Project AX: visible"));
+        assert!(output.contains("Jira auth: OK (Jane Doe)"));
+        assert!(output.contains("Project PROJ: visible"));
         assert!(!output.contains("stored-token"));
     }
 
@@ -458,7 +511,7 @@ mod tests {
         let keychain = InMemoryKeychain::with_token("stored-token");
         let jira = FakeJiraClient::new()
             .with_myself(myself())
-            .with_get_project_not_found("AX");
+            .with_get_project_not_found("PROJ");
         let factory = factory_returning(jira);
         let ctx = AuthContext {
             paths: &paths,
