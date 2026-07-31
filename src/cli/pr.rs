@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::github::gh_cli::{GhError, PrCreateRequest};
 use crate::ticketing::{
-    TicketingContext, TicketingError, associate_ticket, auto_create_and_associate,
-    resolve_existing_key,
+    AssociateOutcome, StatusTransition, TicketingContext, TicketingError, associate_ticket,
+    auto_create_and_associate, resolve_existing_key,
 };
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
@@ -86,8 +86,25 @@ pub fn create(
         None => auto_create_and_associate(ctx, &pr)?,
     };
     writeln!(out, "Ticket {}: {}", outcome.issue_key, outcome.issue_url)?;
+    print_status_transition(&outcome, out)?;
 
     Ok(())
+}
+
+/// Print the result of an auto-create ticket's `status_on_pr` transition
+/// attempt, if one was made.
+///
+/// Prints nothing when `status_transition` is `None` (either
+/// `status_on_pr` isn't configured, or the outcome came from
+/// `associate_ticket`, which never transitions an existing ticket).
+fn print_status_transition(outcome: &AssociateOutcome, out: &mut dyn Write) -> std::io::Result<()> {
+    match &outcome.status_transition {
+        Some(StatusTransition::Applied(status)) => {
+            writeln!(out, "Moved {} to {status}", outcome.issue_key)
+        }
+        Some(StatusTransition::Warning(message)) => writeln!(out, "warning: {message}"),
+        None => Ok(()),
+    }
 }
 
 /// `tm pr status`: report the pull request open for the current branch and
@@ -135,6 +152,7 @@ pub fn status(
                     "Created ticket {}: {}",
                     outcome.issue_key, outcome.issue_url
                 )?;
+                print_status_transition(&outcome, out)?;
             }
         }
     }
@@ -150,7 +168,7 @@ mod tests {
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::pr::PrInfo;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory};
+    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -185,6 +203,7 @@ mod tests {
             jira_email: "dev@example.com".to_string(),
             default_project_key: "PROJ".to_string(),
             default_assignee_account_id: Some("acct-1".to_string()),
+            status_on_pr: None,
         }
     }
 
@@ -212,6 +231,136 @@ mod tests {
         assert!(output.contains("Created PR #42: https://github.com/example/repo/pull/42"));
         assert!(output.contains("Ticket PROJ-9: https://example.atlassian.net/browse/PROJ-9"));
         assert_eq!(jira.create_issue_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_prints_moved_line_when_status_on_pr_transition_applies() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions(
+                "PROJ-9",
+                vec![Transition {
+                    id: "21".to_string(),
+                    name: "Send to review".to_string(),
+                    to: Status {
+                        name: "In Review".to_string(),
+                        status_category: StatusCategory {
+                            key: "indeterminate".to_string(),
+                        },
+                    },
+                }],
+            );
+        let gh = FakeGhCli::new().with_pr_create_result(Ok(pr_with_title("Add the widget")));
+        let cfg = Config {
+            status_on_pr: Some("In Review".to_string()),
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrCreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            base: None,
+        };
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Moved PROJ-9 to In Review"));
+    }
+
+    #[test]
+    fn create_prints_warning_line_when_no_matching_transition() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let gh = FakeGhCli::new().with_pr_create_result(Ok(pr_with_title("Add the widget")));
+        let cfg = Config {
+            status_on_pr: Some("In Review".to_string()),
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrCreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            base: None,
+        };
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("warning:"));
+    }
+
+    #[test]
+    fn create_prints_nothing_extra_when_status_on_pr_unset() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let gh = FakeGhCli::new().with_pr_create_result(Ok(pr_with_title("Add the widget")));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrCreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            base: None,
+        };
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("Moved"));
+        assert!(!output.contains("warning:"));
+    }
+
+    #[test]
+    fn status_auto_create_prints_moved_line_when_transition_applies() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions(
+                "PROJ-9",
+                vec![Transition {
+                    id: "21".to_string(),
+                    name: "Send to review".to_string(),
+                    to: Status {
+                        name: "In Review".to_string(),
+                        status_category: StatusCategory {
+                            key: "indeterminate".to_string(),
+                        },
+                    },
+                }],
+            );
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr_with_title("Fix the thing"))));
+        let cfg = Config {
+            status_on_pr: Some("In Review".to_string()),
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrStatusOptions { auto_ticket: true };
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Moved PROJ-9 to In Review"));
     }
 
     #[test]
