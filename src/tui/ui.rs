@@ -195,6 +195,7 @@ mod tests {
             status: "In Progress".to_string(),
             url: format!("https://example.atlassian.net/browse/{key}"),
             description: "A longer description of the ticket.".to_string(),
+            status_category: "indeterminate".to_string(),
         }
     }
 

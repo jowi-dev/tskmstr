@@ -23,6 +23,57 @@ pub struct TicketSummary {
     /// Plain-text description, extracted from the issue's ADF description
     /// via [`crate::jira::adf::adf_to_text`].
     pub description: String,
+    /// Status category key (`new`, `indeterminate`, `done`, or anything else
+    /// Jira reports), used to order board columns.
+    pub status_category: String,
+}
+
+/// One column of the sprint board: all tickets currently in a given status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    /// Status name shared by every ticket in this column.
+    pub title: String,
+    /// Tickets in this column, in fetch order.
+    pub tickets: Vec<TicketSummary>,
+}
+
+/// Rank a status category for column ordering: `new` sorts first, then
+/// `indeterminate`, then `done`, then anything unrecognized.
+fn category_rank(category: &str) -> u8 {
+    match category {
+        "new" => 0,
+        "indeterminate" => 1,
+        "done" => 2,
+        _ => 3,
+    }
+}
+
+/// Group `tickets` into [`Column`]s, one per distinct status name.
+///
+/// Columns are ordered by status category rank (new, then indeterminate,
+/// then done, then unknown categories), and alphabetically by status name
+/// within a category. Tickets keep their relative fetch order within a
+/// column.
+pub fn group_into_columns(tickets: Vec<TicketSummary>) -> Vec<Column> {
+    let mut columns: Vec<Column> = Vec::new();
+
+    for ticket in tickets {
+        match columns.iter_mut().find(|c| c.title == ticket.status) {
+            Some(column) => column.tickets.push(ticket),
+            None => columns.push(Column {
+                title: ticket.status.clone(),
+                tickets: vec![ticket],
+            }),
+        }
+    }
+
+    columns.sort_by(|a, b| {
+        let rank_a = category_rank(&a.tickets[0].status_category);
+        let rank_b = category_rank(&b.tickets[0].status_category);
+        rank_a.cmp(&rank_b).then_with(|| a.title.cmp(&b.title))
+    });
+
+    columns
 }
 
 /// Which screen is currently shown.
@@ -304,6 +355,15 @@ mod tests {
             status: "To Do".to_string(),
             url: format!("https://example.atlassian.net/browse/{key}"),
             description: format!("Description for {key}"),
+            status_category: "new".to_string(),
+        }
+    }
+
+    fn ticket_with(key: &str, status: &str, status_category: &str) -> TicketSummary {
+        TicketSummary {
+            status: status.to_string(),
+            status_category: status_category.to_string(),
+            ..ticket(key)
         }
     }
 
@@ -613,5 +673,79 @@ mod tests {
         assert_eq!(app.transition_selected, 1);
         let (app, _) = update(app, Msg::Down);
         assert_eq!(app.transition_selected, 1);
+    }
+
+    #[test]
+    fn group_into_columns_orders_by_category_then_name() {
+        struct Case {
+            name: &'static str,
+            tickets: Vec<TicketSummary>,
+            expected: Vec<(&'static str, Vec<&'static str>)>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "empty input produces no columns",
+                tickets: vec![],
+                expected: vec![],
+            },
+            Case {
+                name: "single status produces a single column",
+                tickets: vec![ticket_with("AX-1", "To Do", "new")],
+                expected: vec![("To Do", vec!["AX-1"])],
+            },
+            Case {
+                name: "categories ordered new < indeterminate < done",
+                tickets: vec![
+                    ticket_with("AX-1", "Done", "done"),
+                    ticket_with("AX-2", "In Progress", "indeterminate"),
+                    ticket_with("AX-3", "To Do", "new"),
+                ],
+                expected: vec![
+                    ("To Do", vec!["AX-3"]),
+                    ("In Progress", vec!["AX-2"]),
+                    ("Done", vec!["AX-1"]),
+                ],
+            },
+            Case {
+                name: "same category sorts alphabetically by status name",
+                tickets: vec![
+                    ticket_with("AX-1", "In Review", "indeterminate"),
+                    ticket_with("AX-2", "In Progress", "indeterminate"),
+                ],
+                expected: vec![("In Progress", vec!["AX-2"]), ("In Review", vec!["AX-1"])],
+            },
+            Case {
+                name: "unknown category sorts after done",
+                tickets: vec![
+                    ticket_with("AX-1", "Done", "done"),
+                    ticket_with("AX-2", "Weird", "some-unknown-category"),
+                ],
+                expected: vec![("Done", vec!["AX-1"]), ("Weird", vec!["AX-2"])],
+            },
+            Case {
+                name: "ticket order within a column is preserved",
+                tickets: vec![
+                    ticket_with("AX-1", "To Do", "new"),
+                    ticket_with("AX-2", "To Do", "new"),
+                    ticket_with("AX-3", "To Do", "new"),
+                ],
+                expected: vec![("To Do", vec!["AX-1", "AX-2", "AX-3"])],
+            },
+        ];
+
+        for case in cases {
+            let columns = group_into_columns(case.tickets);
+            let actual: Vec<(&str, Vec<&str>)> = columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.title.as_str(),
+                        c.tickets.iter().map(|t| t.key.as_str()).collect(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, case.expected, "case: {}", case.name);
+        }
     }
 }

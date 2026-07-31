@@ -193,6 +193,7 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
         url: format!("{base_url}/browse/{}", issue.key),
         key: issue.key,
         summary: issue.fields.summary,
+        status_category: issue.fields.status.status_category.key.clone(),
         status: issue.fields.status.name,
         description,
     }
