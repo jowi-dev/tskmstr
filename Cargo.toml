@@ -22,6 +22,7 @@ crossterm = "0.28"
 regex = "1"
 toml = "0.8"
 rpassword = "7"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [dev-dependencies]
 httpmock = "0.7"
