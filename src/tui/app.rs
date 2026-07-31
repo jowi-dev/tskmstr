@@ -12,7 +12,7 @@ use crate::jira::types::Transition;
 /// [`crate::jira::types::Issue`] plus the configured Jira base URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketSummary {
-    /// Issue key, e.g. `AX-123`.
+    /// Issue key, e.g. `PROJ-123`.
     pub key: String,
     /// One-line issue summary.
     pub summary: String,
@@ -493,21 +493,24 @@ mod tests {
 
     #[test]
     fn up_clamps_at_zero() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 0);
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 0);
         let (app, _) = update(app, Msg::Up);
         assert_eq!(app.selected_row, 0);
     }
 
     #[test]
     fn down_clamps_at_last_index() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
         let (app, _) = update(app, Msg::Down);
         assert_eq!(app.selected_row, 1);
     }
 
     #[test]
     fn up_and_down_move_selection_within_bounds() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2"), ticket("AX-3")], 1);
+        let app = board_with(
+            vec![ticket("PROJ-1"), ticket("PROJ-2"), ticket("PROJ-3")],
+            1,
+        );
         let (app, _) = update(app, Msg::Down);
         assert_eq!(app.selected_row, 2);
         let (app, _) = update(app, Msg::Up);
@@ -516,7 +519,7 @@ mod tests {
 
     #[test]
     fn left_and_right_are_noops_when_board_has_one_column() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
         let (app, _) = update(app, Msg::Right);
         assert_eq!(app.selected_col, 0);
         assert_eq!(app.selected_row, 1);
@@ -528,10 +531,10 @@ mod tests {
     #[test]
     fn left_and_right_move_between_columns_and_clamp() {
         let tickets = vec![
-            ticket_with("AX-1", "To Do", "new"),
-            ticket_with("AX-2", "In Progress", "indeterminate"),
-            ticket_with("AX-3", "In Progress", "indeterminate"),
-            ticket_with("AX-4", "Done", "done"),
+            ticket_with("PROJ-1", "To Do", "new"),
+            ticket_with("PROJ-2", "In Progress", "indeterminate"),
+            ticket_with("PROJ-3", "In Progress", "indeterminate"),
+            ticket_with("PROJ-4", "Done", "done"),
         ];
         let app = App {
             columns: group_into_columns(tickets),
@@ -582,7 +585,7 @@ mod tests {
         let app = App {
             screen: Screen::Detail,
             detail_scroll: 3,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, _) = update(app, Msg::Right);
         assert_eq!(app.selected_col, 0);
@@ -599,13 +602,16 @@ mod tests {
 
     #[test]
     fn tickets_loaded_replaces_list_and_clamps_selected() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2"), ticket("AX-3")], 2);
-        let (app, cmds) = update(app, Msg::TicketsLoaded(vec![ticket("AX-9")]));
+        let app = board_with(
+            vec![ticket("PROJ-1"), ticket("PROJ-2"), ticket("PROJ-3")],
+            2,
+        );
+        let (app, cmds) = update(app, Msg::TicketsLoaded(vec![ticket("PROJ-9")]));
         assert_eq!(
             app.columns,
             vec![Column {
                 title: "To Do".to_string(),
-                tickets: vec![ticket("AX-9")],
+                tickets: vec![ticket("PROJ-9")],
             }]
         );
         assert_eq!(app.selected_col, 0);
@@ -615,7 +621,7 @@ mod tests {
 
     #[test]
     fn tickets_loaded_with_empty_list_resets_selected_to_zero() {
-        let app = board_with(vec![ticket("AX-1")], 0);
+        let app = board_with(vec![ticket("PROJ-1")], 0);
         let (app, _) = update(app, Msg::TicketsLoaded(vec![]));
         assert_eq!(app.selected_col, 0);
         assert_eq!(app.selected_row, 0);
@@ -624,12 +630,12 @@ mod tests {
 
     #[test]
     fn tickets_loaded_preserves_selection_by_key_when_still_present() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
         let (app, _) = update(
             app,
-            Msg::TicketsLoaded(vec![ticket("AX-0"), ticket("AX-2"), ticket("AX-3")]),
+            Msg::TicketsLoaded(vec![ticket("PROJ-0"), ticket("PROJ-2"), ticket("PROJ-3")]),
         );
-        assert_eq!(app.selected_ticket().unwrap().key, "AX-2");
+        assert_eq!(app.selected_ticket().unwrap().key, "PROJ-2");
     }
 
     #[test]
@@ -650,12 +656,12 @@ mod tests {
 
     #[test]
     fn open_in_browser_emits_open_url_for_selected_ticket() {
-        let app = board_with(vec![ticket("AX-1"), ticket("AX-2")], 1);
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
         let (_, cmds) = update(app, Msg::OpenInBrowser);
         assert_eq!(
             cmds,
             vec![Cmd::OpenUrl(
-                "https://example.atlassian.net/browse/AX-2".to_string()
+                "https://example.atlassian.net/browse/PROJ-2".to_string()
             )]
         );
     }
@@ -693,7 +699,7 @@ mod tests {
 
     #[test]
     fn enter_on_board_with_selection_opens_detail() {
-        let app = board_with(vec![ticket("AX-1")], 0);
+        let app = board_with(vec![ticket("PROJ-1")], 0);
         let (app, cmds) = update(app, Msg::Enter);
         assert_eq!(app.screen, Screen::Detail);
         assert!(cmds.is_empty());
@@ -711,14 +717,14 @@ mod tests {
     fn enter_on_detail_emits_fetch_transitions_and_stays_on_detail() {
         let app = App {
             screen: Screen::Detail,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, cmds) = update(app, Msg::Enter);
         assert_eq!(app.screen, Screen::Detail);
         assert_eq!(
             cmds,
             vec![Cmd::FetchTransitions {
-                key: "AX-1".to_string()
+                key: "PROJ-1".to_string()
             }]
         );
     }
@@ -727,7 +733,7 @@ mod tests {
     fn transitions_loaded_moves_to_transition_menu() {
         let app = App {
             screen: Screen::Detail,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, cmds) = update(
             app,
@@ -743,7 +749,7 @@ mod tests {
     fn transitions_failed_sets_status_line_and_stays_on_detail() {
         let app = App {
             screen: Screen::Detail,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, cmds) = update(app, Msg::TransitionsFailed("boom".to_string()));
         assert_eq!(app.status_line, "boom");
@@ -757,13 +763,13 @@ mod tests {
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "Start Progress")],
             transition_selected: 0,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (_, cmds) = update(app, Msg::Enter);
         assert_eq!(
             cmds,
             vec![Cmd::ApplyTransition {
-                key: "AX-1".to_string(),
+                key: "PROJ-1".to_string(),
                 transition_id: "11".to_string()
             }]
         );
@@ -774,22 +780,22 @@ mod tests {
         let app = App {
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "In Progress")],
-            ..board_with(vec![ticket("AX-1"), ticket("AX-2")], 0)
+            ..board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 0)
         };
         let (app, cmds) = update(
             app,
             Msg::TransitionApplied {
-                key: "AX-1".to_string(),
+                key: "PROJ-1".to_string(),
                 status: "In Progress".to_string(),
                 status_category: "indeterminate".to_string(),
             },
         );
         assert_eq!(app.screen, Screen::Detail);
-        assert_eq!(app.status_line, "AX-1 -> In Progress");
+        assert_eq!(app.status_line, "PROJ-1 -> In Progress");
         assert_eq!(
             flatten(&app.columns)
                 .iter()
-                .find(|t| t.key == "AX-1")
+                .find(|t| t.key == "PROJ-1")
                 .unwrap()
                 .status,
             "In Progress"
@@ -800,8 +806,8 @@ mod tests {
     #[test]
     fn transition_applied_moves_ticket_across_columns_and_selection_follows_it() {
         let tickets = vec![
-            ticket_with("AX-1", "To Do", "new"),
-            ticket_with("AX-2", "To Do", "new"),
+            ticket_with("PROJ-1", "To Do", "new"),
+            ticket_with("PROJ-2", "To Do", "new"),
         ];
         let app = App {
             screen: Screen::TransitionMenu,
@@ -815,38 +821,38 @@ mod tests {
         let (app, _) = update(
             app,
             Msg::TransitionApplied {
-                key: "AX-1".to_string(),
+                key: "PROJ-1".to_string(),
                 status: "Done".to_string(),
                 status_category: "done".to_string(),
             },
         );
 
-        // AX-1 leaves the "To Do" column (now down to just AX-2) and lands
+        // PROJ-1 leaves the "To Do" column (now down to just PROJ-2) and lands
         // in a new "Done" column, ordered after "To Do" (new < done).
         assert_eq!(
             app.columns,
             vec![
                 Column {
                     title: "To Do".to_string(),
-                    tickets: vec![ticket_with("AX-2", "To Do", "new")],
+                    tickets: vec![ticket_with("PROJ-2", "To Do", "new")],
                 },
                 Column {
                     title: "Done".to_string(),
-                    tickets: vec![ticket_with("AX-1", "Done", "done")],
+                    tickets: vec![ticket_with("PROJ-1", "Done", "done")],
                 },
             ]
         );
-        // Selection follows AX-1 into its new column.
+        // Selection follows PROJ-1 into its new column.
         assert_eq!(app.selected_col, 1);
         assert_eq!(app.selected_row, 0);
-        assert_eq!(app.selected_ticket().unwrap().key, "AX-1");
+        assert_eq!(app.selected_ticket().unwrap().key, "PROJ-1");
     }
 
     #[test]
     fn transition_failed_sets_status_line() {
         let app = App {
             screen: Screen::TransitionMenu,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, cmds) = update(app, Msg::TransitionFailed("nope".to_string()));
         assert_eq!(app.status_line, "nope");
@@ -857,7 +863,7 @@ mod tests {
     fn back_on_transition_menu_returns_to_detail() {
         let app = App {
             screen: Screen::TransitionMenu,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, _) = update(app, Msg::Back);
         assert_eq!(app.screen, Screen::Detail);
@@ -867,7 +873,7 @@ mod tests {
     fn back_on_detail_returns_to_board() {
         let app = App {
             screen: Screen::Detail,
-            ..board_with(vec![ticket("AX-1")], 0)
+            ..board_with(vec![ticket("PROJ-1")], 0)
         };
         let (app, _) = update(app, Msg::Back);
         assert_eq!(app.screen, Screen::Board);
@@ -875,7 +881,7 @@ mod tests {
 
     #[test]
     fn back_on_board_quits() {
-        let app = board_with(vec![ticket("AX-1")], 0);
+        let app = board_with(vec![ticket("PROJ-1")], 0);
         let (app, _) = update(app, Msg::Back);
         assert!(app.quit);
     }
@@ -934,46 +940,49 @@ mod tests {
             },
             Case {
                 name: "single status produces a single column",
-                tickets: vec![ticket_with("AX-1", "To Do", "new")],
-                expected: vec![("To Do", vec!["AX-1"])],
+                tickets: vec![ticket_with("PROJ-1", "To Do", "new")],
+                expected: vec![("To Do", vec!["PROJ-1"])],
             },
             Case {
                 name: "categories ordered new < indeterminate < done",
                 tickets: vec![
-                    ticket_with("AX-1", "Done", "done"),
-                    ticket_with("AX-2", "In Progress", "indeterminate"),
-                    ticket_with("AX-3", "To Do", "new"),
+                    ticket_with("PROJ-1", "Done", "done"),
+                    ticket_with("PROJ-2", "In Progress", "indeterminate"),
+                    ticket_with("PROJ-3", "To Do", "new"),
                 ],
                 expected: vec![
-                    ("To Do", vec!["AX-3"]),
-                    ("In Progress", vec!["AX-2"]),
-                    ("Done", vec!["AX-1"]),
+                    ("To Do", vec!["PROJ-3"]),
+                    ("In Progress", vec!["PROJ-2"]),
+                    ("Done", vec!["PROJ-1"]),
                 ],
             },
             Case {
                 name: "same category sorts alphabetically by status name",
                 tickets: vec![
-                    ticket_with("AX-1", "In Review", "indeterminate"),
-                    ticket_with("AX-2", "In Progress", "indeterminate"),
+                    ticket_with("PROJ-1", "In Review", "indeterminate"),
+                    ticket_with("PROJ-2", "In Progress", "indeterminate"),
                 ],
-                expected: vec![("In Progress", vec!["AX-2"]), ("In Review", vec!["AX-1"])],
+                expected: vec![
+                    ("In Progress", vec!["PROJ-2"]),
+                    ("In Review", vec!["PROJ-1"]),
+                ],
             },
             Case {
                 name: "unknown category sorts after done",
                 tickets: vec![
-                    ticket_with("AX-1", "Done", "done"),
-                    ticket_with("AX-2", "Weird", "some-unknown-category"),
+                    ticket_with("PROJ-1", "Done", "done"),
+                    ticket_with("PROJ-2", "Weird", "some-unknown-category"),
                 ],
-                expected: vec![("Done", vec!["AX-1"]), ("Weird", vec!["AX-2"])],
+                expected: vec![("Done", vec!["PROJ-1"]), ("Weird", vec!["PROJ-2"])],
             },
             Case {
                 name: "ticket order within a column is preserved",
                 tickets: vec![
-                    ticket_with("AX-1", "To Do", "new"),
-                    ticket_with("AX-2", "To Do", "new"),
-                    ticket_with("AX-3", "To Do", "new"),
+                    ticket_with("PROJ-1", "To Do", "new"),
+                    ticket_with("PROJ-2", "To Do", "new"),
+                    ticket_with("PROJ-3", "To Do", "new"),
                 ],
-                expected: vec![("To Do", vec!["AX-1", "AX-2", "AX-3"])],
+                expected: vec![("To Do", vec!["PROJ-1", "PROJ-2", "PROJ-3"])],
             },
         ];
 

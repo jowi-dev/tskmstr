@@ -241,16 +241,19 @@ mod tests {
         use crate::jira::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
-            issues: vec![issue("AX-1", "To Do")],
+            issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
         let msgs = fetch_tickets(&deps(jira));
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets)] => {
                 assert_eq!(tickets.len(), 1);
-                assert_eq!(tickets[0].key, "AX-1");
+                assert_eq!(tickets[0].key, "PROJ-1");
                 assert_eq!(tickets[0].status, "To Do");
-                assert_eq!(tickets[0].url, "https://example.atlassian.net/browse/AX-1");
+                assert_eq!(
+                    tickets[0].url,
+                    "https://example.atlassian.net/browse/PROJ-1"
+                );
                 assert_eq!(tickets[0].description, "Body text");
             }
             other => panic!("expected TicketsLoaded, got {other:?}"),
@@ -277,18 +280,18 @@ mod tests {
     #[test]
     fn fetch_transitions_success_emits_transitions_loaded() {
         let jira = FakeJiraClient::new();
-        let msgs = fetch_transitions(&deps(jira), "AX-1");
+        let msgs = fetch_transitions(&deps(jira), "PROJ-1");
         assert_eq!(msgs, vec![Msg::TransitionsLoaded(vec![])]);
     }
 
     #[test]
     fn apply_transition_success_refetches_issue_for_new_status() {
-        let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "In Progress"));
-        let msgs = apply_transition(&deps(jira), "AX-1", "11");
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1", "In Progress"));
+        let msgs = apply_transition(&deps(jira), "PROJ-1", "11");
         assert_eq!(
             msgs,
             vec![Msg::TransitionApplied {
-                key: "AX-1".to_string(),
+                key: "PROJ-1".to_string(),
                 status: "In Progress".to_string(),
                 status_category: "new".to_string()
             }]
@@ -297,8 +300,8 @@ mod tests {
 
     #[test]
     fn apply_transition_failure_to_refetch_emits_transition_failed() {
-        let jira = FakeJiraClient::new().with_issue_not_found("AX-1");
-        let msgs = apply_transition(&deps(jira), "AX-1", "11");
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-1");
+        let msgs = apply_transition(&deps(jira), "PROJ-1", "11");
         match msgs.as_slice() {
             [Msg::TransitionFailed(_)] => {}
             other => panic!("expected TransitionFailed, got {other:?}"),
@@ -307,16 +310,16 @@ mod tests {
 
     #[test]
     fn to_ticket_summary_derives_url_and_extracts_description() {
-        let summary = to_ticket_summary(issue("AX-1", "To Do"), "https://example.atlassian.net");
-        assert_eq!(summary.key, "AX-1");
+        let summary = to_ticket_summary(issue("PROJ-1", "To Do"), "https://example.atlassian.net");
+        assert_eq!(summary.key, "PROJ-1");
         assert_eq!(summary.status, "To Do");
-        assert_eq!(summary.url, "https://example.atlassian.net/browse/AX-1");
+        assert_eq!(summary.url, "https://example.atlassian.net/browse/PROJ-1");
         assert_eq!(summary.description, "Body text");
     }
 
     #[test]
     fn to_ticket_summary_with_no_description_is_empty_string() {
-        let mut issue = issue("AX-1", "To Do");
+        let mut issue = issue("PROJ-1", "To Do");
         issue.fields.description = None;
         let summary = to_ticket_summary(issue, "https://example.atlassian.net");
         assert_eq!(summary.description, "");
@@ -327,7 +330,7 @@ mod tests {
         use crate::jira::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
-            issues: vec![issue("AX-1", "To Do")],
+            issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
         let app = run_cmds(App::new(), vec![Cmd::FetchTickets], &deps(jira));

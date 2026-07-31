@@ -11,7 +11,7 @@ use crate::ticketing::{TicketingContext, TicketingError, associate_ticket};
 #[derive(Debug, Error)]
 pub enum TicketCliError {
     /// `key` didn't normalize to a valid Jira issue key shape.
-    #[error("invalid ticket key `{key}`; expected a Jira key like AX-123")]
+    #[error("invalid ticket key `{key}`; expected a Jira key like PROJ-123")]
     InvalidKey {
         /// The key as originally passed on the command line.
         key: String,
@@ -102,22 +102,22 @@ mod tests {
             url: "https://github.com/example/repo/pull/42".to_string(),
             title: "Fix the thing".to_string(),
             body: String::new(),
-            head_ref_name: "ax-372-fix".to_string(),
+            head_ref_name: "proj-372-fix".to_string(),
         }
     }
 
     fn config() -> Config {
         Config {
-            jira_base_url: "https://home-solutions.atlassian.net".to_string(),
-            jira_email: "joe.williams@homesolutions.com".to_string(),
-            default_project_key: "AX".to_string(),
+            jira_base_url: "https://example.atlassian.net".to_string(),
+            jira_email: "dev@example.com".to_string(),
+            default_project_key: "PROJ".to_string(),
             default_assignee_account_id: None,
         }
     }
 
     #[test]
     fn happy_path_prints_url_and_outcome() {
-        let jira = FakeJiraClient::new().with_issue("AX-372", issue("AX-372"));
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
         let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr())));
         let cfg = config();
         let ctx = TicketingContext {
@@ -127,10 +127,10 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        run(&ctx, "ax-372", &mut out).expect("should succeed");
+        run(&ctx, "proj-372", &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("https://home-solutions.atlassian.net/browse/AX-372"));
+        assert!(output.contains("https://example.atlassian.net/browse/PROJ-372"));
         assert!(output.contains("Title updated"));
         assert!(output.contains("Remote link added"));
     }
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn not_found_error_message_is_passed_through() {
-        let jira = FakeJiraClient::new().with_issue_not_found("AX-999");
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-999");
         let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr())));
         let cfg = config();
         let ctx = TicketingContext {
@@ -166,10 +166,10 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let err = run(&ctx, "ax-999", &mut out).expect_err("should fail");
+        let err = run(&ctx, "proj-999", &mut out).expect_err("should fail");
         match err {
             TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
-                assert_eq!(key, "AX-999")
+                assert_eq!(key, "PROJ-999")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
@@ -177,10 +177,10 @@ mod tests {
 
     #[test]
     fn no_pr_for_branch_error_passes_through() {
-        let jira = FakeJiraClient::new().with_issue("AX-372", issue("AX-372"));
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
         let gh = FakeGhCli::new()
             .with_pr_view(Ok(None))
-            .with_current_branch(Ok("ax-372-fix".to_string()));
+            .with_current_branch(Ok("proj-372-fix".to_string()));
         let cfg = config();
         let ctx = TicketingContext {
             jira: &jira,
@@ -189,10 +189,10 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let err = run(&ctx, "AX-372", &mut out).expect_err("should fail");
+        let err = run(&ctx, "PROJ-372", &mut out).expect_err("should fail");
         match err {
             TicketCliError::Ticketing(TicketingError::NoPrForBranch { branch }) => {
-                assert_eq!(branch, "ax-372-fix")
+                assert_eq!(branch, "proj-372-fix")
             }
             other => panic!("expected NoPrForBranch, got {other:?}"),
         }

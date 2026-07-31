@@ -426,18 +426,18 @@ mod tests {
             "number": 42,
             "url": "https://github.com/example/repo/pull/42",
             "title": "Fix the thing",
-            "body": "Resolves AX-372",
-            "headRefName": "ax-372-fix"
+            "body": "Resolves PROJ-372",
+            "headRefName": "proj-372-fix"
         }"#;
         let result = interpret_pr_view_output(Some(0), stdout, "").unwrap();
         let pr = result.expect("expected a PR");
         assert_eq!(pr.number, 42);
-        assert_eq!(pr.head_ref_name, "ax-372-fix");
+        assert_eq!(pr.head_ref_name, "proj-372-fix");
     }
 
     #[test]
     fn pr_view_no_pr_for_branch_returns_none() {
-        let stderr = "no pull requests found for branch \"ax-372-fix\"\n";
+        let stderr = "no pull requests found for branch \"proj-372-fix\"\n";
         let result = interpret_pr_view_output(Some(1), "", stderr).unwrap();
         assert_eq!(result, None);
     }
@@ -502,13 +502,13 @@ mod tests {
 
         let create_req = PrCreateRequest {
             title: "Fix the thing".to_string(),
-            body: "Resolves AX-372".to_string(),
+            body: "Resolves PROJ-372".to_string(),
             base: None,
         };
         fake.pr_create(&create_req).unwrap();
 
         let edit_req = PrEditRequest {
-            title: Some("[AX-372] Fix the thing".to_string()),
+            title: Some("[PROJ-372] Fix the thing".to_string()),
             body: None,
         };
         fake.pr_edit(42, &edit_req).unwrap();
@@ -524,7 +524,7 @@ mod tests {
             url: "https://github.com/example/repo/pull/1".to_string(),
             title: "Fix the thing".to_string(),
             body: String::new(),
-            head_ref_name: "ax-372-fix".to_string(),
+            head_ref_name: "proj-372-fix".to_string(),
         };
         let fake = FakeGhCli::new().with_pr_view(Ok(Some(pr.clone())));
 

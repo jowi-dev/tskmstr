@@ -181,16 +181,16 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            jira_base_url: "https://home-solutions.atlassian.net".to_string(),
-            jira_email: "joe.williams@homesolutions.com".to_string(),
-            default_project_key: "AX".to_string(),
+            jira_base_url: "https://example.atlassian.net".to_string(),
+            jira_email: "dev@example.com".to_string(),
+            default_project_key: "PROJ".to_string(),
             default_assignee_account_id: Some("acct-1".to_string()),
         }
     }
 
     #[test]
     fn create_with_flag_title_auto_creates_ticket_when_none_associated() {
-        let jira = FakeJiraClient::new().with_create_issue_result(issue("AX-9"));
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
         let gh = FakeGhCli::new().with_pr_create_result(Ok(pr_with_title("Add the widget")));
         let cfg = config();
         let ctx = TicketingContext {
@@ -210,7 +210,7 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Created PR #42: https://github.com/example/repo/pull/42"));
-        assert!(output.contains("Ticket AX-9: https://home-solutions.atlassian.net/browse/AX-9"));
+        assert!(output.contains("Ticket PROJ-9: https://example.atlassian.net/browse/PROJ-9"));
         assert_eq!(jira.create_issue_calls().len(), 1);
     }
 
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn status_with_existing_key_does_not_call_jira_create() {
         let jira = FakeJiraClient::new();
-        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr_with_title("[AX-372] Fix the thing"))));
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))));
         let cfg = config();
         let ctx = TicketingContext {
             jira: &jira,
@@ -274,15 +274,13 @@ mod tests {
         status(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert!(
-            output.contains("Ticket AX-372: https://home-solutions.atlassian.net/browse/AX-372")
-        );
+        assert!(output.contains("Ticket PROJ-372: https://example.atlassian.net/browse/PROJ-372"));
         assert_eq!(jira.create_issue_calls().len(), 0);
     }
 
     #[test]
     fn status_with_auto_ticket_flag_creates_ticket_without_prompting() {
-        let jira = FakeJiraClient::new().with_create_issue_result(issue("AX-9"));
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
         let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr_with_title("Fix the thing"))));
         let cfg = config();
         let ctx = TicketingContext {
@@ -302,7 +300,7 @@ mod tests {
             "should not prompt when --auto-ticket is set"
         );
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Created ticket AX-9"));
+        assert!(output.contains("Created ticket PROJ-9"));
     }
 
     #[test]

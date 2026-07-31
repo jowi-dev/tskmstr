@@ -281,9 +281,9 @@ mod tests {
     fn three_column_app() -> App {
         App {
             columns: group_into_columns(vec![
-                ticket_with("AX-1", "To Do", "new"),
-                ticket_with("AX-2", "In Progress", "indeterminate"),
-                ticket_with("AX-3", "Done", "done"),
+                ticket_with("PROJ-1", "To Do", "new"),
+                ticket_with("PROJ-2", "In Progress", "indeterminate"),
+                ticket_with("PROJ-3", "Done", "done"),
             ]),
             ..App::new()
         }
@@ -312,12 +312,12 @@ mod tests {
     #[test]
     fn draws_board_with_ticket_row_and_status_bar() {
         let app = App {
-            columns: group_into_columns(vec![ticket("AX-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")]),
             status_line: "Refreshing...".to_string(),
             ..App::new()
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("AX-1"));
+        assert!(text.contains("PROJ-1"));
         assert!(text.contains("In Progress"));
         assert!(text.contains("Fix the thing"));
         assert!(text.contains("Refreshing..."));
@@ -351,25 +351,25 @@ mod tests {
         assert!(text.contains("In Progress (1)"));
         assert!(text.contains("Done (1)"));
         // The detail window itself, titled with the selected ticket's key.
-        assert!(text.contains("[AX-1] Fix the thing"));
+        assert!(text.contains("[PROJ-1] Fix the thing"));
     }
 
     #[test]
     fn draws_detail_with_ticket_fields_and_description() {
         let app = App {
-            columns: group_into_columns(vec![ticket("AX-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")]),
             screen: Screen::Detail,
             ..App::new()
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("[AX-1]"));
+        assert!(text.contains("[PROJ-1]"));
         assert!(text.contains("A longer description"));
     }
 
     #[test]
     fn draws_transition_menu_with_transition_names() {
         let app = App {
-            columns: group_into_columns(vec![ticket("AX-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")]),
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "Start Progress"), transition("31", "Done")],
             ..App::new()
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn draws_help_overlay_on_top_of_detail() {
         let app = App {
-            columns: group_into_columns(vec![ticket("AX-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")]),
             screen: Screen::Detail,
             show_help: true,
             ..App::new()

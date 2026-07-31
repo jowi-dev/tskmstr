@@ -37,7 +37,7 @@ pub enum Command {
     /// Associate a Jira ticket with the pull request open for the current
     /// branch.
     Ticket {
-        /// Jira issue key, e.g. `AX-372` (case-insensitive).
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
         key: String,
     },
     /// Manage the pull request open for the current branch.
@@ -240,9 +240,9 @@ mod tests {
 
     #[test]
     fn parses_ticket_with_key() {
-        let cli = Cli::try_parse_from(["tm", "ticket", "ax-372"]).expect("should parse");
+        let cli = Cli::try_parse_from(["tm", "ticket", "proj-372"]).expect("should parse");
         match cli.command {
-            Some(Command::Ticket { key }) => assert_eq!(key, "ax-372"),
+            Some(Command::Ticket { key }) => assert_eq!(key, "proj-372"),
             other => panic!("expected Ticket, got {other:?}"),
         }
     }

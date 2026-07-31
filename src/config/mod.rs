@@ -492,9 +492,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/tskmstr/config.toml");
         let seed = GlobalConfigSeed {
-            jira_base_url: "https://home-solutions.atlassian.net".to_string(),
-            jira_email: "joe.williams@homesolutions.com".to_string(),
-            default_project_key: "AX".to_string(),
+            jira_base_url: "https://example.atlassian.net".to_string(),
+            jira_email: "dev@example.com".to_string(),
+            default_project_key: "PROJ".to_string(),
         };
 
         write_global(&path, &seed).expect("should write");
@@ -504,9 +504,9 @@ mod tests {
             repo: None,
         };
         let cfg = load(&paths).expect("should load written config");
-        assert_eq!(cfg.jira_base_url, "https://home-solutions.atlassian.net");
-        assert_eq!(cfg.jira_email, "joe.williams@homesolutions.com");
-        assert_eq!(cfg.default_project_key, "AX");
+        assert_eq!(cfg.jira_base_url, "https://example.atlassian.net");
+        assert_eq!(cfg.jira_email, "dev@example.com");
+        assert_eq!(cfg.default_project_key, "PROJ");
         assert_eq!(cfg.default_assignee_account_id, None);
     }
 
@@ -536,9 +536,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let seed = GlobalConfigSeed {
-            jira_base_url: "https://home-solutions.atlassian.net".to_string(),
-            jira_email: "joe.williams@homesolutions.com".to_string(),
-            default_project_key: "AX".to_string(),
+            jira_base_url: "https://example.atlassian.net".to_string(),
+            jira_email: "dev@example.com".to_string(),
+            default_project_key: "PROJ".to_string(),
         };
         write_global(&path, &seed).expect("should write");
 
@@ -553,8 +553,8 @@ mod tests {
             cfg.default_assignee_account_id,
             Some("acct-123".to_string())
         );
-        assert_eq!(cfg.jira_base_url, "https://home-solutions.atlassian.net");
-        assert_eq!(cfg.default_project_key, "AX");
+        assert_eq!(cfg.jira_base_url, "https://example.atlassian.net");
+        assert_eq!(cfg.default_project_key, "PROJ");
     }
 
     #[test]

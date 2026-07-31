@@ -48,7 +48,7 @@ tm auth status
 |---|---|
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
-| `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `AX-372`) with the PR open for the current branch |
+| `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -83,9 +83,9 @@ it, so the board stays visible behind the detail and "Move to" windows.
 Global config lives at `~/.config/tskmstr/config.toml`:
 
 ```toml
-jira_base_url = "https://home-solutions.atlassian.net"
-jira_email = "joe.williams@homesolutions.com"
-default_project_key = "AX"
+jira_base_url = "https://example.atlassian.net"
+jira_email = "dev@example.com"
+default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
 ```
 
@@ -111,7 +111,7 @@ first match:
 1. A `[KEY-123]` prefix on the title, or a bare `KEY-123` token
    elsewhere in the title.
 2. A `KEY-123` token in the body.
-3. The branch name (e.g. `ax-372-fix` or `feature/ax-372-fix`),
+3. The branch name (e.g. `proj-123-fix` or `feature/proj-123-fix`),
    normalized to uppercase.
 
 Title and body matches are trusted outright — someone wrote them on

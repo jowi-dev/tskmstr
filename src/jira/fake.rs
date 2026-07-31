@@ -338,14 +338,14 @@ mod tests {
     #[test]
     fn get_project_ok_by_default() {
         let fake = FakeJiraClient::new();
-        fake.get_project("AX").expect("should succeed");
+        fake.get_project("PROJ").expect("should succeed");
     }
 
     #[test]
     fn get_project_seeded_not_found() {
-        let fake = FakeJiraClient::new().with_get_project_not_found("AX");
-        let err = fake.get_project("AX").expect_err("should fail");
-        assert!(matches!(err, JiraError::NotFound { key } if key == "AX"));
+        let fake = FakeJiraClient::new().with_get_project_not_found("PROJ");
+        let err = fake.get_project("PROJ").expect_err("should fail");
+        assert!(matches!(err, JiraError::NotFound { key } if key == "PROJ"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub enum KeySource {
     Branch,
 }
 
-/// Find the Jira issue key (e.g. `AX-372`) associated with a pull request.
+/// Find the Jira issue key (e.g. `PROJ-372`) associated with a pull request.
 ///
 /// Checks, in order, stopping at the first match:
 ///
@@ -44,8 +44,8 @@ pub enum KeySource {
 /// 2. A bare `KEY-123` token anywhere else in the title.
 /// 3. A `KEY-123` token anywhere in the body.
 /// 4. The branch name, matched case-insensitively against a
-///    `key-123`-shaped segment (e.g. `ax-372-desc` or
-///    `feature/ax-372-desc`) and normalized to uppercase.
+///    `key-123`-shaped segment (e.g. `proj-372-desc` or
+///    `feature/proj-372-desc`) and normalized to uppercase.
 ///
 /// Returns `None` if no key is found by any of these means.
 pub fn find_issue_key(pr: &PrInfo) -> Option<String> {
@@ -97,8 +97,8 @@ fn first_key_match(text: &str) -> Option<String> {
     re.captures(text).map(|caps| caps[1].to_string())
 }
 
-/// Find a `key-123`-shaped segment in a branch name (e.g. `ax-372-desc` or
-/// `feature/ax-372-desc`), case-insensitively, normalized to uppercase.
+/// Find a `key-123`-shaped segment in a branch name (e.g. `proj-372-desc` or
+/// `feature/proj-372-desc`), case-insensitively, normalized to uppercase.
 fn branch_key(branch: &str) -> Option<String> {
     let re = Regex::new(r"(?i)\b([a-z][a-z0-9]+-\d+)\b").expect("static regex is valid");
     re.captures(branch).map(|caps| caps[1].to_uppercase())
@@ -122,47 +122,47 @@ mod tests {
     const CASES: &[(&str, &str, &str, Option<&str>)] = &[
         // Precedence 1: bracketed prefix in title wins over everything else.
         (
-            "[AX-372] Fix the thing",
+            "[PROJ-372] Fix the thing",
             "mentions BX-1 too",
             "cx-2-desc",
-            Some("AX-372"),
+            Some("PROJ-372"),
         ),
         // Precedence 2: bare token in title wins over body/branch.
         (
-            "Fix the thing AX-372",
+            "Fix the thing PROJ-372",
             "mentions BX-1",
             "cx-2-desc",
-            Some("AX-372"),
+            Some("PROJ-372"),
         ),
         // Precedence 3: token in body wins over branch.
         (
             "Fix the thing",
-            "Resolves AX-372",
+            "Resolves PROJ-372",
             "cx-2-desc",
-            Some("AX-372"),
+            Some("PROJ-372"),
         ),
         // Precedence 4: plain branch name, lowercase, normalized to uppercase.
         (
             "Fix the thing",
             "no key here",
-            "ax-372-desc",
-            Some("AX-372"),
+            "proj-372-desc",
+            Some("PROJ-372"),
         ),
         // Precedence 4: branch name with a prefix path segment.
         (
             "Fix the thing",
             "no key here",
-            "feature/ax-372-desc",
-            Some("AX-372"),
+            "feature/proj-372-desc",
+            Some("PROJ-372"),
         ),
         // No match anywhere.
         ("Fix the thing", "no key here", "some-branch-name", None),
         // Multi-key in title picks the first occurrence.
         (
-            "Fix AX-372 also touches BX-1",
+            "Fix PROJ-372 also touches BX-1",
             "irrelevant",
             "cx-2-desc",
-            Some("AX-372"),
+            Some("PROJ-372"),
         ),
     ];
 
@@ -185,22 +185,22 @@ mod tests {
     fn find_issue_key_with_source_table() {
         let cases: &[SourceCase] = &[
             (
-                "[AX-372] Fix the thing",
+                "[PROJ-372] Fix the thing",
                 "mentions BX-1 too",
                 "cx-2-desc",
-                Some(("AX-372", KeySource::Title)),
+                Some(("PROJ-372", KeySource::Title)),
             ),
             (
                 "Fix the thing",
-                "Resolves AX-372",
+                "Resolves PROJ-372",
                 "cx-2-desc",
-                Some(("AX-372", KeySource::Body)),
+                Some(("PROJ-372", KeySource::Body)),
             ),
             (
                 "Fix the thing",
                 "no key here",
-                "ax-372-desc",
-                Some(("AX-372", KeySource::Branch)),
+                "proj-372-desc",
+                Some(("PROJ-372", KeySource::Branch)),
             ),
             ("Fix the thing", "no key here", "some-branch-name", None),
         ];
@@ -218,15 +218,15 @@ mod tests {
     #[test]
     fn with_issue_key_prefix_adds_prefix() {
         assert_eq!(
-            with_issue_key_prefix("Fix the thing", "AX-372"),
-            "[AX-372] Fix the thing"
+            with_issue_key_prefix("Fix the thing", "PROJ-372"),
+            "[PROJ-372] Fix the thing"
         );
     }
 
     #[test]
     fn with_issue_key_prefix_is_idempotent() {
-        let once = with_issue_key_prefix("Fix the thing", "AX-372");
-        let twice = with_issue_key_prefix(&once, "AX-372");
+        let once = with_issue_key_prefix("Fix the thing", "PROJ-372");
+        let twice = with_issue_key_prefix(&once, "PROJ-372");
         assert_eq!(once, twice);
     }
 
@@ -234,10 +234,10 @@ mod tests {
     fn with_issue_key_prefix_never_double_prefixes_when_key_appears_elsewhere() {
         // The key appears in the title already, but not as the prefix; the
         // prefix is still added exactly once.
-        let title = "Fix AX-372 for real this time";
-        let prefixed = with_issue_key_prefix(title, "AX-372");
-        assert_eq!(prefixed, "[AX-372] Fix AX-372 for real this time");
+        let title = "Fix PROJ-372 for real this time";
+        let prefixed = with_issue_key_prefix(title, "PROJ-372");
+        assert_eq!(prefixed, "[PROJ-372] Fix PROJ-372 for real this time");
         // Re-applying is still idempotent.
-        assert_eq!(with_issue_key_prefix(&prefixed, "AX-372"), prefixed);
+        assert_eq!(with_issue_key_prefix(&prefixed, "PROJ-372"), prefixed);
     }
 }

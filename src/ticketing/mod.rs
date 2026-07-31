@@ -208,7 +208,7 @@ mod tests {
             url: "https://github.com/example/repo/pull/42".to_string(),
             title: title.to_string(),
             body: String::new(),
-            head_ref_name: "ax-372-fix".to_string(),
+            head_ref_name: "proj-372-fix".to_string(),
         }
     }
 
@@ -289,7 +289,7 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
         let gh = FakeGhCli::new()
             .with_pr_view(Ok(None))
-            .with_current_branch(Ok("ax-372-fix".to_string()));
+            .with_current_branch(Ok("proj-372-fix".to_string()));
         let cfg = config();
         let ctx = TicketingContext {
             jira: &jira,
@@ -300,7 +300,7 @@ mod tests {
         let err = associate_ticket(&ctx, "PROJ-1").expect_err("should fail");
 
         match err {
-            TicketingError::NoPrForBranch { branch } => assert_eq!(branch, "ax-372-fix"),
+            TicketingError::NoPrForBranch { branch } => assert_eq!(branch, "proj-372-fix"),
             other => panic!("expected NoPrForBranch, got {other:?}"),
         }
         assert_eq!(jira.add_remote_link_calls().len(), 0);
@@ -388,17 +388,17 @@ mod tests {
 
     #[test]
     fn resolve_existing_key_validates_branch_key_that_exists() {
-        let jira = FakeJiraClient::new().with_issue("AX-372", issue("AX-372"));
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
         let pull_request = pr("Fix the thing");
 
         let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
 
-        assert_eq!(key, Some("AX-372".to_string()));
+        assert_eq!(key, Some("PROJ-372".to_string()));
     }
 
     #[test]
     fn resolve_existing_key_branch_key_not_found_is_none() {
-        let jira = FakeJiraClient::new().with_issue_not_found("AX-372");
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-372");
         let pull_request = pr("Fix the thing");
 
         let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn resolve_existing_key_branch_key_other_error_propagates() {
-        let jira = FakeJiraClient::new().with_issue_error("AX-372", 500, "boom");
+        let jira = FakeJiraClient::new().with_issue_error("PROJ-372", 500, "boom");
         let pull_request = pr("Fix the thing");
 
         let err = resolve_existing_key(&jira, &pull_request).expect_err("should fail");
