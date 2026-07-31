@@ -28,12 +28,20 @@ pub struct RawConfig {
     /// Workflow status name to transition an auto-created ticket to, e.g.
     /// `"In Review"`.
     ///
-    /// Only applies to tickets created because a PR is already open (the
-    /// `tm pr create` / `tm pr status --auto-ticket` auto-create path);
-    /// associating an already-existing ticket never transitions it. When
-    /// unset, auto-created tickets are left in the workflow's initial
-    /// status.
+    /// Applies to tickets auto-created by `tm pr create` /
+    /// `tm pr status --auto-ticket`, and to a pre-existing ticket that
+    /// `tm pr create` associates with a newly opened PR (unless that ticket
+    /// is already in the target status). `tm ticket <KEY>` never
+    /// transitions a ticket's status. When unset, tickets are left in
+    /// whatever status they're already in.
     pub status_on_pr: Option<String>,
+    /// Workflow status name to transition a ticket to right after
+    /// `tm ticket create` makes it, e.g. `"In Progress"`.
+    ///
+    /// Jira's create-issue API can't set status directly, so without this
+    /// setting a newly created ticket is left in the workflow's initial
+    /// status.
+    pub status_on_create: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -48,9 +56,13 @@ pub struct Config {
     pub default_project_key: String,
     /// Default Jira account ID to assign new tickets to, if configured.
     pub default_assignee_account_id: Option<String>,
-    /// Workflow status name to transition an auto-created ticket to, if
-    /// configured. See [`RawConfig::status_on_pr`] for semantics.
+    /// Workflow status name to transition an auto-created or pre-existing
+    /// ticket to on `tm pr create`, if configured. See
+    /// [`RawConfig::status_on_pr`] for semantics.
     pub status_on_pr: Option<String>,
+    /// Workflow status name to transition a `tm ticket create`d ticket to,
+    /// if configured. See [`RawConfig::status_on_create`] for semantics.
+    pub status_on_create: Option<String>,
 }
 
 /// Locations to read configuration from.
@@ -172,6 +184,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         default_project_key: Some(seed.default_project_key.clone()),
         default_assignee_account_id: None,
         status_on_pr: None,
+        status_on_create: None,
     }
 }
 
@@ -226,6 +239,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         .default_assignee_account_id
         .or(global.default_assignee_account_id);
     let status_on_pr = repo.status_on_pr.or(global.status_on_pr);
+    let status_on_create = repo.status_on_create.or(global.status_on_create);
 
     let expected_path = default_global_config_path();
 
@@ -239,6 +253,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         )?,
         default_assignee_account_id,
         status_on_pr,
+        status_on_create,
     })
 }
 
@@ -343,6 +358,7 @@ mod tests {
             default_project_key: Some("GLOBAL".into()),
             default_assignee_account_id: Some("acct-global".into()),
             status_on_pr: Some("In Review".into()),
+            status_on_create: Some("In Progress".into()),
         }
     }
 
@@ -363,6 +379,7 @@ mod tests {
             default_project_key: Some("REPO".into()),
             default_assignee_account_id: None,
             status_on_pr: None,
+            status_on_create: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -372,6 +389,7 @@ mod tests {
         assert_eq!(cfg.jira_email, "global@example.com");
         assert_eq!(cfg.default_assignee_account_id, Some("acct-global".into()));
         assert_eq!(cfg.status_on_pr, Some("In Review".into()));
+        assert_eq!(cfg.status_on_create, Some("In Progress".into()));
     }
 
     #[test]
@@ -382,6 +400,7 @@ mod tests {
             default_project_key: None,
             default_assignee_account_id: None,
             status_on_pr: Some("Ready for Review".into()),
+            status_on_create: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -395,6 +414,30 @@ mod tests {
         };
         let cfg = merge(global, None).expect("should merge");
         assert_eq!(cfg.status_on_pr, None);
+    }
+
+    #[test]
+    fn merge_repo_overrides_status_on_create() {
+        let repo = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: Some("In Progress".into()),
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.status_on_create, Some("In Progress".into()));
+    }
+
+    #[test]
+    fn merge_status_on_create_absent_from_both_is_none() {
+        let global = RawConfig {
+            status_on_create: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.status_on_create, None);
     }
 
     #[test]
@@ -534,6 +577,77 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".to_string()));
+    }
+
+    #[test]
+    fn load_global_with_status_on_create_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            status_on_create = "In Progress"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_create, Some("In Progress".to_string()));
+    }
+
+    #[test]
+    fn load_global_without_status_on_create_is_none() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_create, None);
+    }
+
+    #[test]
+    fn load_repo_overrides_status_on_create() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            status_on_create = "In Progress"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"status_on_create = "Doing""#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_create, Some("Doing".to_string()));
     }
 
     #[test]

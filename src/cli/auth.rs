@@ -129,6 +129,7 @@ fn bootstrap_config(
         default_project_key: seed.default_project_key,
         default_assignee_account_id: None,
         status_on_pr: None,
+        status_on_create: None,
     })
 }
 

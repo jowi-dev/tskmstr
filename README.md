@@ -49,6 +49,7 @@ tm auth status
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
+| `tm ticket create [--title] [--body]` | Create a new ticket in the configured default project. No PR required or touched |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -88,25 +89,35 @@ jira_email = "dev@example.com"
 default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
+# status_on_create = "In Progress"    # optional, see below
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
 its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
-between the two files or `tm` refuses to run; `default_assignee_account_id`
-and `status_on_pr` are optional.
+between the two files or `tm` refuses to run; `default_assignee_account_id`,
+`status_on_pr`, and `status_on_create` are optional.
 
 `status_on_pr` names the workflow status (e.g. `"In Review"`) to move a
-ticket to when `tm pr create` or `tm pr status --auto-ticket` auto-creates
-it because a PR is already open. Jira's create-issue API can't set status
-directly, so without this setting an auto-created ticket is left in the
-workflow's initial status (typically Backlog/To Do). When set, `tm` looks
-up the new ticket's available transitions and applies the first one whose
-target status matches, case-insensitively; if none match, or the
-transition call itself fails, `tm` prints a warning and continues — the
-ticket is still created and linked to the PR either way. This only applies
-to auto-created tickets; `tm ticket <KEY>` never changes an existing
-ticket's status.
+ticket to when `tm pr create` gives it a ticket, whether that ticket was
+just auto-created or already existed (e.g. one made by `tm ticket create`
+and picked up via the branch/title/body). If the ticket already sits in
+the target status, `tm pr create` leaves it alone and prints nothing extra.
+`tm pr status --auto-ticket` also applies it to a freshly auto-created
+ticket. Jira's create-issue API can't set status directly, so without this
+setting an auto-created ticket is left in the workflow's initial status
+(typically Backlog/To Do). When set, `tm` looks up the ticket's available
+transitions and applies the first one whose target status matches,
+case-insensitively; if none match, or the transition call itself fails,
+`tm` prints a warning and continues — the ticket is still created/linked
+either way. `tm ticket <KEY>` (plain association, no PR being created)
+never changes an existing ticket's status.
+
+`status_on_create` names the workflow status (e.g. `"In Progress"`) to
+move a ticket to right after `tm ticket create` makes it. It's matched the
+same way as `status_on_pr` (available transitions, case-insensitive,
+warn-and-continue on no match or API failure) and is independent of it —
+set one, both, or neither depending on your workflow.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes
