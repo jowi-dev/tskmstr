@@ -252,6 +252,15 @@ mod tests {
         fn get_project(&self, key: &str) -> Result<(), JiraError> {
             self.0.get_project(key)
         }
+        fn assignable_users(
+            &self,
+            project: &str,
+        ) -> Result<Vec<crate::jira::types::JiraUser>, JiraError> {
+            self.0.assignable_users(project)
+        }
+        fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
+            self.0.assign(key, account_id)
+        }
     }
 
     fn write_test_config(path: &Path) {

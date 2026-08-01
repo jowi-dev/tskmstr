@@ -5,7 +5,7 @@
 //! [`HttpJiraClient`] directly against an `httpmock` server.
 
 use crate::jira::types::{
-    CreateIssueRequest, Issue, Myself, RemoteLinkRequest, SearchResult, Transition,
+    CreateIssueRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
 use reqwest::blocking::Client;
 use thiserror::Error;
@@ -100,6 +100,20 @@ pub trait JiraClient {
     /// Used by `tm auth status` to verify the configured token has access to
     /// the expected project, beyond merely being a valid credential.
     fn get_project(&self, key: &str) -> Result<(), JiraError>;
+
+    /// List users eligible to be assigned an issue in `project`
+    /// (`GET /user/assignable/search?project={project}&maxResults=100`).
+    ///
+    /// Used by `tm ticket assign <KEY> <NAME>` to resolve `NAME` against the
+    /// issue's project. Only the first 100 assignable users are fetched;
+    /// projects with more than that are not paginated through.
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError>;
+
+    /// Set (or clear) an issue's assignee (`PUT /issue/{key}/assignee`).
+    ///
+    /// `account_id: None` clears the assignee (Jira's documented way to
+    /// unassign an issue is `{"accountId": null}`, not omitting the field).
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -308,6 +322,29 @@ impl JiraClient for HttpJiraClient {
             .get(self.url(&format!("/project/{key}")))
             .basic_auth(&self.ctx.email, Some(&self.ctx.token))
             .header("Accept", "application/json")
+            .send()?;
+        Self::parse_empty(response, key)
+    }
+
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError> {
+        let response = self
+            .http
+            .get(self.url("/user/assignable/search"))
+            .query(&[("project", project), ("maxResults", "100")])
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .send()?;
+        Self::parse(response, "")
+    }
+
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .put(self.url(&format!("/issue/{key}/assignee")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "accountId": account_id }))
             .send()?;
         Self::parse_empty(response, key)
     }
@@ -698,6 +735,116 @@ mod tests {
 
         match err {
             JiraError::NotFound { key } => assert_eq!(key, "NOPE"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignable_users_returns_users() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/user/assignable/search")
+                .query_param("project", "PROJ")
+                .query_param("maxResults", "100")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!([
+                    { "accountId": "acct-1", "displayName": "Ada Lovelace" },
+                    { "accountId": "acct-2", "displayName": "Grace Hopper" }
+                ]));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let users = client
+            .assignable_users("PROJ")
+            .expect("assignable_users should succeed");
+
+        mock.assert();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].account_id, "acct-1");
+        assert_eq!(users[1].display_name, "Grace Hopper");
+    }
+
+    #[test]
+    fn assignable_users_maps_401_to_unauthorized() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/user/assignable/search");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Unauthorized"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.assignable_users("PROJ").expect_err("should fail");
+
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn assign_puts_account_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-1/assignee")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({ "accountId": "acct-1" }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .assign("PROJ-1", Some("acct-1"))
+            .expect("assign should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn assign_none_puts_null_account_id() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-1/assignee")
+                .json_body(serde_json::json!({ "accountId": null }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .assign("PROJ-1", None)
+            .expect("assign should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn assign_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-404/assignee");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .assign("PROJ-404", Some("acct-1"))
+            .expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
             other => panic!("expected NotFound, got {other:?}"),
         }
     }

@@ -70,6 +70,21 @@ pub struct UserRef {
     pub display_name: String,
 }
 
+/// A user eligible to be assigned to an issue in a given project, as
+/// returned by `GET /rest/api/3/user/assignable/search`.
+///
+/// Deliberately narrower than [`Myself`] (no `emailAddress`): assignee
+/// resolution only ever needs the account ID and display name, and omitting
+/// the extra field keeps test fixtures minimal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraUser {
+    /// Jira account ID.
+    pub account_id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+}
+
 /// A workflow transition available on an issue, as returned by
 /// `GET /rest/api/3/issue/{key}/transitions`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -240,6 +255,33 @@ mod tests {
         assert_eq!(assignee.account_id, "acct-789");
         assert_eq!(assignee.display_name, "Grace Hopper");
         assert!(issue.fields.description.is_some());
+    }
+
+    #[test]
+    fn deserializes_jira_user() {
+        let raw = r#"
+        {
+            "accountId": "acct-789",
+            "displayName": "Grace Hopper"
+        }
+        "#;
+        let user: JiraUser = serde_json::from_str(raw).unwrap();
+        assert_eq!(user.account_id, "acct-789");
+        assert_eq!(user.display_name, "Grace Hopper");
+    }
+
+    #[test]
+    fn deserializes_jira_user_list() {
+        let raw = r#"
+        [
+            { "accountId": "acct-1", "displayName": "Ada Lovelace" },
+            { "accountId": "acct-2", "displayName": "Grace Hopper" }
+        ]
+        "#;
+        let users: Vec<JiraUser> = serde_json::from_str(raw).unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].display_name, "Ada Lovelace");
+        assert_eq!(users[1].account_id, "acct-2");
     }
 
     #[test]

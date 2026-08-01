@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::types::{
-    CreateIssueRequest, Issue, Myself, RemoteLinkRequest, SearchResult, Transition,
+    CreateIssueRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
 
 /// Canned outcome for [`FakeJiraClient::get_issue`] on a given key.
@@ -37,6 +37,13 @@ enum TransitionsOutcome {
     Error { status: u16, message: String },
 }
 
+/// Canned outcome for [`FakeJiraClient::assignable_users`] on a given
+/// project.
+enum AssignableUsersOutcome {
+    Found(Vec<JiraUser>),
+    Error { status: u16, message: String },
+}
+
 /// An in-memory [`JiraClient`] test double.
 ///
 /// Issues are seeded by key via [`with_issue`](Self::with_issue),
@@ -55,6 +62,9 @@ pub struct FakeJiraClient {
     transitions_result: RefCell<HashMap<String, TransitionsOutcome>>,
     transition_result: RefCell<Result<(), (u16, String)>>,
     transition_calls: RefCell<Vec<(String, String)>>,
+    assignable_users_result: RefCell<HashMap<String, AssignableUsersOutcome>>,
+    assign_result: RefCell<Result<(), (u16, String)>>,
+    assign_calls: RefCell<Vec<(String, Option<String>)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -70,6 +80,9 @@ impl Default for FakeJiraClient {
             transitions_result: RefCell::new(HashMap::new()),
             transition_result: RefCell::new(Ok(())),
             transition_calls: RefCell::new(Vec::new()),
+            assignable_users_result: RefCell::new(HashMap::new()),
+            assign_result: RefCell::new(Ok(())),
+            assign_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -199,6 +212,39 @@ impl FakeJiraClient {
     pub fn transition_calls(&self) -> Vec<(String, String)> {
         self.transition_calls.borrow().clone()
     }
+
+    /// Seed `assignable_users(project)` to return `users`.
+    pub fn with_assignable_users(self, project: &str, users: Vec<JiraUser>) -> Self {
+        self.assignable_users_result
+            .borrow_mut()
+            .insert(project.to_string(), AssignableUsersOutcome::Found(users));
+        self
+    }
+
+    /// Seed `assignable_users(project)` to return [`JiraError::Api`] with the
+    /// given status and message.
+    pub fn with_assignable_users_error(self, project: &str, status: u16, message: &str) -> Self {
+        self.assignable_users_result.borrow_mut().insert(
+            project.to_string(),
+            AssignableUsersOutcome::Error {
+                status,
+                message: message.to_string(),
+            },
+        );
+        self
+    }
+
+    /// Seed `assign(..)` to return [`JiraError::Api`] with the given status
+    /// and message.
+    pub fn with_assign_error(self, status: u16, message: &str) -> Self {
+        *self.assign_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The `(key, account_id)` pairs passed to `assign`, in call order.
+    pub fn assign_calls(&self) -> Vec<(String, Option<String>)> {
+        self.assign_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -292,6 +338,30 @@ impl JiraClient for FakeJiraClient {
             Err((404, _)) => Err(JiraError::NotFound {
                 key: key.to_string(),
             }),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
+    }
+
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError> {
+        match self.assignable_users_result.borrow().get(project) {
+            Some(AssignableUsersOutcome::Found(users)) => Ok(users.clone()),
+            Some(AssignableUsersOutcome::Error { status, message }) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
+        self.assign_calls
+            .borrow_mut()
+            .push((key.to_string(), account_id.map(str::to_string)));
+        match self.assign_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
             Err((status, message)) => Err(JiraError::Api {
                 status: *status,
                 message: message.clone(),
@@ -408,6 +478,74 @@ mod tests {
         let fake = FakeJiraClient::new().with_get_project_not_found("PROJ");
         let err = fake.get_project("PROJ").expect_err("should fail");
         assert!(matches!(err, JiraError::NotFound { key } if key == "PROJ"));
+    }
+
+    #[test]
+    fn assignable_users_returns_seeded_users() {
+        let fake = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![JiraUser {
+                account_id: "acct-1".to_string(),
+                display_name: "Ada Lovelace".to_string(),
+            }],
+        );
+
+        let users = fake.assignable_users("PROJ").expect("should succeed");
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].display_name, "Ada Lovelace");
+    }
+
+    #[test]
+    fn assignable_users_unseeded_project_is_empty() {
+        let fake = FakeJiraClient::new();
+        let users = fake.assignable_users("PROJ").expect("should succeed");
+        assert!(users.is_empty());
+    }
+
+    #[test]
+    fn assignable_users_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_assignable_users_error("PROJ", 500, "boom");
+        let err = fake.assignable_users("PROJ").expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_records_calls_and_succeeds_by_default() {
+        let fake = FakeJiraClient::new();
+
+        fake.assign("PROJ-1", Some("acct-1"))
+            .expect("should succeed");
+        fake.assign("PROJ-2", None).expect("should succeed");
+
+        assert_eq!(
+            fake.assign_calls(),
+            vec![
+                ("PROJ-1".to_string(), Some("acct-1".to_string())),
+                ("PROJ-2".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn assign_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_assign_error(500, "boom");
+        let err = fake
+            .assign("PROJ-1", Some("acct-1"))
+            .expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 
     #[test]
