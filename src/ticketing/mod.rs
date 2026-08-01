@@ -21,6 +21,15 @@
 //! time a transition is attempted. [`associate_ticket`] (`tm ticket <KEY>`)
 //! never transitions a ticket's status, nor does `tm pr status`'s read-only
 //! report of an already-associated ticket.
+//!
+//! [`transition_ticket`] (`tm ticket transition <KEY> <STATUS>`) shares the
+//! same matching rule (via the private `find_matching_transition` helper)
+//! but is the opposite of advisory: since the command is an explicit request
+//! to change status, a mismatch or API failure is a hard error
+//! ([`TicketingError::NoMatchingTransition`] or the underlying
+//! [`JiraError`]), not a warning. [`list_transitions`] (`tm ticket
+//! transition <KEY>` with no status) reports a ticket's current status and
+//! available transitions without changing anything.
 
 use thiserror::Error;
 
@@ -113,6 +122,24 @@ pub enum TicketingError {
     NoPrForBranch {
         /// The branch that has no open pull request.
         branch: String,
+    },
+
+    /// `tm ticket transition <KEY> <STATUS>` found no transition leading to
+    /// `target`, by either matching rule (see [`find_matching_transition`]).
+    /// Unlike [`apply_status_transition`]'s advisory
+    /// [`StatusTransition::Warning`], this is a hard error: the command is
+    /// explicit, so a caller (often a script) needs a non-zero exit and
+    /// enough detail — the available transitions — to retry with a valid
+    /// status.
+    #[error("no transition to \"{target}\" found for {key}; available transitions: {available}")]
+    NoMatchingTransition {
+        /// The issue key that was to be transitioned.
+        key: String,
+        /// The requested target status that matched no transition.
+        target: String,
+        /// The issue's available transitions, formatted as `name -> target
+        /// status`, comma-separated, for display in the error message.
+        available: String,
     },
 }
 
@@ -275,16 +302,7 @@ fn apply_status_transition(jira: &dyn JiraClient, key: &str, target: &str) -> St
         }
     };
 
-    let matching = transitions
-        .iter()
-        .find(|t| t.to.name.eq_ignore_ascii_case(target))
-        .or_else(|| {
-            transitions
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(target))
-        });
-
-    let Some(transition) = matching else {
+    let Some(transition) = find_matching_transition(&transitions, target) else {
         return StatusTransition::Warning(format!(
             "no transition to \"{target}\" found for {key}; leaving it in its initial status"
         ));
@@ -296,6 +314,119 @@ fn apply_status_transition(jira: &dyn JiraClient, key: &str, target: &str) -> St
             StatusTransition::Warning(format!("failed to transition {key} to \"{target}\": {err}"))
         }
     }
+}
+
+/// Find the transition (if any) among `transitions` that leads to `target`.
+///
+/// Picks the first transition whose target status name matches `target`
+/// case-insensitively, falling back to matching the transition's own name
+/// case-insensitively if none of the target statuses match (some workflows
+/// name a transition the same as the status it leads to). Shared by
+/// [`apply_status_transition`] (the advisory `status_on_pr`/`status_on_create`
+/// paths) and [`transition_ticket`] (the explicit, hard-error `tm ticket
+/// transition <KEY> <STATUS>` path) so both use identical matching rules.
+fn find_matching_transition<'a>(
+    transitions: &'a [crate::jira::types::Transition],
+    target: &str,
+) -> Option<&'a crate::jira::types::Transition> {
+    transitions
+        .iter()
+        .find(|t| t.to.name.eq_ignore_ascii_case(target))
+        .or_else(|| {
+            transitions
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(target))
+        })
+}
+
+/// Format `transitions` as `name -> target status`, comma-separated, for
+/// display in [`TicketingError::NoMatchingTransition`].
+fn format_transitions(transitions: &[crate::jira::types::Transition]) -> String {
+    transitions
+        .iter()
+        .map(|t| format!("{} -> {}", t.name, t.to.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Outcome of [`transition_ticket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The ticket was moved; carries the resolved target status name (the
+    /// matched transition's actual `to` status, which may differ in case
+    /// from the requested target).
+    Applied(String),
+    /// The ticket's current status already matched the requested target
+    /// case-insensitively, so no transition was applied. Carries the
+    /// ticket's actual current status name.
+    AlreadyInStatus(String),
+}
+
+/// `tm ticket transition <KEY> <STATUS>`: move `key` to `target`'s workflow
+/// status.
+///
+/// Unlike [`apply_status_transition`] (used by the advisory
+/// `status_on_pr`/`status_on_create` paths, where a transition problem is
+/// merely a warning since the ticket was already created/linked by the time
+/// it's attempted), this command is explicit, so failure is a hard error:
+/// [`TicketingError::NoMatchingTransition`] if no transition matches `target`
+/// (by either rule in [`find_matching_transition`]), or the underlying
+/// [`JiraError`] if fetching the issue, fetching its transitions, or
+/// applying the transition fails.
+///
+/// If the issue's current status already equals `target` case-insensitively,
+/// the transition is skipped entirely and
+/// [`TransitionOutcome::AlreadyInStatus`] is returned (mirrors
+/// [`associate_existing_ticket_for_pr_create`]'s skip-if-already-there
+/// check).
+pub fn transition_ticket(
+    jira: &dyn JiraClient,
+    key: &str,
+    target: &str,
+) -> Result<TransitionOutcome, TicketingError> {
+    let issue = jira.get_issue(key)?;
+    if issue.fields.status.name.eq_ignore_ascii_case(target) {
+        return Ok(TransitionOutcome::AlreadyInStatus(issue.fields.status.name));
+    }
+
+    let transitions = jira.transitions(key)?;
+    let matching = find_matching_transition(&transitions, target).ok_or_else(|| {
+        TicketingError::NoMatchingTransition {
+            key: key.to_string(),
+            target: target.to_string(),
+            available: format_transitions(&transitions),
+        }
+    })?;
+    let resolved_status = matching.to.name.clone();
+    let transition_id = matching.id.clone();
+
+    jira.transition(key, &transition_id)?;
+    Ok(TransitionOutcome::Applied(resolved_status))
+}
+
+/// The current status and available workflow transitions of a ticket, as
+/// returned by [`list_transitions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionListing {
+    /// The ticket's current status name.
+    pub current_status: String,
+    /// Transitions available on the ticket right now.
+    pub transitions: Vec<crate::jira::types::Transition>,
+}
+
+/// `tm ticket transition <KEY>` (no status): list `key`'s current status and
+/// available workflow transitions, for a caller to choose a target status
+/// with [`transition_ticket`].
+pub fn list_transitions(
+    jira: &dyn JiraClient,
+    key: &str,
+) -> Result<TransitionListing, TicketingError> {
+    let issue = jira.get_issue(key)?;
+    let transitions = jira.transitions(key)?;
+    Ok(TransitionListing {
+        current_status: issue.fields.status.name,
+        transitions,
+    })
 }
 
 /// Resolve an issue key already associated with `pr`, if any.
@@ -956,6 +1087,177 @@ mod tests {
 
         assert_eq!(outcome.status_transition, None);
         assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn transition_ticket_applies_matching_transition_case_insensitively() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![
+                    transition("11", "Start Progress", "In Progress"),
+                    transition("21", "Send to review", "in review"),
+                ],
+            );
+
+        let outcome = transition_ticket(&jira, "PROJ-1", "In Review").expect("should succeed");
+
+        assert_eq!(outcome, TransitionOutcome::Applied("in review".to_string()));
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-1".to_string(), "21".to_string())]
+        );
+    }
+
+    #[test]
+    fn transition_ticket_falls_back_to_transition_name_match() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("31", "in review", "Under Review")],
+            );
+
+        let outcome = transition_ticket(&jira, "PROJ-1", "In Review").expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Applied("Under Review".to_string())
+        );
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-1".to_string(), "31".to_string())]
+        );
+    }
+
+    #[test]
+    fn transition_ticket_skips_when_already_in_target_status() {
+        let mut already_in_review = issue("PROJ-1");
+        already_in_review.fields.status.name = "In Review".to_string();
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", already_in_review)
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("21", "Send to review", "In Review")],
+            );
+
+        // Case-insensitive match against the ticket's current status.
+        let outcome = transition_ticket(&jira, "PROJ-1", "in review").expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::AlreadyInStatus("In Review".to_string())
+        );
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn transition_ticket_no_matching_transition_is_a_hard_error_listing_available() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("11", "Start Progress", "In Progress")],
+            );
+
+        let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
+
+        match err {
+            TicketingError::NoMatchingTransition {
+                key,
+                target,
+                available,
+            } => {
+                assert_eq!(key, "PROJ-1");
+                assert_eq!(target, "In Review");
+                assert!(
+                    available.contains("Start Progress") && available.contains("In Progress"),
+                    "available should list transition name and target status: {available}"
+                );
+            }
+            other => panic!("expected NoMatchingTransition, got {other:?}"),
+        }
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn transition_ticket_propagates_get_issue_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = transition_ticket(&jira, "PROJ-404", "In Review").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_ticket_propagates_transitions_fetch_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions_error("PROJ-1", 500, "fetch boom");
+
+        let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "fetch boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_ticket_propagates_transition_api_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("21", "Send to review", "In Review")],
+            )
+            .with_transition_error(500, "boom");
+
+        let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_transitions_returns_current_status_and_transitions() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions(
+                "PROJ-1",
+                vec![transition("11", "Start Progress", "In Progress")],
+            );
+
+        let listing = list_transitions(&jira, "PROJ-1").expect("should succeed");
+
+        assert_eq!(listing.current_status, "To Do");
+        assert_eq!(listing.transitions.len(), 1);
+        assert_eq!(listing.transitions[0].name, "Start Progress");
+        assert_eq!(listing.transitions[0].to.name, "In Progress");
+    }
+
+    #[test]
+    fn list_transitions_propagates_get_issue_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = list_transitions(&jira, "PROJ-404").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
     }
 
     #[test]
