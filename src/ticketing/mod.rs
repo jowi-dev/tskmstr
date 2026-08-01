@@ -30,6 +30,13 @@
 //! [`JiraError`]), not a warning. [`list_transitions`] (`tm ticket
 //! transition <KEY>` with no status) reports a ticket's current status and
 //! available transitions without changing anything.
+//!
+//! [`assign_ticket`] (`tm ticket assign <KEY> ...`) is the same kind of
+//! explicit, hard-error command: resolving a name to no assignable user, or
+//! to more than one, is [`TicketingError::NoMatchingAssignee`], not a
+//! warning. Its project lookup for name resolution comes from `KEY`'s own
+//! prefix (via [`project_key_from_issue_key`]), not [`Config::default_project_key`],
+//! so assigning a ticket in another project still works.
 
 use thiserror::Error;
 
@@ -38,7 +45,7 @@ use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError};
-use crate::jira::types::{CreateIssueRequest, RemoteLinkRequest};
+use crate::jira::types::{CreateIssueRequest, JiraUser, RemoteLinkRequest};
 
 /// Dependencies shared by the ticketing orchestration functions that deal
 /// with a pull request.
@@ -141,6 +148,23 @@ pub enum TicketingError {
         /// transitions: name -> target status, ..."`), or, when there are
         /// none, says so explicitly instead of leaving a dangling empty
         /// list. See [`format_transitions`].
+        available: String,
+    },
+
+    /// `tm ticket assign <KEY> <NAME>` found either no assignable user
+    /// matching `name` in `key`'s project, or more than one. See
+    /// [`resolve_assignee_by_name`].
+    #[error("no unambiguous assignee match for \"{name}\" on {key}; {available}")]
+    NoMatchingAssignee {
+        /// The issue key that was to be assigned.
+        key: String,
+        /// The requested name that matched zero or more than one assignable
+        /// user.
+        name: String,
+        /// Describes the candidates found (`"candidates: name, ..."`), or,
+        /// when none matched, the project's full assignable-user list
+        /// (`"assignable users: name, ..."`), or, when the project has none
+        /// at all, says so explicitly. See [`format_assignee_candidates`].
         available: String,
     },
 }
@@ -438,6 +462,161 @@ pub fn list_transitions(
     })
 }
 
+/// What `tm ticket assign <KEY> ...` was asked to do, mirroring its
+/// mutually-exclusive CLI flags (`NAME`, `--me`, `--unassign`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignTarget {
+    /// Resolve the given name against the issue's project's assignable
+    /// users and assign to the match.
+    Name(String),
+    /// Assign to the current user.
+    Me,
+    /// Clear the issue's assignee.
+    Unassign,
+}
+
+/// Outcome of successfully assigning (or unassigning) a ticket via
+/// [`assign_ticket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignOutcome {
+    /// Assigned by name; carries the resolved user's displayName.
+    AssignedToUser(String),
+    /// Assigned to the current user; carries a display label for the CLI to
+    /// print. This is [`crate::jira::types::Myself::display_name`] when
+    /// [`Config::default_assignee_account_id`] wasn't cached and `myself()`
+    /// had to be called, or the cached account ID itself when it was
+    /// (fetching `myself()` just to get a display name isn't worth the extra
+    /// request when the cached ID already lets the assign call proceed).
+    AssignedToMe(String),
+    /// The issue's assignee was cleared.
+    Unassigned,
+}
+
+/// `tm ticket assign <KEY> ...`: assign `key` by resolved name, to the
+/// current user, or clear its assignee, per `target`.
+///
+/// Like [`transition_ticket`], this command is explicit, so every failure
+/// mode is a hard error: an ambiguous or unknown name is
+/// [`TicketingError::NoMatchingAssignee`], and any Jira API failure
+/// propagates as the underlying [`JiraError`].
+///
+/// [`AssignTarget::Name`] resolves against the assignable users of `key`'s
+/// *own* project (derived from `key`'s prefix via
+/// [`project_key_from_issue_key`]), not [`Config::default_project_key`], so
+/// assigning a ticket that lives in a different project still works.
+/// [`AssignTarget::Me`] prefers `config`'s cached
+/// [`Config::default_assignee_account_id`] (set by `tm auth login`) over an
+/// extra `myself()` call.
+pub fn assign_ticket(
+    jira: &dyn JiraClient,
+    config: &Config,
+    key: &str,
+    target: &AssignTarget,
+) -> Result<AssignOutcome, TicketingError> {
+    match target {
+        AssignTarget::Unassign => {
+            jira.assign(key, None)?;
+            Ok(AssignOutcome::Unassigned)
+        }
+        AssignTarget::Me => {
+            let (account_id, label) = match &config.default_assignee_account_id {
+                Some(account_id) => (account_id.clone(), account_id.clone()),
+                None => {
+                    let myself = jira.myself()?;
+                    (myself.account_id, myself.display_name)
+                }
+            };
+            jira.assign(key, Some(&account_id))?;
+            Ok(AssignOutcome::AssignedToMe(label))
+        }
+        AssignTarget::Name(name) => {
+            let project = project_key_from_issue_key(key);
+            let users = jira.assignable_users(&project)?;
+            let user = resolve_assignee_by_name(&users, name, key)?;
+            let account_id = user.account_id.clone();
+            let display_name = user.display_name.clone();
+            jira.assign(key, Some(&account_id))?;
+            Ok(AssignOutcome::AssignedToUser(display_name))
+        }
+    }
+}
+
+/// Extract the project key prefix from an issue key, e.g. `PROJ` from
+/// `PROJ-372`.
+///
+/// Issue keys are validated by the CLI layer's `normalize_key`
+/// (`^[A-Z][A-Z0-9]+-\d+$`) before reaching here, so the project part never
+/// itself contains a `-`; falls back to the whole key in the (should-not-happen)
+/// case of no `-` at all.
+fn project_key_from_issue_key(key: &str) -> &str {
+    key.split_once('-').map_or(key, |(project, _)| project)
+}
+
+/// Resolve `name` against `users`: a case-insensitive exact match on
+/// `display_name` wins first; failing that, a case-insensitive substring
+/// match, but only if it is unambiguous (exactly one candidate).
+///
+/// Fails with [`TicketingError::NoMatchingAssignee`] when the substring match
+/// finds zero or more than one candidate, listing the candidates found (or,
+/// when none matched at all, every assignable user in the project) via
+/// [`format_assignee_candidates`].
+fn resolve_assignee_by_name<'a>(
+    users: &'a [JiraUser],
+    name: &str,
+    key: &str,
+) -> Result<&'a JiraUser, TicketingError> {
+    let needle = name.to_lowercase();
+
+    if let Some(exact) = users
+        .iter()
+        .find(|u| u.display_name.to_lowercase() == needle)
+    {
+        return Ok(exact);
+    }
+
+    let candidates: Vec<&JiraUser> = users
+        .iter()
+        .filter(|u| u.display_name.to_lowercase().contains(&needle))
+        .collect();
+
+    match candidates.as_slice() {
+        [only] => Ok(only),
+        _ => Err(TicketingError::NoMatchingAssignee {
+            key: key.to_string(),
+            name: name.to_string(),
+            available: format_assignee_candidates(&candidates, users),
+        }),
+    }
+}
+
+/// Describe assignee candidates for display in
+/// [`TicketingError::NoMatchingAssignee`]: `"candidates: name, ..."` when
+/// `candidates` is non-empty (an ambiguous substring match), or, when it's
+/// empty (no match at all), every assignable user in the project
+/// (`"assignable users: name, ..."`), or, when there are none of those
+/// either, says so explicitly rather than leaving a dangling empty list.
+fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) -> String {
+    if !candidates.is_empty() {
+        let list = candidates
+            .iter()
+            .map(|u| u.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("candidates: {list}");
+    }
+
+    if all_users.is_empty() {
+        return "no assignable users found in the project".to_string();
+    }
+
+    let list = all_users
+        .iter()
+        .map(|u| u.display_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("assignable users: {list}")
+}
+
 /// Resolve an issue key already associated with `pr`, if any.
 ///
 /// Delegates to [`find_issue_key_with_source`] for the title/body/branch
@@ -513,7 +692,9 @@ mod tests {
     use super::*;
     use crate::github::gh_cli::FakeGhCli;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
+    use crate::jira::types::{
+        Issue, IssueFields, JiraUser, Myself, Status, StatusCategory, Transition,
+    };
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -1303,6 +1484,323 @@ mod tests {
             TicketingError::Jira(JiraError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "fetch boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    fn jira_user(account_id: &str, display_name: &str) -> JiraUser {
+        JiraUser {
+            account_id: account_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_by_name_exact_match_assigns() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Ada Lovelace"),
+                jira_user("acct-2", "Jane Doe"),
+            ],
+        );
+        let cfg = config();
+
+        let outcome = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("Jane Doe".to_string()),
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            AssignOutcome::AssignedToUser("Jane Doe".to_string())
+        );
+        assert_eq!(
+            jira.assign_calls(),
+            vec![("PROJ-372".to_string(), Some("acct-2".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_by_name_is_case_insensitive() {
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("PROJ", vec![jira_user("acct-1", "Jane Doe")]);
+        let cfg = config();
+
+        let outcome = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("jane doe".to_string()),
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            AssignOutcome::AssignedToUser("Jane Doe".to_string())
+        );
+    }
+
+    #[test]
+    fn assign_ticket_by_name_falls_back_to_unambiguous_substring_match() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "John Smith"),
+            ],
+        );
+        let cfg = config();
+
+        let outcome = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("jane".to_string()),
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            AssignOutcome::AssignedToUser("Jane Doe".to_string())
+        );
+        assert_eq!(
+            jira.assign_calls(),
+            vec![("PROJ-372".to_string(), Some("acct-1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_by_name_ambiguous_substring_match_is_a_hard_error_listing_candidates() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "Jane Smith"),
+            ],
+        );
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("jane".to_string()),
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketingError::NoMatchingAssignee {
+                key,
+                name,
+                available,
+            } => {
+                assert_eq!(key, "PROJ-372");
+                assert_eq!(name, "jane");
+                assert!(available.contains("Jane Doe") && available.contains("Jane Smith"));
+            }
+            other => panic!("expected NoMatchingAssignee, got {other:?}"),
+        }
+        assert!(jira.assign_calls().is_empty());
+    }
+
+    #[test]
+    fn assign_ticket_by_name_no_match_lists_all_assignable_users() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "John Smith"),
+            ],
+        );
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("nobody".to_string()),
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketingError::NoMatchingAssignee { available, .. } => {
+                assert!(available.contains("Jane Doe") && available.contains("John Smith"));
+                assert!(available.contains("assignable users"));
+            }
+            other => panic!("expected NoMatchingAssignee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_by_name_no_assignable_users_at_all_says_so() {
+        let jira = FakeJiraClient::new().with_assignable_users("PROJ", vec![]);
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("nobody".to_string()),
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketingError::NoMatchingAssignee { available, .. } => {
+                assert_eq!(available, "no assignable users found in the project");
+            }
+            other => panic!("expected NoMatchingAssignee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_by_name_uses_projects_own_prefix_not_default_project() {
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("OTHER", vec![jira_user("acct-1", "Jane Doe")]);
+        let cfg = config(); // default_project_key is "PROJ"
+
+        let outcome = assign_ticket(
+            &jira,
+            &cfg,
+            "OTHER-9",
+            &AssignTarget::Name("Jane Doe".to_string()),
+        )
+        .expect("should succeed even though OTHER != config's default project");
+
+        assert_eq!(
+            outcome,
+            AssignOutcome::AssignedToUser("Jane Doe".to_string())
+        );
+    }
+
+    #[test]
+    fn assign_ticket_by_name_propagates_assignable_users_error() {
+        let jira = FakeJiraClient::new().with_assignable_users_error("PROJ", 500, "boom");
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("Jane".to_string()),
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_by_name_propagates_assign_api_error() {
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("PROJ", vec![jira_user("acct-1", "Jane Doe")])
+            .with_assign_error(500, "boom");
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("Jane Doe".to_string()),
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_me_uses_cached_account_id_without_calling_myself() {
+        let jira = FakeJiraClient::new();
+        let cfg = config(); // default_assignee_account_id is Some("acct-1")
+
+        let outcome =
+            assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Me).expect("should succeed");
+
+        assert_eq!(outcome, AssignOutcome::AssignedToMe("acct-1".to_string()));
+        assert_eq!(
+            jira.assign_calls(),
+            vec![("PROJ-372".to_string(), Some("acct-1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_me_falls_back_to_myself_when_no_cached_account_id() {
+        let jira = FakeJiraClient::new().with_myself(Myself {
+            account_id: "acct-me".to_string(),
+            display_name: "Ada Lovelace".to_string(),
+            email_address: None,
+        });
+        let cfg = Config {
+            default_assignee_account_id: None,
+            ..config()
+        };
+
+        let outcome =
+            assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Me).expect("should succeed");
+
+        assert_eq!(
+            outcome,
+            AssignOutcome::AssignedToMe("Ada Lovelace".to_string())
+        );
+        assert_eq!(
+            jira.assign_calls(),
+            vec![("PROJ-372".to_string(), Some("acct-me".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_me_propagates_myself_error() {
+        let jira = FakeJiraClient::new().with_myself_unauthorized();
+        let cfg = Config {
+            default_assignee_account_id: None,
+            ..config()
+        };
+
+        let err =
+            assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Me).expect_err("should fail");
+
+        assert!(matches!(err, TicketingError::Jira(JiraError::Unauthorized)));
+    }
+
+    #[test]
+    fn assign_ticket_unassign_clears_assignee() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+
+        let outcome = assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Unassign)
+            .expect("should succeed");
+
+        assert_eq!(outcome, AssignOutcome::Unassigned);
+        assert_eq!(jira.assign_calls(), vec![("PROJ-372".to_string(), None)]);
+    }
+
+    #[test]
+    fn assign_ticket_unassign_propagates_assign_error() {
+        let jira = FakeJiraClient::new().with_assign_error(500, "boom");
+        let cfg = config();
+
+        let err = assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Unassign)
+            .expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
