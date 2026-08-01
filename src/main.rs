@@ -54,6 +54,7 @@ fn run_board(
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
+        project_key: config.default_project_key,
     })?;
     Ok(())
 }

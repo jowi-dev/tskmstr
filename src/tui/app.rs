@@ -6,7 +6,10 @@
 //! should perform next, and *Failed messages let callers feed I/O errors back
 //! in without `update` ever needing to panic.
 
-use crate::jira::types::Transition;
+use crate::jira::jql::{
+    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, unassigned_tickets_jql,
+};
+use crate::jira::types::{JiraUser, Transition};
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::jira::types::Issue`] plus the configured Jira base URL.
@@ -26,6 +29,47 @@ pub struct TicketSummary {
     /// Status category key (`new`, `indeterminate`, `done`, or anything else
     /// Jira reports), used to order board columns.
     pub status_category: String,
+    /// Display name of the ticket's assignee, or `None` if unassigned.
+    pub assignee: Option<String>,
+}
+
+/// The board's assignee filter: which subset of tickets to show.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AssigneeFilter {
+    /// The current user's open tickets (the original, unfiltered board).
+    #[default]
+    Me,
+    /// Open tickets in the default project with no assignee.
+    Unassigned,
+    /// Every open ticket in the default project, regardless of assignee.
+    Everyone,
+    /// Open tickets in the default project assigned to a specific user.
+    User(JiraUser),
+}
+
+impl AssigneeFilter {
+    /// The human-readable label for this filter, used both in the picker
+    /// list and the board's status line.
+    pub fn label(&self) -> String {
+        match self {
+            AssigneeFilter::Me => "Me".to_string(),
+            AssigneeFilter::Unassigned => "Unassigned".to_string(),
+            AssigneeFilter::Everyone => "Everyone".to_string(),
+            AssigneeFilter::User(user) => user.display_name.clone(),
+        }
+    }
+}
+
+/// Build the JQL query for `filter`, scoping project-wide filters to
+/// `project_key`. [`AssigneeFilter::Me`] ignores `project_key` entirely,
+/// preserving the board's original, unscoped query.
+pub fn jql_for_filter(filter: &AssigneeFilter, project_key: &str) -> String {
+    match filter {
+        AssigneeFilter::Me => my_open_tickets_jql(),
+        AssigneeFilter::Unassigned => unassigned_tickets_jql(project_key),
+        AssigneeFilter::Everyone => everyone_tickets_jql(project_key),
+        AssigneeFilter::User(user) => assignee_tickets_jql(project_key, &user.account_id),
+    }
 }
 
 /// One column of the sprint board: all tickets currently in a given status.
@@ -112,6 +156,23 @@ pub struct App {
     pub status_line: String,
     /// Whether the help overlay is shown.
     pub show_help: bool,
+    /// The configured default Jira project key, used to scope every
+    /// [`AssigneeFilter`] other than [`AssigneeFilter::Me`].
+    pub project_key: String,
+    /// The board's active assignee filter.
+    pub filter: AssigneeFilter,
+    /// Assignable users for `project_key`, fetched lazily the first time the
+    /// filter picker opens and cached for the rest of the session. `None`
+    /// until a fetch has succeeded at least once.
+    pub assignable_users: Option<Vec<JiraUser>>,
+    /// Whether the assignee filter picker overlay is shown.
+    pub show_filter_picker: bool,
+    /// Index into the picker's option list of the currently highlighted
+    /// option.
+    pub filter_picker_selected: usize,
+    /// Error from the last failed assignable-users fetch, shown in the
+    /// picker until the next successful fetch.
+    pub filter_picker_error: Option<String>,
     /// Set when the event loop should exit.
     pub quit: bool,
 }
@@ -128,6 +189,20 @@ impl App {
             .get(self.selected_col)?
             .tickets
             .get(self.selected_row)
+    }
+
+    /// The assignee filter picker's options, in display order: `Me`,
+    /// `Unassigned`, `Everyone`, then each cached assignable user.
+    pub fn filter_options(&self) -> Vec<AssigneeFilter> {
+        let mut options = vec![
+            AssigneeFilter::Me,
+            AssigneeFilter::Unassigned,
+            AssigneeFilter::Everyone,
+        ];
+        if let Some(users) = &self.assignable_users {
+            options.extend(users.iter().cloned().map(AssigneeFilter::User));
+        }
+        options
     }
 }
 
@@ -154,6 +229,22 @@ pub enum Msg {
     ToggleHelp,
     /// Quit the application.
     Quit,
+    /// Open the assignee filter picker overlay. Only meaningful on
+    /// [`Screen::Board`]; [`crate::tui::keymap::map_key`] only ever emits
+    /// this from there.
+    OpenFilterPicker,
+    /// Move the filter picker's highlighted option up.
+    FilterPickerUp,
+    /// Move the filter picker's highlighted option down.
+    FilterPickerDown,
+    /// Apply the filter picker's highlighted option and close the picker.
+    FilterPickerSelect,
+    /// Close the filter picker without changing the active filter.
+    FilterPickerClose,
+    /// Assignable users for the picker finished loading.
+    AssignableUsersLoaded(Vec<JiraUser>),
+    /// Assignable users failed to load.
+    AssignableUsersFailed(String),
     /// The ticket list finished loading.
     TicketsLoaded(Vec<TicketSummary>),
     /// The ticket list failed to load.
@@ -183,8 +274,17 @@ pub enum Msg {
 /// resulting `Msg` back through `update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// Fetch the current user's open tickets.
-    FetchTickets,
+    /// Fetch tickets matching `jql`, built by [`jql_for_filter`] from the
+    /// board's active [`AssigneeFilter`].
+    FetchTickets {
+        /// The JQL query to search with.
+        jql: String,
+    },
+    /// Fetch assignable users for `project`, for the filter picker.
+    FetchAssignableUsers {
+        /// Project key to list assignable users for.
+        project: String,
+    },
     /// Fetch the workflow transitions available on `key`.
     FetchTransitions {
         /// Ticket key to fetch transitions for.
@@ -226,7 +326,8 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
-            (app, vec![Cmd::FetchTickets])
+            let jql = jql_for_filter(&app.filter, &app.project_key);
+            (app, vec![Cmd::FetchTickets { jql }])
         }
         Msg::OpenInBrowser => {
             let cmds = match app.selected_ticket() {
@@ -288,7 +389,76 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = err;
             (app, Vec::new())
         }
+        Msg::OpenFilterPicker => open_filter_picker(app),
+        Msg::FilterPickerUp => {
+            app.filter_picker_selected = app.filter_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::FilterPickerDown => {
+            let count = app.filter_options().len();
+            if count > 0 {
+                app.filter_picker_selected = (app.filter_picker_selected + 1).min(count - 1);
+            }
+            (app, Vec::new())
+        }
+        Msg::FilterPickerSelect => filter_picker_select(app),
+        Msg::FilterPickerClose => {
+            app.show_filter_picker = false;
+            (app, Vec::new())
+        }
+        Msg::AssignableUsersLoaded(users) => {
+            app.assignable_users = Some(users);
+            app.filter_picker_error = None;
+            let count = app.filter_options().len();
+            if count > 0 {
+                app.filter_picker_selected = app.filter_picker_selected.min(count - 1);
+            }
+            (app, Vec::new())
+        }
+        Msg::AssignableUsersFailed(err) => {
+            app.filter_picker_error = Some(err);
+            (app, Vec::new())
+        }
     }
+}
+
+/// Handle [`Msg::OpenFilterPicker`]: show the picker, highlight the currently
+/// active filter, and fetch assignable users if they haven't been cached yet.
+fn open_filter_picker(mut app: App) -> (App, Vec<Cmd>) {
+    app.show_filter_picker = true;
+    app.filter_picker_error = None;
+    app.filter_picker_selected = app
+        .filter_options()
+        .iter()
+        .position(|option| option == &app.filter)
+        .unwrap_or(0);
+
+    let cmds = if app.assignable_users.is_none() {
+        vec![Cmd::FetchAssignableUsers {
+            project: app.project_key.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    (app, cmds)
+}
+
+/// Handle [`Msg::FilterPickerSelect`]: apply the highlighted option as the
+/// active filter, close the picker, and refetch tickets under the new
+/// filter.
+fn filter_picker_select(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(filter) = app
+        .filter_options()
+        .get(app.filter_picker_selected)
+        .cloned()
+    else {
+        return (app, Vec::new());
+    };
+    app.filter = filter;
+    app.show_filter_picker = false;
+    app.status_line = "Refreshing...".to_string();
+    let jql = jql_for_filter(&app.filter, &app.project_key);
+    (app, vec![Cmd::FetchTickets { jql }])
 }
 
 /// Handle [`Msg::Enter`]: activate whatever is selected on the current
@@ -455,6 +625,7 @@ mod tests {
             url: format!("https://example.atlassian.net/browse/{key}"),
             description: format!("Description for {key}"),
             status_category: "new".to_string(),
+            assignee: None,
         }
     }
 
@@ -597,7 +768,12 @@ mod tests {
         let app = App::new();
         let (app, cmds) = update(app, Msg::Refresh);
         assert_eq!(app.status_line, "Refreshing...");
-        assert_eq!(cmds, vec![Cmd::FetchTickets]);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: my_open_tickets_jql()
+            }]
+        );
     }
 
     #[test]
@@ -999,5 +1175,248 @@ mod tests {
                 .collect();
             assert_eq!(actual, case.expected, "case: {}", case.name);
         }
+    }
+
+    fn jira_user(account_id: &str, display_name: &str) -> JiraUser {
+        JiraUser {
+            account_id: account_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_filter_picker_shows_it_and_fetches_users_when_uncached() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::OpenFilterPicker);
+        assert!(app.show_filter_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchAssignableUsers {
+                project: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn open_filter_picker_does_not_refetch_when_users_already_cached() {
+        let app = App {
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::OpenFilterPicker);
+        assert!(app.show_filter_picker);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn open_filter_picker_highlights_the_active_filter() {
+        let app = App {
+            filter: AssigneeFilter::Everyone,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::OpenFilterPicker);
+        assert_eq!(app.filter_picker_selected, 2);
+    }
+
+    #[test]
+    fn open_filter_picker_highlights_active_user_filter_when_cached() {
+        let app = App {
+            filter: AssigneeFilter::User(jira_user("acct-2", "John Roe")),
+            assignable_users: Some(vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "John Roe"),
+            ]),
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::OpenFilterPicker);
+        assert_eq!(app.filter_picker_selected, 4);
+    }
+
+    #[test]
+    fn filter_picker_up_and_down_navigate_and_clamp() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 0,
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..App::new()
+        };
+        // 4 options: Me, Unassigned, Everyone, Jane Doe.
+        let (app, _) = update(app, Msg::FilterPickerUp);
+        assert_eq!(app.filter_picker_selected, 0);
+        let (app, _) = update(app, Msg::FilterPickerDown);
+        assert_eq!(app.filter_picker_selected, 1);
+        let (app, _) = update(app, Msg::FilterPickerDown);
+        let (app, _) = update(app, Msg::FilterPickerDown);
+        assert_eq!(app.filter_picker_selected, 3);
+        let (app, _) = update(app, Msg::FilterPickerDown);
+        assert_eq!(app.filter_picker_selected, 3);
+        let (app, _) = update(app, Msg::FilterPickerUp);
+        assert_eq!(app.filter_picker_selected, 2);
+    }
+
+    #[test]
+    fn filter_picker_select_unassigned_applies_filter_and_fetches_scoped_jql() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 1,
+            project_key: "PROJ".to_string(),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerSelect);
+        assert!(!app.show_filter_picker);
+        assert_eq!(app.filter, AssigneeFilter::Unassigned);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: unassigned_tickets_jql("PROJ")
+            }]
+        );
+    }
+
+    #[test]
+    fn filter_picker_select_everyone_applies_filter_and_fetches_scoped_jql() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 2,
+            project_key: "PROJ".to_string(),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerSelect);
+        assert_eq!(app.filter, AssigneeFilter::Everyone);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: everyone_tickets_jql("PROJ")
+            }]
+        );
+    }
+
+    #[test]
+    fn filter_picker_select_specific_user_applies_filter_and_fetches_scoped_jql() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 3,
+            project_key: "PROJ".to_string(),
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerSelect);
+        assert_eq!(
+            app.filter,
+            AssigneeFilter::User(jira_user("acct-1", "Jane Doe"))
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: assignee_tickets_jql("PROJ", "acct-1")
+            }]
+        );
+    }
+
+    #[test]
+    fn filter_picker_select_me_ignores_project_key() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 0,
+            project_key: "PROJ".to_string(),
+            filter: AssigneeFilter::Everyone,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerSelect);
+        assert_eq!(app.filter, AssigneeFilter::Me);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: my_open_tickets_jql()
+            }]
+        );
+    }
+
+    #[test]
+    fn filter_picker_select_out_of_range_is_a_noop() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_selected: 10,
+            filter: AssigneeFilter::Me,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerSelect);
+        assert!(app.show_filter_picker);
+        assert_eq!(app.filter, AssigneeFilter::Me);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn filter_picker_close_leaves_filter_unchanged() {
+        let app = App {
+            show_filter_picker: true,
+            filter: AssigneeFilter::Me,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::FilterPickerClose);
+        assert!(!app.show_filter_picker);
+        assert_eq!(app.filter, AssigneeFilter::Me);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assignable_users_loaded_caches_users_and_clears_error() {
+        let app = App {
+            filter_picker_error: Some("boom".to_string()),
+            ..App::new()
+        };
+        let (app, cmds) = update(
+            app,
+            Msg::AssignableUsersLoaded(vec![jira_user("acct-1", "Jane Doe")]),
+        );
+        assert_eq!(
+            app.assignable_users,
+            Some(vec![jira_user("acct-1", "Jane Doe")])
+        );
+        assert_eq!(app.filter_picker_error, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assignable_users_failed_sets_picker_error_without_touching_cache() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::AssignableUsersFailed("boom".to_string()));
+        assert_eq!(app.filter_picker_error, Some("boom".to_string()));
+        assert_eq!(app.assignable_users, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn filter_options_lists_me_unassigned_everyone_then_cached_users() {
+        let app = App {
+            assignable_users: Some(vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "John Roe"),
+            ]),
+            ..App::new()
+        };
+        assert_eq!(
+            app.filter_options(),
+            vec![
+                AssigneeFilter::Me,
+                AssigneeFilter::Unassigned,
+                AssigneeFilter::Everyone,
+                AssigneeFilter::User(jira_user("acct-1", "Jane Doe")),
+                AssigneeFilter::User(jira_user("acct-2", "John Roe")),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_options_without_cached_users_lists_only_the_three_builtins() {
+        let app = App::new();
+        assert_eq!(
+            app.filter_options(),
+            vec![
+                AssigneeFilter::Me,
+                AssigneeFilter::Unassigned,
+                AssigneeFilter::Everyone,
+            ]
+        );
     }
 }

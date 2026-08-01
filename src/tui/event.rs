@@ -20,9 +20,8 @@ use thiserror::Error;
 
 use crate::jira::adf::adf_to_text;
 use crate::jira::client::JiraClient;
-use crate::jira::jql::my_open_tickets_jql;
 use crate::jira::types::Issue;
-use crate::tui::app::{App, Cmd, Msg, update};
+use crate::tui::app::{App, Cmd, Msg, jql_for_filter, update};
 use crate::tui::keymap::map_key;
 use crate::tui::ui::draw;
 
@@ -44,6 +43,9 @@ pub struct TuiDeps {
     /// Base URL of the Jira instance, used to build `{base_url}/browse/{key}`
     /// links for [`Cmd::OpenUrl`].
     pub base_url: String,
+    /// The configured default Jira project key, used to scope every
+    /// assignee filter other than `Me`.
+    pub project_key: String,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -76,8 +78,12 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
-    app = run_cmds(app, vec![Cmd::FetchTickets], &deps);
+    let mut app = App {
+        project_key: deps.project_key.clone(),
+        ..App::new()
+    };
+    let jql = jql_for_filter(&app.filter, &app.project_key);
+    app = run_cmds(app, vec![Cmd::FetchTickets { jql }], &deps);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -85,7 +91,12 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         if event::poll(POLL_INTERVAL)?
             && let CEvent::Key(key_event) = event::read()?
             && key_event.kind == KeyEventKind::Press
-            && let Some(msg) = map_key(&app.screen, app.show_help, key_event.code)
+            && let Some(msg) = map_key(
+                &app.screen,
+                app.show_help,
+                app.show_filter_picker,
+                key_event.code,
+            )
         {
             let (next_app, cmds) = update(app, msg);
             app = run_cmds(next_app, cmds, &deps);
@@ -116,17 +127,18 @@ fn run_cmds(mut app: App, cmds: Vec<Cmd>, deps: &TuiDeps) -> App {
 /// process); everything else in `tui` stays pure and terminal-free.
 fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
-        Cmd::FetchTickets => fetch_tickets(deps),
+        Cmd::FetchTickets { jql } => fetch_tickets(deps, &jql),
+        Cmd::FetchAssignableUsers { project } => fetch_assignable_users(deps, &project),
         Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
         Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
         Cmd::OpenUrl(url) => open_url(&url),
     }
 }
 
-/// Run `Cmd::FetchTickets`: search for the user's open tickets and map them
-/// to [`crate::tui::app::TicketSummary`]s.
-fn fetch_tickets(deps: &TuiDeps) -> Vec<Msg> {
-    match deps.jira.search(&my_open_tickets_jql()) {
+/// Run `Cmd::FetchTickets`: search for tickets matching `jql` and map them to
+/// [`crate::tui::app::TicketSummary`]s.
+fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
+    match deps.jira.search(jql) {
         Ok(result) => {
             let tickets = result
                 .issues
@@ -136,6 +148,15 @@ fn fetch_tickets(deps: &TuiDeps) -> Vec<Msg> {
             vec![Msg::TicketsLoaded(tickets)]
         }
         Err(err) => vec![Msg::TicketsFailed(err.to_string())],
+    }
+}
+
+/// Run `Cmd::FetchAssignableUsers`: list the users eligible for assignment in
+/// `project`, for the filter picker.
+fn fetch_assignable_users(deps: &TuiDeps, project: &str) -> Vec<Msg> {
+    match deps.jira.assignable_users(project) {
+        Ok(users) => vec![Msg::AssignableUsersLoaded(users)],
+        Err(err) => vec![Msg::AssignableUsersFailed(err.to_string())],
     }
 }
 
@@ -190,6 +211,11 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
         .as_ref()
         .map(adf_to_text)
         .unwrap_or_default();
+    let assignee = issue
+        .fields
+        .assignee
+        .as_ref()
+        .map(|a| a.display_name.clone());
     crate::tui::app::TicketSummary {
         url: format!("{base_url}/browse/{}", issue.key),
         key: issue.key,
@@ -197,6 +223,7 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
         status_category: issue.fields.status.status_category.key.clone(),
         status: issue.fields.status.name,
         description,
+        assignee,
     }
 }
 
@@ -204,7 +231,8 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
 mod tests {
     use super::*;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{IssueFields, Status, StatusCategory};
+    use crate::jira::jql::my_open_tickets_jql;
+    use crate::jira::types::{IssueFields, JiraUser, Status, StatusCategory};
 
     fn issue(key: &str, status: &str) -> Issue {
         Issue {
@@ -233,6 +261,7 @@ mod tests {
         TuiDeps {
             jira: Box::new(jira),
             base_url: "https://example.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
         }
     }
 
@@ -244,7 +273,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
-        let msgs = fetch_tickets(&deps(jira));
+        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets)] => {
                 assert_eq!(tickets.len(), 1);
@@ -263,17 +292,48 @@ mod tests {
     #[test]
     fn fetch_tickets_with_empty_search_result_loads_empty_list() {
         let jira = FakeJiraClient::new();
-        let msgs = fetch_tickets(&deps(jira));
+        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
         assert_eq!(msgs, vec![Msg::TicketsLoaded(vec![])]);
     }
 
     #[test]
     fn fetch_tickets_failure_emits_tickets_failed() {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
-        let msgs = fetch_tickets(&deps(jira));
+        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
         match msgs.as_slice() {
             [Msg::TicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
             other => panic!("expected TicketsFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_assignable_users_success_emits_loaded() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![JiraUser {
+                account_id: "acct-1".to_string(),
+                display_name: "Jane Doe".to_string(),
+            }],
+        );
+        let msgs = fetch_assignable_users(&deps(jira), "PROJ");
+        assert_eq!(
+            msgs,
+            vec![Msg::AssignableUsersLoaded(vec![JiraUser {
+                account_id: "acct-1".to_string(),
+                display_name: "Jane Doe".to_string(),
+            }])]
+        );
+    }
+
+    #[test]
+    fn fetch_assignable_users_failure_emits_failed() {
+        let jira = FakeJiraClient::new().with_assignable_users_error("PROJ", 500, "boom");
+        let msgs = fetch_assignable_users(&deps(jira), "PROJ");
+        match msgs.as_slice() {
+            [Msg::AssignableUsersFailed(message)] => {
+                assert_eq!(message, "Jira API error (500): boom")
+            }
+            other => panic!("expected AssignableUsersFailed, got {other:?}"),
         }
     }
 
@@ -326,6 +386,25 @@ mod tests {
     }
 
     #[test]
+    fn to_ticket_summary_with_no_assignee_is_none() {
+        let summary = to_ticket_summary(issue("PROJ-1", "To Do"), "https://example.atlassian.net");
+        assert_eq!(summary.assignee, None);
+    }
+
+    #[test]
+    fn to_ticket_summary_with_assignee_extracts_display_name() {
+        use crate::jira::types::UserRef;
+
+        let mut issue = issue("PROJ-1", "To Do");
+        issue.fields.assignee = Some(UserRef {
+            account_id: "acct-1".to_string(),
+            display_name: "Jane Doe".to_string(),
+        });
+        let summary = to_ticket_summary(issue, "https://example.atlassian.net");
+        assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
+    }
+
+    #[test]
     fn run_cmds_feeds_tickets_loaded_back_through_update() {
         use crate::jira::types::SearchResult;
 
@@ -333,7 +412,13 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
-        let app = run_cmds(App::new(), vec![Cmd::FetchTickets], &deps(jira));
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::FetchTickets {
+                jql: my_open_tickets_jql(),
+            }],
+            &deps(jira),
+        );
         assert_eq!(app.columns.len(), 1);
         assert_eq!(app.selected_col, 0);
         assert_eq!(app.selected_row, 0);

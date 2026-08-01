@@ -16,7 +16,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::tui::app::{App, Column, Screen, TicketSummary};
+use crate::tui::app::{App, AssigneeFilter, Column, Screen, TicketSummary};
 
 /// Maximum number of wrapped summary lines shown on a single ticket card.
 /// Longer summaries are truncated with a trailing ellipsis so that one long
@@ -43,10 +43,33 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    draw_status_bar(frame, status_area, &app.status_line, hint_for(app.screen));
+    draw_status_bar(
+        frame,
+        status_area,
+        &status_line_text(app),
+        hint_for(app.screen),
+    );
 
     if app.show_help {
         draw_help_overlay(frame);
+    }
+
+    if app.show_filter_picker {
+        draw_filter_picker(frame, app);
+    }
+}
+
+/// The status bar's left-hand text: the active assignee filter (when it
+/// isn't `Me`) prefixed onto `app.status_line`.
+fn status_line_text(app: &App) -> String {
+    if app.filter == AssigneeFilter::Me {
+        return app.status_line.clone();
+    }
+    let filter_text = format!("Filter: {}", app.filter.label());
+    if app.status_line.is_empty() {
+        filter_text
+    } else {
+        format!("{filter_text}  |  {}", app.status_line)
     }
 }
 
@@ -73,7 +96,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 /// The key-hint text shown in the status bar for `screen`.
 fn hint_for(screen: Screen) -> &'static str {
     match screen {
-        Screen::Board => "h/l column  j/k move  Enter open  r refresh  o browser  ? help  q quit",
+        Screen::Board => {
+            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  ? help  q quit"
+        }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
     }
@@ -97,6 +122,8 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
+    let show_assignee = app.filter != AssigneeFilter::Me;
+
     for (index, column) in app.columns.iter().enumerate() {
         let is_selected_column = index == app.selected_col;
         let selected_row = is_selected_column.then_some(app.selected_row);
@@ -106,6 +133,7 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
             column,
             is_selected_column,
             selected_row,
+            show_assignee,
         );
     }
 }
@@ -124,6 +152,7 @@ fn draw_column(
     column: &Column,
     is_selected: bool,
     selected_row: Option<usize>,
+    show_assignee: bool,
 ) {
     let title = format!("{} ({})", column.title, column.tickets.len());
     let border_style = if is_selected {
@@ -149,7 +178,7 @@ fn draw_column(
     let heights: Vec<u16> = column
         .tickets
         .iter()
-        .map(|t| card_height(t, content_width))
+        .map(|t| card_height(t, content_width, show_assignee))
         .collect();
 
     let selected = selected_row.unwrap_or(0).min(column.tickets.len() - 1);
@@ -173,6 +202,7 @@ fn draw_column(
             ticket,
             is_selected_card,
             content_width,
+            show_assignee,
         );
     }
 }
@@ -187,6 +217,7 @@ fn draw_card(
     ticket: &TicketSummary,
     is_selected: bool,
     content_width: usize,
+    show_assignee: bool,
 ) {
     let style = if is_selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -200,20 +231,35 @@ fn draw_card(
         .title(ticket.key.clone())
         .border_style(style);
 
-    let lines: Vec<Line> = wrapped_summary(&ticket.summary, content_width)
+    let mut lines: Vec<Line> = wrapped_summary(&ticket.summary, content_width)
         .into_iter()
         .map(Line::from)
         .collect();
+    if show_assignee {
+        lines.push(Line::from(assignee_line(ticket)));
+    }
 
     let paragraph = Paragraph::new(lines).style(style).block(block);
     frame.render_widget(paragraph, area);
 }
 
+/// The assignee line shown on a card when the active filter isn't `Me`:
+/// `Assignee: <display name>`, or `Assignee: Unassigned` when the ticket has
+/// no assignee.
+fn assignee_line(ticket: &TicketSummary) -> String {
+    format!(
+        "Assignee: {}",
+        ticket.assignee.as_deref().unwrap_or("Unassigned")
+    )
+}
+
 /// The rendered height of `ticket`'s card at `content_width`: its wrapped,
-/// capped summary plus top/bottom border rows.
-fn card_height(ticket: &TicketSummary, content_width: usize) -> u16 {
+/// capped summary plus top/bottom border rows, plus one more row for the
+/// assignee line when `show_assignee` is set.
+fn card_height(ticket: &TicketSummary, content_width: usize, show_assignee: bool) -> u16 {
     let lines = wrapped_summary(&ticket.summary, content_width).len() as u16;
-    lines + CARD_BORDER_ROWS
+    let assignee_row = if show_assignee { 1 } else { 0 };
+    lines + assignee_row + CARD_BORDER_ROWS
 }
 
 /// Word-wrap `summary` to `width` columns, hard-breaking any single word
@@ -397,6 +443,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("Esc / q     back (quits from the board)"),
         Line::from("r           refresh tickets"),
         Line::from("o           open in browser"),
+        Line::from("f           filter by assignee (board only)"),
         Line::from("?           toggle this help"),
         Line::from(""),
         Line::from("press any key to close"),
@@ -405,6 +452,46 @@ fn draw_help_overlay(frame: &mut Frame) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Help"));
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+/// A centered floating window listing the board's assignee filter options
+/// (`Me`, `Unassigned`, `Everyone`, then each assignable user). The currently
+/// active filter is marked with a leading `*`. While assignable users are
+/// still loading, a loading line is shown in place of the user options; if
+/// the last fetch failed, the error is shown instead.
+fn draw_filter_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let options = app.filter_options();
+    let mut items: Vec<ListItem> = options
+        .iter()
+        .map(|option| {
+            let marker = if option == &app.filter { "* " } else { "  " };
+            ListItem::new(format!("{marker}{}", option.label()))
+        })
+        .collect();
+
+    if app.assignable_users.is_none() {
+        match &app.filter_picker_error {
+            Some(err) => items.push(ListItem::new(format!("Error: {err}"))),
+            None => items.push(ListItem::new("Loading users...")),
+        }
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Filter: assignee"),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    if !options.is_empty() {
+        state.select(Some(app.filter_picker_selected.min(options.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` percent of its
@@ -445,6 +532,7 @@ mod tests {
             url: format!("https://example.atlassian.net/browse/{key}"),
             description: "A longer description of the ticket.".to_string(),
             status_category: "indeterminate".to_string(),
+            assignee: None,
         }
     }
 
@@ -742,5 +830,97 @@ mod tests {
             ..App::new()
         };
         let _ = render_with_size(&app, 4, 24);
+    }
+
+    fn jira_user(account_id: &str, display_name: &str) -> crate::jira::types::JiraUser {
+        crate::jira::types::JiraUser {
+            account_id: account_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn draws_filter_picker_overlay_with_options_and_active_marker() {
+        let app = App {
+            show_filter_picker: true,
+            filter: AssigneeFilter::Unassigned,
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Filter: assignee"));
+        assert!(text.contains("Me"));
+        assert!(text.contains("* Unassigned"));
+        assert!(text.contains("Everyone"));
+        assert!(text.contains("Jane Doe"));
+    }
+
+    #[test]
+    fn draws_filter_picker_loading_line_when_users_uncached() {
+        let app = App {
+            show_filter_picker: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Loading users"));
+    }
+
+    #[test]
+    fn draws_filter_picker_error_line_when_last_fetch_failed() {
+        let app = App {
+            show_filter_picker: true,
+            filter_picker_error: Some("boom".to_string()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Error: boom"));
+    }
+
+    #[test]
+    fn status_bar_shows_active_filter_when_not_me() {
+        let app = App {
+            filter: AssigneeFilter::Everyone,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Filter: Everyone"));
+    }
+
+    #[test]
+    fn status_bar_omits_filter_when_me() {
+        let app = App::new();
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Filter:"));
+    }
+
+    #[test]
+    fn card_shows_assignee_line_when_filter_is_not_me() {
+        let assigned = TicketSummary {
+            assignee: Some("Jane Doe".to_string()),
+            ..ticket("PROJ-1")
+        };
+        let unassigned = TicketSummary {
+            key: "PROJ-2".to_string(),
+            ..ticket("PROJ-2")
+        };
+        let app = App {
+            columns: group_into_columns(vec![assigned, unassigned]),
+            filter: AssigneeFilter::Everyone,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Assignee: Jane Doe"));
+        assert!(text.contains("Assignee: Unassigned"));
+    }
+
+    #[test]
+    fn card_omits_assignee_line_when_filter_is_me() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            filter: AssigneeFilter::Me,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Assignee:"));
     }
 }
