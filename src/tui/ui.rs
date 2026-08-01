@@ -101,7 +101,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 fn hint_for(screen: Screen) -> &'static str {
     match screen {
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -664,6 +664,27 @@ mod tests {
         assert!(text.contains("In Progress"));
         assert!(text.contains("Fix the thing"));
         assert!(text.contains("Refreshing..."));
+    }
+
+    #[test]
+    fn board_hint_lists_every_board_key() {
+        let hint = hint_for(Screen::Board);
+        for key in [
+            "h/l",
+            "j/k",
+            "Enter",
+            "r",
+            "o",
+            "f filter",
+            "p priority",
+            "?",
+            "q",
+        ] {
+            assert!(
+                hint.contains(key),
+                "board hint should mention `{key}`: {hint}"
+            );
+        }
     }
 
     #[test]
