@@ -117,15 +117,19 @@ fn build_ticketing_deps(
     Ok((config, jira, gh))
 }
 
-/// Dispatch `tm ticket <KEY>` and `tm ticket create`.
+/// Dispatch `tm ticket <KEY>`, `tm ticket create`, and `tm ticket
+/// transition`.
 ///
-/// The two forms need different dependencies: associating a key needs the
-/// full [`TicketingContext`] (Jira + `gh` + config) to find the current
-/// branch's PR, while creating a ticket has nothing to do with a PR and
-/// only needs Jira + config (see [`CreateTicketContext`]). `key` and `cmd`
-/// are both `Option` at the clap layer so `tm ticket create` doesn't also
-/// require a positional key; exactly one of them is expected to be `Some`,
-/// which this function enforces since clap itself doesn't.
+/// The forms need different dependencies: associating a key needs the full
+/// [`TicketingContext`] (Jira + `gh` + config) to find the current branch's
+/// PR, while creating a ticket has nothing to do with a PR and only needs
+/// Jira + config (see [`CreateTicketContext`]). `tm ticket transition` needs
+/// only a Jira client and config (to build one) — no `gh`/`git` at all,
+/// since it neither reads nor writes anything about a pull request. `key`
+/// and `cmd` are both `Option` at the clap layer so `tm ticket create`/`tm
+/// ticket transition` don't also require a positional key; exactly one of
+/// them is expected to be `Some`, which this function enforces since clap
+/// itself doesn't.
 fn run_ticket(
     key: Option<String>,
     cmd: Option<TicketCmd>,
@@ -157,6 +161,14 @@ fn run_ticket(
             let mut prompter = RealPrompter;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::create(&ctx, &opts, &mut prompter, &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Transition { key, status })) => {
+            let config = config::load(paths)?;
+            let token = resolve_token(keychain, env_token)?;
+            let jira = jira_client_for(&config, &token);
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::transition(jira.as_ref(), &key, status.as_deref(), &mut stdout)?;
             Ok(())
         }
         (None, None) => Err(Box::new(

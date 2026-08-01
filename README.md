@@ -50,6 +50,8 @@ tm auth status
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
 | `tm ticket create [--title] [--body]` | Create a new ticket in the configured default project. No PR required or touched |
+| `tm ticket transition <KEY> <STATUS>` | Move ticket `<KEY>` to `<STATUS>`. Fails (non-zero exit) if no transition matches or the Jira API call fails |
+| `tm ticket transition <KEY>` | List ticket `<KEY>`'s current status and available transitions |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -118,6 +120,15 @@ move a ticket to right after `tm ticket create` makes it. It's matched the
 same way as `status_on_pr` (available transitions, case-insensitive,
 warn-and-continue on no match or API failure) and is independent of it —
 set one, both, or neither depending on your workflow.
+
+`tm ticket transition <KEY> <STATUS>` uses the same case-insensitive
+matching rule (target status name, falling back to the transition's own
+name), but unlike `status_on_pr`/`status_on_create` it's a hard failure
+if nothing matches or the API call fails, since the command is an explicit
+request rather than an automatic side effect of creating/linking a ticket.
+If `<KEY>` is already in `<STATUS>`, it prints a message and exits 0
+without calling the transition API. Omit `<STATUS>` to list the ticket's
+current status and available transitions instead.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes

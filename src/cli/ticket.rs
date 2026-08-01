@@ -1,12 +1,14 @@
-//! `tm ticket <KEY>` and `tm ticket create`.
+//! `tm ticket <KEY>`, `tm ticket create`, and `tm ticket transition`.
 
 use std::io::Write;
 
 use regex::Regex;
 use thiserror::Error;
 
+use crate::jira::client::JiraClient;
 use crate::ticketing::{
-    CreateTicketContext, TicketingContext, TicketingError, associate_ticket, create_ticket,
+    CreateTicketContext, TicketingContext, TicketingError, TransitionOutcome, associate_ticket,
+    create_ticket, list_transitions, transition_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -104,6 +106,67 @@ pub fn run(ctx: &TicketingContext, key: &str, out: &mut dyn Write) -> Result<(),
     Ok(())
 }
 
+/// `tm ticket transition <KEY> [STATUS]`: move `key` to `status`'s workflow
+/// status, or, if `status` is omitted, list `key`'s current status and
+/// available transitions.
+///
+/// Unlike `tm ticket create`/`tm pr create`'s advisory
+/// `status_on_create`/`status_on_pr` transitions (which never fail the
+/// overall command), this command is an explicit request to change status:
+/// a mismatched status name or Jira API failure is a hard error (propagated
+/// via [`TicketCliError::Ticketing`]), not a warning. Only the Jira client
+/// is needed — this command has nothing to do with a pull request, `gh`, or
+/// `git`.
+pub fn transition(
+    jira: &dyn JiraClient,
+    key: &str,
+    status: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    match status {
+        Some(status) => transition_to_status(jira, &normalized, status, out),
+        None => print_available_transitions(jira, &normalized, out),
+    }
+}
+
+/// Apply `target` to `key` via [`transition_ticket`] and print the outcome.
+fn transition_to_status(
+    jira: &dyn JiraClient,
+    key: &str,
+    target: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    match transition_ticket(jira, key, target)? {
+        TransitionOutcome::Applied(resolved_status) => {
+            writeln!(out, "Moved {key} to {resolved_status}")?;
+        }
+        TransitionOutcome::AlreadyInStatus(current_status) => {
+            writeln!(out, "{key} is already in {current_status}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Print `key`'s current status and available transitions via
+/// [`list_transitions`].
+fn print_available_transitions(
+    jira: &dyn JiraClient,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let listing = list_transitions(jira, key)?;
+    writeln!(
+        out,
+        "{key} is in {}. Available transitions:",
+        listing.current_status
+    )?;
+    for t in &listing.transitions {
+        writeln!(out, "{} -> {}", t.name, t.to.name)?;
+    }
+    Ok(())
+}
+
 /// Uppercase `key` and validate it looks like a Jira issue key
 /// (`^[A-Z][A-Z0-9]+-\d+$`).
 fn normalize_key(key: &str) -> Result<String, TicketCliError> {
@@ -126,7 +189,7 @@ mod tests {
     use crate::github::pr::PrInfo;
     use crate::jira::client::JiraError;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory};
+    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -351,8 +414,6 @@ mod tests {
 
     #[test]
     fn create_prints_moved_line_when_status_on_create_transition_applies() {
-        use crate::jira::types::Transition;
-
         let jira = FakeJiraClient::new()
             .with_create_issue_result(issue("PROJ-9"))
             .with_transitions(
@@ -424,5 +485,129 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Moved"));
         assert!(!output.contains("warning:"));
+    }
+
+    fn transition_fixture(id: &str, name: &str, to_status: &str) -> Transition {
+        Transition {
+            id: id.to_string(),
+            name: name.to_string(),
+            to: Status {
+                name: to_status.to_string(),
+                status_category: StatusCategory {
+                    key: "indeterminate".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn transition_with_status_moves_ticket_and_prints_resolved_status() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_transitions(
+                "PROJ-372",
+                vec![transition_fixture("21", "Send to review", "In Review")],
+            );
+        let mut out = Vec::new();
+
+        transition(&jira, "proj-372", Some("in review"), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Moved PROJ-372 to In Review\n");
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-372".to_string(), "21".to_string())]
+        );
+    }
+
+    #[test]
+    fn transition_with_status_already_in_status_is_a_no_op_success() {
+        let mut already_in_review = issue("PROJ-372");
+        already_in_review.fields.status.name = "In Review".to_string();
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", already_in_review);
+        let mut out = Vec::new();
+
+        transition(&jira, "PROJ-372", Some("in review"), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-372 is already in In Review\n");
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn transition_with_status_no_matching_transition_is_a_hard_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_transitions(
+                "PROJ-372",
+                vec![transition_fixture("11", "Start Progress", "In Progress")],
+            );
+        let mut out = Vec::new();
+
+        let err = transition(&jira, "PROJ-372", Some("In Review"), &mut out).expect_err(
+            "should fail hard when no transition matches, unlike the advisory pr-create path",
+        );
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::NoMatchingTransition {
+                key,
+                target,
+                available,
+            }) => {
+                assert_eq!(key, "PROJ-372");
+                assert_eq!(target, "In Review");
+                assert!(available.contains("Start Progress"));
+                assert!(available.contains("In Progress"));
+            }
+            other => panic!("expected NoMatchingTransition, got {other:?}"),
+        }
+        assert!(out.is_empty(), "nothing should be printed on hard failure");
+    }
+
+    #[test]
+    fn transition_with_status_api_error_is_a_hard_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let mut out = Vec::new();
+
+        let err = transition(&jira, "PROJ-404", Some("In Review"), &mut out)
+            .expect_err("should fail hard");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+                assert_eq!(key, "PROJ-404")
+            }
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_without_status_lists_current_status_and_available_transitions() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_transitions(
+                "PROJ-372",
+                vec![transition_fixture("11", "Start Progress", "In Progress")],
+            );
+        let mut out = Vec::new();
+
+        transition(&jira, "proj-372", None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-372 is in To Do. Available transitions:\nStart Progress -> In Progress\n"
+        );
+    }
+
+    #[test]
+    fn transition_without_status_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        let err = transition(&jira, "not-a-key!", None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
     }
 }
