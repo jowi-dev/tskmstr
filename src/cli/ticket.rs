@@ -161,6 +161,12 @@ fn print_available_transitions(
         "{key} is in {}. Available transitions:",
         listing.current_status
     )?;
+    if listing.transitions.is_empty() {
+        // A ticket with no available transitions (e.g. a closed one) would
+        // otherwise leave nothing but the header, which reads as broken
+        // output rather than an empty-but-valid result.
+        writeln!(out, "No transitions available.")?;
+    }
     for t in &listing.transitions {
         writeln!(out, "{} -> {}", t.name, t.to.name)?;
     }
@@ -596,6 +602,22 @@ mod tests {
         assert_eq!(
             output,
             "PROJ-372 is in To Do. Available transitions:\nStart Progress -> In Progress\n"
+        );
+    }
+
+    #[test]
+    fn transition_without_status_and_no_transitions_available_says_so() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_transitions("PROJ-372", vec![]);
+        let mut out = Vec::new();
+
+        transition(&jira, "proj-372", None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-372 is in To Do. Available transitions:\nNo transitions available.\n"
         );
     }
 
