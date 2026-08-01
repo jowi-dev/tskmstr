@@ -55,6 +55,8 @@ tm auth status
 | `tm ticket assign <KEY> <NAME>` | Assign ticket `<KEY>` to the assignable user matching `<NAME>` (exact displayName match, else an unambiguous substring match). Fails if no user or more than one matches |
 | `tm ticket assign <KEY> --me` | Assign ticket `<KEY>` to you (cached account ID from `tm auth login`, or the Jira `myself` endpoint) |
 | `tm ticket assign <KEY> --unassign` | Clear ticket `<KEY>`'s assignee |
+| `tm ticket rank <KEY> --above <OTHER>` | Rank ticket `<KEY>` above `<OTHER>` in Jira's native backlog rank |
+| `tm ticket rank <KEY> --below <OTHER>` | Rank ticket `<KEY>` below `<OTHER>` in Jira's native backlog rank |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -162,6 +164,18 @@ preferring the `default_assignee_account_id` cached by `tm auth login` over
 an extra Jira `myself` call; `--unassign` clears the assignee. Like `tm
 ticket transition`, every failure here is a hard error (non-zero exit) —
 this is an explicit command, not an automatic side effect.
+
+### Ranking
+
+`tm ticket rank <KEY> (--above|--below) <OTHER>` moves `<KEY>` to a new
+position in Jira's native backlog rank (the `Rank` field Jira's own
+backlog/board drag-and-drop uses), relative to `<OTHER>`. `<KEY>` is
+verified to exist first, so a typo'd primary key gives the same friendly
+"not found" error as every other `tm ticket` subcommand; a typo'd `<OTHER>`
+surfaces from the rank request itself. Ranking `<KEY>` relative to itself
+is rejected as a usage error. Like `tm ticket transition`/`tm ticket
+assign`, this is an explicit command, so every failure is a hard error
+(non-zero exit).
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes

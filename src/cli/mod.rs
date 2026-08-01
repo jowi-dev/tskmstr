@@ -140,6 +140,33 @@ pub enum TicketCmd {
         #[arg(long, group = "assignee")]
         unassign: bool,
     },
+    /// Move a ticket above or below another in Jira's native backlog rank.
+    ///
+    /// Exactly one of `--above`/`--below` is required; clap rejects giving
+    /// both or neither.
+    // Same `override_usage` fix as `Assign`: clap's default-derived synopsis
+    // for a required `ArgGroup` mixed with a plain positional puts the group
+    // before `KEY`, which reads as `KEY` coming second -- wrong, since `KEY`
+    // is always the first positional argument. Plain comment (not a doc
+    // comment) so it doesn't leak into `--help`.
+    #[command(
+        group(
+            ArgGroup::new("rank_direction")
+                .required(true)
+                .args(["above", "below"])
+        ),
+        override_usage = "tm ticket rank <KEY> (--above <KEY>|--below <KEY>)"
+    )]
+    Rank {
+        /// Jira issue key to rank, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Rank `KEY` above (before) this issue key.
+        #[arg(long, group = "rank_direction")]
+        above: Option<String>,
+        /// Rank `KEY` below (after) this issue key.
+        #[arg(long, group = "rank_direction")]
+        below: Option<String>,
+    },
 }
 
 /// `tm auth` subcommands.
@@ -531,6 +558,73 @@ mod tests {
     fn ticket_assign_without_key_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "assign"]);
         assert!(result.is_err(), "assign requires a key");
+    }
+
+    #[test]
+    fn parses_ticket_rank_with_above() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "rank", "proj-372", "--above", "proj-1"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Rank { key, above, below }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(above, Some("proj-1".to_string()));
+                assert_eq!(below, None);
+            }
+            other => panic!("expected TicketCmd::Rank, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_rank_with_below() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "rank", "proj-372", "--below", "proj-1"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Rank { key, above, below }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(above, None);
+                assert_eq!(below, Some("proj-1".to_string()));
+            }
+            other => panic!("expected TicketCmd::Rank, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_rank_above_and_below_conflict_is_a_clap_error() {
+        let result = Cli::try_parse_from([
+            "tm", "ticket", "rank", "proj-372", "--above", "proj-1", "--below", "proj-2",
+        ]);
+        assert!(result.is_err(), "--above and --below should conflict");
+    }
+
+    #[test]
+    fn ticket_rank_with_neither_above_nor_below_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "rank", "proj-372"]);
+        assert!(
+            result.is_err(),
+            "giving neither --above nor --below should be a usage error"
+        );
+    }
+
+    #[test]
+    fn ticket_rank_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "rank"]);
+        assert!(result.is_err(), "rank requires a key");
+    }
+
+    #[test]
+    fn ticket_rank_usage_synopsis_lists_key_before_direction_group() {
+        let err = Cli::try_parse_from(["tm", "ticket", "rank"]).expect_err("missing everything");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("tm ticket rank <KEY> (--above <KEY>|--below <KEY>)"),
+            "usage synopsis should list KEY first: {rendered}"
+        );
     }
 
     #[test]

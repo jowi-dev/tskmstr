@@ -1,5 +1,5 @@
-//! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, and
-//! `tm ticket assign`.
+//! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
+//! ticket assign`, and `tm ticket rank`.
 
 use std::io::Write;
 
@@ -7,11 +7,11 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::jira::client::JiraClient;
+use crate::jira::client::{JiraClient, RankAnchor};
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
     TransitionOutcome, assign_ticket, associate_ticket, create_ticket, list_transitions,
-    transition_ticket,
+    rank_ticket, transition_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -32,6 +32,16 @@ pub enum TicketCliError {
     /// title for `tm ticket create`.
     #[error("ticket title is required; pass --title or answer the prompt")]
     TitleRequired,
+
+    /// `tm ticket rank <KEY> (--above|--below) <OTHER>` was given the same
+    /// key (after normalization) for both `KEY` and `OTHER`. Rejected here
+    /// rather than left to the Jira API, whose behavior ranking an issue
+    /// relative to itself is undefined/unhelpful.
+    #[error("cannot rank {key} relative to itself")]
+    RankRelativeToSelf {
+        /// The key given for both the ticket to rank and its anchor.
+        key: String,
+    },
 
     /// Association with the current branch's pull request failed.
     #[error(transparent)]
@@ -216,6 +226,45 @@ pub fn assign(
             writeln!(out, "Unassigned {normalized}")?;
         }
     }
+    Ok(())
+}
+
+/// `tm ticket rank <KEY> (--above <OTHER> | --below <OTHER>)`: move `key`
+/// above or below `other` in Jira's native backlog rank.
+///
+/// Exactly one of `above`/`below` is expected to be `Some` — clap's
+/// `ArgGroup` on [`super::TicketCmd::Rank`] enforces this before this
+/// function is ever called. Both keys are normalized via [`normalize_key`];
+/// ranking `key` relative to itself is rejected as
+/// [`TicketCliError::RankRelativeToSelf`] before any Jira call is made. Like
+/// [`transition`] and [`assign`], every other failure is a hard error
+/// propagated via [`TicketCliError::Ticketing`].
+pub fn rank(
+    jira: &dyn JiraClient,
+    key: &str,
+    above: Option<&str>,
+    below: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    let (other, jira_anchor, verb) = match (above, below) {
+        (Some(other), None) => {
+            let other = normalize_key(other)?;
+            (other.clone(), RankAnchor::Before(other), "above")
+        }
+        (None, Some(other)) => {
+            let other = normalize_key(other)?;
+            (other.clone(), RankAnchor::After(other), "below")
+        }
+        _ => unreachable!("clap's ArgGroup guarantees exactly one of above/below is set"),
+    };
+
+    if normalized == other {
+        return Err(TicketCliError::RankRelativeToSelf { key: normalized });
+    }
+
+    rank_ticket(jira, &normalized, jira_anchor)?;
+    writeln!(out, "Ranked {normalized} {verb} {other}")?;
     Ok(())
 }
 
@@ -803,6 +852,119 @@ mod tests {
         match err {
             TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
             other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_above_prints_ranked_message_and_calls_rank_with_before_anchor() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        rank(&jira, "proj-372", Some("proj-1"), None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Ranked PROJ-372 above PROJ-1\n");
+        assert_eq!(
+            jira.rank_calls(),
+            vec![(
+                vec!["PROJ-372".to_string()],
+                crate::jira::client::RankAnchor::Before("PROJ-1".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn rank_below_prints_ranked_message_and_calls_rank_with_after_anchor() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        rank(&jira, "proj-372", None, Some("proj-1"), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Ranked PROJ-372 below PROJ-1\n");
+        assert_eq!(
+            jira.rank_calls(),
+            vec![(
+                vec!["PROJ-372".to_string()],
+                crate::jira::client::RankAnchor::After("PROJ-1".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn rank_relative_to_self_is_a_usage_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        let err = rank(&jira, "proj-372", Some("PROJ-372"), None, &mut out).expect_err(
+            "ranking a ticket relative to itself should fail before any Jira call is made",
+        );
+
+        match err {
+            TicketCliError::RankRelativeToSelf { key } => assert_eq!(key, "PROJ-372"),
+            other => panic!("expected RankRelativeToSelf, got {other:?}"),
+        }
+        assert!(jira.rank_calls().is_empty());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rank_invalid_primary_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        let err =
+            rank(&jira, "not-a-key!", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_invalid_anchor_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        let err =
+            rank(&jira, "proj-372", Some("not-a-key!"), None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_missing_primary_key_gives_friendly_not_found_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let mut out = Vec::new();
+
+        let err = rank(&jira, "proj-404", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+                assert_eq!(key, "PROJ-404")
+            }
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(jira.rank_calls().is_empty());
+    }
+
+    #[test]
+    fn rank_anchor_error_surfaces_from_rank_call() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_rank_error(500, "boom");
+        let mut out = Vec::new();
+
+        let err = rank(&jira, "proj-372", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
 }
