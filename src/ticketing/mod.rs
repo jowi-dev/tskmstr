@@ -531,7 +531,7 @@ pub fn assign_ticket(
         }
         AssignTarget::Name(name) => {
             let project = project_key_from_issue_key(key);
-            let users = jira.assignable_users(&project)?;
+            let users = jira.assignable_users(project)?;
             let user = resolve_assignee_by_name(&users, name, key)?;
             let account_id = user.account_id.clone();
             let display_name = user.display_name.clone();
