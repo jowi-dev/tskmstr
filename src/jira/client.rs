@@ -25,11 +25,23 @@ pub struct JiraClientContext {
 /// Display output never includes the API token.
 #[derive(Debug, Error)]
 pub enum JiraError {
-    /// The requested issue or resource does not exist (HTTP 404).
+    /// The requested issue does not exist (HTTP 404).
     #[error("Jira issue not found: {key}")]
     NotFound {
         /// The issue key that was not found.
         key: String,
+    },
+
+    /// [`JiraClient::assignable_users`] got a 404 for `project`: unlike an
+    /// issue key 404, this doesn't mean "not found by key" (there is no
+    /// key), it means the project itself doesn't exist or isn't visible to
+    /// the authenticated user. Kept distinct from [`JiraError::NotFound`] so
+    /// the error text names a project and an assignable-user search, not an
+    /// issue.
+    #[error("Jira project not found while searching assignable users: {project}")]
+    ProjectNotFound {
+        /// The project key that was not found.
+        project: String,
     },
 
     /// The request was rejected as unauthenticated or unauthorized (HTTP 401/403).
@@ -334,6 +346,16 @@ impl JiraClient for HttpJiraClient {
             .basic_auth(&self.ctx.email, Some(&self.ctx.token))
             .header("Accept", "application/json")
             .send()?;
+        // `Self::parse`'s generic 404 handling assumes an issue key (it
+        // builds `JiraError::NotFound { key }`), which is the wrong noun and
+        // loses the project entirely for this endpoint. Handle 404 here
+        // instead, before falling back to the shared path for every other
+        // status.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(JiraError::ProjectNotFound {
+                project: project.to_string(),
+            });
+        }
         Self::parse(response, "")
     }
 
@@ -768,6 +790,27 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].account_id, "acct-1");
         assert_eq!(users[1].display_name, "Grace Hopper");
+    }
+
+    #[test]
+    fn assignable_users_maps_404_to_project_not_found_with_project_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/user/assignable/search")
+                .query_param("project", "NOPE");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["No project could be found"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.assignable_users("NOPE").expect_err("should fail");
+
+        match err {
+            JiraError::ProjectNotFound { project } => assert_eq!(project, "NOPE"),
+            other => panic!("expected ProjectNotFound, got {other:?}"),
+        }
     }
 
     #[test]
