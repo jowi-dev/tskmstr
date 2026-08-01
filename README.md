@@ -52,6 +52,9 @@ tm auth status
 | `tm ticket create [--title] [--body]` | Create a new ticket in the configured default project. No PR required or touched |
 | `tm ticket transition <KEY> <STATUS>` | Move ticket `<KEY>` to `<STATUS>`. Fails (non-zero exit) if no transition matches or the Jira API call fails |
 | `tm ticket transition <KEY>` | List ticket `<KEY>`'s current status and available transitions |
+| `tm ticket assign <KEY> <NAME>` | Assign ticket `<KEY>` to the assignable user matching `<NAME>` (exact displayName match, else an unambiguous substring match). Fails if no user or more than one matches |
+| `tm ticket assign <KEY> --me` | Assign ticket `<KEY>` to you (cached account ID from `tm auth login`, or the Jira `myself` endpoint) |
+| `tm ticket assign <KEY> --unassign` | Clear ticket `<KEY>`'s assignee |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -129,6 +132,18 @@ request rather than an automatic side effect of creating/linking a ticket.
 If `<KEY>` is already in `<STATUS>`, it prints a message and exits 0
 without calling the transition API. Omit `<STATUS>` to list the ticket's
 current status and available transitions instead.
+
+`tm ticket assign <KEY> <NAME>` resolves `<NAME>` against the assignable
+users of `<KEY>`'s *own* project (not `default_project_key` — assigning a
+ticket in another project still works): a case-insensitive exact match on
+displayName wins first, falling back to a case-insensitive substring match,
+but only when exactly one user matches it. Zero or more than one substring
+match is a hard failure listing the candidates found (or every assignable
+user in the project, when none matched at all). `--me` assigns to you,
+preferring the `default_assignee_account_id` cached by `tm auth login` over
+an extra Jira `myself` call; `--unassign` clears the assignee. Like `tm
+ticket transition`, every failure here is a hard error (non-zero exit) —
+this is an explicit command, not an automatic side effect.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes
