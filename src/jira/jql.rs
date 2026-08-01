@@ -30,10 +30,18 @@ pub fn assignee_tickets_jql(project_key: &str, account_id: &str) -> String {
     )
 }
 
+/// The JQL query used by `tm ticket rank` (and, in future, a stack-rank TUI
+/// screen) to list `project_key`'s open tickets in Jira's native backlog
+/// rank order, driven by the same `Rank` field [`JiraClient::rank`] moves.
+pub fn ranked_tickets_jql(project_key: &str) -> String {
+    format!("project = {project_key} AND statusCategory != Done ORDER BY Rank ASC")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, unassigned_tickets_jql,
+        assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
+        unassigned_tickets_jql,
     };
 
     #[test]
@@ -65,6 +73,14 @@ mod tests {
         assert_eq!(
             assignee_tickets_jql("PROJ", "acct-1"),
             "project = PROJ AND assignee = \"acct-1\" AND statusCategory != Done ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn ranked_tickets_jql_scopes_to_project_and_orders_by_rank() {
+        assert_eq!(
+            ranked_tickets_jql("PROJ"),
+            "project = PROJ AND statusCategory != Done ORDER BY Rank ASC"
         );
     }
 }

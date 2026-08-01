@@ -60,6 +60,47 @@ pub enum JiraError {
         /// Error message extracted from the response body, if any.
         message: String,
     },
+
+    /// [`JiraClient::rank`] got a 404: unlike a single-issue 404, a rank
+    /// request names both the issue(s) being moved and an anchor issue, and
+    /// the 404 doesn't say which one is missing. Kept distinct from
+    /// [`JiraError::NotFound`] so the error text names every key involved
+    /// instead of a single one.
+    #[error("Jira issue not found while ranking {keys} relative to {anchor}")]
+    RankNotFound {
+        /// The issue keys that were to be ranked, comma-joined.
+        keys: String,
+        /// The anchor issue key (from `rankBeforeIssue`/`rankAfterIssue`).
+        anchor: String,
+    },
+
+    /// [`JiraClient::rank`] got a 207 Multi-Status, meaning at least one
+    /// issue in the request could not be re-ranked. Treated as a hard error
+    /// since tskmstr only ever ranks one issue at a time and expects
+    /// all-or-nothing success.
+    #[error("Jira rank request partially failed: {message}")]
+    RankPartialFailure {
+        /// Detail extracted from the response body, if any.
+        message: String,
+    },
+}
+
+/// Where to rank an issue relative to another, for [`JiraClient::rank`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RankAnchor {
+    /// Rank before (above) the given issue key.
+    Before(String),
+    /// Rank after (below) the given issue key.
+    After(String),
+}
+
+impl RankAnchor {
+    /// The anchor issue key, regardless of direction.
+    fn key(&self) -> &str {
+        match self {
+            RankAnchor::Before(key) | RankAnchor::After(key) => key,
+        }
+    }
 }
 
 /// Behavior tskmstr needs from the Jira Cloud REST API.
@@ -126,6 +167,18 @@ pub trait JiraClient {
     /// `account_id: None` clears the assignee (Jira's documented way to
     /// unassign an issue is `{"accountId": null}`, not omitting the field).
     fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError>;
+
+    /// Move `keys` to a new position in the backlog rank, relative to
+    /// `anchor` (`PUT /rest/agile/1.0/issue/rank`).
+    ///
+    /// This is the Jira Software Agile API, not the platform REST API the
+    /// rest of this trait uses — a different base path
+    /// (`/rest/agile/1.0`) and host behavior (a 204 on success, and a 207
+    /// Multi-Status on partial failure, mapped to
+    /// [`JiraError::RankPartialFailure`]). `keys` accepts more than one
+    /// issue because that's what the API supports, though tskmstr only ever
+    /// ranks one issue at a time today.
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -159,6 +212,14 @@ impl HttpJiraClient {
     /// Build the full URL for a path under `/rest/api/3/`.
     fn url(&self, path: &str) -> String {
         format!("{}/rest/api/3{path}", self.ctx.base_url)
+    }
+
+    /// Build the full URL for a path under `/rest/agile/1.0/`, the Jira
+    /// Software Agile API used by [`JiraClient::rank`]. Distinct from
+    /// [`Self::url`] because it lives under a different base path than the
+    /// platform REST API (`/rest/api/3`) the rest of this client talks to.
+    fn agile_url(&self, path: &str) -> String {
+        format!("{}/rest/agile/1.0{path}", self.ctx.base_url)
     }
 
     /// Turn a completed response into a typed value, mapping non-2xx status
@@ -369,6 +430,59 @@ impl JiraClient for HttpJiraClient {
             .json(&serde_json::json!({ "accountId": account_id }))
             .send()?;
         Self::parse_empty(response, key)
+    }
+
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError> {
+        let mut body = serde_json::json!({ "issues": keys });
+        match &anchor {
+            RankAnchor::Before(key) => {
+                body["rankBeforeIssue"] = serde_json::Value::from(key.clone())
+            }
+            RankAnchor::After(key) => body["rankAfterIssue"] = serde_json::Value::from(key.clone()),
+        }
+
+        let response = self
+            .http
+            .put(self.agile_url("/issue/rank"))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()?;
+
+        let status = response.status();
+        // 207 Multi-Status is in the 2xx range (`is_success()` would treat
+        // it as Ok), but for this endpoint it means partial failure — some
+        // issues in the request couldn't be re-ranked — so it must be
+        // checked before the success fast path, not folded into the shared
+        // `parse_empty` handling every other endpoint uses.
+        if status.as_u16() == 207 {
+            let body = response.text().unwrap_or_default();
+            return Err(JiraError::RankPartialFailure {
+                message: extract_error_message(&body),
+            });
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        // A 404 doesn't name a single issue key the way every other
+        // endpoint's does, so it needs both the moved issue(s) and the
+        // anchor to produce a useful error.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(JiraError::RankNotFound {
+                keys: keys.join(", "),
+                anchor: anchor.key().to_string(),
+            });
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(JiraError::Unauthorized);
+        }
+
+        let body = response.text().unwrap_or_default();
+        Err(JiraError::Api {
+            status: status.as_u16(),
+            message: extract_error_message(&body),
+        })
     }
 }
 
@@ -889,6 +1003,135 @@ mod tests {
         match err {
             JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_puts_before_anchor_body() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/agile/1.0/issue/rank")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({
+                    "issues": ["PROJ-1"],
+                    "rankBeforeIssue": "PROJ-2"
+                }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-2".to_string()),
+            )
+            .expect("rank should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn rank_puts_after_anchor_body() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/agile/1.0/issue/rank")
+                .json_body(serde_json::json!({
+                    "issues": ["PROJ-1"],
+                    "rankAfterIssue": "PROJ-2"
+                }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::After("PROJ-2".to_string()),
+            )
+            .expect("rank should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn rank_maps_401_to_unauthorized() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/agile/1.0/issue/rank");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Unauthorized"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-2".to_string()),
+            )
+            .expect_err("should fail");
+
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn rank_maps_404_to_rank_not_found_with_keys_and_anchor() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/agile/1.0/issue/rank");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-404".to_string()),
+            )
+            .expect_err("should fail");
+
+        match err {
+            JiraError::RankNotFound { keys, anchor } => {
+                assert_eq!(keys, "PROJ-1");
+                assert_eq!(anchor, "PROJ-404");
+            }
+            other => panic!("expected RankNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_maps_207_to_rank_partial_failure() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/agile/1.0/issue/rank");
+            then.status(207)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["PROJ-1 could not be ranked"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-2".to_string()),
+            )
+            .expect_err("should fail");
+
+        match err {
+            JiraError::RankPartialFailure { message } => {
+                assert!(message.contains("could not be ranked"), "{message}");
+            }
+            other => panic!("expected RankPartialFailure, got {other:?}"),
         }
     }
 

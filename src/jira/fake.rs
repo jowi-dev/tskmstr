@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::jira::client::{JiraClient, JiraError};
+use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::{
     CreateIssueRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
@@ -65,6 +65,8 @@ pub struct FakeJiraClient {
     assignable_users_result: RefCell<HashMap<String, AssignableUsersOutcome>>,
     assign_result: RefCell<Result<(), (u16, String)>>,
     assign_calls: RefCell<Vec<(String, Option<String>)>>,
+    rank_result: RefCell<Result<(), (u16, String)>>,
+    rank_calls: RefCell<Vec<(Vec<String>, RankAnchor)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -83,6 +85,8 @@ impl Default for FakeJiraClient {
             assignable_users_result: RefCell::new(HashMap::new()),
             assign_result: RefCell::new(Ok(())),
             assign_calls: RefCell::new(Vec::new()),
+            rank_result: RefCell::new(Ok(())),
+            rank_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -245,6 +249,18 @@ impl FakeJiraClient {
     pub fn assign_calls(&self) -> Vec<(String, Option<String>)> {
         self.assign_calls.borrow().clone()
     }
+
+    /// Seed `rank(..)` to return [`JiraError::Api`] with the given status
+    /// and message.
+    pub fn with_rank_error(self, status: u16, message: &str) -> Self {
+        *self.rank_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The `(keys, anchor)` pairs passed to `rank`, in call order.
+    pub fn rank_calls(&self) -> Vec<(Vec<String>, RankAnchor)> {
+        self.rank_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -361,6 +377,17 @@ impl JiraClient for FakeJiraClient {
             .borrow_mut()
             .push((key.to_string(), account_id.map(str::to_string)));
         match self.assign_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
+    }
+
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError> {
+        self.rank_calls.borrow_mut().push((keys.to_vec(), anchor));
+        match self.rank_result.borrow().as_ref() {
             Ok(()) => Ok(()),
             Err((status, message)) => Err(JiraError::Api {
                 status: *status,
@@ -538,6 +565,43 @@ mod tests {
         let fake = FakeJiraClient::new().with_assign_error(500, "boom");
         let err = fake
             .assign("PROJ-1", Some("acct-1"))
+            .expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_records_calls_and_succeeds_by_default() {
+        let fake = FakeJiraClient::new();
+
+        fake.rank(
+            &["PROJ-1".to_string()],
+            RankAnchor::Before("PROJ-2".to_string()),
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            fake.rank_calls(),
+            vec![(
+                vec!["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-2".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn rank_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_rank_error(500, "boom");
+        let err = fake
+            .rank(
+                &["PROJ-1".to_string()],
+                RankAnchor::After("PROJ-2".to_string()),
+            )
             .expect_err("should fail");
         match err {
             JiraError::Api { status, message } => {

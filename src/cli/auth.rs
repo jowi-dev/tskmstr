@@ -261,6 +261,13 @@ mod tests {
         fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
             self.0.assign(key, account_id)
         }
+        fn rank(
+            &self,
+            keys: &[String],
+            anchor: crate::jira::client::RankAnchor,
+        ) -> Result<(), JiraError> {
+            self.0.rank(keys, anchor)
+        }
     }
 
     fn write_test_config(path: &Path) {
