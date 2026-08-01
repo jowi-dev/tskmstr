@@ -131,14 +131,16 @@ pub enum TicketingError {
     /// explicit, so a caller (often a script) needs a non-zero exit and
     /// enough detail — the available transitions — to retry with a valid
     /// status.
-    #[error("no transition to \"{target}\" found for {key}; available transitions: {available}")]
+    #[error("no transition to \"{target}\" found for {key}; {available}")]
     NoMatchingTransition {
         /// The issue key that was to be transitioned.
         key: String,
         /// The requested target status that matched no transition.
         target: String,
-        /// The issue's available transitions, formatted as `name -> target
-        /// status`, comma-separated, for display in the error message.
+        /// Describes the issue's available transitions (`"available
+        /// transitions: name -> target status, ..."`), or, when there are
+        /// none, says so explicitly instead of leaving a dangling empty
+        /// list. See [`format_transitions`].
         available: String,
     },
 }
@@ -339,14 +341,21 @@ fn find_matching_transition<'a>(
         })
 }
 
-/// Format `transitions` as `name -> target status`, comma-separated, for
-/// display in [`TicketingError::NoMatchingTransition`].
+/// Describe `transitions` for display in
+/// [`TicketingError::NoMatchingTransition`]: `"available transitions: name
+/// -> target status, ..."`, or, when the issue has none at all (common for
+/// closed tickets), `"the ticket has no available transitions"` rather than
+/// a dangling, empty list.
 fn format_transitions(transitions: &[crate::jira::types::Transition]) -> String {
-    transitions
+    if transitions.is_empty() {
+        return "the ticket has no available transitions".to_string();
+    }
+    let list = transitions
         .iter()
         .map(|t| format!("{} -> {}", t.name, t.to.name))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    format!("available transitions: {list}")
 }
 
 /// Outcome of [`transition_ticket`].
@@ -1182,6 +1191,28 @@ mod tests {
     }
 
     #[test]
+    fn transition_ticket_no_transitions_available_is_a_hard_error_with_sensible_message() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions("PROJ-1", vec![]);
+
+        let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
+
+        match err {
+            TicketingError::NoMatchingTransition {
+                key,
+                target,
+                available,
+            } => {
+                assert_eq!(key, "PROJ-1");
+                assert_eq!(target, "In Review");
+                assert_eq!(available, "the ticket has no available transitions");
+            }
+            other => panic!("expected NoMatchingTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn transition_ticket_propagates_get_issue_error() {
         let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
 
@@ -1257,6 +1288,23 @@ mod tests {
         match err {
             TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
             other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_transitions_propagates_transitions_fetch_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_transitions_error("PROJ-1", 500, "fetch boom");
+
+        let err = list_transitions(&jira, "PROJ-1").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "fetch boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
 
