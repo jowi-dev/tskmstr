@@ -575,9 +575,23 @@ fn rank_grab_toggle(mut app: App) -> (App, Vec<Cmd>) {
                 return (app, Vec::new());
             }
             let key = app.rank_tickets[app.rank_selected].key.clone();
+            // Invariant: reaching the `None` arm below means `rank_selected`
+            // is the last index (no ticket below), so `Before` isn't taken;
+            // the `rank_selected == origin` check above guarantees the
+            // ticket actually moved, so there must be a ticket above it too
+            // (a single-item list can't move away from its own origin). Use
+            // `.get` with a wrapping subtraction anyway rather than direct
+            // indexing, so a future change to that invariant can't turn this
+            // into a subtract-with-overflow panic.
             let anchor = match app.rank_tickets.get(app.rank_selected + 1) {
-                Some(next) => RankAnchor::Before(next.key.clone()),
-                None => RankAnchor::After(app.rank_tickets[app.rank_selected - 1].key.clone()),
+                Some(next) => Some(RankAnchor::Before(next.key.clone())),
+                None => app
+                    .rank_tickets
+                    .get(app.rank_selected.wrapping_sub(1))
+                    .map(|prev| RankAnchor::After(prev.key.clone())),
+            };
+            let Some(anchor) = anchor else {
+                return (app, Vec::new());
             };
             (app, vec![Cmd::RankTicket { key, anchor }])
         }
@@ -1771,6 +1785,27 @@ mod tests {
             app.rank_snapshot,
             Some(vec![ticket("PROJ-1"), ticket("PROJ-2")])
         );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn dropping_with_no_next_and_no_prev_is_defensive_and_does_not_panic() {
+        // This state is unreachable through normal grab/move/drop flow (a
+        // single-item list can never move away from its origin, so the
+        // `rank_selected == origin` no-op catches it first) but the drop
+        // branch's index arithmetic must stay panic-safe even if that
+        // invariant is ever broken by a future change to clamping. Construct
+        // the contrived state directly to exercise it.
+        let app = App {
+            screen: Screen::Rank,
+            rank_tickets: vec![ticket("PROJ-1")],
+            rank_selected: 0,
+            rank_grab_origin: Some(1),
+            rank_snapshot: Some(vec![ticket("PROJ-1")]),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::RankGrabToggle);
+        assert!(!app.is_rank_grabbed());
         assert!(cmds.is_empty());
     }
 
