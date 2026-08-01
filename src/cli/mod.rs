@@ -364,8 +364,8 @@ mod tests {
 
     #[test]
     fn parses_ticket_transition_without_status() {
-        let cli = Cli::try_parse_from(["tm", "ticket", "transition", "proj-372"])
-            .expect("should parse");
+        let cli =
+            Cli::try_parse_from(["tm", "ticket", "transition", "proj-372"]).expect("should parse");
         match cli.command {
             Some(Command::Ticket {
                 key: None,
