@@ -112,11 +112,20 @@ pub enum TicketCmd {
     ///
     /// Exactly one of `NAME`, `--me`, or `--unassign` is required; clap
     /// rejects giving more than one or none at all.
-    #[command(group(
-        ArgGroup::new("assignee")
-            .required(true)
-            .args(["name", "me", "unassign"])
-    ))]
+    // `override_usage` is needed because clap's default-derived synopsis for
+    // a required `ArgGroup` mixed with a plain positional puts the group
+    // before `KEY` regardless of field declaration order
+    // (`<NAME|--me|--unassign> <KEY>`), which reads as `KEY` coming second —
+    // wrong, since `KEY` is always the first positional argument. This is a
+    // plain comment, not a doc comment, so it doesn't leak into `--help`.
+    #[command(
+        group(
+            ArgGroup::new("assignee")
+                .required(true)
+                .args(["name", "me", "unassign"])
+        ),
+        override_usage = "tm ticket assign <KEY> [NAME|--me|--unassign]"
+    )]
     Assign {
         /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
         key: String,
@@ -499,6 +508,22 @@ mod tests {
         assert!(
             result.is_err(),
             "giving neither NAME, --me, nor --unassign should be a usage error"
+        );
+    }
+
+    #[test]
+    fn ticket_assign_usage_synopsis_lists_key_before_assignee_group() {
+        // clap's default-derived usage for a required ArgGroup mixed with a
+        // plain positional put the group first regardless of declaration
+        // order: "tm ticket assign <NAME|--me|--unassign> <KEY>", which
+        // reads as KEY coming second and is wrong -- KEY is always the first
+        // positional. Assert the synopsis actually printed to users (in the
+        // "missing key" error) reflects reality.
+        let err = Cli::try_parse_from(["tm", "ticket", "assign"]).expect_err("missing everything");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("tm ticket assign <KEY> [NAME|--me|--unassign]"),
+            "usage synopsis should list KEY first: {rendered}"
         );
     }
 
