@@ -85,6 +85,7 @@ it, so the board stays visible behind the detail and "Move to" windows.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `p` | Open the priority (stack-rank) view (board only) |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
@@ -97,6 +98,33 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### Priority view (stack-ranking)
+
+Pressing `p` on the board opens a full-screen "Priority" list of every open
+ticket in `default_project_key`, in Jira's own backlog rank order, regardless
+of assignee. This is a separate list from the board: leaving the priority
+view with `Esc`/`q` shows the board exactly as it was, with no refetch.
+
+| Key | Action |
+|---|---|
+| `j`/`k` / arrows | Move the cursor (or, if a ticket is grabbed, move the ticket itself) |
+| `Enter` / `Space` | Grab the highlighted ticket, or drop it if already grabbed |
+| `Esc` / `q` | Cancel the grab and restore the original order, or (if nothing is grabbed) return to the board |
+| `r` | Refetch the priority list from Jira |
+| `o` | Open the highlighted ticket in the browser |
+| `?` | Toggle the help overlay |
+
+Grabbing a row (`Enter`/`Space`) marks it with a leading `><` and lets `j`/`k`
+reorder it in place, with the cursor following it. Dropping it (`Enter`/`Space`
+again) re-ranks it in Jira: relative to its new neighbors, it's anchored
+`Before` the ticket now below it, or `After` the ticket above it if it landed
+at the bottom of the list. Dropping it back at its starting position sends no
+request. A successful re-rank shows a confirmation like `Ranked PROJ-3 above
+PROJ-7` in the status bar and keeps the already-reordered list; a failed one
+shows the error and refetches the list so the display returns to Jira's
+actual order. `q` never quits from the priority view — while a ticket is
+grabbed it cancels the grab instead of leaving the screen, matching `Esc`.
 
 Every filter other than `Me` scopes the query to `default_project_key`
 (`Me` keeps the board's original, project-independent query). When a

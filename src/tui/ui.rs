@@ -32,10 +32,14 @@ const CARD_BORDER_ROWS: u16 = 2;
 pub fn draw(frame: &mut Frame, app: &App) {
     let (body, status_area) = split_body_and_status(frame.area());
 
-    draw_board_columns(frame, app, body);
+    if app.screen == Screen::Rank {
+        draw_rank_list(frame, app, body);
+    } else {
+        draw_board_columns(frame, app, body);
+    }
 
     match app.screen {
-        Screen::Board => {}
+        Screen::Board | Screen::Rank => {}
         Screen::Detail => draw_detail_window(frame, app),
         Screen::TransitionMenu => {
             draw_detail_window(frame, app);
@@ -62,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// The status bar's left-hand text: the active assignee filter (when it
 /// isn't `Me`) prefixed onto `app.status_line`.
 fn status_line_text(app: &App) -> String {
-    if app.filter == AssigneeFilter::Me {
+    if app.screen == Screen::Rank || app.filter == AssigneeFilter::Me {
         return app.status_line.clone();
     }
     let filter_text = format!("Filter: {}", app.filter.label());
@@ -101,6 +105,9 @@ fn hint_for(screen: Screen) -> &'static str {
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
+        Screen::Rank => {
+            "j/k move  Enter/Space grab-drop  r refresh  o browser  Esc back  ? help  q quit"
+        }
     }
 }
 
@@ -376,6 +383,50 @@ fn visible_card_range(heights: &[u16], selected: usize, available: u16) -> std::
     start..end
 }
 
+/// The priority (stack-rank) screen: every open ticket in the project as a
+/// single vertical list, in Jira backlog rank order. Each row shows its rank
+/// position, key, status, assignee, and summary. The grabbed row (if any)
+/// carries a leading marker distinguishing it from a merely-highlighted row.
+fn draw_rank_list(frame: &mut Frame, app: &App, area: Rect) {
+    let title = if app.is_rank_grabbed() {
+        "Priority (grabbed - j/k move, Enter/Space drop, Esc cancel)"
+    } else {
+        "Priority"
+    };
+
+    let items: Vec<ListItem> = app
+        .rank_tickets
+        .iter()
+        .enumerate()
+        .map(|(index, ticket)| {
+            let marker = if app.rank_grab_origin.is_some() && app.rank_selected == index {
+                "><"
+            } else {
+                "  "
+            };
+            let assignee = ticket.assignee.as_deref().unwrap_or("Unassigned");
+            ListItem::new(format!(
+                "{marker} {:>3}. {}  [{}]  {}  {}",
+                index + 1,
+                ticket.key,
+                ticket.status,
+                assignee,
+                ticket.summary
+            ))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    if !app.rank_tickets.is_empty() {
+        state.select(Some(app.rank_selected.min(app.rank_tickets.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
 /// ticket's full detail, drawn over the board.
 fn draw_detail_window(frame: &mut Frame, app: &App) {
@@ -444,6 +495,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("r           refresh tickets"),
         Line::from("o           open in browser"),
         Line::from("f           filter by assignee (board only)"),
+        Line::from("p           priority (stack-rank) view (board only)"),
+        Line::from("Enter/Space grab or drop a ticket (priority view only)"),
         Line::from("?           toggle this help"),
         Line::from(""),
         Line::from("press any key to close"),
@@ -922,5 +975,105 @@ mod tests {
         };
         let text = buffer_text(&render(&app));
         assert!(!text.contains("Assignee:"));
+    }
+
+    fn ranked_ticket(key: &str, status: &str, assignee: Option<&str>) -> TicketSummary {
+        TicketSummary {
+            status: status.to_string(),
+            assignee: assignee.map(str::to_string),
+            ..ticket(key)
+        }
+    }
+
+    #[test]
+    fn draws_rank_screen_with_position_key_status_assignee_and_summary() {
+        let app = App {
+            screen: Screen::Rank,
+            rank_tickets: vec![
+                ranked_ticket("PROJ-1", "To Do", Some("Jane Doe")),
+                ranked_ticket("PROJ-2", "In Progress", None),
+            ],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Priority"));
+        assert!(text.contains("1."));
+        assert!(text.contains("PROJ-1"));
+        assert!(text.contains("To Do"));
+        assert!(text.contains("Jane Doe"));
+        assert!(text.contains("2."));
+        assert!(text.contains("PROJ-2"));
+        assert!(text.contains("In Progress"));
+        assert!(text.contains("Unassigned"));
+        assert!(text.contains("Fix the thing"));
+    }
+
+    #[test]
+    fn rank_screen_does_not_show_board_columns_behind_it() {
+        let app = App {
+            screen: Screen::Rank,
+            rank_tickets: vec![ranked_ticket("PROJ-1", "To Do", None)],
+            ..three_column_app()
+        };
+        let text = buffer_text(&render(&app));
+        // The board columns from `three_column_app` must not leak through;
+        // the rank screen is a full replacement, not an overlay.
+        assert!(!text.contains("To Do (1)"));
+        assert!(!text.contains("In Progress (1)"));
+        assert!(!text.contains("Done (1)"));
+    }
+
+    #[test]
+    fn draws_rank_screen_empty_list_without_panicking() {
+        let app = App {
+            screen: Screen::Rank,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Priority"));
+    }
+
+    #[test]
+    fn grabbed_row_shows_a_distinct_marker_and_title() {
+        let app = App {
+            screen: Screen::Rank,
+            rank_tickets: vec![
+                ranked_ticket("PROJ-1", "To Do", None),
+                ranked_ticket("PROJ-2", "To Do", None),
+            ],
+            rank_selected: 0,
+            rank_grab_origin: Some(0),
+            rank_snapshot: Some(vec![
+                ranked_ticket("PROJ-1", "To Do", None),
+                ranked_ticket("PROJ-2", "To Do", None),
+            ]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("><"));
+        assert!(text.contains("grabbed"));
+    }
+
+    #[test]
+    fn rank_screen_status_bar_never_shows_the_board_filter_label() {
+        let app = App {
+            screen: Screen::Rank,
+            filter: AssigneeFilter::Everyone,
+            rank_tickets: vec![ranked_ticket("PROJ-1", "To Do", None)],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Filter:"));
+    }
+
+    #[test]
+    fn help_overlay_documents_priority_view_keys() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("priority"));
+        assert!(text.contains("grab"));
     }
 }
