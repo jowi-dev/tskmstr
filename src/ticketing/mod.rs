@@ -37,6 +37,14 @@
 //! warning. Its project lookup for name resolution comes from `KEY`'s own
 //! prefix (via [`project_key_from_issue_key`]), not [`Config::default_project_key`],
 //! so assigning a ticket in another project still works.
+//!
+//! [`rank_ticket`] (`tm ticket rank <KEY> (--above|--below) <OTHER>`) moves a
+//! ticket in Jira's native backlog rank (the `Rank` field, via
+//! [`JiraClient::rank`]) relative to another issue. Like transition and
+//! assign, it's explicit: any Jira API failure is a hard error. It verifies
+//! `KEY` exists first so a typo there gets a friendly [`JiraError::NotFound`];
+//! a typo'd anchor key surfaces from the rank call itself as
+//! [`JiraError::RankNotFound`].
 
 use thiserror::Error;
 
@@ -44,7 +52,7 @@ use crate::config::Config;
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
-use crate::jira::client::{JiraClient, JiraError};
+use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::{CreateIssueRequest, JiraUser, RemoteLinkRequest};
 
 /// Dependencies shared by the ticketing orchestration functions that deal
@@ -561,6 +569,26 @@ pub fn assign_ticket(
             Ok(AssignOutcome::AssignedToUser(display_name))
         }
     }
+}
+
+/// `tm ticket rank <KEY> (--above|--below) <OTHER>`: move `key` to a new
+/// position in the backlog rank, relative to `anchor`.
+///
+/// Verifies `key` exists first (via [`JiraClient::get_issue`]) so a typo'd
+/// primary key gives the same friendly [`JiraError::NotFound`] every other
+/// `tm ticket` subcommand does, rather than surfacing as a raw
+/// [`JiraError::RankNotFound`] from the agile API. A typo'd anchor key (in
+/// `anchor`) is not checked ahead of time; it surfaces from the `rank` call
+/// itself as [`JiraError::RankNotFound`], since Jira's rank endpoint reports
+/// that case directly and a second lookup would be redundant.
+pub fn rank_ticket(
+    jira: &dyn JiraClient,
+    key: &str,
+    anchor: RankAnchor,
+) -> Result<(), TicketingError> {
+    jira.get_issue(key)?;
+    jira.rank(&[key.to_string()], anchor)?;
+    Ok(())
 }
 
 /// Extract the project key prefix from an issue key, e.g. `PROJ` from
@@ -1960,6 +1988,73 @@ mod tests {
 
         match err {
             TicketingError::Jira(JiraError::Api { status, .. }) => assert_eq!(status, 500),
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_ticket_ranks_before_anchor() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+
+        rank_ticket(&jira, "PROJ-1", RankAnchor::Before("PROJ-2".to_string()))
+            .expect("should succeed");
+
+        assert_eq!(
+            jira.rank_calls(),
+            vec![(
+                vec!["PROJ-1".to_string()],
+                RankAnchor::Before("PROJ-2".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn rank_ticket_ranks_after_anchor() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+
+        rank_ticket(&jira, "PROJ-1", RankAnchor::After("PROJ-2".to_string()))
+            .expect("should succeed");
+
+        assert_eq!(
+            jira.rank_calls(),
+            vec![(
+                vec!["PROJ-1".to_string()],
+                RankAnchor::After("PROJ-2".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn rank_ticket_missing_primary_key_errors_with_key_before_calling_rank() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = rank_ticket(&jira, "PROJ-404", RankAnchor::Before("PROJ-2".to_string()))
+            .expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(
+            jira.rank_calls().is_empty(),
+            "should not call rank when the primary key doesn't exist"
+        );
+    }
+
+    #[test]
+    fn rank_ticket_propagates_rank_api_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_rank_error(500, "boom");
+
+        let err = rank_ticket(&jira, "PROJ-1", RankAnchor::Before("PROJ-2".to_string()))
+            .expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
