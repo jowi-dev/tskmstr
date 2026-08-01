@@ -10,7 +10,7 @@
 
 use std::io::{self, Write};
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
 pub mod pr;
@@ -107,6 +107,29 @@ pub enum TicketCmd {
         /// Target workflow status name, matched case-insensitively. Omit to
         /// list available transitions instead of applying one.
         status: Option<String>,
+    },
+    /// Assign a ticket by name, to the current user, or clear its assignee.
+    ///
+    /// Exactly one of `NAME`, `--me`, or `--unassign` is required; clap
+    /// rejects giving more than one or none at all.
+    #[command(group(
+        ArgGroup::new("assignee")
+            .required(true)
+            .args(["name", "me", "unassign"])
+    ))]
+    Assign {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Display name (or an unambiguous substring of one) of the
+        /// assignable user to assign the ticket to.
+        #[arg(group = "assignee")]
+        name: Option<String>,
+        /// Assign to the current user.
+        #[arg(long, group = "assignee")]
+        me: bool,
+        /// Clear the ticket's assignee.
+        #[arg(long, group = "assignee")]
+        unassign: bool,
     },
 }
 
@@ -376,6 +399,113 @@ mod tests {
             }
             other => panic!("expected TicketCmd::Transition, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ticket_assign_with_name() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "Jane"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Assign {
+                        key,
+                        name,
+                        me,
+                        unassign,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(name, Some("Jane".to_string()));
+                assert!(!me);
+                assert!(!unassign);
+            }
+            other => panic!("expected TicketCmd::Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_assign_with_me() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "--me"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Assign {
+                        key,
+                        name,
+                        me,
+                        unassign,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(name, None);
+                assert!(me);
+                assert!(!unassign);
+            }
+            other => panic!("expected TicketCmd::Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_assign_with_unassign() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "--unassign"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Assign {
+                        key,
+                        name,
+                        me,
+                        unassign,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(name, None);
+                assert!(!me);
+                assert!(unassign);
+            }
+            other => panic!("expected TicketCmd::Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_assign_name_and_me_conflict_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "Jane", "--me"]);
+        assert!(result.is_err(), "NAME and --me should conflict");
+    }
+
+    #[test]
+    fn ticket_assign_name_and_unassign_conflict_is_a_clap_error() {
+        let result =
+            Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "Jane", "--unassign"]);
+        assert!(result.is_err(), "NAME and --unassign should conflict");
+    }
+
+    #[test]
+    fn ticket_assign_me_and_unassign_conflict_is_a_clap_error() {
+        let result =
+            Cli::try_parse_from(["tm", "ticket", "assign", "proj-372", "--me", "--unassign"]);
+        assert!(result.is_err(), "--me and --unassign should conflict");
+    }
+
+    #[test]
+    fn ticket_assign_with_none_given_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "assign", "proj-372"]);
+        assert!(
+            result.is_err(),
+            "giving neither NAME, --me, nor --unassign should be a usage error"
+        );
+    }
+
+    #[test]
+    fn ticket_assign_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "assign"]);
+        assert!(result.is_err(), "assign requires a key");
     }
 
     #[test]

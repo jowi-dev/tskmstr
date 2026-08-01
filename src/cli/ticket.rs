@@ -1,14 +1,17 @@
-//! `tm ticket <KEY>`, `tm ticket create`, and `tm ticket transition`.
+//! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, and
+//! `tm ticket assign`.
 
 use std::io::Write;
 
 use regex::Regex;
 use thiserror::Error;
 
+use crate::config::Config;
 use crate::jira::client::JiraClient;
 use crate::ticketing::{
-    CreateTicketContext, TicketingContext, TicketingError, TransitionOutcome, associate_ticket,
-    create_ticket, list_transitions, transition_ticket,
+    AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
+    TransitionOutcome, assign_ticket, associate_ticket, create_ticket, list_transitions,
+    transition_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -169,6 +172,49 @@ fn print_available_transitions(
     }
     for t in &listing.transitions {
         writeln!(out, "{} -> {}", t.name, t.to.name)?;
+    }
+    Ok(())
+}
+
+/// `tm ticket assign <KEY> [NAME] [--me] [--unassign]`: assign `key` by
+/// resolved name, to the current user, or clear its assignee.
+///
+/// Exactly one of `name`, `me`, `unassign` is expected to be set — clap's
+/// `ArgGroup` on [`super::TicketCmd::Assign`] enforces this before this
+/// function is ever called. Like [`transition`], every failure is a hard
+/// error propagated via [`TicketCliError::Ticketing`]: an ambiguous or
+/// unknown name, or any Jira API failure.
+pub fn assign(
+    jira: &dyn JiraClient,
+    config: &Config,
+    key: &str,
+    name: Option<&str>,
+    me: bool,
+    unassign: bool,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    let target = if unassign {
+        AssignTarget::Unassign
+    } else if me {
+        AssignTarget::Me
+    } else {
+        AssignTarget::Name(
+            name.expect("clap's ArgGroup guarantees one of name/me/unassign is set")
+                .to_string(),
+        )
+    };
+
+    match assign_ticket(jira, config, &normalized, &target)? {
+        AssignOutcome::AssignedToUser(display_name) => {
+            writeln!(out, "Assigned {normalized} to {display_name}")?;
+        }
+        AssignOutcome::AssignedToMe(label) => {
+            writeln!(out, "Assigned {normalized} to me ({label})")?;
+        }
+        AssignOutcome::Unassigned => {
+            writeln!(out, "Unassigned {normalized}")?;
+        }
     }
     Ok(())
 }
@@ -619,6 +665,133 @@ mod tests {
             output,
             "PROJ-372 is in To Do. Available transitions:\nNo transitions available.\n"
         );
+    }
+
+    fn jira_user(account_id: &str, display_name: &str) -> crate::jira::types::JiraUser {
+        crate::jira::types::JiraUser {
+            account_id: account_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn assign_by_name_prints_assigned_message() {
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("PROJ", vec![jira_user("acct-1", "Jane Doe")]);
+        let cfg = config();
+        let mut out = Vec::new();
+
+        assign(
+            &jira,
+            &cfg,
+            "proj-372",
+            Some("Jane"),
+            false,
+            false,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Assigned PROJ-372 to Jane Doe\n");
+        assert_eq!(
+            jira.assign_calls(),
+            vec![("PROJ-372".to_string(), Some("acct-1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_by_name_ambiguous_is_a_hard_error() {
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Jane Doe"),
+                jira_user("acct-2", "Jane Smith"),
+            ],
+        );
+        let cfg = config();
+        let mut out = Vec::new();
+
+        let err = assign(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            Some("jane"),
+            false,
+            false,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::NoMatchingAssignee { key, name, .. }) => {
+                assert_eq!(key, "PROJ-372");
+                assert_eq!(name, "jane");
+            }
+            other => panic!("expected NoMatchingAssignee, got {other:?}"),
+        }
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn assign_me_uses_cached_account_id() {
+        let jira = FakeJiraClient::new();
+        let cfg = Config {
+            default_assignee_account_id: Some("acct-1".to_string()),
+            ..config()
+        };
+        let mut out = Vec::new();
+
+        assign(&jira, &cfg, "PROJ-372", None, true, false, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Assigned PROJ-372 to me (acct-1)\n");
+    }
+
+    #[test]
+    fn assign_me_falls_back_to_myself_display_name() {
+        let jira = FakeJiraClient::new().with_myself(crate::jira::types::Myself {
+            account_id: "acct-me".to_string(),
+            display_name: "Ada Lovelace".to_string(),
+            email_address: None,
+        });
+        let cfg = Config {
+            default_assignee_account_id: None,
+            ..config()
+        };
+        let mut out = Vec::new();
+
+        assign(&jira, &cfg, "PROJ-372", None, true, false, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Assigned PROJ-372 to me (Ada Lovelace)\n");
+    }
+
+    #[test]
+    fn assign_unassign_clears_assignee() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+        let mut out = Vec::new();
+
+        assign(&jira, &cfg, "PROJ-372", None, false, true, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Unassigned PROJ-372\n");
+        assert_eq!(jira.assign_calls(), vec![("PROJ-372".to_string(), None)]);
+    }
+
+    #[test]
+    fn assign_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+        let mut out = Vec::new();
+
+        let err = assign(&jira, &cfg, "not-a-key!", None, true, false, &mut out)
+            .expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
     }
 
     #[test]
