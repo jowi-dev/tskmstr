@@ -93,6 +93,21 @@ pub enum TicketCmd {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Move a ticket to a workflow status, or list its available
+    /// transitions.
+    ///
+    /// With `STATUS`, moves `KEY` there (a hard error, unlike the advisory
+    /// `status_on_pr`/`status_on_create` transitions applied by `tm pr
+    /// create`/`tm ticket create`) if no matching transition exists or the
+    /// Jira API call fails. Without `STATUS`, lists `KEY`'s available
+    /// transitions instead.
+    Transition {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Target workflow status name, matched case-insensitively. Omit to
+        /// list available transitions instead of applying one.
+        status: Option<String>,
+    },
 }
 
 /// `tm auth` subcommands.
@@ -329,6 +344,47 @@ mod tests {
             }
             other => panic!("expected Ticket Create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ticket_transition_with_status() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "transition", "proj-372", "Done"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Transition { key, status }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(status, Some("Done".to_string()));
+            }
+            other => panic!("expected TicketCmd::Transition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_transition_without_status() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "transition", "proj-372"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Transition { key, status }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(status, None);
+            }
+            other => panic!("expected TicketCmd::Transition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_transition_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "transition"]);
+        assert!(
+            result.is_err(),
+            "bare `tm ticket transition` with no key should fail to parse"
+        );
     }
 
     #[test]
