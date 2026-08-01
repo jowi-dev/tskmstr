@@ -82,7 +82,25 @@ it, so the board stays visible behind the detail and "Move to" windows.
 | `Esc` / `q` | Go back a screen, or quit from the board |
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
+| `f` | Open the assignee filter picker (board only) |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
+
+### Filtering the board by assignee
+
+By default the board shows only your own open tickets (`assignee =
+currentUser()`), same as always. Pressing `f` on the board opens a floating
+picker listing `Me`, `Unassigned`, `Everyone`, and every user assignable in
+`default_project_key` (fetched from Jira the first time the picker opens and
+cached for the rest of the session). `j`/`k` navigate the list, `Enter`
+applies the highlighted filter and refetches the board, `Esc`/`q` closes the
+picker without changing anything. The currently active filter is marked with
+a leading `*`.
+
+Every filter other than `Me` scopes the query to `default_project_key`
+(`Me` keeps the board's original, project-independent query). When a
+non-`Me` filter is active, the status line shows `Filter: <name>` and each
+ticket card also shows its assignee (`Assignee: <name>` or `Assignee:
+Unassigned`).
 
 ## Configuration
 
