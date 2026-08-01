@@ -111,7 +111,7 @@ view with `Esc`/`q` shows the board exactly as it was, with no refetch.
 | `j`/`k` / arrows | Move the cursor (or, if a ticket is grabbed, move the ticket itself) |
 | `Enter` / `Space` | Grab the highlighted ticket, or drop it if already grabbed |
 | `Esc` / `q` | Cancel the grab and restore the original order, or (if nothing is grabbed) return to the board |
-| `r` | Refetch the priority list from Jira |
+| `r` | Refetch the priority list from Jira (inert while a ticket is grabbed) |
 | `o` | Open the highlighted ticket in the browser |
 | `?` | Toggle the help overlay |
 

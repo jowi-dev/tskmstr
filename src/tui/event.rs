@@ -95,6 +95,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                 &app.screen,
                 app.show_help,
                 app.show_filter_picker,
+                app.is_rank_grabbed(),
                 key_event.code,
             )
         {

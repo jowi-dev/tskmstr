@@ -492,7 +492,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("l / Right   next column"),
         Line::from("Enter       open / apply"),
         Line::from("Esc / q     back (quits from the board)"),
-        Line::from("r           refresh tickets"),
+        Line::from("r           refresh tickets (inert mid-grab in priority view)"),
         Line::from("o           open in browser"),
         Line::from("f           filter by assignee (board only)"),
         Line::from("p           priority (stack-rank) view (board only)"),

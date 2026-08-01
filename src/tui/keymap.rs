@@ -15,6 +15,14 @@ fn map_rank_key(key: KeyCode) -> Option<Msg> {
     }
 }
 
+/// Whether `key` must be inert on [`Screen::Rank`] while a ticket is
+/// grabbed, rather than falling through to its usual shared binding.
+/// Currently just `r`: refreshing mid-grab would replace `rank_tickets` out
+/// from under the pending, undropped reorder.
+fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
+    matches!(key, KeyCode::Char('r'))
+}
+
 /// Map a key press to the [`Msg`] it produces, or `None` if the key is
 /// unbound.
 ///
@@ -31,10 +39,15 @@ fn map_rank_key(key: KeyCode) -> Option<Msg> {
 /// `j`/`k`/arrows (navigate), `Enter` (select), and `Esc`/`q` (close without
 /// changing the filter) are bound; every other key is inert, same as board
 /// keys are inert while the help overlay is up.
+///
+/// While a ticket is grabbed on [`Screen::Rank`] (`rank_grabbed`), `r` is
+/// inert: refreshing would silently discard the pending, undropped reorder.
+/// `rank_grabbed` is ignored on every other screen.
 pub fn map_key(
     screen: &Screen,
     show_help: bool,
     show_filter_picker: bool,
+    rank_grabbed: bool,
     key: KeyCode,
 ) -> Option<Msg> {
     if show_help {
@@ -54,10 +67,13 @@ pub fn map_key(
         };
     }
 
-    if *screen == Screen::Rank
-        && let Some(msg) = map_rank_key(key)
-    {
-        return Some(msg);
+    if *screen == Screen::Rank {
+        if let Some(msg) = map_rank_key(key) {
+            return Some(msg);
+        }
+        if rank_grabbed && is_inert_while_rank_grabbed(key) {
+            return None;
+        }
     }
 
     match key {
@@ -89,7 +105,10 @@ mod tests {
             (KeyCode::Up, Msg::Up),
         ];
         for (key, expected) in cases {
-            assert_eq!(map_key(&Screen::Board, false, false, key), Some(expected));
+            assert_eq!(
+                map_key(&Screen::Board, false, false, false, key),
+                Some(expected)
+            );
         }
     }
 
@@ -103,7 +122,10 @@ mod tests {
         ];
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             for (key, ref expected) in cases.clone() {
-                assert_eq!(map_key(&screen, false, false, key), Some(expected.clone()));
+                assert_eq!(
+                    map_key(&screen, false, false, false, key),
+                    Some(expected.clone())
+                );
             }
         }
     }
@@ -112,7 +134,7 @@ mod tests {
     fn enter_maps_to_enter_on_every_screen() {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             assert_eq!(
-                map_key(&screen, false, false, KeyCode::Enter),
+                map_key(&screen, false, false, false, KeyCode::Enter),
                 Some(Msg::Enter)
             );
         }
@@ -122,11 +144,11 @@ mod tests {
     fn esc_and_q_map_to_back_on_every_screen() {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             assert_eq!(
-                map_key(&screen, false, false, KeyCode::Esc),
+                map_key(&screen, false, false, false, KeyCode::Esc),
                 Some(Msg::Back)
             );
             assert_eq!(
-                map_key(&screen, false, false, KeyCode::Char('q')),
+                map_key(&screen, false, false, false, KeyCode::Char('q')),
                 Some(Msg::Back)
             );
         }
@@ -135,7 +157,7 @@ mod tests {
     #[test]
     fn r_maps_to_refresh() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('r')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('r')),
             Some(Msg::Refresh)
         );
     }
@@ -143,7 +165,7 @@ mod tests {
     #[test]
     fn o_maps_to_open_in_browser() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('o')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('o')),
             Some(Msg::OpenInBrowser)
         );
     }
@@ -151,7 +173,7 @@ mod tests {
     #[test]
     fn question_mark_maps_to_toggle_help() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('?')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('?')),
             Some(Msg::ToggleHelp)
         );
     }
@@ -159,24 +181,27 @@ mod tests {
     #[test]
     fn unbound_key_maps_to_none() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('z')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('z')),
             None
         );
-        assert_eq!(map_key(&Screen::Board, false, false, KeyCode::Tab), None);
+        assert_eq!(
+            map_key(&Screen::Board, false, false, false, KeyCode::Tab),
+            None
+        );
     }
 
     #[test]
     fn help_overlay_swallows_any_key_and_closes_it() {
         assert_eq!(
-            map_key(&Screen::Board, true, false, KeyCode::Char('z')),
+            map_key(&Screen::Board, true, false, false, KeyCode::Char('z')),
             Some(Msg::ToggleHelp)
         );
         assert_eq!(
-            map_key(&Screen::Board, true, false, KeyCode::Enter),
+            map_key(&Screen::Board, true, false, false, KeyCode::Enter),
             Some(Msg::ToggleHelp)
         );
         assert_eq!(
-            map_key(&Screen::Board, true, false, KeyCode::Char('r')),
+            map_key(&Screen::Board, true, false, false, KeyCode::Char('r')),
             Some(Msg::ToggleHelp)
         );
     }
@@ -184,7 +209,7 @@ mod tests {
     #[test]
     fn help_overlay_q_quits_instead_of_closing() {
         assert_eq!(
-            map_key(&Screen::Board, true, false, KeyCode::Char('q')),
+            map_key(&Screen::Board, true, false, false, KeyCode::Char('q')),
             Some(Msg::Quit)
         );
     }
@@ -192,7 +217,7 @@ mod tests {
     #[test]
     fn f_opens_filter_picker_on_board_screen() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('f')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('f')),
             Some(Msg::OpenFilterPicker)
         );
     }
@@ -200,7 +225,10 @@ mod tests {
     #[test]
     fn f_is_unbound_off_the_board_screen() {
         for screen in [Screen::Detail, Screen::TransitionMenu] {
-            assert_eq!(map_key(&screen, false, false, KeyCode::Char('f')), None);
+            assert_eq!(
+                map_key(&screen, false, false, false, KeyCode::Char('f')),
+                None
+            );
         }
     }
 
@@ -213,14 +241,17 @@ mod tests {
             (KeyCode::Up, Msg::FilterPickerUp),
         ];
         for (key, expected) in cases {
-            assert_eq!(map_key(&Screen::Board, false, true, key), Some(expected));
+            assert_eq!(
+                map_key(&Screen::Board, false, true, false, key),
+                Some(expected)
+            );
         }
     }
 
     #[test]
     fn filter_picker_enter_selects() {
         assert_eq!(
-            map_key(&Screen::Board, false, true, KeyCode::Enter),
+            map_key(&Screen::Board, false, true, false, KeyCode::Enter),
             Some(Msg::FilterPickerSelect)
         );
     }
@@ -228,11 +259,11 @@ mod tests {
     #[test]
     fn filter_picker_esc_and_q_close_it() {
         assert_eq!(
-            map_key(&Screen::Board, false, true, KeyCode::Esc),
+            map_key(&Screen::Board, false, true, false, KeyCode::Esc),
             Some(Msg::FilterPickerClose)
         );
         assert_eq!(
-            map_key(&Screen::Board, false, true, KeyCode::Char('q')),
+            map_key(&Screen::Board, false, true, false, KeyCode::Char('q')),
             Some(Msg::FilterPickerClose)
         );
     }
@@ -240,7 +271,7 @@ mod tests {
     #[test]
     fn p_opens_rank_screen_on_board() {
         assert_eq!(
-            map_key(&Screen::Board, false, false, KeyCode::Char('p')),
+            map_key(&Screen::Board, false, false, false, KeyCode::Char('p')),
             Some(Msg::OpenRank)
         );
     }
@@ -248,18 +279,21 @@ mod tests {
     #[test]
     fn p_is_unbound_off_the_board_screen() {
         for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
-            assert_eq!(map_key(&screen, false, false, KeyCode::Char('p')), None);
+            assert_eq!(
+                map_key(&screen, false, false, false, KeyCode::Char('p')),
+                None
+            );
         }
     }
 
     #[test]
     fn enter_and_space_grab_toggle_on_rank_screen() {
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Enter),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Enter),
             Some(Msg::RankGrabToggle)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char(' ')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char(' ')),
             Some(Msg::RankGrabToggle)
         );
     }
@@ -267,40 +301,91 @@ mod tests {
     #[test]
     fn space_is_unbound_off_the_rank_screen() {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
-            assert_eq!(map_key(&screen, false, false, KeyCode::Char(' ')), None);
+            assert_eq!(
+                map_key(&screen, false, false, false, KeyCode::Char(' ')),
+                None
+            );
         }
     }
 
     #[test]
     fn rank_screen_still_maps_shared_navigation_and_action_keys() {
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('j')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('j')),
             Some(Msg::Down)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('k')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('k')),
             Some(Msg::Up)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Esc),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Esc),
             Some(Msg::Back)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('q')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('q')),
             Some(Msg::Back)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('r')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('r')),
             Some(Msg::Refresh)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('o')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('o')),
             Some(Msg::OpenInBrowser)
         );
         assert_eq!(
-            map_key(&Screen::Rank, false, false, KeyCode::Char('?')),
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('?')),
             Some(Msg::ToggleHelp)
         );
+    }
+
+    #[test]
+    fn r_is_inert_on_rank_screen_while_a_ticket_is_grabbed() {
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, true, KeyCode::Char('r')),
+            None
+        );
+    }
+
+    #[test]
+    fn r_still_refreshes_on_rank_screen_when_nothing_is_grabbed() {
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, false, KeyCode::Char('r')),
+            Some(Msg::Refresh)
+        );
+    }
+
+    #[test]
+    fn rank_grabbed_does_not_affect_other_keys() {
+        // Only `r` is gated while grabbed; everything else on the rank
+        // screen behaves the same whether or not a ticket is grabbed.
+        for key in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('o'),
+            KeyCode::Char('?'),
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+        ] {
+            assert_eq!(
+                map_key(&Screen::Rank, false, false, true, key),
+                map_key(&Screen::Rank, false, false, false, key),
+                "key {key:?} should behave the same grabbed or not"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_grabbed_flag_is_ignored_off_the_rank_screen() {
+        for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
+            assert_eq!(
+                map_key(&screen, false, false, true, KeyCode::Char('r')),
+                Some(Msg::Refresh)
+            );
+        }
     }
 
     #[test]
@@ -314,7 +399,7 @@ mod tests {
             KeyCode::Char('f'),
             KeyCode::Char('z'),
         ] {
-            assert_eq!(map_key(&Screen::Board, false, true, key), None);
+            assert_eq!(map_key(&Screen::Board, false, true, false, key), None);
         }
     }
 }
