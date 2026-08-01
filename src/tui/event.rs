@@ -19,9 +19,9 @@ use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
 
 use crate::jira::adf::adf_to_text;
-use crate::jira::client::JiraClient;
+use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::Issue;
-use crate::tui::app::{App, Cmd, Msg, jql_for_filter, update};
+use crate::tui::app::{App, Cmd, Msg, TicketSummary, jql_for_filter, update};
 use crate::tui::keymap::map_key;
 use crate::tui::ui::draw;
 
@@ -132,22 +132,53 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
         Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
         Cmd::OpenUrl(url) => open_url(&url),
+        Cmd::FetchRankTickets { jql } => fetch_rank_tickets(deps, &jql),
+        Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
     }
+}
+
+/// Search for tickets matching `jql` and map them to
+/// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
+/// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
+/// error) becomes.
+fn search_tickets(deps: &TuiDeps, jql: &str) -> Result<Vec<TicketSummary>, JiraError> {
+    let result = deps.jira.search(jql)?;
+    Ok(result
+        .issues
+        .into_iter()
+        .map(|issue| to_ticket_summary(issue, &deps.base_url))
+        .collect())
 }
 
 /// Run `Cmd::FetchTickets`: search for tickets matching `jql` and map them to
 /// [`crate::tui::app::TicketSummary`]s.
 fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
-    match deps.jira.search(jql) {
-        Ok(result) => {
-            let tickets = result
-                .issues
-                .into_iter()
-                .map(|issue| to_ticket_summary(issue, &deps.base_url))
-                .collect();
-            vec![Msg::TicketsLoaded(tickets)]
-        }
+    match search_tickets(deps, jql) {
+        Ok(tickets) => vec![Msg::TicketsLoaded(tickets)],
         Err(err) => vec![Msg::TicketsFailed(err.to_string())],
+    }
+}
+
+/// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
+/// list for [`crate::tui::app::Screen::Rank`].
+fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
+    match search_tickets(deps, jql) {
+        Ok(tickets) => vec![Msg::RankTicketsLoaded(tickets)],
+        Err(err) => vec![Msg::RankTicketsFailed(err.to_string())],
+    }
+}
+
+/// Run `Cmd::RankTicket`: move `key` to its new position relative to
+/// `anchor`, reporting a human-readable confirmation on success (e.g.
+/// `Ranked PROJ-3 above PROJ-7`).
+fn rank_ticket(deps: &TuiDeps, key: &str, anchor: RankAnchor) -> Vec<Msg> {
+    let message = match &anchor {
+        RankAnchor::Before(other) => format!("Ranked {key} above {other}"),
+        RankAnchor::After(other) => format!("Ranked {key} below {other}"),
+    };
+    match deps.jira.rank(&[key.to_string()], anchor) {
+        Ok(()) => vec![Msg::RankApplied(message)],
+        Err(err) => vec![Msg::RankFailed(err.to_string())],
     }
 }
 
@@ -402,6 +433,79 @@ mod tests {
         });
         let summary = to_ticket_summary(issue, "https://example.atlassian.net");
         assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
+    }
+
+    #[test]
+    fn fetch_rank_tickets_maps_issues_to_ticket_summaries() {
+        use crate::jira::jql::ranked_tickets_jql;
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do")],
+            next_page_token: None,
+        });
+        let msgs = fetch_rank_tickets(&deps(jira), &ranked_tickets_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RankTicketsLoaded(tickets)] => {
+                assert_eq!(tickets.len(), 1);
+                assert_eq!(tickets[0].key, "PROJ-1");
+            }
+            other => panic!("expected RankTicketsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_rank_tickets_failure_emits_rank_tickets_failed() {
+        use crate::jira::jql::ranked_tickets_jql;
+
+        let jira = FakeJiraClient::new().with_search_error(500, "boom");
+        let msgs = fetch_rank_tickets(&deps(jira), &ranked_tickets_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RankTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            other => panic!("expected RankTicketsFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_ticket_before_emits_rank_applied_with_above_message() {
+        let jira = FakeJiraClient::new();
+        let msgs = rank_ticket(
+            &deps(jira),
+            "PROJ-3",
+            RankAnchor::Before("PROJ-7".to_string()),
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::RankApplied("Ranked PROJ-3 above PROJ-7".to_string())]
+        );
+    }
+
+    #[test]
+    fn rank_ticket_after_emits_rank_applied_with_below_message() {
+        let jira = FakeJiraClient::new();
+        let msgs = rank_ticket(
+            &deps(jira),
+            "PROJ-3",
+            RankAnchor::After("PROJ-7".to_string()),
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::RankApplied("Ranked PROJ-3 below PROJ-7".to_string())]
+        );
+    }
+
+    #[test]
+    fn rank_ticket_failure_emits_rank_failed() {
+        let jira = FakeJiraClient::new().with_rank_error(500, "boom");
+        let msgs = rank_ticket(
+            &deps(jira),
+            "PROJ-3",
+            RankAnchor::Before("PROJ-7".to_string()),
+        );
+        match msgs.as_slice() {
+            [Msg::RankFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            other => panic!("expected RankFailed, got {other:?}"),
+        }
     }
 
     #[test]

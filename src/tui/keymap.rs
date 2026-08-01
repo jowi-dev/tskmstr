@@ -5,6 +5,16 @@ use crossterm::event::KeyCode;
 
 use crate::tui::app::{Msg, Screen};
 
+/// Key bindings active on [`Screen::Rank`]. `Enter`/`Space` grab or drop the
+/// highlighted ticket; every other binding falls through to the shared
+/// bindings below (navigation, `r`, `o`, `?`, `Esc`/`q`).
+fn map_rank_key(key: KeyCode) -> Option<Msg> {
+    match key {
+        KeyCode::Enter | KeyCode::Char(' ') => Some(Msg::RankGrabToggle),
+        _ => None,
+    }
+}
+
 /// Map a key press to the [`Msg`] it produces, or `None` if the key is
 /// unbound.
 ///
@@ -44,6 +54,12 @@ pub fn map_key(
         };
     }
 
+    if *screen == Screen::Rank
+        && let Some(msg) = map_rank_key(key)
+    {
+        return Some(msg);
+    }
+
     match key {
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::Up),
@@ -55,6 +71,7 @@ pub fn map_key(
         KeyCode::Char('o') => Some(Msg::OpenInBrowser),
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
+        KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         _ => None,
     }
 }
@@ -217,6 +234,72 @@ mod tests {
         assert_eq!(
             map_key(&Screen::Board, false, true, KeyCode::Char('q')),
             Some(Msg::FilterPickerClose)
+        );
+    }
+
+    #[test]
+    fn p_opens_rank_screen_on_board() {
+        assert_eq!(
+            map_key(&Screen::Board, false, false, KeyCode::Char('p')),
+            Some(Msg::OpenRank)
+        );
+    }
+
+    #[test]
+    fn p_is_unbound_off_the_board_screen() {
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
+            assert_eq!(map_key(&screen, false, false, KeyCode::Char('p')), None);
+        }
+    }
+
+    #[test]
+    fn enter_and_space_grab_toggle_on_rank_screen() {
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Enter),
+            Some(Msg::RankGrabToggle)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char(' ')),
+            Some(Msg::RankGrabToggle)
+        );
+    }
+
+    #[test]
+    fn space_is_unbound_off_the_rank_screen() {
+        for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
+            assert_eq!(map_key(&screen, false, false, KeyCode::Char(' ')), None);
+        }
+    }
+
+    #[test]
+    fn rank_screen_still_maps_shared_navigation_and_action_keys() {
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('j')),
+            Some(Msg::Down)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('k')),
+            Some(Msg::Up)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Esc),
+            Some(Msg::Back)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('q')),
+            Some(Msg::Back)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('r')),
+            Some(Msg::Refresh)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('o')),
+            Some(Msg::OpenInBrowser)
+        );
+        assert_eq!(
+            map_key(&Screen::Rank, false, false, KeyCode::Char('?')),
+            Some(Msg::ToggleHelp)
         );
     }
 

@@ -6,8 +6,10 @@
 //! should perform next, and *Failed messages let callers feed I/O errors back
 //! in without `update` ever needing to panic.
 
+use crate::jira::client::RankAnchor;
 use crate::jira::jql::{
-    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, unassigned_tickets_jql,
+    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
+    unassigned_tickets_jql,
 };
 use crate::jira::types::{JiraUser, Transition};
 
@@ -130,6 +132,9 @@ pub enum Screen {
     Detail,
     /// Menu of workflow transitions available on the selected ticket.
     TransitionMenu,
+    /// The project's full open-ticket list in Jira backlog rank order,
+    /// spanning every assignee, with grab-and-drop reordering.
+    Rank,
 }
 
 /// All state needed to render and drive the TUI.
@@ -173,6 +178,20 @@ pub struct App {
     /// Error from the last failed assignable-users fetch, shown in the
     /// picker until the next successful fetch.
     pub filter_picker_error: Option<String>,
+    /// [`Screen::Rank`]'s ticket list, in Jira backlog rank order. Kept
+    /// entirely separate from `columns` so leaving the rank screen never
+    /// requires refetching (or clobbers) the board.
+    pub rank_tickets: Vec<TicketSummary>,
+    /// Index into `rank_tickets` of the currently highlighted row.
+    pub rank_selected: usize,
+    /// The original index of the currently grabbed ticket in `rank_tickets`,
+    /// or `None` if nothing is grabbed. Used to detect a no-op drop (dropped
+    /// back at its starting position) and to restore `rank_selected` on
+    /// cancel.
+    pub rank_grab_origin: Option<usize>,
+    /// A snapshot of `rank_tickets` taken at grab time, restored verbatim if
+    /// the grab is cancelled. `None` whenever nothing is grabbed.
+    pub rank_snapshot: Option<Vec<TicketSummary>>,
     /// Set when the event loop should exit.
     pub quit: bool,
 }
@@ -189,6 +208,16 @@ impl App {
             .get(self.selected_col)?
             .tickets
             .get(self.selected_row)
+    }
+
+    /// The currently highlighted ticket on [`Screen::Rank`], if any.
+    pub fn rank_selected_ticket(&self) -> Option<&TicketSummary> {
+        self.rank_tickets.get(self.rank_selected)
+    }
+
+    /// Whether a ticket is currently grabbed on [`Screen::Rank`].
+    pub fn is_rank_grabbed(&self) -> bool {
+        self.rank_grab_origin.is_some()
     }
 
     /// The assignee filter picker's options, in display order: `Me`,
@@ -265,6 +294,21 @@ pub enum Msg {
     },
     /// A transition failed to apply.
     TransitionFailed(String),
+    /// Open the priority (stack-rank) screen. Only meaningful on
+    /// [`Screen::Board`]; [`crate::tui::keymap::map_key`] only ever emits
+    /// this from there.
+    OpenRank,
+    /// The rank screen's ticket list finished loading.
+    RankTicketsLoaded(Vec<TicketSummary>),
+    /// The rank screen's ticket list failed to load.
+    RankTicketsFailed(String),
+    /// Grab the highlighted ticket on the rank screen, or drop it if it's
+    /// already grabbed. A no-op when the rank list is empty.
+    RankGrabToggle,
+    /// A rank reorder was successfully applied.
+    RankApplied(String),
+    /// A rank reorder failed to apply.
+    RankFailed(String),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -299,6 +343,19 @@ pub enum Cmd {
     },
     /// Open `url` in the user's default browser.
     OpenUrl(String),
+    /// Fetch every open ticket in the project, in Jira backlog rank order,
+    /// for [`Screen::Rank`].
+    FetchRankTickets {
+        /// The JQL query to search with (built by [`ranked_tickets_jql`]).
+        jql: String,
+    },
+    /// Re-rank `key` relative to `anchor`.
+    RankTicket {
+        /// Ticket key to move.
+        key: String,
+        /// Where to move it to.
+        anchor: RankAnchor,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -326,11 +383,21 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
-            let jql = jql_for_filter(&app.filter, &app.project_key);
-            (app, vec![Cmd::FetchTickets { jql }])
+            if app.screen == Screen::Rank {
+                let jql = ranked_tickets_jql(&app.project_key);
+                (app, vec![Cmd::FetchRankTickets { jql }])
+            } else {
+                let jql = jql_for_filter(&app.filter, &app.project_key);
+                (app, vec![Cmd::FetchTickets { jql }])
+            }
         }
         Msg::OpenInBrowser => {
-            let cmds = match app.selected_ticket() {
+            let ticket = if app.screen == Screen::Rank {
+                app.rank_selected_ticket()
+            } else {
+                app.selected_ticket()
+            };
+            let cmds = match ticket {
                 Some(ticket) => vec![Cmd::OpenUrl(ticket.url.clone())],
                 None => Vec::new(),
             };
@@ -419,6 +486,112 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.filter_picker_error = Some(err);
             (app, Vec::new())
         }
+        Msg::OpenRank => open_rank(app),
+        Msg::RankTicketsLoaded(tickets) => {
+            rank_tickets_loaded(&mut app, tickets);
+            (app, Vec::new())
+        }
+        Msg::RankTicketsFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::RankGrabToggle => rank_grab_toggle(app),
+        Msg::RankApplied(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
+        Msg::RankFailed(err) => {
+            app.status_line = err;
+            let jql = ranked_tickets_jql(&app.project_key);
+            (app, vec![Cmd::FetchRankTickets { jql }])
+        }
+    }
+}
+
+/// Handle [`Msg::OpenRank`]: switch to [`Screen::Rank`], reset any stale
+/// selection/grab state, and fetch the project's full ranked ticket list.
+fn open_rank(mut app: App) -> (App, Vec<Cmd>) {
+    app.screen = Screen::Rank;
+    app.rank_selected = 0;
+    app.rank_grab_origin = None;
+    app.rank_snapshot = None;
+    app.status_line = "Loading priority list...".to_string();
+    let jql = ranked_tickets_jql(&app.project_key);
+    (app, vec![Cmd::FetchRankTickets { jql }])
+}
+
+/// Handle [`Msg::RankTicketsLoaded`]: replace `rank_tickets` with server
+/// truth, clearing any in-progress grab (a fresh load always reflects the
+/// current server state) and preferring to keep the previously highlighted
+/// ticket selected if it still exists.
+fn rank_tickets_loaded(app: &mut App, tickets: Vec<TicketSummary>) {
+    let preferred_key = app.rank_selected_ticket().map(|t| t.key.clone());
+    app.rank_tickets = tickets;
+    app.rank_grab_origin = None;
+    app.rank_snapshot = None;
+    let found =
+        preferred_key.is_some_and(
+            |key| match app.rank_tickets.iter().position(|t| t.key == key) {
+                Some(pos) => {
+                    app.rank_selected = pos;
+                    true
+                }
+                None => false,
+            },
+        );
+    if !found {
+        clamp_rank_selected(app);
+    }
+}
+
+/// Clamp `rank_selected` into the bounds of `rank_tickets`, resetting to `0`
+/// when the list is empty.
+fn clamp_rank_selected(app: &mut App) {
+    match app.rank_tickets.len() {
+        0 => app.rank_selected = 0,
+        len if app.rank_selected >= len => app.rank_selected = len - 1,
+        _ => {}
+    }
+}
+
+/// Handle [`Msg::RankGrabToggle`]: grab the highlighted ticket if nothing is
+/// grabbed, or drop it (emitting [`Cmd::RankTicket`] if its position
+/// changed) if it is. A no-op on an empty list.
+fn rank_grab_toggle(mut app: App) -> (App, Vec<Cmd>) {
+    if app.rank_tickets.is_empty() {
+        return (app, Vec::new());
+    }
+
+    match app.rank_grab_origin {
+        None => {
+            app.rank_grab_origin = Some(app.rank_selected);
+            app.rank_snapshot = Some(app.rank_tickets.clone());
+            (app, Vec::new())
+        }
+        Some(origin) => {
+            app.rank_grab_origin = None;
+            app.rank_snapshot = None;
+            if app.rank_selected == origin {
+                return (app, Vec::new());
+            }
+            let key = app.rank_tickets[app.rank_selected].key.clone();
+            let anchor = match app.rank_tickets.get(app.rank_selected + 1) {
+                Some(next) => RankAnchor::Before(next.key.clone()),
+                None => RankAnchor::After(app.rank_tickets[app.rank_selected - 1].key.clone()),
+            };
+            (app, vec![Cmd::RankTicket { key, anchor }])
+        }
+    }
+}
+
+/// Handle [`Msg::Back`] while a ticket is grabbed on the rank screen: restore
+/// the pre-grab order and selection, cancelling the in-progress move.
+fn rank_cancel_grab(app: &mut App) {
+    if let Some(origin) = app.rank_grab_origin.take()
+        && let Some(snapshot) = app.rank_snapshot.take()
+    {
+        app.rank_tickets = snapshot;
+        app.rank_selected = origin;
     }
 }
 
@@ -491,25 +664,47 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
             };
             (app, cmd.into_iter().collect())
         }
+        // `map_key` routes Enter/Space on the rank screen to
+        // `Msg::RankGrabToggle`, never `Msg::Enter`; kept as a no-op so
+        // `Screen` stays exhaustively matched here.
+        Screen::Rank => (app, Vec::new()),
     }
 }
 
-/// Handle [`Msg::Back`]: step back a screen, or quit from the board.
+/// Handle [`Msg::Back`]: step back a screen, or quit from the board. On the
+/// rank screen, cancels an in-progress grab instead of leaving the screen if
+/// one is active (so `Esc`/`q` can never quit or navigate away mid-grab).
 fn back(app: &mut App) {
     match app.screen {
         Screen::Board => app.quit = true,
         Screen::Detail => app.screen = Screen::Board,
         Screen::TransitionMenu => app.screen = Screen::Detail,
+        Screen::Rank => {
+            if app.is_rank_grabbed() {
+                rank_cancel_grab(app);
+            } else {
+                app.screen = Screen::Board;
+            }
+        }
     }
 }
 
-/// Move the current selection/scroll up by one, saturating at the top.
+/// Move the current selection/scroll up by one, saturating at the top. On
+/// the rank screen, moves the grabbed ticket itself (cursor follows it)
+/// instead of just the cursor while a grab is active.
 fn move_up(app: &mut App) {
     match app.screen {
         Screen::Board => app.selected_row = app.selected_row.saturating_sub(1),
         Screen::Detail => app.detail_scroll = app.detail_scroll.saturating_sub(1),
         Screen::TransitionMenu => {
             app.transition_selected = app.transition_selected.saturating_sub(1);
+        }
+        Screen::Rank => {
+            if app.is_rank_grabbed() {
+                rank_swap_up(app);
+            } else {
+                app.rank_selected = app.rank_selected.saturating_sub(1);
+            }
         }
     }
 }
@@ -531,7 +726,36 @@ fn move_down(app: &mut App) {
                     (app.transition_selected + 1).min(app.transitions.len() - 1);
             }
         }
+        Screen::Rank => {
+            if app.is_rank_grabbed() {
+                rank_swap_down(app);
+            } else if !app.rank_tickets.is_empty() {
+                app.rank_selected = (app.rank_selected + 1).min(app.rank_tickets.len() - 1);
+            }
+        }
     }
+}
+
+/// Swap the grabbed ticket with its upstairs neighbor and follow it with the
+/// cursor, clamping (no-op) at the top of the list.
+fn rank_swap_up(app: &mut App) {
+    if app.rank_selected == 0 {
+        return;
+    }
+    app.rank_tickets
+        .swap(app.rank_selected, app.rank_selected - 1);
+    app.rank_selected -= 1;
+}
+
+/// Swap the grabbed ticket with its downstairs neighbor and follow it with
+/// the cursor, clamping (no-op) at the bottom of the list.
+fn rank_swap_down(app: &mut App) {
+    if app.rank_tickets.is_empty() || app.rank_selected >= app.rank_tickets.len() - 1 {
+        return;
+    }
+    app.rank_tickets
+        .swap(app.rank_selected, app.rank_selected + 1);
+    app.rank_selected += 1;
 }
 
 /// Move the selected board column left by one, saturating at the first
@@ -1417,6 +1641,346 @@ mod tests {
                 AssigneeFilter::Unassigned,
                 AssigneeFilter::Everyone,
             ]
+        );
+    }
+
+    fn rank_app(keys: &[&str], selected: usize) -> App {
+        App {
+            screen: Screen::Rank,
+            project_key: "PROJ".to_string(),
+            rank_tickets: keys.iter().map(|k| ticket(k)).collect(),
+            rank_selected: selected,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn open_rank_switches_screen_resets_state_and_fetches_ranked_jql() {
+        let app = App {
+            project_key: "PROJ".to_string(),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::OpenRank);
+        assert_eq!(app.screen, Screen::Rank);
+        assert_eq!(app.rank_selected, 0);
+        assert!(app.rank_grab_origin.is_none());
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchRankTickets {
+                jql: ranked_tickets_jql("PROJ")
+            }]
+        );
+    }
+
+    #[test]
+    fn refresh_on_rank_screen_fetches_ranked_jql() {
+        let app = rank_app(&["PROJ-1"], 0);
+        let (app, cmds) = update(app, Msg::Refresh);
+        assert_eq!(app.status_line, "Refreshing...");
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchRankTickets {
+                jql: ranked_tickets_jql("PROJ")
+            }]
+        );
+    }
+
+    #[test]
+    fn refresh_on_board_screen_still_fetches_board_jql() {
+        // Regression guard: adding the rank branch to Refresh must not change
+        // the board's existing behavior.
+        let app = App::new();
+        let (_app, cmds) = update(app, Msg::Refresh);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                jql: my_open_tickets_jql()
+            }]
+        );
+    }
+
+    #[test]
+    fn open_in_browser_on_rank_screen_uses_rank_selection() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 1);
+        let (_, cmds) = update(app, Msg::OpenInBrowser);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenUrl(
+                "https://example.atlassian.net/browse/PROJ-2".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn open_in_browser_on_rank_screen_with_empty_list_emits_nothing() {
+        let app = rank_app(&[], 0);
+        let (_, cmds) = update(app, Msg::OpenInBrowser);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rank_tickets_loaded_replaces_list_and_clamps_selection() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 2);
+        let (app, cmds) = update(app, Msg::RankTicketsLoaded(vec![ticket("PROJ-9")]));
+        assert_eq!(app.rank_tickets, vec![ticket("PROJ-9")]);
+        assert_eq!(app.rank_selected, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rank_tickets_loaded_preserves_selection_by_key_when_still_present() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 1);
+        let (app, _) = update(
+            app,
+            Msg::RankTicketsLoaded(vec![ticket("PROJ-0"), ticket("PROJ-2"), ticket("PROJ-3")]),
+        );
+        assert_eq!(app.rank_selected_ticket().unwrap().key, "PROJ-2");
+    }
+
+    #[test]
+    fn rank_tickets_loaded_clears_any_in_progress_grab() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle);
+        assert!(app.is_rank_grabbed());
+        let (app, _) = update(app, Msg::RankTicketsLoaded(vec![ticket("PROJ-1")]));
+        assert!(!app.is_rank_grabbed());
+    }
+
+    #[test]
+    fn rank_tickets_failed_sets_status_line() {
+        let app = rank_app(&["PROJ-1"], 0);
+        let (app, cmds) = update(app, Msg::RankTicketsFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rank_grab_toggle_on_empty_list_is_a_noop() {
+        let app = rank_app(&[], 0);
+        let (app, cmds) = update(app, Msg::RankGrabToggle);
+        assert!(!app.is_rank_grabbed());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rank_grab_toggle_grabs_the_highlighted_ticket() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 1);
+        let (app, cmds) = update(app, Msg::RankGrabToggle);
+        assert_eq!(app.rank_grab_origin, Some(1));
+        assert_eq!(
+            app.rank_snapshot,
+            Some(vec![ticket("PROJ-1"), ticket("PROJ-2")])
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn dropping_without_moving_emits_nothing() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle); // grab
+        let (app, cmds) = update(app, Msg::RankGrabToggle); // drop, unmoved
+        assert!(!app.is_rank_grabbed());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn dropping_mid_list_emits_before_next() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle); // grab PROJ-1
+        let (app, _) = update(app, Msg::Down); // swap with PROJ-2: order [2, 1, 3], selected=1
+        let (app, cmds) = update(app, Msg::RankGrabToggle); // drop at index 1
+        assert!(!app.is_rank_grabbed());
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-2", "PROJ-1", "PROJ-3"]
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::RankTicket {
+                key: "PROJ-1".to_string(),
+                anchor: RankAnchor::Before("PROJ-3".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    fn dropping_at_bottom_emits_after_prev() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle); // grab PROJ-1
+        let (app, _) = update(app, Msg::Down); // [2,1,3] selected=1
+        let (app, _) = update(app, Msg::Down); // [2,3,1] selected=2
+        let (app, cmds) = update(app, Msg::RankGrabToggle); // drop at bottom
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-2", "PROJ-3", "PROJ-1"]
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::RankTicket {
+                key: "PROJ-1".to_string(),
+                anchor: RankAnchor::After("PROJ-3".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    fn dropping_at_top_emits_before_old_first() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 2);
+        let (app, _) = update(app, Msg::RankGrabToggle); // grab PROJ-3
+        let (app, _) = update(app, Msg::Up); // [1,3,2] selected=1
+        let (app, _) = update(app, Msg::Up); // [3,1,2] selected=0
+        let (app, cmds) = update(app, Msg::RankGrabToggle); // drop at top
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-3", "PROJ-1", "PROJ-2"]
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::RankTicket {
+                key: "PROJ-3".to_string(),
+                anchor: RankAnchor::Before("PROJ-1".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    fn grabbed_move_up_clamps_at_top_as_a_noop() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.rank_selected, 0);
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-1", "PROJ-2"]
+        );
+    }
+
+    #[test]
+    fn grabbed_move_down_clamps_at_bottom_as_a_noop() {
+        let app = rank_app(&["PROJ-1", "PROJ-2"], 1);
+        let (app, _) = update(app, Msg::RankGrabToggle);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.rank_selected, 1);
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-1", "PROJ-2"]
+        );
+    }
+
+    #[test]
+    fn ungrabbed_up_and_down_only_move_the_cursor() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 0);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.rank_selected, 1);
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-1", "PROJ-2", "PROJ-3"]
+        );
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.rank_selected, 0);
+    }
+
+    #[test]
+    fn ungrabbed_up_and_down_are_noops_on_an_empty_list() {
+        let app = rank_app(&[], 0);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.rank_selected, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.rank_selected, 0);
+    }
+
+    #[test]
+    fn back_while_grabbed_cancels_and_restores_original_order_and_selection() {
+        let app = rank_app(&["PROJ-1", "PROJ-2", "PROJ-3"], 0);
+        let (app, _) = update(app, Msg::RankGrabToggle); // grab PROJ-1
+        let (app, _) = update(app, Msg::Down); // [2,1,3] selected=1
+        let (app, _) = update(app, Msg::Down); // [2,3,1] selected=2
+        let (app, cmds) = update(app, Msg::Back); // cancel
+        assert!(!app.is_rank_grabbed());
+        assert_eq!(app.screen, Screen::Rank, "cancel stays on the rank screen");
+        assert_eq!(app.rank_selected, 0, "selection restored to its origin");
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-1", "PROJ-2", "PROJ-3"],
+            "original order restored"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn back_while_not_grabbed_returns_to_board_without_quitting() {
+        let app = rank_app(&["PROJ-1"], 0);
+        let (app, _) = update(app, Msg::Back);
+        assert_eq!(app.screen, Screen::Board);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn back_never_quits_from_the_rank_screen_grabbed_or_not() {
+        // q and Esc both map to Msg::Back; the rank screen must never let
+        // either quit the app outright (unlike the board, where Back quits).
+        let grabbed = {
+            let app = rank_app(&["PROJ-1"], 0);
+            let (app, _) = update(app, Msg::RankGrabToggle);
+            app
+        };
+        let (grabbed, _) = update(grabbed, Msg::Back);
+        assert!(!grabbed.quit);
+
+        let not_grabbed = rank_app(&["PROJ-1"], 0);
+        let (not_grabbed, _) = update(not_grabbed, Msg::Back);
+        assert!(!not_grabbed.quit);
+    }
+
+    #[test]
+    fn rank_applied_sets_status_line_and_keeps_the_reordered_list() {
+        let app = rank_app(&["PROJ-2", "PROJ-1", "PROJ-3"], 1);
+        let (app, cmds) = update(
+            app,
+            Msg::RankApplied("Ranked PROJ-1 above PROJ-3".to_string()),
+        );
+        assert_eq!(app.status_line, "Ranked PROJ-1 above PROJ-3");
+        assert_eq!(
+            app.rank_tickets
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-2", "PROJ-1", "PROJ-3"]
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rank_failed_sets_status_line_and_refetches_rank_list() {
+        let app = rank_app(&["PROJ-1"], 0);
+        let (app, cmds) = update(app, Msg::RankFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchRankTickets {
+                jql: ranked_tickets_jql("PROJ")
+            }]
         );
     }
 }
