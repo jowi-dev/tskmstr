@@ -152,8 +152,10 @@ pub enum TicketingError {
     },
 
     /// `tm ticket assign <KEY> <NAME>` found either no assignable user
-    /// matching `name` in `key`'s project, or more than one. See
-    /// [`resolve_assignee_by_name`].
+    /// matching `name` in `key`'s project, or more than one — including two
+    /// users sharing the exact same `displayName` (real Jira projects can
+    /// have this; account IDs are included in `available` specifically to
+    /// disambiguate that case). See [`resolve_assignee_by_name`].
     #[error("no unambiguous assignee match for \"{name}\" on {key}; {available}")]
     NoMatchingAssignee {
         /// The issue key that was to be assigned.
@@ -161,11 +163,26 @@ pub enum TicketingError {
         /// The requested name that matched zero or more than one assignable
         /// user.
         name: String,
-        /// Describes the candidates found (`"candidates: name, ..."`), or,
-        /// when none matched, the project's full assignable-user list
-        /// (`"assignable users: name, ..."`), or, when the project has none
-        /// at all, says so explicitly. See [`format_assignee_candidates`].
+        /// Describes the candidates found (`"candidates: name (accountId),
+        /// ..."`), or, when none matched, the project's full
+        /// assignable-user list (`"assignable users: name (accountId),
+        /// ..."`), or, when the project has none at all, says so explicitly.
+        /// See [`format_assignee_candidates`].
         available: String,
+    },
+
+    /// `tm ticket assign <KEY> <NAME>` was given an empty (or all-whitespace)
+    /// `NAME`.
+    ///
+    /// Rejected explicitly rather than left to the substring-match rule in
+    /// [`resolve_assignee_by_name`], which would otherwise treat `""` as
+    /// matching every assignable user's `displayName` (`str::contains("")`
+    /// is always true) — silently succeeding in any project with exactly one
+    /// assignable user instead of failing loudly.
+    #[error("assignee name for {key} must not be empty")]
+    EmptyAssigneeName {
+        /// The issue key that was to be assigned.
+        key: String,
     },
 }
 
@@ -530,6 +547,11 @@ pub fn assign_ticket(
             Ok(AssignOutcome::AssignedToMe(label))
         }
         AssignTarget::Name(name) => {
+            if name.trim().is_empty() {
+                return Err(TicketingError::EmptyAssigneeName {
+                    key: key.to_string(),
+                });
+            }
             let project = project_key_from_issue_key(key);
             let users = jira.assignable_users(project)?;
             let user = resolve_assignee_by_name(&users, name, key)?;
@@ -553,13 +575,15 @@ fn project_key_from_issue_key(key: &str) -> &str {
 }
 
 /// Resolve `name` against `users`: a case-insensitive exact match on
-/// `display_name` wins first; failing that, a case-insensitive substring
-/// match, but only if it is unambiguous (exactly one candidate).
+/// `display_name` wins first, but only if it is unambiguous (exactly one
+/// user has that exact name — real Jira projects can have two distinct
+/// accounts sharing a `displayName`, so this is not assumed away); failing
+/// that, a case-insensitive substring match, again only if it is unambiguous.
 ///
-/// Fails with [`TicketingError::NoMatchingAssignee`] when the substring match
-/// finds zero or more than one candidate, listing the candidates found (or,
-/// when none matched at all, every assignable user in the project) via
-/// [`format_assignee_candidates`].
+/// Fails with [`TicketingError::NoMatchingAssignee`] when either the exact or
+/// the substring match finds zero or more than one candidate, listing the
+/// candidates found (or, when none matched at all, every assignable user in
+/// the project) via [`format_assignee_candidates`].
 fn resolve_assignee_by_name<'a>(
     users: &'a [JiraUser],
     name: &str,
@@ -567,11 +591,20 @@ fn resolve_assignee_by_name<'a>(
 ) -> Result<&'a JiraUser, TicketingError> {
     let needle = name.to_lowercase();
 
-    if let Some(exact) = users
+    let exact_matches: Vec<&JiraUser> = users
         .iter()
-        .find(|u| u.display_name.to_lowercase() == needle)
-    {
-        return Ok(exact);
+        .filter(|u| u.display_name.to_lowercase() == needle)
+        .collect();
+    match exact_matches.as_slice() {
+        [only] => return Ok(only),
+        [] => {}
+        _ => {
+            return Err(TicketingError::NoMatchingAssignee {
+                key: key.to_string(),
+                name: name.to_string(),
+                available: format_assignee_candidates(&exact_matches, users),
+            });
+        }
     }
 
     let candidates: Vec<&JiraUser> = users
@@ -590,16 +623,19 @@ fn resolve_assignee_by_name<'a>(
 }
 
 /// Describe assignee candidates for display in
-/// [`TicketingError::NoMatchingAssignee`]: `"candidates: name, ..."` when
-/// `candidates` is non-empty (an ambiguous substring match), or, when it's
-/// empty (no match at all), every assignable user in the project
-/// (`"assignable users: name, ..."`), or, when there are none of those
-/// either, says so explicitly rather than leaving a dangling empty list.
+/// [`TicketingError::NoMatchingAssignee`]: `"candidates: name (accountId),
+/// ..."` when `candidates` is non-empty (an ambiguous exact or substring
+/// match — account IDs are included so users sharing an identical
+/// `displayName` are still distinguishable), or, when it's empty (no match
+/// at all), every assignable user in the project the same way
+/// (`"assignable users: name (accountId), ..."`), or, when there are none of
+/// those either, says so explicitly rather than leaving a dangling empty
+/// list.
 fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) -> String {
     if !candidates.is_empty() {
         let list = candidates
             .iter()
-            .map(|u| u.display_name.as_str())
+            .map(|u| format!("{} ({})", u.display_name, u.account_id))
             .collect::<Vec<_>>()
             .join(", ");
         return format!("candidates: {list}");
@@ -611,7 +647,7 @@ fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) 
 
     let list = all_users
         .iter()
-        .map(|u| u.display_name.as_str())
+        .map(|u| format!("{} ({})", u.display_name, u.account_id))
         .collect::<Vec<_>>()
         .join(", ");
     format!("assignable users: {list}")
@@ -1605,6 +1641,83 @@ mod tests {
             }
             other => panic!("expected NoMatchingAssignee, got {other:?}"),
         }
+        assert!(jira.assign_calls().is_empty());
+    }
+
+    #[test]
+    fn assign_ticket_by_name_duplicate_exact_display_name_is_a_hard_error_listing_account_ids() {
+        // Real Jira data: project AX has two distinct accountIds sharing the
+        // exact displayName "Reports & Timesheets AI Agent". An exact match
+        // must not silently pick whichever the API happened to list first.
+        let jira = FakeJiraClient::new().with_assignable_users(
+            "PROJ",
+            vec![
+                jira_user("acct-1", "Reports & Timesheets AI Agent"),
+                jira_user("acct-2", "Reports & Timesheets AI Agent"),
+            ],
+        );
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("Reports & Timesheets AI Agent".to_string()),
+        )
+        .expect_err("should fail: two users share this exact displayName");
+
+        match err {
+            TicketingError::NoMatchingAssignee {
+                key,
+                name,
+                available,
+            } => {
+                assert_eq!(key, "PROJ-372");
+                assert_eq!(name, "Reports & Timesheets AI Agent");
+                assert!(
+                    available.contains("acct-1") && available.contains("acct-2"),
+                    "available should list account IDs to disambiguate identically-named users: {available}"
+                );
+            }
+            other => panic!("expected NoMatchingAssignee, got {other:?}"),
+        }
+        assert!(jira.assign_calls().is_empty());
+    }
+
+    #[test]
+    fn assign_ticket_by_name_empty_name_is_a_hard_error() {
+        // A single-user project would otherwise let the substring rule match
+        // trivially on an empty needle ("".contains("") is always true),
+        // silently assigning. This must be rejected explicitly instead.
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("PROJ", vec![jira_user("acct-1", "Jane Doe")]);
+        let cfg = config();
+
+        let err = assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Name("".to_string()))
+            .expect_err("empty name should fail");
+
+        match err {
+            TicketingError::EmptyAssigneeName { key } => assert_eq!(key, "PROJ-372"),
+            other => panic!("expected EmptyAssigneeName, got {other:?}"),
+        }
+        assert!(jira.assign_calls().is_empty());
+    }
+
+    #[test]
+    fn assign_ticket_by_name_whitespace_only_name_is_a_hard_error() {
+        let jira = FakeJiraClient::new()
+            .with_assignable_users("PROJ", vec![jira_user("acct-1", "Jane Doe")]);
+        let cfg = config();
+
+        let err = assign_ticket(
+            &jira,
+            &cfg,
+            "PROJ-372",
+            &AssignTarget::Name("   ".to_string()),
+        )
+        .expect_err("whitespace-only name should fail");
+
+        assert!(matches!(err, TicketingError::EmptyAssigneeName { .. }));
         assert!(jira.assign_calls().is_empty());
     }
 
