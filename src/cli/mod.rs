@@ -317,6 +317,12 @@ pub enum RunsCmd {
         #[arg(long)]
         detail: Option<String>,
     },
+    /// Marks abandoned runs (stale heartbeat, dead pid) as failed.
+    Reap {
+        /// Minutes without a heartbeat before a run counts as stale.
+        #[arg(long, default_value_t = 10)]
+        stale_after: u64,
+    },
 }
 
 /// Terminal statuses accepted by `tm runs finish` (queued/running are not
@@ -1147,6 +1153,33 @@ mod tests {
                 assert_eq!(detail, None);
             }
             other => panic!("expected Runs Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_reap_with_default_stale_after() {
+        let cli = Cli::try_parse_from(["tm", "runs", "reap"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Reap { stale_after }),
+            }) => {
+                assert_eq!(stale_after, 10);
+            }
+            other => panic!("expected Runs Reap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_reap_with_explicit_stale_after() {
+        let cli = Cli::try_parse_from(["tm", "runs", "reap", "--stale-after", "0"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Reap { stale_after }),
+            }) => {
+                assert_eq!(stale_after, 0);
+            }
+            other => panic!("expected Runs Reap, got {other:?}"),
         }
     }
 }

@@ -11,6 +11,29 @@ use thiserror::Error;
 
 use crate::runs::{FinishRun, RunStore, RunStoreError, RunSummary, StartRun};
 
+/// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
+///
+/// Prints `Reaped run {id} ({ticket})` for each reaped run, or
+/// `Nothing to reap.` when none qualified.
+pub fn reap(
+    store: &RunStore,
+    stale_after_mins: u64,
+    pid_alive: &dyn Fn(u32) -> bool,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let reaped = store.reap(stale_after_mins, pid_alive)?;
+
+    if reaped.is_empty() {
+        writeln!(out, "Nothing to reap.")?;
+        return Ok(());
+    }
+
+    for run in &reaped {
+        writeln!(out, "Reaped run {} ({})", run.id, run.ticket)?;
+    }
+    Ok(())
+}
+
 /// Errors surfaced by `tm runs` subcommands.
 #[derive(Debug, Error)]
 pub enum RunsCliError {
@@ -397,5 +420,46 @@ mod tests {
     #[test]
     fn format_age_negative_clamps_to_zero_seconds() {
         assert_eq!(format_age(-5), "0s");
+    }
+
+    fn always_alive(_pid: u32) -> bool {
+        true
+    }
+
+    fn always_dead(_pid: u32) -> bool {
+        false
+    }
+
+    #[test]
+    fn reap_prints_nothing_to_reap_when_none_qualify() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        reap(&store, 10, &always_alive, &mut out).expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "Nothing to reap.\n");
+    }
+
+    #[test]
+    fn reap_prints_a_line_per_reaped_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        // `RunStore` keeps its connection private, so this test can't
+        // backdate the heartbeat directly (see runs::tests for that kind of
+        // coverage). Instead, let a moment of real time pass and reap with
+        // `--stale-after 0`, so the freshly-started run's `started_at` is
+        // already "stale" relative to "now".
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut out = Vec::new();
+
+        reap(&store, 0, &always_dead, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Reaped run {id} (PROJ-1)\n")
+        );
     }
 }

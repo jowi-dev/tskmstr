@@ -333,6 +333,14 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             tskmstr::cli::runs::event(&store, run_id, &kind, detail.as_deref(), &mut stdout)?;
         }
+        Some(RunsCmd::Reap { stale_after }) => {
+            tskmstr::cli::runs::reap(
+                &store,
+                stale_after,
+                &tskmstr::runs::pid::pid_alive,
+                &mut stdout,
+            )?;
+        }
     }
     Ok(())
 }
