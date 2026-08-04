@@ -37,10 +37,10 @@ Set these before there are two concurrent lanes. The failure mode when you forge
 is `SQLITE_BUSY` surfacing as an apparently flaky agent — you'll debug the wrong
 layer for an afternoon.
 
-- [ ] `runs` and `run_events` tables, indexes
-- [ ] `tskmstr runs start` → prints a run id
-- [ ] `tskmstr runs finish` → status, exit code, session id, cost, turns
-- [ ] `tskmstr runs` → table view
+- [x] `runs` and `run_events` tables, indexes
+- [x] `tskmstr runs start` → prints a run id
+- [x] `tskmstr runs finish` → status, exit code, session id, cost, turns
+- [x] `tskmstr runs` → table view
 
 ### 2. Wire the runner
 
@@ -57,7 +57,7 @@ isolate the block path — each needs one append before its `exit 2`.
 A run that trips the Boberdoo guard and then spins is exactly the failure that's
 currently invisible.
 
-- [ ] `tskmstr runs event <run-id> --kind gate_blocked --detail <json>`
+- [x] `tskmstr runs event <run-id> --kind gate_blocked --detail <json>`
 - [ ] Append call in both hooks
 
 ### 4. Remaining hook telemetry
@@ -72,14 +72,14 @@ currently invisible.
 
 A crashed runner leaves a row reading `running` forever.
 
-- [ ] `tskmstr runs reap` — stale `heartbeat_at` **and** dead `pid` → `failed`
-- [ ] Reap on TUI startup and on a timer. Never trust `status` alone.
+- [x] `tskmstr runs reap` — stale `heartbeat_at` **and** dead `pid` → `failed`
+- [x] Reap on TUI startup and on a timer. Never trust `status` alone.
 
 ### 6. TUI
 
-- [ ] `tskmstr runs watch` — poll SQLite, 500ms is fine
-- [ ] `tskmstr runs show <ticket>` — event timeline
-- [ ] `tskmstr runs resume <ticket>` — print session id for `claude --resume`
+- [x] `tskmstr runs watch` — poll SQLite, 500ms is fine
+- [x] `tskmstr runs show <ticket>` — event timeline
+- [x] `tskmstr runs resume <ticket>` — print session id for `claude --resume`
 
 ---
 

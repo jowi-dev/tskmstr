@@ -66,6 +66,48 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
+| `tm runs` | List every recorded lane run in a table |
+| `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid]` | Record the start of a lane run; prints the new run id |
+| `tm runs finish <RUN_ID> --status <STATUS> [...]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`) |
+| `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
+| `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
+| `tm runs show <KEY>` | Print the latest run for a ticket and its event timeline |
+| `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
+| `tm runs watch` | Live kanban board of lane runs, polling the local run db |
+
+## `tm runs`
+
+`tm runs` inspects and records autonomous lane runs. Ticket data still lives
+in Jira and process lifecycle is owned by whatever supervises the runner
+(systemd, launchd, a shell loop) — `tm` never spawns or supervises a runner
+itself; see `docs/decisions/0001-run-state.md`. State lives in a local
+SQLite database at `$XDG_DATA_HOME/tskmstr/runs.db` (falling back to
+`~/.local/share/tskmstr/runs.db` when `XDG_DATA_HOME` isn't set), or wherever
+`run_db_path` in `config.toml` points instead.
+
+A runner (or its hooks) is expected to call `start`/`event`/`finish` around
+its own lifecycle:
+
+```
+run_id=$(tm runs start --ticket PROJ-123 --lane backend --worktree /path/to/wt --pid $$)
+tm runs event "$run_id" --kind tool_use --detail '{"file":"a.rs"}'
+tm runs finish "$run_id" --status done --session-id sess-abc --cost-usd 1.23 --num-turns 7
+```
+
+`tm runs reap` (also run automatically on `tm runs watch` startup and every
+~30s while it's open) marks a run `failed` if its status is `running`, its
+last heartbeat is older than `--stale-after` minutes (default 10), and its
+recorded pid is no longer alive — a crashed runner otherwise leaves a row
+reading `running` forever.
+
+`tm runs watch` opens a full-screen kanban board of every run, one column
+per status (Queued, Running, Blocked, Review, Done, Failed), refreshing from
+the database every ~500ms. `h`/`l` move between columns, `j`/`k` move within
+a column, `Enter` opens a floating window with the selected run's full
+detail and event timeline (`j`/`k` scroll it, `Esc`/`q` closes it), `r`
+refreshes immediately, and `q`/`Esc` quits when no detail window is open. A
+`Running` card whose heartbeat is more than 10 minutes stale is marked with
+a red `!`.
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default
