@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod pid;
@@ -232,6 +232,61 @@ pub struct RunSummary {
     pub last_event_kind: Option<String>,
     /// Seconds since the most recent event, if any.
     pub last_event_age_secs: Option<i64>,
+}
+
+/// Full row from `runs`, used by `tm runs show`/`resume` and (later) the
+/// watch detail view.
+#[derive(Debug, Clone)]
+pub struct Run {
+    /// Row id.
+    pub id: i64,
+    /// Jira ticket key.
+    pub ticket: String,
+    /// Lane name.
+    pub lane: String,
+    /// Current status.
+    pub status: RunStatus,
+    /// `claude -p` session id, if recorded.
+    pub session_id: Option<String>,
+    /// Filesystem path of the git worktree the run used.
+    pub worktree: String,
+    /// Branch checked out in the worktree, if known.
+    pub branch: Option<String>,
+    /// PID of the runner process, if known.
+    pub pid: Option<u32>,
+    /// Filesystem path of the full transcript, if one was captured.
+    pub transcript: Option<String>,
+    /// When the run started.
+    pub started_at: String,
+    /// Last heartbeat time, if any.
+    pub heartbeat_at: Option<String>,
+    /// When the run ended, if it has.
+    pub ended_at: Option<String>,
+    /// Process exit code, if the run exited normally.
+    pub exit_code: Option<i32>,
+    /// Number of turns the run took, if known.
+    pub num_turns: Option<i64>,
+    /// Reported cost of the run in USD, if known.
+    pub cost_usd: Option<f64>,
+    /// Escalation text, set when `status` is [`RunStatus::Blocked`].
+    pub blocker: Option<String>,
+    /// URL of the pull request the run opened, if any.
+    pub pr_url: Option<String>,
+    /// Seconds since `started_at`, computed in SQL like [`RunSummary::age_secs`].
+    pub age_secs: i64,
+}
+
+/// One `run_events` row.
+#[derive(Debug, Clone)]
+pub struct RunEvent {
+    /// Row id.
+    pub id: i64,
+    /// When the event was recorded.
+    pub at: String,
+    /// Event kind, e.g. `tool_use` or `stop`.
+    pub kind: String,
+    /// Optional detail payload, stored as-is.
+    pub detail: Option<String>,
 }
 
 impl RunStore {
@@ -495,6 +550,71 @@ impl RunStore {
         }
 
         Ok(reaped)
+    }
+
+    /// Returns the latest run for `ticket` (by `started_at`, breaking ties
+    /// by `id`, both descending), or `None` if it has no runs.
+    pub fn latest_run_for_ticket(&self, ticket: &str) -> Result<Option<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             WHERE ticket = ?1
+             ORDER BY started_at DESC, id DESC
+             LIMIT 1";
+
+        self.conn
+            .query_row(sql, params![ticket], |row| {
+                let status_str: String = row.get(3)?;
+                let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+                Ok(Run {
+                    id: row.get(0)?,
+                    ticket: row.get(1)?,
+                    lane: row.get(2)?,
+                    status,
+                    session_id: row.get(4)?,
+                    worktree: row.get(5)?,
+                    branch: row.get(6)?,
+                    pid: row.get(7)?,
+                    transcript: row.get(8)?,
+                    started_at: row.get(9)?,
+                    heartbeat_at: row.get(10)?,
+                    ended_at: row.get(11)?,
+                    exit_code: row.get(12)?,
+                    num_turns: row.get(13)?,
+                    cost_usd: row.get(14)?,
+                    blocker: row.get(15)?,
+                    pr_url: row.get(16)?,
+                    age_secs: row.get(17)?,
+                })
+            })
+            .optional()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Returns all events for `run_id`, oldest first.
+    pub fn events_for_run(&self, run_id: i64) -> Result<Vec<RunEvent>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, at, kind, detail FROM run_events
+             WHERE run_id = ?1
+             ORDER BY at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(RunEvent {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                kind: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 }
 
@@ -1202,5 +1322,157 @@ mod tests {
         let reaped = store.reap(10, &always_dead).unwrap();
 
         assert!(reaped.is_empty());
+    }
+
+    #[test]
+    fn latest_run_for_ticket_returns_none_when_no_runs() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.latest_run_for_ticket("PROJ-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_run_for_ticket_picks_most_recent_started_at() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let older_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-older".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![older_id],
+            )
+            .unwrap();
+
+        let newer_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-newer".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = '2020-06-01T00:00:00.000Z' WHERE id = ?1",
+                params![newer_id],
+            )
+            .unwrap();
+
+        let run = store
+            .latest_run_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(run.id, newer_id);
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(run.worktree, "/tmp/wt-newer");
+        assert!(run.age_secs >= 0);
+    }
+
+    #[test]
+    fn latest_run_for_ticket_breaks_started_at_tie_by_id() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let first_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-first".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        let second_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-second".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        let same_started_at = "2020-06-01T00:00:00.000Z";
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = ?1 WHERE id IN (?2, ?3)",
+                params![same_started_at, first_id, second_id],
+            )
+            .unwrap();
+
+        let run = store
+            .latest_run_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(run.id, second_id);
+    }
+
+    #[test]
+    fn events_for_run_returns_empty_vec_when_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let run_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        let events = store.events_for_run(run_id).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn events_for_run_orders_oldest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let run_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        let second_id = store.add_event(run_id, "second", None).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE run_events SET at = '2020-06-01T00:00:00.000Z' WHERE id = ?1",
+                params![second_id],
+            )
+            .unwrap();
+        let first_id = store.add_event(run_id, "first", Some("detail")).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE run_events SET at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![first_id],
+            )
+            .unwrap();
+
+        let events = store.events_for_run(run_id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["first", "second"]);
+        assert_eq!(events[0].detail.as_deref(), Some("detail"));
     }
 }
