@@ -594,6 +594,49 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Returns the run with id `run_id`, or `None` if no such row exists.
+    ///
+    /// Used by `tm runs watch`'s detail window, which navigates by row id
+    /// rather than ticket key (unlike [`RunStore::latest_run_for_ticket`],
+    /// multiple runs can share a ticket key).
+    pub fn run_by_id(&self, run_id: i64) -> Result<Option<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             WHERE id = ?1";
+
+        self.conn
+            .query_row(sql, params![run_id], |row| {
+                let status_str: String = row.get(3)?;
+                let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+                Ok(Run {
+                    id: row.get(0)?,
+                    ticket: row.get(1)?,
+                    lane: row.get(2)?,
+                    status,
+                    session_id: row.get(4)?,
+                    worktree: row.get(5)?,
+                    branch: row.get(6)?,
+                    pid: row.get(7)?,
+                    transcript: row.get(8)?,
+                    started_at: row.get(9)?,
+                    heartbeat_at: row.get(10)?,
+                    ended_at: row.get(11)?,
+                    exit_code: row.get(12)?,
+                    num_turns: row.get(13)?,
+                    cost_usd: row.get(14)?,
+                    blocker: row.get(15)?,
+                    pr_url: row.get(16)?,
+                    age_secs: row.get(17)?,
+                })
+            })
+            .optional()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns all events for `run_id`, oldest first.
     pub fn events_for_run(&self, run_id: i64) -> Result<Vec<RunEvent>, RunStoreError> {
         let mut stmt = self.conn.prepare(
@@ -1419,6 +1462,47 @@ mod tests {
             .unwrap()
             .expect("expected a run");
         assert_eq!(run.id, second_id);
+    }
+
+    #[test]
+    fn run_by_id_returns_none_when_no_such_row() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.run_by_id(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn run_by_id_returns_the_matching_row() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let other_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-other".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-target".to_string(),
+                branch: Some("proj-1".to_string()),
+                pid: Some(4242),
+            })
+            .unwrap();
+        assert_ne!(other_id, id);
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.id, id);
+        assert_eq!(run.worktree, "/tmp/wt-target");
+        assert_eq!(run.branch, Some("proj-1".to_string()));
+        assert_eq!(run.pid, Some(4242));
+        assert!(run.age_secs >= 0);
     }
 
     #[test]
