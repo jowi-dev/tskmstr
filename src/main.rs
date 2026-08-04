@@ -326,6 +326,13 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
             };
             tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
         }
+        Some(RunsCmd::Event {
+            run_id,
+            kind,
+            detail,
+        }) => {
+            tskmstr::cli::runs::event(&store, run_id, &kind, detail.as_deref(), &mut stdout)?;
+        }
     }
     Ok(())
 }

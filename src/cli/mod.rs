@@ -306,6 +306,17 @@ pub enum RunsCmd {
         #[arg(long)]
         transcript: Option<String>,
     },
+    /// Appends a telemetry event to a run and bumps its heartbeat.
+    Event {
+        /// Row id returned by `tm runs start`.
+        run_id: i64,
+        /// Event kind, e.g. `tool_use` or `stop`.
+        #[arg(long)]
+        kind: String,
+        /// Optional JSON detail payload, validated before it is stored.
+        #[arg(long)]
+        detail: Option<String>,
+    },
 }
 
 /// Terminal statuses accepted by `tm runs finish` (queued/running are not
@@ -1086,5 +1097,56 @@ mod tests {
     fn runs_finish_status_running_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "runs", "finish", "3", "--status", "running"]);
         assert!(result.is_err(), "running is not a valid finish status");
+    }
+
+    #[test]
+    fn parses_runs_event_with_detail() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "runs",
+            "event",
+            "3",
+            "--kind",
+            "tool_use",
+            "--detail",
+            r#"{"file":"a.rs"}"#,
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Event {
+                        run_id,
+                        kind,
+                        detail,
+                    }),
+            }) => {
+                assert_eq!(run_id, 3);
+                assert_eq!(kind, "tool_use");
+                assert_eq!(detail, Some(r#"{"file":"a.rs"}"#.to_string()));
+            }
+            other => panic!("expected Runs Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_event_without_detail() {
+        let cli = Cli::try_parse_from(["tm", "runs", "event", "3", "--kind", "stop"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Event {
+                        run_id,
+                        kind,
+                        detail,
+                    }),
+            }) => {
+                assert_eq!(run_id, 3);
+                assert_eq!(kind, "stop");
+                assert_eq!(detail, None);
+            }
+            other => panic!("expected Runs Event, got {other:?}"),
+        }
     }
 }

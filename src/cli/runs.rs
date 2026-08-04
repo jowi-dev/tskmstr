@@ -21,6 +21,10 @@ pub enum RunsCliError {
     /// Writing output failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// `--detail` was given but isn't valid JSON.
+    #[error("--detail is not valid JSON: {0}")]
+    InvalidDetailJson(#[from] serde_json::Error),
 }
 
 /// `tm runs start`: record the start of a lane run, printing only the new
@@ -43,6 +47,28 @@ pub fn finish(
 ) -> Result<(), RunsCliError> {
     store.finish_run(run_id, outcome)?;
     writeln!(out, "Finished run {run_id}: {}", outcome.status.as_str())?;
+    Ok(())
+}
+
+/// `tm runs event`: append a telemetry event to a run and bump its
+/// heartbeat.
+///
+/// If `detail` is given, it is validated as JSON before the store is
+/// touched at all, so an invalid `--detail` never results in a partially
+/// recorded event. Prints `Recorded {kind} for run {run_id}` on success.
+pub fn event(
+    store: &RunStore,
+    run_id: i64,
+    kind: &str,
+    detail: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    if let Some(detail) = detail {
+        serde_json::from_str::<serde_json::Value>(detail)?;
+    }
+
+    store.add_event(run_id, kind, detail)?;
+    writeln!(out, "Recorded {kind} for run {run_id}")?;
     Ok(())
 }
 
@@ -194,6 +220,82 @@ mod tests {
         let mut out = Vec::new();
 
         let err = finish(&store, 999, &FinishRun::default(), &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::Store(RunStoreError::RunNotFound(999))
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn event_prints_confirmation_and_records_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        event(&store, id, "tool_use", Some(r#"{"file":"a.rs"}"#), &mut out)
+            .expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Recorded tool_use for run {id}\n")
+        );
+
+        let mut list_out = Vec::new();
+        list(&store, &mut list_out).unwrap();
+        let list_output = String::from_utf8(list_out).unwrap();
+        assert!(
+            list_output.contains("tool_use"),
+            "list output should show the recorded event kind: {list_output}"
+        );
+    }
+
+    #[test]
+    fn event_without_detail_succeeds() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        event(&store, id, "stop", None, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Recorded stop for run {id}\n")
+        );
+    }
+
+    #[test]
+    fn event_invalid_json_detail_errors_and_inserts_nothing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        let err =
+            event(&store, id, "tool_use", Some("not json"), &mut out).expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::InvalidDetailJson(_)));
+        assert!(out.is_empty());
+
+        let mut list_out = Vec::new();
+        list(&store, &mut list_out).unwrap();
+        let list_output = String::from_utf8(list_out).unwrap();
+        assert!(
+            !list_output.contains("tool_use"),
+            "no event should have been recorded: {list_output}"
+        );
+    }
+
+    #[test]
+    fn event_unknown_run_id_errors() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = event(&store, 999, "tool_use", None, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
