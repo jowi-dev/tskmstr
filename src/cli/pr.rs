@@ -197,6 +197,7 @@ mod tests {
             default_assignee_account_id: Some("acct-1".to_string()),
             status_on_pr: None,
             status_on_create: None,
+            run_db_path: None,
         }
     }
 

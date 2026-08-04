@@ -130,6 +130,7 @@ fn bootstrap_config(
         default_assignee_account_id: None,
         status_on_pr: None,
         status_on_create: None,
+        run_db_path: None,
     })
 }
 

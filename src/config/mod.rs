@@ -42,6 +42,13 @@ pub struct RawConfig {
     /// setting a newly created ticket is left in the workflow's initial
     /// status.
     pub status_on_create: Option<String>,
+    /// Override path for the run-state SQLite database used by `tm runs`.
+    ///
+    /// When unset, `tm runs` falls back to
+    /// [`crate::runs::default_db_path`]. Set here (typically in a repo-local
+    /// `.tskmstr.toml`) so that a project's runs stay in the project rather
+    /// than the shared per-user default.
+    pub run_db_path: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -63,6 +70,9 @@ pub struct Config {
     /// Workflow status name to transition a `tm ticket create`d ticket to,
     /// if configured. See [`RawConfig::status_on_create`] for semantics.
     pub status_on_create: Option<String>,
+    /// Override path for the run-state SQLite database, if configured. See
+    /// [`RawConfig::run_db_path`] for semantics.
+    pub run_db_path: Option<String>,
 }
 
 /// Locations to read configuration from.
@@ -185,6 +195,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         default_assignee_account_id: None,
         status_on_pr: None,
         status_on_create: None,
+        run_db_path: None,
     }
 }
 
@@ -240,6 +251,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         .or(global.default_assignee_account_id);
     let status_on_pr = repo.status_on_pr.or(global.status_on_pr);
     let status_on_create = repo.status_on_create.or(global.status_on_create);
+    let run_db_path = repo.run_db_path.or(global.run_db_path);
 
     let expected_path = default_global_config_path();
 
@@ -254,6 +266,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         default_assignee_account_id,
         status_on_pr,
         status_on_create,
+        run_db_path,
     })
 }
 
@@ -359,6 +372,7 @@ mod tests {
             default_assignee_account_id: Some("acct-global".into()),
             status_on_pr: Some("In Review".into()),
             status_on_create: Some("In Progress".into()),
+            run_db_path: Some("/global/runs.db".into()),
         }
     }
 
@@ -380,6 +394,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
+            run_db_path: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -401,6 +416,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: Some("Ready for Review".into()),
             status_on_create: None,
+            run_db_path: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -425,6 +441,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: Some("In Progress".into()),
+            run_db_path: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -438,6 +455,31 @@ mod tests {
         };
         let cfg = merge(global, None).expect("should merge");
         assert_eq!(cfg.status_on_create, None);
+    }
+
+    #[test]
+    fn merge_repo_overrides_run_db_path() {
+        let repo = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: None,
+            run_db_path: Some("/repo/runs.db".into()),
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
+    }
+
+    #[test]
+    fn merge_run_db_path_absent_from_both_is_none() {
+        let global = RawConfig {
+            run_db_path: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.run_db_path, None);
     }
 
     #[test]
@@ -648,6 +690,77 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.status_on_create, Some("Doing".to_string()));
+    }
+
+    #[test]
+    fn load_global_with_run_db_path_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            run_db_path = "/global/runs.db"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.run_db_path, Some("/global/runs.db".to_string()));
+    }
+
+    #[test]
+    fn load_global_without_run_db_path_is_none() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.run_db_path, None);
+    }
+
+    #[test]
+    fn load_repo_overrides_run_db_path() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            run_db_path = "/global/runs.db"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"run_db_path = "/repo/runs.db""#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.run_db_path, Some("/repo/runs.db".to_string()));
     }
 
     #[test]
