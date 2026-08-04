@@ -5,5 +5,6 @@ pub mod config;
 pub mod github;
 pub mod jira;
 pub mod keychain;
+pub mod runs;
 pub mod ticketing;
 pub mod tui;
