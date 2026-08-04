@@ -5,7 +5,8 @@
 //! [`HttpJiraClient`] directly against an `httpmock` server.
 
 use crate::jira::types::{
-    CreateIssueRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
+    CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
+    SearchResult, Transition,
 };
 use reqwest::blocking::Client;
 use thiserror::Error;
@@ -82,6 +83,18 @@ pub enum JiraError {
     RankPartialFailure {
         /// Detail extracted from the response body, if any.
         message: String,
+    },
+
+    /// [`JiraClient::create_link`] got a 404: like [`JiraError::RankNotFound`],
+    /// a link request names two issues and Jira's 404 body doesn't reliably
+    /// say which one is missing. Kept distinct from [`JiraError::NotFound`]
+    /// so the error text names both keys involved instead of a single one.
+    #[error("Jira issue not found while linking {blocker} as blocking {blocked}")]
+    LinkNotFound {
+        /// The issue key that was to block `blocked`.
+        blocker: String,
+        /// The issue key that was to be blocked by `blocker`.
+        blocked: String,
     },
 }
 
@@ -179,6 +192,16 @@ pub trait JiraClient {
     /// issue because that's what the API supports, though tskmstr only ever
     /// ranks one issue at a time today.
     fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError>;
+
+    /// Create a `Blocks` issue link (`POST /rest/api/3/issueLink`), 201 on
+    /// success, such that `req.blocker_key` blocks `req.blocked_key`.
+    ///
+    /// A 404 means one of the two issues in `req` doesn't exist, but Jira's
+    /// error body doesn't reliably say which — mapped to
+    /// [`JiraError::LinkNotFound`] naming both keys rather than the generic
+    /// [`JiraError::NotFound`], following the precedent of
+    /// [`JiraError::RankNotFound`].
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -375,7 +398,7 @@ impl JiraClient for HttpJiraClient {
     fn search(&self, jql: &str) -> Result<SearchResult, JiraError> {
         let body = serde_json::json!({
             "jql": jql,
-            "fields": ["summary", "status", "assignee", "description"],
+            "fields": ["summary", "status", "assignee", "description", "issuelinks"],
             "maxResults": 50,
         });
         let response = self
@@ -472,6 +495,40 @@ impl JiraClient for HttpJiraClient {
             return Err(JiraError::RankNotFound {
                 keys: keys.join(", "),
                 anchor: anchor.key().to_string(),
+            });
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(JiraError::Unauthorized);
+        }
+
+        let body = response.text().unwrap_or_default();
+        Err(JiraError::Api {
+            status: status.as_u16(),
+            message: extract_error_message(&body),
+        })
+    }
+
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .post(self.url("/issueLink"))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&req.to_payload())
+            .send()?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // Like `rank`'s 404 handling, a link request names two issues and
+        // Jira's 404 body doesn't say which is missing, so this can't go
+        // through `parse_empty`'s single-key `NotFound`.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(JiraError::LinkNotFound {
+                blocker: req.blocker_key.clone(),
+                blocked: req.blocked_key.clone(),
             });
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -783,7 +840,7 @@ mod tests {
                 )
                 .json_body(serde_json::json!({
                     "jql": "assignee = currentUser()",
-                    "fields": ["summary", "status", "assignee", "description"],
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
                     "maxResults": 50
                 }));
             then.status(200)
@@ -1148,6 +1205,89 @@ mod tests {
 
         let client = HttpJiraClient::new(test_ctx(&server));
         let err = client.myself().expect_err("should fail");
+
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn create_link_posts_blocks_payload() {
+        use crate::jira::types::CreateLinkRequest;
+
+        let server = MockServer::start();
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issueLink")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(req.to_payload());
+            then.status(201);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .create_link(&req)
+            .expect("create_link should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn create_link_maps_404_to_link_not_found_with_both_keys() {
+        use crate::jira::types::CreateLinkRequest;
+
+        let server = MockServer::start();
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-404".to_string(),
+        };
+
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issueLink");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.create_link(&req).expect_err("should fail");
+
+        match err {
+            JiraError::LinkNotFound { blocker, blocked } => {
+                assert_eq!(blocker, "PROJ-1");
+                assert_eq!(blocked, "PROJ-404");
+            }
+            other => panic!("expected LinkNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_link_maps_401_to_unauthorized() {
+        use crate::jira::types::CreateLinkRequest;
+
+        let server = MockServer::start();
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issueLink");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Unauthorized"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.create_link(&req).expect_err("should fail");
 
         assert!(matches!(err, JiraError::Unauthorized));
     }

@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::{
-    CreateIssueRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
+    CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
+    SearchResult, Transition,
 };
 
 /// Canned outcome for [`FakeJiraClient::get_issue`] on a given key.
@@ -48,9 +49,10 @@ enum AssignableUsersOutcome {
 ///
 /// Issues are seeded by key via [`with_issue`](Self::with_issue),
 /// [`with_issue_not_found`](Self::with_issue_not_found), and
-/// [`with_issue_error`](Self::with_issue_error). `create_issue` and
-/// `add_remote_link` calls are recorded for assertions; every other method
-/// returns an inert default, since ticketing flows don't exercise them.
+/// [`with_issue_error`](Self::with_issue_error). `create_issue`,
+/// `add_remote_link`, and `create_link` calls are recorded for assertions;
+/// every other method returns an inert default, since ticketing flows don't
+/// exercise them.
 pub struct FakeJiraClient {
     issues: RefCell<HashMap<String, IssueOutcome>>,
     create_issue_result: RefCell<Option<Issue>>,
@@ -67,6 +69,8 @@ pub struct FakeJiraClient {
     assign_calls: RefCell<Vec<(String, Option<String>)>>,
     rank_result: RefCell<Result<(), (u16, String)>>,
     rank_calls: RefCell<Vec<(Vec<String>, RankAnchor)>>,
+    create_link_result: RefCell<Result<(), (u16, String)>>,
+    create_link_calls: RefCell<Vec<CreateLinkRequest>>,
 }
 
 impl Default for FakeJiraClient {
@@ -87,6 +91,8 @@ impl Default for FakeJiraClient {
             assign_calls: RefCell::new(Vec::new()),
             rank_result: RefCell::new(Ok(())),
             rank_calls: RefCell::new(Vec::new()),
+            create_link_result: RefCell::new(Ok(())),
+            create_link_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -261,6 +267,18 @@ impl FakeJiraClient {
     pub fn rank_calls(&self) -> Vec<(Vec<String>, RankAnchor)> {
         self.rank_calls.borrow().clone()
     }
+
+    /// Seed `create_link(..)` to return [`JiraError::Api`] with the given
+    /// status and message.
+    pub fn with_create_link_error(self, status: u16, message: &str) -> Self {
+        *self.create_link_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The requests passed to `create_link`, in call order.
+    pub fn create_link_calls(&self) -> Vec<CreateLinkRequest> {
+        self.create_link_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -395,6 +413,17 @@ impl JiraClient for FakeJiraClient {
             }),
         }
     }
+
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError> {
+        self.create_link_calls.borrow_mut().push(req.clone());
+        match self.create_link_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +445,7 @@ mod tests {
                 },
                 description: None,
                 assignee: None,
+                issue_links: vec![],
             },
         }
     }
@@ -603,6 +633,37 @@ mod tests {
                 RankAnchor::After("PROJ-2".to_string()),
             )
             .expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_link_records_calls_and_succeeds_by_default() {
+        let fake = FakeJiraClient::new();
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        fake.create_link(&req).expect("should succeed");
+
+        assert_eq!(fake.create_link_calls(), vec![req]);
+    }
+
+    #[test]
+    fn create_link_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_create_link_error(500, "boom");
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        let err = fake.create_link(&req).expect_err("should fail");
         match err {
             JiraError::Api { status, message } => {
                 assert_eq!(status, 500);

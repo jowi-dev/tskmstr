@@ -268,6 +268,12 @@ mod tests {
         ) -> Result<(), JiraError> {
             self.0.rank(keys, anchor)
         }
+        fn create_link(
+            &self,
+            req: &crate::jira::types::CreateLinkRequest,
+        ) -> Result<(), JiraError> {
+            self.0.create_link(req)
+        }
     }
 
     fn write_test_config(path: &Path) {

@@ -41,6 +41,73 @@ pub struct IssueFields {
     pub description: Option<Value>,
     /// Assigned user, if any.
     pub assignee: Option<UserRef>,
+    /// Issue links (dependencies) attached to this issue.
+    ///
+    /// `#[serde(default)]` is required for two reasons: search responses
+    /// only include fields that were explicitly requested (so an issue
+    /// fetched by a query that didn't ask for `issuelinks` simply omits the
+    /// key), and many existing fixtures predate link support entirely. Note
+    /// the Jira field name is `issuelinks`, all lowercase, unlike the
+    /// camelCase used elsewhere in this struct.
+    #[serde(default, rename = "issuelinks")]
+    pub issue_links: Vec<IssueLink>,
+}
+
+/// A single issue-link entry, as embedded in [`IssueFields::issue_links`].
+///
+/// Jira models a link as directional relative to the issue it's embedded
+/// in, using exactly one of `inwardIssue`/`outwardIssue` per entry (never
+/// both, in practice, but both are modeled as `Option` since nothing in the
+/// API schema guarantees exactly one). The direction is easy to get
+/// backwards, so spell it out: for an entry on issue X,
+/// - `inward_issue: Some(Y)` means "X `<link_type.inward>` Y" — for the
+///   `Blocks` link type, "X is blocked by Y", i.e. Y blocks X.
+/// - `outward_issue: Some(Y)` means "X `<link_type.outward>` Y" — for the
+///   `Blocks` link type, "X blocks Y".
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueLink {
+    /// The kind of relationship this link represents.
+    #[serde(rename = "type")]
+    pub link_type: IssueLinkType,
+    /// Present when this entry describes an inward relationship (see
+    /// [`IssueLink`] docs for what "inward" means).
+    pub inward_issue: Option<LinkedIssue>,
+    /// Present when this entry describes an outward relationship (see
+    /// [`IssueLink`] docs for what "outward" means).
+    pub outward_issue: Option<LinkedIssue>,
+}
+
+/// The kind of relationship an [`IssueLink`] represents, e.g. `Blocks`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueLinkType {
+    /// Link type name, e.g. `Blocks`.
+    pub name: String,
+    /// Description used when this issue is the inward side of the link,
+    /// e.g. `is blocked by`.
+    pub inward: String,
+    /// Description used when this issue is the outward side of the link,
+    /// e.g. `blocks`.
+    pub outward: String,
+}
+
+/// The other issue named by an [`IssueLink`], with enough of its fields to
+/// render a summary without a follow-up fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LinkedIssue {
+    /// Issue key, e.g. `PROJ-123`.
+    pub key: String,
+    /// The subset of the linked issue's fields Jira embeds inline.
+    pub fields: LinkedIssueFields,
+}
+
+/// Fields Jira embeds inline for a [`LinkedIssue`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LinkedIssueFields {
+    /// One-line issue summary.
+    pub summary: String,
+    /// Current workflow status.
+    pub status: Status,
 }
 
 /// A workflow status.
@@ -166,6 +233,39 @@ impl RemoteLinkRequest {
     pub fn to_payload(&self) -> Value {
         serde_json::to_value(RemoteLinkObject { object: self })
             .expect("RemoteLinkRequest serialization cannot fail")
+    }
+}
+
+/// Request body for `POST /rest/api/3/issueLink` (create an issue-link
+/// dependency between two issues).
+///
+/// tskmstr only ever creates `Blocks`-type links, so the link type name is
+/// hardcoded rather than taking a parameter. Per Atlassian's documented
+/// contract, the *outward* issue is the one the link type's outward
+/// description applies to: for `Blocks`, `outwardIssue` is the blocker and
+/// `inwardIssue` is the blocked issue (`outwardIssue` "blocks" `inwardIssue`,
+/// `inwardIssue` "is blocked by" `outwardIssue`). This is the mirror image
+/// of how it reads in English, so it's easy to swap the two fields by
+/// accident — double check against this doc comment, not intuition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateLinkRequest {
+    /// Key of the issue that blocks `blocked_key`; serialized as
+    /// `outwardIssue`.
+    pub blocker_key: String,
+    /// Key of the issue that is blocked by `blocker_key`; serialized as
+    /// `inwardIssue`.
+    pub blocked_key: String,
+}
+
+impl CreateLinkRequest {
+    /// Serialize this request into the exact JSON body Jira expects for
+    /// `POST /rest/api/3/issueLink`.
+    pub fn to_payload(&self) -> Value {
+        serde_json::json!({
+            "type": { "name": "Blocks" },
+            "inwardIssue": { "key": self.blocked_key },
+            "outwardIssue": { "key": self.blocker_key },
+        })
     }
 }
 
@@ -386,6 +486,118 @@ mod tests {
                     "description": { "type": "doc", "version": 1, "content": [] },
                     "issuetype": { "name": "Task" }
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_issue_links_with_inward_and_outward_entries() {
+        let raw = r#"
+        {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Fix the thing",
+                "status": {
+                    "name": "To Do",
+                    "statusCategory": { "key": "new" }
+                },
+                "description": null,
+                "assignee": null,
+                "issuelinks": [
+                    {
+                        "type": {
+                            "name": "Blocks",
+                            "inward": "is blocked by",
+                            "outward": "blocks"
+                        },
+                        "inwardIssue": {
+                            "key": "PROJ-2",
+                            "fields": {
+                                "summary": "Blocker ticket",
+                                "status": {
+                                    "name": "In Progress",
+                                    "statusCategory": { "key": "indeterminate" }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "type": {
+                            "name": "Blocks",
+                            "inward": "is blocked by",
+                            "outward": "blocks"
+                        },
+                        "outwardIssue": {
+                            "key": "PROJ-3",
+                            "fields": {
+                                "summary": "Blocked ticket",
+                                "status": {
+                                    "name": "To Do",
+                                    "statusCategory": { "key": "new" }
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert_eq!(issue.fields.issue_links.len(), 2);
+
+        let blocker_entry = &issue.fields.issue_links[0];
+        assert_eq!(blocker_entry.link_type.name, "Blocks");
+        let blocker = blocker_entry
+            .inward_issue
+            .as_ref()
+            .expect("inward issue present");
+        assert_eq!(blocker.key, "PROJ-2");
+        assert_eq!(blocker.fields.summary, "Blocker ticket");
+        assert_eq!(blocker.fields.status.status_category.key, "indeterminate");
+        assert!(blocker_entry.outward_issue.is_none());
+
+        let blocked_entry = &issue.fields.issue_links[1];
+        let blocked = blocked_entry
+            .outward_issue
+            .as_ref()
+            .expect("outward issue present");
+        assert_eq!(blocked.key, "PROJ-3");
+        assert!(blocked_entry.inward_issue.is_none());
+    }
+
+    #[test]
+    fn deserializes_issue_without_issuelinks_key_as_empty_vec() {
+        let raw = r#"
+        {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Fix the thing",
+                "status": {
+                    "name": "To Do",
+                    "statusCategory": { "key": "new" }
+                },
+                "description": null,
+                "assignee": null
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert!(issue.fields.issue_links.is_empty());
+    }
+
+    #[test]
+    fn serializes_create_link_request() {
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+        let payload = req.to_payload();
+        assert_eq!(
+            payload,
+            json!({
+                "type": { "name": "Blocks" },
+                "inwardIssue": { "key": "PROJ-2" },
+                "outwardIssue": { "key": "PROJ-1" }
             })
         );
     }
