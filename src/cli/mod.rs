@@ -15,6 +15,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 pub mod auth;
 pub mod pr;
 pub mod ready;
+pub mod runs;
 pub mod ticket;
 
 use crate::ticketing::StatusTransition;
@@ -90,6 +91,13 @@ pub enum Command {
     },
     /// Open the interactive terminal board.
     Board,
+    /// Inspect and record autonomous lane runs (local SQLite; see
+    /// docs/decisions/0001-run-state.md).
+    Runs {
+        /// Which runs action to perform. Omit to list current runs.
+        #[command(subcommand)]
+        cmd: Option<RunsCmd>,
+    },
 }
 
 /// `tm ticket` subcommands.
@@ -246,6 +254,83 @@ pub enum PrCmd {
         #[arg(long)]
         auto_ticket: bool,
     },
+}
+
+/// `tm runs` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum RunsCmd {
+    /// Record the start of a lane run; prints the new run id.
+    Start {
+        /// Jira ticket key the run is working, e.g. `PROJ-123`.
+        #[arg(long)]
+        ticket: String,
+        /// Lane name the run executed in.
+        #[arg(long)]
+        lane: String,
+        /// Filesystem path of the git worktree the run used.
+        #[arg(long)]
+        worktree: String,
+        /// Branch checked out in the worktree, if known.
+        #[arg(long)]
+        branch: Option<String>,
+        /// PID of the runner process, if known.
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// Record a run's terminal outcome.
+    Finish {
+        /// Row id returned by `tm runs start`.
+        run_id: i64,
+        /// Final status of the run.
+        #[arg(long, value_enum)]
+        status: FinishStatusArg,
+        /// Process exit code, if the run exited normally.
+        #[arg(long)]
+        exit_code: Option<i32>,
+        /// `claude -p` session id, enabling `claude --resume`.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Reported cost of the run in USD.
+        #[arg(long)]
+        cost_usd: Option<f64>,
+        /// Number of turns the run took.
+        #[arg(long)]
+        num_turns: Option<i64>,
+        /// Escalation text, set when `--status blocked`.
+        #[arg(long)]
+        blocker: Option<String>,
+        /// URL of the pull request the run opened, if any.
+        #[arg(long)]
+        pr_url: Option<String>,
+        /// Filesystem path of the full transcript, if one was captured.
+        #[arg(long)]
+        transcript: Option<String>,
+    },
+}
+
+/// Terminal statuses accepted by `tm runs finish` (queued/running are not
+/// outcomes, so they're deliberately excluded from this enum).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum FinishStatusArg {
+    /// Finished successfully.
+    Done,
+    /// Finished with an error.
+    Failed,
+    /// Waiting on an external dependency or escalation.
+    Blocked,
+    /// Finished and awaiting human review.
+    Review,
+}
+
+impl From<FinishStatusArg> for crate::runs::RunStatus {
+    fn from(value: FinishStatusArg) -> Self {
+        match value {
+            FinishStatusArg::Done => crate::runs::RunStatus::Done,
+            FinishStatusArg::Failed => crate::runs::RunStatus::Failed,
+            FinishStatusArg::Blocked => crate::runs::RunStatus::Blocked,
+            FinishStatusArg::Review => crate::runs::RunStatus::Review,
+        }
+    }
 }
 
 /// Interactive input the CLI needs beyond plain positional/flag arguments:
@@ -891,5 +976,115 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["tm"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_bare_runs_as_list() {
+        let cli = Cli::try_parse_from(["tm", "runs"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs { cmd }) => assert!(cmd.is_none()),
+            other => panic!("expected Runs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_start_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "runs",
+            "start",
+            "--ticket",
+            "PROJ-123",
+            "--lane",
+            "backend",
+            "--worktree",
+            "/tmp/wt",
+            "--branch",
+            "proj-123",
+            "--pid",
+            "4242",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Start {
+                        ticket,
+                        lane,
+                        worktree,
+                        branch,
+                        pid,
+                    }),
+            }) => {
+                assert_eq!(ticket, "PROJ-123");
+                assert_eq!(lane, "backend");
+                assert_eq!(worktree, "/tmp/wt");
+                assert_eq!(branch, Some("proj-123".to_string()));
+                assert_eq!(pid, Some(4242));
+            }
+            other => panic!("expected Runs Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_start_with_minimal_flags() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "runs",
+            "start",
+            "--ticket",
+            "PROJ-123",
+            "--lane",
+            "backend",
+            "--worktree",
+            "/tmp/wt",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Start {
+                        ticket,
+                        lane,
+                        worktree,
+                        branch,
+                        pid,
+                    }),
+            }) => {
+                assert_eq!(ticket, "PROJ-123");
+                assert_eq!(lane, "backend");
+                assert_eq!(worktree, "/tmp/wt");
+                assert_eq!(branch, None);
+                assert_eq!(pid, None);
+            }
+            other => panic!("expected Runs Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_finish_with_status_done() {
+        let cli = Cli::try_parse_from(["tm", "runs", "finish", "3", "--status", "done"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Finish { run_id, status, .. }),
+            }) => {
+                assert_eq!(run_id, 3);
+                assert!(matches!(status, FinishStatusArg::Done));
+            }
+            other => panic!("expected Runs Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_finish_status_queued_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "runs", "finish", "3", "--status", "queued"]);
+        assert!(result.is_err(), "queued is not a valid finish status");
+    }
+
+    #[test]
+    fn runs_finish_status_running_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "runs", "finish", "3", "--status", "running"]);
+        assert!(result.is_err(), "running is not a valid finish status");
     }
 }

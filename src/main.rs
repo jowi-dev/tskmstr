@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, TicketCmd};
+use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, RunsCmd, TicketCmd};
 use tskmstr::config::{self, Config, ConfigPaths};
 use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
@@ -40,6 +40,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
+        Command::Runs { cmd } => run_runs(cmd),
     }
 }
 
@@ -272,6 +273,83 @@ fn run_ready(
         None => tskmstr::cli::ready::list(jira.as_ref(), &mut stdout)?,
     }
     Ok(())
+}
+
+/// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.
+///
+/// Deliberately doesn't go through [`build_ticketing_deps`]/[`config::load`]
+/// in the strict (error-if-missing) sense: `tm runs` must work on a machine
+/// with no Jira config at all, so config loading here is best-effort (see
+/// [`resolve_run_db_path`]).
+fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
+    let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+    let mut stdout = std::io::stdout();
+
+    match cmd {
+        None => tskmstr::cli::runs::list(&store, &mut stdout)?,
+        Some(RunsCmd::Start {
+            ticket,
+            lane,
+            worktree,
+            branch,
+            pid,
+        }) => {
+            let params = tskmstr::runs::StartRun {
+                ticket,
+                lane,
+                worktree,
+                branch,
+                pid,
+            };
+            tskmstr::cli::runs::start(&store, &params, &mut stdout)?;
+        }
+        Some(RunsCmd::Finish {
+            run_id,
+            status,
+            exit_code,
+            session_id,
+            cost_usd,
+            num_turns,
+            blocker,
+            pr_url,
+            transcript,
+        }) => {
+            let outcome = tskmstr::runs::FinishRun {
+                status: status.into(),
+                exit_code,
+                session_id,
+                cost_usd,
+                num_turns,
+                blocker,
+                pr_url,
+                transcript,
+            };
+            tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the run database path: the configured `run_db_path` if config
+/// loads and sets it, otherwise the XDG default.
+///
+/// Lenient by design: `tm runs` needs to work on machines with no Jira
+/// config at all, so a missing or invalid config file is silently ignored
+/// here rather than surfaced as an error (unlike every other command, which
+/// requires config to load via [`config::load`]).
+fn resolve_run_db_path() -> PathBuf {
+    let paths = default_config_paths();
+    let configured = config::load(&paths).ok().and_then(|cfg| cfg.run_db_path);
+
+    if let Some(path) = configured {
+        return PathBuf::from(path);
+    }
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    tskmstr::runs::default_db_path(&home, xdg_data_home.as_deref())
 }
 
 fn run_pr(
