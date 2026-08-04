@@ -1,5 +1,5 @@
 //! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
-//! ticket assign`, and `tm ticket rank`.
+//! ticket assign`, `tm ticket rank`, and `tm ticket link`.
 
 use std::io::Write;
 
@@ -8,10 +8,11 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::jira::client::{JiraClient, RankAnchor};
+use crate::jira::types::CreateLinkRequest;
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
-    TransitionOutcome, assign_ticket, associate_ticket, create_ticket, list_transitions,
-    rank_ticket, transition_ticket,
+    TransitionOutcome, assign_ticket, associate_ticket, create_ticket, link_ticket, list_links,
+    list_transitions, rank_ticket, transition_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -40,6 +41,17 @@ pub enum TicketCliError {
     #[error("cannot rank {key} relative to itself")]
     RankRelativeToSelf {
         /// The key given for both the ticket to rank and its anchor.
+        key: String,
+    },
+
+    /// `tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>` was given the
+    /// same key (after normalization) for both `KEY` and `OTHER`. Rejected
+    /// here, before any Jira call, mirroring [`TicketCliError::RankRelativeToSelf`]:
+    /// Jira's issue-link semantics for an issue linked to itself are
+    /// undefined/unhelpful.
+    #[error("cannot link {key} to itself")]
+    LinkRelativeToSelf {
+        /// The key given for both the ticket to link and its counterpart.
         key: String,
     },
 
@@ -265,6 +277,95 @@ pub fn rank(
 
     rank_ticket(jira, &normalized, jira_anchor)?;
     writeln!(out, "Ranked {normalized} {verb} {other}")?;
+    Ok(())
+}
+
+/// `tm ticket link <KEY> (--blocks <OTHER> | --blocked-by <OTHER>)`: create a
+/// `Blocks`-type Jira link between `key` and `other`, or, with neither flag,
+/// list `key`'s existing links of any type.
+///
+/// At most one of `blocks`/`blocked_by` is expected to be `Some` — clap's
+/// `ArgGroup` on [`super::TicketCmd::Link`] enforces this before this
+/// function is ever called; neither being set means "list mode". Both keys
+/// are normalized via [`normalize_key`]; linking `key` to itself is rejected
+/// as [`TicketCliError::LinkRelativeToSelf`] before any Jira call is made.
+/// Getting the `--blocks`/`--blocked-by` direction backwards would write
+/// inverted dependency data into Jira, so double check against
+/// [`CreateLinkRequest`]'s doc comment, not intuition: `--blocks OTHER`
+/// means `key` is the blocker (`blocker_key: key, blocked_key: other`);
+/// `--blocked-by OTHER` means `key` is the blocked issue (`blocker_key:
+/// other, blocked_key: key`).
+pub fn link(
+    jira: &dyn JiraClient,
+    key: &str,
+    blocks: Option<&str>,
+    blocked_by: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    match (blocks, blocked_by) {
+        (Some(other), None) => {
+            let other = normalize_key(other)?;
+            if normalized == other {
+                return Err(TicketCliError::LinkRelativeToSelf { key: normalized });
+            }
+            let req = CreateLinkRequest {
+                blocker_key: normalized.clone(),
+                blocked_key: other.clone(),
+            };
+            link_ticket(jira, &normalized, &req)?;
+            writeln!(out, "Linked: {normalized} blocks {other}")?;
+            Ok(())
+        }
+        (None, Some(other)) => {
+            let other = normalize_key(other)?;
+            if normalized == other {
+                return Err(TicketCliError::LinkRelativeToSelf { key: normalized });
+            }
+            let req = CreateLinkRequest {
+                blocker_key: other.clone(),
+                blocked_key: normalized.clone(),
+            };
+            link_ticket(jira, &normalized, &req)?;
+            writeln!(out, "Linked: {normalized} is blocked by {other}")?;
+            Ok(())
+        }
+        (None, None) => print_links(jira, &normalized, out),
+        (Some(_), Some(_)) => {
+            unreachable!("clap's ArgGroup guarantees at most one of blocks/blocked_by is set")
+        }
+    }
+}
+
+/// Print `key`'s existing issue links via [`list_links`], for the `tm
+/// ticket link <KEY>` (no flag) discovery view.
+fn print_links(
+    jira: &dyn JiraClient,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let listing = list_links(jira, key)?;
+    writeln!(out, "{key} links:")?;
+    if listing.links.is_empty() {
+        writeln!(out, "No links.")?;
+    }
+    for link in &listing.links {
+        if let Some(other) = &link.inward_issue {
+            writeln!(
+                out,
+                "{} {} ({}): {}",
+                link.link_type.inward, other.key, other.fields.status.name, other.fields.summary
+            )?;
+        } else if let Some(other) = &link.outward_issue {
+            writeln!(
+                out,
+                "{} {} ({}): {}",
+                link.link_type.outward, other.key, other.fields.status.name, other.fields.summary
+            )?;
+        }
+        // Neither side present: nothing meaningful to render, so skip it
+        // rather than printing a blank/garbled line.
+    }
     Ok(())
 }
 
@@ -967,5 +1068,206 @@ mod tests {
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn link_blocks_prints_message_and_calls_create_link_with_key_as_blocker() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        link(&jira, "proj-372", Some("proj-1"), None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Linked: PROJ-372 blocks PROJ-1\n");
+        assert_eq!(
+            jira.create_link_calls(),
+            vec![crate::jira::types::CreateLinkRequest {
+                blocker_key: "PROJ-372".to_string(),
+                blocked_key: "PROJ-1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn link_blocked_by_prints_message_and_calls_create_link_with_key_as_blocked() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        link(&jira, "proj-372", None, Some("proj-1"), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Linked: PROJ-372 is blocked by PROJ-1\n");
+        assert_eq!(
+            jira.create_link_calls(),
+            vec![crate::jira::types::CreateLinkRequest {
+                blocker_key: "PROJ-1".to_string(),
+                blocked_key: "PROJ-372".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn link_relative_to_self_is_a_usage_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        let err = link(&jira, "proj-372", Some("PROJ-372"), None, &mut out)
+            .expect_err("linking a ticket to itself should fail before any Jira call is made");
+
+        match err {
+            TicketCliError::LinkRelativeToSelf { key } => assert_eq!(key, "PROJ-372"),
+            other => panic!("expected LinkRelativeToSelf, got {other:?}"),
+        }
+        assert!(jira.create_link_calls().is_empty());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn link_invalid_primary_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        let err =
+            link(&jira, "not-a-key!", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_invalid_other_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        let err =
+            link(&jira, "proj-372", Some("not-a-key!"), None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_missing_primary_key_gives_friendly_not_found_error_and_makes_no_create_link_call() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let mut out = Vec::new();
+
+        let err = link(&jira, "proj-404", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+                assert_eq!(key, "PROJ-404")
+            }
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(jira.create_link_calls().is_empty());
+    }
+
+    #[test]
+    fn link_create_link_api_error_surfaces() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-372", issue("PROJ-372"))
+            .with_create_link_error(500, "boom");
+        let mut out = Vec::new();
+
+        let err = link(&jira, "proj-372", Some("PROJ-1"), None, &mut out).expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_list_mode_renders_inward_and_outward_links() {
+        let mut with_links = issue("PROJ-372");
+        with_links.fields.issue_links = vec![
+            crate::jira::types::IssueLink {
+                link_type: crate::jira::types::IssueLinkType {
+                    name: "Blocks".to_string(),
+                    inward: "is blocked by".to_string(),
+                    outward: "blocks".to_string(),
+                },
+                inward_issue: Some(crate::jira::types::LinkedIssue {
+                    key: "PROJ-2".to_string(),
+                    fields: crate::jira::types::LinkedIssueFields {
+                        summary: "Fix the thing".to_string(),
+                        status: Status {
+                            name: "In Progress".to_string(),
+                            status_category: StatusCategory {
+                                key: "indeterminate".to_string(),
+                            },
+                        },
+                    },
+                }),
+                outward_issue: None,
+            },
+            crate::jira::types::IssueLink {
+                link_type: crate::jira::types::IssueLinkType {
+                    name: "Blocks".to_string(),
+                    inward: "is blocked by".to_string(),
+                    outward: "blocks".to_string(),
+                },
+                inward_issue: None,
+                outward_issue: Some(crate::jira::types::LinkedIssue {
+                    key: "PROJ-3".to_string(),
+                    fields: crate::jira::types::LinkedIssueFields {
+                        summary: "Ship the widget".to_string(),
+                        status: Status {
+                            name: "To Do".to_string(),
+                            status_category: StatusCategory {
+                                key: "new".to_string(),
+                            },
+                        },
+                    },
+                }),
+            },
+        ];
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", with_links);
+        let mut out = Vec::new();
+
+        link(&jira, "proj-372", None, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-372 links:\nis blocked by PROJ-2 (In Progress): Fix the thing\nblocks PROJ-3 (To Do): Ship the widget\n"
+        );
+    }
+
+    #[test]
+    fn link_list_mode_with_no_links_prints_no_links() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut out = Vec::new();
+
+        link(&jira, "proj-372", None, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-372 links:\nNo links.\n");
+    }
+
+    #[test]
+    fn link_list_mode_skips_entry_with_neither_side_present() {
+        let mut with_links = issue("PROJ-372");
+        with_links.fields.issue_links = vec![crate::jira::types::IssueLink {
+            link_type: crate::jira::types::IssueLinkType {
+                name: "Blocks".to_string(),
+                inward: "is blocked by".to_string(),
+                outward: "blocks".to_string(),
+            },
+            inward_issue: None,
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", with_links);
+        let mut out = Vec::new();
+
+        link(&jira, "proj-372", None, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-372 links:\n");
     }
 }

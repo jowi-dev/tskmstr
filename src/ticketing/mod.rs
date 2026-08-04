@@ -45,6 +45,15 @@
 //! `KEY` exists first so a typo there gets a friendly [`JiraError::NotFound`];
 //! a typo'd anchor key surfaces from the rank call itself as
 //! [`JiraError::RankNotFound`].
+//!
+//! [`link_ticket`] (`tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>`)
+//! creates a `Blocks`-type Jira issue link between two tickets, via
+//! [`JiraClient::create_link`]. Like rank, it verifies `KEY` exists first so
+//! a typo there gets a friendly [`JiraError::NotFound`]; a typo'd `OTHER`
+//! surfaces from the create-link call itself as [`JiraError::LinkNotFound`].
+//! [`list_links`] (`tm ticket link <KEY>` with neither flag) is a read-only
+//! discovery view: it lists all of `KEY`'s existing issue links, of any link
+//! type, not just `Blocks`.
 
 use thiserror::Error;
 
@@ -53,7 +62,9 @@ use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
-use crate::jira::types::{CreateIssueRequest, JiraUser, RemoteLinkRequest};
+use crate::jira::types::{
+    CreateIssueRequest, CreateLinkRequest, IssueLink, JiraUser, RemoteLinkRequest,
+};
 
 /// Dependencies shared by the ticketing orchestration functions that deal
 /// with a pull request.
@@ -589,6 +600,44 @@ pub fn rank_ticket(
     jira.get_issue(key)?;
     jira.rank(&[key.to_string()], anchor)?;
     Ok(())
+}
+
+/// `tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>`: create a `Blocks`
+/// link between two tickets, per `req` (already resolved to the correct
+/// `blocker_key`/`blocked_key` direction by the CLI layer).
+///
+/// Verifies `key` (the primary ticket named on the command line, not
+/// necessarily `req.blocker_key`) exists first, for the same reason
+/// [`rank_ticket`] does: a typo there gets the friendly
+/// [`JiraError::NotFound`] every other `tm ticket` subcommand gives, rather
+/// than surfacing as a raw [`JiraError::LinkNotFound`] from the link API. A
+/// typo'd `OTHER` is not checked ahead of time; it surfaces from the
+/// `create_link` call itself as [`JiraError::LinkNotFound`].
+pub fn link_ticket(
+    jira: &dyn JiraClient,
+    key: &str,
+    req: &CreateLinkRequest,
+) -> Result<(), TicketingError> {
+    jira.get_issue(key)?;
+    jira.create_link(req)?;
+    Ok(())
+}
+
+/// A ticket's existing issue links, as returned by [`list_links`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkListing {
+    /// Every issue-link entry attached to the ticket, of any link type.
+    pub links: Vec<IssueLink>,
+}
+
+/// `tm ticket link <KEY>` (no flag): list `key`'s existing issue links, of
+/// any link type, for discovery. Unlike [`link_ticket`], this never creates
+/// anything.
+pub fn list_links(jira: &dyn JiraClient, key: &str) -> Result<LinkListing, TicketingError> {
+    let issue = jira.get_issue(key)?;
+    Ok(LinkListing {
+        links: issue.fields.issue_links,
+    })
 }
 
 /// Extract the project key prefix from an issue key, e.g. `PROJ` from
@@ -2057,6 +2106,106 @@ mod tests {
                 assert_eq!(message, "boom");
             }
             other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_ticket_creates_link() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        link_ticket(&jira, "PROJ-1", &req).expect("should succeed");
+
+        assert_eq!(jira.create_link_calls(), vec![req]);
+    }
+
+    #[test]
+    fn link_ticket_missing_primary_key_errors_before_calling_create_link() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-404".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        let err = link_ticket(&jira, "PROJ-404", &req).expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(
+            jira.create_link_calls().is_empty(),
+            "should not call create_link when the primary key doesn't exist"
+        );
+    }
+
+    #[test]
+    fn link_ticket_propagates_create_link_api_error() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_create_link_error(500, "boom");
+        let req = CreateLinkRequest {
+            blocker_key: "PROJ-1".to_string(),
+            blocked_key: "PROJ-2".to_string(),
+        };
+
+        let err = link_ticket(&jira, "PROJ-1", &req).expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_links_returns_issue_links() {
+        let mut with_links = issue("PROJ-1");
+        with_links.fields.issue_links = vec![IssueLink {
+            link_type: crate::jira::types::IssueLinkType {
+                name: "Blocks".to_string(),
+                inward: "is blocked by".to_string(),
+                outward: "blocks".to_string(),
+            },
+            inward_issue: Some(crate::jira::types::LinkedIssue {
+                key: "PROJ-2".to_string(),
+                fields: crate::jira::types::LinkedIssueFields {
+                    summary: "Blocker ticket".to_string(),
+                    status: Status {
+                        name: "In Progress".to_string(),
+                        status_category: StatusCategory {
+                            key: "indeterminate".to_string(),
+                        },
+                    },
+                },
+            }),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", with_links);
+
+        let listing = list_links(&jira, "PROJ-1").expect("should succeed");
+
+        assert_eq!(listing.links.len(), 1);
+        assert_eq!(
+            listing.links[0].inward_issue.as_ref().unwrap().key,
+            "PROJ-2"
+        );
+    }
+
+    #[test]
+    fn list_links_propagates_get_issue_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = list_links(&jira, "PROJ-404").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
         }
     }
 }

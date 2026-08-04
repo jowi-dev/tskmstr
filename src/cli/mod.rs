@@ -167,6 +167,30 @@ pub enum TicketCmd {
         #[arg(long, group = "rank_direction")]
         below: Option<String>,
     },
+    /// Create a `Blocks`-type Jira link between two tickets, or, with
+    /// neither flag, list `KEY`'s existing links of any type.
+    ///
+    /// Unlike `Assign`/`Rank`, at most one of `--blocks`/`--blocked-by` is
+    /// required (`required = false`): giving neither is a valid request,
+    /// meaning "list existing links" rather than "create one". Giving both
+    /// is still rejected by the `ArgGroup`.
+    #[command(
+        group(
+            ArgGroup::new("link_direction")
+                .required(false)
+                .args(["blocks", "blocked_by"])
+        )
+    )]
+    Link {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// `KEY` blocks this other issue key.
+        #[arg(long, group = "link_direction")]
+        blocks: Option<String>,
+        /// `KEY` is blocked by this other issue key.
+        #[arg(long, group = "link_direction")]
+        blocked_by: Option<String>,
+    },
 }
 
 /// `tm auth` subcommands.
@@ -625,6 +649,93 @@ mod tests {
             rendered.contains("tm ticket rank <KEY> (--above <KEY>|--below <KEY>)"),
             "usage synopsis should list KEY first: {rendered}"
         );
+    }
+
+    #[test]
+    fn parses_ticket_link_with_blocks() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "link", "proj-372", "--blocks", "proj-1"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Link {
+                        key,
+                        blocks,
+                        blocked_by,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(blocks, Some("proj-1".to_string()));
+                assert_eq!(blocked_by, None);
+            }
+            other => panic!("expected TicketCmd::Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_link_with_blocked_by() {
+        let cli =
+            Cli::try_parse_from(["tm", "ticket", "link", "proj-372", "--blocked-by", "proj-1"])
+                .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Link {
+                        key,
+                        blocks,
+                        blocked_by,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(blocks, None);
+                assert_eq!(blocked_by, Some("proj-1".to_string()));
+            }
+            other => panic!("expected TicketCmd::Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_link_with_neither_flag_as_list_mode() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "link", "proj-372"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Link {
+                        key,
+                        blocks,
+                        blocked_by,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(blocks, None);
+                assert_eq!(blocked_by, None);
+            }
+            other => panic!("expected TicketCmd::Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_link_blocks_and_blocked_by_conflict_is_a_clap_error() {
+        let result = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "link",
+            "proj-372",
+            "--blocks",
+            "proj-1",
+            "--blocked-by",
+            "proj-2",
+        ]);
+        assert!(result.is_err(), "--blocks and --blocked-by should conflict");
+    }
+
+    #[test]
+    fn ticket_link_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "link"]);
+        assert!(result.is_err(), "link requires a key");
     }
 
     #[test]

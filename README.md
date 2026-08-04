@@ -57,6 +57,9 @@ tm auth status
 | `tm ticket assign <KEY> --unassign` | Clear ticket `<KEY>`'s assignee |
 | `tm ticket rank <KEY> --above <OTHER>` | Rank ticket `<KEY>` above `<OTHER>` in Jira's native backlog rank |
 | `tm ticket rank <KEY> --below <OTHER>` | Rank ticket `<KEY>` below `<OTHER>` in Jira's native backlog rank |
+| `tm ticket link <KEY> --blocks <OTHER>` | Create a `Blocks` link: `<KEY>` blocks `<OTHER>` |
+| `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
+| `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -204,6 +207,20 @@ surfaces from the rank request itself. Ranking `<KEY>` relative to itself
 is rejected as a usage error. Like `tm ticket transition`/`tm ticket
 assign`, this is an explicit command, so every failure is a hard error
 (non-zero exit).
+
+### Linking
+
+`tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>` creates a `Blocks`
+link between two tickets: `--blocks <OTHER>` records that `<KEY>` blocks
+`<OTHER>`, `--blocked-by <OTHER>` records that `<KEY>` is blocked by
+`<OTHER>` — getting these backwards writes inverted dependency data, so the
+direction is worth double-checking. `<KEY>` is verified to exist first, same
+as `rank`; a typo'd `<OTHER>` surfaces from the link request itself. Linking
+`<KEY>` to itself is rejected as a usage error. Giving neither flag lists
+`<KEY>`'s existing links instead of creating one — a discovery view that
+includes every link type, not just `Blocks`. Like `tm ticket rank`, creating
+a link is an explicit command, so every failure is a hard error (non-zero
+exit).
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes
