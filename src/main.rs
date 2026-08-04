@@ -38,6 +38,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Auth { cmd } => run_auth(cmd, &paths, &keychain, env_token),
         Command::Ticket { key, cmd } => run_ticket(key, cmd, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
+        Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
     }
 }
@@ -241,6 +242,26 @@ fn run_ticket(
             unreachable!("clap's args_conflicts_with_subcommands rejects key and cmd together")
         }
     }
+}
+
+/// `tm ready` / `tm ready <KEY>`: needs only a Jira client + config, the same
+/// shape as the `TicketCmd::Transition` arm above, since neither form of
+/// `tm ready` touches a pull request.
+fn run_ready(
+    key: Option<String>,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let token = resolve_token(keychain, env_token)?;
+    let jira = jira_client_for(&config, &token);
+    let mut stdout = std::io::stdout();
+    match key {
+        Some(key) => tskmstr::cli::ready::check(jira.as_ref(), &key, &mut stdout)?,
+        None => tskmstr::cli::ready::list(jira.as_ref(), &mut stdout)?,
+    }
+    Ok(())
 }
 
 fn run_pr(

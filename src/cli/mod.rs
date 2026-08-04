@@ -14,6 +14,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
 pub mod pr;
+pub mod ready;
 pub mod ticket;
 
 use crate::ticketing::StatusTransition;
@@ -73,6 +74,19 @@ pub enum Command {
         /// Which PR action to perform.
         #[command(subcommand)]
         cmd: PrCmd,
+    },
+    /// List tickets assigned to you that are ready to pick up, or check
+    /// whether a specific ticket is ready.
+    ///
+    /// With no `KEY`, lists tickets assigned to the current user that are in
+    /// the "To Do" status category and have no open `Blocks`-type blockers,
+    /// in Jira's native backlog rank order. With `KEY` (any assignee, any
+    /// status), reports whether that one ticket is ready, exiting non-zero
+    /// if it's blocked.
+    Ready {
+        /// Jira issue key to check, e.g. `PROJ-372` (case-insensitive). Omit
+        /// to list your ready tickets instead.
+        key: Option<String>,
     },
     /// Open the interactive terminal board.
     Board,
@@ -816,6 +830,24 @@ mod tests {
                 cmd: PrCmd::Status { auto_ticket },
             }) => assert!(!auto_ticket),
             other => panic!("expected Pr Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ready_with_no_key() {
+        let cli = Cli::try_parse_from(["tm", "ready"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ready { key }) => assert!(key.is_none()),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ready_with_key() {
+        let cli = Cli::try_parse_from(["tm", "ready", "proj-20"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ready { key }) => assert_eq!(key, Some("proj-20".to_string())),
+            other => panic!("expected Ready, got {other:?}"),
         }
     }
 

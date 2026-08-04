@@ -37,11 +37,22 @@ pub fn ranked_tickets_jql(project_key: &str) -> String {
     format!("project = {project_key} AND statusCategory != Done ORDER BY Rank ASC")
 }
 
+/// The JQL query used by `tm ready` to list the current user's candidate
+/// tickets: assigned to them and still in the "To Do" status category.
+/// Restricted to "To Do" rather than every open status (unlike
+/// [`my_open_tickets_jql`]'s `statusCategory != Done`) because a ticket
+/// already `In Progress` has already been picked up, not "ready to be picked
+/// up". Ordered by `Rank ASC` so the caller can filter out blocked tickets
+/// client-side while preserving backlog order.
+pub fn ready_candidates_jql() -> String {
+    "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-        unassigned_tickets_jql,
+        ready_candidates_jql, unassigned_tickets_jql,
     };
 
     #[test]
@@ -81,6 +92,14 @@ mod tests {
         assert_eq!(
             ranked_tickets_jql("PROJ"),
             "project = PROJ AND statusCategory != Done ORDER BY Rank ASC"
+        );
+    }
+
+    #[test]
+    fn ready_candidates_jql_scopes_to_current_user_and_to_do_category() {
+        assert_eq!(
+            ready_candidates_jql(),
+            "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC"
         );
     }
 }

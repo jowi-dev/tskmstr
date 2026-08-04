@@ -371,7 +371,10 @@ fn print_links(
 
 /// Uppercase `key` and validate it looks like a Jira issue key
 /// (`^[A-Z][A-Z0-9]+-\d+$`).
-fn normalize_key(key: &str) -> Result<String, TicketCliError> {
+///
+/// `pub(crate)` so [`crate::cli::ready`] can reuse the same normalization
+/// rule rather than duplicating it.
+pub(crate) fn normalize_key(key: &str) -> Result<String, TicketCliError> {
     let upper = key.to_uppercase();
     let re = Regex::new(r"^[A-Z][A-Z0-9]+-\d+$").expect("static regex is valid");
     if re.is_match(&upper) {

@@ -60,6 +60,8 @@ tm auth status
 | `tm ticket link <KEY> --blocks <OTHER>` | Create a `Blocks` link: `<KEY>` blocks `<OTHER>` |
 | `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
+| `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
+| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
@@ -221,6 +223,25 @@ as `rank`; a typo'd `<OTHER>` surfaces from the link request itself. Linking
 includes every link type, not just `Blocks`. Like `tm ticket rank`, creating
 a link is an explicit command, so every failure is a hard error (non-zero
 exit).
+
+### Readiness
+
+A ticket is "ready" when it has no open `Blocks`-type blockers: a `Blocks`
+link where the linked issue isn't yet Done. A Done blocker doesn't count,
+and a ticket that merely blocks something else is never "blocked" by that
+relationship.
+
+`tm ready` (no key) lists tickets assigned to you that are ready, further
+restricted to your "To Do" tickets (something already In Progress has
+already been picked up) and printed in Jira's native backlog rank order,
+`KEY  Summary` per line. If any of your To Do tickets were excluded for
+having an open blocker, a final `(N blocked tickets hidden)` line says so,
+so a filtered list doesn't read as "this is everything assigned to you".
+
+`tm ready <KEY>` checks one specific ticket, regardless of assignee or
+status: it prints `KEY is ready (<status>)` on success, or `KEY is blocked
+by:` followed by one line per open blocker on failure, exiting non-zero so
+scripts can branch on it.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes

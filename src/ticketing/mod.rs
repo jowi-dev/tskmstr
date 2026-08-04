@@ -62,8 +62,10 @@ use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
+use crate::jira::jql::ready_candidates_jql;
 use crate::jira::types::{
-    CreateIssueRequest, CreateLinkRequest, IssueLink, JiraUser, RemoteLinkRequest,
+    CreateIssueRequest, CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue,
+    RemoteLinkRequest,
 };
 
 /// Dependencies shared by the ticketing orchestration functions that deal
@@ -637,6 +639,84 @@ pub fn list_links(jira: &dyn JiraClient, key: &str) -> Result<LinkListing, Ticke
     let issue = jira.get_issue(key)?;
     Ok(LinkListing {
         links: issue.fields.issue_links,
+    })
+}
+
+/// The open (not-Done) `Blocks`-type blockers of `issue`: the linked issues
+/// named by an inward `Blocks` entry (`inward_issue: Some(Y)` means "`issue`
+/// is blocked by `Y`", see [`IssueLink`]'s doc comment) whose status category
+/// isn't `done`. A Done blocker doesn't block; an outward `Blocks` entry
+/// (`issue` blocks someone else) never makes `issue` itself blocked; a link
+/// of any other type (e.g. `Relates`) is ignored regardless of direction.
+///
+/// Pure and unit-testable: used by both [`ready_tickets`] (to filter search
+/// results) and [`check_ready`] (to report a single ticket's blockers).
+pub fn open_blockers(issue: &Issue) -> Vec<&LinkedIssue> {
+    issue
+        .fields
+        .issue_links
+        .iter()
+        .filter(|link| link.link_type.name == "Blocks")
+        .filter_map(|link| link.inward_issue.as_ref())
+        .filter(|blocker| blocker.fields.status.status_category.key != "done")
+        .collect()
+}
+
+/// Result of [`ready_tickets`]: the caller's ready-to-pick-up tickets, in the
+/// same rank order the search returned, plus a count of candidates that were
+/// excluded for having an open blocker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyListing {
+    /// Tickets assigned to the current user, in "To Do", with no open
+    /// blockers, in rank order.
+    pub ready: Vec<Issue>,
+    /// Number of candidates excluded because [`open_blockers`] found at
+    /// least one. Surfaced by the CLI so a caller doesn't mistake a filtered
+    /// list for the complete set of assigned tickets.
+    pub hidden_blocked_count: usize,
+}
+
+/// `tm ready` (no key): search the current user's "To Do" tickets (via
+/// [`ready_candidates_jql`]) and keep only those with no open blockers.
+///
+/// Rank order from the search is preserved in [`ReadyListing::ready`].
+pub fn ready_tickets(jira: &dyn JiraClient) -> Result<ReadyListing, TicketingError> {
+    let result = jira.search(&ready_candidates_jql())?;
+    let mut ready = Vec::new();
+    let mut hidden_blocked_count = 0;
+    for issue in result.issues {
+        if open_blockers(&issue).is_empty() {
+            ready.push(issue);
+        } else {
+            hidden_blocked_count += 1;
+        }
+    }
+    Ok(ReadyListing {
+        ready,
+        hidden_blocked_count,
+    })
+}
+
+/// Result of [`check_ready`]: `key`'s current status and its open blockers,
+/// if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyCheck {
+    /// `key`'s current workflow status name.
+    pub status_name: String,
+    /// `key`'s open (not-Done) `Blocks`-type blockers, per [`open_blockers`].
+    /// Empty means `key` is ready to pick up.
+    pub open_blockers: Vec<LinkedIssue>,
+}
+
+/// `tm ready <KEY>`: fetch `key` (any assignee, any status) and report
+/// whether it has any open blockers.
+pub fn check_ready(jira: &dyn JiraClient, key: &str) -> Result<ReadyCheck, TicketingError> {
+    let issue = jira.get_issue(key)?;
+    let status_name = issue.fields.status.name.clone();
+    let open_blockers = open_blockers(&issue).into_iter().cloned().collect();
+    Ok(ReadyCheck {
+        status_name,
+        open_blockers,
     })
 }
 
@@ -2202,6 +2282,232 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
 
         let err = list_links(&jira, "PROJ-404").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    fn linked_issue(key: &str, status_name: &str, status_category_key: &str) -> LinkedIssue {
+        LinkedIssue {
+            key: key.to_string(),
+            fields: crate::jira::types::LinkedIssueFields {
+                summary: format!("Summary for {key}"),
+                status: Status {
+                    name: status_name.to_string(),
+                    status_category: StatusCategory {
+                        key: status_category_key.to_string(),
+                    },
+                },
+            },
+        }
+    }
+
+    fn blocks_link_type() -> crate::jira::types::IssueLinkType {
+        crate::jira::types::IssueLinkType {
+            name: "Blocks".to_string(),
+            inward: "is blocked by".to_string(),
+            outward: "blocks".to_string(),
+        }
+    }
+
+    fn relates_link_type() -> crate::jira::types::IssueLinkType {
+        crate::jira::types::IssueLinkType {
+            name: "Relates".to_string(),
+            inward: "relates to".to_string(),
+            outward: "relates to".to_string(),
+        }
+    }
+
+    #[test]
+    fn open_blockers_with_no_links_is_empty() {
+        let i = issue("PROJ-1");
+        assert!(open_blockers(&i).is_empty());
+    }
+
+    #[test]
+    fn open_blockers_ignores_outward_only_blocks_link() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            link_type: blocks_link_type(),
+            inward_issue: None,
+            outward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
+        }];
+        assert!(
+            open_blockers(&i).is_empty(),
+            "an outward Blocks entry means PROJ-1 blocks PROJ-2, not the reverse"
+        );
+    }
+
+    #[test]
+    fn open_blockers_includes_inward_blocks_link_when_not_done() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+            outward_issue: None,
+        }];
+        let blockers = open_blockers(&i);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].key, "PROJ-2");
+    }
+
+    #[test]
+    fn open_blockers_excludes_inward_blocks_link_when_done() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "Done", "done")),
+            outward_issue: None,
+        }];
+        assert!(
+            open_blockers(&i).is_empty(),
+            "a Done blocker should not count as an open blocker"
+        );
+    }
+
+    #[test]
+    fn open_blockers_ignores_inward_link_of_a_different_type() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            link_type: relates_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
+            outward_issue: None,
+        }];
+        assert!(open_blockers(&i).is_empty());
+    }
+
+    #[test]
+    fn open_blockers_mixed_links_returns_only_open_blocks_blockers() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![
+            IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+                outward_issue: None,
+            },
+            IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
+                outward_issue: None,
+            },
+            IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: None,
+                outward_issue: Some(linked_issue("PROJ-4", "To Do", "new")),
+            },
+            IssueLink {
+                link_type: relates_link_type(),
+                inward_issue: Some(linked_issue("PROJ-5", "To Do", "new")),
+                outward_issue: None,
+            },
+        ];
+        let blockers = open_blockers(&i);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].key, "PROJ-2");
+    }
+
+    fn search_result(issues: Vec<Issue>) -> crate::jira::types::SearchResult {
+        crate::jira::types::SearchResult {
+            issues,
+            next_page_token: None,
+        }
+    }
+
+    #[test]
+    fn ready_tickets_keeps_candidates_with_no_open_blockers_and_preserves_order() {
+        let blocked = {
+            let mut i = issue("PROJ-2");
+            i.fields.issue_links = vec![IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
+                outward_issue: None,
+            }];
+            i
+        };
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("PROJ-1"),
+            blocked,
+            issue("PROJ-3"),
+        ]));
+
+        let listing = ready_tickets(&jira).expect("should succeed");
+
+        assert_eq!(
+            listing
+                .ready
+                .iter()
+                .map(|i| i.key.clone())
+                .collect::<Vec<_>>(),
+            vec!["PROJ-1".to_string(), "PROJ-3".to_string()]
+        );
+        assert_eq!(listing.hidden_blocked_count, 1);
+    }
+
+    #[test]
+    fn ready_tickets_with_no_candidates_is_empty_with_zero_hidden() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![]));
+
+        let listing = ready_tickets(&jira).expect("should succeed");
+
+        assert!(listing.ready.is_empty());
+        assert_eq!(listing.hidden_blocked_count, 0);
+    }
+
+    #[test]
+    fn ready_tickets_propagates_search_error() {
+        let jira = FakeJiraClient::new().with_search_error(500, "boom");
+
+        let err = ready_tickets(&jira).expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_ready_with_no_open_blockers_reports_ready() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+
+        let check = check_ready(&jira, "PROJ-1").expect("should succeed");
+
+        assert_eq!(check.status_name, "To Do");
+        assert!(check.open_blockers.is_empty());
+    }
+
+    #[test]
+    fn check_ready_with_open_blocker_reports_it_and_excludes_done_blocker() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![
+            IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+                outward_issue: None,
+            },
+            IssueLink {
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
+                outward_issue: None,
+            },
+        ];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let check = check_ready(&jira, "PROJ-1").expect("should succeed");
+
+        assert_eq!(check.open_blockers.len(), 1);
+        assert_eq!(check.open_blockers[0].key, "PROJ-2");
+    }
+
+    #[test]
+    fn check_ready_propagates_get_issue_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = check_ready(&jira, "PROJ-404").expect_err("should fail");
 
         match err {
             TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
