@@ -333,6 +333,8 @@ pub enum RunsCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         ticket: String,
     },
+    /// Live board of lane runs (polls the local run db).
+    Watch,
 }
 
 /// Terminal statuses accepted by `tm runs finish` (queued/running are not
@@ -1217,5 +1219,16 @@ mod tests {
             }
             other => panic!("expected Runs Resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_runs_watch() {
+        let cli = Cli::try_parse_from(["tm", "runs", "watch"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Watch)
+            })
+        ));
     }
 }

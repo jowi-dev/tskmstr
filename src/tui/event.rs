@@ -96,6 +96,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                 app.show_help,
                 app.show_filter_picker,
                 app.is_rank_grabbed(),
+                app.show_run_detail,
                 key_event.code,
             )
         {
@@ -122,6 +123,179 @@ fn run_cmds(mut app: App, cmds: Vec<Cmd>, deps: &TuiDeps) -> App {
     app
 }
 
+/// Dependencies for `tm runs watch`: just the run store.
+///
+/// Deliberately separate from [`TuiDeps`] rather than a superset of it: `tm
+/// runs watch` is a local-only command and must not drag a Jira client or
+/// token into scope just to satisfy a shared dependency struct.
+pub struct WatchDeps {
+    /// Store used to load and reap runs.
+    pub store: crate::runs::RunStore,
+}
+
+/// Run the live runs kanban board until the user quits.
+///
+/// Mirrors [`run`]'s skeleton (raw mode, the alternate screen, a
+/// [`TerminalGuard`], a [`POLL_INTERVAL`] poll loop), but starts on
+/// [`crate::tui::app::Screen::Runs`], reaps and loads runs on startup, and
+/// feeds [`Msg::Tick`] through [`update`] whenever a poll times out with no
+/// key pressed (the board loop just redraws instead; the watch loop uses the
+/// timeout as its clock for polling and periodic reaping).
+pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
+    enable_raw_mode()?;
+    let _guard = TerminalGuard;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App {
+        screen: crate::tui::app::Screen::Runs,
+        ..App::new()
+    };
+    app = run_watch_cmds(app, vec![Cmd::ReapRuns, Cmd::LoadRuns], &deps);
+
+    while !app.quit {
+        terminal.draw(|frame| draw(frame, &app))?;
+
+        if event::poll(POLL_INTERVAL)? {
+            if let CEvent::Key(key_event) = event::read()?
+                && key_event.kind == KeyEventKind::Press
+                && let Some(msg) = map_key(
+                    &app.screen,
+                    app.show_help,
+                    app.show_filter_picker,
+                    app.is_rank_grabbed(),
+                    app.show_run_detail,
+                    key_event.code,
+                )
+            {
+                let (next_app, cmds) = update(app, msg);
+                app = run_watch_cmds(next_app, cmds, &deps);
+            }
+        } else {
+            let (next_app, cmds) = update(app, Msg::Tick);
+            app = run_watch_cmds(next_app, cmds, &deps);
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute every `Cmd` in `cmds` against [`WatchDeps`], feeding each
+/// resulting `Msg` back through `update` (which may itself produce further
+/// `Cmd`s). Mirrors [`run_cmds`].
+fn run_watch_cmds(mut app: App, cmds: Vec<Cmd>, deps: &WatchDeps) -> App {
+    let mut pending: VecDeque<Cmd> = cmds.into();
+    while let Some(cmd) = pending.pop_front() {
+        for msg in execute_watch(deps, cmd) {
+            let (next_app, more_cmds) = update(app, msg);
+            app = next_app;
+            pending.extend(more_cmds);
+        }
+    }
+    app
+}
+
+/// Translate a single [`Cmd`] into the [`Msg`]s it produces, for `tm runs
+/// watch`. Handles only the run-store `Cmd`s; every other variant is
+/// unreachable from [`crate::tui::app::Screen::Runs`].
+fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
+    match cmd {
+        Cmd::LoadRuns => load_runs(deps),
+        Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
+        Cmd::ReapRuns => reap_runs(deps),
+        other => {
+            debug_assert!(
+                false,
+                "execute_watch: unreachable Cmd from Screen::Runs: {other:?}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Run `Cmd::LoadRuns`: list every run and map it to a
+/// [`crate::tui::app::RunCard`].
+fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
+    match deps.store.list_runs() {
+        Ok(summaries) => vec![Msg::RunsLoaded(
+            summaries.into_iter().map(run_summary_to_card).collect(),
+        )],
+        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
+/// Map a [`crate::runs::RunSummary`] to a [`crate::tui::app::RunCard`].
+fn run_summary_to_card(summary: crate::runs::RunSummary) -> crate::tui::app::RunCard {
+    crate::tui::app::RunCard {
+        id: summary.id,
+        ticket: summary.ticket,
+        lane: summary.lane,
+        status: summary.status,
+        age_secs: summary.age_secs,
+        heartbeat_age_secs: summary.heartbeat_age_secs,
+        last_event_kind: summary.last_event_kind,
+        last_event_age_secs: summary.last_event_age_secs,
+    }
+}
+
+/// Run `Cmd::LoadRunDetail`: load the run and its full event timeline for the
+/// run detail floating window.
+fn load_run_detail(deps: &WatchDeps, run_id: i64) -> Vec<Msg> {
+    let run = match deps.store.run_by_id(run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return vec![Msg::RunDetailFailed(format!("no run with id {run_id}"))],
+        Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
+    };
+    let events = match deps.store.events_for_run(run_id) {
+        Ok(events) => events,
+        Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
+    };
+    vec![Msg::RunDetailLoaded(Box::new(run_to_detail(run, events)))]
+}
+
+/// Map a [`crate::runs::Run`] plus its events to a
+/// [`crate::tui::app::RunDetail`].
+fn run_to_detail(
+    run: crate::runs::Run,
+    events: Vec<crate::runs::RunEvent>,
+) -> crate::tui::app::RunDetail {
+    crate::tui::app::RunDetail {
+        id: run.id,
+        ticket: run.ticket,
+        lane: run.lane,
+        status: run.status,
+        worktree: run.worktree,
+        branch: run.branch,
+        pid: run.pid,
+        session_id: run.session_id,
+        cost_usd: run.cost_usd,
+        num_turns: run.num_turns,
+        pr_url: run.pr_url,
+        blocker: run.blocker,
+        started_at: run.started_at,
+        ended_at: run.ended_at,
+        events: events
+            .into_iter()
+            .map(|e| crate::tui::app::RunDetailEvent {
+                at: e.at,
+                kind: e.kind,
+                detail: e.detail,
+            })
+            .collect(),
+    }
+}
+
+/// Run `Cmd::ReapRuns`: mark abandoned runs as failed, using the same
+/// staleness threshold as `tm runs reap`'s default (10 minutes).
+fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
+    match deps.store.reap(10, &crate::runs::pid::pid_alive) {
+        Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
+        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
 /// Translate a single [`Cmd`] into the [`Msg`]s it produces.
 ///
 /// Performs the actual I/O (a Jira API call, or spawning the `open`
@@ -135,6 +309,15 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::OpenUrl(url) => open_url(&url),
         Cmd::FetchRankTickets { jql } => fetch_rank_tickets(deps, &jql),
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
+        // The Jira board never enters `Screen::Runs`, so `update` can never
+        // produce one of these for `run`/`execute` to handle.
+        other @ (Cmd::LoadRuns | Cmd::LoadRunDetail { .. } | Cmd::ReapRuns) => {
+            debug_assert!(
+                false,
+                "execute: unreachable Cmd on the Jira board: {other:?}"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -528,5 +711,76 @@ mod tests {
         assert_eq!(app.columns.len(), 1);
         assert_eq!(app.selected_col, 0);
         assert_eq!(app.selected_row, 0);
+    }
+
+    fn watch_deps(store: crate::runs::RunStore) -> WatchDeps {
+        WatchDeps { store }
+    }
+
+    fn start_params(ticket: &str) -> crate::runs::StartRun {
+        crate::runs::StartRun {
+            ticket: ticket.to_string(),
+            lane: "backend".to_string(),
+            worktree: "/tmp/wt".to_string(),
+            branch: None,
+            pid: None,
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_runs_maps_summaries_to_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRuns);
+        match msgs.as_slice() {
+            [Msg::RunsLoaded(cards)] => {
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0].ticket, "PROJ-1");
+                assert_eq!(cards[0].status, crate::runs::RunStatus::Running);
+            }
+            other => panic!("expected RunsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_for_existing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.add_event(run_id, "tool_use", None).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                assert_eq!(detail.id, run_id);
+                assert_eq!(detail.ticket, "PROJ-1");
+                assert_eq!(detail.events.len(), 1);
+                assert_eq!(detail.events[0].kind, "tool_use");
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_for_missing_id_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id: 999 });
+        match msgs.as_slice() {
+            [Msg::RunDetailFailed(_)] => {}
+            other => panic!("expected RunDetailFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_reap_runs_on_empty_store_reaps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::ReapRuns);
+        assert_eq!(msgs, vec![Msg::RunsReaped(0)]);
     }
 }

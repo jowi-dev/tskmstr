@@ -347,6 +347,9 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
         Some(RunsCmd::Resume { ticket }) => {
             tskmstr::cli::runs::resume(&store, &ticket, &mut stdout)?;
         }
+        Some(RunsCmd::Watch) => {
+            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
+        }
     }
     Ok(())
 }

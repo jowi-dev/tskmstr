@@ -135,7 +135,92 @@ pub enum Screen {
     /// The project's full open-ticket list in Jira backlog rank order,
     /// spanning every assignee, with grab-and-drop reordering.
     Rank,
+    /// Live kanban of lane runs, entered via `tm runs watch`.
+    Runs,
 }
+
+/// A run as displayed on the [`Screen::Runs`] kanban board, derived from a
+/// [`crate::runs::RunSummary`]. Kept as its own type (rather than reusing
+/// `RunSummary` directly) so the pure Elm core stays decoupled from the
+/// store module's evolution; `crate::tui::event` maps between the two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunCard {
+    /// Row id.
+    pub id: i64,
+    /// Jira ticket key.
+    pub ticket: String,
+    /// Lane name.
+    pub lane: String,
+    /// Current status.
+    pub status: crate::runs::RunStatus,
+    /// Seconds since the run started.
+    pub age_secs: i64,
+    /// Seconds since the last heartbeat, or `None` if the run has ended.
+    pub heartbeat_age_secs: Option<i64>,
+    /// Kind of the most recent event recorded for this run, if any.
+    pub last_event_kind: Option<String>,
+    /// Seconds since the most recent event, if any.
+    pub last_event_age_secs: Option<i64>,
+}
+
+/// One event in a [`RunDetail`]'s timeline, mirroring
+/// [`crate::runs::RunEvent`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDetailEvent {
+    /// When the event was recorded.
+    pub at: String,
+    /// Event kind, e.g. `tool_use` or `stop`.
+    pub kind: String,
+    /// Optional detail payload.
+    pub detail: Option<String>,
+}
+
+/// Full detail for the floating window opened on [`Screen::Runs`], mirroring
+/// [`crate::runs::Run`] plus its event timeline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDetail {
+    /// Row id.
+    pub id: i64,
+    /// Jira ticket key.
+    pub ticket: String,
+    /// Lane name.
+    pub lane: String,
+    /// Current status.
+    pub status: crate::runs::RunStatus,
+    /// Filesystem path of the git worktree the run used.
+    pub worktree: String,
+    /// Branch checked out in the worktree, if known.
+    pub branch: Option<String>,
+    /// PID of the runner process, if known.
+    pub pid: Option<u32>,
+    /// `claude -p` session id, if recorded.
+    pub session_id: Option<String>,
+    /// Reported cost of the run in USD, if known.
+    pub cost_usd: Option<f64>,
+    /// Number of turns the run took, if known.
+    pub num_turns: Option<i64>,
+    /// URL of the pull request the run opened, if any.
+    pub pr_url: Option<String>,
+    /// Escalation text, set when `status` is [`crate::runs::RunStatus::Blocked`].
+    pub blocker: Option<String>,
+    /// When the run started.
+    pub started_at: String,
+    /// When the run ended, if it has.
+    pub ended_at: Option<String>,
+    /// The run's event timeline, oldest first.
+    pub events: Vec<RunDetailEvent>,
+}
+
+/// The fixed column order for [`Screen::Runs`]'s kanban board. All six
+/// columns always render, even when empty.
+pub const RUN_COLUMNS: [crate::runs::RunStatus; 6] = [
+    crate::runs::RunStatus::Queued,
+    crate::runs::RunStatus::Running,
+    crate::runs::RunStatus::Blocked,
+    crate::runs::RunStatus::Review,
+    crate::runs::RunStatus::Done,
+    crate::runs::RunStatus::Failed,
+];
 
 /// All state needed to render and drive the TUI.
 #[derive(Debug, Clone, Default)]
@@ -194,6 +279,24 @@ pub struct App {
     pub rank_snapshot: Option<Vec<TicketSummary>>,
     /// Set when the event loop should exit.
     pub quit: bool,
+    /// [`Screen::Runs`]'s cards, in the order [`RunStore::list_runs`] returns
+    /// them.
+    pub runs: Vec<RunCard>,
+    /// Index into [`RUN_COLUMNS`] of the currently selected column.
+    pub runs_selected_col: usize,
+    /// Index into the selected run column's cards of the currently selected
+    /// card. Always clamped into bounds (`0` when the column is empty).
+    pub runs_selected_row: usize,
+    /// Whether the run detail floating window is shown.
+    pub show_run_detail: bool,
+    /// Detail for the run shown in the floating window, `None` while it's
+    /// still loading.
+    pub run_detail: Option<RunDetail>,
+    /// Scroll offset into the run detail window's event timeline.
+    pub run_detail_scroll: u16,
+    /// Number of [`Msg::Tick`]s processed since `tm runs watch` started,
+    /// used to throttle polling and periodic reaping.
+    pub watch_tick: u64,
 }
 
 impl App {
@@ -232,6 +335,23 @@ impl App {
             options.extend(users.iter().cloned().map(AssigneeFilter::User));
         }
         options
+    }
+
+    /// The run cards in `self.runs` whose status is `RUN_COLUMNS[col]`,
+    /// preserving `self.runs`' order. Empty (rather than panicking) if `col`
+    /// is out of bounds.
+    pub fn runs_in_col(&self, col: usize) -> Vec<&RunCard> {
+        let Some(status) = RUN_COLUMNS.get(col) else {
+            return Vec::new();
+        };
+        self.runs.iter().filter(|c| c.status == *status).collect()
+    }
+
+    /// The currently highlighted run card on [`Screen::Runs`], if any.
+    pub fn selected_run_card(&self) -> Option<&RunCard> {
+        self.runs_in_col(self.runs_selected_col)
+            .into_iter()
+            .nth(self.runs_selected_row)
     }
 }
 
@@ -309,6 +429,20 @@ pub enum Msg {
     RankApplied(String),
     /// A rank reorder failed to apply.
     RankFailed(String),
+    /// A poll timeout elapsed with no key pressed. Only meaningful on
+    /// [`Screen::Runs`]; ignored on every other screen.
+    Tick,
+    /// The runs kanban board finished loading.
+    RunsLoaded(Vec<RunCard>),
+    /// The runs kanban board failed to load.
+    RunsFailed(String),
+    /// The run detail window's data finished loading.
+    RunDetailLoaded(Box<RunDetail>),
+    /// The run detail window's data failed to load.
+    RunDetailFailed(String),
+    /// A reap pass completed, having reaped `0` reports as a no-op status
+    /// line.
+    RunsReaped(usize),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -356,6 +490,16 @@ pub enum Cmd {
         /// Where to move it to.
         anchor: RankAnchor,
     },
+    /// Reload [`Screen::Runs`]'s kanban board from the run store.
+    LoadRuns,
+    /// Load the full detail (including its event timeline) of one run, for
+    /// the run detail floating window.
+    LoadRunDetail {
+        /// Row id of the run to load.
+        run_id: i64,
+    },
+    /// Reap abandoned runs in the run store.
+    ReapRuns,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -383,7 +527,15 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
-            if app.screen == Screen::Rank {
+            if app.screen == Screen::Runs {
+                let mut cmds = vec![Cmd::LoadRuns];
+                if app.show_run_detail
+                    && let Some(card) = app.selected_run_card()
+                {
+                    cmds.push(Cmd::LoadRunDetail { run_id: card.id });
+                }
+                (app, cmds)
+            } else if app.screen == Screen::Rank {
                 let jql = ranked_tickets_jql(&app.project_key);
                 (app, vec![Cmd::FetchRankTickets { jql }])
             } else {
@@ -505,6 +657,94 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             let jql = ranked_tickets_jql(&app.project_key);
             (app, vec![Cmd::FetchRankTickets { jql }])
         }
+        Msg::Tick => tick(app),
+        Msg::RunsLoaded(cards) => {
+            runs_loaded(&mut app, cards);
+            (app, Vec::new())
+        }
+        Msg::RunsFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::RunDetailLoaded(detail) => {
+            app.run_detail = Some(*detail);
+            (app, Vec::new())
+        }
+        Msg::RunDetailFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::RunsReaped(count) => {
+            if count > 0 {
+                app.status_line = format!("Reaped {count} dead run(s)");
+            }
+            (app, Vec::new())
+        }
+    }
+}
+
+/// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]. On it, increments
+/// `watch_tick` and emits [`Cmd::LoadRuns`] every 2nd tick (plus
+/// [`Cmd::LoadRunDetail`] when the detail window is open) and
+/// [`Cmd::ReapRuns`] every 120th tick (~30s at the 250ms poll interval).
+fn tick(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Runs {
+        return (app, Vec::new());
+    }
+
+    app.watch_tick += 1;
+    let mut cmds = Vec::new();
+
+    if app.watch_tick.is_multiple_of(2) {
+        cmds.push(Cmd::LoadRuns);
+        if app.show_run_detail
+            && let Some(card) = app.selected_run_card()
+        {
+            cmds.push(Cmd::LoadRunDetail { run_id: card.id });
+        }
+    }
+
+    if app.watch_tick.is_multiple_of(120) {
+        cmds.push(Cmd::ReapRuns);
+    }
+
+    (app, cmds)
+}
+
+/// Handle [`Msg::RunsLoaded`]: replace `app.runs` with server truth,
+/// preferring to keep the previously selected run card selected (by id) if
+/// it still exists, otherwise clamping the row within the current column
+/// (mirroring [`clamp_row`]'s board behavior).
+fn runs_loaded(app: &mut App, cards: Vec<RunCard>) {
+    let preferred_id = app.selected_run_card().map(|c| c.id);
+    app.runs = cards;
+
+    let found = preferred_id.is_some_and(|id| select_run_by_id(app, id));
+    if !found {
+        clamp_runs_row(app);
+    }
+}
+
+/// Select the run card with id `id`, if it exists in `app.runs`. Returns
+/// whether it was found.
+fn select_run_by_id(app: &mut App, id: i64) -> bool {
+    for col in 0..RUN_COLUMNS.len() {
+        if let Some(row) = app.runs_in_col(col).iter().position(|c| c.id == id) {
+            app.runs_selected_col = col;
+            app.runs_selected_row = row;
+            return true;
+        }
+    }
+    false
+}
+
+/// Clamp `runs_selected_row` into the bounds of the currently selected run
+/// column, resetting to `0` when that column is empty.
+fn clamp_runs_row(app: &mut App) {
+    match app.runs_in_col(app.runs_selected_col).len() {
+        0 => app.runs_selected_row = 0,
+        len if app.runs_selected_row >= len => app.runs_selected_row = len - 1,
+        _ => {}
     }
 }
 
@@ -682,12 +922,27 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
         // `Msg::RankGrabToggle`, never `Msg::Enter`; kept as a no-op so
         // `Screen` stays exhaustively matched here.
         Screen::Rank => (app, Vec::new()),
+        // `map_key` never emits `Msg::Enter` while `show_run_detail` is set,
+        // so this only fires with the detail window closed.
+        Screen::Runs => match app.selected_run_card() {
+            Some(card) => {
+                let run_id = card.id;
+                app.show_run_detail = true;
+                app.run_detail = None;
+                app.run_detail_scroll = 0;
+                (app, vec![Cmd::LoadRunDetail { run_id }])
+            }
+            None => (app, Vec::new()),
+        },
     }
 }
 
 /// Handle [`Msg::Back`]: step back a screen, or quit from the board. On the
 /// rank screen, cancels an in-progress grab instead of leaving the screen if
-/// one is active (so `Esc`/`q` can never quit or navigate away mid-grab).
+/// one is active (so `Esc`/`q` can never quit or navigate away mid-grab). On
+/// the runs screen, closes the detail window if one is open instead of
+/// quitting (`tm runs watch` has no screen to fall back to, so `Back` quits
+/// only once the window is already closed).
 fn back(app: &mut App) {
     match app.screen {
         Screen::Board => app.quit = true,
@@ -698,6 +953,14 @@ fn back(app: &mut App) {
                 rank_cancel_grab(app);
             } else {
                 app.screen = Screen::Board;
+            }
+        }
+        Screen::Runs => {
+            if app.show_run_detail {
+                app.show_run_detail = false;
+                app.run_detail = None;
+            } else {
+                app.quit = true;
             }
         }
     }
@@ -718,6 +981,13 @@ fn move_up(app: &mut App) {
                 rank_swap_up(app);
             } else {
                 app.rank_selected = app.rank_selected.saturating_sub(1);
+            }
+        }
+        Screen::Runs => {
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_sub(1);
+            } else {
+                app.runs_selected_row = app.runs_selected_row.saturating_sub(1);
             }
         }
     }
@@ -747,6 +1017,16 @@ fn move_down(app: &mut App) {
                 app.rank_selected = (app.rank_selected + 1).min(app.rank_tickets.len() - 1);
             }
         }
+        Screen::Runs => {
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_add(1);
+            } else {
+                let len = app.runs_in_col(app.runs_selected_col).len();
+                if len > 0 {
+                    app.runs_selected_row = (app.runs_selected_row + 1).min(len - 1);
+                }
+            }
+        }
     }
 }
 
@@ -772,24 +1052,38 @@ fn rank_swap_down(app: &mut App) {
     app.rank_selected += 1;
 }
 
-/// Move the selected board column left by one, saturating at the first
-/// column. No-op outside [`Screen::Board`].
+/// Move the selected column left by one, saturating at the first column. A
+/// no-op outside [`Screen::Board`]/[`Screen::Runs`], on an empty board, or
+/// while the run detail window is open.
 fn move_left(app: &mut App) {
-    if app.screen != Screen::Board || app.columns.is_empty() {
-        return;
+    match app.screen {
+        Screen::Board if !app.columns.is_empty() => {
+            app.selected_col = app.selected_col.saturating_sub(1);
+            clamp_row(app);
+        }
+        Screen::Runs if !app.show_run_detail => {
+            app.runs_selected_col = app.runs_selected_col.saturating_sub(1);
+            clamp_runs_row(app);
+        }
+        _ => {}
     }
-    app.selected_col = app.selected_col.saturating_sub(1);
-    clamp_row(app);
 }
 
-/// Move the selected board column right by one, clamping at the last
-/// column. No-op outside [`Screen::Board`].
+/// Move the selected column right by one, clamping at the last column. A
+/// no-op outside [`Screen::Board`]/[`Screen::Runs`], on an empty board, or
+/// while the run detail window is open.
 fn move_right(app: &mut App) {
-    if app.screen != Screen::Board || app.columns.is_empty() {
-        return;
+    match app.screen {
+        Screen::Board if !app.columns.is_empty() => {
+            app.selected_col = (app.selected_col + 1).min(app.columns.len() - 1);
+            clamp_row(app);
+        }
+        Screen::Runs if !app.show_run_detail => {
+            app.runs_selected_col = (app.runs_selected_col + 1).min(RUN_COLUMNS.len() - 1);
+            clamp_runs_row(app);
+        }
+        _ => {}
     }
-    app.selected_col = (app.selected_col + 1).min(app.columns.len() - 1);
-    clamp_row(app);
 }
 
 /// The number of tickets in the currently selected column, or `None` if
@@ -2017,5 +2311,342 @@ mod tests {
                 jql: ranked_tickets_jql("PROJ")
             }]
         );
+    }
+
+    fn run_card(id: i64, ticket: &str, status: crate::runs::RunStatus) -> RunCard {
+        RunCard {
+            id,
+            ticket: ticket.to_string(),
+            lane: "backend".to_string(),
+            status,
+            age_secs: 10,
+            heartbeat_age_secs: Some(5),
+            last_event_kind: None,
+            last_event_age_secs: None,
+        }
+    }
+
+    fn runs_app(cards: Vec<RunCard>, col: usize, row: usize) -> App {
+        App {
+            screen: Screen::Runs,
+            runs: cards,
+            runs_selected_col: col,
+            runs_selected_row: row,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn tick_is_a_noop_off_the_runs_screen() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn tick_on_runs_screen_increments_but_only_loads_every_second_tick() {
+        let app = App {
+            screen: Screen::Runs,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 1);
+        assert!(cmds.is_empty());
+
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 2);
+        assert_eq!(cmds, vec![Cmd::LoadRuns]);
+    }
+
+    #[test]
+    fn tick_reaps_every_120th_tick() {
+        let app = App {
+            screen: Screen::Runs,
+            watch_tick: 119,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 120);
+        assert_eq!(cmds, vec![Cmd::LoadRuns, Cmd::ReapRuns]);
+    }
+
+    #[test]
+    fn tick_also_loads_run_detail_when_the_detail_window_is_open() {
+        let app = App {
+            show_run_detail: true,
+            ..runs_app(
+                vec![run_card(1, "PROJ-1", crate::runs::RunStatus::Running)],
+                1,
+                0,
+            )
+        };
+        let (app, _) = update(app, Msg::Tick);
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 2);
+        assert_eq!(cmds, vec![Cmd::LoadRuns, Cmd::LoadRunDetail { run_id: 1 }]);
+    }
+
+    #[test]
+    fn runs_loaded_preserves_selection_by_id_across_reload() {
+        let app = runs_app(
+            vec![
+                run_card(1, "PROJ-1", crate::runs::RunStatus::Running),
+                run_card(2, "PROJ-2", crate::runs::RunStatus::Running),
+            ],
+            1,
+            1,
+        );
+        let (app, cmds) = update(
+            app,
+            Msg::RunsLoaded(vec![
+                run_card(2, "PROJ-2", crate::runs::RunStatus::Running),
+                run_card(3, "PROJ-3", crate::runs::RunStatus::Running),
+            ]),
+        );
+        assert_eq!(app.selected_run_card().unwrap().id, 2);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn runs_loaded_clamps_row_when_selected_id_disappears() {
+        let app = runs_app(
+            vec![
+                run_card(1, "PROJ-1", crate::runs::RunStatus::Running),
+                run_card(2, "PROJ-2", crate::runs::RunStatus::Running),
+            ],
+            1,
+            1,
+        );
+        let (app, _) = update(
+            app,
+            Msg::RunsLoaded(vec![run_card(3, "PROJ-3", crate::runs::RunStatus::Running)]),
+        );
+        assert_eq!(app.runs_selected_row, 0);
+        assert_eq!(app.selected_run_card().unwrap().id, 3);
+    }
+
+    #[test]
+    fn runs_loaded_with_empty_column_resets_row_to_zero() {
+        let app = runs_app(
+            vec![run_card(1, "PROJ-1", crate::runs::RunStatus::Running)],
+            1,
+            0,
+        );
+        let (app, _) = update(app, Msg::RunsLoaded(vec![]));
+        assert_eq!(app.runs_selected_row, 0);
+        assert!(app.selected_run_card().is_none());
+    }
+
+    #[test]
+    fn runs_failed_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::RunsFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn run_detail_failed_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::RunDetailFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    fn run_detail(id: i64) -> RunDetail {
+        RunDetail {
+            id,
+            ticket: "PROJ-1".to_string(),
+            lane: "backend".to_string(),
+            status: crate::runs::RunStatus::Running,
+            worktree: "/tmp/wt".to_string(),
+            branch: None,
+            pid: None,
+            session_id: None,
+            cost_usd: None,
+            num_turns: None,
+            pr_url: None,
+            blocker: None,
+            started_at: "2020-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn run_detail_loaded_sets_detail() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::RunDetailLoaded(Box::new(run_detail(1))));
+        assert_eq!(app.run_detail, Some(run_detail(1)));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn runs_reaped_zero_is_a_noop() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::RunsReaped(0));
+        assert_eq!(app.status_line, "");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn runs_reaped_nonzero_sets_status_line() {
+        let app = App::new();
+        let (app, _) = update(app, Msg::RunsReaped(2));
+        assert_eq!(app.status_line, "Reaped 2 dead run(s)");
+    }
+
+    #[test]
+    fn h_and_l_move_between_run_columns_and_clamp() {
+        let app = runs_app(
+            vec![run_card(1, "PROJ-1", crate::runs::RunStatus::Running)],
+            1,
+            0,
+        );
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.runs_selected_col, 2);
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.runs_selected_col, 1);
+    }
+
+    #[test]
+    fn l_clamps_at_the_last_run_column() {
+        let app = runs_app(vec![], RUN_COLUMNS.len() - 1, 0);
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.runs_selected_col, RUN_COLUMNS.len() - 1);
+    }
+
+    #[test]
+    fn h_clamps_at_the_first_run_column() {
+        let app = runs_app(vec![], 0, 0);
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.runs_selected_col, 0);
+    }
+
+    #[test]
+    fn moving_columns_clamps_row_into_the_new_columns_bounds() {
+        let app = runs_app(
+            vec![
+                run_card(1, "PROJ-1", crate::runs::RunStatus::Running),
+                run_card(2, "PROJ-2", crate::runs::RunStatus::Running),
+            ],
+            1,
+            1,
+        );
+        // Column 2 (Blocked) is empty; moving into it must clamp the row.
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.runs_selected_col, 2);
+        assert_eq!(app.runs_selected_row, 0);
+    }
+
+    #[test]
+    fn j_and_k_move_the_row_within_a_run_column_and_clamp() {
+        let app = runs_app(
+            vec![
+                run_card(1, "PROJ-1", crate::runs::RunStatus::Running),
+                run_card(2, "PROJ-2", crate::runs::RunStatus::Running),
+            ],
+            1,
+            0,
+        );
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.runs_selected_row, 1);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.runs_selected_row, 1);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.runs_selected_row, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.runs_selected_row, 0);
+    }
+
+    #[test]
+    fn j_and_k_are_noops_on_an_empty_run_column() {
+        let app = runs_app(vec![], 0, 0);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.runs_selected_row, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.runs_selected_row, 0);
+    }
+
+    #[test]
+    fn enter_on_runs_screen_opens_detail_and_emits_load_run_detail() {
+        let app = runs_app(
+            vec![run_card(7, "PROJ-7", crate::runs::RunStatus::Running)],
+            1,
+            0,
+        );
+        let (app, cmds) = update(app, Msg::Enter);
+        assert!(app.show_run_detail);
+        assert_eq!(app.run_detail, None);
+        assert_eq!(app.run_detail_scroll, 0);
+        assert_eq!(cmds, vec![Cmd::LoadRunDetail { run_id: 7 }]);
+    }
+
+    #[test]
+    fn enter_on_empty_run_column_is_a_noop() {
+        let app = runs_app(vec![], 0, 0);
+        let (app, cmds) = update(app, Msg::Enter);
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn back_closes_the_detail_window_without_quitting() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail(1)),
+            ..runs_app(
+                vec![run_card(1, "PROJ-1", crate::runs::RunStatus::Running)],
+                1,
+                0,
+            )
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert!(!app.show_run_detail);
+        assert_eq!(app.run_detail, None);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn back_with_no_detail_open_quits() {
+        let app = runs_app(vec![], 0, 0);
+        let (app, _) = update(app, Msg::Back);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn j_and_k_scroll_the_detail_window_when_open() {
+        let app = App {
+            show_run_detail: true,
+            run_detail_scroll: 2,
+            ..runs_app(vec![], 0, 0)
+        };
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.run_detail_scroll, 3);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.run_detail_scroll, 2);
+    }
+
+    #[test]
+    fn refresh_on_runs_screen_emits_load_runs() {
+        let app = runs_app(vec![], 0, 0);
+        let (app, cmds) = update(app, Msg::Refresh);
+        assert_eq!(app.status_line, "Refreshing...");
+        assert_eq!(cmds, vec![Cmd::LoadRuns]);
+    }
+
+    #[test]
+    fn refresh_on_runs_screen_with_detail_open_also_reloads_detail() {
+        let app = App {
+            show_run_detail: true,
+            ..runs_app(
+                vec![run_card(4, "PROJ-4", crate::runs::RunStatus::Running)],
+                1,
+                0,
+            )
+        };
+        let (_app, cmds) = update(app, Msg::Refresh);
+        assert_eq!(cmds, vec![Cmd::LoadRuns, Cmd::LoadRunDetail { run_id: 4 }]);
     }
 }

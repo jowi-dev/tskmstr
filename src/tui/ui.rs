@@ -16,7 +16,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::tui::app::{App, AssigneeFilter, Column, Screen, TicketSummary};
+use crate::cli::runs::format_age;
+use crate::runs::RunStatus;
+use crate::tui::app::{App, AssigneeFilter, Column, RUN_COLUMNS, RunCard, Screen, TicketSummary};
 
 /// Maximum number of wrapped summary lines shown on a single ticket card.
 /// Longer summaries are truncated with a trailing ellipsis so that one long
@@ -32,10 +34,10 @@ const CARD_BORDER_ROWS: u16 = 2;
 pub fn draw(frame: &mut Frame, app: &App) {
     let (body, status_area) = split_body_and_status(frame.area());
 
-    if app.screen == Screen::Rank {
-        draw_rank_list(frame, app, body);
-    } else {
-        draw_board_columns(frame, app, body);
+    match app.screen {
+        Screen::Rank => draw_rank_list(frame, app, body),
+        Screen::Runs => draw_runs_board(frame, app, body),
+        _ => draw_board_columns(frame, app, body),
     }
 
     match app.screen {
@@ -45,13 +47,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_detail_window(frame, app);
             draw_transition_window(frame, app);
         }
+        Screen::Runs => {
+            if app.show_run_detail {
+                draw_run_detail_window(frame, app);
+            }
+        }
     }
 
     draw_status_bar(
         frame,
         status_area,
         &status_line_text(app),
-        hint_for(app.screen),
+        hint_for(app.screen, app.show_run_detail),
     );
 
     if app.show_help {
@@ -97,8 +104,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
     frame.render_widget(Paragraph::new(text), area);
 }
 
-/// The key-hint text shown in the status bar for `screen`.
-fn hint_for(screen: Screen) -> &'static str {
+/// The key-hint text shown in the status bar for `screen`. `show_run_detail`
+/// only affects [`Screen::Runs`]'s hint, picking the detail-window variant.
+fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board => {
             "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  ? help  q quit"
@@ -108,6 +116,8 @@ fn hint_for(screen: Screen) -> &'static str {
         Screen::Rank => {
             "j/k move  Enter/Space grab-drop  r refresh  o browser  Esc back  ? help  q quit"
         }
+        Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
+        Screen::Runs => "h/l/j/k: move  enter: detail  r: refresh  q: quit",
     }
 }
 
@@ -427,6 +437,184 @@ fn draw_rank_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// How many seconds without a heartbeat before a running card is marked
+/// stale with a leading `!`. Matches `tm runs reap`'s reasoning, though not
+/// its default threshold: this is purely a visual warning, not a reap
+/// decision.
+const STALE_HEARTBEAT_SECS: i64 = 600;
+
+/// The runs kanban board: one bordered column per [`RUN_COLUMNS`] entry,
+/// always all six, even when empty.
+fn draw_runs_board(frame: &mut Frame, app: &App, area: Rect) {
+    let column_count = RUN_COLUMNS.len() as u32;
+    let constraints: Vec<Constraint> = (0..column_count)
+        .map(|_| Constraint::Ratio(1, column_count))
+        .collect();
+    let areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (index, status) in RUN_COLUMNS.iter().enumerate() {
+        let cards = app.runs_in_col(index);
+        let is_selected_column = index == app.runs_selected_col;
+        let selected_row = is_selected_column.then_some(app.runs_selected_row);
+        draw_run_column(frame, areas[index], *status, &cards, selected_row);
+    }
+}
+
+/// One column of the runs board: a bordered, titled stack of run cards.
+fn draw_run_column(
+    frame: &mut Frame,
+    area: Rect,
+    status: RunStatus,
+    cards: &[&RunCard],
+    selected_row: Option<usize>,
+) {
+    let title = format!("{status:?} ({})", cards.len());
+    let border_style = if selected_row.is_some() {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if cards.is_empty() || inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let constraints: Vec<Constraint> = cards.iter().map(|_| Constraint::Length(3)).collect();
+    let card_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (index, card) in cards.iter().enumerate() {
+        let is_selected = selected_row == Some(index);
+        draw_run_card(frame, card_areas[index], card, is_selected);
+    }
+}
+
+/// One run's card: three lines (ticket, lane, age/last-event), reversed when
+/// selected. A running card whose heartbeat is older than
+/// [`STALE_HEARTBEAT_SECS`] gets a trailing red `!` on its ticket line.
+fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: bool) {
+    let style = if is_selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+
+    let stale = card.status == RunStatus::Running
+        && card
+            .heartbeat_age_secs
+            .is_some_and(|age| age > STALE_HEARTBEAT_SECS);
+
+    let mut ticket_spans = vec![Span::styled(
+        card.ticket.clone(),
+        style.add_modifier(Modifier::BOLD),
+    )];
+    if stale {
+        ticket_spans.push(Span::styled(
+            " !",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let last_event = match (&card.last_event_kind, card.last_event_age_secs) {
+        (Some(kind), Some(age)) => format!("{kind} {}", format_age(age)),
+        _ => "-".to_string(),
+    };
+
+    let lines = vec![
+        Line::from(ticket_spans),
+        Line::from(Span::styled(card.lane.clone(), style)),
+        Line::from(Span::styled(
+            format!("{} · {last_event}", format_age(card.age_secs)),
+            style,
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).style(style), area);
+}
+
+/// A centered floating window (~80% wide, ~70% tall) showing the selected
+/// run's full detail and event timeline, drawn over the runs board.
+///
+/// While `app.run_detail` is still loading (`None`), shows a placeholder
+/// instead. Event lines are truncated to width rather than wrapped, and
+/// scrolled by `app.run_detail_scroll`.
+fn draw_run_detail_window(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(detail) = &app.run_detail else {
+        let paragraph = Paragraph::new("Loading...")
+            .block(Block::default().borders(Borders::ALL).title("Run detail"));
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
+    let title = format!("Run {}: {}", detail.id, detail.ticket);
+
+    let mut lines = vec![
+        Line::from(format!("lane: {}", detail.lane)),
+        Line::from(format!("status: {:?}", detail.status)),
+        Line::from(format!("worktree: {}", detail.worktree)),
+    ];
+    if let Some(branch) = &detail.branch {
+        lines.push(Line::from(format!("branch: {branch}")));
+    }
+    if let Some(pid) = detail.pid {
+        lines.push(Line::from(format!("pid: {pid}")));
+    }
+    if let Some(session_id) = &detail.session_id {
+        lines.push(Line::from(format!("session: {session_id}")));
+    }
+    if let Some(cost) = detail.cost_usd {
+        lines.push(Line::from(format!("cost: ${cost:.2}")));
+    }
+    if let Some(turns) = detail.num_turns {
+        lines.push(Line::from(format!("turns: {turns}")));
+    }
+    if let Some(pr_url) = &detail.pr_url {
+        lines.push(Line::from(format!("pr: {pr_url}")));
+    }
+    if let Some(blocker) = &detail.blocker {
+        lines.push(Line::from(format!("blocker: {blocker}")));
+    }
+    lines.push(Line::from(format!("started: {}", detail.started_at)));
+    if let Some(ended_at) = &detail.ended_at {
+        lines.push(Line::from(format!("ended: {ended_at}")));
+    }
+    lines.push(Line::from(""));
+
+    if detail.events.is_empty() {
+        lines.push(Line::from("(no events)"));
+    } else {
+        for event in &detail.events {
+            let text = match &event.detail {
+                Some(d) => format!("{}  {}  {}", event.at, event.kind, d),
+                None => format!("{}  {}", event.at, event.kind),
+            };
+            lines.push(Line::from(text));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((app.run_detail_scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
 /// ticket's full detail, drawn over the board.
 fn draw_detail_window(frame: &mut Frame, app: &App) {
@@ -668,7 +856,7 @@ mod tests {
 
     #[test]
     fn board_hint_lists_every_board_key() {
-        let hint = hint_for(Screen::Board);
+        let hint = hint_for(Screen::Board, false);
         for key in [
             "h/l",
             "j/k",
@@ -1096,5 +1284,120 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("priority"));
         assert!(text.contains("grab"));
+    }
+
+    fn run_card(id: i64, ticket: &str, lane: &str, status: RunStatus) -> RunCard {
+        RunCard {
+            id,
+            ticket: ticket.to_string(),
+            lane: lane.to_string(),
+            status,
+            age_secs: 90,
+            heartbeat_age_secs: Some(30),
+            last_event_kind: Some("tool_use".to_string()),
+            last_event_age_secs: Some(5),
+        }
+    }
+
+    fn runs_app(cards: Vec<RunCard>) -> App {
+        App {
+            screen: Screen::Runs,
+            runs: cards,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn draws_runs_board_with_all_six_column_titles() {
+        let app = runs_app(vec![]);
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Queued (0)"));
+        assert!(text.contains("Running (0)"));
+        assert!(text.contains("Blocked (0)"));
+        assert!(text.contains("Review (0)"));
+        assert!(text.contains("Done (0)"));
+        assert!(text.contains("Failed (0)"));
+    }
+
+    #[test]
+    fn draws_runs_board_with_a_cards_ticket_and_lane_visible() {
+        let app = runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)]);
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Running (1)"));
+        assert!(text.contains("PROJ-1"));
+        assert!(text.contains("backend"));
+    }
+
+    #[test]
+    fn stale_running_card_shows_a_marker() {
+        let stale = RunCard {
+            heartbeat_age_secs: Some(601),
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        let text = buffer_text(&render(&runs_app(vec![stale])));
+        assert!(text.contains('!'));
+    }
+
+    #[test]
+    fn fresh_running_card_shows_no_stale_marker() {
+        let fresh = RunCard {
+            heartbeat_age_secs: Some(30),
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        let text = buffer_text(&render(&runs_app(vec![fresh])));
+        assert!(!text.contains('!'));
+    }
+
+    #[test]
+    fn run_detail_overlay_leaves_column_titles_visible() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: None,
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Running (1)"));
+        assert!(text.contains("Loading..."));
+    }
+
+    #[test]
+    fn run_detail_overlay_shows_loaded_fields_and_events() {
+        let detail = crate::tui::app::RunDetail {
+            id: 1,
+            ticket: "PROJ-1".to_string(),
+            lane: "backend".to_string(),
+            status: RunStatus::Running,
+            worktree: "/tmp/wt".to_string(),
+            branch: Some("proj-1".to_string()),
+            pid: Some(4242),
+            session_id: Some("sess-abc".to_string()),
+            cost_usd: Some(1.5),
+            num_turns: Some(3),
+            pr_url: None,
+            blocker: None,
+            started_at: "2020-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            events: vec![crate::tui::app::RunDetailEvent {
+                at: "2020-01-01T00:00:01.000Z".to_string(),
+                kind: "tool_use".to_string(),
+                detail: None,
+            }],
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Run 1: PROJ-1"));
+        assert!(text.contains("sess-abc"));
+        assert!(text.contains("tool_use"));
+    }
+
+    #[test]
+    fn runs_hint_mentions_detail_and_refresh() {
+        let hint = hint_for(Screen::Runs, false);
+        assert!(hint.contains("enter"));
+        assert!(hint.contains("refresh"));
     }
 }
