@@ -323,6 +323,16 @@ pub enum RunsCmd {
         #[arg(long, default_value_t = 10)]
         stale_after: u64,
     },
+    /// Event timeline for the latest run of a ticket.
+    Show {
+        /// Jira ticket key, e.g. `PROJ-123`.
+        ticket: String,
+    },
+    /// Print the session id of the latest run of a ticket, for `claude --resume`.
+    Resume {
+        /// Jira ticket key, e.g. `PROJ-123`.
+        ticket: String,
+    },
 }
 
 /// Terminal statuses accepted by `tm runs finish` (queued/running are not
@@ -1180,6 +1190,32 @@ mod tests {
                 assert_eq!(stale_after, 0);
             }
             other => panic!("expected Runs Reap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_show() {
+        let cli = Cli::try_parse_from(["tm", "runs", "show", "PROJ-1"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Show { ticket }),
+            }) => {
+                assert_eq!(ticket, "PROJ-1");
+            }
+            other => panic!("expected Runs Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_resume() {
+        let cli = Cli::try_parse_from(["tm", "runs", "resume", "PROJ-1"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Resume { ticket }),
+            }) => {
+                assert_eq!(ticket, "PROJ-1");
+            }
+            other => panic!("expected Runs Resume, got {other:?}"),
         }
     }
 }

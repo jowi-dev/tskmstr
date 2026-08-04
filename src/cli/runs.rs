@@ -9,7 +9,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use crate::runs::{FinishRun, RunStore, RunStoreError, RunSummary, StartRun};
+use crate::runs::{FinishRun, RunEvent, RunStore, RunStoreError, RunSummary, StartRun};
 
 /// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
 ///
@@ -48,6 +48,24 @@ pub enum RunsCliError {
     /// `--detail` was given but isn't valid JSON.
     #[error("--detail is not valid JSON: {0}")]
     InvalidDetailJson(#[from] serde_json::Error),
+
+    /// `tm runs show`/`resume` was given a ticket with no recorded runs.
+    #[error("no runs recorded for {ticket}")]
+    NoRunForTicket {
+        /// The ticket key that was looked up.
+        ticket: String,
+    },
+
+    /// `tm runs resume` was given a ticket whose latest run has no session id.
+    #[error(
+        "latest run {run_id} for {ticket} has no session id; was it finished with --session-id?"
+    )]
+    NoSessionId {
+        /// The ticket key that was looked up.
+        ticket: String,
+        /// The run id that has no session id.
+        run_id: i64,
+    },
 }
 
 /// `tm runs start`: record the start of a lane run, printing only the new
@@ -156,6 +174,101 @@ fn last_event_column(run: &RunSummary) -> String {
         (Some(kind), Some(age_secs)) => format!("{kind} {} ago", format_age(age_secs)),
         _ => "-".to_string(),
     }
+}
+
+/// `tm runs show`: print the latest run for `ticket` and its event timeline.
+///
+/// # Errors
+///
+/// Returns [`RunsCliError::NoRunForTicket`] if `ticket` has no recorded runs.
+pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), RunsCliError> {
+    let ticket = ticket.to_uppercase();
+    let run =
+        store
+            .latest_run_for_ticket(&ticket)?
+            .ok_or_else(|| RunsCliError::NoRunForTicket {
+                ticket: ticket.clone(),
+            })?;
+
+    writeln!(
+        out,
+        "Run {}: {} [{}] {}",
+        run.id,
+        run.ticket,
+        run.lane,
+        run.status.as_str()
+    )?;
+    writeln!(out, "started {}", run.started_at)?;
+    if let Some(ended_at) = &run.ended_at {
+        writeln!(out, "ended {ended_at}")?;
+    }
+    if let Some(session_id) = &run.session_id {
+        writeln!(out, "session {session_id}")?;
+    }
+    if let Some(pr_url) = &run.pr_url {
+        writeln!(out, "pr {pr_url}")?;
+    }
+    if let Some(blocker) = &run.blocker {
+        writeln!(out, "blocker {blocker}")?;
+    }
+    if run.cost_usd.is_some() || run.num_turns.is_some() {
+        let cost = run
+            .cost_usd
+            .map(|c| format!("{c:.2}"))
+            .unwrap_or_else(|| "?".to_string());
+        let turns = run
+            .num_turns
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        writeln!(out, "cost ${cost} / {turns} turns")?;
+    }
+
+    writeln!(out)?;
+    let events = store.events_for_run(run.id)?;
+    if events.is_empty() {
+        writeln!(out, "(no events)")?;
+    } else {
+        for event in &events {
+            writeln!(out, "{}", format_event_line(event))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Format one [`RunEvent`] as `{at}  {kind}  {detail}`, omitting the detail
+/// segment when there is none.
+fn format_event_line(event: &RunEvent) -> String {
+    match &event.detail {
+        Some(detail) => format!("{}  {}  {}", event.at, event.kind, detail),
+        None => format!("{}  {}", event.at, event.kind),
+    }
+}
+
+/// `tm runs resume`: print the session id of the latest run of `ticket`, for
+/// `claude --resume $(tm runs resume PROJ-1)`.
+///
+/// # Errors
+///
+/// Returns [`RunsCliError::NoRunForTicket`] if `ticket` has no recorded
+/// runs, or [`RunsCliError::NoSessionId`] if its latest run has no session
+/// id.
+pub fn resume(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), RunsCliError> {
+    let ticket = ticket.to_uppercase();
+    let run =
+        store
+            .latest_run_for_ticket(&ticket)?
+            .ok_or_else(|| RunsCliError::NoRunForTicket {
+                ticket: ticket.clone(),
+            })?;
+
+    let session_id = run.session_id.as_ref().ok_or(RunsCliError::NoSessionId {
+        ticket: ticket.clone(),
+        run_id: run.id,
+    })?;
+
+    writeln!(out, "{session_id}")?;
+    Ok(())
 }
 
 /// Format `secs` as a short human-readable age.
@@ -461,5 +574,147 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!("Reaped run {id} (PROJ-1)\n")
         );
+    }
+
+    #[test]
+    fn show_prints_header_and_events_for_latest_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    session_id: Some("sess-abc".to_string()),
+                    cost_usd: Some(1.5),
+                    num_turns: Some(3),
+                    pr_url: Some("https://example.invalid/pr/1".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        event(
+            &store,
+            id,
+            "tool_use",
+            Some(r#"{"file":"a.rs"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.starts_with(&format!("Run {id}: PROJ-1 [backend] done\n")));
+        assert!(output.contains("session sess-abc\n"));
+        assert!(output.contains("pr https://example.invalid/pr/1\n"));
+        assert!(output.contains("cost $1.50 / 3 turns\n"));
+        assert!(output.contains("tool_use  {\"file\":\"a.rs\"}"));
+        assert!(output.contains("  stop\n") || output.ends_with("  stop\n"));
+        assert!(!output.contains("blocker"));
+    }
+
+    #[test]
+    fn show_with_no_events_prints_placeholder() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("(no events)"));
+        assert!(!output.contains("ended "));
+        assert!(!output.contains("session "));
+    }
+
+    #[test]
+    fn show_unknown_ticket_errors() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = show(&store, "PROJ-404", &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::NoRunForTicket { ticket } if ticket == "PROJ-404"
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resume_prints_only_the_session_id() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    session_id: Some("sess-abc".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        resume(&store, "proj-1", &mut out).expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "sess-abc\n");
+    }
+
+    #[test]
+    fn resume_unknown_ticket_errors() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = resume(&store, "PROJ-404", &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::NoRunForTicket { ticket } if ticket == "PROJ-404"
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resume_no_session_id_errors_with_run_id_in_message() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        let err = resume(&store, "PROJ-1", &mut out).expect_err("should fail");
+
+        match &err {
+            RunsCliError::NoSessionId { ticket, run_id } => {
+                assert_eq!(ticket, "PROJ-1");
+                assert_eq!(*run_id, id);
+            }
+            other => panic!("expected NoSessionId, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "latest run {id} for PROJ-1 has no session id; was it finished with --session-id?"
+            )
+        );
+        assert!(out.is_empty());
     }
 }

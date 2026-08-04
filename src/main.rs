@@ -341,6 +341,12 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
                 &mut stdout,
             )?;
         }
+        Some(RunsCmd::Show { ticket }) => {
+            tskmstr::cli::runs::show(&store, &ticket, &mut stdout)?;
+        }
+        Some(RunsCmd::Resume { ticket }) => {
+            tskmstr::cli::runs::resume(&store, &ticket, &mut stdout)?;
+        }
     }
     Ok(())
 }
