@@ -205,6 +205,14 @@ pub enum TicketCmd {
         #[arg(long, group = "link_direction")]
         blocked_by: Option<String>,
     },
+    /// Remove the `Blocks`-type link(s) between two tickets, regardless of
+    /// direction — the inverse of `Link`.
+    Unlink {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// The other issue key to remove the `Blocks` link with.
+        other: String,
+    },
 }
 
 /// `tm auth` subcommands.
@@ -750,6 +758,28 @@ mod tests {
     fn ticket_link_without_key_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "link"]);
         assert!(result.is_err(), "link requires a key");
+    }
+
+    #[test]
+    fn parses_ticket_unlink_with_both_positionals() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "unlink", "proj-372", "proj-1"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Unlink { key, other }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(other, "proj-1".to_string());
+            }
+            other => panic!("expected TicketCmd::Unlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_unlink_missing_other_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "unlink", "proj-372"]);
+        assert!(result.is_err(), "unlink requires both KEY and OTHER");
     }
 
     #[test]

@@ -96,6 +96,17 @@ pub enum JiraError {
         /// The issue key that was to be blocked by `blocker`.
         blocked: String,
     },
+
+    /// [`JiraClient::delete_link`] got a 404 (HTTP `DELETE
+    /// /rest/api/3/issueLink/{linkId}`). The generic [`JiraError::NotFound`]
+    /// would report `link_id` using the `key` wording, misreporting a link
+    /// id as an issue key — the same reasoning as
+    /// [`JiraError::ProjectNotFound`] being kept distinct from `NotFound`.
+    #[error("Jira issue link not found: {link_id}")]
+    LinkIdNotFound {
+        /// The issue-link id that was not found.
+        link_id: String,
+    },
 }
 
 /// Where to rank an issue relative to another, for [`JiraClient::rank`].
@@ -202,6 +213,15 @@ pub trait JiraClient {
     /// [`JiraError::NotFound`], following the precedent of
     /// [`JiraError::RankNotFound`].
     fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError>;
+
+    /// Remove an issue link by its id (`DELETE /rest/api/3/issueLink/{linkId}`).
+    ///
+    /// Jira documents a 200 on success; some deployments return 204, so both
+    /// are accepted. A 404 means `link_id` itself doesn't exist, mapped to
+    /// [`JiraError::LinkIdNotFound`] rather than the generic
+    /// [`JiraError::NotFound`], which would misreport a link id as an issue
+    /// key.
+    fn delete_link(&self, link_id: &str) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -529,6 +549,36 @@ impl JiraClient for HttpJiraClient {
             return Err(JiraError::LinkNotFound {
                 blocker: req.blocker_key.clone(),
                 blocked: req.blocked_key.clone(),
+            });
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(JiraError::Unauthorized);
+        }
+
+        let body = response.text().unwrap_or_default();
+        Err(JiraError::Api {
+            status: status.as_u16(),
+            message: extract_error_message(&body),
+        })
+    }
+
+    fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .delete(self.url(&format!("/issueLink/{link_id}")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .send()?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // Like `create_link`'s 404 handling, a link id is not an issue key,
+        // so this can't go through `parse_empty`'s single-key `NotFound`.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(JiraError::LinkIdNotFound {
+                link_id: link_id.to_string(),
             });
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -1288,6 +1338,81 @@ mod tests {
 
         let client = HttpJiraClient::new(test_ctx(&server));
         let err = client.create_link(&req).expect_err("should fail");
+
+        assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn delete_link_succeeds_on_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/rest/api/3/issueLink/10001")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                );
+            then.status(200);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .delete_link("10001")
+            .expect("delete_link should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn delete_link_succeeds_on_204() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/rest/api/3/issueLink/10001");
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .delete_link("10001")
+            .expect("delete_link should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn delete_link_maps_404_to_link_id_not_found() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/rest/api/3/issueLink/nope");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue link does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.delete_link("nope").expect_err("should fail");
+
+        match err {
+            JiraError::LinkIdNotFound { link_id } => assert_eq!(link_id, "nope"),
+            other => panic!("expected LinkIdNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_link_maps_401_to_unauthorized() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/rest/api/3/issueLink/10001");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Unauthorized"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client.delete_link("10001").expect_err("should fail");
 
         assert!(matches!(err, JiraError::Unauthorized));
     }

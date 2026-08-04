@@ -71,6 +71,8 @@ pub struct FakeJiraClient {
     rank_calls: RefCell<Vec<(Vec<String>, RankAnchor)>>,
     create_link_result: RefCell<Result<(), (u16, String)>>,
     create_link_calls: RefCell<Vec<CreateLinkRequest>>,
+    delete_link_result: RefCell<Result<(), (u16, String)>>,
+    delete_link_calls: RefCell<Vec<String>>,
 }
 
 impl Default for FakeJiraClient {
@@ -93,6 +95,8 @@ impl Default for FakeJiraClient {
             rank_calls: RefCell::new(Vec::new()),
             create_link_result: RefCell::new(Ok(())),
             create_link_calls: RefCell::new(Vec::new()),
+            delete_link_result: RefCell::new(Ok(())),
+            delete_link_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -279,6 +283,18 @@ impl FakeJiraClient {
     pub fn create_link_calls(&self) -> Vec<CreateLinkRequest> {
         self.create_link_calls.borrow().clone()
     }
+
+    /// Seed `delete_link(..)` to return [`JiraError::Api`] with the given
+    /// status and message.
+    pub fn with_delete_link_error(self, status: u16, message: &str) -> Self {
+        *self.delete_link_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The link ids passed to `delete_link`, in call order.
+    pub fn delete_link_calls(&self) -> Vec<String> {
+        self.delete_link_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -417,6 +433,19 @@ impl JiraClient for FakeJiraClient {
     fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError> {
         self.create_link_calls.borrow_mut().push(req.clone());
         match self.create_link_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
+    }
+
+    fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
+        self.delete_link_calls
+            .borrow_mut()
+            .push(link_id.to_string());
+        match self.delete_link_result.borrow().as_ref() {
             Ok(()) => Ok(()),
             Err((status, message)) => Err(JiraError::Api {
                 status: *status,
@@ -664,6 +693,29 @@ mod tests {
         };
 
         let err = fake.create_link(&req).expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_link_records_calls_and_succeeds_by_default() {
+        let fake = FakeJiraClient::new();
+
+        fake.delete_link("10001").expect("should succeed");
+
+        assert_eq!(fake.delete_link_calls(), vec!["10001".to_string()]);
+    }
+
+    #[test]
+    fn delete_link_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_delete_link_error(500, "boom");
+
+        let err = fake.delete_link("10001").expect_err("should fail");
         match err {
             JiraError::Api { status, message } => {
                 assert_eq!(status, 500);

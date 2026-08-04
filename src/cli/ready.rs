@@ -214,6 +214,7 @@ mod tests {
     fn list_appends_hidden_count_when_candidates_are_blocked() {
         let mut blocked = issue("PROJ-2");
         blocked.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: blocks_link_type(),
             inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
             outward_issue: None,
@@ -235,6 +236,7 @@ mod tests {
     fn list_all_blocked_prints_no_ready_tickets_then_hidden_count() {
         let mut blocked = issue("PROJ-1");
         blocked.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: blocks_link_type(),
             inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
             outward_issue: None,
@@ -253,6 +255,7 @@ mod tests {
         let blocked = |key: &str| {
             let mut i = issue(key);
             i.fields.issue_links = vec![IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
                 outward_issue: None,
@@ -285,11 +288,13 @@ mod tests {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
                 outward_issue: None,
             },
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
                 outward_issue: None,

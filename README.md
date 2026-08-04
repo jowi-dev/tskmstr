@@ -60,6 +60,7 @@ tm auth status
 | `tm ticket link <KEY> --blocks <OTHER>` | Create a `Blocks` link: `<KEY>` blocks `<OTHER>` |
 | `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
+| `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
@@ -223,6 +224,15 @@ as `rank`; a typo'd `<OTHER>` surfaces from the link request itself. Linking
 includes every link type, not just `Blocks`. Like `tm ticket rank`, creating
 a link is an explicit command, so every failure is a hard error (non-zero
 exit).
+
+`tm ticket unlink <KEY> <OTHER>` is the inverse: it removes the `Blocks`
+link(s) between the two tickets, direction-agnostic — you don't need to
+remember which of `--blocks`/`--blocked-by` was used to create it. It only
+ever touches `Blocks`-type links; if no `Blocks` link exists between
+`<KEY>` and `<OTHER>`, it's a hard error, and if a link of some other type
+(e.g. `Relates`) exists between the pair instead, the error names it so you
+can see what's actually there. Unlinking `<KEY>` from itself is rejected as
+a usage error, same as `link`.
 
 ### Readiness
 

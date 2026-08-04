@@ -54,6 +54,13 @@
 //! [`list_links`] (`tm ticket link <KEY>` with neither flag) is a read-only
 //! discovery view: it lists all of `KEY`'s existing issue links, of any link
 //! type, not just `Blocks`.
+//!
+//! [`unlink_ticket`] (`tm ticket unlink <KEY> <OTHER>`) is the inverse of
+//! [`link_ticket`]: it removes the `Blocks`-type link(s) between two
+//! tickets, regardless of which one is the inward/outward side, via
+//! [`JiraClient::delete_link`]. No matching `Blocks` link between the pair is
+//! a hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
+//! non-`Blocks` link found between them instead.
 
 use thiserror::Error;
 
@@ -205,6 +212,40 @@ pub enum TicketingError {
         /// The issue key that was to be assigned.
         key: String,
     },
+
+    /// `tm ticket unlink <KEY> <OTHER>` found no `Blocks`-type link between
+    /// `key` and `other`, in either direction. Unlike [`open_blockers`],
+    /// which only cares about `Blocks` links, `unlink_ticket` scans every
+    /// link type so it can name any non-`Blocks` link it found between the
+    /// pair (e.g. a `Relates` link) — a caller who expected to unlink a
+    /// blocker relationship that never existed should learn what *does*
+    /// exist between the two tickets instead of a bare "not found".
+    #[error("no Blocks link between {key} and {other}{}", format_no_blocks_others(.others))]
+    NoBlocksLinkBetween {
+        /// The primary issue key passed to `unlink_ticket`.
+        key: String,
+        /// The other issue key passed to `unlink_ticket`.
+        other: String,
+        /// Semicolon-joined summary of non-`Blocks` links found between
+        /// `key` and `other` (e.g. `"relates to PROJ-2"`), or an empty
+        /// string when no link of any type exists between the pair. See
+        /// [`format_no_blocks_others`].
+        others: String,
+    },
+}
+
+/// Describe `others` for display in [`TicketingError::NoBlocksLinkBetween`]:
+/// `"; other links exist: ..."` when non-`Blocks` links were found between
+/// the pair, or an empty string (no suffix at all) when `others` is empty —
+/// mirrors [`format_transitions`]'s "say so explicitly instead of a dangling
+/// list" approach, just inverted (here, the *absence* of a suffix is the
+/// common case, not an explicit "none" message).
+fn format_no_blocks_others(others: &str) -> String {
+    if others.is_empty() {
+        String::new()
+    } else {
+        format!("; other links exist: {others}")
+    }
 }
 
 /// `tm ticket <KEY>`: verify `key` exists in Jira, then associate it with the
@@ -623,6 +664,70 @@ pub fn link_ticket(
     jira.get_issue(key)?;
     jira.create_link(req)?;
     Ok(())
+}
+
+/// Result of successfully [`unlink_ticket`]ing two tickets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlinkOutcome {
+    /// The direction phrase of each removed link (e.g. `"blocks"`, `"is
+    /// blocked by"`), relative to `key`, in encounter order. Normally a
+    /// single entry; two when both an inward and an outward `Blocks` link
+    /// existed between the pair (degenerate but possible in Jira).
+    pub removed: Vec<String>,
+}
+
+/// `tm ticket unlink <KEY> <OTHER>`: remove the `Blocks`-type link(s) between
+/// `key` and `other`, regardless of direction.
+///
+/// Fetches `key` and scans its `issuelinks` for entries where
+/// [`IssueLinkType::name`](crate::jira::types::IssueLinkType) is `Blocks` and
+/// the other side (`inward_issue` or `outward_issue`) is `other`; each match
+/// is deleted by its link id via [`JiraClient::delete_link`]. No match is a
+/// hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
+/// non-`Blocks` links found between the pair so a caller who mistyped the
+/// relationship type learns what does exist instead of a bare "not found". A
+/// `Blocks` link to a different issue entirely is left untouched.
+pub fn unlink_ticket(
+    jira: &dyn JiraClient,
+    key: &str,
+    other: &str,
+) -> Result<UnlinkOutcome, TicketingError> {
+    let issue = jira.get_issue(key)?;
+
+    let mut to_delete: Vec<(String, String)> = Vec::new();
+    let mut other_links: Vec<String> = Vec::new();
+
+    for link in &issue.fields.issue_links {
+        let side = if link.inward_issue.as_ref().is_some_and(|i| i.key == other) {
+            Some(link.link_type.inward.clone())
+        } else if link.outward_issue.as_ref().is_some_and(|o| o.key == other) {
+            Some(link.link_type.outward.clone())
+        } else {
+            None
+        };
+        let Some(phrase) = side else { continue };
+
+        if link.link_type.name == "Blocks" {
+            to_delete.push((link.id.clone(), phrase));
+        } else {
+            other_links.push(format!("{phrase} {other}"));
+        }
+    }
+
+    if to_delete.is_empty() {
+        return Err(TicketingError::NoBlocksLinkBetween {
+            key: key.to_string(),
+            other: other.to_string(),
+            others: other_links.join("; "),
+        });
+    }
+
+    let mut removed = Vec::new();
+    for (link_id, phrase) in to_delete {
+        jira.delete_link(&link_id)?;
+        removed.push(phrase);
+    }
+    Ok(UnlinkOutcome { removed })
 }
 
 /// A ticket's existing issue links, as returned by [`list_links`].
@@ -2247,6 +2352,7 @@ mod tests {
     fn list_links_returns_issue_links() {
         let mut with_links = issue("PROJ-1");
         with_links.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: crate::jira::types::IssueLinkType {
                 name: "Blocks".to_string(),
                 inward: "is blocked by".to_string(),
@@ -2286,6 +2392,182 @@ mod tests {
         match err {
             TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
             other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlink_ticket_removes_inward_blocks_link() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let outcome = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect("should succeed");
+
+        assert_eq!(outcome.removed, vec!["is blocked by".to_string()]);
+        assert_eq!(jira.delete_link_calls(), vec!["10001".to_string()]);
+    }
+
+    #[test]
+    fn unlink_ticket_removes_outward_blocks_link() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10002".to_string(),
+            link_type: blocks_link_type(),
+            inward_issue: None,
+            outward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let outcome = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect("should succeed");
+
+        assert_eq!(outcome.removed, vec!["blocks".to_string()]);
+        assert_eq!(jira.delete_link_calls(), vec!["10002".to_string()]);
+    }
+
+    #[test]
+    fn unlink_ticket_removes_both_directions_when_both_exist() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![
+            IssueLink {
+                id: "10001".to_string(),
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+                outward_issue: None,
+            },
+            IssueLink {
+                id: "10002".to_string(),
+                link_type: blocks_link_type(),
+                inward_issue: None,
+                outward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+            },
+        ];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let outcome = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect("should succeed");
+
+        assert_eq!(
+            outcome.removed,
+            vec!["is blocked by".to_string(), "blocks".to_string()]
+        );
+        assert_eq!(
+            jira.delete_link_calls(),
+            vec!["10001".to_string(), "10002".to_string()]
+        );
+    }
+
+    #[test]
+    fn unlink_ticket_no_links_at_all_is_a_hard_error_with_empty_others() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+
+        let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
+
+        match err {
+            TicketingError::NoBlocksLinkBetween { key, other, others } => {
+                assert_eq!(key, "PROJ-1");
+                assert_eq!(other, "PROJ-2");
+                assert_eq!(others, "");
+            }
+            other => panic!("expected NoBlocksLinkBetween, got {other:?}"),
+        }
+        assert!(jira.delete_link_calls().is_empty());
+    }
+
+    #[test]
+    fn unlink_ticket_only_relates_link_between_pair_names_it_in_the_error() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10003".to_string(),
+            link_type: relates_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
+
+        match err {
+            TicketingError::NoBlocksLinkBetween { others, .. } => {
+                assert_eq!(others, "relates to PROJ-2");
+            }
+            other => panic!("expected NoBlocksLinkBetween, got {other:?}"),
+        }
+        assert!(jira.delete_link_calls().is_empty());
+    }
+
+    #[test]
+    fn unlink_ticket_error_message_includes_other_links_summary() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10003".to_string(),
+            link_type: relates_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("no Blocks link between PROJ-1 and PROJ-2"));
+        assert!(message.contains("other links exist: relates to PROJ-2"));
+    }
+
+    #[test]
+    fn unlink_ticket_blocks_link_to_a_different_issue_is_untouched() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10004".to_string(),
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+
+        let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
+
+        assert!(matches!(err, TicketingError::NoBlocksLinkBetween { .. }));
+        assert!(jira.delete_link_calls().is_empty());
+    }
+
+    #[test]
+    fn unlink_ticket_missing_primary_key_passes_through_get_issue_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+
+        let err = unlink_ticket(&jira, "PROJ-404", "PROJ-2").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(jira.delete_link_calls().is_empty());
+    }
+
+    #[test]
+    fn unlink_ticket_propagates_delete_link_api_error() {
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", i)
+            .with_delete_link_error(500, "boom");
+
+        let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
 
@@ -2330,6 +2612,7 @@ mod tests {
     fn open_blockers_ignores_outward_only_blocks_link() {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: blocks_link_type(),
             inward_issue: None,
             outward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
@@ -2344,6 +2627,7 @@ mod tests {
     fn open_blockers_includes_inward_blocks_link_when_not_done() {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: blocks_link_type(),
             inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
             outward_issue: None,
@@ -2357,6 +2641,7 @@ mod tests {
     fn open_blockers_excludes_inward_blocks_link_when_done() {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: blocks_link_type(),
             inward_issue: Some(linked_issue("PROJ-2", "Done", "done")),
             outward_issue: None,
@@ -2371,6 +2656,7 @@ mod tests {
     fn open_blockers_ignores_inward_link_of_a_different_type() {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![IssueLink {
+            id: "10001".to_string(),
             link_type: relates_link_type(),
             inward_issue: Some(linked_issue("PROJ-2", "To Do", "new")),
             outward_issue: None,
@@ -2383,21 +2669,25 @@ mod tests {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
                 outward_issue: None,
             },
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
                 outward_issue: None,
             },
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: None,
                 outward_issue: Some(linked_issue("PROJ-4", "To Do", "new")),
             },
             IssueLink {
+                id: "10001".to_string(),
                 link_type: relates_link_type(),
                 inward_issue: Some(linked_issue("PROJ-5", "To Do", "new")),
                 outward_issue: None,
@@ -2420,6 +2710,7 @@ mod tests {
         let blocked = {
             let mut i = issue("PROJ-2");
             i.fields.issue_links = vec![IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
                 outward_issue: None,
@@ -2485,11 +2776,13 @@ mod tests {
         let mut i = issue("PROJ-1");
         i.fields.issue_links = vec![
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
                 outward_issue: None,
             },
             IssueLink {
+                id: "10001".to_string(),
                 link_type: blocks_link_type(),
                 inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
                 outward_issue: None,

@@ -67,6 +67,11 @@ pub struct IssueFields {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLink {
+    /// Jira's identifier for this specific link entry, distinct from either
+    /// issue's key. Passed to [`crate::jira::client::JiraClient::delete_link`]
+    /// to remove the link; every persisted link has one, so this is a plain
+    /// `String`, not `Option`.
+    pub id: String,
     /// The kind of relationship this link represents.
     #[serde(rename = "type")]
     pub link_type: IssueLinkType,
@@ -505,6 +510,7 @@ mod tests {
                 "assignee": null,
                 "issuelinks": [
                     {
+                        "id": "10001",
                         "type": {
                             "name": "Blocks",
                             "inward": "is blocked by",
@@ -522,6 +528,7 @@ mod tests {
                         }
                     },
                     {
+                        "id": "10002",
                         "type": {
                             "name": "Blocks",
                             "inward": "is blocked by",
@@ -546,6 +553,7 @@ mod tests {
         assert_eq!(issue.fields.issue_links.len(), 2);
 
         let blocker_entry = &issue.fields.issue_links[0];
+        assert_eq!(blocker_entry.id, "10001");
         assert_eq!(blocker_entry.link_type.name, "Blocks");
         let blocker = blocker_entry
             .inward_issue

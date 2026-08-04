@@ -274,6 +274,9 @@ mod tests {
         ) -> Result<(), JiraError> {
             self.0.create_link(req)
         }
+        fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
+            self.0.delete_link(link_id)
+        }
     }
 
     fn write_test_config(path: &Path) {
