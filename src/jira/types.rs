@@ -245,20 +245,27 @@ impl RemoteLinkRequest {
 /// dependency between two issues).
 ///
 /// tskmstr only ever creates `Blocks`-type links, so the link type name is
-/// hardcoded rather than taking a parameter. Per Atlassian's documented
-/// contract, the *outward* issue is the one the link type's outward
-/// description applies to: for `Blocks`, `outwardIssue` is the blocker and
-/// `inwardIssue` is the blocked issue (`outwardIssue` "blocks" `inwardIssue`,
-/// `inwardIssue` "is blocked by" `outwardIssue`). This is the mirror image
-/// of how it reads in English, so it's easy to swap the two fields by
-/// accident — double check against this doc comment, not intuition.
+/// hardcoded rather than taking a parameter. In this payload the *inward*
+/// issue is the blocker: `inwardIssue` "blocks" `outwardIssue`. This is the
+/// OPPOSITE of what Atlassian's own KB examples suggest ("the outward issue
+/// is the one the outward description applies to") — but it is what Jira
+/// Cloud actually does, verified end-to-end against a live instance on
+/// 2026-08-04 (link created with the blocker as `outwardIssue` rendered as
+/// "is blocked by" in the Jira UI; see also
+/// <https://github.com/atlassian/atlassian-mcp-server/issues/112>, which
+/// reports the same observed behavior). Consistency check: an issue's
+/// `issuelinks` field shows the OTHER issue under its stored role key, and
+/// an `inwardIssue` entry renders with the `type.inward` phrase ("is blocked
+/// by <other>") — so the stored inward end is the blocker, and this payload
+/// must put the blocker there too. Trust this doc comment and the payload
+/// test over Atlassian's examples.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateLinkRequest {
     /// Key of the issue that blocks `blocked_key`; serialized as
-    /// `outwardIssue`.
+    /// `inwardIssue`.
     pub blocker_key: String,
     /// Key of the issue that is blocked by `blocker_key`; serialized as
-    /// `inwardIssue`.
+    /// `outwardIssue`.
     pub blocked_key: String,
 }
 
@@ -268,8 +275,8 @@ impl CreateLinkRequest {
     pub fn to_payload(&self) -> Value {
         serde_json::json!({
             "type": { "name": "Blocks" },
-            "inwardIssue": { "key": self.blocked_key },
-            "outwardIssue": { "key": self.blocker_key },
+            "inwardIssue": { "key": self.blocker_key },
+            "outwardIssue": { "key": self.blocked_key },
         })
     }
 }
@@ -594,18 +601,22 @@ mod tests {
     }
 
     #[test]
-    fn serializes_create_link_request() {
+    fn serializes_create_link_request_with_blocker_as_inward_issue() {
         let req = CreateLinkRequest {
             blocker_key: "PROJ-1".to_string(),
             blocked_key: "PROJ-2".to_string(),
         };
         let payload = req.to_payload();
+        // The blocker goes under `inwardIssue` — verified against live Jira
+        // Cloud (see the CreateLinkRequest doc comment); do not "fix" this
+        // to match Atlassian's KB examples, which describe the opposite of
+        // what the API actually does.
         assert_eq!(
             payload,
             json!({
                 "type": { "name": "Blocks" },
-                "inwardIssue": { "key": "PROJ-2" },
-                "outwardIssue": { "key": "PROJ-1" }
+                "inwardIssue": { "key": "PROJ-1" },
+                "outwardIssue": { "key": "PROJ-2" }
             })
         );
     }
