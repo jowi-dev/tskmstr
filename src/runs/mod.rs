@@ -338,6 +338,43 @@ impl RunStore {
         Ok(())
     }
 
+    /// Appends an event to a run and bumps the run's heartbeat, atomically.
+    ///
+    /// `detail` is stored as-is; validating it (e.g. as JSON) is the CLI
+    /// layer's responsibility. Returns the new event row's id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching
+    /// row; no event row is inserted in that case.
+    pub fn add_event(
+        &self,
+        run_id: i64,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Result<i64, RunStoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let changes = tx.execute(
+            &format!("UPDATE runs SET heartbeat_at = {NOW_SQL} WHERE id = ?1"),
+            params![run_id],
+        )?;
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+
+        tx.execute(
+            &format!(
+                "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, ?2, ?3)"
+            ),
+            params![run_id, kind, detail],
+        )?;
+        let event_id = tx.last_insert_rowid();
+
+        tx.commit()?;
+        Ok(event_id)
+    }
+
     /// Lists all runs, ordered with active runs (queued/running/blocked/
     /// review) before terminal ones (done/failed), and by `started_at`
     /// descending within each group.
@@ -710,6 +747,153 @@ mod tests {
         assert_eq!(run.last_event_kind.as_deref(), Some("tool_use"));
         assert!(run.last_event_age_secs.is_some());
         assert!(run.last_event_age_secs.unwrap() >= 0);
+    }
+
+    #[test]
+    fn add_event_writes_row_and_bumps_heartbeat() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let run_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        let event_id = store
+            .add_event(run_id, "tool_use", Some(r#"{"file":"a.rs"}"#))
+            .unwrap();
+        assert_eq!(event_id, 1);
+
+        let (kind, detail, at): (String, Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT kind, detail, at FROM run_events WHERE id = ?1",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(kind, "tool_use");
+        assert_eq!(detail, Some(r#"{"file":"a.rs"}"#.to_string()));
+        let re = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$").unwrap();
+        assert!(re.is_match(&at), "at {at:?} did not match expected format");
+
+        let heartbeat_at: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT heartbeat_at FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(heartbeat_at.is_some());
+    }
+
+    #[test]
+    fn add_event_orders_two_events_by_at() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let run_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        let first_id = store.add_event(run_id, "first", None).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE run_events SET at = '2000-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![first_id],
+            )
+            .unwrap();
+        let second_id = store.add_event(run_id, "second", None).unwrap();
+
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id FROM run_events WHERE run_id = ?1 ORDER BY at ASC")
+            .unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map(params![run_id], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(ids, vec![first_id, second_id]);
+    }
+
+    #[test]
+    fn add_event_unknown_run_id_returns_run_not_found_and_inserts_nothing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .add_event(999, "tool_use", None)
+            .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM run_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn add_event_is_safe_under_concurrent_writers() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+
+        let run_id = {
+            let store = RunStore::open(&db_path).unwrap();
+            store
+                .start_run(&StartRun {
+                    ticket: "PROJ-1".to_string(),
+                    lane: "backend".to_string(),
+                    worktree: "/tmp/wt1".to_string(),
+                    branch: None,
+                    pid: None,
+                })
+                .unwrap()
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let db_path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = RunStore::open(&db_path).expect("open should succeed");
+                for i in 0..250 {
+                    store
+                        .add_event(run_id, "tool_use", Some(&i.to_string()))
+                        .expect("add_event should succeed");
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        let store = RunStore::open(&db_path).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM run_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 500);
     }
 
     #[test]
