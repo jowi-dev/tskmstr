@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 
+pub mod pid;
+
 /// A SQL expression yielding the current UTC time as
 /// `YYYY-MM-DDTHH:MM:SS.sssZ`. Takes no user input, so it is safe to splice
 /// directly into statement text; all user-supplied values still go through
@@ -197,6 +199,17 @@ impl Default for FinishRun {
             transcript: None,
         }
     }
+}
+
+/// A run marked failed by [`RunStore::reap`].
+#[derive(Debug, Clone)]
+pub struct ReapedRun {
+    /// Row id.
+    pub id: i64,
+    /// Jira ticket key.
+    pub ticket: String,
+    /// PID recorded for the run, if any.
+    pub pid: Option<u32>,
 }
 
 /// A single row from [`RunStore::list_runs`], with ages precomputed in SQL.
@@ -417,6 +430,71 @@ impl RunStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Marks abandoned runs as failed.
+    ///
+    /// A run is reaped when its status is `running`, its last heartbeat
+    /// (falling back to `started_at`) is older than `stale_after_mins`, and
+    /// its recorded pid is no longer alive (per `pid_alive`); rows with no
+    /// recorded pid are reaped on staleness alone, since there's nothing to
+    /// probe. Each reaped run gets `ended_at` set and a `reaped` event
+    /// appended.
+    ///
+    /// Deliberately does not go through [`RunStore::add_event`]: that bumps
+    /// `heartbeat_at`, which would be wrong to do for a run just declared
+    /// dead.
+    pub fn reap(
+        &self,
+        stale_after_mins: u64,
+        pid_alive: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<ReapedRun>, RunStoreError> {
+        // stale_after_mins is a plain integer, not user-supplied text, so
+        // it's safe to format directly into the modifier string rather than
+        // trying to bind it inside strftime's modifier argument.
+        let modifier = format!("-{stale_after_mins} minutes");
+
+        let candidates: Vec<(i64, String, Option<u32>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, ticket, pid FROM runs
+                 WHERE status = 'running'
+                   AND COALESCE(heartbeat_at, started_at) < strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)",
+            )?;
+            let rows = stmt.query_map(params![modifier], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let mut reaped = Vec::new();
+        for (id, ticket, pid) in candidates {
+            if let Some(p) = pid
+                && pid_alive(p)
+            {
+                continue;
+            }
+
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute(
+                &format!("UPDATE runs SET status = 'failed', ended_at = {NOW_SQL} WHERE id = ?1"),
+                params![id],
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, 'reaped', NULL)"
+                ),
+                params![id],
+            )?;
+            tx.commit()?;
+
+            reaped.push(ReapedRun { id, ticket, pid });
+        }
+
+        Ok(reaped)
     }
 }
 
@@ -916,5 +994,213 @@ mod tests {
             path,
             PathBuf::from("/home/user/.local/share/tskmstr/runs.db")
         );
+    }
+
+    /// Backdates `run_id`'s heartbeat (falling back to `started_at` if there
+    /// is none yet) to `minutes_ago` minutes in the past, so [`RunStore::reap`]
+    /// sees it as stale.
+    fn backdate_heartbeat(store: &RunStore, run_id: i64, minutes_ago: i64) {
+        store
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-{minutes_ago} minutes') WHERE id = ?1"
+                ),
+                params![run_id],
+            )
+            .unwrap();
+    }
+
+    fn always_alive(_pid: u32) -> bool {
+        true
+    }
+
+    fn always_dead(_pid: u32) -> bool {
+        false
+    }
+
+    #[test]
+    fn reap_marks_stale_run_with_dead_pid_as_failed() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: Some(4242),
+            })
+            .unwrap();
+        backdate_heartbeat(&store, id, 20);
+
+        let reaped = store.reap(10, &always_dead).unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].id, id);
+        assert_eq!(reaped[0].ticket, "PROJ-1");
+        assert_eq!(reaped[0].pid, Some(4242));
+
+        let (status, ended_at): (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT status, ended_at FROM runs WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(ended_at.is_some());
+
+        let event_kind: String = store
+            .conn
+            .query_row(
+                "SELECT kind FROM run_events WHERE run_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_kind, "reaped");
+    }
+
+    #[test]
+    fn reap_leaves_stale_run_with_alive_pid_untouched() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: Some(4242),
+            })
+            .unwrap();
+        backdate_heartbeat(&store, id, 20);
+
+        let reaped = store.reap(10, &always_alive).unwrap();
+
+        assert!(reaped.is_empty());
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn reap_leaves_fresh_run_with_dead_pid_untouched() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: Some(4242),
+            })
+            .unwrap();
+
+        let reaped = store.reap(10, &always_dead).unwrap();
+
+        assert!(reaped.is_empty());
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn reap_marks_stale_run_with_no_pid_as_failed() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        backdate_heartbeat(&store, id, 20);
+
+        let reaped = store.reap(10, &always_alive).unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].pid, None);
+    }
+
+    #[test]
+    fn reap_ignores_non_running_statuses_even_when_stale() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let blocked_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-BLOCKED".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                blocked_id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        // finish_run sets ended_at; reset it so this looks like a
+        // long-running-but-blocked row rather than a finished one.
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET ended_at = NULL WHERE id = ?1",
+                params![blocked_id],
+            )
+            .unwrap();
+        backdate_heartbeat(&store, blocked_id, 20);
+
+        let done_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-DONE".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                done_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        backdate_heartbeat(&store, done_id, 20);
+
+        let reaped = store.reap(10, &always_dead).unwrap();
+
+        assert!(reaped.is_empty());
     }
 }
