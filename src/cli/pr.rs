@@ -4,6 +4,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
+use crate::github::bot_findings::count_bot_findings;
 use crate::github::gh_cli::{GhError, PrCreateRequest};
 use crate::ticketing::{
     TicketingContext, TicketingError, associate_existing_ticket_for_pr_create,
@@ -94,8 +95,15 @@ pub fn create(
     Ok(())
 }
 
-/// `tm pr status`: report the pull request open for the current branch and
-/// which ticket (if any) is associated with it.
+/// `tm pr status`: report the pull request open for the current branch,
+/// which ticket (if any) is associated with it, and a summary of any bot
+/// review findings (see [`crate::github::bot_findings::count_bot_findings`])
+/// on the pull request.
+///
+/// The bot-findings check is best-effort: if
+/// [`crate::github::gh_cli::GhCli::pr_review_threads`] fails, a warning line
+/// is printed and the rest of `tm pr status` (ticket resolution, prompts)
+/// still runs, returning `Ok` on the happy path as usual.
 pub fn status(
     ctx: &TicketingContext,
     opts: &PrStatusOptions,
@@ -116,6 +124,24 @@ pub fn status(
 
     writeln!(out, "PR #{}: {}", pr.number, pr.url)?;
     writeln!(out, "Title: {}", pr.title)?;
+
+    match ctx.gh.pr_review_threads(pr.number) {
+        Ok(threads) => {
+            let counts = count_bot_findings(&threads, &ctx.config.review_bots);
+            if counts.total > 0 {
+                writeln!(
+                    out,
+                    "Bot findings: {} unresolved (of {})",
+                    counts.unresolved, counts.total
+                )?;
+            } else {
+                writeln!(out, "Bot findings: none")?;
+            }
+        }
+        Err(err) => {
+            writeln!(out, "warning: could not check bot findings: {err}")?;
+        }
+    }
 
     match resolve_existing_key(ctx.jira, &pr)? {
         Some(key) => {
@@ -156,7 +182,8 @@ mod tests {
     use super::*;
     use crate::cli::FakePrompter;
     use crate::config::Config;
-    use crate::github::gh_cli::FakeGhCli;
+    use crate::github::bot_findings::ReviewThread;
+    use crate::github::gh_cli::{FakeGhCli, GhError};
     use crate::github::pr::PrInfo;
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
@@ -604,5 +631,118 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("no ticket associated"));
         assert!(!output.contains("Created ticket"));
+    }
+
+    fn review_thread(is_resolved: bool, author_login: &str) -> ReviewThread {
+        ReviewThread {
+            is_resolved,
+            author_login: Some(author_login.to_string()),
+        }
+    }
+
+    #[test]
+    fn status_prints_bot_findings_counts_for_mixed_threads() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))))
+            .with_review_threads(
+                42,
+                Ok(vec![
+                    review_thread(true, "cursor"),
+                    review_thread(false, "cursor"),
+                    review_thread(false, "some-human"),
+                ]),
+            );
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrStatusOptions::default();
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Bot findings: 1 unresolved (of 2)"));
+    }
+
+    #[test]
+    fn status_prints_bot_findings_none_when_no_bot_threads() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))))
+            .with_review_threads(42, Ok(vec![review_thread(false, "some-human")]));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrStatusOptions::default();
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Bot findings: none"));
+    }
+
+    #[test]
+    fn status_prints_warning_and_continues_when_review_threads_fails() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))))
+            .with_review_threads(
+                42,
+                Err(GhError::Command {
+                    command: "gh api graphql".to_string(),
+                    exit_code: Some(1),
+                    stderr: "boom".to_string(),
+                }),
+            );
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrStatusOptions::default();
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(&ctx, &opts, &mut prompter, &mut out).expect("should still succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("warning: could not check bot findings:"));
+        assert!(output.contains("Ticket PROJ-372: https://example.atlassian.net/browse/PROJ-372"));
+    }
+
+    #[test]
+    fn status_respects_custom_review_bots_config() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))))
+            .with_review_threads(42, Ok(vec![review_thread(false, "my-custom-bot")]));
+        let cfg = Config {
+            review_bots: vec!["my-custom-bot".to_string()],
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let opts = PrStatusOptions::default();
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Bot findings: 1 unresolved (of 1)"));
     }
 }
