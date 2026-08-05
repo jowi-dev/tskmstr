@@ -604,6 +604,9 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
     if let Some(ended_at) = &detail.ended_at {
         lines.push(Line::from(format!("ended: {ended_at}")));
     }
+    if let Some(tools_line) = crate::runs::format_tool_counts(&detail.tool_counts) {
+        lines.push(Line::from(tools_line));
+    }
     lines.push(Line::from(""));
 
     if let Some(checklist) = &detail.checklist {
@@ -623,9 +626,13 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         lines.push(Line::from("(no events)"));
     } else {
         for event in detail.events.iter().rev() {
-            let text = match &event.detail {
-                Some(d) => format!("{}  {}  {}", event.at, event.kind, d),
-                None => format!("{}  {}", event.at, event.kind),
+            let text = match crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
+            {
+                Some(friendly) => format!("{}  {}  {}", event.at, event.kind, friendly),
+                None => match &event.detail {
+                    Some(d) => format!("{}  {}  {}", event.at, event.kind, d),
+                    None => format!("{}  {}", event.at, event.kind),
+                },
             };
             lines.push(Line::from(text));
         }
@@ -1406,6 +1413,7 @@ mod tests {
                 detail: None,
             }],
             checklist: None,
+            tool_counts: vec![],
         };
         let app = App {
             show_run_detail: true,
@@ -1494,6 +1502,52 @@ mod tests {
         assert!(!text.contains("Checklist"));
     }
 
+    #[test]
+    fn run_detail_overlay_renders_friendly_tool_event_detail() {
+        let detail = crate::tui::app::RunDetail {
+            events: vec![crate::tui::app::RunDetailEvent {
+                at: "2020-01-01T00:00:01.000Z".to_string(),
+                kind: "tool".to_string(),
+                detail: Some(r#"{"tool":"Bash","summary":"cargo test"}"#.to_string()),
+            }],
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Bash — cargo test"));
+        assert!(!text.contains("\"tool\":\"Bash\""));
+    }
+
+    #[test]
+    fn run_detail_overlay_shows_tools_summary_line() {
+        let detail = crate::tui::app::RunDetail {
+            tool_counts: vec![("Bash".to_string(), 2), ("Edit".to_string(), 1)],
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Tools: Bash \u{d7}2, Edit \u{d7}1"));
+    }
+
+    #[test]
+    fn run_detail_overlay_with_no_tool_events_has_no_tools_line() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Tools:"));
+    }
+
     fn run_detail_fixture() -> crate::tui::app::RunDetail {
         crate::tui::app::RunDetail {
             id: 1,
@@ -1512,6 +1566,7 @@ mod tests {
             ended_at: None,
             events: vec![],
             checklist: None,
+            tool_counts: vec![],
         }
     }
 

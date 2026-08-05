@@ -385,6 +385,95 @@ pub fn latest_checklist(events: &[RunEvent]) -> Option<ChecklistState> {
         })
 }
 
+/// The JSON shape of a `tool` event's `detail`: `{"tool":"Bash","summary":
+/// "...","agent":"..."}`. `summary` and `agent` are optional; older events
+/// carry only `tool`. Kept private; callers only see the formatted or
+/// counted results.
+#[derive(serde::Deserialize)]
+struct ToolDetail {
+    tool: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+/// Renders a human-friendly one-line summary of a `run_events` row's
+/// `detail`, for the known conventions a lane-run hook emits:
+///
+/// - `kind == "tool"`: the tool name, prefixed with `[<agent>]` when an
+///   `agent` is present, suffixed with ` — <summary>` when a non-empty
+///   `summary` is present. E.g. `{"tool":"Bash","summary":"cargo
+///   test"}` -> `Bash — cargo test`.
+/// - `kind == "checklist"`: `N/M done`, reusing the same detail shape as
+///   [`latest_checklist`].
+///
+/// Returns `None` for any other kind, missing `detail`, or `detail` that
+/// doesn't parse as the expected shape, so callers can fall back to
+/// rendering the raw detail JSON.
+pub fn format_event_detail(kind: &str, detail: Option<&str>) -> Option<String> {
+    let detail = detail?;
+    match kind {
+        "tool" => {
+            let parsed: ToolDetail = serde_json::from_str(detail).ok()?;
+            let base = match parsed.agent.as_deref() {
+                Some(agent) if !agent.is_empty() => format!("[{agent}] {}", parsed.tool),
+                _ => parsed.tool,
+            };
+            Some(match parsed.summary.as_deref() {
+                Some(summary) if !summary.is_empty() => format!("{base} — {summary}"),
+                _ => base,
+            })
+        }
+        "checklist" => {
+            let parsed: ChecklistDetail = serde_json::from_str(detail).ok()?;
+            let done = parsed.items.iter().filter(|item| item.done).count();
+            Some(format!("{done}/{} done", parsed.items.len()))
+        }
+        _ => None,
+    }
+}
+
+/// Counts `tool` events in `events` by their `"tool"` name, skipping events
+/// that aren't `kind == "tool"` or whose `detail` is missing or doesn't
+/// parse as the [`ToolDetail`] shape.
+///
+/// Sorted by count descending, then tool name ascending, so the most-used
+/// tools lead and ties are stable.
+pub fn tool_counts(events: &[RunEvent]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for event in events {
+        if event.kind != "tool" {
+            continue;
+        }
+        let Some(detail) = event.detail.as_deref() else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<ToolDetail>(detail) else {
+            continue;
+        };
+        *counts.entry(parsed.tool).or_insert(0) += 1;
+    }
+
+    let mut counts: Vec<(String, usize)> = counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+}
+
+/// Renders [`tool_counts`]'s output as a single summary line, e.g. `Tools:
+/// Bash \u{d7}34, Edit \u{d7}8, Read \u{d7}10`. Returns `None` when `counts`
+/// is empty so callers can omit the line entirely.
+pub fn format_tool_counts(counts: &[(String, usize)]) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(name, n)| format!("{name} \u{d7}{n}"))
+        .collect();
+    Some(format!("Tools: {}", parts.join(", ")))
+}
+
 impl RunStore {
     /// Opens (creating if necessary) the run database at `path`, applying
     /// any pending migrations.
@@ -1786,6 +1875,131 @@ mod tests {
             kind: "checklist".to_string(),
             detail: detail.map(str::to_string),
         }
+    }
+
+    fn make_event(id: i64, kind: &str, detail: Option<&str>) -> RunEvent {
+        RunEvent {
+            id,
+            at: format!("2020-01-01T00:00:{id:02}.000Z"),
+            kind: kind.to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_event_detail_renders_tool_with_summary() {
+        let rendered =
+            format_event_detail("tool", Some(r#"{"tool":"Bash","summary":"cargo test"}"#));
+        assert_eq!(rendered, Some("Bash — cargo test".to_string()));
+    }
+
+    #[test]
+    fn format_event_detail_renders_tool_with_agent_and_summary() {
+        let rendered = format_event_detail(
+            "tool",
+            Some(r#"{"tool":"Read","summary":"src/main.rs","agent":"Explore"}"#),
+        );
+        assert_eq!(rendered, Some("[Explore] Read — src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn format_event_detail_renders_tool_name_only() {
+        let rendered = format_event_detail("tool", Some(r#"{"tool":"Bash"}"#));
+        assert_eq!(rendered, Some("Bash".to_string()));
+    }
+
+    #[test]
+    fn format_event_detail_ignores_empty_summary_and_agent() {
+        let rendered =
+            format_event_detail("tool", Some(r#"{"tool":"Bash","summary":"","agent":""}"#));
+        assert_eq!(rendered, Some("Bash".to_string()));
+    }
+
+    #[test]
+    fn format_event_detail_renders_checklist_progress() {
+        let rendered = format_event_detail(
+            "checklist",
+            Some(r#"{"items":[{"text":"a","done":true},{"text":"b","done":false}]}"#),
+        );
+        assert_eq!(rendered, Some("1/2 done".to_string()));
+    }
+
+    #[test]
+    fn format_event_detail_returns_none_for_unknown_kind() {
+        let rendered = format_event_detail("stop", Some(r#"{"tool":"Bash"}"#));
+        assert_eq!(rendered, None);
+    }
+
+    #[test]
+    fn format_event_detail_returns_none_for_malformed_tool_detail() {
+        let rendered = format_event_detail("tool", Some("not json"));
+        assert_eq!(rendered, None);
+    }
+
+    #[test]
+    fn format_event_detail_returns_none_for_missing_detail() {
+        assert_eq!(format_event_detail("tool", None), None);
+        assert_eq!(format_event_detail("checklist", None), None);
+    }
+
+    #[test]
+    fn tool_counts_counts_and_sorts_by_count_desc_then_name_asc() {
+        let events = vec![
+            make_event(1, "tool", Some(r#"{"tool":"Read"}"#)),
+            make_event(2, "tool", Some(r#"{"tool":"Bash"}"#)),
+            make_event(3, "tool", Some(r#"{"tool":"Bash"}"#)),
+            make_event(4, "tool", Some(r#"{"tool":"Edit"}"#)),
+            make_event(5, "tool", Some(r#"{"tool":"Bash"}"#)),
+        ];
+
+        let counts = tool_counts(&events);
+
+        assert_eq!(
+            counts,
+            vec![
+                ("Bash".to_string(), 3),
+                ("Edit".to_string(), 1),
+                ("Read".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_counts_skips_non_tool_events_and_malformed_detail() {
+        let events = vec![
+            make_event(1, "tool", Some(r#"{"tool":"Bash"}"#)),
+            make_event(2, "checklist", Some(r#"{"items":[]}"#)),
+            make_event(3, "tool", Some("not json")),
+            make_event(4, "tool", None),
+        ];
+
+        assert_eq!(tool_counts(&events), vec![("Bash".to_string(), 1)]);
+    }
+
+    #[test]
+    fn tool_counts_returns_empty_vec_when_no_tool_events() {
+        let events = vec![make_event(1, "stop", None)];
+
+        assert_eq!(tool_counts(&events), Vec::<(String, usize)>::new());
+    }
+
+    #[test]
+    fn format_tool_counts_renders_multiplication_sign_line() {
+        let counts = vec![
+            ("Bash".to_string(), 34),
+            ("Edit".to_string(), 8),
+            ("Read".to_string(), 10),
+        ];
+
+        assert_eq!(
+            format_tool_counts(&counts),
+            Some("Tools: Bash \u{d7}34, Edit \u{d7}8, Read \u{d7}10".to_string())
+        );
+    }
+
+    #[test]
+    fn format_tool_counts_returns_none_for_empty() {
+        assert_eq!(format_tool_counts(&[]), None);
     }
 
     #[test]

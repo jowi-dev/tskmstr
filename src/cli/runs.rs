@@ -225,6 +225,10 @@ pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), R
 
     let events = store.events_for_run(run.id)?;
 
+    if let Some(tools_line) = crate::runs::format_tool_counts(&crate::runs::tool_counts(&events)) {
+        writeln!(out, "{tools_line}")?;
+    }
+
     if let Some(checklist) = crate::runs::latest_checklist(&events) {
         writeln!(out)?;
         writeln!(
@@ -252,11 +256,16 @@ pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), R
 }
 
 /// Format one [`RunEvent`] as `{at}  {kind}  {detail}`, omitting the detail
-/// segment when there is none.
+/// segment when there is none. When [`crate::runs::format_event_detail`]
+/// recognizes the event's kind and detail shape, the friendly rendering is
+/// used in place of the raw detail JSON.
 fn format_event_line(event: &RunEvent) -> String {
-    match &event.detail {
-        Some(detail) => format!("{}  {}  {}", event.at, event.kind, detail),
-        None => format!("{}  {}", event.at, event.kind),
+    match crate::runs::format_event_detail(&event.kind, event.detail.as_deref()) {
+        Some(friendly) => format!("{}  {}  {}", event.at, event.kind, friendly),
+        None => match &event.detail {
+            Some(detail) => format!("{}  {}  {}", event.at, event.kind, detail),
+            None => format!("{}  {}", event.at, event.kind),
+        },
     }
 }
 
@@ -633,6 +642,114 @@ mod tests {
     }
 
     #[test]
+    fn show_renders_friendly_tool_event_detail() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Bash","summary":"cargo test"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("tool  Bash — cargo test"));
+        assert!(!output.contains("\"tool\":\"Bash\""));
+    }
+
+    #[test]
+    fn show_falls_back_to_raw_detail_for_unrecognized_shape() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "tool_use",
+            Some(r#"{"file":"a.rs"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("tool_use  {\"file\":\"a.rs\"}"));
+    }
+
+    #[test]
+    fn show_prints_tools_summary_line_before_checklist() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Bash"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Bash"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Edit"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(
+            &store,
+            id,
+            "checklist",
+            Some(r#"{"items":[{"text":"write tests","done":true}]}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("Tools: Bash \u{d7}2, Edit \u{d7}1"));
+        let tools_pos = output.find("Tools:").unwrap();
+        let checklist_pos = output.find("Checklist").unwrap();
+        assert!(
+            tools_pos < checklist_pos,
+            "expected Tools summary before checklist section: {output}"
+        );
+    }
+
+    #[test]
+    fn show_with_no_tool_events_has_no_tools_line() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!output.contains("Tools:"));
+    }
+
+    #[test]
     fn show_prints_events_newest_first() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -674,7 +791,7 @@ mod tests {
         assert!(output.contains("[x] write tests"));
         assert!(output.contains("[ ] implement"));
         let checklist_pos = output.find("Checklist").unwrap();
-        let event_pos = output.find("checklist  {").unwrap();
+        let event_pos = output.find("checklist  1/2 done").unwrap();
         assert!(
             checklist_pos < event_pos,
             "expected checklist section before event timeline: {output}"

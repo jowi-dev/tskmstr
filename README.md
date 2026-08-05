@@ -138,6 +138,32 @@ Both `tm runs show` and the watch detail window print the event timeline
 newest first — the most recent event is always the first line, so you don't
 have to scroll to see what a run just did.
 
+### Friendly event rendering
+
+`tool` and `checklist` events render as a short human-readable summary
+instead of raw detail JSON, in both `tm runs show` and the watch detail
+window:
+
+- A `tool` event's `detail` is `{"tool": string, "summary"?: string,
+  "agent"?: string}` — `summary` and `agent` are optional (older events may
+  carry only `tool`). It renders as the tool name, prefixed with
+  `[<agent>]` when `agent` is present, suffixed with ` — <summary>` when
+  `summary` is present: `{"tool":"Bash","summary":"cargo test"}` renders as
+  `Bash — cargo test`; `{"tool":"Read","summary":"src/main.rs","agent":
+  "Explore"}` renders as `[Explore] Read — src/main.rs`.
+- A `checklist` event renders as `{done}/{total} done`, using the same
+  `items` shape as the checklist section above.
+
+Any other event kind, or a `tool`/`checklist` event whose `detail` doesn't
+match the shape above, falls back to the raw `{at}  {kind}  {detail}` line
+used before this convention existed.
+
+`tm runs show` also prints a `Tools: <name> ×<count>, ...` summary line —
+counting every `tool` event by tool name, sorted by count descending then
+name ascending — right after the run's header fields and before the
+checklist section, omitted entirely when the run has emitted no `tool`
+events. The watch detail window shows the same line in its header block.
+
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default
 assignee) when no key can be resolved from the PR's title, body, or

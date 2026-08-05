@@ -215,6 +215,10 @@ pub struct RunDetail {
     /// The run's latest checklist snapshot (see
     /// [`crate::runs::latest_checklist`]), if it has emitted one.
     pub checklist: Option<crate::runs::ChecklistState>,
+    /// Counts of `tool` events by tool name (see
+    /// [`crate::runs::tool_counts`]), sorted by count descending then name
+    /// ascending. Empty when the run has emitted no `tool` events.
+    pub tool_counts: Vec<(String, usize)>,
 }
 
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
@@ -2479,6 +2483,7 @@ mod tests {
             ended_at: None,
             events: vec![],
             checklist: None,
+            tool_counts: vec![],
         }
     }
 

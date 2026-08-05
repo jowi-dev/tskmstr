@@ -284,6 +284,7 @@ fn run_to_detail(
     events: Vec<crate::runs::RunEvent>,
 ) -> crate::tui::app::RunDetail {
     let checklist = crate::runs::latest_checklist(&events);
+    let tool_counts = crate::runs::tool_counts(&events);
     crate::tui::app::RunDetail {
         id: run.id,
         ticket: run.ticket,
@@ -308,6 +309,7 @@ fn run_to_detail(
             })
             .collect(),
         checklist,
+        tool_counts,
     }
 }
 
@@ -782,6 +784,33 @@ mod tests {
                 assert_eq!(detail.ticket, "PROJ-1");
                 assert_eq!(detail.events.len(), 1);
                 assert_eq!(detail.events[0].kind, "tool_use");
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_populates_tool_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .add_event(run_id, "tool", Some(r#"{"tool":"Bash"}"#))
+            .unwrap();
+        store
+            .add_event(run_id, "tool", Some(r#"{"tool":"Bash"}"#))
+            .unwrap();
+        store
+            .add_event(run_id, "tool", Some(r#"{"tool":"Edit"}"#))
+            .unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                assert_eq!(
+                    detail.tool_counts,
+                    vec![("Bash".to_string(), 2), ("Edit".to_string(), 1)]
+                );
             }
             other => panic!("expected RunDetailLoaded, got {other:?}"),
         }
