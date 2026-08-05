@@ -74,7 +74,7 @@ tm auth status
 | `tm runs finish <RUN_ID> --status <STATUS> [...]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`) |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
-| `tm runs show <KEY>` | Print the latest run for a ticket and its event timeline |
+| `tm runs show <KEY>` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 
@@ -130,7 +130,13 @@ refreshes immediately, and `q`/`Esc` quits when no detail window is open. A
 `Running` card whose heartbeat is more than 10 minutes stale is marked with
 a red `!`. A run's latest checklist (see above), if it has emitted one, is
 rendered as a `[x]`/`[ ]` section above the event timeline in the detail
-window, and as a terse `{done}/{total}` marker on its kanban card.
+window, and as a terse `{done}/{total}` marker on its kanban card. `tm runs
+show` renders the same checklist section, in the same place, for the
+non-interactive one-shot view.
+
+Both `tm runs show` and the watch detail window print the event timeline
+newest first — the most recent event is always the first line, so you don't
+have to scroll to see what a run just did.
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default

@@ -622,7 +622,7 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
     if detail.events.is_empty() {
         lines.push(Line::from("(no events)"));
     } else {
-        for event in &detail.events {
+        for event in detail.events.iter().rev() {
             let text = match &event.detail {
                 Some(d) => format!("{}  {}  {}", event.at, event.kind, d),
                 None => format!("{}  {}", event.at, event.kind),
@@ -1416,6 +1416,37 @@ mod tests {
         assert!(text.contains("Run 1: PROJ-1"));
         assert!(text.contains("sess-abc"));
         assert!(text.contains("tool_use"));
+    }
+
+    #[test]
+    fn run_detail_overlay_renders_events_newest_first() {
+        let detail = crate::tui::app::RunDetail {
+            events: vec![
+                crate::tui::app::RunDetailEvent {
+                    at: "2020-01-01T00:00:01.000Z".to_string(),
+                    kind: "first".to_string(),
+                    detail: None,
+                },
+                crate::tui::app::RunDetailEvent {
+                    at: "2020-01-01T00:00:02.000Z".to_string(),
+                    kind: "second".to_string(),
+                    detail: None,
+                },
+            ],
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        let first_pos = text.find("second").expect("second event present");
+        let second_pos = text.find("first").expect("first event present");
+        assert!(
+            first_pos < second_pos,
+            "expected newest event (second) to render before oldest event (first): {text}"
+        );
     }
 
     fn checklist(items: &[(&str, bool)]) -> crate::runs::ChecklistState {

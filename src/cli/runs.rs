@@ -223,12 +223,27 @@ pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), R
         writeln!(out, "cost ${cost} / {turns} turns")?;
     }
 
-    writeln!(out)?;
     let events = store.events_for_run(run.id)?;
+
+    if let Some(checklist) = crate::runs::latest_checklist(&events) {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "Checklist ({}/{} done)",
+            checklist.done_count(),
+            checklist.items.len()
+        )?;
+        for item in &checklist.items {
+            let marker = if item.done { "[x]" } else { "[ ]" };
+            writeln!(out, "{marker} {}", item.text)?;
+        }
+    }
+
+    writeln!(out)?;
     if events.is_empty() {
         writeln!(out, "(no events)")?;
     } else {
-        for event in &events {
+        for event in events.iter().rev() {
             writeln!(out, "{}", format_event_line(event))?;
         }
     }
@@ -615,6 +630,69 @@ mod tests {
         assert!(output.contains("tool_use  {\"file\":\"a.rs\"}"));
         assert!(output.contains("  stop\n") || output.ends_with("  stop\n"));
         assert!(!output.contains("blocker"));
+    }
+
+    #[test]
+    fn show_prints_events_newest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(&store, id, "first", None, &mut Vec::new()).unwrap();
+        event(&store, id, "second", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        let first_pos = output.find("second").expect("second event present");
+        let second_pos = output.find("first").expect("first event present");
+        assert!(
+            first_pos < second_pos,
+            "expected newest event (second) to print before oldest event (first): {output}"
+        );
+    }
+
+    #[test]
+    fn show_prints_checklist_section_above_events() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "checklist",
+            Some(r#"{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("Checklist (1/2 done)"));
+        assert!(output.contains("[x] write tests"));
+        assert!(output.contains("[ ] implement"));
+        let checklist_pos = output.find("Checklist").unwrap();
+        let event_pos = output.find("checklist  {").unwrap();
+        assert!(
+            checklist_pos < event_pos,
+            "expected checklist section before event timeline: {output}"
+        );
+    }
+
+    #[test]
+    fn show_with_no_checklist_has_no_checklist_section() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!output.contains("Checklist"));
     }
 
     #[test]
