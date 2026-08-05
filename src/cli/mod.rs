@@ -362,6 +362,14 @@ pub enum RunsCmd {
         /// Filesystem path of the full transcript, if one was captured.
         #[arg(long)]
         transcript: Option<String>,
+        /// Per-model token/cost usage as a JSON object, verbatim from
+        /// `claude -p`'s `modelUsage` map, e.g.
+        /// `{"claude-fable-5":{"inputTokens":146,"outputTokens":58564,
+        /// "cacheReadInputTokens":6535803,"cacheCreationInputTokens":203983,
+        /// "costUSD":12.996}}`. Must parse as a JSON object; an invalid
+        /// value is a hard error.
+        #[arg(long)]
+        model_usage: Option<String>,
     },
     /// Appends a telemetry event to a run and bumps its heartbeat.
     Event {

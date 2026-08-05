@@ -66,6 +66,9 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_ticket_audits_key ON ticket_audits(ticket_key, audited_at);
     "#,
+    r#"
+    ALTER TABLE runs ADD COLUMN model_usage TEXT;
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -191,6 +194,10 @@ pub struct FinishRun {
     pub pr_url: Option<String>,
     /// Filesystem path of the full transcript, if one was captured.
     pub transcript: Option<String>,
+    /// Per-model token/cost usage, as a JSON object string keyed by model
+    /// name (see [`ModelUsage`]). Verbatim from `claude -p`'s `modelUsage`
+    /// map. Validated as JSON by the CLI layer before it reaches here.
+    pub model_usage: Option<String>,
 }
 
 impl Default for FinishRun {
@@ -209,6 +216,7 @@ impl Default for FinishRun {
             blocker: None,
             pr_url: None,
             transcript: None,
+            model_usage: None,
         }
     }
 }
@@ -286,6 +294,10 @@ pub struct Run {
     pub pr_url: Option<String>,
     /// Seconds since `started_at`, computed in SQL like [`RunSummary::age_secs`].
     pub age_secs: i64,
+    /// Per-model token/cost usage recorded at `finish`, as raw JSON (see
+    /// [`FinishRun::model_usage`]), if known. Parse with
+    /// [`parse_model_usage`].
+    pub model_usage: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -385,6 +397,155 @@ pub fn latest_checklist(events: &[RunEvent]) -> Option<ChecklistState> {
         })
 }
 
+/// Per-model token/cost usage, as reported verbatim in a `claude -p`
+/// result's `modelUsage` map. All token fields default to `0` when absent
+/// so a live snapshot (which never carries `costUSD`) still parses cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize)]
+pub struct ModelUsage {
+    /// Input tokens (excluding cache reads/writes).
+    #[serde(rename = "inputTokens", default)]
+    pub input_tokens: u64,
+    /// Output tokens generated.
+    #[serde(rename = "outputTokens", default)]
+    pub output_tokens: u64,
+    /// Tokens read from the prompt cache.
+    #[serde(rename = "cacheReadInputTokens", default)]
+    pub cache_read_input_tokens: u64,
+    /// Tokens written to the prompt cache.
+    #[serde(rename = "cacheCreationInputTokens", default)]
+    pub cache_creation_input_tokens: u64,
+    /// Cost in USD, present in the authoritative `runs.model_usage` column
+    /// (recorded at `tm runs finish --model-usage`) and absent from live
+    /// `usage` event snapshots.
+    #[serde(rename = "costUSD", default)]
+    pub cost_usd: Option<f64>,
+}
+
+/// A model name (e.g. `claude-fable-5`) to its [`ModelUsage`]. A
+/// [`std::collections::BTreeMap`] rather than a `HashMap` so
+/// [`format_model_usage`] renders models in a deterministic order.
+pub type ModelUsageMap = std::collections::BTreeMap<String, ModelUsage>;
+
+/// The JSON shape of a `usage` event's `detail`: `{"models":{"<model>":
+/// {...}}}`. Kept private; callers only see the parsed [`ModelUsageMap`].
+#[derive(serde::Deserialize)]
+struct UsageDetail {
+    models: ModelUsageMap,
+}
+
+/// Scans `events` (as returned by [`RunStore::events_for_run`], oldest
+/// first) for the newest event with `kind == "usage"` whose `detail` parses
+/// as `{"models":{...}}`, and returns the parsed map.
+///
+/// This is the convention a Claude Code "lane" run's Stop hook uses to
+/// report live per-model token usage: `tm runs event <ID> --kind usage
+/// --detail '{"models":{"claude-fable-5":{"inputTokens":146,
+/// "outputTokens":58564,"cacheReadInputTokens":6535803,
+/// "cacheCreationInputTokens":203983}}}'`. Each `usage` event is a full
+/// snapshot, not a diff — latest wins, same convention as
+/// [`latest_checklist`], and garbage-tolerant in the same way: an event
+/// with kind `usage` but missing or malformed `detail` is skipped in favor
+/// of the next-newest one that does parse.
+///
+/// `costUSD` is never present on these live events (it's only known once
+/// the run finishes); see [`RunStore::finish_run`]'s `model_usage` column
+/// for the authoritative, cost-bearing snapshot.
+pub fn latest_usage(events: &[RunEvent]) -> Option<ModelUsageMap> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.kind == "usage")
+        .find_map(|event| {
+            let detail = event.detail.as_deref()?;
+            let parsed: UsageDetail = serde_json::from_str(detail).ok()?;
+            Some(parsed.models)
+        })
+}
+
+/// Parses the `runs.model_usage` column: a bare JSON object mapping model
+/// name to [`ModelUsage`] (no `"models"` wrapper, unlike [`latest_usage`]'s
+/// event `detail`), as passed verbatim to `tm runs finish --model-usage`.
+/// Returns `None` if `json` doesn't parse as that shape.
+pub fn parse_model_usage(json: &str) -> Option<ModelUsageMap> {
+    serde_json::from_str(json).ok()
+}
+
+/// Formats a token count human-readably: under 1,000 as a plain integer,
+/// under 1,000,000 as `{n.n}k`, otherwise as `{n.n}M`. E.g. `58564` ->
+/// `"58.6k"`, `6535803` -> `"6.5M"`.
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Renders [`latest_usage`]/[`parse_model_usage`]'s output as one line per
+/// model, plus a trailing `total` line when any model carries a `costUSD`
+/// (i.e. the map came from the authoritative `runs.model_usage` column
+/// rather than a live event snapshot). Cache tokens are always shown
+/// alongside input/output — they dominate real cost on a cached-heavy run
+/// and hiding them would misrepresent it.
+///
+/// Returns an empty `Vec` for an empty map.
+pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
+    if map.is_empty() {
+        return Vec::new();
+    }
+
+    let any_cost = map.values().any(|usage| usage.cost_usd.is_some());
+    let name_width = map
+        .keys()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let cost_width = map
+        .values()
+        .filter_map(|usage| usage.cost_usd)
+        .map(|cost| format!("${cost:.2}").chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_w = name_width + 2;
+    let cost_w = cost_width + 2;
+
+    let mut lines = Vec::new();
+    let mut total_cost = 0.0_f64;
+    let mut have_cost = false;
+
+    for (name, usage) in map {
+        let detail = format!(
+            "out {}, in {}, cache-read {}, cache-write {}",
+            format_token_count(usage.output_tokens),
+            format_token_count(usage.input_tokens),
+            format_token_count(usage.cache_read_input_tokens),
+            format_token_count(usage.cache_creation_input_tokens),
+        );
+        if any_cost {
+            let cost_str = match usage.cost_usd {
+                Some(cost) => {
+                    total_cost += cost;
+                    have_cost = true;
+                    format!("${cost:.2}")
+                }
+                None => String::new(),
+            };
+            lines.push(format!("{name:<name_w$}{cost_str:<cost_w$}{detail}"));
+        } else {
+            lines.push(format!("{name:<name_w$}{detail}"));
+        }
+    }
+
+    if have_cost {
+        let total_label = "total";
+        lines.push(format!("{total_label:<name_w$}${total_cost:.2}"));
+    }
+
+    lines
+}
+
 /// The JSON shape of a `tool` event's `detail`: `{"tool":"Bash","summary":
 /// "...","agent":"..."}`. `summary` and `agent` are optional; older events
 /// carry only `tool`. Kept private; callers only see the formatted or
@@ -407,6 +568,9 @@ struct ToolDetail {
 ///   test"}` -> `Bash — cargo test`.
 /// - `kind == "checklist"`: `N/M done`, reusing the same detail shape as
 ///   [`latest_checklist`].
+/// - `kind == "usage"`: one `{model} {out} out` segment per model, joined
+///   by ` / `, e.g. `fable-5 89.2k out / sonnet-5 30.7k out`. A leading
+///   `claude-` is stripped from each model name for brevity.
 ///
 /// Returns `None` for any other kind, missing `detail`, or `detail` that
 /// doesn't parse as the expected shape, so callers can fall back to
@@ -429,6 +593,21 @@ pub fn format_event_detail(kind: &str, detail: Option<&str>) -> Option<String> {
             let parsed: ChecklistDetail = serde_json::from_str(detail).ok()?;
             let done = parsed.items.iter().filter(|item| item.done).count();
             Some(format!("{done}/{} done", parsed.items.len()))
+        }
+        "usage" => {
+            let parsed: UsageDetail = serde_json::from_str(detail).ok()?;
+            if parsed.models.is_empty() {
+                return None;
+            }
+            let parts: Vec<String> = parsed
+                .models
+                .iter()
+                .map(|(name, usage)| {
+                    let short = name.strip_prefix("claude-").unwrap_or(name);
+                    format!("{short} {} out", format_token_count(usage.output_tokens))
+                })
+                .collect();
+            Some(parts.join(" / "))
         }
         _ => None,
     }
@@ -569,8 +748,9 @@ impl RunStore {
                     num_turns = COALESCE(?5, num_turns),
                     blocker = COALESCE(?6, blocker),
                     pr_url = COALESCE(?7, pr_url),
-                    transcript = COALESCE(?8, transcript)
-                 WHERE id = ?9"
+                    transcript = COALESCE(?8, transcript),
+                    model_usage = COALESCE(?9, model_usage)
+                 WHERE id = ?10"
             ),
             params![
                 outcome.status.as_str(),
@@ -581,6 +761,7 @@ impl RunStore {
                 outcome.blocker,
                 outcome.pr_url,
                 outcome.transcript,
+                outcome.model_usage,
                 run_id,
             ],
         )?;
@@ -743,7 +924,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url,
+                blocker, pr_url, model_usage,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1
@@ -772,7 +953,8 @@ impl RunStore {
                     cost_usd: row.get(14)?,
                     blocker: row.get(15)?,
                     pr_url: row.get(16)?,
-                    age_secs: row.get(17)?,
+                    model_usage: row.get(17)?,
+                    age_secs: row.get(18)?,
                 })
             })
             .optional()
@@ -788,7 +970,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url,
+                blocker, pr_url, model_usage,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE id = ?1";
@@ -815,7 +997,8 @@ impl RunStore {
                     cost_usd: row.get(14)?,
                     blocker: row.get(15)?,
                     pr_url: row.get(16)?,
-                    age_secs: row.get(17)?,
+                    model_usage: row.get(17)?,
+                    age_secs: row.get(18)?,
                 })
             })
             .optional()
@@ -1049,6 +1232,7 @@ mod tests {
                     blocker: None,
                     pr_url: Some("https://example.invalid/pr/1".to_string()),
                     transcript: Some("/tmp/transcript.log".to_string()),
+                    model_usage: Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string()),
                 },
             )
             .unwrap();
@@ -1062,12 +1246,13 @@ mod tests {
             Option<i64>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
 
-        let (status, ended_at, exit_code, session_id, cost_usd, num_turns, pr_url, transcript): FinishedRunRow = store
+        let (status, ended_at, exit_code, session_id, cost_usd, num_turns, pr_url, transcript, model_usage): FinishedRunRow = store
             .conn
             .query_row(
-                "SELECT status, ended_at, exit_code, session_id, cost_usd, num_turns, pr_url, transcript
+                "SELECT status, ended_at, exit_code, session_id, cost_usd, num_turns, pr_url, transcript, model_usage
                  FROM runs WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1080,6 +1265,7 @@ mod tests {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -1093,6 +1279,53 @@ mod tests {
         assert_eq!(num_turns, Some(7));
         assert_eq!(pr_url, Some("https://example.invalid/pr/1".to_string()));
         assert_eq!(transcript, Some("/tmp/transcript.log".to_string()));
+        assert_eq!(
+            model_usage,
+            Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn finish_run_leaves_model_usage_untouched_when_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    model_usage: Some(r#"{"claude-fable-5":{"inputTokens":1}}"#.to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    model_usage: None,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(
+            run.model_usage,
+            Some(r#"{"claude-fable-5":{"inputTokens":1}}"#.to_string())
+        );
     }
 
     #[test]
@@ -2096,6 +2329,178 @@ mod tests {
         let state = latest_checklist(&events).expect("expected a checklist");
         assert!(state.items.is_empty());
         assert_eq!(state.done_count(), 0);
+    }
+
+    fn usage_event(id: i64, detail: Option<&str>) -> RunEvent {
+        RunEvent {
+            id,
+            at: format!("2020-01-01T00:00:{id:02}.000Z"),
+            kind: "usage".to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn latest_usage_parses_happy_path() {
+        let events = vec![usage_event(
+            1,
+            Some(
+                r#"{"models":{"claude-fable-5":{"inputTokens":146,"outputTokens":58564,"cacheReadInputTokens":6535803,"cacheCreationInputTokens":203983}}}"#,
+            ),
+        )];
+
+        let usage = latest_usage(&events).expect("expected usage");
+        let fable = usage.get("claude-fable-5").expect("expected fable-5 entry");
+        assert_eq!(fable.input_tokens, 146);
+        assert_eq!(fable.output_tokens, 58564);
+        assert_eq!(fable.cache_read_input_tokens, 6535803);
+        assert_eq!(fable.cache_creation_input_tokens, 203983);
+        assert_eq!(fable.cost_usd, None);
+    }
+
+    #[test]
+    fn latest_usage_prefers_the_newest_event() {
+        let events = vec![
+            usage_event(
+                1,
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            ),
+            usage_event(
+                2,
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":2}}}"#),
+            ),
+        ];
+
+        let usage = latest_usage(&events).expect("expected usage");
+        assert_eq!(usage.get("claude-fable-5").unwrap().output_tokens, 2);
+    }
+
+    #[test]
+    fn latest_usage_falls_back_when_the_newest_detail_is_malformed() {
+        let events = vec![
+            usage_event(
+                1,
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            ),
+            usage_event(2, Some("not json")),
+        ];
+
+        let usage = latest_usage(&events).expect("expected a fallback usage");
+        assert_eq!(usage.get("claude-fable-5").unwrap().output_tokens, 1);
+    }
+
+    #[test]
+    fn latest_usage_returns_none_when_no_usage_events() {
+        let events = vec![make_event(1, "tool_use", None)];
+        assert!(latest_usage(&events).is_none());
+    }
+
+    #[test]
+    fn latest_usage_returns_none_when_every_usage_event_is_malformed() {
+        let events = vec![usage_event(1, Some("garbage")), usage_event(2, None)];
+        assert!(latest_usage(&events).is_none());
+    }
+
+    #[test]
+    fn parse_model_usage_parses_bare_map() {
+        let usage =
+            parse_model_usage(r#"{"claude-fable-5":{"outputTokens":58564,"costUSD":12.996}}"#)
+                .expect("expected a map");
+        let fable = usage.get("claude-fable-5").unwrap();
+        assert_eq!(fable.output_tokens, 58564);
+        assert_eq!(fable.cost_usd, Some(12.996));
+    }
+
+    #[test]
+    fn parse_model_usage_returns_none_for_malformed_json() {
+        assert!(parse_model_usage("not json").is_none());
+    }
+
+    #[test]
+    fn format_model_usage_returns_empty_vec_for_empty_map() {
+        assert_eq!(
+            format_model_usage(&ModelUsageMap::new()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn format_model_usage_omits_cost_column_when_none_present() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-fable-5".to_string(),
+            ModelUsage {
+                input_tokens: 146,
+                output_tokens: 58564,
+                cache_read_input_tokens: 6535803,
+                cache_creation_input_tokens: 203983,
+                cost_usd: None,
+            },
+        );
+
+        let lines = format_model_usage(&map);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('$'));
+        assert!(lines[0].contains("out 58.6k"));
+        assert!(lines[0].contains("in 146"));
+        assert!(lines[0].contains("cache-read 6.5M"));
+        assert!(lines[0].contains("cache-write 204.0k"));
+    }
+
+    #[test]
+    fn format_model_usage_renders_cost_and_total_when_present() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-fable-5".to_string(),
+            ModelUsage {
+                input_tokens: 146,
+                output_tokens: 58564,
+                cache_read_input_tokens: 6535803,
+                cache_creation_input_tokens: 203983,
+                cost_usd: Some(12.996),
+            },
+        );
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 150,
+                output_tokens: 30722,
+                cache_read_input_tokens: 5400000,
+                cache_creation_input_tokens: 191000,
+                cost_usd: Some(2.81),
+            },
+        );
+
+        let lines = format_model_usage(&map);
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected two model lines plus a total: {lines:?}"
+        );
+        assert!(lines[0].starts_with("claude-fable-5"));
+        assert!(lines[0].contains("$13.00"));
+        assert!(lines[1].starts_with("claude-sonnet-5"));
+        assert!(lines[1].contains("$2.81"));
+        assert_eq!(lines[2], format!("total{}${:.2}", " ".repeat(12), 15.806));
+    }
+
+    #[test]
+    fn format_event_detail_renders_usage_compactly() {
+        let rendered = format_event_detail(
+            "usage",
+            Some(
+                r#"{"models":{"claude-fable-5":{"outputTokens":89200},"claude-sonnet-5":{"outputTokens":30700}}}"#,
+            ),
+        );
+        assert_eq!(
+            rendered,
+            Some("fable-5 89.2k out / sonnet-5 30.7k out".to_string())
+        );
+    }
+
+    #[test]
+    fn format_event_detail_returns_none_for_malformed_usage_detail() {
+        assert_eq!(format_event_detail("usage", Some("not json")), None);
     }
 
     #[test]

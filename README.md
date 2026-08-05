@@ -71,7 +71,7 @@ tm auth status
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs` | List every recorded lane run in a table |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid]` | Record the start of a lane run; prints the new run id |
-| `tm runs finish <RUN_ID> --status <STATUS> [...]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`) |
+| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`), optionally with the authoritative per-model token/cost breakdown |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
 | `tm runs show <KEY>` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first) |
@@ -138,11 +138,64 @@ Both `tm runs show` and the watch detail window print the event timeline
 newest first — the most recent event is always the first line, so you don't
 have to scroll to see what a run just did.
 
+### Per-model token/cost usage
+
+Two complementary sources feed the "Model usage" breakdown shown by `tm runs
+show` and the watch detail window:
+
+- **Live snapshots, via `usage` events.** A runner's Stop hook can report
+  running token counts the same way it reports a checklist: a full snapshot
+  each time, latest-parseable-wins, garbage-tolerant.
+
+  ```
+  tm runs event abc123 --kind usage --detail '{"models":{"claude-fable-5":{"inputTokens":146,"outputTokens":58564,"cacheReadInputTokens":6535803,"cacheCreationInputTokens":203983}}}'
+  ```
+
+  `models` maps model name to `{inputTokens, outputTokens,
+  cacheReadInputTokens, cacheCreationInputTokens}` (all default to `0` if
+  omitted). These live events never carry `costUSD` — cost isn't known until
+  the run finishes.
+
+- **The authoritative breakdown, via `tm runs finish --model-usage`.** A
+  runner wrapper passes the `claude -p` result's `modelUsage` map verbatim
+  (a bare object, no `"models"` wrapper) when the run ends:
+
+  ```
+  tm runs finish "$run_id" --status done --model-usage '{"claude-fable-5":{"inputTokens":146,"outputTokens":58564,"cacheReadInputTokens":6535803,"cacheCreationInputTokens":203983,"costUSD":12.996}}'
+  ```
+
+  Unlike every other `finish` flag, `--model-usage` is validated eagerly:
+  since `finish` is an explicit, one-shot command (not a best-effort hook),
+  a value that isn't a JSON object is a hard error and nothing is stored.
+  Omitting the flag leaves any previously recorded `model_usage` untouched,
+  same as `finish`'s other optional flags.
+
+`tm runs show` and the watch detail window render a `Model usage` section
+using the authoritative column when the run has finished with one, falling
+back to the latest `usage` event's live snapshot (labeled `Model usage
+(live)`) while the run is still running; the section is omitted entirely
+when neither is available. Cache tokens are always shown alongside
+input/output — on a cache-heavy run they dominate the real cost, and hiding
+them would misrepresent it:
+
+```
+Model usage
+claude-fable-5   $13.00  out 58.6k, in 146, cache-read 6.5M, cache-write 204.0k
+claude-sonnet-5  $2.81   out 30.7k, in 150, cache-read 5.4M, cache-write 191.0k
+total            $15.81
+```
+
+The `total` line is only added when at least one model carries a `costUSD`
+(i.e. the authoritative column, never a live snapshot). A `usage` event also
+gets a compact one-line rendering in the event timeline itself, e.g. `fable-5
+89.2k out / sonnet-5 30.7k out` (a leading `claude-` is stripped from each
+model name for brevity).
+
 ### Friendly event rendering
 
-`tool` and `checklist` events render as a short human-readable summary
-instead of raw detail JSON, in both `tm runs show` and the watch detail
-window:
+`tool`, `checklist`, and `usage` events render as a short human-readable
+summary instead of raw detail JSON, in both `tm runs show` and the watch
+detail window:
 
 - A `tool` event's `detail` is `{"tool": string, "summary"?: string,
   "agent"?: string}` — `summary` and `agent` are optional (older events may
@@ -153,6 +206,9 @@ window:
   "Explore"}` renders as `[Explore] Read — src/main.rs`.
 - A `checklist` event renders as `{done}/{total} done`, using the same
   `items` shape as the checklist section above.
+- A `usage` event renders as `{model} {out} out`, joined by ` / ` for
+  multiple models, using the same `models` shape as the per-model usage
+  section above (see "Per-model token/cost usage").
 
 Any other event kind, or a `tool`/`checklist` event whose `detail` doesn't
 match the shape above, falls back to the raw `{at}  {kind}  {detail}` line

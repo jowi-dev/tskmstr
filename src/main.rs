@@ -413,6 +413,7 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
             blocker,
             pr_url,
             transcript,
+            model_usage,
         }) => {
             let outcome = tskmstr::runs::FinishRun {
                 status: status.into(),
@@ -423,6 +424,7 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
                 blocker,
                 pr_url,
                 transcript,
+                model_usage,
             };
             tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
         }

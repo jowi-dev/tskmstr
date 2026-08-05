@@ -49,6 +49,10 @@ pub enum RunsCliError {
     #[error("--detail is not valid JSON: {0}")]
     InvalidDetailJson(#[from] serde_json::Error),
 
+    /// `--model-usage` was given but isn't a JSON object.
+    #[error("--model-usage is not a valid JSON object: {0}")]
+    InvalidModelUsageJson(String),
+
     /// `tm runs show`/`resume` was given a ticket with no recorded runs.
     #[error("no runs recorded for {ticket}")]
     NoRunForTicket {
@@ -86,6 +90,16 @@ pub fn finish(
     outcome: &FinishRun,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
+    if let Some(model_usage) = &outcome.model_usage {
+        let value: serde_json::Value = serde_json::from_str(model_usage)
+            .map_err(|e| RunsCliError::InvalidModelUsageJson(e.to_string()))?;
+        if !value.is_object() {
+            return Err(RunsCliError::InvalidModelUsageJson(
+                "expected a JSON object".to_string(),
+            ));
+        }
+    }
+
     store.finish_run(run_id, outcome)?;
     writeln!(out, "Finished run {run_id}: {}", outcome.status.as_str())?;
     Ok(())
@@ -227,6 +241,25 @@ pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), R
 
     if let Some(tools_line) = crate::runs::format_tool_counts(&crate::runs::tool_counts(&events)) {
         writeln!(out, "{tools_line}")?;
+    }
+
+    let authoritative_usage = run
+        .model_usage
+        .as_deref()
+        .and_then(crate::runs::parse_model_usage);
+    let (usage, usage_label) = match authoritative_usage {
+        Some(usage) => (Some(usage), "Model usage"),
+        None if run.status == crate::runs::RunStatus::Running => {
+            (crate::runs::latest_usage(&events), "Model usage (live)")
+        }
+        None => (None, ""),
+    };
+    if let Some(usage) = usage {
+        writeln!(out)?;
+        writeln!(out, "{usage_label}")?;
+        for line in crate::runs::format_model_usage(&usage) {
+            writeln!(out, "{line}")?;
+        }
     }
 
     if let Some(checklist) = crate::runs::latest_checklist(&events) {
@@ -386,6 +419,81 @@ mod tests {
             RunsCliError::Store(RunStoreError::RunNotFound(999))
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn finish_stores_valid_model_usage_json() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string()),
+                ..FinishRun::default()
+            },
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(
+            run.model_usage,
+            Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn finish_rejects_malformed_model_usage_json_and_stores_nothing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        let err = finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some("not json".to_string()),
+                ..FinishRun::default()
+            },
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::InvalidModelUsageJson(_)));
+        assert!(out.is_empty());
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.model_usage, None);
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn finish_rejects_model_usage_json_that_is_not_an_object() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        let err = finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some("[1,2,3]".to_string()),
+                ..FinishRun::default()
+            },
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::InvalidModelUsageJson(_)));
     }
 
     #[test]
@@ -810,6 +918,89 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Checklist"));
+    }
+
+    #[test]
+    fn show_prefers_authoritative_model_usage_over_live_events() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "usage",
+            Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-fable-5":{"outputTokens":58564,"costUSD":12.996}}"#.to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("Model usage"));
+        assert!(!output.contains("Model usage (live)"));
+        assert!(output.contains("$13.00"));
+        assert!(output.contains("out 58.6k"));
+    }
+
+    #[test]
+    fn show_falls_back_to_live_usage_events_while_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "usage",
+            Some(r#"{"models":{"claude-fable-5":{"outputTokens":58564}}}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("Model usage (live)"));
+        assert!(output.contains("out 58.6k"));
+        assert!(!output.contains('$'));
+    }
+
+    #[test]
+    fn show_with_no_model_usage_has_no_model_usage_section() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!output.contains("Model usage"));
     }
 
     #[test]

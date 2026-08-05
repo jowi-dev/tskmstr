@@ -607,6 +607,14 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
     if let Some(tools_line) = crate::runs::format_tool_counts(&detail.tool_counts) {
         lines.push(Line::from(tools_line));
     }
+
+    if let Some(usage) = &detail.model_usage {
+        lines.push(Line::from(""));
+        lines.push(Line::from(usage.label));
+        for line in &usage.lines {
+            lines.push(Line::from(line.clone()));
+        }
+    }
     lines.push(Line::from(""));
 
     if let Some(checklist) = &detail.checklist {
@@ -1414,6 +1422,7 @@ mod tests {
             }],
             checklist: None,
             tool_counts: vec![],
+            model_usage: None,
         };
         let app = App {
             show_run_detail: true,
@@ -1538,6 +1547,36 @@ mod tests {
     }
 
     #[test]
+    fn run_detail_overlay_renders_model_usage_section() {
+        let detail = crate::tui::app::RunDetail {
+            model_usage: Some(crate::tui::app::RunModelUsage {
+                label: "Model usage",
+                lines: vec!["claude-fable-5  $13.00  out 58.6k, in 146".to_string()],
+            }),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Model usage"));
+        assert!(text.contains("$13.00"));
+    }
+
+    #[test]
+    fn run_detail_overlay_with_no_model_usage_has_no_model_usage_section() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Model usage"));
+    }
+
+    #[test]
     fn run_detail_overlay_with_no_tool_events_has_no_tools_line() {
         let app = App {
             show_run_detail: true,
@@ -1567,6 +1606,7 @@ mod tests {
             events: vec![],
             checklist: None,
             tool_counts: vec![],
+            model_usage: None,
         }
     }
 

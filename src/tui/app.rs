@@ -219,6 +219,24 @@ pub struct RunDetail {
     /// [`crate::runs::tool_counts`]), sorted by count descending then name
     /// ascending. Empty when the run has emitted no `tool` events.
     pub tool_counts: Vec<(String, usize)>,
+    /// Per-model token/cost usage to render, and whether it's the
+    /// authoritative (has `costUSD`) or a live (running, no cost yet)
+    /// snapshot. Prefers the run's `model_usage` column, falling back to
+    /// the latest `usage` event while the run is still running (see
+    /// [`crate::runs::latest_usage`]). `None` when neither is available.
+    pub model_usage: Option<RunModelUsage>,
+}
+
+/// A [`RunDetail`]'s model usage breakdown, labeled so the UI can
+/// distinguish the authoritative (post-finish, cost-bearing) snapshot from
+/// a live in-progress one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunModelUsage {
+    /// Section label: `"Model usage"` when authoritative, `"Model usage
+    /// (live)"` when sourced from a running run's latest `usage` event.
+    pub label: &'static str,
+    /// Formatted lines, per [`crate::runs::format_model_usage`].
+    pub lines: Vec<String>,
 }
 
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
@@ -2484,6 +2502,7 @@ mod tests {
             events: vec![],
             checklist: None,
             tool_counts: vec![],
+            model_usage: None,
         }
     }
 

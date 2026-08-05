@@ -285,6 +285,7 @@ fn run_to_detail(
 ) -> crate::tui::app::RunDetail {
     let checklist = crate::runs::latest_checklist(&events);
     let tool_counts = crate::runs::tool_counts(&events);
+    let model_usage = run_model_usage(run.model_usage.as_deref(), run.status, &events);
     crate::tui::app::RunDetail {
         id: run.id,
         ticket: run.ticket,
@@ -310,7 +311,35 @@ fn run_to_detail(
             .collect(),
         checklist,
         tool_counts,
+        model_usage,
     }
+}
+
+/// Resolves a [`crate::tui::app::RunModelUsage`] for the run detail window:
+/// prefers `model_usage_column` (the authoritative, cost-bearing snapshot
+/// recorded by `tm runs finish --model-usage`), falling back to the
+/// latest `usage` event's live snapshot while `status` is
+/// [`crate::runs::RunStatus::Running`]. `None` when neither is available.
+fn run_model_usage(
+    model_usage_column: Option<&str>,
+    status: crate::runs::RunStatus,
+    events: &[crate::runs::RunEvent],
+) -> Option<crate::tui::app::RunModelUsage> {
+    if let Some(usage) = model_usage_column.and_then(crate::runs::parse_model_usage) {
+        return Some(crate::tui::app::RunModelUsage {
+            label: "Model usage",
+            lines: crate::runs::format_model_usage(&usage),
+        });
+    }
+    if status == crate::runs::RunStatus::Running
+        && let Some(usage) = crate::runs::latest_usage(events)
+    {
+        return Some(crate::tui::app::RunModelUsage {
+            label: "Model usage (live)",
+            lines: crate::runs::format_model_usage(&usage),
+        });
+    }
+    None
 }
 
 /// Run `Cmd::ReapRuns`: mark abandoned runs as failed, using the same
@@ -811,6 +840,81 @@ mod tests {
                     detail.tool_counts,
                     vec![("Bash".to_string(), 2), ("Edit".to_string(), 1)]
                 );
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_prefers_authoritative_model_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .add_event(
+                run_id,
+                "usage",
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            )
+            .unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    model_usage: Some(
+                        r#"{"claude-fable-5":{"outputTokens":58564,"costUSD":12.996}}"#.to_string(),
+                    ),
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                let usage = detail.model_usage.as_ref().expect("expected model usage");
+                assert_eq!(usage.label, "Model usage");
+                assert!(usage.lines.iter().any(|l| l.contains("$13.00")));
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_falls_back_to_live_usage_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .add_event(
+                run_id,
+                "usage",
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":58564}}}"#),
+            )
+            .unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                let usage = detail.model_usage.as_ref().expect("expected model usage");
+                assert_eq!(usage.label, "Model usage (live)");
+                assert!(usage.lines.iter().any(|l| l.contains("out 58.6k")));
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_with_no_usage_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                assert!(detail.model_usage.is_none());
             }
             other => panic!("expected RunDetailLoaded, got {other:?}"),
         }
