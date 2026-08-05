@@ -7,13 +7,37 @@
 //! and exits non-zero if it's blocked, so scripts can branch on it —
 //! implemented as [`ReadyCliError::NotReady`] so `main.rs`'s existing
 //! error-to-exit-code path handles this without special-casing `tm ready`.
+//!
+//! Both forms also carry a best-effort, ADVISORY annotation of GitHub bot
+//! review findings (see [`crate::github::bot_findings`]) on a ready ticket's
+//! associated pull request, if any. This is purely informational: it never
+//! hides a ticket, changes an exit code, or turns a `gh` failure into an
+//! error, since a bot false positive must not freeze a ticket. See
+//! [`bot_finding_annotations`] and [`print_bot_finding_note`] for the lookup.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use thiserror::Error;
 
+use crate::github::bot_findings::count_bot_findings;
+use crate::github::gh_cli::GhCli;
+use crate::github::pr::{PrInfo, find_issue_key};
 use crate::jira::client::JiraClient;
+use crate::jira::types::Issue;
 use crate::ticketing::{TicketingError, check_ready, ready_tickets};
+
+/// Dependencies `tm ready`'s bot-findings annotation needs, alongside the
+/// Jira client, bundled to keep `list`/`check`'s arity within this project's
+/// convention (see `TicketingContext`).
+pub struct ReadyContext<'a> {
+    /// Jira client used for the readiness query/check itself.
+    pub jira: &'a dyn JiraClient,
+    /// `gh` client used for the best-effort bot-findings annotation.
+    pub gh: &'a dyn GhCli,
+    /// Bot logins configured as [`crate::config::Config::review_bots`].
+    pub review_bots: &'a [String],
+}
 
 /// Errors surfaced by `tm ready`.
 #[derive(Debug, Error)]
@@ -65,14 +89,36 @@ fn normalize(key: &str) -> Result<String, ReadyCliError> {
 /// excluded for having an open blocker, appends a final `(N blocked tickets
 /// hidden)` line so a filtered list doesn't read as "this is everything
 /// assigned to you". Always exits 0.
-pub fn list(jira: &dyn JiraClient, out: &mut dyn Write) -> Result<(), ReadyCliError> {
-    let listing = ready_tickets(jira)?;
+///
+/// Each line also carries a best-effort, advisory bot-findings annotation:
+/// when a ready ticket has an open PR (matched by title) with unresolved bot
+/// review findings, the line becomes `KEY  Summary  [N unresolved bot
+/// findings]` (singular "finding" when `N == 1`). Zero unresolved or no
+/// matching PR leaves the line unchanged. See [`bot_finding_annotations`] for
+/// how the lookup degrades if `gh` fails.
+pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError> {
+    let listing = ready_tickets(ctx.jira)?;
 
     if listing.ready.is_empty() {
         writeln!(out, "No ready tickets.")?;
     } else {
+        let annotations = bot_finding_annotations(ctx, &listing.ready, out)?;
         for issue in &listing.ready {
-            writeln!(out, "{}  {}", issue.key, issue.fields.summary)?;
+            match annotations.get(&issue.key) {
+                Some(unresolved) if *unresolved > 0 => {
+                    let noun = if *unresolved == 1 {
+                        "finding"
+                    } else {
+                        "findings"
+                    };
+                    writeln!(
+                        out,
+                        "{}  {}  [{unresolved} unresolved bot {noun}]",
+                        issue.key, issue.fields.summary
+                    )?;
+                }
+                _ => writeln!(out, "{}  {}", issue.key, issue.fields.summary)?,
+            }
         }
     }
 
@@ -100,12 +146,21 @@ pub fn list(jira: &dyn JiraClient, out: &mut dyn Write) -> Result<(), ReadyCliEr
 /// prints a `KEY is blocked by:` header followed by one line per open
 /// blocker — `main.rs`'s existing error path turns this into a non-zero
 /// exit. Done blockers are never listed.
-pub fn check(jira: &dyn JiraClient, key: &str, out: &mut dyn Write) -> Result<(), ReadyCliError> {
+///
+/// On the ready path only, also prints a best-effort, advisory bot-findings
+/// note (`  note: N unresolved bot findings on PR #<number>`, singular
+/// "finding" when `N == 1`) when `key` has an open PR (matched by title)
+/// with unresolved bot review findings. This never affects the return value
+/// — the command still returns `Ok(())` — and the blocked path never
+/// performs this lookup. See [`print_bot_finding_note`] for how the lookup
+/// degrades if `gh` fails.
+pub fn check(ctx: &ReadyContext, key: &str, out: &mut dyn Write) -> Result<(), ReadyCliError> {
     let normalized = normalize(key)?;
-    let result = check_ready(jira, &normalized)?;
+    let result = check_ready(ctx.jira, &normalized)?;
 
     if result.open_blockers.is_empty() {
         writeln!(out, "{normalized} is ready ({})", result.status_name)?;
+        print_bot_finding_note(ctx, &normalized, out)?;
         return Ok(());
     }
 
@@ -127,14 +182,168 @@ pub fn check(jira: &dyn JiraClient, key: &str, out: &mut dyn Write) -> Result<()
     })
 }
 
+/// For `list`: compute unresolved bot-finding counts for every ticket in
+/// `tickets` that has a matching open PR, degrading to a printed warning
+/// (once) rather than an error if `gh` fails.
+///
+/// Calls `gh.pr_list()` once. If it fails, prints
+/// `warning: could not check bot findings: {err}` and returns an empty map —
+/// the listing is then printed unannotated. Otherwise, for each ticket
+/// matched to an open PR (by [`find_issue_key`] against the PR title), calls
+/// `gh.pr_review_threads`; a failure there prints the same warning line
+/// exactly once (not once per ticket) and simply omits that ticket (and any
+/// ticket whose lookup fails afterward) from the returned map, without
+/// aborting the remaining lookups.
+fn bot_finding_annotations(
+    ctx: &ReadyContext,
+    tickets: &[Issue],
+    out: &mut dyn Write,
+) -> Result<HashMap<String, usize>, ReadyCliError> {
+    let mut annotations = HashMap::new();
+
+    let prs = match ctx.gh.pr_list() {
+        Ok(prs) => prs,
+        Err(err) => {
+            writeln!(out, "warning: could not check bot findings: {err}")?;
+            return Ok(annotations);
+        }
+    };
+
+    let mut warned = false;
+    for issue in tickets {
+        let Some(number) = matching_pr_number(&prs, &issue.key) else {
+            continue;
+        };
+        match ctx.gh.pr_review_threads(number) {
+            Ok(threads) => {
+                let counts = count_bot_findings(&threads, ctx.review_bots);
+                if counts.unresolved > 0 {
+                    annotations.insert(issue.key.clone(), counts.unresolved);
+                }
+            }
+            Err(err) => {
+                if !warned {
+                    writeln!(out, "warning: could not check bot findings: {err}")?;
+                    warned = true;
+                }
+            }
+        }
+    }
+
+    Ok(annotations)
+}
+
+/// For `check`: print a `  note: N unresolved bot findings on PR #<number>`
+/// line (singular "finding" when `N == 1`) if `key` has a matching open PR
+/// with unresolved bot review findings.
+///
+/// Degrades the same way as [`bot_finding_annotations`]: a `pr_list` or
+/// `pr_review_threads` failure prints
+/// `warning: could not check bot findings: {err}` instead, never an error.
+fn print_bot_finding_note(
+    ctx: &ReadyContext,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), ReadyCliError> {
+    let prs = match ctx.gh.pr_list() {
+        Ok(prs) => prs,
+        Err(err) => {
+            writeln!(out, "warning: could not check bot findings: {err}")?;
+            return Ok(());
+        }
+    };
+
+    let Some(number) = matching_pr_number(&prs, key) else {
+        return Ok(());
+    };
+
+    match ctx.gh.pr_review_threads(number) {
+        Ok(threads) => {
+            let counts = count_bot_findings(&threads, ctx.review_bots);
+            if counts.unresolved > 0 {
+                let noun = if counts.unresolved == 1 {
+                    "finding"
+                } else {
+                    "findings"
+                };
+                writeln!(
+                    out,
+                    "  note: {} unresolved bot {noun} on PR #{number}",
+                    counts.unresolved
+                )?;
+            }
+        }
+        Err(err) => {
+            writeln!(out, "warning: could not check bot findings: {err}")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the number of the open PR (from `gh pr list`) whose title resolves
+/// to `key`, reusing [`find_issue_key`] — the same title/body/branch
+/// extraction `tm pr status` uses — rather than re-implementing key
+/// parsing. `gh pr list` only returns `number`/`title`, so body and branch
+/// are left empty in the synthetic [`PrInfo`] passed in; this only ever
+/// matches on the title.
+fn matching_pr_number(prs: &[crate::github::pr::PrSummary], key: &str) -> Option<u64> {
+    prs.iter()
+        .find(|pr| {
+            let synthetic = PrInfo {
+                number: pr.number,
+                url: String::new(),
+                title: pr.title.clone(),
+                body: String::new(),
+                head_ref_name: String::new(),
+            };
+            find_issue_key(&synthetic).as_deref() == Some(key)
+        })
+        .map(|pr| pr.number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::bot_findings::ReviewThread;
+    use crate::github::gh_cli::{FakeGhCli, GhError};
+    use crate::github::pr::PrSummary;
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, SearchResult,
         Status, StatusCategory,
     };
+
+    /// The default `review_bots` config: `["cursor[bot]"]`.
+    fn cursor_bot() -> Vec<String> {
+        vec!["cursor[bot]".to_string()]
+    }
+
+    fn ready_ctx<'a>(
+        jira: &'a FakeJiraClient,
+        gh: &'a FakeGhCli,
+        review_bots: &'a [String],
+    ) -> ReadyContext<'a> {
+        ReadyContext {
+            jira,
+            gh,
+            review_bots,
+        }
+    }
+
+    fn pr_summary(number: u64, title: &str) -> PrSummary {
+        PrSummary {
+            number,
+            title: title.to_string(),
+        }
+    }
+
+    fn review_thread(is_resolved: bool, author_login: &str) -> ReviewThread {
+        ReviewThread {
+            is_resolved,
+            author_login: Some(author_login.to_string()),
+        }
+    }
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -188,9 +397,11 @@ mod tests {
     fn list_happy_path_prints_key_and_summary_per_line() {
         let jira = FakeJiraClient::new()
             .with_search_result(search_result(vec![issue("PROJ-1"), issue("PROJ-2")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        list(&jira, &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -202,9 +413,11 @@ mod tests {
     #[test]
     fn list_with_no_candidates_prints_no_ready_tickets() {
         let jira = FakeJiraClient::new().with_search_result(search_result(vec![]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        list(&jira, &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "No ready tickets.\n");
@@ -221,9 +434,11 @@ mod tests {
         }];
         let jira =
             FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1"), blocked]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        list(&jira, &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -242,9 +457,11 @@ mod tests {
             outward_issue: None,
         }];
         let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        list(&jira, &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "No ready tickets.\n(1 blocked ticket hidden)\n");
@@ -264,23 +481,161 @@ mod tests {
         };
         let jira = FakeJiraClient::new()
             .with_search_result(search_result(vec![blocked("PROJ-1"), blocked("PROJ-2")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        list(&jira, &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "No ready tickets.\n(2 blocked tickets hidden)\n");
     }
 
     #[test]
-    fn check_ready_ticket_prints_ready_message() {
-        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+    fn list_annotates_ticket_with_matched_pr_and_unresolved_bot_findings() {
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1"), issue("PROJ-2")]));
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![
+                pr_summary(42, "[PROJ-1] Fix the thing"),
+                pr_summary(43, "[PROJ-2] Add the widget"),
+            ]))
+            .with_review_threads(
+                42,
+                Ok(vec![
+                    review_thread(false, "cursor"),
+                    review_thread(false, "cursor"),
+                    review_thread(true, "cursor"),
+                ]),
+            )
+            .with_review_threads(43, Ok(vec![review_thread(false, "cursor")]));
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        check(&jira, "proj-1", &mut out).expect("should succeed");
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-1  Summary for PROJ-1  [2 unresolved bot findings]\n\
+             PROJ-2  Summary for PROJ-2  [1 unresolved bot finding]\n"
+        );
+    }
+
+    #[test]
+    fn list_leaves_line_unchanged_when_zero_unresolved_bot_findings() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_summary(42, "[PROJ-1] Fix the thing")]))
+            .with_review_threads(42, Ok(vec![review_thread(true, "cursor")]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-1  Summary for PROJ-1\n");
+    }
+
+    #[test]
+    fn list_leaves_line_unchanged_when_no_matching_pr() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_summary(42, "Unrelated PR")]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-1  Summary for PROJ-1\n");
+        assert!(!output.contains("warning"));
+    }
+
+    #[test]
+    fn list_pr_list_failure_warns_once_and_prints_unannotated_list() {
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1"), issue("PROJ-2")]));
+        let gh = FakeGhCli::new().with_pr_list(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should still succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "warning: could not check bot findings: `gh pr list` failed (exit Some(1)): boom\n\
+             PROJ-1  Summary for PROJ-1\n\
+             PROJ-2  Summary for PROJ-2\n"
+        );
+    }
+
+    #[test]
+    fn list_review_threads_failure_for_one_ticket_warns_once_and_still_annotates_the_other() {
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1"), issue("PROJ-2")]));
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![
+                pr_summary(42, "[PROJ-1] Fix the thing"),
+                pr_summary(43, "[PROJ-2] Add the widget"),
+            ]))
+            .with_review_threads(
+                42,
+                Err(GhError::Command {
+                    command: "gh api graphql".to_string(),
+                    exit_code: Some(1),
+                    stderr: "boom".to_string(),
+                }),
+            )
+            .with_review_threads(43, Ok(vec![review_thread(false, "cursor")]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should still succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output.matches("warning:").count(),
+            1,
+            "expected exactly one warning line: {output}"
+        );
+        assert!(output.contains("PROJ-1  Summary for PROJ-1\n"));
+        assert!(output.contains("PROJ-2  Summary for PROJ-2  [1 unresolved bot finding]\n"));
+    }
+
+    #[test]
+    fn check_ready_ticket_prints_ready_message() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        check(&ready_ctx(&jira, &gh, &bots), "proj-1", &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "PROJ-1 is ready (To Do)\n");
+    }
+
+    #[test]
+    fn check_ready_ticket_with_unresolved_bot_findings_prints_note() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_summary(42, "[PROJ-1] Fix the thing")]))
+            .with_review_threads(42, Ok(vec![review_thread(false, "cursor")]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        check(&ready_ctx(&jira, &gh, &bots), "proj-1", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-1 is ready (To Do)\n  note: 1 unresolved bot finding on PR #42\n"
+        );
     }
 
     #[test]
@@ -301,9 +656,16 @@ mod tests {
             },
         ];
         let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+        let gh = FakeGhCli::new().with_pr_list(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "should never be called".to_string(),
+        }));
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        let err = check(&jira, "proj-1", &mut out).expect_err("should fail");
+        let err =
+            check(&ready_ctx(&jira, &gh, &bots), "proj-1", &mut out).expect_err("should fail");
 
         let rendered = err.to_string();
         assert!(rendered.contains("PROJ-1 is blocked by:"));
@@ -313,14 +675,21 @@ mod tests {
             "Done blocker should not be listed: {rendered}"
         );
         assert!(out.is_empty(), "nothing should be printed on failure");
+        assert!(
+            !String::from_utf8(out.clone()).unwrap().contains("warning"),
+            "the blocked path must never perform a bot-findings lookup"
+        );
     }
 
     #[test]
     fn check_invalid_key_is_an_actionable_error() {
         let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        let err = check(&jira, "not-a-key!", &mut out).expect_err("should fail");
+        let err =
+            check(&ready_ctx(&jira, &gh, &bots), "not-a-key!", &mut out).expect_err("should fail");
 
         match err {
             ReadyCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
@@ -331,9 +700,12 @@ mod tests {
     #[test]
     fn check_not_found_error_passes_through() {
         let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
         let mut out = Vec::new();
 
-        let err = check(&jira, "proj-404", &mut out).expect_err("should fail");
+        let err =
+            check(&ready_ctx(&jira, &gh, &bots), "proj-404", &mut out).expect_err("should fail");
 
         match err {
             ReadyCliError::Ticketing(TicketingError::Jira(

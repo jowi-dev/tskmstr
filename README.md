@@ -191,13 +191,26 @@ default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
+# review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
 its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files or `tm` refuses to run; `default_assignee_account_id`,
-`status_on_pr`, and `status_on_create` are optional.
+`status_on_pr`, `status_on_create`, and `review_bots` are optional.
+
+`review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
+review comment threads count as "bot findings" for `tm pr status` and
+`tm ready`. Defaults to `["cursor[bot]"]` when unset in both global and
+repo config.
+
+`tm pr status` reports these as a `Bot findings:` line: `Bot findings: 2
+unresolved (of 3)` when at least one bot-authored review thread exists, or
+`Bot findings: none` when there are none. If the GitHub lookup itself fails,
+`tm` prints `warning: could not check bot findings: ...` instead and
+continues with the rest of `tm pr status` — this is informational and never
+fails the command.
 
 `status_on_pr` names the workflow status (e.g. `"In Review"`) to move a
 ticket to when `tm pr create` gives it a ticket, whether that ticket was
@@ -294,6 +307,17 @@ so a filtered list doesn't read as "this is everything assigned to you".
 status: it prints `KEY is ready (<status>)` on success, or `KEY is blocked
 by:` followed by one line per open blocker on failure, exiting non-zero so
 scripts can branch on it.
+
+Both forms also carry a best-effort, advisory annotation of unresolved
+GitHub bot review findings (see `review_bots` above and `Bot findings`
+below) on a ready ticket's associated open pull request (matched by title,
+the same way as `tm ticket`/`tm pr` association). `tm ready`'s list adds
+`  [N unresolved bot findings]` to a matched ticket's line when `N > 0`;
+`tm ready <KEY>` prints a `  note: N unresolved bot findings on PR #<number>`
+line after the ready message. This is purely visible, never blocks
+claimability, and never changes an exit code: if the GitHub lookup fails,
+`tm` prints a single `warning: could not check bot findings: ...` line and
+falls back to the unannotated output rather than failing the command.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes

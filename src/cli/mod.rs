@@ -83,7 +83,10 @@ pub enum Command {
     /// the "To Do" status category and have no open `Blocks`-type blockers,
     /// in Jira's native backlog rank order. With `KEY` (any assignee, any
     /// status), reports whether that one ticket is ready, exiting non-zero
-    /// if it's blocked.
+    /// if it's blocked. Both forms also carry a best-effort, advisory
+    /// annotation of unresolved GitHub bot review findings on a ready
+    /// ticket's associated pull request, if any; this never blocks
+    /// claimability or changes the exit code.
     Ready {
         /// Jira issue key to check, e.g. `PROJ-372` (case-insensitive). Omit
         /// to list your ready tickets instead.
@@ -247,7 +250,8 @@ pub enum PrCmd {
         #[arg(long)]
         base: Option<String>,
     },
-    /// Report the pull request open for the current branch and its ticket.
+    /// Report the pull request open for the current branch, its ticket, and
+    /// a summary of any unresolved GitHub bot review findings on it.
     Status {
         /// Automatically create a ticket if none is associated yet, without
         /// prompting.

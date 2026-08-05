@@ -255,9 +255,10 @@ fn run_ticket(
     }
 }
 
-/// `tm ready` / `tm ready <KEY>`: needs only a Jira client + config, the same
-/// shape as the `TicketCmd::Transition` arm above, since neither form of
-/// `tm ready` touches a pull request.
+/// `tm ready` / `tm ready <KEY>`: needs a Jira client + config, same as the
+/// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
+/// `review_bots` for the best-effort bot-findings annotation both forms now
+/// carry (see [`tskmstr::cli::ready::ReadyContext`]).
 fn run_ready(
     key: Option<String>,
     paths: &ConfigPaths,
@@ -267,10 +268,16 @@ fn run_ready(
     let config = config::load(paths)?;
     let token = resolve_token(keychain, env_token)?;
     let jira = jira_client_for(&config, &token);
+    let gh = ShellGhCli::new();
+    let ctx = tskmstr::cli::ready::ReadyContext {
+        jira: jira.as_ref(),
+        gh: &gh,
+        review_bots: &config.review_bots,
+    };
     let mut stdout = std::io::stdout();
     match key {
-        Some(key) => tskmstr::cli::ready::check(jira.as_ref(), &key, &mut stdout)?,
-        None => tskmstr::cli::ready::list(jira.as_ref(), &mut stdout)?,
+        Some(key) => tskmstr::cli::ready::check(&ctx, &key, &mut stdout)?,
+        None => tskmstr::cli::ready::list(&ctx, &mut stdout)?,
     }
     Ok(())
 }
