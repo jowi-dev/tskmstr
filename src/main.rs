@@ -246,6 +246,9 @@ fn run_ticket(
             tskmstr::cli::ticket::unlink(jira.as_ref(), &key, &other, &mut stdout)?;
             Ok(())
         }
+        (None, Some(TicketCmd::Audit { key, record, notes })) => {
+            run_ticket_audit(key, record, notes, paths, keychain, env_token)
+        }
         (None, None) => Err(Box::new(
             tskmstr::cli::ticket::TicketCliError::KeyOrCreateRequired,
         )),
@@ -253,6 +256,87 @@ fn run_ticket(
             unreachable!("clap's args_conflicts_with_subcommands rejects key and cmd together")
         }
     }
+}
+
+/// `tm ticket audit <KEY> [--record <VERDICT> [--notes <TEXT>]]`.
+///
+/// Both modes load config strictly via [`config::load`] (unlike `tm runs`,
+/// which loads leniently so it works with no Jira config at all): read mode
+/// already needs a full Jira client, and record mode reaching the same
+/// `run_db_path` override without a second, differently-lenient config-load
+/// path is simpler than branching the loading strategy per mode. The
+/// tradeoff is that `tm ticket audit --record` (which itself never touches
+/// Jira) still requires valid Jira config to run.
+///
+/// Read mode degrades a runs-DB open failure to `Last audit: unavailable
+/// (...)` rather than failing the command (see
+/// [`tskmstr::cli::ticket::AuditStoreStatus`]); record mode propagates the
+/// same failure as a hard error, since persisting the verdict is the whole
+/// point of that mode.
+fn run_ticket_audit(
+    key: String,
+    record: Option<tskmstr::cli::AuditVerdict>,
+    notes: Option<String>,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let db_path = run_db_path_from_config(&config);
+    let mut stdout = std::io::stdout();
+
+    match record {
+        Some(verdict) => {
+            let store = tskmstr::runs::RunStore::open(&db_path)?;
+            tskmstr::cli::ticket::audit_record(
+                &store,
+                &key,
+                verdict.as_str(),
+                notes.as_deref(),
+                &mut stdout,
+            )?;
+        }
+        None => {
+            let token = resolve_token(keychain, env_token)?;
+            let jira = jira_client_for(&config, &token);
+            // `AuditStoreStatus::Open` borrows `store`, so the store itself
+            // has to live in this match's success arm rather than being
+            // built into a `status` variable up front and dropped early.
+            match tskmstr::runs::RunStore::open(&db_path) {
+                Ok(store) => {
+                    let status = tskmstr::cli::ticket::AuditStoreStatus::Open(&store);
+                    tskmstr::cli::ticket::audit_read(jira.as_ref(), &status, &key, &mut stdout)?;
+                }
+                Err(err) => {
+                    let status =
+                        tskmstr::cli::ticket::AuditStoreStatus::Unavailable(err.to_string());
+                    tskmstr::cli::ticket::audit_read(jira.as_ref(), &status, &key, &mut stdout)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the run database path from an already-loaded [`Config`]: the
+/// configured `run_db_path` if set, otherwise the XDG default. Shares the
+/// XDG-fallback logic with [`resolve_run_db_path`], which additionally
+/// tolerates a missing/invalid config file.
+fn run_db_path_from_config(config: &Config) -> PathBuf {
+    match &config.run_db_path {
+        Some(path) => PathBuf::from(path),
+        None => default_xdg_run_db_path(),
+    }
+}
+
+/// The XDG-derived default run database path: `$XDG_DATA_HOME/tskmstr/runs.db`
+/// when set, otherwise `~/.local/share/tskmstr/runs.db`.
+fn default_xdg_run_db_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    tskmstr::runs::default_db_path(&home, xdg_data_home.as_deref())
 }
 
 /// `tm ready` / `tm ready <KEY>`: needs a Jira client + config, same as the
@@ -372,15 +456,10 @@ fn resolve_run_db_path() -> PathBuf {
     let paths = default_config_paths();
     let configured = config::load(&paths).ok().and_then(|cfg| cfg.run_db_path);
 
-    if let Some(path) = configured {
-        return PathBuf::from(path);
+    match configured {
+        Some(path) => PathBuf::from(path),
+        None => default_xdg_run_db_path(),
     }
-
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    tskmstr::runs::default_db_path(&home, xdg_data_home.as_deref())
 }
 
 fn run_pr(

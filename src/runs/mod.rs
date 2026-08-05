@@ -25,7 +25,8 @@ const NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 /// Schema migrations, indexed by `PRAGMA user_version`. `MIGRATIONS[0]` is
 /// applied to take a fresh database from version 0 to version 1, and so on.
 /// Future schema changes append here rather than editing existing entries.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
     CREATE TABLE runs (
       id           INTEGER PRIMARY KEY,
       ticket       TEXT    NOT NULL,
@@ -54,7 +55,18 @@ const MIGRATIONS: &[&str] = &[r#"
     );
     CREATE INDEX idx_events_run ON run_events(run_id, at);
     CREATE INDEX idx_runs_status ON runs(status);
-    "#];
+    "#,
+    r#"
+    CREATE TABLE ticket_audits (
+      id INTEGER PRIMARY KEY,
+      ticket_key TEXT NOT NULL,
+      verdict TEXT NOT NULL,
+      notes TEXT,
+      audited_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_ticket_audits_key ON ticket_audits(ticket_key, audited_at);
+    "#,
+];
 
 /// A handle to the run-state SQLite database.
 ///
@@ -274,6 +286,20 @@ pub struct Run {
     pub pr_url: Option<String>,
     /// Seconds since `started_at`, computed in SQL like [`RunSummary::age_secs`].
     pub age_secs: i64,
+}
+
+/// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
+/// and [`RunStore::latest_audit_for_ticket`].
+#[derive(Debug, Clone)]
+pub struct TicketAudit {
+    /// Jira ticket key the audit was recorded for.
+    pub ticket_key: String,
+    /// Audit verdict, e.g. `ready` or `needs-work`.
+    pub verdict: String,
+    /// Optional free-text notes attached to the verdict.
+    pub notes: Option<String>,
+    /// When the audit was recorded, per [`NOW_SQL`].
+    pub audited_at: String,
 }
 
 /// One `run_events` row.
@@ -659,6 +685,57 @@ impl RunStore {
         }
         Ok(out)
     }
+
+    /// Records an audit verdict for `ticket_key`, with `audited_at` set to
+    /// the database's current time (see [`NOW_SQL`]).
+    ///
+    /// Keeps full history rather than upserting: every call inserts a new
+    /// row, so [`RunStore::latest_audit_for_ticket`] can report the most
+    /// recent verdict while earlier ones remain queryable directly against
+    /// the `ticket_audits` table.
+    pub fn record_audit(
+        &self,
+        ticket_key: &str,
+        verdict: &str,
+        notes: Option<&str>,
+    ) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO ticket_audits (ticket_key, verdict, notes, audited_at)
+                 VALUES (?1, ?2, ?3, {NOW_SQL})"
+            ),
+            params![ticket_key, verdict, notes],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recently recorded audit for `ticket_key` (newest by
+    /// `audited_at`, which is lexicographically sortable, breaking ties by
+    /// `id`), or `None` if it has never been audited.
+    pub fn latest_audit_for_ticket(
+        &self,
+        ticket_key: &str,
+    ) -> Result<Option<TicketAudit>, RunStoreError> {
+        self.conn
+            .query_row(
+                "SELECT ticket_key, verdict, notes, audited_at
+                 FROM ticket_audits
+                 WHERE ticket_key = ?1
+                 ORDER BY audited_at DESC, id DESC
+                 LIMIT 1",
+                params![ticket_key],
+                |row| {
+                    Ok(TicketAudit {
+                        ticket_key: row.get(0)?,
+                        verdict: row.get(1)?,
+                        notes: row.get(2)?,
+                        audited_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(RunStoreError::from)
+    }
 }
 
 /// Returns the default path for the run database: `$XDG_DATA_HOME/tskmstr/runs.db`
@@ -730,7 +807,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, MIGRATIONS.len() as i64);
         }
 
         let store = RunStore::open(&db_path).expect("reopen should succeed");
@@ -738,7 +815,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -1558,5 +1635,93 @@ mod tests {
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["first", "second"]);
         assert_eq!(events[0].detail.as_deref(), Some("detail"));
+    }
+
+    #[test]
+    fn latest_audit_for_ticket_returns_none_when_never_audited() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.latest_audit_for_ticket("PROJ-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn record_audit_round_trips_verdict_and_notes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_audit("PROJ-1", "ready", Some("looks good"))
+            .unwrap();
+
+        let audit = store
+            .latest_audit_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected an audit");
+        assert_eq!(audit.ticket_key, "PROJ-1");
+        assert_eq!(audit.verdict, "ready");
+        assert_eq!(audit.notes.as_deref(), Some("looks good"));
+        let re = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$").unwrap();
+        assert!(
+            re.is_match(&audit.audited_at),
+            "audited_at {:?} did not match expected format",
+            audit.audited_at
+        );
+    }
+
+    #[test]
+    fn record_audit_notes_are_optional() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.record_audit("PROJ-1", "needs-work", None).unwrap();
+
+        let audit = store
+            .latest_audit_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected an audit");
+        assert_eq!(audit.verdict, "needs-work");
+        assert_eq!(audit.notes, None);
+    }
+
+    #[test]
+    fn latest_audit_for_ticket_prefers_most_recently_recorded() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.record_audit("PROJ-1", "needs-work", None).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE ticket_audits SET audited_at = '2000-01-01T00:00:00.000Z' WHERE ticket_key = 'PROJ-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .record_audit("PROJ-1", "ready", Some("second pass"))
+            .unwrap();
+
+        let audit = store
+            .latest_audit_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected an audit");
+        assert_eq!(audit.verdict, "ready");
+        assert_eq!(audit.notes.as_deref(), Some("second pass"));
+    }
+
+    #[test]
+    fn latest_audit_for_ticket_is_scoped_to_the_given_key() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.record_audit("PROJ-1", "ready", None).unwrap();
+        store.record_audit("PROJ-2", "needs-work", None).unwrap();
+
+        let audit = store
+            .latest_audit_for_ticket("PROJ-2")
+            .unwrap()
+            .expect("expected an audit");
+        assert_eq!(audit.ticket_key, "PROJ-2");
+        assert_eq!(audit.verdict, "needs-work");
     }
 }

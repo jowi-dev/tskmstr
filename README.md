@@ -61,6 +61,8 @@ tm auth status
 | `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
+| `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit, and description — the material for an audit conversation |
+| `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
@@ -288,6 +290,24 @@ ever touches `Blocks`-type links; if no `Blocks` link exists between
 (e.g. `Relates`) exists between the pair instead, the error names it so you
 can see what's actually there. Unlinking `<KEY>` from itself is rejected as
 a usage error, same as `link`.
+
+### Auditing
+
+`tm ticket audit <KEY>` prints the raw material for a pre-handoff audit
+conversation — a ticket's summary, status, assignee, existing links (in the
+same style as `tm ticket link <KEY>`'s bare listing, omitted entirely when
+there are none), its last recorded audit verdict (or `Last audit: never`),
+and its description. `tm` only owns the state/data side of an audit: the
+actual human + Claude conversation that decides whether a ticket is ready
+for an autonomous run is a Claude skill, not something `tm` runs itself.
+
+`tm ticket audit <KEY> --record <ready|needs-work> [--notes "..."]` persists
+that conversation's verdict, timestamped, to the same local SQLite database
+`tm runs` uses (`$XDG_DATA_HOME/tskmstr/runs.db`, or wherever `run_db_path`
+in `config.toml` points instead). Recording never touches Jira and works
+fully offline; every past verdict is kept (no upsert), and the read mode
+above always shows the most recent one. `--notes` only makes sense alongside
+`--record`, so it requires it.
 
 ### Readiness
 

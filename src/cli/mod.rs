@@ -224,6 +224,46 @@ pub enum TicketCmd {
         /// The other issue key to remove the `Blocks` link with.
         other: String,
     },
+    /// Print a ticket's data for a human + Claude audit conversation, or
+    /// record that conversation's verdict.
+    ///
+    /// Without `--record`, prints `KEY`'s summary, status, assignee, links,
+    /// last recorded audit, and description — the raw material for an
+    /// interactive audit conversation (a Claude skill, out of scope for
+    /// `tm` itself). With `--record`, persists a verdict to the same local
+    /// SQLite database `tm runs` uses instead, without touching Jira.
+    /// `--notes` is only meaningful alongside `--record`, so it requires it.
+    Audit {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Record an audit verdict instead of printing the ticket's data.
+        #[arg(long, value_enum)]
+        record: Option<AuditVerdict>,
+        /// Free-text notes to attach to the recorded verdict.
+        #[arg(long, requires = "record")]
+        notes: Option<String>,
+    },
+}
+
+/// Verdicts accepted by `tm ticket audit --record`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum AuditVerdict {
+    /// Ready to hand off to an autonomous run.
+    Ready,
+    /// Needs more work before being handed off.
+    NeedsWork,
+}
+
+impl AuditVerdict {
+    /// Returns the lowercase, hyphenated string this verdict is stored and
+    /// printed as (`ready` / `needs-work`), matching clap's derived value
+    /// names for this enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuditVerdict::Ready => "ready",
+            AuditVerdict::NeedsWork => "needs-work",
+        }
+    }
 }
 
 /// `tm auth` subcommands.
@@ -1223,6 +1263,88 @@ mod tests {
             }
             other => panic!("expected Runs Resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ticket_audit_with_no_record() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "audit", "proj-372"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Audit { key, record, notes }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert!(record.is_none());
+                assert_eq!(notes, None);
+            }
+            other => panic!("expected TicketCmd::Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_audit_with_record_ready() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "audit", "proj-372", "--record", "ready"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Audit { key, record, notes }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert!(matches!(record, Some(AuditVerdict::Ready)));
+                assert_eq!(notes, None);
+            }
+            other => panic!("expected TicketCmd::Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_audit_with_record_needs_work_and_notes() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "audit",
+            "proj-372",
+            "--record",
+            "needs-work",
+            "--notes",
+            "missing acceptance criteria",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Audit { key, record, notes }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert!(matches!(record, Some(AuditVerdict::NeedsWork)));
+                assert_eq!(notes, Some("missing acceptance criteria".to_string()));
+            }
+            other => panic!("expected TicketCmd::Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_audit_invalid_verdict_is_a_clap_error() {
+        let result =
+            Cli::try_parse_from(["tm", "ticket", "audit", "proj-372", "--record", "bogus"]);
+        assert!(result.is_err(), "unknown verdict should be a clap error");
+    }
+
+    #[test]
+    fn ticket_audit_notes_without_record_is_a_clap_error() {
+        let result =
+            Cli::try_parse_from(["tm", "ticket", "audit", "proj-372", "--notes", "some notes"]);
+        assert!(
+            result.is_err(),
+            "--notes without --record should be a clap error"
+        );
+    }
+
+    #[test]
+    fn ticket_audit_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "audit"]);
+        assert!(result.is_err(), "audit requires a key");
     }
 
     #[test]

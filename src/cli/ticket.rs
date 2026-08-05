@@ -1,6 +1,6 @@
 //! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
-//! ticket assign`, `tm ticket rank`, `tm ticket link`, and `tm ticket
-//! unlink`.
+//! ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
+//! and `tm ticket audit`.
 
 use std::io::Write;
 
@@ -8,8 +8,10 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::config::Config;
+use crate::jira::adf::adf_to_text;
 use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::types::CreateLinkRequest;
+use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
     TransitionOutcome, assign_ticket, associate_ticket, create_ticket, link_ticket, list_links,
@@ -68,6 +70,11 @@ pub enum TicketCliError {
     /// Association with the current branch's pull request failed.
     #[error(transparent)]
     Ticketing(#[from] TicketingError),
+
+    /// A [`RunStore`] operation failed (`tm ticket audit --record`, or
+    /// reading a previously recorded audit in read mode).
+    #[error(transparent)]
+    RunStore(#[from] RunStoreError),
 
     /// Writing output failed.
     #[error("io error: {0}")]
@@ -404,6 +411,129 @@ pub fn unlink(
     for phrase in &outcome.removed {
         writeln!(out, "Unlinked: {normalized} {phrase} {other}")?;
     }
+    Ok(())
+}
+
+/// Backing store status for `tm ticket audit`'s read mode ([`audit_read`]):
+/// either a usable [`RunStore`] handle, or the display text of a failed
+/// [`RunStore::open`] attempt.
+///
+/// Read mode degrades to `Last audit: unavailable (<error>)` on the latter
+/// rather than failing the whole command, since the Jira data is the
+/// primary payload there. Record mode ([`audit_record`]) has no equivalent:
+/// an unopenable runs DB is a hard error there, since persisting the
+/// verdict is the entire point.
+pub enum AuditStoreStatus<'a> {
+    /// The runs DB opened successfully.
+    Open(&'a RunStore),
+    /// The runs DB could not be opened; carries the error's display text.
+    Unavailable(String),
+}
+
+/// `tm ticket audit <KEY>` (no `--record`): print `KEY`'s raw Jira data —
+/// the material for an interactive audit conversation, which is a Claude
+/// skill concern out of scope for `tm` itself — plus its last recorded audit
+/// verdict.
+///
+/// Field order: `KEY  <summary>`, `Status: ...`, `Assignee: ...`, `Links:`
+/// (a line per existing issue link, in the same `<verb> <key> (<status>):
+/// <summary>` style as `tm ticket link <KEY>`'s bare-list rendering; the
+/// whole section is omitted when there are no links), `Last audit: ...`, a
+/// blank line, then the description rendered via [`adf_to_text`] (or `(no
+/// description)`).
+pub fn audit_read(
+    jira: &dyn JiraClient,
+    store: &AuditStoreStatus,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    let issue = jira.get_issue(&normalized).map_err(TicketingError::Jira)?;
+
+    writeln!(out, "{}  {}", normalized, issue.fields.summary)?;
+    writeln!(out, "Status: {}", issue.fields.status.name)?;
+    writeln!(
+        out,
+        "Assignee: {}",
+        issue
+            .fields
+            .assignee
+            .as_ref()
+            .map(|a| a.display_name.as_str())
+            .unwrap_or("unassigned")
+    )?;
+
+    if !issue.fields.issue_links.is_empty() {
+        writeln!(out, "Links:")?;
+        for link in &issue.fields.issue_links {
+            if let Some(other) = &link.inward_issue {
+                writeln!(
+                    out,
+                    "{} {} ({}): {}",
+                    link.link_type.inward,
+                    other.key,
+                    other.fields.status.name,
+                    other.fields.summary
+                )?;
+            } else if let Some(other) = &link.outward_issue {
+                writeln!(
+                    out,
+                    "{} {} ({}): {}",
+                    link.link_type.outward,
+                    other.key,
+                    other.fields.status.name,
+                    other.fields.summary
+                )?;
+            }
+            // Neither side present: nothing meaningful to render, matching
+            // `print_links`'s handling of the same shape.
+        }
+    }
+
+    match store {
+        AuditStoreStatus::Open(store) => match store.latest_audit_for_ticket(&normalized)? {
+            Some(audit) => match &audit.notes {
+                Some(notes) => writeln!(
+                    out,
+                    "Last audit: {} at {} -- {}",
+                    audit.verdict, audit.audited_at, notes
+                )?,
+                None => writeln!(out, "Last audit: {} at {}", audit.verdict, audit.audited_at)?,
+            },
+            None => writeln!(out, "Last audit: never")?,
+        },
+        AuditStoreStatus::Unavailable(err) => writeln!(out, "Last audit: unavailable ({err})")?,
+    }
+
+    writeln!(out)?;
+    let description = issue
+        .fields
+        .description
+        .as_ref()
+        .map(adf_to_text)
+        .filter(|text| !text.is_empty());
+    match description {
+        Some(text) => writeln!(out, "{text}")?,
+        None => writeln!(out, "(no description)")?,
+    }
+
+    Ok(())
+}
+
+/// `tm ticket audit <KEY> --record <ready|needs-work> [--notes <TEXT>]`:
+/// persist an audit verdict, timestamped by the runs DB itself (see
+/// [`RunStore::record_audit`]). Never touches Jira, so this works fully
+/// offline.
+pub fn audit_record(
+    store: &RunStore,
+    key: &str,
+    verdict: &str,
+    notes: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    store.record_audit(&normalized, verdict, notes)?;
+    writeln!(out, "Recorded audit for {normalized}: {verdict}")?;
     Ok(())
 }
 
@@ -1482,5 +1612,158 @@ mod tests {
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(jira.delete_link_calls().is_empty());
+    }
+
+    fn open_run_store(dir: &std::path::Path) -> RunStore {
+        RunStore::open(&dir.join("runs.db")).expect("open should succeed")
+    }
+
+    #[test]
+    fn audit_read_prints_all_sections_and_never_audited() {
+        let mut with_links = issue("PROJ-372");
+        with_links.fields.assignee = Some(crate::jira::types::UserRef {
+            account_id: "acct-1".to_string(),
+            display_name: "Jane Doe".to_string(),
+        });
+        with_links.fields.description = Some(serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": "Some details." }] }
+            ]
+        }));
+        with_links.fields.issue_links = vec![blocks_issue_link("10001", Some("PROJ-1"), None)];
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", with_links);
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(&jira, &status, "proj-372", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-372  Fix the thing\n\
+             Status: To Do\n\
+             Assignee: Jane Doe\n\
+             Links:\n\
+             is blocked by PROJ-1 (To Do): Summary\n\
+             Last audit: never\n\
+             \n\
+             Some details.\n"
+        );
+    }
+
+    #[test]
+    fn audit_read_unassigned_and_no_links_and_no_description() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(&jira, &status, "PROJ-372", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Assignee: unassigned\n"));
+        assert!(!output.contains("Links:"));
+        assert!(output.contains("(no description)"));
+    }
+
+    #[test]
+    fn audit_read_prints_last_recorded_audit_with_notes() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        store
+            .record_audit("PROJ-372", "ready", Some("looks good"))
+            .unwrap();
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(&jira, &status, "proj-372", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Last audit: ready at "));
+        assert!(output.contains(" -- looks good\n"));
+    }
+
+    #[test]
+    fn audit_read_store_unavailable_degrades_instead_of_failing() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let status = AuditStoreStatus::Unavailable("disk full".to_string());
+        let mut out = Vec::new();
+
+        audit_read(&jira, &status, "proj-372", &mut out).expect("should still succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Last audit: unavailable (disk full)\n"));
+    }
+
+    #[test]
+    fn audit_read_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        let err = audit_read(&jira, &status, "not-a-key!", &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_read_missing_ticket_gives_friendly_not_found_error() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        let err = audit_read(&jira, &status, "proj-404", &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+                assert_eq!(key, "PROJ-404")
+            }
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_record_inserts_a_row_readable_via_latest_audit_for_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        audit_record(&store, "proj-372", "ready", Some("looks good"), &mut out)
+            .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Recorded audit for PROJ-372: ready\n");
+
+        let audit = store
+            .latest_audit_for_ticket("PROJ-372")
+            .unwrap()
+            .expect("expected an audit");
+        assert_eq!(audit.verdict, "ready");
+        assert_eq!(audit.notes.as_deref(), Some("looks good"));
+    }
+
+    #[test]
+    fn audit_record_invalid_key_is_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        let err =
+            audit_record(&store, "not-a-key!", "ready", None, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
     }
 }
