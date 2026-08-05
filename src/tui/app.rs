@@ -161,6 +161,9 @@ pub struct RunCard {
     pub last_event_kind: Option<String>,
     /// Seconds since the most recent event, if any.
     pub last_event_age_secs: Option<i64>,
+    /// The run's latest checklist snapshot (see
+    /// [`crate::runs::latest_checklist`]), if it has emitted one.
+    pub checklist: Option<crate::runs::ChecklistState>,
 }
 
 /// One event in a [`RunDetail`]'s timeline, mirroring
@@ -209,6 +212,9 @@ pub struct RunDetail {
     pub ended_at: Option<String>,
     /// The run's event timeline, oldest first.
     pub events: Vec<RunDetailEvent>,
+    /// The run's latest checklist snapshot (see
+    /// [`crate::runs::latest_checklist`]), if it has emitted one.
+    pub checklist: Option<crate::runs::ChecklistState>,
 }
 
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
@@ -2323,6 +2329,7 @@ mod tests {
             heartbeat_age_secs: Some(5),
             last_event_kind: None,
             last_event_age_secs: None,
+            checklist: None,
         }
     }
 
@@ -2471,6 +2478,7 @@ mod tests {
             started_at: "2020-01-01T00:00:00.000Z".to_string(),
             ended_at: None,
             events: vec![],
+            checklist: None,
         }
     }
 

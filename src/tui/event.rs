@@ -217,17 +217,38 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
 
 /// Run `Cmd::LoadRuns`: list every run and map it to a
 /// [`crate::tui::app::RunCard`].
+///
+/// Fetches each run's full event timeline (via
+/// [`crate::runs::RunStore::events_for_run`]) to compute its latest
+/// checklist for the card's progress marker. This re-fetches events already
+/// read for the (much rarer) detail window rather than adding a dedicated
+/// `latest_event_of_kind` store query: run and per-run event counts are
+/// small in this local SQLite store, `run_events` is already indexed by
+/// `run_id`, and `LoadRuns` only fires every other tick (~500ms), so the
+/// N+1 query pattern here stays cheap.
 fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
     match deps.store.list_runs() {
         Ok(summaries) => vec![Msg::RunsLoaded(
-            summaries.into_iter().map(run_summary_to_card).collect(),
+            summaries
+                .into_iter()
+                .map(|summary| run_summary_to_card(deps, summary))
+                .collect(),
         )],
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
     }
 }
 
-/// Map a [`crate::runs::RunSummary`] to a [`crate::tui::app::RunCard`].
-fn run_summary_to_card(summary: crate::runs::RunSummary) -> crate::tui::app::RunCard {
+/// Map a [`crate::runs::RunSummary`] to a [`crate::tui::app::RunCard`],
+/// attaching its latest checklist (if any) per [`load_runs`]'s doc comment.
+fn run_summary_to_card(
+    deps: &WatchDeps,
+    summary: crate::runs::RunSummary,
+) -> crate::tui::app::RunCard {
+    let checklist = deps
+        .store
+        .events_for_run(summary.id)
+        .ok()
+        .and_then(|events| crate::runs::latest_checklist(&events));
     crate::tui::app::RunCard {
         id: summary.id,
         ticket: summary.ticket,
@@ -237,6 +258,7 @@ fn run_summary_to_card(summary: crate::runs::RunSummary) -> crate::tui::app::Run
         heartbeat_age_secs: summary.heartbeat_age_secs,
         last_event_kind: summary.last_event_kind,
         last_event_age_secs: summary.last_event_age_secs,
+        checklist,
     }
 }
 
@@ -261,6 +283,7 @@ fn run_to_detail(
     run: crate::runs::Run,
     events: Vec<crate::runs::RunEvent>,
 ) -> crate::tui::app::RunDetail {
+    let checklist = crate::runs::latest_checklist(&events);
     crate::tui::app::RunDetail {
         id: run.id,
         ticket: run.ticket,
@@ -284,6 +307,7 @@ fn run_to_detail(
                 detail: e.detail,
             })
             .collect(),
+        checklist,
     }
 }
 

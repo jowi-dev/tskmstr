@@ -315,6 +315,76 @@ pub struct RunEvent {
     pub detail: Option<String>,
 }
 
+/// One item in a run's checklist snapshot.
+///
+/// Mirrors the shape a runner emits via
+/// `tm runs event <ID> --kind checklist --detail '{"items":[...]}'`: see
+/// [`latest_checklist`] for the full convention. Unknown extra JSON fields
+/// on an item are ignored rather than rejected, so the convention can grow
+/// without breaking older `tm` builds.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ChecklistItem {
+    /// The checklist item's text, e.g. `"write tests"`.
+    pub text: String,
+    /// Whether the item is complete.
+    pub done: bool,
+}
+
+/// A run's checklist, as of its most recent `checklist` event.
+///
+/// Every `checklist` event carries a full snapshot rather than a diff
+/// against the previous one, so this is simply the parsed detail of the
+/// newest event that parsed successfully; see [`latest_checklist`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChecklistState {
+    /// Checklist items, in emitted order.
+    pub items: Vec<ChecklistItem>,
+}
+
+impl ChecklistState {
+    /// Number of items marked done.
+    pub fn done_count(&self) -> usize {
+        self.items.iter().filter(|item| item.done).count()
+    }
+}
+
+/// The JSON shape of a `checklist` event's `detail`: `{"items":[{"text":
+/// "...","done":false}, ...]}`. Kept private; callers only ever see the
+/// parsed [`ChecklistState`].
+#[derive(serde::Deserialize)]
+struct ChecklistDetail {
+    items: Vec<ChecklistItem>,
+}
+
+/// Scans `events` (as returned by [`RunStore::events_for_run`], oldest
+/// first) for the newest event with `kind == "checklist"` whose `detail`
+/// parses as the documented shape, and returns it.
+///
+/// This is the convention a Claude Code "lane" run uses to report
+/// fine-grained progress: `tm runs event <ID> --kind checklist --detail
+/// '{"items":[{"text":"write tests","done":true},{"text":"implement",
+/// "done":false}]}'`. Each `checklist` event is a full snapshot — latest
+/// wins, there is no diffing against earlier ones.
+///
+/// Tolerant by design: an event with kind `checklist` but missing or
+/// malformed `detail` (not valid JSON, or valid JSON that doesn't match the
+/// shape) is skipped in favor of the next-newest `checklist` event that does
+/// parse, rather than erroring or panicking. Returns `None` if no event
+/// parses.
+pub fn latest_checklist(events: &[RunEvent]) -> Option<ChecklistState> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.kind == "checklist")
+        .find_map(|event| {
+            let detail = event.detail.as_deref()?;
+            let parsed: ChecklistDetail = serde_json::from_str(detail).ok()?;
+            Some(ChecklistState {
+                items: parsed.items,
+            })
+        })
+}
+
 impl RunStore {
     /// Opens (creating if necessary) the run database at `path`, applying
     /// any pending migrations.
@@ -1707,6 +1777,111 @@ mod tests {
             .expect("expected an audit");
         assert_eq!(audit.verdict, "ready");
         assert_eq!(audit.notes.as_deref(), Some("second pass"));
+    }
+
+    fn checklist_event(id: i64, detail: Option<&str>) -> RunEvent {
+        RunEvent {
+            id,
+            at: format!("2020-01-01T00:00:{id:02}.000Z"),
+            kind: "checklist".to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn latest_checklist_parses_happy_path() {
+        let events = vec![checklist_event(
+            1,
+            Some(
+                r#"{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}"#,
+            ),
+        )];
+
+        let state = latest_checklist(&events).expect("expected a checklist");
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.items[0].text, "write tests");
+        assert!(state.items[0].done);
+        assert_eq!(state.items[1].text, "implement");
+        assert!(!state.items[1].done);
+        assert_eq!(state.done_count(), 1);
+    }
+
+    #[test]
+    fn latest_checklist_prefers_the_newest_event() {
+        let events = vec![
+            checklist_event(1, Some(r#"{"items":[{"text":"old","done":false}]}"#)),
+            checklist_event(2, Some(r#"{"items":[{"text":"new","done":true}]}"#)),
+        ];
+
+        let state = latest_checklist(&events).expect("expected a checklist");
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].text, "new");
+        assert!(state.items[0].done);
+    }
+
+    #[test]
+    fn latest_checklist_falls_back_when_the_newest_detail_is_malformed() {
+        let events = vec![
+            checklist_event(1, Some(r#"{"items":[{"text":"good","done":true}]}"#)),
+            checklist_event(2, Some("not json at all")),
+        ];
+
+        let state = latest_checklist(&events).expect("expected a fallback checklist");
+        assert_eq!(state.items[0].text, "good");
+    }
+
+    #[test]
+    fn latest_checklist_falls_back_when_the_newest_detail_is_missing() {
+        let events = vec![
+            checklist_event(1, Some(r#"{"items":[{"text":"good","done":false}]}"#)),
+            checklist_event(2, None),
+        ];
+
+        let state = latest_checklist(&events).expect("expected a fallback checklist");
+        assert_eq!(state.items[0].text, "good");
+    }
+
+    #[test]
+    fn latest_checklist_returns_none_when_no_checklist_events() {
+        let events = vec![RunEvent {
+            id: 1,
+            at: "2020-01-01T00:00:01.000Z".to_string(),
+            kind: "tool_use".to_string(),
+            detail: None,
+        }];
+
+        assert!(latest_checklist(&events).is_none());
+    }
+
+    #[test]
+    fn latest_checklist_returns_none_when_every_checklist_event_is_malformed() {
+        let events = vec![
+            checklist_event(1, Some("garbage")),
+            checklist_event(2, None),
+        ];
+
+        assert!(latest_checklist(&events).is_none());
+    }
+
+    #[test]
+    fn latest_checklist_ignores_unknown_extra_json_fields() {
+        let events = vec![checklist_event(
+            1,
+            Some(r#"{"items":[{"text":"a","done":true,"note":"extra"}],"schema_version":2}"#),
+        )];
+
+        let state = latest_checklist(&events).expect("expected a checklist");
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].text, "a");
+    }
+
+    #[test]
+    fn latest_checklist_handles_empty_items() {
+        let events = vec![checklist_event(1, Some(r#"{"items":[]}"#))];
+
+        let state = latest_checklist(&events).expect("expected a checklist");
+        assert!(state.items.is_empty());
+        assert_eq!(state.done_count(), 0);
     }
 
     #[test]

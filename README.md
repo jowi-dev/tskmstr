@@ -102,6 +102,24 @@ last heartbeat is older than `--stale-after` minutes (default 10), and its
 recorded pid is no longer alive — a crashed runner otherwise leaves a row
 reading `running` forever.
 
+### The `checklist` event convention
+
+A `checklist` event reports a run's current todo list (Claude's own
+checklist) so `tm runs watch` can show fine-grained progress rather than
+just coarse status-column moves. `--detail` must be a full snapshot of the
+whole checklist, not a diff — each new `checklist` event replaces the
+previous one entirely, and `tm` always renders the newest one it can parse:
+
+```
+tm runs event abc123 --kind checklist --detail '{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}'
+```
+
+`items` is a list of `{"text": string, "done": bool}` objects, in display
+order. An event whose `detail` isn't valid JSON, or doesn't match this
+shape, is skipped in favor of the next-newest `checklist` event that does
+parse — a malformed emission never crashes the watch board, it just falls
+back.
+
 `tm runs watch` opens a full-screen kanban board of every run, one column
 per status (Queued, Running, Blocked, Review, Done, Failed), refreshing from
 the database every ~500ms. `h`/`l` move between columns, `j`/`k` move within
@@ -109,7 +127,9 @@ a column, `Enter` opens a floating window with the selected run's full
 detail and event timeline (`j`/`k` scroll it, `Esc`/`q` closes it), `r`
 refreshes immediately, and `q`/`Esc` quits when no detail window is open. A
 `Running` card whose heartbeat is more than 10 minutes stale is marked with
-a red `!`.
+a red `!`. A run's latest checklist (see above), if it has emitted one, is
+rendered as a `[x]`/`[ ]` section above the event timeline in the detail
+window, and as a terse `{done}/{total}` marker on its kanban card.
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default

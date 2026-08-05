@@ -534,9 +534,18 @@ fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: boo
         _ => "-".to_string(),
     };
 
+    let mut lane_line = card.lane.clone();
+    if let Some(checklist) = &card.checklist {
+        lane_line = format!(
+            "{lane_line}  {}/{}",
+            checklist.done_count(),
+            checklist.items.len()
+        );
+    }
+
     let lines = vec![
         Line::from(ticket_spans),
-        Line::from(Span::styled(card.lane.clone(), style)),
+        Line::from(Span::styled(lane_line, style)),
         Line::from(Span::styled(
             format!("{} · {last_event}", format_age(card.age_secs)),
             style,
@@ -596,6 +605,19 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         lines.push(Line::from(format!("ended: {ended_at}")));
     }
     lines.push(Line::from(""));
+
+    if let Some(checklist) = &detail.checklist {
+        lines.push(Line::from(format!(
+            "Checklist ({}/{} done)",
+            checklist.done_count(),
+            checklist.items.len()
+        )));
+        for item in &checklist.items {
+            let marker = if item.done { "[x]" } else { "[ ]" };
+            lines.push(Line::from(format!("{marker} {}", item.text)));
+        }
+        lines.push(Line::from(""));
+    }
 
     if detail.events.is_empty() {
         lines.push(Line::from("(no events)"));
@@ -1296,6 +1318,7 @@ mod tests {
             heartbeat_age_secs: Some(30),
             last_event_kind: Some("tool_use".to_string()),
             last_event_age_secs: Some(5),
+            checklist: None,
         }
     }
 
@@ -1382,6 +1405,7 @@ mod tests {
                 kind: "tool_use".to_string(),
                 detail: None,
             }],
+            checklist: None,
         };
         let app = App {
             show_run_detail: true,
@@ -1392,6 +1416,98 @@ mod tests {
         assert!(text.contains("Run 1: PROJ-1"));
         assert!(text.contains("sess-abc"));
         assert!(text.contains("tool_use"));
+    }
+
+    fn checklist(items: &[(&str, bool)]) -> crate::runs::ChecklistState {
+        crate::runs::ChecklistState {
+            items: items
+                .iter()
+                .map(|(text, done)| crate::runs::ChecklistItem {
+                    text: text.to_string(),
+                    done: *done,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn run_detail_overlay_renders_checklist_section_above_events() {
+        let detail = crate::tui::app::RunDetail {
+            checklist: Some(checklist(&[
+                ("write tests", true),
+                ("implement", true),
+                ("review", false),
+            ])),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Checklist (2/3 done)"));
+        assert!(text.contains("[x] write tests"));
+        assert!(text.contains("[x] implement"));
+        assert!(text.contains("[ ] review"));
+    }
+
+    #[test]
+    fn run_detail_overlay_with_no_checklist_has_no_checklist_section() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Checklist"));
+    }
+
+    fn run_detail_fixture() -> crate::tui::app::RunDetail {
+        crate::tui::app::RunDetail {
+            id: 1,
+            ticket: "PROJ-1".to_string(),
+            lane: "backend".to_string(),
+            status: RunStatus::Running,
+            worktree: "/tmp/wt".to_string(),
+            branch: None,
+            pid: None,
+            session_id: None,
+            cost_usd: None,
+            num_turns: None,
+            pr_url: None,
+            blocker: None,
+            started_at: "2020-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            events: vec![],
+            checklist: None,
+        }
+    }
+
+    #[test]
+    fn runs_board_card_shows_checklist_progress() {
+        let card = RunCard {
+            checklist: Some(checklist(&[
+                ("a", true),
+                ("b", true),
+                ("c", true),
+                ("d", false),
+            ])),
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        let text = buffer_text(&render(&runs_app(vec![card])));
+        assert!(text.contains("3/4"));
+    }
+
+    #[test]
+    fn runs_board_card_with_no_checklist_shows_no_progress_marker() {
+        let app = runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)]);
+        let text = buffer_text(&render(&app));
+        let lane_line = text
+            .lines()
+            .find(|line| line.contains("backend"))
+            .expect("expected a line with the card's lane");
+        assert!(!lane_line.contains('/'));
     }
 
     #[test]
