@@ -400,7 +400,7 @@ pub fn latest_checklist(events: &[RunEvent]) -> Option<ChecklistState> {
 /// Per-model token/cost usage, as reported verbatim in a `claude -p`
 /// result's `modelUsage` map. All token fields default to `0` when absent
 /// so a live snapshot (which never carries `costUSD`) still parses cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize, serde::Serialize)]
 pub struct ModelUsage {
     /// Input tokens (excluding cache reads/writes).
     #[serde(rename = "inputTokens", default)]
@@ -417,7 +417,7 @@ pub struct ModelUsage {
     /// Cost in USD, present in the authoritative `runs.model_usage` column
     /// (recorded at `tm runs finish --model-usage`) and absent from live
     /// `usage` event snapshots.
-    #[serde(rename = "costUSD", default)]
+    #[serde(rename = "costUSD", default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
 }
 

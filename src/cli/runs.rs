@@ -192,10 +192,23 @@ fn last_event_column(run: &RunSummary) -> String {
 
 /// `tm runs show`: print the latest run for `ticket` and its event timeline.
 ///
+/// When `json` is `true`, prints a single pretty-printed JSON object instead
+/// of the human-oriented rendering (see [`show_json`] for the schema) and
+/// nothing else.
+///
 /// # Errors
 ///
 /// Returns [`RunsCliError::NoRunForTicket`] if `ticket` has no recorded runs.
-pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), RunsCliError> {
+pub fn show(
+    store: &RunStore,
+    ticket: &str,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    if json {
+        return show_json(store, ticket, out);
+    }
+
     let ticket = ticket.to_uppercase();
     let run =
         store
@@ -285,6 +298,193 @@ pub fn show(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), R
         }
     }
 
+    Ok(())
+}
+
+/// JSON projection of [`crate::runs::Run`] for [`show_json`]. Every field is
+/// present (`null` rather than omitted) so downstream tooling can rely on a
+/// stable schema regardless of which optionals happen to be set.
+#[derive(serde::Serialize)]
+struct RunJson<'a> {
+    id: i64,
+    ticket: &'a str,
+    lane: &'a str,
+    status: &'a str,
+    session_id: Option<&'a str>,
+    worktree: &'a str,
+    branch: Option<&'a str>,
+    pid: Option<u32>,
+    transcript: Option<&'a str>,
+    started_at: &'a str,
+    heartbeat_at: Option<&'a str>,
+    ended_at: Option<&'a str>,
+    exit_code: Option<i32>,
+    num_turns: Option<i64>,
+    cost_usd: Option<f64>,
+    blocker: Option<&'a str>,
+    pr_url: Option<&'a str>,
+    age_secs: i64,
+}
+
+/// JSON projection of one [`crate::runs::ChecklistItem`] for [`show_json`].
+#[derive(serde::Serialize)]
+struct ChecklistItemJson<'a> {
+    text: &'a str,
+    done: bool,
+}
+
+/// JSON projection of [`crate::runs::ChecklistState`] for [`show_json`].
+#[derive(serde::Serialize)]
+struct ChecklistJson<'a> {
+    done: usize,
+    total: usize,
+    items: Vec<ChecklistItemJson<'a>>,
+}
+
+/// JSON projection of a run's model usage for [`show_json`]: the parsed
+/// usage map alongside whether it came from the authoritative
+/// `runs.model_usage` column (`"final"`) or a live `usage` event snapshot
+/// (`"live"`) — the same distinction [`show`] labels "Model usage" vs.
+/// "Model usage (live)".
+#[derive(serde::Serialize)]
+struct ModelUsageJson<'a> {
+    source: &'static str,
+    models: &'a crate::runs::ModelUsageMap,
+}
+
+/// JSON projection of one [`crate::runs::tool_counts`] entry for
+/// [`show_json`].
+#[derive(serde::Serialize)]
+struct ToolCountJson<'a> {
+    tool: &'a str,
+    count: usize,
+}
+
+/// JSON projection of one [`RunEvent`] for [`show_json`]: `detail` is the
+/// raw stored string verbatim, never the friendly rendering [`show`] uses.
+#[derive(serde::Serialize)]
+struct EventJson<'a> {
+    at: &'a str,
+    kind: &'a str,
+    detail: Option<&'a str>,
+}
+
+/// Top-level JSON payload printed by `tm runs show --json`.
+#[derive(serde::Serialize)]
+struct ShowJson<'a> {
+    run: RunJson<'a>,
+    checklist: Option<ChecklistJson<'a>>,
+    model_usage: Option<ModelUsageJson<'a>>,
+    tool_counts: Vec<ToolCountJson<'a>>,
+    events: Vec<EventJson<'a>>,
+}
+
+/// `tm runs show --json`: print the latest run for `ticket`, its checklist,
+/// model usage, tool counts, and full event timeline as a single
+/// pretty-printed JSON object, and nothing else.
+///
+/// Unlike [`show`]'s human-oriented rendering, `events` is
+/// **oldest-first** (chronological order, matching
+/// [`RunStore::events_for_run`]) and each event's `detail` is the raw stored
+/// string verbatim — the newest-first ordering and friendly rendering
+/// `show` uses are display-only concerns that don't belong in a stable,
+/// machine-readable schema.
+///
+/// # Errors
+///
+/// Returns [`RunsCliError::NoRunForTicket`] if `ticket` has no recorded runs.
+fn show_json(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), RunsCliError> {
+    let ticket = ticket.to_uppercase();
+    let run =
+        store
+            .latest_run_for_ticket(&ticket)?
+            .ok_or_else(|| RunsCliError::NoRunForTicket {
+                ticket: ticket.clone(),
+            })?;
+
+    let events = store.events_for_run(run.id)?;
+
+    let checklist_state = crate::runs::latest_checklist(&events);
+    let checklist = checklist_state.as_ref().map(|checklist| ChecklistJson {
+        done: checklist.done_count(),
+        total: checklist.items.len(),
+        items: checklist
+            .items
+            .iter()
+            .map(|item| ChecklistItemJson {
+                text: &item.text,
+                done: item.done,
+            })
+            .collect(),
+    });
+
+    let authoritative_usage = run
+        .model_usage
+        .as_deref()
+        .and_then(crate::runs::parse_model_usage);
+    // Both branches must produce an owned `ModelUsageMap` so they unify:
+    // the authoritative branch already owns one from `parse_model_usage`,
+    // and the live branch owns one from `latest_usage`.
+    let model_usage_data: Option<(crate::runs::ModelUsageMap, &'static str)> =
+        match authoritative_usage {
+            Some(models) => Some((models, "final")),
+            None if run.status == crate::runs::RunStatus::Running => {
+                crate::runs::latest_usage(&events).map(|models| (models, "live"))
+            }
+            None => None,
+        };
+    let model_usage = model_usage_data
+        .as_ref()
+        .map(|(models, source)| ModelUsageJson { source, models });
+
+    let tool_counts_data = crate::runs::tool_counts(&events);
+    let tool_counts: Vec<ToolCountJson> = tool_counts_data
+        .iter()
+        .map(|(tool, count)| ToolCountJson {
+            tool,
+            count: *count,
+        })
+        .collect();
+
+    let events_json: Vec<EventJson> = events
+        .iter()
+        .map(|event| EventJson {
+            at: &event.at,
+            kind: &event.kind,
+            detail: event.detail.as_deref(),
+        })
+        .collect();
+
+    let payload = ShowJson {
+        run: RunJson {
+            id: run.id,
+            ticket: &run.ticket,
+            lane: &run.lane,
+            status: run.status.as_str(),
+            session_id: run.session_id.as_deref(),
+            worktree: &run.worktree,
+            branch: run.branch.as_deref(),
+            pid: run.pid,
+            transcript: run.transcript.as_deref(),
+            started_at: &run.started_at,
+            heartbeat_at: run.heartbeat_at.as_deref(),
+            ended_at: run.ended_at.as_deref(),
+            exit_code: run.exit_code,
+            num_turns: run.num_turns,
+            cost_usd: run.cost_usd,
+            blocker: run.blocker.as_deref(),
+            pr_url: run.pr_url.as_deref(),
+            age_secs: run.age_secs,
+        },
+        checklist,
+        model_usage,
+        tool_counts,
+        events: events_json,
+    };
+
+    let rendered = serde_json::to_string_pretty(&payload)
+        .map_err(|e| RunsCliError::Io(std::io::Error::other(e.to_string())))?;
+    writeln!(out, "{rendered}")?;
     Ok(())
 }
 
@@ -737,7 +937,7 @@ mod tests {
         event(&store, id, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", &mut out).expect("should succeed");
+        show(&store, "proj-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.starts_with(&format!("Run {id}: PROJ-1 [backend] done\n")));
@@ -764,7 +964,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("tool  Bash — cargo test"));
@@ -786,7 +986,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("tool_use  {\"file\":\"a.rs\"}"));
@@ -831,7 +1031,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Tools: Bash \u{d7}2, Edit \u{d7}1"));
@@ -851,7 +1051,7 @@ mod tests {
         event(&store, id, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Tools:"));
@@ -866,7 +1066,7 @@ mod tests {
         event(&store, id, "second", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         let first_pos = output.find("second").expect("second event present");
@@ -892,7 +1092,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Checklist (1/2 done)"));
@@ -914,7 +1114,7 @@ mod tests {
         event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Checklist"));
@@ -948,7 +1148,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Model usage"));
@@ -972,7 +1172,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Model usage (live)"));
@@ -997,7 +1197,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Model usage"));
@@ -1010,7 +1210,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", &mut out).expect("should succeed");
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("(no events)"));
@@ -1024,13 +1224,241 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err = show(&store, "PROJ-404", &mut out).expect_err("should fail");
+        let err = show(&store, "PROJ-404", false, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
             RunsCliError::NoRunForTicket { ticket } if ticket == "PROJ-404"
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn show_json_unknown_ticket_errors_and_prints_nothing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = show(&store, "PROJ-404", true, &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::NoRunForTicket { ticket } if ticket == "PROJ-404"
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn show_json_happy_path_has_expected_fields() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    session_id: Some("sess-abc".to_string()),
+                    cost_usd: Some(1.5),
+                    num_turns: Some(3),
+                    pr_url: Some("https://example.invalid/pr/1".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Bash"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", true, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        assert_eq!(value["run"]["id"], id);
+        assert_eq!(value["run"]["ticket"], "PROJ-1");
+        assert_eq!(value["run"]["lane"], "backend");
+        assert_eq!(value["run"]["status"], "done");
+        assert_eq!(value["run"]["session_id"], "sess-abc");
+        assert_eq!(value["run"]["worktree"], "/tmp/wt");
+        assert_eq!(value["run"]["branch"], serde_json::Value::Null);
+        assert_eq!(value["run"]["pid"], serde_json::Value::Null);
+        assert_eq!(value["run"]["cost_usd"], 1.5);
+        assert_eq!(value["run"]["num_turns"], 3);
+        assert_eq!(value["run"]["pr_url"], "https://example.invalid/pr/1");
+        assert_eq!(value["run"]["blocker"], serde_json::Value::Null);
+        assert!(value["run"]["started_at"].is_string());
+        assert!(value["run"]["age_secs"].is_number());
+
+        assert_eq!(
+            value["tool_counts"],
+            serde_json::json!([{"tool": "Bash", "count": 1}])
+        );
+
+        let events = value["events"].as_array().expect("events should be array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"], "tool");
+        assert_eq!(events[0]["detail"], r#"{"tool":"Bash"}"#);
+        assert_eq!(events[1]["kind"], "stop");
+        assert_eq!(events[1]["detail"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn show_json_checklist_and_model_usage_are_null_when_absent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["checklist"], serde_json::Value::Null);
+        assert_eq!(value["model_usage"], serde_json::Value::Null);
+        assert_eq!(value["tool_counts"], serde_json::json!([]));
+        assert_eq!(value["events"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn show_json_includes_checklist_done_total_and_items() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "checklist",
+            Some(r#"{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["checklist"]["done"], 1);
+        assert_eq!(value["checklist"]["total"], 2);
+        assert_eq!(
+            value["checklist"]["items"],
+            serde_json::json!([
+                {"text": "write tests", "done": true},
+                {"text": "implement", "done": false},
+            ])
+        );
+    }
+
+    #[test]
+    fn show_json_model_usage_source_is_final_when_authoritative() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "usage",
+            Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-fable-5":{"outputTokens":58564,"costUSD":12.996}}"#.to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["model_usage"]["source"], "final");
+        assert_eq!(
+            value["model_usage"]["models"]["claude-fable-5"]["outputTokens"],
+            58564
+        );
+        assert_eq!(
+            value["model_usage"]["models"]["claude-fable-5"]["costUSD"],
+            12.996
+        );
+    }
+
+    #[test]
+    fn show_json_model_usage_source_is_live_while_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "usage",
+            Some(r#"{"models":{"claude-fable-5":{"outputTokens":58564}}}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["model_usage"]["source"], "live");
+        assert_eq!(
+            value["model_usage"]["models"]["claude-fable-5"]["outputTokens"],
+            58564
+        );
+        assert!(
+            value["model_usage"]["models"]["claude-fable-5"]
+                .get("costUSD")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn show_json_events_are_oldest_first_with_raw_detail() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "tool",
+            Some(r#"{"tool":"Bash","summary":"cargo test"}"#),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(&store, id, "second", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events[0]["kind"], "tool");
+        assert_eq!(
+            events[0]["detail"],
+            r#"{"tool":"Bash","summary":"cargo test"}"#
+        );
+        assert_eq!(events[1]["kind"], "second");
     }
 
     #[test]

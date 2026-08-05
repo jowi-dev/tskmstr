@@ -392,6 +392,11 @@ pub enum RunsCmd {
     Show {
         /// Jira ticket key, e.g. `PROJ-123`.
         ticket: String,
+        /// Print a single JSON object (run, checklist, model usage, tool
+        /// counts, and the full event timeline oldest-first with raw detail)
+        /// instead of the human-oriented rendering.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the session id of the latest run of a ticket, for `claude --resume`.
     Resume {
@@ -1300,9 +1305,25 @@ mod tests {
         let cli = Cli::try_parse_from(["tm", "runs", "show", "PROJ-1"]).expect("should parse");
         match cli.command {
             Some(Command::Runs {
-                cmd: Some(RunsCmd::Show { ticket }),
+                cmd: Some(RunsCmd::Show { ticket, json }),
             }) => {
                 assert_eq!(ticket, "PROJ-1");
+                assert!(!json);
+            }
+            other => panic!("expected Runs Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_show_json_flag() {
+        let cli =
+            Cli::try_parse_from(["tm", "runs", "show", "PROJ-1", "--json"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Show { ticket, json }),
+            }) => {
+                assert_eq!(ticket, "PROJ-1");
+                assert!(json);
             }
             other => panic!("expected Runs Show, got {other:?}"),
         }

@@ -74,7 +74,7 @@ tm auth status
 | `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`), optionally with the authoritative per-model token/cost breakdown |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
-| `tm runs show <KEY>` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first) |
+| `tm runs show <KEY> [--json]` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 
@@ -219,6 +219,80 @@ counting every `tool` event by tool name, sorted by count descending then
 name ascending — right after the run's header fields and before the
 checklist section, omitted entirely when the run has emitted no `tool`
 events. The watch detail window shows the same line in its header block.
+
+### `tm runs show --json`
+
+`tm runs show <KEY> --json` prints a single pretty-printed JSON object to
+stdout instead of the rendering above, and nothing else (errors, e.g. an
+unknown ticket, still go to stderr with a non-zero exit). It's meant for
+scripts and LLM tooling that would otherwise have to parse the human-oriented
+prose.
+
+Two things differ deliberately from the human rendering:
+
+- **`events` is oldest-first** (chronological order), not newest-first — the
+  newest-first reversal `tm runs show` uses is a display-only convenience.
+- **Each event's `detail` is the raw stored string verbatim**, never the
+  friendly one-line rendering (see "Friendly event rendering" above).
+
+Every optional field on `run` is present as `null` rather than omitted, so
+the schema is stable regardless of which fields a given run happens to have
+set. `checklist` and `model_usage` are `null` when the run has none;
+`model_usage.source` is `"final"` when it came from the authoritative
+`runs.model_usage` column, or `"live"` when it fell back to the latest
+`usage` event snapshot (same distinction as the "Model usage" / "Model usage
+(live)" section label). `tool_counts` is the same `(tool, count)` list
+`tool_counts()` computes, just as objects instead of tuples.
+
+```json
+{
+  "run": {
+    "id": 12,
+    "ticket": "PROJ-123",
+    "lane": "backend",
+    "status": "done",
+    "session_id": "sess-abc",
+    "worktree": "/path/to/wt",
+    "branch": null,
+    "pid": null,
+    "transcript": null,
+    "started_at": "2026-08-05 12:00:00",
+    "heartbeat_at": null,
+    "ended_at": "2026-08-05 12:04:00",
+    "exit_code": null,
+    "num_turns": 3,
+    "cost_usd": 1.5,
+    "blocker": null,
+    "pr_url": "https://example.invalid/pr/1",
+    "age_secs": 240
+  },
+  "checklist": {
+    "done": 1,
+    "total": 2,
+    "items": [
+      {"text": "write tests", "done": true},
+      {"text": "implement", "done": false}
+    ]
+  },
+  "model_usage": {
+    "source": "final",
+    "models": {
+      "claude-fable-5": {
+        "inputTokens": 146,
+        "outputTokens": 58564,
+        "cacheReadInputTokens": 6535803,
+        "cacheCreationInputTokens": 203983,
+        "costUSD": 12.996
+      }
+    }
+  },
+  "tool_counts": [{"tool": "Bash", "count": 2}],
+  "events": [
+    {"at": "2026-08-05 12:00:01", "kind": "tool", "detail": "{\"tool\":\"Bash\"}"},
+    {"at": "2026-08-05 12:04:00", "kind": "stop", "detail": null}
+  ]
+}
+```
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default
