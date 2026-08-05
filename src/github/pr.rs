@@ -24,6 +24,15 @@ pub struct PrInfo {
     pub head_ref_name: String,
 }
 
+/// A pull request summary, as returned by `gh pr list --json number,title`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PrSummary {
+    /// Pull request number.
+    pub number: u64,
+    /// Pull request title.
+    pub title: String,
+}
+
 /// Which part of a pull request an issue key resolved by
 /// [`find_issue_key_with_source`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

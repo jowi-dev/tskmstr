@@ -49,6 +49,12 @@ pub struct RawConfig {
     /// `.tskmstr.toml`) so that a project's runs stay in the project rather
     /// than the shared per-user default.
     pub run_db_path: Option<String>,
+    /// GitHub bot logins whose PR review threads count as "bot findings",
+    /// e.g. `cursor[bot]`.
+    ///
+    /// When unset in both global and repo config, defaults to
+    /// `["cursor[bot]"]`.
+    pub review_bots: Option<Vec<String>>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -73,6 +79,10 @@ pub struct Config {
     /// Override path for the run-state SQLite database, if configured. See
     /// [`RawConfig::run_db_path`] for semantics.
     pub run_db_path: Option<String>,
+    /// GitHub bot logins whose PR review threads count as "bot findings".
+    /// See [`RawConfig::review_bots`] for semantics; defaults to
+    /// `["cursor[bot]"]` when unset in both global and repo config.
+    pub review_bots: Vec<String>,
 }
 
 /// Locations to read configuration from.
@@ -196,6 +206,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         status_on_pr: None,
         status_on_create: None,
         run_db_path: None,
+        review_bots: None,
     }
 }
 
@@ -252,6 +263,10 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
     let status_on_pr = repo.status_on_pr.or(global.status_on_pr);
     let status_on_create = repo.status_on_create.or(global.status_on_create);
     let run_db_path = repo.run_db_path.or(global.run_db_path);
+    let review_bots = repo
+        .review_bots
+        .or(global.review_bots)
+        .unwrap_or_else(|| vec!["cursor[bot]".to_string()]);
 
     let expected_path = default_global_config_path();
 
@@ -267,6 +282,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         status_on_pr,
         status_on_create,
         run_db_path,
+        review_bots,
     })
 }
 
@@ -373,6 +389,7 @@ mod tests {
             status_on_pr: Some("In Review".into()),
             status_on_create: Some("In Progress".into()),
             run_db_path: Some("/global/runs.db".into()),
+            review_bots: Some(vec!["cursor[bot]".into()]),
         }
     }
 
@@ -395,6 +412,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             run_db_path: None,
+            review_bots: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -417,6 +435,7 @@ mod tests {
             status_on_pr: Some("Ready for Review".into()),
             status_on_create: None,
             run_db_path: None,
+            review_bots: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -442,6 +461,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: Some("In Progress".into()),
             run_db_path: None,
+            review_bots: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -467,6 +487,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             run_db_path: Some("/repo/runs.db".into()),
+            review_bots: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -480,6 +501,32 @@ mod tests {
         };
         let cfg = merge(global, None).expect("should merge");
         assert_eq!(cfg.run_db_path, None);
+    }
+
+    #[test]
+    fn merge_repo_overrides_review_bots() {
+        let repo = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: None,
+            run_db_path: None,
+            review_bots: Some(vec!["repo-bot[bot]".into()]),
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
+    }
+
+    #[test]
+    fn merge_review_bots_absent_from_both_defaults_to_cursor_bot() {
+        let global = RawConfig {
+            review_bots: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.review_bots, vec!["cursor[bot]".to_string()]);
     }
 
     #[test]
@@ -761,6 +808,80 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".to_string()));
+    }
+
+    #[test]
+    fn load_global_with_review_bots_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            review_bots = ["cursor[bot]", "other[bot]"]
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.review_bots,
+            vec!["cursor[bot]".to_string(), "other[bot]".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_global_without_review_bots_defaults_to_cursor_bot() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.review_bots, vec!["cursor[bot]".to_string()]);
+    }
+
+    #[test]
+    fn load_repo_overrides_review_bots() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            review_bots = ["cursor[bot]"]
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"review_bots = ["repo-bot[bot]"]"#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
     }
 
     #[test]

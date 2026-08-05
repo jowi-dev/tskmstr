@@ -1031,6 +1031,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             run_db_path: None,
+            review_bots: vec!["cursor[bot]".to_string()],
         }
     }
 

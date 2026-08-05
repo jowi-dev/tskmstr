@@ -15,11 +15,14 @@
 //! test here.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::process::Command;
 
+use serde::Deserialize;
 use thiserror::Error;
 
-use super::pr::PrInfo;
+use super::bot_findings::ReviewThread;
+use super::pr::{PrInfo, PrSummary};
 
 /// Errors that can occur while shelling out to `gh` or `git`.
 #[derive(Debug, Clone, Error)]
@@ -91,11 +94,44 @@ pub trait GhCli {
 
     /// The name of the currently checked out branch (`git branch --show-current`).
     fn current_branch(&self) -> Result<String, GhError>;
+
+    /// List the review threads on pull request `number`, including each
+    /// thread's resolution state and first-comment author.
+    ///
+    /// Thread resolution state is only exposed via GitHub's GraphQL API, not
+    /// the REST endpoints `gh` otherwise wraps, so this shells out to
+    /// `gh api graphql`. Only the first 100 review threads are fetched;
+    /// pagination is not followed. This mirrors the single-page limitation
+    /// documented on [`crate::jira::client::JiraClient::search`] and is
+    /// sufficient for tskmstr's current use (bot review findings rarely
+    /// exceed one page of threads).
+    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError>;
+
+    /// List open pull requests in the current repository
+    /// (`gh pr list --state open --json number,title`).
+    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError>;
 }
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
 /// [`PrInfo`] deserialization stay in lockstep.
 const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName";
+
+/// GraphQL query fetching a pull request's review threads: resolution state
+/// plus the author of each thread's first comment.
+///
+/// Fetches only the first 100 threads (see [`GhCli::pr_review_threads`]).
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 1) { nodes { author { login } } }
+        }
+      }
+    }
+  }
+}";
 
 /// [`GhCli`] implementation that shells out to the real `gh` and `git`
 /// binaries.
@@ -181,6 +217,260 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         )
+    }
+
+    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError> {
+        let repo_output = Command::new("gh")
+            .args(["repo", "view", "--json", "owner,name"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh repo view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        let repo = interpret_repo_view_output(
+            repo_output.status.code(),
+            &String::from_utf8_lossy(&repo_output.stdout),
+            &String::from_utf8_lossy(&repo_output.stderr),
+        )?;
+
+        let query_arg = format!("query={REVIEW_THREADS_QUERY}");
+        let owner_arg = format!("owner={}", repo.owner);
+        let name_arg = format!("name={}", repo.name);
+        let number_arg = format!("number={number}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-F",
+                &owner_arg,
+                "-F",
+                &name_arg,
+                "-F",
+                &number_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_review_threads_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            number,
+        )
+    }
+
+    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError> {
+        let output = Command::new("gh")
+            .args(["pr", "list", "--state", "open", "--json", "number,title"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_list_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+}
+
+/// An `owner`/`name` repository reference, as returned by
+/// `gh repo view --json owner,name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoRef {
+    owner: String,
+    name: String,
+}
+
+/// Raw shape of `gh repo view --json owner,name` output, for deserialization
+/// only; [`RepoRef`] is the flattened shape callers use.
+#[derive(Debug, Deserialize)]
+struct RawRepoView {
+    owner: RawRepoOwner,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRepoOwner {
+    login: String,
+}
+
+/// Interpret the result of a `gh repo view --json owner,name` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_repo_view_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<RepoRef, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<RawRepoView>(stdout)
+            .map(|raw| RepoRef {
+                owner: raw.owner.login,
+                name: raw.name,
+            })
+            .map_err(|err| GhError::Parse {
+                command: "gh repo view".to_string(),
+                message: err.to_string(),
+            }),
+        Some(code) => Err(GhError::Command {
+            command: "gh repo view".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh repo view".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Raw shape of the `gh api graphql` response body for
+/// [`REVIEW_THREADS_QUERY`], for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawGraphQlResponse {
+    data: Option<RawGraphQlData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlData {
+    repository: Option<RawGraphQlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<RawGraphQlPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlPullRequest {
+    #[serde(rename = "reviewThreads")]
+    review_threads: RawGraphQlReviewThreads,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlReviewThreads {
+    nodes: Vec<RawGraphQlReviewThreadNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    comments: RawGraphQlComments,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlComments {
+    nodes: Vec<RawGraphQlComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlComment {
+    author: Option<RawGraphQlAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGraphQlAuthor {
+    login: String,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`REVIEW_THREADS_QUERY`] for pull request `number`.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. A null
+/// `data.repository.pullRequest` (pull request not found) is treated as a
+/// [`GhError::Parse`] naming `number`.
+fn interpret_review_threads_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    number: u64,
+) -> Result<Vec<ReviewThread>, GhError> {
+    match exit_code {
+        Some(0) => {
+            let response = serde_json::from_str::<RawGraphQlResponse>(stdout).map_err(|err| {
+                GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: err.to_string(),
+                }
+            })?;
+
+            let pull_request = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.pull_request)
+                .ok_or_else(|| GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: format!("pull request #{number} not found"),
+                })?;
+
+            Ok(pull_request
+                .review_threads
+                .nodes
+                .into_iter()
+                .map(|node| ReviewThread {
+                    is_resolved: node.is_resolved,
+                    author_login: node
+                        .comments
+                        .nodes
+                        .into_iter()
+                        .next()
+                        .and_then(|comment| comment.author)
+                        .map(|author| author.login),
+                })
+                .collect())
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Interpret the result of a `gh pr list --state open --json number,title`
+/// invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_pr_list_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<PrSummary>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<PrSummary>>(stdout).map_err(|err| GhError::Parse {
+            command: "gh pr list".to_string(),
+            message: err.to_string(),
+        }),
+        Some(code) => Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
     }
 }
 
@@ -331,6 +621,9 @@ pub struct FakeGhCli {
     pr_edit_result: RefCell<Result<(), GhError>>,
     pr_create_calls: RefCell<Vec<PrCreateRequest>>,
     pr_edit_calls: RefCell<Vec<(u64, PrEditRequest)>>,
+    review_threads_results: RefCell<HashMap<u64, Result<Vec<ReviewThread>, GhError>>>,
+    review_threads_calls: RefCell<Vec<u64>>,
+    pr_list_result: RefCell<Result<Vec<PrSummary>, GhError>>,
 }
 
 impl Default for FakeGhCli {
@@ -351,6 +644,9 @@ impl Default for FakeGhCli {
             pr_edit_result: RefCell::new(Ok(())),
             pr_create_calls: RefCell::new(Vec::new()),
             pr_edit_calls: RefCell::new(Vec::new()),
+            review_threads_results: RefCell::new(HashMap::new()),
+            review_threads_calls: RefCell::new(Vec::new()),
+            pr_list_result: RefCell::new(Ok(Vec::new())),
         }
     }
 }
@@ -394,6 +690,34 @@ impl FakeGhCli {
     pub fn pr_edit_calls(&self) -> Vec<(u64, PrEditRequest)> {
         self.pr_edit_calls.borrow().clone()
     }
+
+    /// Set the result `pr_review_threads` will return for pull request
+    /// `number`.
+    ///
+    /// A PR number with no configured result returns `Ok(vec![])`, mirroring
+    /// how [`FakeGhCli::default`] treats unconfigured queries as trivially
+    /// empty rather than erroring.
+    pub fn with_review_threads(
+        self,
+        number: u64,
+        result: Result<Vec<ReviewThread>, GhError>,
+    ) -> Self {
+        self.review_threads_results
+            .borrow_mut()
+            .insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_review_threads`, in call order.
+    pub fn pr_review_threads_calls(&self) -> Vec<u64> {
+        self.review_threads_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_list` will return.
+    pub fn with_pr_list(self, result: Result<Vec<PrSummary>, GhError>) -> Self {
+        *self.pr_list_result.borrow_mut() = result;
+        self
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -413,6 +737,18 @@ impl GhCli for FakeGhCli {
 
     fn current_branch(&self) -> Result<String, GhError> {
         self.current_branch_result.borrow().clone()
+    }
+
+    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError> {
+        self.review_threads_calls.borrow_mut().push(number);
+        match self.review_threads_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError> {
+        self.pr_list_result.borrow().clone()
     }
 }
 
@@ -592,5 +928,156 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn repo_view_parses_owner_and_name() {
+        let stdout = r#"{"owner":{"login":"example"},"name":"repo"}"#;
+        let repo = interpret_repo_view_output(Some(0), stdout, "").unwrap();
+        assert_eq!(repo.owner, "example");
+        assert_eq!(repo.name, "repo");
+    }
+
+    #[test]
+    fn repo_view_malformed_json_is_a_parse_error() {
+        let err = interpret_repo_view_output(Some(0), "not json", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn repo_view_failure_is_a_command_error() {
+        let err =
+            interpret_repo_view_output(Some(1), "", "gh: authentication required").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn review_threads_parses_resolved_and_author() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": true,
+                                    "comments": { "nodes": [{ "author": { "login": "cursor" } }] }
+                                },
+                                {
+                                    "isResolved": false,
+                                    "comments": { "nodes": [{ "author": { "login": "someone" } }] }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let threads = interpret_review_threads_output(Some(0), stdout, "", 42).unwrap();
+        assert_eq!(
+            threads,
+            vec![
+                ReviewThread {
+                    is_resolved: true,
+                    author_login: Some("cursor".to_string()),
+                },
+                ReviewThread {
+                    is_resolved: false,
+                    author_login: Some("someone".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn review_threads_null_author_becomes_none() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": false,
+                                    "comments": { "nodes": [{ "author": null }] }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let threads = interpret_review_threads_output(Some(0), stdout, "", 42).unwrap();
+        assert_eq!(threads[0].author_login, None);
+    }
+
+    #[test]
+    fn review_threads_null_pull_request_is_a_parse_error_naming_number() {
+        let stdout = r#"{"data":{"repository":{"pullRequest":null}}}"#;
+        let err = interpret_review_threads_output(Some(0), stdout, "", 42).unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("42")),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_threads_failure_is_a_command_error() {
+        let err = interpret_review_threads_output(Some(1), "", "gh: not found", 42).unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn pr_list_parses_number_and_title() {
+        let stdout =
+            r#"[{"number":1,"title":"Fix the thing"},{"number":2,"title":"Add the widget"}]"#;
+        let prs = interpret_pr_list_output(Some(0), stdout, "").unwrap();
+        assert_eq!(
+            prs,
+            vec![
+                PrSummary {
+                    number: 1,
+                    title: "Fix the thing".to_string()
+                },
+                PrSummary {
+                    number: 2,
+                    title: "Add the widget".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_list_failure_is_a_command_error() {
+        let err = interpret_pr_list_output(Some(1), "", "gh: authentication required").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_returns_configured_review_threads_for_pr_number() {
+        let threads = vec![ReviewThread {
+            is_resolved: false,
+            author_login: Some("cursor".to_string()),
+        }];
+        let fake = FakeGhCli::new().with_review_threads(42, Ok(threads.clone()));
+
+        assert_eq!(fake.pr_review_threads(42).unwrap(), threads);
+        assert_eq!(fake.pr_review_threads_calls(), vec![42]);
+    }
+
+    #[test]
+    fn fake_gh_cli_unconfigured_review_threads_returns_empty() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.pr_review_threads(99).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn fake_gh_cli_returns_configured_pr_list() {
+        let prs = vec![PrSummary {
+            number: 1,
+            title: "Fix the thing".to_string(),
+        }];
+        let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
+        assert_eq!(fake.pr_list().unwrap(), prs);
     }
 }
