@@ -1,6 +1,6 @@
 //! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
 //! ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
-//! and `tm ticket audit`.
+//! `tm ticket update`, and `tm ticket audit`.
 
 use std::io::Write;
 
@@ -8,7 +8,7 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::jira::adf::adf_to_text;
+use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::types::CreateLinkRequest;
 use crate::runs::{RunStore, RunStoreError};
@@ -411,6 +411,28 @@ pub fn unlink(
     for phrase in &outcome.removed {
         writeln!(out, "Unlinked: {normalized} {phrase} {other}")?;
     }
+    Ok(())
+}
+
+/// `tm ticket update <KEY> --body <BODY>`: replace `key`'s description with
+/// `body`, converted from GitHub-flavored Markdown to ADF via
+/// [`text_to_adf`] (the same conversion `tm ticket create --body` uses).
+///
+/// This replaces the whole description; there is no partial-update form.
+/// Like [`transition`]/[`assign`], this is an explicit request, so any Jira
+/// API failure (including a 404 for an unknown `key`) is a hard error
+/// propagated via [`TicketCliError::Ticketing`] rather than a warning.
+pub fn update(
+    jira: &dyn JiraClient,
+    key: &str,
+    body: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized = normalize_key(key)?;
+    let description = text_to_adf(body);
+    jira.update_description(&normalized, &description)
+        .map_err(TicketingError::Jira)?;
+    writeln!(out, "Description updated for {normalized}")?;
     Ok(())
 }
 
@@ -1127,6 +1149,69 @@ mod tests {
         match err {
             TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
             other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_prints_confirmation_and_calls_update_description_with_adf_body() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        update(&jira, "proj-372", "**bold** details", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Description updated for PROJ-372\n");
+
+        let calls = jira.update_description_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "PROJ-372");
+        let description = calls[0].1.to_string();
+        assert!(
+            description.contains("\"strong\""),
+            "markdown body should be converted to ADF marks: {description}"
+        );
+    }
+
+    #[test]
+    fn update_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        let err = update(&jira, "not-a-key!", "body", &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        assert!(jira.update_description_calls().is_empty());
+    }
+
+    #[test]
+    fn update_api_error_is_a_hard_error() {
+        let jira = FakeJiraClient::new().with_update_description_error(500, "boom");
+        let mut out = Vec::new();
+
+        let err = update(&jira, "PROJ-372", "body", &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+        assert!(out.is_empty(), "nothing should be printed on hard failure");
+    }
+
+    #[test]
+    fn update_not_found_error_passes_through() {
+        let jira = FakeJiraClient::new().with_update_description_error(404, "Issue does not exist");
+        let mut out = Vec::new();
+
+        let err = update(&jira, "PROJ-404", "body", &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, .. })) => {
+                assert_eq!(status, 404)
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
 

@@ -121,23 +121,24 @@ fn build_ticketing_deps(
 }
 
 /// Dispatch `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`,
-/// `tm ticket assign`, `tm ticket rank`, `tm ticket link`, and `tm ticket
-/// unlink`.
+/// `tm ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket
+/// unlink`, and `tm ticket update`.
 ///
 /// The forms need different dependencies: associating a key needs the full
 /// [`TicketingContext`] (Jira + `gh` + config) to find the current branch's
 /// PR, while creating a ticket has nothing to do with a PR and only needs
 /// Jira + config (see [`CreateTicketContext`]). `tm ticket transition`, `tm
-/// ticket assign`, `tm ticket rank`, `tm ticket link`, and `tm ticket
-/// unlink` need only a Jira client (and, for `assign`, config) — no
-/// `gh`/`git` at all, since none of them reads or writes anything about a
-/// pull request; `assign` additionally needs `config` itself (not just to
-/// build the Jira client) for [`Config::default_assignee_account_id`]. `key`
-/// and `cmd` are both `Option` at the clap layer so `tm ticket create`/`tm
-/// ticket transition`/`tm ticket assign`/`tm ticket rank`/`tm ticket link`/`tm
-/// ticket unlink` don't also require a positional key; exactly one of them
-/// is expected to be `Some`, which this function enforces since clap itself
-/// doesn't.
+/// ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
+/// and `tm ticket update` need only a Jira client (and, for `assign`,
+/// config) — no `gh`/`git` at all, since none of them reads or writes
+/// anything about a pull request; `assign` additionally needs `config`
+/// itself (not just to build the Jira client) for
+/// [`Config::default_assignee_account_id`]. `key` and `cmd` are both
+/// `Option` at the clap layer so `tm ticket create`/`tm ticket
+/// transition`/`tm ticket assign`/`tm ticket rank`/`tm ticket link`/`tm
+/// ticket unlink`/`tm ticket update` don't also require a positional key;
+/// exactly one of them is expected to be `Some`, which this function
+/// enforces since clap itself doesn't.
 fn run_ticket(
     key: Option<String>,
     cmd: Option<TicketCmd>,
@@ -177,6 +178,14 @@ fn run_ticket(
             let jira = jira_client_for(&config, &token);
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::transition(jira.as_ref(), &key, status.as_deref(), &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Update { key, body })) => {
+            let config = config::load(paths)?;
+            let token = resolve_token(keychain, env_token)?;
+            let jira = jira_client_for(&config, &token);
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::update(jira.as_ref(), &key, &body, &mut stdout)?;
             Ok(())
         }
         (

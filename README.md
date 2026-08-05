@@ -61,6 +61,7 @@ tm auth status
 | `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
+| `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit, and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |

@@ -224,6 +224,19 @@ pub enum TicketCmd {
         /// The other issue key to remove the `Blocks` link with.
         other: String,
     },
+    /// Replace a ticket's description.
+    ///
+    /// `--body` REPLACES the whole description; there is no partial-update
+    /// form. Supports GitHub-flavored Markdown, converted to Jira's ADF
+    /// format the same way `tm ticket create --body` does.
+    Update {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// New ticket description, as GitHub-flavored Markdown. Replaces the
+        /// existing description entirely.
+        #[arg(long)]
+        body: String,
+    },
     /// Print a ticket's data for a human + Claude audit conversation, or
     /// record that conversation's verdict.
     ///
@@ -938,6 +951,41 @@ mod tests {
     fn ticket_unlink_missing_other_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "unlink", "proj-372"]);
         assert!(result.is_err(), "unlink requires both KEY and OTHER");
+    }
+
+    #[test]
+    fn parses_ticket_update_with_body() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "update",
+            "proj-372",
+            "--body",
+            "new description",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Update { key, body }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert_eq!(body, "new description".to_string());
+            }
+            other => panic!("expected TicketCmd::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_update_without_body_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "update", "proj-372"]);
+        assert!(result.is_err(), "update requires --body");
+    }
+
+    #[test]
+    fn ticket_update_without_key_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "update", "--body", "text"]);
+        assert!(result.is_err(), "update requires a positional KEY");
     }
 
     #[test]

@@ -222,6 +222,19 @@ pub trait JiraClient {
     /// [`JiraError::NotFound`], which would misreport a link id as an issue
     /// key.
     fn delete_link(&self, link_id: &str) -> Result<(), JiraError>;
+
+    /// Replace an issue's description (`PUT /issue/{key}` with `{"fields":
+    /// {"description": description}}`), 204 on success.
+    ///
+    /// `description` is an ADF document value (see
+    /// [`crate::jira::adf::text_to_adf`]), not plain text — Jira Cloud's v3
+    /// API only accepts descriptions in ADF. This replaces the whole
+    /// description; there is no partial-update form.
+    fn update_description(
+        &self,
+        key: &str,
+        description: &serde_json::Value,
+    ) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -590,6 +603,22 @@ impl JiraClient for HttpJiraClient {
             status: status.as_u16(),
             message: extract_error_message(&body),
         })
+    }
+
+    fn update_description(
+        &self,
+        key: &str,
+        description: &serde_json::Value,
+    ) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .put(self.url(&format!("/issue/{key}")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "fields": { "description": description } }))
+            .send()?;
+        Self::parse_empty(response, key)
     }
 }
 
@@ -1415,5 +1444,51 @@ mod tests {
         let err = client.delete_link("10001").expect_err("should fail");
 
         assert!(matches!(err, JiraError::Unauthorized));
+    }
+
+    #[test]
+    fn update_description_puts_description() {
+        let server = MockServer::start();
+        let description = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-1")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({ "fields": { "description": description } }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .update_description("PROJ-1", &description)
+            .expect("update_description should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn update_description_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let description = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-404");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .update_description("PROJ-404", &description)
+            .expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }
