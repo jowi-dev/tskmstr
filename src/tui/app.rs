@@ -96,11 +96,14 @@ fn category_rank(category: &str) -> u8 {
 
 /// Group `tickets` into [`Column`]s, one per distinct status name.
 ///
-/// Columns are ordered by status category rank (new, then indeterminate,
-/// then done, then unknown categories), and alphabetically by status name
-/// within a category. Tickets keep their relative fetch order within a
-/// column.
-pub fn group_into_columns(tickets: Vec<TicketSummary>) -> Vec<Column> {
+/// Columns whose status name (case-insensitively) appears in `column_order`
+/// sort first, in the order listed there. Every other column keeps the
+/// default ordering -- status category rank (new, then indeterminate, then
+/// done, then unknown categories), and alphabetically by status name within
+/// a category -- and sorts after every listed column. Pass an empty slice to
+/// leave every column on the default ordering. Tickets keep their relative
+/// fetch order within a column.
+pub fn group_into_columns(tickets: Vec<TicketSummary>, column_order: &[String]) -> Vec<Column> {
     let mut columns: Vec<Column> = Vec::new();
 
     for ticket in tickets {
@@ -113,11 +116,24 @@ pub fn group_into_columns(tickets: Vec<TicketSummary>) -> Vec<Column> {
         }
     }
 
-    columns.sort_by(|a, b| {
-        let rank_a = category_rank(&a.tickets[0].status_category);
-        let rank_b = category_rank(&b.tickets[0].status_category);
-        rank_a.cmp(&rank_b).then_with(|| a.title.cmp(&b.title))
-    });
+    let listed_rank = |title: &str| {
+        column_order
+            .iter()
+            .position(|configured| configured.eq_ignore_ascii_case(title))
+    };
+
+    columns.sort_by(
+        |a, b| match (listed_rank(&a.title), listed_rank(&b.title)) {
+            (Some(rank_a), Some(rank_b)) => rank_a.cmp(&rank_b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let rank_a = category_rank(&a.tickets[0].status_category);
+                let rank_b = category_rank(&b.tickets[0].status_category);
+                rank_a.cmp(&rank_b).then_with(|| a.title.cmp(&b.title))
+            }
+        },
+    );
 
     columns
 }
@@ -277,6 +293,11 @@ pub struct App {
     /// The configured default Jira project key, used to scope every
     /// [`AssigneeFilter`] other than [`AssigneeFilter::Me`].
     pub project_key: String,
+    /// Configured board column order (status names, case-insensitive),
+    /// from [`crate::config::Config::board_column_order`]. Listed columns
+    /// sort first, in this order; unlisted columns keep the default
+    /// category-then-name ordering and sort after. Empty when unconfigured.
+    pub board_column_order: Vec<String>,
     /// The board's active assignee filter.
     pub filter: AssigneeFilter,
     /// Assignable users for `project_key`, fetched lazily the first time the
@@ -593,7 +614,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::TicketsLoaded(tickets) => {
             let preferred_key = app.selected_ticket().map(|t| t.key.clone());
-            app.columns = group_into_columns(tickets);
+            app.columns = group_into_columns(tickets, &app.board_column_order);
             reselect(&mut app, preferred_key);
             (app, Vec::new())
         }
@@ -626,7 +647,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 ticket.status = status.clone();
                 ticket.status_category = status_category;
             }
-            app.columns = group_into_columns(tickets);
+            app.columns = group_into_columns(tickets, &app.board_column_order);
             reselect(&mut app, Some(key.clone()));
             app.status_line = format!("{key} -> {status}");
             app.screen = Screen::Detail;
@@ -1199,7 +1220,7 @@ mod tests {
 
     fn board_with(tickets: Vec<TicketSummary>, selected_row: usize) -> App {
         App {
-            columns: group_into_columns(tickets),
+            columns: group_into_columns(tickets, &[]),
             selected_col: 0,
             selected_row,
             ..App::new()
@@ -1268,7 +1289,7 @@ mod tests {
             ticket_with("PROJ-4", "Done", "done"),
         ];
         let app = App {
-            columns: group_into_columns(tickets),
+            columns: group_into_columns(tickets, &[]),
             selected_col: 0,
             selected_row: 0,
             ..App::new()
@@ -1548,7 +1569,7 @@ mod tests {
         let app = App {
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "Done")],
-            columns: group_into_columns(tickets),
+            columns: group_into_columns(tickets, &[]),
             selected_col: 0,
             selected_row: 0,
             ..App::new()
@@ -1723,7 +1744,7 @@ mod tests {
         ];
 
         for case in cases {
-            let columns = group_into_columns(case.tickets);
+            let columns = group_into_columns(case.tickets, &[]);
             let actual: Vec<(&str, Vec<&str>)> = columns
                 .iter()
                 .map(|c| {
@@ -1735,6 +1756,62 @@ mod tests {
                 .collect();
             assert_eq!(actual, case.expected, "case: {}", case.name);
         }
+    }
+
+    #[test]
+    fn group_into_columns_empty_order_is_unchanged() {
+        let tickets = vec![
+            ticket_with("PROJ-1", "Code Review", "indeterminate"),
+            ticket_with("PROJ-2", "In Progress", "indeterminate"),
+        ];
+        let columns = group_into_columns(tickets, &[]);
+        let titles: Vec<&str> = columns.iter().map(|c| c.title.as_str()).collect();
+        // Same category, so falls back to alphabetical: Code Review < In Progress.
+        assert_eq!(titles, vec!["Code Review", "In Progress"]);
+    }
+
+    #[test]
+    fn group_into_columns_respects_configured_order() {
+        let tickets = vec![
+            ticket_with("PROJ-1", "Code Review", "indeterminate"),
+            ticket_with("PROJ-2", "In Progress", "indeterminate"),
+            ticket_with("PROJ-3", "To Do", "new"),
+        ];
+        let order = vec!["To Do".to_string(), "In Progress".to_string()];
+        let columns = group_into_columns(tickets, &order);
+        let titles: Vec<&str> = columns.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["To Do", "In Progress", "Code Review"]);
+    }
+
+    #[test]
+    fn group_into_columns_unlisted_columns_keep_category_then_name_order() {
+        let tickets = vec![
+            ticket_with("PROJ-1", "Backlog", "new"),
+            ticket_with("PROJ-2", "Done", "done"),
+            ticket_with("PROJ-3", "Code Review", "indeterminate"),
+            ticket_with("PROJ-4", "In Progress", "indeterminate"),
+        ];
+        // Only "In Progress" is listed; everything else keeps the default
+        // category-then-name ordering and sorts after it.
+        let order = vec!["In Progress".to_string()];
+        let columns = group_into_columns(tickets, &order);
+        let titles: Vec<&str> = columns.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["In Progress", "Backlog", "Code Review", "Done"]
+        );
+    }
+
+    #[test]
+    fn group_into_columns_matches_configured_order_case_insensitively() {
+        let tickets = vec![
+            ticket_with("PROJ-1", "Code Review", "indeterminate"),
+            ticket_with("PROJ-2", "In Progress", "indeterminate"),
+        ];
+        let order = vec!["in progress".to_string()];
+        let columns = group_into_columns(tickets, &order);
+        let titles: Vec<&str> = columns.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["In Progress", "Code Review"]);
     }
 
     fn jira_user(account_id: &str, display_name: &str) -> JiraUser {

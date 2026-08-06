@@ -55,6 +55,15 @@ pub struct RawConfig {
     /// When unset in both global and repo config, defaults to
     /// `["cursor[bot]"]`.
     pub review_bots: Option<Vec<String>>,
+    /// Workflow status names, in the order the board's columns should show
+    /// them, e.g. `["To Do", "In Progress", "Code Review"]`.
+    ///
+    /// Matching against a ticket's status name is case-insensitive.
+    /// Statuses not listed here keep the board's default ordering (status
+    /// category, then alphabetically) and are shown after every listed
+    /// column. When unset in both global and repo config, the board uses
+    /// the default ordering for every column.
+    pub board_column_order: Option<Vec<String>>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -83,6 +92,10 @@ pub struct Config {
     /// See [`RawConfig::review_bots`] for semantics; defaults to
     /// `["cursor[bot]"]` when unset in both global and repo config.
     pub review_bots: Vec<String>,
+    /// Configured board column order. See [`RawConfig::board_column_order`]
+    /// for semantics; empty when unset in both global and repo config,
+    /// which leaves the board's default ordering unchanged.
+    pub board_column_order: Vec<String>,
 }
 
 /// Locations to read configuration from.
@@ -207,6 +220,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         status_on_create: None,
         run_db_path: None,
         review_bots: None,
+        board_column_order: None,
     }
 }
 
@@ -267,6 +281,10 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         .review_bots
         .or(global.review_bots)
         .unwrap_or_else(|| vec!["cursor[bot]".to_string()]);
+    let board_column_order = repo
+        .board_column_order
+        .or(global.board_column_order)
+        .unwrap_or_default();
 
     let expected_path = default_global_config_path();
 
@@ -283,6 +301,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         status_on_create,
         run_db_path,
         review_bots,
+        board_column_order,
     })
 }
 
@@ -390,6 +409,7 @@ mod tests {
             status_on_create: Some("In Progress".into()),
             run_db_path: Some("/global/runs.db".into()),
             review_bots: Some(vec!["cursor[bot]".into()]),
+            board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
         }
     }
 
@@ -413,6 +433,7 @@ mod tests {
             status_on_create: None,
             run_db_path: None,
             review_bots: None,
+            board_column_order: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -436,6 +457,7 @@ mod tests {
             status_on_create: None,
             run_db_path: None,
             review_bots: None,
+            board_column_order: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -462,6 +484,7 @@ mod tests {
             status_on_create: Some("In Progress".into()),
             run_db_path: None,
             review_bots: None,
+            board_column_order: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -488,6 +511,7 @@ mod tests {
             status_on_create: None,
             run_db_path: Some("/repo/runs.db".into()),
             review_bots: None,
+            board_column_order: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -514,6 +538,7 @@ mod tests {
             status_on_create: None,
             run_db_path: None,
             review_bots: Some(vec!["repo-bot[bot]".into()]),
+            board_column_order: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
@@ -527,6 +552,33 @@ mod tests {
         };
         let cfg = merge(global, None).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["cursor[bot]".to_string()]);
+    }
+
+    #[test]
+    fn merge_repo_overrides_board_column_order() {
+        let repo = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: None,
+            run_db_path: None,
+            review_bots: None,
+            board_column_order: Some(vec!["Code Review".into()]),
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
+    }
+
+    #[test]
+    fn merge_board_column_order_absent_from_both_is_empty() {
+        let global = RawConfig {
+            board_column_order: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.board_column_order, Vec::<String>::new());
     }
 
     #[test]
@@ -882,6 +934,84 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
+    }
+
+    #[test]
+    fn load_global_with_board_column_order_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            board_column_order = ["To Do", "In Progress", "Code Review"]
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.board_column_order,
+            vec![
+                "To Do".to_string(),
+                "In Progress".to_string(),
+                "Code Review".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn load_global_without_board_column_order_is_empty() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.board_column_order, Vec::<String>::new());
+    }
+
+    #[test]
+    fn load_repo_overrides_board_column_order() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            board_column_order = ["To Do", "In Progress"]
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"board_column_order = ["Code Review"]"#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
     }
 
     #[test]

@@ -57,6 +57,7 @@ fn run_board(
         jira,
         base_url: config.jira_base_url,
         project_key: config.default_project_key,
+        board_column_order: config.board_column_order,
     })?;
     Ok(())
 }

@@ -303,9 +303,11 @@ branch name.
 
 The board lays tickets out as columns, one per Jira status, ordered by
 status category (new, then indeterminate, then done) and alphabetically by
-status name within a category. Drilling into a ticket or its transitions
-opens a centered floating window on top of the board rather than replacing
-it, so the board stays visible behind the detail and "Move to" windows.
+status name within a category. Set `board_column_order` in `config.toml` to
+override this ordering (see Configuration below). Drilling into a ticket or
+its transitions opens a centered floating window on top of the board rather
+than replacing it, so the board stays visible behind the detail and "Move
+to" windows.
 
 | Key | Action |
 |---|---|
@@ -377,13 +379,15 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
+# board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
 its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files or `tm` refuses to run; `default_assignee_account_id`,
-`status_on_pr`, `status_on_create`, and `review_bots` are optional.
+`status_on_pr`, `status_on_create`, `review_bots`, and `board_column_order`
+are optional.
 
 `review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
 review comment threads count as "bot findings" for `tm pr status` and
@@ -426,6 +430,16 @@ request rather than an automatic side effect of creating/linking a ticket.
 If `<KEY>` is already in `<STATUS>`, it prints a message and exits 0
 without calling the transition API. Omit `<STATUS>` to list the ticket's
 current status and available transitions instead.
+
+`board_column_order` lists workflow status names (case-insensitive match)
+in the order the board's columns should appear, e.g. `["To Do", "In
+Progress", "Code Review"]`. Listed statuses sort first, in that order;
+any status not listed keeps the board's default ordering (status category,
+then alphabetically by name) and sorts after every listed column. Useful
+when two statuses share a category but Jira's alphabetical fallback puts
+them in the wrong order for your workflow (e.g. "Code Review" sorting
+before "In Progress"). Unset (the default) leaves the board's ordering
+unchanged.
 
 `tm ticket assign <KEY> <NAME>` resolves `<NAME>` against the assignable
 users of `<KEY>`'s *own* project (not `default_project_key` — assigning a

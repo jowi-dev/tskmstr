@@ -46,6 +46,10 @@ pub struct TuiDeps {
     /// The configured default Jira project key, used to scope every
     /// assignee filter other than `Me`.
     pub project_key: String,
+    /// Configured board column order, from
+    /// [`crate::config::Config::board_column_order`]. Empty when
+    /// unconfigured, leaving the board's default column ordering unchanged.
+    pub board_column_order: Vec<String>,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -80,6 +84,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 
     let mut app = App {
         project_key: deps.project_key.clone(),
+        board_column_order: deps.board_column_order.clone(),
         ..App::new()
     };
     let jql = jql_for_filter(&app.filter, &app.project_key);
@@ -533,6 +538,7 @@ mod tests {
             jira: Box::new(jira),
             base_url: "https://example.atlassian.net".to_string(),
             project_key: "PROJ".to_string(),
+            board_column_order: Vec::new(),
         }
     }
 

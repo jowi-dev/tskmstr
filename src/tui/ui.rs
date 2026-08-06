@@ -844,11 +844,14 @@ mod tests {
 
     fn three_column_app() -> App {
         App {
-            columns: group_into_columns(vec![
-                ticket_with("PROJ-1", "To Do", "new"),
-                ticket_with("PROJ-2", "In Progress", "indeterminate"),
-                ticket_with("PROJ-3", "Done", "done"),
-            ]),
+            columns: group_into_columns(
+                vec![
+                    ticket_with("PROJ-1", "To Do", "new"),
+                    ticket_with("PROJ-2", "In Progress", "indeterminate"),
+                    ticket_with("PROJ-3", "Done", "done"),
+                ],
+                &[],
+            ),
             ..App::new()
         }
     }
@@ -880,7 +883,7 @@ mod tests {
     #[test]
     fn draws_board_with_ticket_row_and_status_bar() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             status_line: "Refreshing...".to_string(),
             ..App::new()
         };
@@ -946,7 +949,7 @@ mod tests {
     #[test]
     fn draws_detail_with_ticket_fields_and_description() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             screen: Screen::Detail,
             ..App::new()
         };
@@ -958,7 +961,7 @@ mod tests {
     #[test]
     fn draws_transition_menu_with_transition_names() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             screen: Screen::TransitionMenu,
             transitions: vec![transition("11", "Start Progress"), transition("31", "Done")],
             ..App::new()
@@ -993,7 +996,7 @@ mod tests {
     #[test]
     fn draws_help_overlay_on_top_of_detail() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             screen: Screen::Detail,
             show_help: true,
             ..App::new()
@@ -1005,10 +1008,13 @@ mod tests {
     #[test]
     fn long_ticket_summary_wraps_across_multiple_lines_and_is_capped_with_ellipsis() {
         let app = App {
-            columns: group_into_columns(vec![ticket_with_summary(
-                "PROJ-1",
-                "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo Lima Mike November Oscar",
-            )]),
+            columns: group_into_columns(
+                vec![ticket_with_summary(
+                    "PROJ-1",
+                    "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo Lima Mike November Oscar",
+                )],
+                &[],
+            ),
             ..App::new()
         };
         // Narrow terminal forces a narrow column, which forces wrapping well
@@ -1024,7 +1030,7 @@ mod tests {
     #[test]
     fn two_tickets_in_a_column_render_as_visually_separated_cards() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")]),
+            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")], &[]),
             ..App::new()
         };
         let text = buffer_text(&render(&app));
@@ -1038,7 +1044,7 @@ mod tests {
     #[test]
     fn selected_card_is_styled_distinctly_from_unselected_card() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")]),
+            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")], &[]),
             selected_col: 0,
             selected_row: 1,
             ..App::new()
@@ -1080,7 +1086,7 @@ mod tests {
             .map(|n| ticket_with_summary(&format!("T{n}"), "short"))
             .collect();
         let app = App {
-            columns: group_into_columns(tickets),
+            columns: group_into_columns(tickets, &[]),
             selected_col: 0,
             selected_row: 19,
             ..App::new()
@@ -1116,7 +1122,7 @@ mod tests {
     #[test]
     fn terminal_too_short_for_a_full_card_does_not_panic() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             ..App::new()
         };
         let _ = render_with_size(&app, 80, 3);
@@ -1125,7 +1131,7 @@ mod tests {
     #[test]
     fn very_narrow_column_does_not_panic() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")]),
+            columns: group_into_columns(vec![ticket("PROJ-1"), ticket("PROJ-2")], &[]),
             ..App::new()
         };
         let _ = render_with_size(&app, 4, 24);
@@ -1203,7 +1209,7 @@ mod tests {
             ..ticket("PROJ-2")
         };
         let app = App {
-            columns: group_into_columns(vec![assigned, unassigned]),
+            columns: group_into_columns(vec![assigned, unassigned], &[]),
             filter: AssigneeFilter::Everyone,
             ..App::new()
         };
@@ -1215,7 +1221,7 @@ mod tests {
     #[test]
     fn card_omits_assignee_line_when_filter_is_me() {
         let app = App {
-            columns: group_into_columns(vec![ticket("PROJ-1")]),
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
             filter: AssigneeFilter::Me,
             ..App::new()
         };

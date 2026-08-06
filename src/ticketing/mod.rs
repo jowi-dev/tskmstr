@@ -1032,6 +1032,7 @@ mod tests {
             status_on_create: None,
             run_db_path: None,
             review_bots: vec!["cursor[bot]".to_string()],
+            board_column_order: Vec::new(),
         }
     }
 
