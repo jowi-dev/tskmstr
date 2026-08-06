@@ -117,6 +117,16 @@ pub enum TicketCmd {
         /// entirely if not given.
         #[arg(long)]
         body: Option<String>,
+        /// Transition the new ticket to this workflow status instead of
+        /// `status_on_create` from config, matched case-insensitively. Same
+        /// advisory warn-and-continue semantics as the config-driven
+        /// transition. Conflicts with `--no-transition`.
+        #[arg(long, conflicts_with = "no_transition")]
+        status: Option<String>,
+        /// Create the ticket without applying any status transition, even if
+        /// `status_on_create` is configured. Conflicts with `--status`.
+        #[arg(long)]
+        no_transition: bool,
     },
     /// Move a ticket to a workflow status, or list its available
     /// transitions.
@@ -609,9 +619,16 @@ mod tests {
             Some(Command::Ticket { key, cmd }) => {
                 assert_eq!(key, None);
                 match cmd {
-                    Some(TicketCmd::Create { title, body }) => {
+                    Some(TicketCmd::Create {
+                        title,
+                        body,
+                        status,
+                        no_transition,
+                    }) => {
                         assert_eq!(title, Some("Fix it".to_string()));
                         assert_eq!(body, Some("Details".to_string()));
+                        assert_eq!(status, None);
+                        assert!(!no_transition);
                     }
                     other => panic!("expected TicketCmd::Create, got {other:?}"),
                 }
@@ -626,13 +643,77 @@ mod tests {
         match cli.command {
             Some(Command::Ticket {
                 key: None,
-                cmd: Some(TicketCmd::Create { title, body }),
+                cmd:
+                    Some(TicketCmd::Create {
+                        title,
+                        body,
+                        status,
+                        no_transition,
+                    }),
             }) => {
                 assert_eq!(title, None);
                 assert_eq!(body, None);
+                assert_eq!(status, None);
+                assert!(!no_transition);
             }
             other => panic!("expected Ticket Create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ticket_create_with_status_override() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "create",
+            "--title",
+            "Fix it",
+            "--status",
+            "Ready For Work",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Create { status, .. }),
+            }) => {
+                assert_eq!(status, Some("Ready For Work".to_string()));
+            }
+            other => panic!("expected TicketCmd::Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_create_with_no_transition() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "create", "--no-transition"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Create { no_transition, .. }),
+            }) => {
+                assert!(no_transition);
+            }
+            other => panic!("expected TicketCmd::Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_create_status_and_no_transition_conflict() {
+        let err = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "create",
+            "--status",
+            "Ready For Work",
+            "--no-transition",
+        ])
+        .expect_err("should be a clap error");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "unexpected error kind: {err}"
+        );
     }
 
     #[test]

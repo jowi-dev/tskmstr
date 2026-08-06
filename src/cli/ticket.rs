@@ -89,10 +89,24 @@ pub struct CreateOptions {
     /// Ticket description, as GitHub-flavored Markdown; no description if
     /// `None`.
     pub body: Option<String>,
+    /// `--status`: transition target overriding `Config::status_on_create`
+    /// for this invocation. Mutually exclusive with `no_transition` at the
+    /// clap level.
+    pub status: Option<String>,
+    /// `--no-transition`: skip any status transition for this invocation,
+    /// even if `Config::status_on_create` is set. Mutually exclusive with
+    /// `status` at the clap level.
+    pub no_transition: bool,
 }
 
 /// `tm ticket create`: create a new ticket in the configured default
 /// project, with no pull request involved.
+///
+/// The transition applied after creation is resolved here, in order:
+/// `opts.no_transition` (none), else `opts.status` (the `--status`
+/// override), else `Config::status_on_create`, else none. This resolved
+/// target is passed straight through to [`create_ticket`], which no longer
+/// looks at config itself.
 pub fn create(
     ctx: &CreateTicketContext,
     opts: &CreateOptions,
@@ -107,7 +121,15 @@ pub fn create(
         return Err(TicketCliError::TitleRequired);
     }
 
-    let outcome = create_ticket(ctx, &title, opts.body.as_deref())?;
+    let status_target = if opts.no_transition {
+        None
+    } else {
+        opts.status
+            .as_deref()
+            .or(ctx.config.status_on_create.as_deref())
+    };
+
+    let outcome = create_ticket(ctx, &title, opts.body.as_deref(), status_target)?;
     writeln!(
         out,
         "Created ticket {}: {}",
@@ -723,6 +745,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: None,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -778,6 +801,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: Some("**bold** details".to_string()),
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -799,6 +823,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: None,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -836,6 +861,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: None,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -857,6 +883,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: None,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -875,6 +902,7 @@ mod tests {
         let opts = CreateOptions {
             title: Some("Add the widget".to_string()),
             body: None,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -884,6 +912,88 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Moved"));
         assert!(!output.contains("warning:"));
+    }
+
+    #[test]
+    fn create_status_override_transitions_to_override_not_status_on_create() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions(
+                "PROJ-9",
+                vec![transition_fixture("21", "Send to review", "In Review")],
+            );
+        let cfg = Config {
+            status_on_create: Some("In Progress".to_string()),
+            ..config()
+        };
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            status: Some("In Review".to_string()),
+            no_transition: false,
+        };
+        let mut prompter = crate::cli::FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Moved PROJ-9 to In Review"));
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-9".to_string(), "21".to_string())]
+        );
+    }
+
+    #[test]
+    fn create_no_transition_skips_status_on_create() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("PROJ-9"))
+            .with_transitions(
+                "PROJ-9",
+                vec![transition_fixture("11", "Start Progress", "In Progress")],
+            );
+        let cfg = Config {
+            status_on_create: Some("In Progress".to_string()),
+            ..config()
+        };
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            status: None,
+            no_transition: true,
+        };
+        let mut prompter = crate::cli::FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("Moved"));
+        assert!(!output.contains("warning:"));
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn create_status_override_prints_warning_when_no_matching_transition() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            status: Some("In Review".to_string()),
+            no_transition: false,
+        };
+        let mut prompter = crate::cli::FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("warning:"));
     }
 
     fn transition_fixture(id: &str, name: &str, to_status: &str) -> Transition {

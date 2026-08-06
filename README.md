@@ -49,7 +49,7 @@ tm auth status
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
-| `tm ticket create [--title] [--body]` | Create a new ticket in the configured default project. No PR required or touched |
+| `tm ticket create [--title] [--body] [--status <STATUS>\|--no-transition]` | Create a new ticket in the configured default project. No PR required or touched |
 | `tm ticket transition <KEY> <STATUS>` | Move ticket `<KEY>` to `<STATUS>`. Fails (non-zero exit) if no transition matches or the Jira API call fails |
 | `tm ticket transition <KEY>` | List ticket `<KEY>`'s current status and available transitions |
 | `tm ticket assign <KEY> <NAME>` | Assign ticket `<KEY>` to the assignable user matching `<NAME>` (exact displayName match, else an unambiguous substring match). Fails if no user or more than one matches |
@@ -421,6 +421,12 @@ move a ticket to right after `tm ticket create` makes it. It's matched the
 same way as `status_on_pr` (available transitions, case-insensitive,
 warn-and-continue on no match or API failure) and is independent of it —
 set one, both, or neither depending on your workflow.
+
+`tm ticket create` takes two flags to control this per invocation:
+`--status <STATUS>` transitions the new ticket to `<STATUS>` instead of
+`status_on_create`, with the same case-insensitive, warn-and-continue
+matching; `--no-transition` creates the ticket with no transition at all,
+even if `status_on_create` is configured. They're mutually exclusive.
 
 `tm ticket transition <KEY> <STATUS>` uses the same case-insensitive
 matching rule (target status name, falling back to the transition's own

@@ -14,7 +14,12 @@
 //! (a pre-existing ticket that `tm pr create` links to a newly opened PR),
 //! and [`create_ticket`] (a fresh ticket made by `tm ticket create`, with no
 //! PR involved at all — see [`CreateTicketContext`], which deliberately has
-//! no [`GhCli`] dependency). All three share the same matching logic via
+//! no [`GhCli`] dependency). [`create_ticket`] takes its transition target as
+//! a plain `Option<&str>` argument rather than reading
+//! [`Config::status_on_create`] itself; resolving that argument from `tm
+//! ticket create`'s `--status`/`--no-transition` flags and the config
+//! fallback is [`crate::cli::ticket::create`]'s job. All three share the same
+//! matching logic via
 //! [`apply_status_transition`] and the same advisory contract: a transition
 //! problem is reported as a [`StatusTransition::Warning`] and never fails the
 //! overall operation, since the ticket was already created/linked by the
@@ -346,8 +351,9 @@ pub struct CreateTicketOutcome {
     pub issue_key: String,
     /// Browsable URL of the newly created issue.
     pub issue_url: String,
-    /// Outcome of attempting to move the ticket to
-    /// [`Config::status_on_create`], if configured. `None` when it isn't.
+    /// Outcome of attempting to move the ticket to the effective transition
+    /// target passed to [`create_ticket`] (its `status_target` argument),
+    /// if any. `None` when there was no target to transition to.
     pub status_transition: Option<StatusTransition>,
 }
 
@@ -357,13 +363,18 @@ pub struct CreateTicketOutcome {
 ///
 /// `body`, if given, is parsed as GitHub-flavored Markdown into the issue's
 /// ADF description; when absent, the issue is created with an empty
-/// description. If [`Config::status_on_create`] is configured, the new
-/// ticket is moved to it via [`apply_status_transition`] — the same
-/// case-insensitive matching used by the `tm pr create` paths.
+/// description. `status_target`, if given, is where the new ticket is moved
+/// via [`apply_status_transition`] — the same case-insensitive matching used
+/// by the `tm pr create` paths. Resolving whether that target comes from `tm
+/// ticket create`'s `--status` flag, `--no-transition`, or falls back to
+/// [`Config::status_on_create`] is the caller's job (see
+/// [`crate::cli::ticket::create`]); this function only ever applies whatever
+/// it's given.
 pub fn create_ticket(
     ctx: &CreateTicketContext,
     title: &str,
     body: Option<&str>,
+    status_target: Option<&str>,
 ) -> Result<CreateTicketOutcome, TicketingError> {
     let description = text_to_adf(body.unwrap_or_default());
     let req = CreateIssueRequest {
@@ -374,11 +385,8 @@ pub fn create_ticket(
         assignee_account_id: ctx.config.default_assignee_account_id.clone(),
     };
     let issue = ctx.jira.create_issue(&req)?;
-    let status_transition = ctx
-        .config
-        .status_on_create
-        .as_ref()
-        .map(|target| apply_status_transition(ctx.jira, &issue.key, target));
+    let status_transition =
+        status_target.map(|target| apply_status_transition(ctx.jira, &issue.key, target));
 
     Ok(CreateTicketOutcome {
         issue_key: issue.key.clone(),
@@ -1479,8 +1487,8 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome =
-            create_ticket(&ctx, "Add the widget", Some("Some **body**")).expect("should succeed");
+        let outcome = create_ticket(&ctx, "Add the widget", Some("Some **body**"), None)
+            .expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(calls.len(), 1);
@@ -1509,7 +1517,7 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+        create_ticket(&ctx, "Add the widget", None, None).expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(
@@ -1519,20 +1527,18 @@ mod tests {
     }
 
     #[test]
-    fn create_ticket_applies_status_on_create_transition() {
+    fn create_ticket_applies_given_status_target_transition() {
         let jira = FakeJiraClient::new()
             .with_create_issue_result(issue("PROJ-9"))
             .with_transitions(
                 "PROJ-9",
                 vec![transition("11", "Start Progress", "In Progress")],
             );
-        let cfg = Config {
-            status_on_create: Some("In Progress".to_string()),
-            ..config()
-        };
+        let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+        let outcome = create_ticket(&ctx, "Add the widget", None, Some("In Progress"))
+            .expect("should succeed");
 
         assert_eq!(
             outcome.status_transition,
@@ -1549,13 +1555,10 @@ mod tests {
         let jira = FakeJiraClient::new()
             .with_create_issue_result(issue("PROJ-9"))
             .with_transitions("PROJ-9", vec![]);
-        let cfg = Config {
-            status_on_create: Some("In Progress".to_string()),
-            ..config()
-        };
+        let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None)
+        let outcome = create_ticket(&ctx, "Add the widget", None, Some("In Progress"))
             .expect("should succeed even with no matching transition");
 
         match outcome.status_transition {
@@ -1570,12 +1573,12 @@ mod tests {
     }
 
     #[test]
-    fn create_ticket_no_status_on_create_configured_never_transitions() {
+    fn create_ticket_no_status_target_never_transitions() {
         let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None).expect("should succeed");
+        let outcome = create_ticket(&ctx, "Add the widget", None, None).expect("should succeed");
 
         assert_eq!(outcome.status_transition, None);
         assert!(jira.transition_calls().is_empty());

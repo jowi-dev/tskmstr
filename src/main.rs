@@ -159,7 +159,15 @@ fn run_ticket(
             tskmstr::cli::ticket::run(&ctx, &key, &mut stdout)?;
             Ok(())
         }
-        (None, Some(TicketCmd::Create { title, body })) => {
+        (
+            None,
+            Some(TicketCmd::Create {
+                title,
+                body,
+                status,
+                no_transition,
+            }),
+        ) => {
             let config = config::load(paths)?;
             let token = resolve_token(keychain, env_token)?;
             let jira = jira_client_for(&config, &token);
@@ -167,7 +175,12 @@ fn run_ticket(
                 jira: jira.as_ref(),
                 config: &config,
             };
-            let opts = tskmstr::cli::ticket::CreateOptions { title, body };
+            let opts = tskmstr::cli::ticket::CreateOptions {
+                title,
+                body,
+                status,
+                no_transition,
+            };
             let mut prompter = RealPrompter;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::create(&ctx, &opts, &mut prompter, &mut stdout)?;
