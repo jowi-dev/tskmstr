@@ -8,3 +8,4 @@ pub mod keychain;
 pub mod runs;
 pub mod ticketing;
 pub mod tui;
+pub mod work;
