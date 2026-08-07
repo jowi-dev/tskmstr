@@ -6,6 +6,7 @@
 //! global file. The merged result must supply all required fields or
 //! [`ConfigError::MissingField`] is returned.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,78 @@ pub struct RawConfig {
     /// column. When unset in both global and repo config, the board uses
     /// the default ordering for every column.
     pub board_column_order: Option<Vec<String>>,
+    /// `tm work` settings: worktree/session defaults and per-lane
+    /// definitions. See [`RawWorkConfig`].
+    ///
+    /// When unset in both global and repo config, `tm work` has no lanes to
+    /// run and no defaults beyond its own hardcoded fallbacks.
+    pub work: Option<RawWorkConfig>,
+}
+
+/// Raw, partially-specified `[work]` section as parsed directly from TOML.
+///
+/// Mirrors [`RawConfig`]'s optional-everything shape: either the global or
+/// the repo file may set any subset of these fields, merged by [`merge`].
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawWorkConfig {
+    /// Root directory under which `tm work` creates git worktrees for lanes,
+    /// e.g. `~/Worktrees`. Tilde is not expanded by this module (consistent
+    /// with [`RawConfig::run_db_path`]); expansion, if any, is the
+    /// responsibility of the `tm work` caller.
+    pub worktree_root: Option<String>,
+    /// Default Claude model used for a lane's driver process when the lane
+    /// itself doesn't set [`RawLaneConfig::model`].
+    pub default_model: Option<String>,
+    /// Default max-turns budget for a lane's driver process when the lane
+    /// itself doesn't set [`RawLaneConfig::max_turns`].
+    pub default_max_turns: Option<u32>,
+    /// Default permission mode for a lane's driver process when the lane
+    /// itself doesn't set [`RawLaneConfig::permission_mode`].
+    pub default_permission_mode: Option<String>,
+    /// Extra tmux window names created alongside the primary window when a
+    /// lane's session is provisioned.
+    pub tmux_windows: Option<Vec<String>>,
+    /// Name of the tmux window considered "primary" (e.g. where the driver
+    /// process runs) when a lane's session is provisioned.
+    pub tmux_primary_window: Option<String>,
+    /// Per-lane definitions, keyed by lane name.
+    ///
+    /// Merge precedence: a repo-local lane entry replaces the corresponding
+    /// global lane entry *as a whole* rather than being merged field by
+    /// field. There's no existing precedent in this module for deep-merging
+    /// nested structures, and lanes are small enough that whole-lane
+    /// replacement is the simplest rule a config author can reason about
+    /// ("the repo-local `.tskmstr.toml` fully owns any lane it names").
+    #[serde(default)]
+    pub lanes: BTreeMap<String, RawLaneConfig>,
+}
+
+/// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
+/// directly from TOML.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawLaneConfig {
+    /// Filesystem path to the repository this lane operates on. Required:
+    /// a lane without a `repo` fails validation in [`merge`] rather than
+    /// panicking later when `tm work` tries to use it.
+    pub repo: Option<String>,
+    /// Path to the prompt file fed to this lane's driver process.
+    ///
+    /// When unset, callers default to `~/.claude/prompts/<lane>.md`; that
+    /// defaulting convention belongs to the `tm work` module, not config —
+    /// this module only stores what was written.
+    pub prompt_file: Option<String>,
+    /// Base branch new lane branches are created from, overriding whatever
+    /// default (e.g. `origin/HEAD`) the caller would otherwise use.
+    pub base_branch: Option<String>,
+    /// Claude model for this lane's driver process, overriding
+    /// [`RawWorkConfig::default_model`].
+    pub model: Option<String>,
+    /// Max-turns budget for this lane's driver process, overriding
+    /// [`RawWorkConfig::default_max_turns`].
+    pub max_turns: Option<u32>,
+    /// Permission mode for this lane's driver process, overriding
+    /// [`RawWorkConfig::default_permission_mode`].
+    pub permission_mode: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -96,6 +169,54 @@ pub struct Config {
     /// for semantics; empty when unset in both global and repo config,
     /// which leaves the board's default ordering unchanged.
     pub board_column_order: Vec<String>,
+    /// Validated `tm work` settings. See [`WorkConfig`]; empty (no lanes, no
+    /// defaults set) when the `[work]` section is absent from both global
+    /// and repo config.
+    pub work: WorkConfig,
+}
+
+/// Fully validated `[work]` section.
+///
+/// Unlike [`Config`]'s top-level required fields, nothing here is required
+/// at the `tm work`-defaults level: a config with no `[work]` section at all
+/// produces a `WorkConfig` with every default `None` and no lanes. Lane
+/// entries, however, must each have a `repo` (see [`LaneConfig`]) — that's
+/// enforced at merge time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkConfig {
+    /// See [`RawWorkConfig::worktree_root`].
+    pub worktree_root: Option<String>,
+    /// See [`RawWorkConfig::default_model`].
+    pub default_model: Option<String>,
+    /// See [`RawWorkConfig::default_max_turns`].
+    pub default_max_turns: Option<u32>,
+    /// See [`RawWorkConfig::default_permission_mode`].
+    pub default_permission_mode: Option<String>,
+    /// See [`RawWorkConfig::tmux_windows`]. Empty when unset in both global
+    /// and repo config.
+    pub tmux_windows: Vec<String>,
+    /// See [`RawWorkConfig::tmux_primary_window`].
+    pub tmux_primary_window: Option<String>,
+    /// Validated per-lane definitions, keyed by lane name.
+    pub lanes: BTreeMap<String, LaneConfig>,
+}
+
+/// Fully validated `[work.lanes.<name>]` subsection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneConfig {
+    /// See [`RawLaneConfig::repo`]. Required — validated present at merge
+    /// time.
+    pub repo: String,
+    /// See [`RawLaneConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// See [`RawLaneConfig::base_branch`].
+    pub base_branch: Option<String>,
+    /// See [`RawLaneConfig::model`].
+    pub model: Option<String>,
+    /// See [`RawLaneConfig::max_turns`].
+    pub max_turns: Option<u32>,
+    /// See [`RawLaneConfig::permission_mode`].
+    pub permission_mode: Option<String>,
 }
 
 /// Locations to read configuration from.
@@ -152,6 +273,16 @@ pub enum ConfigError {
         field: &'static str,
         /// Path to the expected global config file, shown to guide the user.
         expected_path: PathBuf,
+    },
+
+    /// A `[work.lanes.<name>]` entry was missing its required `repo` field
+    /// after merging global and repo config.
+    #[error("lane `{lane}` is missing required field `repo`; set it in [work.lanes.{lane}]")]
+    MissingLaneField {
+        /// Name of the lane missing the field.
+        lane: String,
+        /// Name of the missing field (currently always `"repo"`).
+        field: &'static str,
     },
 
     /// A parent directory for a config file could not be created.
@@ -221,6 +352,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         run_db_path: None,
         review_bots: None,
         board_column_order: None,
+        work: None,
     }
 }
 
@@ -285,6 +417,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         .board_column_order
         .or(global.board_column_order)
         .unwrap_or_default();
+    let work = merge_work(global.work, repo.work)?;
 
     let expected_path = default_global_config_path();
 
@@ -302,6 +435,70 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
         run_db_path,
         review_bots,
         board_column_order,
+        work,
+    })
+}
+
+/// Merge a repo-local `[work]` section on top of a global one, field by
+/// field, then validate that every resulting lane has a `repo`.
+///
+/// Lane maps merge by whole-lane replacement: a lane name present in `repo`
+/// entirely replaces the global lane of the same name (see
+/// [`RawWorkConfig::lanes`] for rationale), rather than being merged field by
+/// field the way the top-level `[work]` scalars are.
+fn merge_work(
+    global: Option<RawWorkConfig>,
+    repo: Option<RawWorkConfig>,
+) -> Result<WorkConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let worktree_root = repo.worktree_root.or(global.worktree_root);
+    let default_model = repo.default_model.or(global.default_model);
+    let default_max_turns = repo.default_max_turns.or(global.default_max_turns);
+    let default_permission_mode = repo
+        .default_permission_mode
+        .or(global.default_permission_mode);
+    let tmux_windows = repo
+        .tmux_windows
+        .or(global.tmux_windows)
+        .unwrap_or_default();
+    let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
+
+    let mut raw_lanes = global.lanes;
+    for (name, lane) in repo.lanes {
+        raw_lanes.insert(name, lane);
+    }
+
+    let lanes = raw_lanes
+        .into_iter()
+        .map(|(name, raw)| {
+            let repo_path = raw.repo.ok_or_else(|| ConfigError::MissingLaneField {
+                lane: name.clone(),
+                field: "repo",
+            })?;
+            Ok((
+                name,
+                LaneConfig {
+                    repo: repo_path,
+                    prompt_file: raw.prompt_file,
+                    base_branch: raw.base_branch,
+                    model: raw.model,
+                    max_turns: raw.max_turns,
+                    permission_mode: raw.permission_mode,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<String, LaneConfig>, ConfigError>>()?;
+
+    Ok(WorkConfig {
+        worktree_root,
+        default_model,
+        default_max_turns,
+        default_permission_mode,
+        tmux_windows,
+        tmux_primary_window,
+        lanes,
     })
 }
 
@@ -410,6 +607,7 @@ mod tests {
             run_db_path: Some("/global/runs.db".into()),
             review_bots: Some(vec!["cursor[bot]".into()]),
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
+            work: None,
         }
     }
 
@@ -434,6 +632,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -458,6 +657,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -485,6 +685,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -512,6 +713,7 @@ mod tests {
             run_db_path: Some("/repo/runs.db".into()),
             review_bots: None,
             board_column_order: None,
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -539,6 +741,7 @@ mod tests {
             run_db_path: None,
             review_bots: Some(vec!["repo-bot[bot]".into()]),
             board_column_order: None,
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
@@ -566,6 +769,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: Some(vec!["Code Review".into()]),
+            work: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
@@ -1154,5 +1358,289 @@ mod tests {
 
         let err = set_assignee_account_id(&path, "acct-123").expect_err("should fail");
         assert!(matches!(err, ConfigError::ReadGlobal { .. }));
+    }
+
+    // --- `[work]` section ---
+
+    #[test]
+    fn merge_work_absent_from_both_produces_empty_defaults() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.work.worktree_root, None);
+        assert_eq!(cfg.work.default_model, None);
+        assert_eq!(cfg.work.default_max_turns, None);
+        assert_eq!(cfg.work.default_permission_mode, None);
+        assert_eq!(cfg.work.tmux_windows, Vec::<String>::new());
+        assert_eq!(cfg.work.tmux_primary_window, None);
+        assert!(cfg.work.lanes.is_empty());
+    }
+
+    #[test]
+    fn load_full_work_section_parses_fields_and_lane() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work]
+            worktree_root = "~/Worktrees"
+            default_model = "fable"
+            default_max_turns = 200
+            default_permission_mode = "acceptEdits"
+            tmux_windows = ["shell"]
+            tmux_primary_window = "code"
+
+            [work.lanes.partner-integrations]
+            repo = "/Users/jowi/Projects/axiom"
+            prompt_file = "~/.claude/prompts/partner-integrations.md"
+            base_branch = "staging"
+            model = "sonnet"
+            max_turns = 300
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+
+        assert_eq!(cfg.work.worktree_root, Some("~/Worktrees".to_string()));
+        assert_eq!(cfg.work.default_model, Some("fable".to_string()));
+        assert_eq!(cfg.work.default_max_turns, Some(200));
+        assert_eq!(
+            cfg.work.default_permission_mode,
+            Some("acceptEdits".to_string())
+        );
+        assert_eq!(cfg.work.tmux_windows, vec!["shell".to_string()]);
+        assert_eq!(cfg.work.tmux_primary_window, Some("code".to_string()));
+
+        let lane = cfg
+            .work
+            .lanes
+            .get("partner-integrations")
+            .expect("lane should be present");
+        assert_eq!(lane.repo, "/Users/jowi/Projects/axiom");
+        assert_eq!(
+            lane.prompt_file,
+            Some("~/.claude/prompts/partner-integrations.md".to_string())
+        );
+        assert_eq!(lane.base_branch, Some("staging".to_string()));
+        assert_eq!(lane.model, Some("sonnet".to_string()));
+        assert_eq!(lane.max_turns, Some(300));
+        assert_eq!(lane.permission_mode, None);
+    }
+
+    #[test]
+    fn lane_with_repo_present_is_valid() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some("/repo/solo".to_string()),
+                ..Default::default()
+            },
+        );
+        let global = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None).expect("lane with repo should be valid");
+        assert_eq!(cfg.lanes.get("solo").unwrap().repo, "/repo/solo");
+    }
+
+    #[test]
+    fn lane_missing_repo_errors() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert("solo".to_string(), RawLaneConfig::default());
+        let global = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+        let err = merge_work(Some(global), None).expect_err("lane without repo should fail");
+        match err {
+            ConfigError::MissingLaneField { lane, field } => {
+                assert_eq!(lane, "solo");
+                assert_eq!(field, "repo");
+            }
+            other => panic!("expected MissingLaneField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_missing_repo_error_message_names_lane() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert("solo".to_string(), RawLaneConfig::default());
+        let global = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+        let err = merge_work(Some(global), None).expect_err("lane without repo should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("solo"),
+            "error should name the lane: {message}"
+        );
+        assert!(
+            message.contains("repo"),
+            "error should name the missing field: {message}"
+        );
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_global_scalar_fields() {
+        let global = RawWorkConfig {
+            worktree_root: Some("~/Worktrees".to_string()),
+            default_model: Some("fable".to_string()),
+            default_max_turns: Some(200),
+            default_permission_mode: Some("acceptEdits".to_string()),
+            tmux_windows: Some(vec!["shell".to_string()]),
+            tmux_primary_window: Some("code".to_string()),
+            lanes: BTreeMap::new(),
+        };
+        let repo = RawWorkConfig {
+            worktree_root: Some("/repo/worktrees".to_string()),
+            default_model: None,
+            default_max_turns: None,
+            default_permission_mode: None,
+            tmux_windows: None,
+            tmux_primary_window: None,
+            lanes: BTreeMap::new(),
+        };
+        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        // Overridden field wins.
+        assert_eq!(cfg.worktree_root, Some("/repo/worktrees".to_string()));
+        // Non-overridden fields fall back to global.
+        assert_eq!(cfg.default_model, Some("fable".to_string()));
+        assert_eq!(cfg.default_max_turns, Some(200));
+        assert_eq!(cfg.default_permission_mode, Some("acceptEdits".to_string()));
+        assert_eq!(cfg.tmux_windows, vec!["shell".to_string()]);
+        assert_eq!(cfg.tmux_primary_window, Some("code".to_string()));
+    }
+
+    #[test]
+    fn merge_work_repo_lane_replaces_global_lane_whole() {
+        let mut global_lanes = BTreeMap::new();
+        global_lanes.insert(
+            "partner-integrations".to_string(),
+            RawLaneConfig {
+                repo: Some("/global/axiom".to_string()),
+                base_branch: Some("main".to_string()),
+                model: Some("fable".to_string()),
+                ..Default::default()
+            },
+        );
+        let global = RawWorkConfig {
+            lanes: global_lanes,
+            ..Default::default()
+        };
+
+        // The repo-local lane sets only `repo`; because lanes replace as a
+        // whole rather than merging field by field, `base_branch`/`model`
+        // from the global lane must NOT leak through.
+        let mut repo_lanes = BTreeMap::new();
+        repo_lanes.insert(
+            "partner-integrations".to_string(),
+            RawLaneConfig {
+                repo: Some("/repo-local/axiom".to_string()),
+                ..Default::default()
+            },
+        );
+        let repo = RawWorkConfig {
+            lanes: repo_lanes,
+            ..Default::default()
+        };
+
+        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let lane = cfg.lanes.get("partner-integrations").unwrap();
+        assert_eq!(lane.repo, "/repo-local/axiom");
+        assert_eq!(lane.base_branch, None);
+        assert_eq!(lane.model, None);
+    }
+
+    #[test]
+    fn merge_work_lanes_merge_by_name_keeping_global_lanes_not_overridden() {
+        let mut global_lanes = BTreeMap::new();
+        global_lanes.insert(
+            "lane-a".to_string(),
+            RawLaneConfig {
+                repo: Some("/global/a".to_string()),
+                ..Default::default()
+            },
+        );
+        global_lanes.insert(
+            "lane-b".to_string(),
+            RawLaneConfig {
+                repo: Some("/global/b".to_string()),
+                ..Default::default()
+            },
+        );
+        let global = RawWorkConfig {
+            lanes: global_lanes,
+            ..Default::default()
+        };
+
+        let mut repo_lanes = BTreeMap::new();
+        repo_lanes.insert(
+            "lane-b".to_string(),
+            RawLaneConfig {
+                repo: Some("/repo-local/b".to_string()),
+                ..Default::default()
+            },
+        );
+        let repo = RawWorkConfig {
+            lanes: repo_lanes,
+            ..Default::default()
+        };
+
+        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        assert_eq!(cfg.lanes.get("lane-a").unwrap().repo, "/global/a");
+        assert_eq!(cfg.lanes.get("lane-b").unwrap().repo, "/repo-local/b");
+    }
+
+    #[test]
+    fn load_repo_local_tskmstr_toml_overrides_work_section() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work]
+            worktree_root = "~/Worktrees"
+
+            [work.lanes.solo]
+            repo = "/global/solo"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work]
+            worktree_root = "/repo/worktrees"
+
+            [work.lanes.solo]
+            repo = "/repo-local/solo"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.work.worktree_root, Some("/repo/worktrees".to_string()));
+        assert_eq!(cfg.work.lanes.get("solo").unwrap().repo, "/repo-local/solo");
     }
 }
