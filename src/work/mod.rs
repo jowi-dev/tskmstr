@@ -10,6 +10,7 @@ pub mod detach;
 pub mod git;
 pub mod hooks;
 pub mod naming;
+pub mod review_watch;
 pub mod run;
 pub mod runner;
 pub mod tmux;
