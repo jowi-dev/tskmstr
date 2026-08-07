@@ -95,9 +95,33 @@ pub fn kind_badge(kind: &str) -> Option<Span<'static>> {
     Some(Span::styled(format!(" {kind}"), kind_style(kind)))
 }
 
+/// The style for a Jira ticket's status *category* (the stable `new` /
+/// `indeterminate` / `done` key, not the free-text status name): board
+/// column titles and the detail overlay's status value share this.
+///
+/// `new` is blue (not started), `indeterminate` is cyan (in progress),
+/// `done` is green (finished); any other category (Jira allows custom
+/// ones) gets the terminal's default color rather than guessing.
+pub fn ticket_status_style(status_category: &str) -> Style {
+    match status_category {
+        "new" => Style::new().fg(Color::Blue),
+        "indeterminate" => Style::new().fg(Color::Cyan),
+        "done" => Style::new().fg(Color::Green),
+        _ => Style::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_status_style_maps_every_known_category_to_its_color() {
+        assert_eq!(ticket_status_style("new").fg, Some(Color::Blue));
+        assert_eq!(ticket_status_style("indeterminate").fg, Some(Color::Cyan));
+        assert_eq!(ticket_status_style("done").fg, Some(Color::Green));
+        assert_eq!(ticket_status_style("something-else").fg, None);
+    }
 
     #[test]
     fn run_status_style_maps_every_status_to_its_color() {

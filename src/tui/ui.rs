@@ -157,6 +157,19 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// A board column's title style: bold, colored by the status category
+/// shared by its tickets (they share a status by construction, so the
+/// first ticket's category stands in for the whole column). An empty
+/// column has no ticket to derive a category from, so it falls back to the
+/// plain [`theme::COLUMN_TITLE`].
+fn column_title_style(column: &Column) -> Style {
+    match column.tickets.first() {
+        Some(ticket) => theme::ticket_status_style(&ticket.status_category)
+            .add_modifier(Modifier::BOLD),
+        None => theme::COLUMN_TITLE,
+    }
+}
+
 /// One column of the board: a bordered, titled stack of ticket cards.
 ///
 /// Each ticket renders as its own rounded-border card (see [`card_height`]
@@ -175,7 +188,7 @@ fn draw_column(
 ) {
     let title = Line::from(Span::styled(
         format!("{} ({})", column.title, column.tickets.len()),
-        theme::COLUMN_TITLE,
+        column_title_style(column),
     ));
     let border_style = if is_selected {
         theme::SELECTED_COLUMN_BORDER
@@ -257,7 +270,7 @@ fn draw_card(
         .map(Line::from)
         .collect();
     if show_assignee {
-        lines.push(Line::from(assignee_line(ticket)));
+        lines.push(Line::from(Span::styled(assignee_line(ticket), theme::DIM)));
     }
 
     let paragraph = Paragraph::new(lines).style(style).block(block);
@@ -708,11 +721,14 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
 
     let text = match app.selected_ticket() {
         Some(ticket) => vec![
-            Line::from(vec![Span::styled(
-                ticket.status.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(ticket.url.clone()),
+            Line::from(vec![
+                Span::styled("Status: ", theme::SECTION_HEADER),
+                Span::styled(
+                    ticket.status.clone(),
+                    theme::ticket_status_style(&ticket.status_category),
+                ),
+            ]),
+            Line::from(Span::styled(ticket.url.clone(), theme::DIM)),
             Line::from(""),
             Line::from(ticket.description.clone()),
         ],
@@ -998,6 +1014,71 @@ mod tests {
     }
 
     #[test]
+    fn board_column_title_carries_its_status_category_color() {
+        let app = three_column_app();
+        let buffer = render(&app);
+        let cell = cell_at(&buffer, "In Progress (1)").expect("column title renders");
+        assert_eq!(
+            Some(cell.fg),
+            theme::ticket_status_style("indeterminate").fg
+        );
+    }
+
+    #[test]
+    fn empty_column_title_falls_back_to_plain_column_title_style() {
+        let column = Column {
+            title: "Backlog".to_string(),
+            tickets: vec![],
+        };
+        assert_eq!(column_title_style(&column), theme::COLUMN_TITLE);
+    }
+
+    #[test]
+    fn assignee_line_renders_dim() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            filter: AssigneeFilter::Everyone,
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let cell = cell_at(&buffer, "Assignee: Unassigned").expect("assignee line renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
+    }
+
+    #[test]
+    fn detail_overlay_status_value_carries_its_status_category_color() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        let buffer = render(&app);
+        // Locate the "Status: " label, then check the color of the value
+        // cell right after it -- searching for "In Progress" directly would
+        // ambiguously match the board's (same-colored) column title, which
+        // is still visible behind the overlay.
+        let (x, y) = cell_pos(&buffer, "Status: ").expect("status label renders");
+        let value_cell = &buffer[(x + "Status: ".chars().count() as u16, y)];
+        assert_eq!(
+            Some(value_cell.fg),
+            theme::ticket_status_style("indeterminate").fg
+        );
+    }
+
+    #[test]
+    fn detail_overlay_url_line_renders_dim() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let cell = cell_at(&buffer, "https://example.atlassian.net/browse/PROJ-1")
+            .expect("url line renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
+    }
+
+    #[test]
     fn detail_overlay_leaves_board_column_titles_visible_and_shows_key_title() {
         let app = App {
             screen: Screen::Detail,
@@ -1107,13 +1188,11 @@ mod tests {
         assert!(text.contains("PROJ-2"));
     }
 
-    /// Find the first cell at which `needle` starts rendering (reading
-    /// left-to-right, top-to-bottom), verifying the full string actually
-    /// matches from that point rather than just its first character.
-    fn cell_at<'a>(
-        buffer: &'a ratatui::buffer::Buffer,
-        needle: &str,
-    ) -> Option<&'a ratatui::buffer::Cell> {
+    /// Find the `(x, y)` position at which `needle` starts rendering
+    /// (reading left-to-right, top-to-bottom), verifying the full string
+    /// actually matches from that point rather than just its first
+    /// character.
+    fn cell_pos(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
                 let cell = &buffer[(x, y)];
@@ -1126,12 +1205,21 @@ mod tests {
                         found.push_str(buffer[(x + dx, y)].symbol());
                     }
                     if found == needle {
-                        return Some(cell);
+                        return Some((x, y));
                     }
                 }
             }
         }
         None
+    }
+
+    /// The cell at which `needle` starts rendering; see [`cell_pos`].
+    fn cell_at<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        let (x, y) = cell_pos(buffer, needle)?;
+        Some(&buffer[(x, y)])
     }
 
     /// The [`Modifier`] of the cell at which `needle` starts rendering, or
