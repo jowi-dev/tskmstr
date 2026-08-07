@@ -95,23 +95,44 @@ pub struct TuiDeps {
     /// [`Cmd::LaunchLaneRun`] (see `docs/plans/board-lane-runs.md`). Boxed
     /// for the same trait+fake reason as `tmux`.
     pub launcher: Box<dyn LaneLauncher>,
+    /// Validated `[work.review_watch]` settings, with its `[work.audit].dir`
+    /// fallback already applied by [`crate::config::merge_work`]. Launching a
+    /// cleanup session is disabled (a status-line error) when `dir` is unset;
+    /// see [`crate::work::bugbot::launch_cleanup`].
+    pub review_watch: crate::config::ReviewWatchConfig,
+    /// `$XDG_DATA_HOME`, if set, used (with `home`) to locate the findings
+    /// file a launched cleanup session's prompt points at.
+    pub xdg_data_home: Option<std::path::PathBuf>,
     /// `config.work.lanes` keys, threaded into
     /// [`crate::tui::app::App::with_lane_names`] at construction (see that
     /// method's doc comment).
     pub lane_names: Vec<String>,
 }
 
-/// One board-launched lane run whose launcher child hasn't yet reported
-/// completion, tracked by [`run`]'s event loop between [`run_cmds`]'s
-/// [`Cmd::LaunchLaneRun`] interception (which creates the entry) and
-/// [`poll_pending_launches`] (which removes it once
+/// One board-launched child (`tm work run` or `tm pr watch`) that hasn't yet
+/// reported completion, tracked by [`run`]'s event loop between [`run_cmds`]'s
+/// [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`] interception (which creates
+/// the entry) and [`poll_pending_launches`] (which removes it once
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] resolves).
 struct PendingLaunch {
-    /// The ticket key the launch was for, echoed back in
-    /// [`Msg::LaneRunLaunchResult`].
+    /// The ticket key the launch was for, echoed back in the result `Msg`.
     key: String,
+    /// Which `Msg` this entry's completion reports as.
+    kind: PendingLaunchKind,
     /// The in-flight launcher child.
     handle: Box<dyn crate::tui::launcher::LaunchHandle>,
+}
+
+/// What a [`PendingLaunch`] was spawned for, which is all
+/// [`poll_pending_launches`] needs in order to pick the right result `Msg`.
+/// Both kinds share one launcher trait and one registry -- they differ only in
+/// argv and in which `Msg` their completion feeds back through `update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingLaunchKind {
+    /// `tm work run <lane> <key>`; reports [`Msg::LaneRunLaunchResult`].
+    LaneRun,
+    /// `tm pr watch <key>`; reports [`Msg::BotWatchLaunchResult`].
+    BotWatch,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -243,20 +264,19 @@ fn run_cmds<B: Backend>(
             continue;
         }
         if let Cmd::LaunchLaneRun { lane, key } = cmd {
-            match deps.launcher.spawn(&lane_run_argv(&lane, &key)) {
-                Ok(handle) => launches.push(PendingLaunch { key, handle }),
-                Err(err) => {
-                    let (next_app, more_cmds) = update(
-                        app,
-                        Msg::LaneRunLaunchResult {
-                            key,
-                            result: Err(err),
-                        },
-                    );
-                    app = next_app;
-                    pending.extend(more_cmds);
-                }
-            }
+            let argv = lane_run_argv(&lane, &key);
+            let (next_app, more_cmds) =
+                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::LaneRun, &argv);
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::LaunchBotWatch { key } = cmd {
+            let argv = bot_watch_argv(&key);
+            let (next_app, more_cmds) =
+                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::BotWatch, &argv);
+            app = next_app;
+            pending.extend(more_cmds);
             continue;
         }
         for msg in execute(deps, cmd) {
@@ -281,6 +301,45 @@ fn lane_run_argv(lane: &str, key: &str) -> Vec<String> {
     ]
 }
 
+/// The argv [`Cmd::LaunchBotWatch`] spawns through
+/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm pr watch <key>`, whose
+/// own quick resolve-then-detach step (see `docs/plans/bugbot-watch.md`'s "CLI
+/// surface") is what makes it watchable in the same way `tm work run`'s
+/// preflight is.
+fn bot_watch_argv(key: &str) -> Vec<String> {
+    vec!["pr".to_string(), "watch".to_string(), key.to_string()]
+}
+
+/// Spawn `argv` as a watched child for `key`, registering it in `launches` on
+/// success. A spawn failure never reaches the registry: it feeds the matching
+/// launch-result `Msg` (an `Err`) straight back through `update`, returning
+/// any further `Cmd`s that produced. Shared by [`Cmd::LaunchLaneRun`] and
+/// [`Cmd::LaunchBotWatch`], which differ only in argv and result `Msg`.
+fn spawn_watched_child(
+    app: App,
+    deps: &TuiDeps,
+    launches: &mut Vec<PendingLaunch>,
+    key: String,
+    kind: PendingLaunchKind,
+    argv: &[String],
+) -> (App, Vec<Cmd>) {
+    match deps.launcher.spawn(argv) {
+        Ok(handle) => {
+            launches.push(PendingLaunch { key, kind, handle });
+            (app, Vec::new())
+        }
+        Err(err) => update(app, launch_result_msg(kind, key, Err(err))),
+    }
+}
+
+/// The result `Msg` a [`PendingLaunchKind`] reports its outcome as.
+fn launch_result_msg(kind: PendingLaunchKind, key: String, result: Result<(), String>) -> Msg {
+    match kind {
+        PendingLaunchKind::LaneRun => Msg::LaneRunLaunchResult { key, result },
+        PendingLaunchKind::BotWatch => Msg::BotWatchLaunchResult { key, result },
+    }
+}
+
 /// Poll every entry in `launches` for completion (non-blocking, via
 /// [`crate::tui::launcher::LaunchHandle::try_finish`]), removing each one
 /// that finishes and returning its [`Msg::LaneRunLaunchResult`]. Entries
@@ -292,10 +351,7 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
     let mut msgs = Vec::new();
     launches.retain_mut(|pending| match pending.handle.try_finish() {
         Some(result) => {
-            msgs.push(Msg::LaneRunLaunchResult {
-                key: pending.key.clone(),
-                result,
-            });
+            msgs.push(launch_result_msg(pending.kind, pending.key.clone(), result));
             false
         }
         None => true,
@@ -616,13 +672,14 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
         Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
+        Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
-        // alternate screen around the blocking `tmux attach` call) and
-        // `Cmd::LaunchLaneRun` needs `&mut Vec<PendingLaunch>` (the in-flight
-        // launcher registry) -- neither of which this function's signature
-        // has access to; `run_cmds` always intercepts both before calling
-        // `execute` (see the module docs), so they're unreachable here in
-        // practice.
+        // alternate screen around the blocking `tmux attach` call), and
+        // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
+        // Vec<PendingLaunch>` (the in-flight launcher registry) -- neither of
+        // which this function's signature has access to; `run_cmds` always
+        // intercepts all three before calling `execute` (see the module
+        // docs), so they're unreachable here in practice.
         //
         // The Jira board never enters `Screen::Runs`, so `update` can never
         // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
@@ -631,7 +688,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
         | Cmd::AttachAudit { .. }
-        | Cmd::LaunchLaneRun { .. }) => {
+        | Cmd::LaunchLaneRun { .. }
+        | Cmd::LaunchBotWatch { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -878,6 +936,37 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     vec![Msg::AuditActionResult(message)]
 }
 
+/// Run `Cmd::LaunchCleanup`: launch a bugbot-cleanup session for `key` via
+/// [`crate::work::bugbot::launch_cleanup`], mapping the outcome to a
+/// status-line message. Mirrors [`launch_audit_cmd`] exactly, including its
+/// `deps.store` being `None` case: there would be nowhere to pre-register the
+/// run row.
+fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::BotsActionResult("runs db unavailable".to_string())];
+    };
+
+    let launch_deps = crate::work::bugbot::CleanupLaunchDeps {
+        store,
+        tmux: deps.tmux.as_ref(),
+    };
+    let request = crate::work::bugbot::CleanupLaunchRequest {
+        cfg: &deps.review_watch,
+        home: &deps.home,
+        xdg_data_home: deps.xdg_data_home.as_deref(),
+        key,
+    };
+
+    let message = match crate::work::bugbot::launch_cleanup(&launch_deps, &request) {
+        Ok(_) => format!("launched bugbot cleanup for {key} -- press b to attach"),
+        Err(crate::work::bugbot::CleanupLaunchError::AlreadyRunning { session_name }) => {
+            format!("bugbot cleanup already running ({session_name}) -- press b to attach")
+        }
+        Err(err) => err.to_string(),
+    };
+    vec![Msg::BotsActionResult(message)]
+}
+
 /// Search for tickets matching `jql` and map them to
 /// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
 /// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
@@ -1047,6 +1136,8 @@ mod tests {
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             audit: crate::config::AuditConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
+            review_watch: crate::config::ReviewWatchConfig::default(),
+            xdg_data_home: None,
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             lane_names: Vec::new(),
         }
@@ -1825,6 +1916,151 @@ mod tests {
         );
     }
 
+    // --- Cmd::LaunchBotWatch routing (run_cmds intercepts it too) ---
+
+    #[test]
+    fn run_cmds_launch_bot_watch_spawns_pr_watch_argv() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher = Box::new(RecordingLauncher(calls.clone()));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        run_cmds(
+            App::new(),
+            vec![Cmd::LaunchBotWatch {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            calls.borrow().clone(),
+            vec![vec![
+                "pr".to_string(),
+                "watch".to_string(),
+                "PROJ-1".to_string(),
+            ]]
+        );
+        assert_eq!(launches.len(), 1);
+    }
+
+    #[test]
+    fn run_cmds_launch_bot_watch_spawn_failure_feeds_immediate_launch_result() {
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher =
+            Box::new(crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("boom"));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchBotWatch {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert!(launches.is_empty());
+        assert_eq!(app.status_line, "PR watch failed for PROJ-1: boom");
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_a_bot_watch_entry_as_bot_watch_result() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
+        let handle = launcher.spawn(&bot_watch_argv("PROJ-1")).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::BotWatch,
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::BotWatchLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Ok(()),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    // --- Cmd::LaunchCleanup / launch_cleanup_cmd ---
+
+    #[test]
+    fn launch_cleanup_cmd_with_no_store_reports_unavailable() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::BotsActionResult("runs db unavailable".to_string())]
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_cmd_success_reports_launched_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.review_watch = crate::config::ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            ..crate::config::ReviewWatchConfig::default()
+        };
+
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::BotsActionResult(
+                "launched bugbot cleanup for PROJ-1 -- press b to attach".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_cmd_not_configured_surfaces_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        // `deps.review_watch` defaults to no `dir`.
+
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::BotsActionResult(message)] => {
+                assert!(message.contains("[work.review_watch].dir"));
+            }
+            other => panic!("expected BotsActionResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_cleanup_cmd_already_running_reports_attach_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.review_watch = crate::config::ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            ..crate::config::ReviewWatchConfig::default()
+        };
+        deps.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_has_session(Ok(true)));
+
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::BotsActionResult(
+                "bugbot cleanup already running (tm-bugbot-proj-1) -- press b to attach"
+                    .to_string()
+            )]
+        );
+    }
+
     // --- poll_pending_launches ---
 
     #[test]
@@ -1834,6 +2070,7 @@ mod tests {
         let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::LaneRun,
             handle,
         }];
         let msgs = poll_pending_launches(&mut launches);
@@ -1848,6 +2085,7 @@ mod tests {
         let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::LaneRun,
             handle,
         }];
         let msgs = poll_pending_launches(&mut launches);
@@ -1868,6 +2106,7 @@ mod tests {
         let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::LaneRun,
             handle,
         }];
         let msgs = poll_pending_launches(&mut launches);

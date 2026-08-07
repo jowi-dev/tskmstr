@@ -121,6 +121,7 @@ pub fn map_key(
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
+        KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         _ => None,
     }
 }
@@ -527,6 +528,45 @@ mod tests {
                     false,
                     false,
                     KeyCode::Char('w')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn b_triggers_bots_action_on_board() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                KeyCode::Char('b')
+            ),
+            Some(Msg::BotsAction)
+        );
+    }
+
+    #[test]
+    fn b_is_unbound_off_the_board_screen() {
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Char('b')
                 ),
                 None
             );

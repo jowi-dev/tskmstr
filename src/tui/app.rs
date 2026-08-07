@@ -578,6 +578,11 @@ pub struct App {
     /// too -- see `docs/plans/bugbot-watch.md`'s "Board integration"), just
     /// over `kind = "bugbot-cleanup"` runs and `tm-bugbot-<key>` sessions.
     pub cleanup_status: HashMap<String, AuditStatusEntry>,
+    /// Ticket keys with a `tm pr watch` launcher child currently in flight (no
+    /// `review-watch` run row recorded yet). Populated by [`Msg::BotsAction`],
+    /// cleared by [`Msg::BotWatchLaunchResult`]. Rendered as a starting-style
+    /// `bots:` badge, the bot-watch counterpart of `pending_lane_launches`.
+    pub pending_bot_watch_launches: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -781,6 +786,26 @@ pub enum Msg {
     /// [`Cmd::LoadCleanupStatus`] finished loading, replacing
     /// `app.cleanup_status` wholesale.
     CleanupStatusLoaded(HashMap<String, AuditStatusEntry>),
+    /// The `b` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// attach to its live cleanup session, launch one, or arm a PR bot
+    /// watcher, per [`bots_action`]'s precedence rule.
+    BotsAction,
+    /// The outcome of [`Cmd::LaunchCleanup`] or of attaching to a cleanup
+    /// session, already rendered to a human-readable status-line message.
+    /// Kept as a single string variant for the same reason
+    /// [`Msg::AuditActionResult`] is.
+    BotsActionResult(String),
+    /// The outcome of [`Cmd::LaunchBotWatch`] for `key`: removes it from
+    /// `pending_bot_watch_launches` and sets a human-readable status-line
+    /// message either way.
+    BotWatchLaunchResult {
+        /// Ticket key the watcher was armed for.
+        key: String,
+        /// `Ok(())` if `tm pr watch` exited zero (the watcher is detached and
+        /// its run row now exists; badge polling takes over), `Err` with its
+        /// stderr otherwise (e.g. no open PR, or already watching).
+        result: Result<(), String>,
+    },
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -879,6 +904,22 @@ pub enum Cmd {
     /// `kind = "bugbot-cleanup"` run per ticket, mapped through the same
     /// [`audit_indicator`] rule audit sessions use).
     LoadCleanupStatus,
+    /// Launch a bugbot-cleanup session for `key` (see
+    /// [`crate::work::bugbot::launch_cleanup`]). Executed in-process, exactly
+    /// like [`Cmd::LaunchAudit`]: the launch only pre-registers a run row and
+    /// starts a tmux session, so it returns immediately.
+    LaunchCleanup {
+        /// Ticket key to launch a cleanup session for.
+        key: String,
+    },
+    /// Arm a PR bot watcher for `key` (`tm pr watch <key>`, spawned via
+    /// `std::env::current_exe()` as a watched child process through the same
+    /// [`crate::tui::launcher::LaneLauncher`] seam [`Cmd::LaunchLaneRun`]
+    /// uses -- see `docs/plans/bugbot-watch.md`'s "Board integration").
+    LaunchBotWatch {
+        /// Ticket key to arm a watcher for.
+        key: String,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -1115,6 +1156,74 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::CleanupStatusLoaded(status) => {
             app.cleanup_status = status;
             (app, Vec::new())
+        }
+        Msg::BotsAction => bots_action(app),
+        Msg::BotsActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
+        Msg::BotWatchLaunchResult { key, result } => {
+            app.pending_bot_watch_launches.remove(&key);
+            app.status_line = match result {
+                Ok(()) => format!("watching PR for {key}"),
+                Err(err) => format!("PR watch failed for {key}: {err}"),
+            };
+            (app, Vec::new())
+        }
+    }
+}
+
+/// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm
+/// precedence for the selected board ticket, per
+/// `docs/plans/bugbot-watch.md`'s "Board integration" section. Mirrors
+/// [`audit_action`]'s shape, with two more steps in front of the launch.
+///
+/// A no-op when no ticket is selected. Otherwise, in order:
+///
+/// 1. A live `tm-bugbot-<key>` tmux session exists -> attach to it
+///    ([`Cmd::AttachAudit`], which takes a session name rather than anything
+///    audit-specific).
+/// 2. No live session but the latest watcher run is
+///    [`BotWatchIndicator::Ready`] (the bots reviewed and left unresolved
+///    findings) -> [`Cmd::LaunchCleanup`].
+/// 3. The latest watcher run is [`BotWatchIndicator::Watching`], or a
+///    watcher launch is still in flight -> a status-line message only; there
+///    is nothing to act on until the bots finish.
+/// 4. Otherwise (no watcher, or the last one is `Clean`/`Failed`) -> arm a new
+///    one ([`Cmd::LaunchBotWatch`]), marking the ticket pending so the badge
+///    reads as starting until the launcher child reports back.
+fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+
+    let has_session = app
+        .cleanup_status
+        .get(&key)
+        .is_some_and(|entry| entry.has_session);
+    if has_session {
+        return (
+            app,
+            vec![Cmd::AttachAudit {
+                session_name: crate::work::bugbot::cleanup_session_name(&key),
+            }],
+        );
+    }
+
+    match app.bot_watch_status.get(&key) {
+        Some(BotWatchIndicator::Ready) => (app, vec![Cmd::LaunchCleanup { key }]),
+        Some(BotWatchIndicator::Watching) => {
+            app.status_line = format!("watching PR for {key} -- bots not done yet");
+            (app, Vec::new())
+        }
+        _ if app.pending_bot_watch_launches.contains(&key) => {
+            app.status_line = format!("arming PR watcher for {key}");
+            (app, Vec::new())
+        }
+        _ => {
+            app.pending_bot_watch_launches.insert(key.clone());
+            (app, vec![Cmd::LaunchBotWatch { key }])
         }
     }
 }
@@ -3448,6 +3557,169 @@ mod tests {
     #[test]
     fn bot_watch_indicator_with_no_run_is_none() {
         assert_eq!(bot_watch_indicator(None), None);
+    }
+
+    // --- Msg::BotsAction precedence ---
+
+    #[test]
+    fn bots_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::BotsAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn bots_action_with_live_cleanup_session_attaches() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.cleanup_status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Running, true),
+        );
+        // A `Ready` watcher must not win over a live cleanup session.
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        let (_app, cmds) = update(app, Msg::BotsAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachAudit {
+                session_name: "tm-bugbot-proj-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn bots_action_with_ready_watcher_and_no_session_launches_cleanup() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        let (_app, cmds) = update(app, Msg::BotsAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchCleanup {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn bots_action_with_running_watcher_only_reports_status() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Watching);
+        let (app, cmds) = update(app, Msg::BotsAction);
+        assert!(cmds.is_empty());
+        assert_eq!(
+            app.status_line,
+            "watching PR for PROJ-1 -- bots not done yet"
+        );
+        assert!(app.pending_bot_watch_launches.is_empty());
+    }
+
+    #[test]
+    fn bots_action_with_no_watcher_arms_one_and_marks_pending() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::BotsAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchBotWatch {
+                key: "PROJ-1".to_string()
+            }]
+        );
+        assert!(app.pending_bot_watch_launches.contains("PROJ-1"));
+    }
+
+    #[test]
+    fn bots_action_with_terminal_watcher_rearms() {
+        for indicator in [BotWatchIndicator::Clean, BotWatchIndicator::Failed] {
+            let mut app = board_with(vec![ticket("PROJ-1")], 0);
+            app.bot_watch_status.insert("PROJ-1".to_string(), indicator);
+            let (_app, cmds) = update(app, Msg::BotsAction);
+            assert_eq!(
+                cmds,
+                vec![Cmd::LaunchBotWatch {
+                    key: "PROJ-1".to_string()
+                }],
+                "{indicator:?} should re-arm a watcher"
+            );
+        }
+    }
+
+    #[test]
+    fn bots_action_with_a_pending_launch_reports_instead_of_relaunching() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.pending_bot_watch_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(app, Msg::BotsAction);
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "arming PR watcher for PROJ-1");
+    }
+
+    #[test]
+    fn bots_action_with_cleanup_entry_but_no_live_session_falls_through() {
+        // `Done`/`Failed` with `has_session: false` never reaches the map (see
+        // `audit_indicator`), but `Running` without a live session can -- and
+        // must not attach to something that isn't there.
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.cleanup_status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Running, false),
+        );
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        let (_app, cmds) = update(app, Msg::BotsAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchCleanup {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    // --- Msg::BotsActionResult / Msg::BotWatchLaunchResult ---
+
+    #[test]
+    fn bots_action_result_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::BotsActionResult("launched bugbot cleanup for PROJ-1".to_string()),
+        );
+        assert_eq!(app.status_line, "launched bugbot cleanup for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn bot_watch_launch_result_ok_removes_pending_and_sets_message() {
+        let mut app = App::new();
+        app.pending_bot_watch_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(
+            app,
+            Msg::BotWatchLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Ok(()),
+            },
+        );
+        assert!(app.pending_bot_watch_launches.is_empty());
+        assert_eq!(app.status_line, "watching PR for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn bot_watch_launch_result_err_removes_pending_and_sets_message() {
+        let mut app = App::new();
+        app.pending_bot_watch_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(
+            app,
+            Msg::BotWatchLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Err("no open pull request found for PROJ-1".to_string()),
+            },
+        );
+        assert!(app.pending_bot_watch_launches.is_empty());
+        assert_eq!(
+            app.status_line,
+            "PR watch failed for PROJ-1: no open pull request found for PROJ-1"
+        );
+        assert!(cmds.is_empty());
     }
 
     // --- Msg::BotWatchStatusLoaded / Msg::CleanupStatusLoaded ---

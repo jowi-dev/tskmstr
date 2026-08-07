@@ -263,6 +263,7 @@ fn run_board(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
     let lane_names: Vec<String> = config.work.lanes.keys().cloned().collect();
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
@@ -271,6 +272,8 @@ fn run_board(
         store,
         tmux: Box::new(tmux),
         audit: config.work.audit,
+        review_watch: config.work.review_watch,
+        xdg_data_home,
         home,
         launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
         lane_names,
