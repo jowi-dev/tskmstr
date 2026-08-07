@@ -404,6 +404,48 @@ pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Opti
     }
 }
 
+/// A ticket's PR bot-watch state on the board, per
+/// `docs/plans/bugbot-watch.md`'s "Board integration" design. Derived, never
+/// stored: [`bot_watch_indicator`] computes it fresh each poll from the
+/// ticket's latest `kind = "review-watch"` run.
+///
+/// Like [`RunIndicator`] (and unlike [`AuditIndicator`]) there is no
+/// tmux-session liveness input: `tm pr watch`'s poll loop is a headless
+/// background process, so the run row is the only source of truth and a
+/// terminal badge persists until a newer watcher run supersedes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotWatchIndicator {
+    /// The latest watcher run is [`RunStatus::Running`]: the PR is up and the
+    /// bots haven't all reviewed yet.
+    Watching,
+    /// The latest watcher run finished [`RunStatus::Review`]: every bot has
+    /// reviewed and left unresolved findings, so a cleanup session is worth
+    /// launching. The loud, act-on-me state.
+    Ready,
+    /// The latest watcher run finished [`RunStatus::Done`]: the bots reviewed
+    /// with nothing left unresolved (or the PR merged/closed first) -- nothing
+    /// to clean up.
+    Clean,
+    /// The latest watcher run finished [`RunStatus::Failed`]: it gave up (bad
+    /// `gh`, or the wall-clock timeout) rather than reaching a verdict.
+    Failed,
+}
+
+/// Pure mapping from a ticket's latest `kind = "review-watch"` run status to
+/// its [`BotWatchIndicator`], per `docs/plans/bugbot-watch.md`'s "Board
+/// integration" design. `None` (no badge) when there is no watcher run at all,
+/// or when its status is one a watcher never reports
+/// ([`RunStatus::Queued`]/[`RunStatus::Blocked`]).
+pub fn bot_watch_indicator(run: Option<RunStatus>) -> Option<BotWatchIndicator> {
+    match run {
+        Some(RunStatus::Running) => Some(BotWatchIndicator::Watching),
+        Some(RunStatus::Review) => Some(BotWatchIndicator::Ready),
+        Some(RunStatus::Done) => Some(BotWatchIndicator::Clean),
+        Some(RunStatus::Failed) => Some(BotWatchIndicator::Failed),
+        _ => None,
+    }
+}
+
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
 /// columns always render, even when empty.
 pub const RUN_COLUMNS: [crate::runs::RunStatus; 6] = [
@@ -523,6 +565,19 @@ pub struct App {
     /// `audit_status`. Empty when the runs DB is unavailable or no ticket has
     /// ever had a lane run.
     pub lane_run_status: HashMap<String, RunIndicator>,
+    /// Per-ticket PR bot-watch badge state for [`Screen::Board`], keyed by
+    /// ticket key. Populated by [`Cmd::LoadBotWatchStatus`], polled every 8th
+    /// [`Msg::Tick`] (~2s at the 250ms poll interval), same cadence as
+    /// `audit_status`/`lane_run_status`. Empty when the runs DB is unavailable
+    /// or no ticket has ever had a `tm pr watch` run.
+    pub bot_watch_status: HashMap<String, BotWatchIndicator>,
+    /// Per-ticket bugbot-cleanup session badge state for [`Screen::Board`],
+    /// keyed by ticket key. Populated by [`Cmd::LoadCleanupStatus`] on the same
+    /// cadence, and derived by the *same* [`audit_indicator`] rule as
+    /// `audit_status` (a cleanup session is a tmux-hosted interactive session
+    /// too -- see `docs/plans/bugbot-watch.md`'s "Board integration"), just
+    /// over `kind = "bugbot-cleanup"` runs and `tm-bugbot-<key>` sessions.
+    pub cleanup_status: HashMap<String, AuditStatusEntry>,
 }
 
 impl App {
@@ -720,6 +775,12 @@ pub enum Msg {
     /// [`Cmd::LoadLaneRunStatus`] finished loading, replacing
     /// `app.lane_run_status` wholesale.
     LaneRunStatusLoaded(HashMap<String, RunIndicator>),
+    /// [`Cmd::LoadBotWatchStatus`] finished loading, replacing
+    /// `app.bot_watch_status` wholesale.
+    BotWatchStatusLoaded(HashMap<String, BotWatchIndicator>),
+    /// [`Cmd::LoadCleanupStatus`] finished loading, replacing
+    /// `app.cleanup_status` wholesale.
+    CleanupStatusLoaded(HashMap<String, AuditStatusEntry>),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -809,6 +870,15 @@ pub enum Cmd {
     /// `kind = "lane"` run per ticket, mapped through
     /// [`lane_run_indicator`]).
     LoadLaneRunStatus,
+    /// Reload [`Screen::Board`]'s per-ticket PR bot-watch status (the latest
+    /// `kind = "review-watch"` run per ticket, mapped through
+    /// [`bot_watch_indicator`]).
+    LoadBotWatchStatus,
+    /// Reload [`Screen::Board`]'s per-ticket bugbot-cleanup session status
+    /// (live `tm-bugbot-<key>` tmux sessions plus the latest
+    /// `kind = "bugbot-cleanup"` run per ticket, mapped through the same
+    /// [`audit_indicator`] rule audit sessions use).
+    LoadCleanupStatus,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -1038,6 +1108,14 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.lane_run_status = status;
             (app, Vec::new())
         }
+        Msg::BotWatchStatusLoaded(status) => {
+            app.bot_watch_status = status;
+            (app, Vec::new())
+        }
+        Msg::CleanupStatusLoaded(status) => {
+            app.cleanup_status = status;
+            (app, Vec::new())
+        }
     }
 }
 
@@ -1135,11 +1213,12 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
 /// interval).
 ///
 /// On [`Screen::Board`], increments the same counter and emits
-/// [`Cmd::LoadAuditStatus`] and [`Cmd::LoadLaneRunStatus`] every 8th tick
-/// (~2s) -- the board polls audit and lane-run status on its own clock while
-/// leaving the Jira ticket list itself on manual refresh (`r`). The two
-/// polls stay separate `Cmd`s (not merged into one query) since a ticket can
-/// legitimately carry both an audit session and a lane run.
+/// [`Cmd::LoadAuditStatus`], [`Cmd::LoadLaneRunStatus`],
+/// [`Cmd::LoadBotWatchStatus`] and [`Cmd::LoadCleanupStatus`] every 8th tick
+/// (~2s) -- the board polls every badge source on its own clock while leaving
+/// the Jira ticket list itself on manual refresh (`r`). The four polls stay
+/// separate `Cmd`s (not merged into one query) since a ticket can legitimately
+/// carry all four badges at once, each keyed off a different run `kind`.
 fn tick(mut app: App) -> (App, Vec<Cmd>) {
     match app.screen {
         Screen::Runs => {
@@ -1167,6 +1246,8 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             if app.watch_tick.is_multiple_of(8) {
                 cmds.push(Cmd::LoadAuditStatus);
                 cmds.push(Cmd::LoadLaneRunStatus);
+                cmds.push(Cmd::LoadBotWatchStatus);
+                cmds.push(Cmd::LoadCleanupStatus);
             }
             (app, cmds)
         }
@@ -3343,6 +3424,57 @@ mod tests {
         );
     }
 
+    // --- bot_watch_indicator ---
+
+    #[test]
+    fn bot_watch_indicator_maps_every_status_to_its_badge() {
+        let cases = [
+            (RunStatus::Running, Some(BotWatchIndicator::Watching)),
+            (RunStatus::Review, Some(BotWatchIndicator::Ready)),
+            (RunStatus::Done, Some(BotWatchIndicator::Clean)),
+            (RunStatus::Failed, Some(BotWatchIndicator::Failed)),
+            (RunStatus::Queued, None),
+            (RunStatus::Blocked, None),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(
+                bot_watch_indicator(Some(status)),
+                expected,
+                "unexpected indicator for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_watch_indicator_with_no_run_is_none() {
+        assert_eq!(bot_watch_indicator(None), None);
+    }
+
+    // --- Msg::BotWatchStatusLoaded / Msg::CleanupStatusLoaded ---
+
+    #[test]
+    fn bot_watch_status_loaded_replaces_bot_watch_status() {
+        let app = App::new();
+        let mut status = HashMap::new();
+        status.insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        let (app, cmds) = update(app, Msg::BotWatchStatusLoaded(status.clone()));
+        assert_eq!(app.bot_watch_status, status);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn cleanup_status_loaded_replaces_cleanup_status() {
+        let app = App::new();
+        let mut status = HashMap::new();
+        status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Running, true),
+        );
+        let (app, cmds) = update(app, Msg::CleanupStatusLoaded(status.clone()));
+        assert_eq!(app.cleanup_status, status);
+        assert!(cmds.is_empty());
+    }
+
     // --- Msg::AuditAction / Msg::AuditStatusLoaded / Msg::AuditActionResult ---
 
     fn audit_entry(indicator: AuditIndicator, has_session: bool) -> AuditStatusEntry {
@@ -3456,7 +3588,15 @@ mod tests {
             app = next_app;
             cmds = next_cmds;
         }
-        assert_eq!(cmds, vec![Cmd::LoadAuditStatus, Cmd::LoadLaneRunStatus]);
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::LoadAuditStatus,
+                Cmd::LoadLaneRunStatus,
+                Cmd::LoadBotWatchStatus,
+                Cmd::LoadCleanupStatus,
+            ]
+        );
     }
 
     // --- lane_names / with_lane_names ---

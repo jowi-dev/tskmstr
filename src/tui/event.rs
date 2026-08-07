@@ -31,7 +31,8 @@ use crate::jira::adf::adf_to_text;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::Issue;
 use crate::tui::app::{
-    App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, lane_run_indicator,
+    App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, bot_watch_indicator,
+    lane_run_indicator,
 };
 use crate::tui::app::{jql_for_filter, update};
 use crate::tui::keymap::map_key;
@@ -41,6 +42,15 @@ use crate::work::tmux::TmuxOps;
 
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Run `kind` of a `tm pr watch` poll loop, filtered on by
+/// [`load_bot_watch_status`].
+const REVIEW_WATCH_KIND: &str = "review-watch";
+
+/// Run `kind` of a bugbot-cleanup session, filtered on by
+/// [`load_cleanup_status`]. Matches
+/// [`crate::work::bugbot::launch_cleanup`]'s own `kind`.
+const CLEANUP_KIND: &str = "bugbot-cleanup";
 
 /// Errors that can occur while running the TUI.
 #[derive(Debug, Error)]
@@ -122,12 +132,13 @@ impl Drop for TerminalGuard {
 /// Run the interactive board until the user quits.
 ///
 /// Enters raw mode and the alternate screen, fetches the initial ticket list
-/// and audit status, then loops: draw the current screen, wait up to
+/// and every badge status, then loops: draw the current screen, wait up to
 /// `POLL_INTERVAL` for a key press. A key press maps to a [`Msg`] which runs
 /// through [`crate::tui::app::update`], executing any resulting [`Cmd`]s; a
 /// timed-out poll feeds [`Msg::Tick`] through the same path (mirroring
-/// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic
-/// [`Cmd::LoadAuditStatus`]/[`Cmd::LoadLaneRunStatus`] polling. Every
+/// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic badge
+/// polling ([`Cmd::LoadAuditStatus`], [`Cmd::LoadLaneRunStatus`],
+/// [`Cmd::LoadBotWatchStatus`] and [`Cmd::LoadCleanupStatus`]). Every
 /// iteration also polls `launches` (the board-launched lane runs still in
 /// flight, per [`run_cmds`]'s [`Cmd::LaunchLaneRun`] interception) via
 /// [`poll_pending_launches`], feeding each completion's
@@ -158,6 +169,8 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
             Cmd::FetchTickets { jql },
             Cmd::LoadAuditStatus,
             Cmd::LoadLaneRunStatus,
+            Cmd::LoadBotWatchStatus,
+            Cmd::LoadCleanupStatus,
         ],
         &deps,
         &mut terminal,
@@ -601,6 +614,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
+        Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
+        Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
         // alternate screen around the blocking `tmux attach` call) and
         // `Cmd::LaunchLaneRun` needs `&mut Vec<PendingLaunch>` (the in-flight
@@ -646,7 +661,7 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
         .list_sessions()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|session| audit_session_ticket_key(&session.name))
+        .filter_map(|session| session_ticket_key(&session.name, AUDIT_SESSION_PREFIX))
         .collect();
 
     // `list_runs_filtered` orders active runs before terminal ones, and by
@@ -725,21 +740,117 @@ fn load_lane_run_status(deps: &TuiDeps) -> Vec<Msg> {
     vec![Msg::LaneRunStatusLoaded(status)]
 }
 
+/// Run `Cmd::LoadBotWatchStatus`: build the board's per-ticket PR bot-watch
+/// badge map from the latest `kind = "review-watch"` run per ticket, via
+/// [`bot_watch_indicator`]'s pure mapping.
+///
+/// Same leniency and same "latest run per ticket" ordering argument as
+/// [`load_lane_run_status`], and the same absence of a tmux-session signal:
+/// `tm pr watch`'s poll loop is a headless background process, so its run row
+/// is the only source of truth (see `docs/plans/bugbot-watch.md`'s "Board
+/// integration"). A ticket whose *launcher* child is still in flight has no
+/// run row yet; that pending state is rendered from
+/// `App::pending_bot_watch_launches` instead, which this function cannot see.
+fn load_bot_watch_status(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::BotWatchStatusLoaded(HashMap::new())];
+    };
+
+    let mut latest_by_ticket: HashMap<String, crate::runs::RunStatus> = HashMap::new();
+    for run in store
+        .list_runs_filtered(Some(REVIEW_WATCH_KIND))
+        .unwrap_or_default()
+    {
+        latest_by_ticket.entry(run.ticket).or_insert(run.status);
+    }
+
+    let mut status = HashMap::new();
+    for (key, run_status) in latest_by_ticket {
+        if let Some(indicator) = bot_watch_indicator(Some(run_status)) {
+            status.insert(key, indicator);
+        }
+    }
+
+    vec![Msg::BotWatchStatusLoaded(status)]
+}
+
+/// Run `Cmd::LoadCleanupStatus`: build the board's per-ticket bugbot-cleanup
+/// badge map from live `tm-bugbot-<key>` tmux sessions and the latest
+/// `kind = "bugbot-cleanup"` run per ticket.
+///
+/// Structurally identical to [`load_audit_status`] -- same leniency, same
+/// ordering argument, and the *same* [`audit_indicator`] precedence rule and
+/// [`AuditStatusEntry`] output type, which were already generic over "a
+/// tmux-hosted interactive session kind" rather than audits specifically (see
+/// `docs/plans/bugbot-watch.md`'s "Ground truth"). Only the session-name
+/// prefix and the run `kind` differ.
+fn load_cleanup_status(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::CleanupStatusLoaded(HashMap::new())];
+    };
+
+    let sessions: HashSet<String> = deps
+        .tmux
+        .list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|session| session_ticket_key(&session.name, CLEANUP_SESSION_PREFIX))
+        .collect();
+
+    let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
+    for run in store
+        .list_runs_filtered(Some(CLEANUP_KIND))
+        .unwrap_or_default()
+    {
+        latest_by_ticket
+            .entry(run.ticket)
+            .or_insert((run.status, run.awaiting_input));
+    }
+
+    let mut keys: HashSet<&String> = sessions.iter().collect();
+    keys.extend(latest_by_ticket.keys());
+
+    let mut status = HashMap::new();
+    for key in keys {
+        let has_session = sessions.contains(key);
+        let run = latest_by_ticket.get(key).copied();
+        if let Some(indicator) = audit_indicator(has_session, run) {
+            status.insert(
+                key.clone(),
+                AuditStatusEntry {
+                    indicator,
+                    has_session,
+                },
+            );
+        }
+    }
+
+    vec![Msg::CleanupStatusLoaded(status)]
+}
+
 /// Maps a live tmux session name back to the ticket key it was launched for,
-/// per [`crate::work::audit::audit_session_name`]'s `tm-audit-<lowercased
-/// key>` convention: strips the `tm-audit-` prefix and uppercases the
-/// remainder. `None` for any session name that doesn't start with that
-/// prefix (an unrelated tmux session).
+/// given the `tm-<kind>-<lowercased key>` prefix its launcher uses (see
+/// [`crate::work::audit::audit_session_name`] and
+/// [`crate::work::bugbot::cleanup_session_name`]): strips `prefix` and
+/// uppercases the remainder. `None` for any session name that doesn't start
+/// with `prefix` (an unrelated tmux session, including one belonging to the
+/// *other* session kind).
 ///
 /// Round-trip assumption: Jira ticket keys are always uppercase
-/// (`PROJ-123`), and `audit_session_name` only ever lowercases -- never
-/// otherwise transforms -- the key, so uppercasing the stripped suffix
+/// (`PROJ-123`), and both session-name functions only ever lowercase -- never
+/// otherwise transform -- the key, so uppercasing the stripped suffix
 /// recovers the original key exactly.
-fn audit_session_ticket_key(session_name: &str) -> Option<String> {
-    session_name
-        .strip_prefix("tm-audit-")
-        .map(str::to_uppercase)
+fn session_ticket_key(session_name: &str, prefix: &str) -> Option<String> {
+    session_name.strip_prefix(prefix).map(str::to_uppercase)
 }
+
+/// Session-name prefix for board-launched audit sessions; see
+/// [`session_ticket_key`].
+const AUDIT_SESSION_PREFIX: &str = "tm-audit-";
+
+/// Session-name prefix for board-launched bugbot-cleanup sessions; see
+/// [`session_ticket_key`].
+const CLEANUP_SESSION_PREFIX: &str = "tm-bugbot-";
 
 /// Run `Cmd::LaunchAudit`: launch a ticket-audit session for `key` via
 /// [`crate::work::audit::launch_audit`], mapping the outcome to a
@@ -1394,19 +1505,38 @@ mod tests {
         assert_eq!(msgs, vec![Msg::RunsReaped(0)]);
     }
 
-    // --- audit_session_ticket_key ---
+    // --- session_ticket_key ---
 
     #[test]
-    fn audit_session_ticket_key_strips_prefix_and_uppercases() {
+    fn session_ticket_key_strips_prefix_and_uppercases() {
         assert_eq!(
-            audit_session_ticket_key("tm-audit-proj-123"),
+            session_ticket_key("tm-audit-proj-123", AUDIT_SESSION_PREFIX),
+            Some("PROJ-123".to_string())
+        );
+        assert_eq!(
+            session_ticket_key("tm-bugbot-proj-123", CLEANUP_SESSION_PREFIX),
             Some("PROJ-123".to_string())
         );
     }
 
     #[test]
-    fn audit_session_ticket_key_returns_none_for_unrelated_session() {
-        assert_eq!(audit_session_ticket_key("some-other-session"), None);
+    fn session_ticket_key_returns_none_for_unrelated_session() {
+        assert_eq!(
+            session_ticket_key("some-other-session", AUDIT_SESSION_PREFIX),
+            None
+        );
+    }
+
+    #[test]
+    fn session_ticket_key_does_not_cross_match_the_other_session_kind() {
+        assert_eq!(
+            session_ticket_key("tm-bugbot-proj-1", AUDIT_SESSION_PREFIX),
+            None
+        );
+        assert_eq!(
+            session_ticket_key("tm-audit-proj-1", CLEANUP_SESSION_PREFIX),
+            None
+        );
     }
 
     // --- Cmd::LoadAuditStatus / load_audit_status ---
@@ -1899,6 +2029,206 @@ mod tests {
             }
             other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
         }
+    }
+
+    // --- Cmd::LoadBotWatchStatus / load_bot_watch_status ---
+
+    fn review_watch_start_params(ticket: &str) -> crate::runs::StartRun {
+        crate::runs::StartRun {
+            kind: "review-watch".to_string(),
+            lane: "review-watch".to_string(),
+            ..start_params(ticket)
+        }
+    }
+
+    fn cleanup_start_params(ticket: &str) -> crate::runs::StartRun {
+        crate::runs::StartRun {
+            kind: "bugbot-cleanup".to_string(),
+            lane: "bugbot-cleanup".to_string(),
+            ..start_params(ticket)
+        }
+    }
+
+    /// Finish `run_id` with `status`, the shorthand every badge-status test
+    /// here needs to reach a terminal run row.
+    fn finish(store: &crate::runs::RunStore, run_id: i64, status: crate::runs::RunStatus) {
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn load_bot_watch_status_with_no_store_yields_empty_map() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = load_bot_watch_status(&deps);
+        assert_eq!(msgs, vec![Msg::BotWatchStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_bot_watch_status_running_maps_to_watching() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store
+            .start_run(&review_watch_start_params("PROJ-1"))
+            .unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_bot_watch_status(&deps);
+        match msgs.as_slice() {
+            [Msg::BotWatchStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::BotWatchIndicator::Watching)
+                );
+            }
+            other => panic!("expected BotWatchStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_bot_watch_status_review_maps_to_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&review_watch_start_params("PROJ-1"))
+            .unwrap();
+        finish(&store, run_id, crate::runs::RunStatus::Review);
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_bot_watch_status(&deps);
+        match msgs.as_slice() {
+            [Msg::BotWatchStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::BotWatchIndicator::Ready)
+                );
+            }
+            other => panic!("expected BotWatchStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_bot_watch_status_excludes_other_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store.start_run(&cleanup_start_params("PROJ-2")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_bot_watch_status(&deps);
+        assert_eq!(msgs, vec![Msg::BotWatchStatusLoaded(HashMap::new())]);
+    }
+
+    // --- Cmd::LoadCleanupStatus / load_cleanup_status ---
+
+    #[test]
+    fn load_cleanup_status_with_no_store_yields_empty_map() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = load_cleanup_status(&deps);
+        assert_eq!(msgs, vec![Msg::CleanupStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_cleanup_status_marks_running_cleanup_with_matching_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&cleanup_start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_sessions(Ok(vec![
+                crate::work::tmux::TmuxSession {
+                    name: "tm-bugbot-proj-1".to_string(),
+                    path: "/repo/axiom".to_string(),
+                },
+            ])),
+        );
+
+        let msgs = load_cleanup_status(&deps);
+        match msgs.as_slice() {
+            [Msg::CleanupStatusLoaded(status)] => {
+                let entry = status.get("PROJ-1").expect("PROJ-1 should have an entry");
+                assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Running);
+                assert!(entry.has_session);
+            }
+            other => panic!("expected CleanupStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_cleanup_status_marks_starting_when_session_exists_with_no_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_sessions(Ok(vec![
+                crate::work::tmux::TmuxSession {
+                    name: "tm-bugbot-proj-2".to_string(),
+                    path: "/repo/axiom".to_string(),
+                },
+            ])),
+        );
+
+        let msgs = load_cleanup_status(&deps);
+        match msgs.as_slice() {
+            [Msg::CleanupStatusLoaded(status)] => {
+                let entry = status.get("PROJ-2").expect("PROJ-2 should have an entry");
+                assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Starting);
+                assert!(entry.has_session);
+            }
+            other => panic!("expected CleanupStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_cleanup_status_ignores_audit_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_sessions(Ok(vec![
+                crate::work::tmux::TmuxSession {
+                    name: "tm-audit-proj-1".to_string(),
+                    path: "/repo/axiom".to_string(),
+                },
+            ])),
+        );
+
+        let msgs = load_cleanup_status(&deps);
+        assert_eq!(msgs, vec![Msg::CleanupStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_cleanup_status_omits_finished_run_with_no_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&cleanup_start_params("PROJ-3")).unwrap();
+        finish(&store, run_id, crate::runs::RunStatus::Done);
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_cleanup_status(&deps);
+        assert_eq!(msgs, vec![Msg::CleanupStatusLoaded(HashMap::new())]);
     }
 
     #[test]
