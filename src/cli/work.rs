@@ -281,14 +281,11 @@ pub fn start(
 
 /// `tm work new <name> [branch] [--from base]`: provision the worktree if
 /// missing, then start/attach its session. Mirrors `work.ml`'s
-/// `worktree_new`/`provision_worktree`.
-///
-/// Interpretation note: `work.ml`'s `provision_worktree` also symlinks a
-/// `.env.local` from the main repo into the new worktree if one exists.
-/// That's a plain filesystem side effect with no corresponding `GitOps`
-/// method (the trait landed in step 3 covers only actual git invocations),
-/// and adding one wasn't in this step's scope — this port intentionally
-/// omits it. Flagged as a known gap, not a silent drop.
+/// `worktree_new`/`provision_worktree`, including the `.env.local` symlink:
+/// [`GitOps::provision_worktree`] performs the link (it's the provisioning
+/// path shared with [`crate::work::run::run_lane_fg`]) and reports back
+/// whether one was created, so this prints `work.ml`'s "Linked .env.local
+/// from main repo" message at the same point `work.ml` does.
 pub fn new(
     ctx: &WorkContext<'_>,
     name: &str,
@@ -310,8 +307,12 @@ pub fn new(
             "Creating worktree: {} (branch: {branch_name})",
             wt_path.display()
         )?;
-        ctx.git
+        let linked = ctx
+            .git
             .provision_worktree(&repo_root, &wt_path, branch_name, from_base)?;
+        if linked {
+            writeln!(out, "Linked .env.local from main repo")?;
+        }
     }
 
     start_in_dir(ctx, &wt_path, out)
@@ -585,6 +586,83 @@ mod tests {
         assert!(printed.contains("Creating worktree:"));
         assert!(printed.contains("branch: my-lane"));
         assert!(printed.contains("Creating session:"));
+    }
+
+    #[test]
+    fn new_prints_linked_env_local_message_when_main_repo_has_one() {
+        let tmp = TempDir::new().unwrap();
+        let worktree_root = tmp.path().join("Worktrees");
+        let repo_root = tmp.path().join("repo").join("axiom");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(repo_root.join(".env.local"), "DATABASE_URL=postgres://\n").unwrap();
+        let config = WorkConfig {
+            worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
+            ..config_with_lanes(BTreeMap::new())
+        };
+        let git = FakeGitOps::new().with_repo_root(Ok(repo_root.clone()));
+        let tmux = FakeTmuxOps::new();
+        let home = tmp.path().to_path_buf();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        new(
+            &ctx,
+            "my-lane",
+            None,
+            Some("origin/main"),
+            Path::new("/cwd"),
+            &mut out,
+        )
+        .unwrap();
+
+        let wt_path = worktree_root.join("axiom").join("my-lane");
+        assert!(wt_path.join(".env.local").is_symlink());
+
+        let printed = out_string(&out);
+        assert!(printed.contains("Linked .env.local from main repo"));
+    }
+
+    #[test]
+    fn new_does_not_print_linked_env_local_message_when_main_repo_has_none() {
+        let tmp = TempDir::new().unwrap();
+        let worktree_root = tmp.path().join("Worktrees");
+        let repo_root = tmp.path().join("repo").join("axiom");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let config = WorkConfig {
+            worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
+            ..config_with_lanes(BTreeMap::new())
+        };
+        let git = FakeGitOps::new().with_repo_root(Ok(repo_root.clone()));
+        let tmux = FakeTmuxOps::new();
+        let home = tmp.path().to_path_buf();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        new(
+            &ctx,
+            "my-lane",
+            None,
+            Some("origin/main"),
+            Path::new("/cwd"),
+            &mut out,
+        )
+        .unwrap();
+
+        let wt_path = worktree_root.join("axiom").join("my-lane");
+        assert!(!wt_path.join(".env.local").exists());
+
+        let printed = out_string(&out);
+        assert!(!printed.contains("Linked .env.local"));
     }
 
     #[test]

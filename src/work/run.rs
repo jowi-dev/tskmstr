@@ -27,12 +27,19 @@
 //! 3. Derive `wt_name` (worktree/branch-prefix name): the lowercased ticket
 //!    if one was given, else the lane name (`run_lane`'s `wt_name`).
 //! 4. Provision the worktree if `wt_path` doesn't exist yet, cutting
-//!    `wt_name` as the initial branch from the resolved base.
-//! 5. Error if the worktree is dirty (a previous run may have left work
-//!    behind) — `work.ml`'s `git status --porcelain` guard. (`work.ml` also
-//!    `git fetch`es origin first; [`GitOps`] has no fetch method yet, so
-//!    this port checks cleanliness without a preceding fetch — a known,
-//!    flagged gap, not a silent drop.)
+//!    `wt_name` as the initial branch from the resolved base. If
+//!    `<repo_root>/.env.local` exists, [`GitOps::provision_worktree`]
+//!    symlinks it into the new worktree and this prints `work.ml`'s
+//!    "Linked .env.local from main repo" message.
+//! 5. Fetch `origin` in the worktree ([`GitOps::fetch_origin`]), so the base
+//!    ref this run's branch is about to be cut from (step 6) is current —
+//!    `work.ml` does this immediately after provisioning-if-missing, before
+//!    the dirty check. `work.ml` ignores this call's exit status entirely
+//!    (`let _ = Sys.command ...`); this port surfaces the error but only
+//!    warns and continues, since an offline fetch failure shouldn't sink an
+//!    otherwise-viable run. Then error if the worktree is dirty (a previous
+//!    run may have left work behind) — `work.ml`'s `git status --porcelain`
+//!    guard.
 //! 6. Resolve the branch owner (see [`resolve_branch_owner`]) and cut this
 //!    run's fresh timestamped branch off the resolved base
 //!    (`GitOps::switch_new_branch`, always `--no-track`).
@@ -377,11 +384,24 @@ pub fn run_lane_fg(
 
     if !wt_path.exists() {
         let base = resolve_base(deps.git)?;
-        deps.git
+        let linked = deps
+            .git
             .provision_worktree(&repo_root, &wt_path, &wt_name, Some(&base))?;
+        if linked {
+            writeln!(out, "Linked .env.local from main repo")?;
+        }
     }
 
-    // Step 5: refuse to run in a dirty worktree.
+    // Step 5: fetch origin so the base ref this run's branch is about to be
+    // cut from is current. work.ml ignores this call's exit status
+    // entirely (`let _ = Sys.command ...`) — an offline fetch failure
+    // shouldn't make an otherwise-viable run fail, so this warns and
+    // continues rather than propagating the error.
+    if let Err(err) = deps.git.fetch_origin(&wt_path) {
+        writeln!(out, "warning: git fetch origin failed: {err}")?;
+    }
+
+    // Step 5b: refuse to run in a dirty worktree.
     if !deps.git.status_is_clean(&wt_path)? {
         return Err(RunLaneError::WorktreeDirty(wt_path));
     }
@@ -908,6 +928,191 @@ mod tests {
 
         assert!(matches!(err, RunLaneError::WorktreeDirty(_)));
         assert!(spawner.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_lane_fg_fetches_origin_before_cutting_the_run_branch() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        // fetch_origin must run before switch_new_branch cuts this run's
+        // fresh branch, mirroring work.ml's run_lane ordering (fetch, then
+        // cut) so the resolved base ref is current.
+        assert_eq!(git.call_log(), vec!["fetch_origin", "switch_new_branch"]);
+    }
+
+    #[test]
+    fn run_lane_fg_fetches_origin_even_when_worktree_already_exists() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        let wt_path = worktree_root
+            .join(repo_root.file_name().unwrap())
+            .join("mylane");
+        std::fs::create_dir_all(&wt_path).unwrap();
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(git.fetch_origin_calls(), vec![wt_path]);
+    }
+
+    #[test]
+    fn run_lane_fg_warns_but_continues_when_fetch_origin_fails() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new().with_fetch_origin_result(Err(GitError::Command {
+            command: "git fetch --quiet origin".to_string(),
+            exit_code: Some(1),
+            stderr: "could not resolve host".to_string(),
+        }));
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("warning: git fetch origin failed"));
+        assert!(printed.contains("could not resolve host"));
+    }
+
+    #[test]
+    fn run_lane_fg_prints_linked_env_local_message_when_present_in_repo_root() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        std::fs::write(repo_root.join(".env.local"), "DATABASE_URL=postgres://\n").unwrap();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.worktree.join(".env.local").is_symlink());
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("Linked .env.local from main repo"));
     }
 
     #[test]

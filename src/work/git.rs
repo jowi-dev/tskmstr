@@ -87,13 +87,21 @@ pub trait GitOps {
     /// worktree to it as-is. Otherwise cuts a new branch: from `from_base`
     /// if given (with `--no-track` — see the module-level "`--no-track`
     /// incident" section), or from the current `HEAD` if not.
+    ///
+    /// After the worktree is created, mirrors `work.ml`'s
+    /// `provision_worktree`: if `<repo_dir>/.env.local` exists, symlinks it
+    /// into the new worktree (`ln -sf`) — Axiom lane runs read `.env.local`
+    /// for database URLs, so this is load-bearing, not cosmetic. Returns
+    /// whether the link was created, so callers can print `work.ml`'s
+    /// "Linked .env.local from main repo" message; this trait has no output
+    /// sink of its own to print through.
     fn provision_worktree(
         &self,
         repo_dir: &Path,
         wt_path: &Path,
         branch: &str,
         from_base: Option<&str>,
-    ) -> Result<(), GitError>;
+    ) -> Result<bool, GitError>;
 
     /// Whether the working tree at `dir` has no uncommitted changes
     /// (`git status --porcelain` producing no output).
@@ -130,6 +138,20 @@ pub trait GitOps {
     /// code of 1, which is `Ok(None)` here, not an error — only a failure
     /// to spawn `git` itself is an error.
     fn config_get(&self, dir: &Path, key: &str) -> Result<Option<String>, GitError>;
+
+    /// Fetch from `origin` in the working tree at `dir`
+    /// (`git -C <dir> fetch --quiet origin`), mirroring `work.ml`'s
+    /// `run_lane`: called right after provisioning-if-missing and before the
+    /// dirty-worktree check, so the base ref (e.g. `origin/staging`) this
+    /// run's branch is about to be cut from is current.
+    ///
+    /// `work.ml` ignores this command's exit status entirely (`let _ =
+    /// Sys.command ...`) — a fetch can fail offline without making the run
+    /// unviable. This trait surfaces the real `Result` rather than
+    /// swallowing it; [`crate::work::run::run_lane_fg`] is the caller that
+    /// decides to warn and continue rather than abort, matching `work.ml`'s
+    /// tolerance but with a printed warning instead of silence.
+    fn fetch_origin(&self, dir: &Path) -> Result<(), GitError>;
 }
 
 /// [`GitOps`] implementation that shells out to the real `git` binary.
@@ -234,13 +256,19 @@ impl GitOps for ShellGitOps {
         wt_path: &Path,
         branch: &str,
         from_base: Option<&str>,
-    ) -> Result<(), GitError> {
+    ) -> Result<bool, GitError> {
         let branch_exists = self.branch_exists_local(repo_dir, branch)?
             || self.branch_exists_remote(repo_dir, branch)?;
         let args = worktree_add_args(wt_path, branch, branch_exists, from_base);
         let output = run_git(repo_dir, &args, "git worktree add")?;
 
-        interpret_success_or_command_error("git worktree add", output.status.code(), &output.stderr)
+        interpret_success_or_command_error(
+            "git worktree add",
+            output.status.code(),
+            &output.stderr,
+        )?;
+
+        Ok(link_env_local(repo_dir, wt_path))
     }
 
     fn status_is_clean(&self, dir: &Path) -> Result<bool, GitError> {
@@ -339,6 +367,41 @@ impl GitOps for ShellGitOps {
             _ => Ok(None),
         }
     }
+
+    fn fetch_origin(&self, dir: &Path) -> Result<(), GitError> {
+        let output = run_git(dir, &fetch_origin_args(), "git fetch --quiet origin")?;
+        interpret_success_or_command_error(
+            "git fetch --quiet origin",
+            output.status.code(),
+            &output.stderr,
+        )
+    }
+}
+
+/// Symlink `<repo_dir>/.env.local` into `<wt_path>/.env.local` if the former
+/// exists, mirroring `work.ml`'s `provision_worktree` (`ln -sf`). Replaces
+/// any existing file/link at the destination first, matching `ln -sf`'s
+/// overwrite semantics. Returns whether a link was created (i.e. whether
+/// `.env.local` existed in `repo_dir` at all) so callers can print
+/// `work.ml`'s "Linked .env.local from main repo" message.
+fn link_env_local(repo_dir: &Path, wt_path: &Path) -> bool {
+    let src = repo_dir.join(".env.local");
+    if !src.exists() {
+        return false;
+    }
+    let dest = wt_path.join(".env.local");
+    let _ = std::fs::remove_file(&dest);
+    std::os::unix::fs::symlink(&src, &dest).is_ok()
+}
+
+/// Build the argument list for `git fetch --quiet origin`, mirroring
+/// `work.ml`'s `run_lane` fetch (`git -C '<wt_path>' fetch --quiet origin`).
+fn fetch_origin_args() -> Vec<String> {
+    vec![
+        "fetch".to_string(),
+        "--quiet".to_string(),
+        "origin".to_string(),
+    ]
 }
 
 /// Build the argument list for `git show-ref --verify --quiet <ref>`, shared
@@ -518,13 +581,20 @@ pub struct FakeGitOps {
     switch_new_branch_result: std::cell::RefCell<Result<(), GitError>>,
     default_base_result: std::cell::RefCell<Result<String, GitError>>,
     remove_worktree_result: std::cell::RefCell<Result<(), GitError>>,
+    fetch_origin_result: std::cell::RefCell<Result<(), GitError>>,
 
     branch_exists_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     branch_exists_remote_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     provision_worktree_calls: std::cell::RefCell<Vec<ProvisionWorktreeCall>>,
     switch_new_branch_calls: std::cell::RefCell<Vec<SwitchNewBranchCall>>,
     remove_worktree_calls: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
+    fetch_origin_calls: std::cell::RefCell<Vec<PathBuf>>,
     config_values: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    /// Method names, in call order, across every traced method — currently
+    /// just [`GitOps::fetch_origin`] and [`GitOps::switch_new_branch`], the
+    /// pair whose relative order [`crate::work::run::run_lane_fg`]'s tests
+    /// need to assert on (fetch must happen before the branch is cut).
+    call_log: std::cell::RefCell<Vec<&'static str>>,
 }
 
 impl Default for FakeGitOps {
@@ -542,12 +612,15 @@ impl Default for FakeGitOps {
             switch_new_branch_result: std::cell::RefCell::new(Ok(())),
             default_base_result: std::cell::RefCell::new(Ok("origin/main".to_string())),
             remove_worktree_result: std::cell::RefCell::new(Ok(())),
+            fetch_origin_result: std::cell::RefCell::new(Ok(())),
             branch_exists_local_calls: std::cell::RefCell::new(Vec::new()),
             branch_exists_remote_calls: std::cell::RefCell::new(Vec::new()),
             provision_worktree_calls: std::cell::RefCell::new(Vec::new()),
             switch_new_branch_calls: std::cell::RefCell::new(Vec::new()),
             remove_worktree_calls: std::cell::RefCell::new(Vec::new()),
+            fetch_origin_calls: std::cell::RefCell::new(Vec::new()),
             config_values: std::cell::RefCell::new(std::collections::HashMap::new()),
+            call_log: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -610,6 +683,23 @@ impl FakeGitOps {
     pub fn with_remove_worktree_result(self, result: Result<(), GitError>) -> Self {
         *self.remove_worktree_result.borrow_mut() = result;
         self
+    }
+
+    /// Set the result `fetch_origin` will return.
+    pub fn with_fetch_origin_result(self, result: Result<(), GitError>) -> Self {
+        *self.fetch_origin_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `dir` arguments passed to `fetch_origin`, in call order.
+    pub fn fetch_origin_calls(&self) -> Vec<PathBuf> {
+        self.fetch_origin_calls.borrow().clone()
+    }
+
+    /// Method names, in call order, across every traced method. See the
+    /// `call_log` field doc for which methods are traced.
+    pub fn call_log(&self) -> Vec<&'static str> {
+        self.call_log.borrow().clone()
     }
 
     /// The `(repo_dir, wt_path)` pairs passed to `remove_worktree`, in call order.
@@ -677,7 +767,7 @@ impl GitOps for FakeGitOps {
         wt_path: &Path,
         branch: &str,
         from_base: Option<&str>,
-    ) -> Result<(), GitError> {
+    ) -> Result<bool, GitError> {
         self.provision_worktree_calls
             .borrow_mut()
             .push(ProvisionWorktreeCall {
@@ -693,10 +783,13 @@ impl GitOps for FakeGitOps {
         // exists before starting a session in it) need that same
         // real-filesystem effect to be exercisable in tests without
         // shelling out to `git`.
-        if result.is_ok() {
-            let _ = std::fs::create_dir_all(wt_path);
+        match result {
+            Ok(()) => {
+                let _ = std::fs::create_dir_all(wt_path);
+                Ok(link_env_local(repo_dir, wt_path))
+            }
+            Err(err) => Err(err),
         }
-        result
     }
 
     fn status_is_clean(&self, _dir: &Path) -> Result<bool, GitError> {
@@ -704,6 +797,7 @@ impl GitOps for FakeGitOps {
     }
 
     fn switch_new_branch(&self, dir: &Path, branch: &str, base: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("switch_new_branch");
         self.switch_new_branch_calls
             .borrow_mut()
             .push(SwitchNewBranchCall {
@@ -727,6 +821,12 @@ impl GitOps for FakeGitOps {
 
     fn config_get(&self, _dir: &Path, key: &str) -> Result<Option<String>, GitError> {
         Ok(self.config_values.borrow().get(key).cloned())
+    }
+
+    fn fetch_origin(&self, dir: &Path) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("fetch_origin");
+        self.fetch_origin_calls.borrow_mut().push(dir.to_path_buf());
+        self.fetch_origin_result.borrow().clone()
     }
 }
 
@@ -835,6 +935,11 @@ mod tests {
             show_ref_args("refs/heads/main"),
             vec!["show-ref", "--verify", "--quiet", "refs/heads/main"]
         );
+    }
+
+    #[test]
+    fn fetch_origin_args_match_work_ml() {
+        assert_eq!(fetch_origin_args(), vec!["fetch", "--quiet", "origin"]);
     }
 
     // --- output-interpretation tests ---
@@ -963,6 +1068,67 @@ mod tests {
             stderr: "boom".to_string(),
         }));
         assert!(fake.status_is_clean(Path::new("/wt")).is_err());
+    }
+
+    #[test]
+    fn fake_git_ops_records_fetch_origin_calls() {
+        let fake = FakeGitOps::new();
+        fake.fetch_origin(Path::new("/wt")).unwrap();
+
+        assert_eq!(fake.fetch_origin_calls(), vec![PathBuf::from("/wt")]);
+    }
+
+    #[test]
+    fn fake_git_ops_fetch_origin_returns_configured_error() {
+        let fake = FakeGitOps::new().with_fetch_origin_result(Err(GitError::Command {
+            command: "git fetch".to_string(),
+            exit_code: Some(1),
+            stderr: "could not resolve host".to_string(),
+        }));
+        assert!(fake.fetch_origin(Path::new("/wt")).is_err());
+    }
+
+    #[test]
+    fn fake_git_ops_call_log_records_fetch_origin_before_switch_new_branch() {
+        let fake = FakeGitOps::new();
+        fake.fetch_origin(Path::new("/wt")).unwrap();
+        fake.switch_new_branch(Path::new("/wt"), "branch", "origin/main")
+            .unwrap();
+
+        assert_eq!(fake.call_log(), vec!["fetch_origin", "switch_new_branch"]);
+    }
+
+    #[test]
+    fn fake_git_ops_provision_worktree_links_env_local_when_present_in_repo_dir() {
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let wt_path = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join(".env.local"), "DATABASE_URL=postgres://\n").unwrap();
+
+        let fake = FakeGitOps::new();
+        let linked = fake
+            .provision_worktree(&repo_dir, &wt_path, "lane", None)
+            .unwrap();
+
+        assert!(linked);
+        assert!(wt_path.join(".env.local").is_symlink());
+    }
+
+    #[test]
+    fn fake_git_ops_provision_worktree_reports_no_link_when_env_local_absent() {
+        let tmp = TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let wt_path = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let fake = FakeGitOps::new();
+        let linked = fake
+            .provision_worktree(&repo_dir, &wt_path, "lane", None)
+            .unwrap();
+
+        assert!(!linked);
+        assert!(!wt_path.join(".env.local").exists());
     }
 
     // --- ShellGitOps integration tests against a real temp git repo ---
@@ -1098,6 +1264,76 @@ mod tests {
             !output.status.success(),
             "expected no upstream to be configured for a --no-track branch"
         );
+    }
+
+    #[test]
+    fn shell_git_ops_provision_worktree_links_env_local_from_main_repo() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join(".env.local"), "DATABASE_URL=postgres://\n").unwrap();
+        let wt_path = tmp.path().join("wt");
+
+        let ops = ShellGitOps::new();
+        let linked = ops
+            .provision_worktree(tmp.path(), &wt_path, "env-local-branch", None)
+            .unwrap();
+
+        assert!(linked);
+        let link = wt_path.join(".env.local");
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            tmp.path().join(".env.local")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "DATABASE_URL=postgres://\n"
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_provision_worktree_reports_no_link_when_env_local_absent() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let wt_path = tmp.path().join("wt");
+
+        let ops = ShellGitOps::new();
+        let linked = ops
+            .provision_worktree(tmp.path(), &wt_path, "no-env-local-branch", None)
+            .unwrap();
+
+        assert!(!linked);
+        assert!(!wt_path.join(".env.local").exists());
+    }
+
+    #[test]
+    fn shell_git_ops_fetch_origin_succeeds_against_real_remote() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_init(&origin);
+
+        let clone = tmp.path().join("clone");
+        let status = StdCommand::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&clone)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let ops = ShellGitOps::new();
+        ops.fetch_origin(&clone).unwrap();
+    }
+
+    #[test]
+    fn shell_git_ops_fetch_origin_fails_without_a_remote() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+
+        let ops = ShellGitOps::new();
+        let err = ops.fetch_origin(tmp.path()).unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }));
     }
 
     #[test]
