@@ -1,9 +1,11 @@
 //! `tm work`: port of devtools' `j work` lane runner (see
 //! `docs/plans/runner-port.md`). `new`/`remove`/`list`/`restore`/`start`
-//! and the foreground `run` path are wired into the CLI (`src/cli/work.rs`,
-//! steps 5 and 9); detached `run` (step 10) is not yet.
+//! and both the foreground (`--fg`) and detached (default) `run` paths are
+//! wired into the CLI (`src/cli/work.rs`, steps 5, 9, and 10). See
+//! [`detach`] for the detached path's design.
 
 pub mod claude;
+pub mod detach;
 pub mod git;
 pub mod hooks;
 pub mod naming;

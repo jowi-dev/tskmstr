@@ -106,13 +106,19 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
         } => {
             let gh = ShellGhCli::new();
             let spawner = tskmstr::work::runner::StdProcessSpawner;
-            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let run_db_path = resolve_run_db_path();
+            let run_store = tskmstr::runs::RunStore::open(&run_db_path)?;
             let clock = tskmstr::work::run::SystemClock;
+            let detach = tskmstr::work::detach::RealDetachSpawner;
+            let current_exe = std::env::current_exe()?;
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
                 run_store: &run_store,
                 clock: &clock,
+                detach: &detach,
+                current_exe: &current_exe,
+                run_db_path: &run_db_path,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -124,6 +130,21 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
             };
             let succeeded =
                 tskmstr::cli::work::run(&ctx, &run_deps, &lane, request, fg, &mut stdout)?;
+            if !succeeded {
+                return Err("lane run failed".into());
+            }
+        }
+        WorkCmd::Supervise { state_file } => {
+            let raw = std::fs::read_to_string(&state_file)?;
+            let state: tskmstr::work::detach::SupervisorState = serde_json::from_str(&raw)?;
+            let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
+            let spawner = tskmstr::work::runner::StdProcessSpawner;
+            let succeeded =
+                tskmstr::cli::work::supervise(&spawner, &run_store, &state, &mut stdout)?;
+            // The state file has served its one-shot handoff purpose; a
+            // failed removal isn't worth failing the (already recorded) run
+            // over. On a supervisor crash it survives for debugging.
+            let _ = std::fs::remove_file(&state_file);
             if !succeeded {
                 return Err("lane run failed".into());
             }

@@ -150,10 +150,11 @@ pub enum WorkCmd {
     /// Run one autonomous headless Claude Code session for a configured
     /// lane, tracked in the run-state store.
     ///
-    /// Only `--fg` (synchronous, this invocation waits for `claude` to
-    /// finish) is implemented so far; the detached default (return the
-    /// terminal immediately, let the run finish in the background) is
-    /// `docs/plans/runner-port.md` step 10, not yet built.
+    /// Detached by default: provisioning/preflight run in the foreground
+    /// (so errors surface immediately), then a supervisor process is
+    /// spawned to run `claude` and record the outcome, and this invocation
+    /// returns the terminal right away. `--fg` instead runs synchronously,
+    /// waiting for `claude` to finish before returning.
     Run {
         /// Configured lane name (must match a `[work.lanes.<name>]` entry).
         lane: String,
@@ -178,10 +179,22 @@ pub enum WorkCmd {
         #[arg(long)]
         prompt: Option<String>,
         /// Run synchronously in the foreground, waiting for `claude` to
-        /// finish before returning. Currently required — the detached
-        /// default isn't implemented yet.
+        /// finish before returning, instead of the detached default.
         #[arg(long)]
         fg: bool,
+    },
+    /// Hidden: the detached run supervisor's own re-exec target. Not a
+    /// user-facing command — `tm work run` (without `--fg`) spawns this
+    /// itself (see `src/work/detach.rs`) after provisioning and starting
+    /// the tracked run in the foreground; it deserializes `--state-file`'s
+    /// `PreparedRun` JSON, spawns `claude`, waits, and finishes the run.
+    #[command(name = "__supervise", hide = true)]
+    Supervise {
+        /// Path to the JSON-serialized
+        /// `tskmstr::work::run::PreparedRun` state file written by the
+        /// foreground half of `tm work run`.
+        #[arg(long = "state-file")]
+        state_file: String,
     },
 }
 
@@ -656,6 +669,7 @@ impl Prompter for FakePrompter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_auth_login() {
@@ -1678,6 +1692,36 @@ mod tests {
             }) => assert_eq!(dir, Some("/tmp/some-dir".to_string())),
             other => panic!("expected Work Start, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_work_supervise_hidden_subcommand() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "work",
+            "__supervise",
+            "--state-file",
+            "/tmp/mylane-20260101.supervisor.json",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Supervise { state_file },
+            }) => assert_eq!(state_file, "/tmp/mylane-20260101.supervisor.json"),
+            other => panic!("expected Work Supervise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn work_supervise_is_hidden_from_help() {
+        let mut cmd = Cli::command();
+        let work_cmd = cmd
+            .find_subcommand_mut("work")
+            .expect("work subcommand should exist");
+        let supervise = work_cmd
+            .find_subcommand("__supervise")
+            .expect("__supervise subcommand should be registered");
+        assert!(supervise.is_hide_set());
     }
 
     #[test]

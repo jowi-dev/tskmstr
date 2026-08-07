@@ -93,7 +93,7 @@ pub struct ClaudeInvocationInputs {
 /// environment deltas to apply before spawning. Pure data — nothing here
 /// spawns a process, reads the environment, or reads the clock. Consumed by
 /// step 8's process-spawning code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeInvocation {
     /// The program to spawn, always `"claude"`.
     pub program: String,

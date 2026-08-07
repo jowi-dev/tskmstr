@@ -49,7 +49,8 @@ use thiserror::Error;
 
 use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
-use crate::runs::RunStore;
+use crate::runs::{RunStore, RunStoreError};
+use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
 use crate::work::naming::{self, expand_tilde};
 use crate::work::run::{Clock, RunLaneError, RunLaneRequest};
@@ -90,15 +91,25 @@ pub enum WorkCliError {
     #[error("cannot derive a repo name from `{}`", .0.display())]
     UnresolvableRepoName(PathBuf),
 
-    /// `tm work run` was invoked without `--fg`. The detached default
-    /// (`docs/plans/runner-port.md` step 10) isn't implemented yet.
-    #[error("detached `tm work run` is not yet implemented, use --fg")]
-    DetachedRunNotImplemented,
-
-    /// The foreground lane-run core failed. See
+    /// The lane-run core (shared by `--fg` and the detached path's
+    /// foreground provisioning half) failed. See
     /// [`crate::work::run::RunLaneError`] for the specific cause.
     #[error(transparent)]
     Run(#[from] RunLaneError),
+
+    /// Spawning the detached run's supervisor process failed.
+    #[error(transparent)]
+    Detach(#[from] DetachError),
+
+    /// The supervisor's `--state-file` could not be serialized/deserialized
+    /// as JSON.
+    #[error("failed to (de)serialize supervisor state: {0}")]
+    SupervisorState(#[from] serde_json::Error),
+
+    /// A run-state store operation failed (the supervisor path's
+    /// `update_pid` call, outside [`RunLaneError`]'s scope).
+    #[error(transparent)]
+    RunStore(#[from] RunStoreError),
 }
 
 /// Dependencies `tm work` subcommands need, gathered so callers don't have
@@ -222,21 +233,43 @@ pub struct RunDeps<'a> {
     pub run_store: &'a RunStore,
     /// "Now" source for the run's timestamp.
     pub clock: &'a dyn Clock,
+    /// Detached-supervisor process spawning (real or fake). Only used when
+    /// `run`'s `fg` argument is `false`.
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path (`std::env::current_exe()` in
+    /// production), re-exec'd as the detached supervisor. Only used when
+    /// `fg` is `false`.
+    pub current_exe: &'a Path,
+    /// The run-state database path, threaded through to the state file so
+    /// the re-exec'd supervisor (a separate process, sharing no memory with
+    /// this one) knows which `RunStore` to open. Only used when `fg` is
+    /// `false`.
+    pub run_db_path: &'a Path,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
-/// [--permission-mode m] [--prompt path] --fg`: run one foreground lane
-/// run. Thin CLI wiring over [`crate::work::run::run_lane_fg`], which owns
-/// the actual sequencing (see that module's doc comment) so it stays
-/// callable from a future TUI without going through this CLI layer at all.
+/// [--permission-mode m] [--prompt path] [--fg]`: run one lane run. Thin CLI
+/// wiring over [`crate::work::run`], which owns the actual sequencing (see
+/// that module's doc comment) so it stays callable from a future TUI
+/// without going through this CLI layer at all.
 ///
-/// `fg` must be `true` — the detached default
-/// (`docs/plans/runner-port.md` step 10) isn't implemented yet.
+/// `fg = true` runs synchronously in this process
+/// ([`crate::work::run::run_lane_fg`]) and returns once `claude` has
+/// finished. `fg = false` (the default) does provisioning/preflight/
+/// `start_run` in this process — so a bad lane, missing prompt, or dirty
+/// worktree still errors out immediately with no run row left behind — then
+/// re-execs `deps.current_exe` as a detached supervisor (see
+/// `crate::work::detach`) to run `claude` and finish the tracked run, and
+/// returns without waiting for it.
 ///
-/// Returns `Ok(true)` when the run completed successfully, `Ok(false)` when
-/// it completed but was recorded as failed (a non-zero `claude` exit or
-/// `is_error: true`) — mirroring `work.ml`'s `if is_err then exit 1 else
-/// exit 0`, which is not itself an error condition worth an `Err`.
+/// Returns `Ok(true)` when the run completed successfully (`fg`) or was
+/// successfully handed off to a supervisor (detached); `Ok(false)` only when
+/// an `fg` run completed but was recorded as failed (a non-zero `claude`
+/// exit or `is_error: true`) — mirroring `work.ml`'s `if is_err then exit 1
+/// else exit 0`, which is not itself an error condition worth an `Err`. The
+/// detached path has no equivalent "did it fail" signal at hand-off time —
+/// `tm runs watch`/`tm runs show` are how that outcome is observed later —
+/// so it always returns `Ok(true)`.
 pub fn run(
     ctx: &WorkContext<'_>,
     deps: &RunDeps<'_>,
@@ -245,10 +278,6 @@ pub fn run(
     fg: bool,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
-    if !fg {
-        return Err(WorkCliError::DetachedRunNotImplemented);
-    }
-
     let paths = crate::work::run::RunLanePaths {
         home: ctx.home.to_path_buf(),
         state_dir: ctx.home.join(".local/state/tskmstr/work"),
@@ -262,7 +291,82 @@ pub fn run(
         clock: deps.clock,
     };
 
-    let outcome = crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
+    if fg {
+        let outcome =
+            crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
+        return Ok(!outcome.is_error);
+    }
+
+    // Detached: provisioning/preflight/start_run happen here, in the
+    // foreground, with pid = None (the supervisor records its own pid on
+    // startup — see prepare_run_lane's doc comment on why).
+    let prepared = crate::work::run::prepare_run_lane(
+        &run_deps, ctx.config, &paths, lane, request, None, out,
+    )?;
+
+    std::fs::create_dir_all(&paths.state_dir)?;
+    let log_path = paths
+        .state_dir
+        .join(format!("{}-{}.log", prepared.wt_name, prepared.timestamp));
+    let state_path = paths.state_dir.join(format!(
+        "{}-{}.supervisor.json",
+        prepared.wt_name, prepared.timestamp
+    ));
+
+    let ticket = prepared.ticket.clone();
+    let branch = prepared.branch.clone();
+    let worktree = prepared.worktree.clone();
+
+    let state = crate::work::detach::SupervisorState {
+        prepared,
+        run_db_path: deps.run_db_path.to_path_buf(),
+    };
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+
+    let argv = crate::work::detach::supervisor_argv(&state_path);
+    deps.detach
+        .spawn_detached(deps.current_exe, &argv, &worktree, &log_path)?;
+
+    writeln!(
+        out,
+        "started   {lane} {} on {branch}",
+        ticket.as_deref().unwrap_or("-")
+    )?;
+    writeln!(out, "worktree  {}", worktree.display())?;
+    writeln!(out, "log       {}", log_path.display())?;
+    writeln!(out, "watch:    tm runs watch")?;
+    writeln!(out, "follow:   tail -f {}", log_path.display())?;
+    if let Some(ticket) = &ticket {
+        writeln!(out, "resume:   tm runs resume {ticket}")?;
+    }
+
+    Ok(true)
+}
+
+/// `tm work __supervise --state-file <path>`: the detached run's re-exec'd
+/// supervisor entry point. Reads back the [`crate::work::detach::SupervisorState`]
+/// `run` (above) wrote, opens the run store it points at, and runs
+/// [`crate::work::run::supervise_run`] — record this process's own pid, then
+/// spawn `claude`, wait, parse, and finish the tracked run.
+///
+/// Split from the thin `main.rs`-level dispatch (which owns reading the
+/// state file, opening the real [`RunStore`], and picking
+/// [`crate::work::runner::StdProcessSpawner`]) so the actual supervision
+/// logic here is exercised with injected fakes in tests, exactly like
+/// [`run`] above.
+pub fn supervise(
+    spawner: &dyn ProcessSpawner,
+    run_store: &RunStore,
+    state: &crate::work::detach::SupervisorState,
+    out: &mut dyn Write,
+) -> Result<bool, WorkCliError> {
+    let outcome = crate::work::run::supervise_run(
+        spawner,
+        run_store,
+        &state.prepared,
+        std::process::id(),
+        out,
+    )?;
     Ok(!outcome.is_error)
 }
 
@@ -1141,5 +1245,302 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, WorkCliError::DirectoryNotFound(_)));
+    }
+
+    // --- run (detached) / supervise ---
+
+    use crate::github::gh_cli::FakeGhCli;
+    use crate::runs::RunStatus;
+    use crate::work::detach::{FakeDetachSpawner, SupervisorState};
+    use crate::work::run::FakeClock;
+    use crate::work::runner::FakeProcessSpawner;
+
+    fn lane_config_for_run(repo: &str) -> LaneConfig {
+        LaneConfig {
+            repo: repo.to_string(),
+            prompt_file: None,
+            base_branch: None,
+            model: None,
+            max_turns: None,
+            permission_mode: None,
+        }
+    }
+
+    fn run_setup() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let prompt_dir = home.join(".claude/prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        let prompt_path = prompt_dir.join("mylane.md");
+        std::fs::write(&prompt_path, "Do the lane thing.").unwrap();
+        (tmp, home, repo_root, prompt_path)
+    }
+
+    fn canned_claude_json() -> String {
+        r#"{"session_id":"sess-1","total_cost_usd":0.5,"num_turns":3,"is_error":false,"result":"done"}"#.to_string()
+    }
+
+    #[test]
+    fn run_detached_spawns_a_supervisor_and_returns_without_running_claude() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+        };
+        let mut out = Vec::new();
+
+        let succeeded = run(
+            &ctx,
+            &deps,
+            "mylane",
+            RunLaneRequest::default(),
+            false,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(succeeded);
+
+        // The supervisor path never spawns `claude` itself — that's the
+        // re-exec'd supervisor's job.
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].program, current_exe);
+        assert_eq!(recorded[0].argv[0], "work");
+        assert_eq!(recorded[0].argv[1], "__supervise");
+        assert_eq!(recorded[0].argv[2], "--state-file");
+        let state_path = PathBuf::from(&recorded[0].argv[3]);
+        assert!(state_path.exists());
+
+        // A run row was started (with no pid yet — the supervisor records
+        // its own).
+        let runs = run_store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let run_row = run_store.run_by_id(runs[0].id).unwrap().unwrap();
+        assert_eq!(run_row.pid, None);
+        assert_eq!(run_row.status, RunStatus::Running);
+
+        let printed = out_string(&out);
+        assert!(printed.contains("started   mylane"));
+        assert!(printed.contains("worktree "));
+        assert!(printed.contains("log       "));
+        assert!(printed.contains("watch:    tm runs watch"));
+        assert!(printed.contains("follow:   tail -f"));
+
+        // The written state file round-trips into a valid SupervisorState
+        // pointing at the same run.
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        let state: SupervisorState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(state.prepared.run_id, run_row.id);
+        assert_eq!(state.run_db_path, run_db_path);
+    }
+
+    #[test]
+    fn run_detached_prints_resume_line_only_when_a_ticket_was_given() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        run(&ctx, &deps, "mylane", request, false, &mut out).unwrap();
+
+        let printed = out_string(&out);
+        assert!(printed.contains("resume:   tm runs resume ABC-123"));
+    }
+
+    #[test]
+    fn run_detached_errors_before_any_supervisor_spawn_when_prompt_file_missing() {
+        let (tmp, home, repo_root, prompt_path) = run_setup();
+        std::fs::remove_file(&prompt_path).unwrap();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+        };
+        let mut out = Vec::new();
+
+        let err = run(
+            &ctx,
+            &deps,
+            "mylane",
+            RunLaneRequest::default(),
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorkCliError::Run(RunLaneError::PromptFileMissing(_))
+        ));
+        assert!(detach.recorded.lock().unwrap().is_empty());
+        assert_eq!(run_store.list_runs().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn supervise_records_its_own_pid_and_completes_the_run() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        // Prepare a run row exactly the way the detached `run` path would,
+        // with no pid yet.
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_deps = crate::work::run::RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = crate::work::run::RunLanePaths {
+            home: home.clone(),
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+        let prepared = crate::work::run::prepare_run_lane(
+            &run_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+
+        let state = SupervisorState {
+            prepared,
+            run_db_path: tmp.path().join("runs.db"),
+        };
+
+        let supervisor_spawner = FakeProcessSpawner::success(canned_claude_json());
+        let mut out = Vec::new();
+
+        let succeeded = supervise(&supervisor_spawner, &run_store, &state, &mut out).unwrap();
+
+        assert!(succeeded);
+        let run_row = run_store.run_by_id(state.prepared.run_id).unwrap().unwrap();
+        assert_eq!(run_row.pid, Some(std::process::id()));
+        assert_eq!(run_row.status, RunStatus::Done);
+
+        let printed = out_string(&out);
+        assert!(printed.contains("session   sess-1"));
     }
 }

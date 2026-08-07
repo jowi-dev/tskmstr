@@ -958,6 +958,36 @@ impl RunStore {
         Ok(())
     }
 
+    /// Updates a run row's recorded `pid` in place, without touching status,
+    /// heartbeat, or any other column.
+    ///
+    /// Exists for the detached `tm work run` supervisor (see
+    /// `docs/plans/runner-port.md` step 10): the row is created by the
+    /// foreground `tm work run` invocation before it re-execs itself into a
+    /// detached supervisor process, so the pid recorded at [`start_run`]
+    /// time (if any) is the *parent's*, not the long-lived supervisor's.
+    /// The supervisor calls this with its own `pid` immediately on startup
+    /// so [`RunStore::reap`]'s liveness check (and any other pid-based
+    /// tooling) probes the process that's actually still running the lane,
+    /// not one that's already exited.
+    ///
+    /// [`start_run`]: RunStore::start_run
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_pid(&self, run_id: i64, pid: u32) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET pid = ?1 WHERE id = ?2",
+            params![pid, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Appends an event to a run and bumps the run's heartbeat, atomically.
     ///
     /// `detail` is stored as-is; validating it (e.g. as JSON) is the CLI
@@ -1522,6 +1552,42 @@ mod tests {
         let err = store
             .finish_run(999, &FinishRun::default())
             .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_pid_overwrites_the_recorded_pid_and_leaves_other_columns_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: Some("owner/backend-20260101".to_string()),
+                pid: None,
+            })
+            .unwrap();
+
+        store.update_pid(id, 9999).unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.pid, Some(9999));
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.branch, Some("owner/backend-20260101".to_string()));
+    }
+
+    #[test]
+    fn update_pid_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store.update_pid(999, 1).expect_err("expected RunNotFound");
 
         match err {
             RunStoreError::RunNotFound(id) => assert_eq!(id, 999),

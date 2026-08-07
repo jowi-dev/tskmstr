@@ -239,6 +239,40 @@ pub struct RunLaneRequest {
     pub prompt_override: Option<String>,
 }
 
+/// Everything [`run_claude_and_finish`] needs to spawn `claude`, wait, parse
+/// its result, and finish the tracked run — the output of
+/// [`prepare_run_lane`] (steps 1-9 of the module doc's sequence), consumed by
+/// steps 10-13.
+///
+/// Deliberately `Serialize`/`Deserialize`: this is also the exact state a
+/// detached run's foreground half hands to its self-re-exec'd supervisor
+/// (see `src/work/detach.rs`), written to a JSON file the supervisor process
+/// reads back on startup since it shares no memory with its parent. Nothing
+/// here is a trait object or a borrowed reference, so it round-trips cleanly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedRun {
+    /// The `RunStore` row id [`prepare_run_lane`] created via `start_run`.
+    pub run_id: i64,
+    /// The lane name this run was prepared for.
+    pub lane: String,
+    /// The ticket given for this run, if any (used for the detached path's
+    /// printed `resume: tm runs resume <ticket>` line).
+    pub ticket: Option<String>,
+    /// The worktree/branch-prefix name (`run_lane`'s `wt_name`).
+    pub wt_name: String,
+    /// The timestamp this run's branch/log/state files are suffixed with.
+    pub timestamp: String,
+    /// The worktree path this run executes in.
+    pub worktree: PathBuf,
+    /// The fresh branch cut for this run.
+    pub branch: String,
+    /// The fully resolved `claude` invocation.
+    pub invocation: crate::work::claude::ClaudeInvocation,
+    /// Where the spawned `claude` process's stdout (its result JSON) is
+    /// written, and later read back from.
+    pub out_json_path: PathBuf,
+}
+
 /// The result of one completed `tm work run --fg` invocation.
 #[derive(Debug, Clone)]
 pub struct RunLaneOutcome {
@@ -333,6 +367,14 @@ fn repo_name(repo_root: &Path) -> Option<String> {
 /// branch, invoke `claude -p`, record the outcome in `run_store`, and print
 /// the summary to `out`. See the module doc comment for the full ported
 /// sequence.
+///
+/// Composed from [`prepare_run_lane`] (steps 1-9, provisioning through
+/// `start_run`, recording *this* process's pid since `--fg` is itself the
+/// driver) followed by [`run_claude_and_finish`] (steps 10-13, spawn through
+/// the printed summary) — the same split the detached path
+/// (`src/work/detach.rs`) uses, except the detached path hands
+/// [`prepare_run_lane`]'s output to a re-exec'd supervisor instead of
+/// calling [`run_claude_and_finish`] itself.
 pub fn run_lane_fg(
     deps: &RunLaneDeps<'_>,
     config: &WorkConfig,
@@ -341,6 +383,42 @@ pub fn run_lane_fg(
     request: RunLaneRequest,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
+    let prepared = prepare_run_lane(
+        deps,
+        config,
+        paths,
+        lane,
+        request,
+        Some(std::process::id()),
+        out,
+    )?;
+    run_claude_and_finish(deps.spawner, deps.run_store, &prepared, out)
+}
+
+/// Steps 1-9 of the module doc's ported sequence: resolve the lane, preflight
+/// the prompt file, provision the worktree if missing, cut this run's fresh
+/// branch, deploy hooks, and [`RunStore::start_run`] — everything that must
+/// happen in the foreground so errors (unknown lane, missing prompt, dirty
+/// worktree, a failed `git`/`gh` call) surface to the invoking terminal
+/// immediately, before any `claude` process is spawned and before any run
+/// row exists to leak if something below fails.
+///
+/// `pid` is what gets recorded on the `start_run` row: `Some(current pid)`
+/// for `--fg` (this process *is* the driver and stays alive for the whole
+/// run), `None` for the detached path, whose caller re-execs a separate
+/// supervisor process that records its own pid via
+/// [`RunStore::update_pid`] immediately on startup — see
+/// `src/work/detach.rs`'s module doc for why a two-step pid handoff, not the
+/// parent's pid, is what keeps `tm runs reap` accurate.
+pub fn prepare_run_lane(
+    deps: &RunLaneDeps<'_>,
+    config: &WorkConfig,
+    paths: &RunLanePaths,
+    lane: &str,
+    request: RunLaneRequest,
+    pid: Option<u32>,
+    out: &mut dyn Write,
+) -> Result<PreparedRun, RunLaneError> {
     let lane_config = config
         .lanes
         .get(lane)
@@ -428,17 +506,21 @@ pub fn run_lane_fg(
     let settings_path = paths.hooks_deploy_dir.join("settings.json");
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
-    // Step 9: start the tracked run.
+    // Step 9: start the tracked run. `pid` is `Some(current pid)` for --fg
+    // (this process is the driver) and `None` for the detached path (the
+    // caller re-execs a separate supervisor, which records its own pid via
+    // `RunStore::update_pid` on startup — see this function's doc comment).
     let ticket_field = request.ticket.clone().unwrap_or_else(|| lane.to_string());
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: ticket_field,
         lane: lane.to_string(),
         worktree: wt_path.to_string_lossy().into_owned(),
         branch: Some(branch.clone()),
-        pid: Some(std::process::id()),
+        pid,
     })?;
 
-    // Step 10: build + spawn the claude invocation.
+    // Build the claude invocation (still part of step 9's "safe to do in the
+    // foreground" work: pure argv construction, no spawning yet).
     let model = request
         .model
         .clone()
@@ -467,28 +549,55 @@ pub fn run_lane_fg(
     std::fs::create_dir_all(&paths.state_dir)?;
     let out_json_path = paths.state_dir.join(format!("{wt_name}-{timestamp}.json"));
 
-    let status = deps.spawner.spawn(SpawnRequest {
+    Ok(PreparedRun {
+        run_id,
+        lane: lane.to_string(),
+        ticket: request.ticket.clone(),
+        wt_name,
+        timestamp,
+        worktree: wt_path,
+        branch,
+        invocation,
+        out_json_path,
+    })
+}
+
+/// Steps 10-13 of the module doc's ported sequence: spawn `claude`, wait,
+/// parse its result JSON, [`RunStore::finish_run`], and print the summary to
+/// `out`. The one tail both `--fg` ([`run_lane_fg`]) and the detached
+/// supervisor ([`supervise_run`]) call — per
+/// `docs/plans/runner-port.md` §4, there is exactly one spawn-wait-parse
+/// path, not one per run mode.
+pub fn run_claude_and_finish(
+    spawner: &dyn ProcessSpawner,
+    run_store: &RunStore,
+    prepared: &PreparedRun,
+    out: &mut dyn Write,
+) -> Result<RunLaneOutcome, RunLaneError> {
+    let invocation = &prepared.invocation;
+
+    let status = spawner.spawn(SpawnRequest {
         program: &invocation.program,
         args: &invocation.args,
         env_set: &invocation.env_set,
         env_remove: &invocation.env_remove,
-        current_dir: &wt_path,
-        stdout_path: &out_json_path,
+        current_dir: &prepared.worktree,
+        stdout_path: &prepared.out_json_path,
     })?;
 
-    // Step 11: parse the outcome. A non-zero exit forces a failed outcome
-    // regardless of what (if anything) the JSON says.
-    let raw_json = std::fs::read_to_string(&out_json_path).unwrap_or_default();
+    // Parse the outcome. A non-zero exit forces a failed outcome regardless
+    // of what (if anything) the JSON says.
+    let raw_json = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
     let parsed = parse_run_outcome(&raw_json).ok();
     let is_error = !status.success() || parsed.as_ref().map(|o| o.is_error).unwrap_or(true);
 
-    // Step 12: finish the tracked run.
+    // Finish the tracked run.
     let model_usage_json = parsed
         .as_ref()
         .and_then(|o| o.model_usage.as_ref())
         .and_then(|m| serde_json::to_string(m).ok());
-    deps.run_store.finish_run(
-        run_id,
+    run_store.finish_run(
+        prepared.run_id,
         &FinishRun {
             status: if is_error {
                 RunStatus::Failed
@@ -501,12 +610,12 @@ pub fn run_lane_fg(
             num_turns: parsed.as_ref().and_then(|o| o.num_turns).map(|t| t as i64),
             blocker: None,
             pr_url: None,
-            transcript: Some(out_json_path.to_string_lossy().into_owned()),
+            transcript: Some(prepared.out_json_path.to_string_lossy().into_owned()),
             model_usage: model_usage_json,
         },
     )?;
 
-    // Step 13: print the summary, mirroring work.ml's final printf block.
+    // Print the summary, mirroring work.ml's final printf block.
     let session_id = parsed.as_ref().map(|o| o.session_id.clone());
     let turns = parsed
         .as_ref()
@@ -524,9 +633,9 @@ pub fn run_lane_fg(
         .unwrap_or_default();
 
     writeln!(out)?;
-    writeln!(out, "lane      {lane}")?;
-    writeln!(out, "worktree  {}", wt_path.display())?;
-    writeln!(out, "branch    {branch}")?;
+    writeln!(out, "lane      {}", prepared.lane)?;
+    writeln!(out, "worktree  {}", prepared.worktree.display())?;
+    writeln!(out, "branch    {}", prepared.branch)?;
     writeln!(out, "session   {}", session_id.clone().unwrap_or_default())?;
     writeln!(out, "turns     {turns}")?;
     writeln!(out, "cost      ${cost}")?;
@@ -539,12 +648,33 @@ pub fn run_lane_fg(
     write!(out, "{summary}")?;
 
     Ok(RunLaneOutcome {
-        run_id,
+        run_id: prepared.run_id,
         is_error,
-        worktree: wt_path,
-        branch,
+        worktree: prepared.worktree.clone(),
+        branch: prepared.branch.clone(),
         session_id,
     })
+}
+
+/// The detached supervisor's core: record this process's own pid on the
+/// already-created run row (see [`prepare_run_lane`]'s doc comment on why
+/// the pid recorded at `start_run` time is `None` for this path), then run
+/// the same spawn-wait-parse-finish tail `--fg` uses.
+///
+/// This is everything `src/work/detach.rs`'s hidden `tm work __supervise`
+/// subcommand does once it has deserialized its [`PreparedRun`] state file —
+/// factored out here (rather than living in `detach.rs`) so it can be
+/// exercised with fakes exactly like [`run_lane_fg`], with no process
+/// re-exec, setsid, or file I/O involved in the test.
+pub fn supervise_run(
+    spawner: &dyn ProcessSpawner,
+    run_store: &RunStore,
+    prepared: &PreparedRun,
+    supervisor_pid: u32,
+    out: &mut dyn Write,
+) -> Result<RunLaneOutcome, RunLaneError> {
+    run_store.update_pid(prepared.run_id, supervisor_pid)?;
+    run_claude_and_finish(spawner, run_store, prepared, out)
 }
 
 #[cfg(test)]
@@ -1156,5 +1286,330 @@ mod tests {
 
         let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
         assert_eq!(run.ticket, "ABC-123");
+    }
+
+    // --- prepare_run_lane / run_claude_and_finish / supervise_run:
+    // the detached path's split of run_lane_fg's sequence. ---
+
+    #[test]
+    fn prepare_run_lane_with_no_pid_starts_the_run_row_with_no_pid_recorded() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        // Nothing was spawned yet — prepare_run_lane only gets as far as
+        // start_run + building the invocation.
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.pid, None);
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn prepare_run_lane_with_a_pid_records_it_on_the_run_row() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            Some(4242),
+            &mut out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.pid, Some(4242));
+    }
+
+    #[test]
+    fn prepare_run_lane_leaves_no_run_row_when_prompt_file_missing() {
+        // Mirrors run_lane_fg_errors_before_any_spawn_when_prompt_file_missing,
+        // but exercises prepare_run_lane directly — this is the guarantee the
+        // detached CLI path depends on: a bad lane/prompt/dirty-worktree
+        // fails before any run row or supervisor process exists.
+        let (tmp, home, repo_root, worktree_root, prompt_path) = setup();
+        std::fs::remove_file(&prompt_path).unwrap();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let err = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunLaneError::PromptFileMissing(_)));
+        assert_eq!(run_store.list_runs().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn prepare_run_lane_state_round_trips_through_json() {
+        // PreparedRun is handed to a re-exec'd supervisor process via a JSON
+        // file (see src/work/detach.rs) — it must serialize and deserialize
+        // back to an equal value.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&prepared).unwrap();
+        let round_tripped: PreparedRun = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(round_tripped.run_id, prepared.run_id);
+        assert_eq!(round_tripped.branch, prepared.branch);
+        assert_eq!(round_tripped.worktree, prepared.worktree);
+        assert_eq!(round_tripped.invocation, prepared.invocation);
+        assert_eq!(round_tripped.out_json_path, prepared.out_json_path);
+    }
+
+    #[test]
+    fn supervise_run_records_its_own_pid_then_completes_the_run() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        // As the detached CLI path does: prepare with no pid yet...
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+        assert_eq!(
+            run_store.run_by_id(prepared.run_id).unwrap().unwrap().pid,
+            None
+        );
+
+        // ...then a separate "supervisor" (here, just a second spawner
+        // standing in for the re-exec'd process) records its own pid and
+        // runs the tail.
+        let supervisor_spawner = FakeProcessSpawner::success(canned_json());
+        let mut supervisor_out = Vec::new();
+
+        let outcome = supervise_run(
+            &supervisor_spawner,
+            &run_store,
+            &prepared,
+            9999,
+            &mut supervisor_out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.pid, Some(9999));
+        assert_eq!(run.status, RunStatus::Done);
+
+        let printed = String::from_utf8(supervisor_out).unwrap();
+        assert!(printed.contains("session   sess-1"));
+    }
+
+    #[test]
+    fn supervise_run_marks_failed_on_nonzero_claude_exit() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+
+        let supervisor_spawner = FakeProcessSpawner::with_exit_code(canned_json(), 1);
+        let mut supervisor_out = Vec::new();
+
+        let outcome = supervise_run(
+            &supervisor_spawner,
+            &run_store,
+            &prepared,
+            4321,
+            &mut supervisor_out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.pid, Some(4321));
     }
 }
