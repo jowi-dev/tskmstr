@@ -11,18 +11,11 @@ start/finish`, deploys the tm telemetry hooks, exports `TSKMSTR_RUN_ID`,
 and its behavior is analyzed through `tm runs show`. The integration
 surface has grown to the point where the runner should live here.
 
-Open questions to settle before starting:
-
-- **Supersedes decision 0001's boundary rule.** `docs/decisions/0001-run-state.md`
-  deliberately scoped tskmstr to run *state* only — no process spawning or
-  supervision. Moving the runner in reverses that. Write a superseding
-  decision doc (0002) rather than silently violating 0001.
-- Port to Rust as `tm work ...` subcommands vs. vendoring the OCaml? A Rust
-  port keeps the nix-only single-toolchain property and lets the runner
-  share the config/runs/Jira layers directly.
-- What stays in devtools: lane prompt files, tmux layout conventions, and
-  the claude-hooks scripts could move here too (they are tm telemetry
-  hooks) or stay behind — decide the seam explicitly.
+Decided 2026-08-06 — see `docs/decisions/0002-runner-absorption.md`:
+session spawning is in scope (supersedes 0001's boundary), the runner is
+ported to Rust as `tm work ...` rather than vendored, and the seam is
+"tskmstr owns what it needs to do its job; personal config stays in the
+user's own tooling."
 
 ## 2. Cost and usage analytics for `tm ticket audit` / `tm ticket create`
 
