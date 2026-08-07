@@ -296,6 +296,7 @@ fn run_to_detail(
         id: run.id,
         ticket: run.ticket,
         lane: run.lane,
+        kind: run.kind,
         status: run.status,
         worktree: run.worktree,
         branch: run.branch,

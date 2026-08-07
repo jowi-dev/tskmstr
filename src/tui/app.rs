@@ -207,6 +207,9 @@ pub struct RunDetail {
     pub ticket: String,
     /// Lane name.
     pub lane: String,
+    /// Discriminates what kind of run this is, e.g. `lane`, `audit`,
+    /// `create`; see [`crate::runs::StartRun::kind`].
+    pub kind: String,
     /// Current status.
     pub status: crate::runs::RunStatus,
     /// Filesystem path of the git worktree the run used.
@@ -2569,6 +2572,7 @@ mod tests {
             id,
             ticket: "PROJ-1".to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status: crate::runs::RunStatus::Running,
             worktree: "/tmp/wt".to_string(),
             branch: None,

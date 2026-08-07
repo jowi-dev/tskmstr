@@ -10,7 +10,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
@@ -19,6 +19,7 @@ use ratatui::widgets::{
 use crate::cli::runs::format_age;
 use crate::runs::RunStatus;
 use crate::tui::app::{App, AssigneeFilter, Column, RUN_COLUMNS, RunCard, Screen, TicketSummary};
+use crate::tui::theme;
 
 /// Maximum number of wrapped summary lines shown on a single ticket card.
 /// Longer summaries are truncated with a trailing ellipsis so that one long
@@ -96,12 +97,13 @@ fn split_body_and_status(area: Rect) -> (Rect, Rect) {
 /// Render the status bar: `status_line` on the left, key hints on the right
 /// (hints are dropped if there isn't room for both).
 fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str) {
-    let text = if status_line.is_empty() {
-        hints.to_string()
+    let hint_span = Span::styled(hints.to_string(), theme::DIM);
+    let line = if status_line.is_empty() {
+        Line::from(hint_span)
     } else {
-        format!("{status_line}  |  {hints}")
+        Line::from(vec![Span::raw(format!("{status_line}  |  ")), hint_span])
     };
-    frame.render_widget(Paragraph::new(text), area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
@@ -171,11 +173,12 @@ fn draw_column(
     selected_row: Option<usize>,
     show_assignee: bool,
 ) {
-    let title = format!("{} ({})", column.title, column.tickets.len());
+    let title = Line::from(Span::styled(
+        format!("{} ({})", column.title, column.tickets.len()),
+        theme::COLUMN_TITLE,
+    ));
     let border_style = if is_selected {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        theme::SELECTED_COLUMN_BORDER
     } else {
         Style::default()
     };
@@ -241,11 +244,12 @@ fn draw_card(
     } else {
         Style::default()
     };
+    let key_style = style.patch(theme::CARD_KEY);
 
     let block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
-        .title(ticket.key.clone())
+        .title(Line::from(Span::styled(ticket.key.clone(), key_style)))
         .border_style(style);
 
     let mut lines: Vec<Line> = wrapped_summary(&ticket.summary, content_width)
@@ -409,20 +413,22 @@ fn draw_rank_list(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(index, ticket)| {
-            let marker = if app.rank_grab_origin.is_some() && app.rank_selected == index {
-                "><"
+            let grabbed = app.rank_grab_origin.is_some() && app.rank_selected == index;
+            let marker_span = if grabbed {
+                Span::styled("><", theme::GRABBED_MARKER)
             } else {
-                "  "
+                Span::raw("  ")
             };
             let assignee = ticket.assignee.as_deref().unwrap_or("Unassigned");
-            ListItem::new(format!(
-                "{marker} {:>3}. {}  [{}]  {}  {}",
-                index + 1,
-                ticket.key,
-                ticket.status,
-                assignee,
-                ticket.summary
-            ))
+            let key_span = Span::styled(
+                format!(" {:>3}. {}", index + 1, ticket.key),
+                theme::CARD_KEY,
+            );
+            let rest_span = Span::raw(format!(
+                "  [{}]  {}  {}",
+                ticket.status, assignee, ticket.summary
+            ));
+            ListItem::new(Line::from(vec![marker_span, key_span, rest_span]))
         })
         .collect();
 
@@ -471,11 +477,13 @@ fn draw_run_column(
     cards: &[&RunCard],
     selected_row: Option<usize>,
 ) {
-    let title = format!("{status:?} ({})", cards.len());
+    let title_style = theme::run_status_style(status).add_modifier(Modifier::BOLD);
+    let title = Line::from(Span::styled(
+        format!("{status:?} ({})", cards.len()),
+        title_style,
+    ));
     let border_style = if selected_row.is_some() {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        theme::SELECTED_COLUMN_BORDER
     } else {
         Style::default()
     };
@@ -520,13 +528,10 @@ fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: boo
 
     let mut ticket_spans = vec![Span::styled(
         card.ticket.clone(),
-        style.add_modifier(Modifier::BOLD),
+        style.patch(theme::CARD_KEY),
     )];
     if stale {
-        ticket_spans.push(Span::styled(
-            " !",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
+        ticket_spans.push(Span::styled(" !", style.patch(theme::STALE_MARKER)));
     }
 
     let last_event = match (&card.last_event_kind, card.last_event_age_secs) {
@@ -542,13 +547,17 @@ fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: boo
             checklist.items.len()
         );
     }
+    let mut lane_spans = vec![Span::styled(lane_line, style)];
+    if let Some(badge) = theme::kind_badge(&card.kind) {
+        lane_spans.push(Span::styled(badge.content, style.patch(badge.style)));
+    }
 
     let lines = vec![
         Line::from(ticket_spans),
-        Line::from(Span::styled(lane_line, style)),
+        Line::from(lane_spans),
         Line::from(Span::styled(
             format!("{} · {last_event}", format_age(card.age_secs)),
-            style,
+            style.patch(theme::DIM),
         )),
     ];
 
@@ -566,13 +575,20 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let Some(detail) = &app.run_detail else {
-        let paragraph = Paragraph::new("Loading...")
-            .block(Block::default().borders(Borders::ALL).title("Run detail"));
+        let paragraph = Paragraph::new("Loading...").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Run detail")),
+        );
         frame.render_widget(paragraph, area);
         return;
     };
 
-    let title = format!("Run {}: {}", detail.id, detail.ticket);
+    let title = if detail.kind == "lane" {
+        format!("Run {}: {}", detail.id, detail.ticket)
+    } else {
+        format!("Run {}: {} ({})", detail.id, detail.ticket, detail.kind)
+    };
 
     let mut lines = vec![
         Line::from(format!("lane: {}", detail.lane)),
@@ -605,12 +621,12 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         lines.push(Line::from(format!("ended: {ended_at}")));
     }
     if let Some(tools_line) = crate::runs::format_tool_counts(&detail.tool_counts) {
-        lines.push(Line::from(tools_line));
+        lines.push(Line::from(Span::styled(tools_line, theme::SECTION_HEADER)));
     }
 
     if let Some(usage) = &detail.model_usage {
         lines.push(Line::from(""));
-        lines.push(Line::from(usage.label));
+        lines.push(Line::from(Span::styled(usage.label, theme::SECTION_HEADER)));
         for line in &usage.lines {
             lines.push(Line::from(line.clone()));
         }
@@ -618,14 +634,24 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
 
     if let Some(checklist) = &detail.checklist {
-        lines.push(Line::from(format!(
-            "Checklist ({}/{} done)",
-            checklist.done_count(),
-            checklist.items.len()
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Checklist ({}/{} done)",
+                checklist.done_count(),
+                checklist.items.len()
+            ),
+            theme::SECTION_HEADER,
         )));
         for item in &checklist.items {
-            let marker = if item.done { "[x]" } else { "[ ]" };
-            lines.push(Line::from(format!("{marker} {}", item.text)));
+            let (marker, item_style) = if item.done {
+                ("[x]", theme::CHECKLIST_DONE)
+            } else {
+                ("[ ]", theme::CHECKLIST_PENDING)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} {}", item.text),
+                item_style,
+            )));
         }
         lines.push(Line::from(""));
     }
@@ -634,20 +660,27 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         lines.push(Line::from("(no events)"));
     } else {
         for event in detail.events.iter().rev() {
-            let text = match crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
+            let rest = match crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
             {
-                Some(friendly) => format!("{}  {}  {}", event.at, event.kind, friendly),
+                Some(friendly) => format!("{}  {friendly}", event.kind),
                 None => match &event.detail {
-                    Some(d) => format!("{}  {}  {}", event.at, event.kind, d),
-                    None => format!("{}  {}", event.at, event.kind),
+                    Some(d) => format!("{}  {d}", event.kind),
+                    None => event.kind.clone(),
                 },
             };
-            lines.push(Line::from(text));
+            lines.push(Line::from(vec![
+                Span::styled(event.at.clone(), theme::DIM),
+                Span::raw(format!("  {rest}")),
+            ]));
         }
     }
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title(title)),
+        )
         .scroll((app.run_detail_scroll, 0));
     frame.render_widget(paragraph, area);
 }
@@ -677,10 +710,19 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
     };
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title(title)),
+        )
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// A window title rendered bold, for every floating window's border title.
+fn bold_title(title: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(title.into(), theme::BOLD))
 }
 
 /// A smaller centered floating window (~40% wide, ~40% tall), layered on top
@@ -697,7 +739,11 @@ fn draw_transition_window(frame: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Move to"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Move to")),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
@@ -726,8 +772,11 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from(""),
         Line::from("press any key to close"),
     ];
-    let paragraph =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Help"));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title("Help")),
+    );
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
@@ -745,8 +794,15 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
     let mut items: Vec<ListItem> = options
         .iter()
         .map(|option| {
-            let marker = if option == &app.filter { "* " } else { "  " };
-            ListItem::new(format!("{marker}{}", option.label()))
+            let line = if option == &app.filter {
+                Line::from(vec![
+                    Span::styled("* ", theme::ACTIVE_FILTER_MARKER),
+                    Span::raw(option.label()),
+                ])
+            } else {
+                Line::from(format!("  {}", option.label()))
+            };
+            ListItem::new(line)
         })
         .collect();
 
@@ -761,7 +817,7 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Filter: assignee"),
+                .title(bold_title("Filter: assignee")),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -1041,6 +1097,41 @@ mod tests {
         assert!(text.contains("PROJ-2"));
     }
 
+    /// Find the first cell at which `needle` starts rendering (reading
+    /// left-to-right, top-to-bottom), verifying the full string actually
+    /// matches from that point rather than just its first character.
+    fn cell_at<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if needle.starts_with(cell.symbol()) && !cell.symbol().trim().is_empty() {
+                    let mut found = String::new();
+                    for dx in 0..needle.chars().count() as u16 {
+                        if x + dx >= buffer.area.width {
+                            break;
+                        }
+                        found.push_str(buffer[(x + dx, y)].symbol());
+                    }
+                    if found == needle {
+                        return Some(cell);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The [`Modifier`] of the cell at which `needle` starts rendering, or
+    /// [`Modifier::empty`] if it isn't found.
+    fn modifier_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> Modifier {
+        cell_at(buffer, needle)
+            .map(|cell| cell.modifier)
+            .unwrap_or_else(Modifier::empty)
+    }
+
     #[test]
     fn selected_card_is_styled_distinctly_from_unselected_card() {
         let app = App {
@@ -1051,31 +1142,8 @@ mod tests {
         };
         let buffer = render(&app);
 
-        let modifier_at = |needle: &str| -> Modifier {
-            for y in 0..buffer.area.height {
-                for x in 0..buffer.area.width {
-                    let cell = &buffer[(x, y)];
-                    if needle.starts_with(cell.symbol()) && !cell.symbol().trim().is_empty() {
-                        // Confirm this is really the start of `needle` by
-                        // reading forward.
-                        let mut found = String::new();
-                        for dx in 0..needle.chars().count() as u16 {
-                            if x + dx >= buffer.area.width {
-                                break;
-                            }
-                            found.push_str(buffer[(x + dx, y)].symbol());
-                        }
-                        if found == needle {
-                            return cell.modifier;
-                        }
-                    }
-                }
-            }
-            Modifier::empty()
-        };
-
-        let selected_modifier = modifier_at("PROJ-2");
-        let unselected_modifier = modifier_at("PROJ-1");
+        let selected_modifier = modifier_at(&buffer, "PROJ-2");
+        let unselected_modifier = modifier_at(&buffer, "PROJ-1");
         assert!(selected_modifier.contains(Modifier::REVERSED));
         assert!(!unselected_modifier.contains(Modifier::REVERSED));
     }
@@ -1374,6 +1442,45 @@ mod tests {
     }
 
     #[test]
+    fn running_column_title_carries_its_status_color() {
+        let app = runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)]);
+        let buffer = render(&app);
+        let cell = cell_at(&buffer, "Running (1)").expect("Running column title renders");
+        assert_eq!(
+            Some(cell.fg),
+            theme::run_status_style(RunStatus::Running).fg
+        );
+    }
+
+    #[test]
+    fn non_lane_run_card_renders_its_kind_badge_styled() {
+        let card = RunCard {
+            kind: "audit".to_string(),
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        // A wide terminal so the kanban columns are wide enough for the lane
+        // name plus the appended kind badge to render unclipped.
+        let buffer = render_with_size(&runs_app(vec![card]), 160, 24);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("backend audit"));
+        let cell = cell_at(&buffer, "audit").expect("kind badge text renders");
+        assert_eq!(Some(cell.fg), theme::kind_style("audit").fg);
+    }
+
+    #[test]
+    fn lane_run_card_renders_no_kind_badge() {
+        let card = run_card(1, "PROJ-1", "backend", RunStatus::Running);
+        assert_eq!(card.kind, "lane");
+        let text = buffer_text(&render_with_size(&runs_app(vec![card]), 160, 24));
+        let lane_line = text
+            .lines()
+            .find(|line| line.contains("backend"))
+            .expect("expected a line with the card's lane");
+        assert!(!lane_line.contains("audit"));
+        assert!(!lane_line.contains("create"));
+    }
+
+    #[test]
     fn stale_running_card_shows_a_marker() {
         let stale = RunCard {
             heartbeat_age_secs: Some(601),
@@ -1411,6 +1518,7 @@ mod tests {
             id: 1,
             ticket: "PROJ-1".to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status: RunStatus::Running,
             worktree: "/tmp/wt".to_string(),
             branch: Some("proj-1".to_string()),
@@ -1508,6 +1616,24 @@ mod tests {
     }
 
     #[test]
+    fn checklist_done_line_is_green_and_pending_line_is_dim() {
+        let detail = crate::tui::app::RunDetail {
+            checklist: Some(checklist(&[("write tests", true), ("review", false)])),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let buffer = render(&app);
+        let done_cell = cell_at(&buffer, "[x] write tests").expect("done item renders");
+        let pending_cell = cell_at(&buffer, "[ ] review").expect("pending item renders");
+        assert_eq!(Some(done_cell.fg), theme::CHECKLIST_DONE.fg);
+        assert_eq!(Some(pending_cell.fg), theme::CHECKLIST_PENDING.fg);
+    }
+
+    #[test]
     fn run_detail_overlay_with_no_checklist_has_no_checklist_section() {
         let app = App {
             show_run_detail: true,
@@ -1599,6 +1725,7 @@ mod tests {
             id: 1,
             ticket: "PROJ-1".to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status: RunStatus::Running,
             worktree: "/tmp/wt".to_string(),
             branch: None,
