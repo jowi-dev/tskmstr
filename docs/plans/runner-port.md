@@ -20,7 +20,7 @@ session-launching core must be callable from a TUI, not just a CLI verb.
 | `branch_owner` (git config → `gh api user` → git config → `"claude"`) | **Ports** | Generic resolution logic; keep the fallback chain, keep reading `git config j.branchOwner` for compatibility |
 | `--no-track` branch creation from a remote base | **Ports (verbatim)** | Load-bearing fix for a real incident (2026-08-05); see Risks |
 | Billing-safety env stripping (`env -u ANTHROPIC_API_KEY ...`) | **Ports (verbatim)** | Silent-failure mode if dropped |
-| `start <dir>` (attach/create tmux session for **any** directory) | **Dies as a public command** | Not ticket/lane work — general "cd and tmux" convenience unrelated to tm's job. The *mechanism* it's built on (has-session/new-session/attach) ports as an internal helper `run`/`new` call; the arbitrary-directory entry point stays in devtools if Jowi still wants it |
+| `start <dir>` (attach/create tmux session for **any** directory) | **Ports** as `tm work start [<dir>]` | Decision reversed by Joe 2026-08-06: this is his main tmux entry point (tmux from the repo dir → session manager → pick a session), and an interface for attaching to sessions is in line with tm's task-managing ethos even as an ad hoc command. Defaults to cwd when no dir is given; same has-session/new-session/attach mechanism `run`/`new` use |
 | Session window set `["code", "fish", "claude", "server"]` | **Stays personal (configurable)** | Jowi's shell layout, not tm's job. tm defines *that* a session gets created and attached; the window list is a config knob with a minimal default |
 | `worktrees_root = ~/Worktrees` | **Stays personal, but as config not a hardcoded path** | Becomes `work.worktree_root` in `~/.config/tskmstr/config.toml` |
 | `prompt_file = ~/.claude/prompts/<lane>.md` | **Stays personal, as a per-lane config field** | The convention is fine as a *default*; the path must be configurable since another tm user's prompts live elsewhere |
@@ -160,9 +160,12 @@ codebase.
    `kill_session`, `list_sessions`) + fake. Session/window creation reads
    `tmux_windows`/`tmux_primary_window` from config rather than the
    hardcoded `["fish"; "claude"; "server"]`.
-5. **`tm work new/remove/list/restore`.** Wire `GitOps`+`TmuxOps` into CLI
-   subcommands under `Command::Work`. Tests use the fakes; assert the same
-   provisioning/attach/removal sequencing as `work.ml`.
+5. **`tm work new/remove/list/restore/start`.** Wire `GitOps`+`TmuxOps` into
+   CLI subcommands under `Command::Work`. `start [<dir>]` attaches to (or
+   creates) the tmux session for a directory, defaulting to cwd — Joe's
+   main tmux entry point, ported per the amended inventory. Tests use the
+   fakes; assert the same provisioning/attach/removal sequencing as
+   `work.ml`.
 6. **Hook scripts into this repo.** Move the six `.sh` files from devtools
    into `tskmstr/hooks/`, add `src/work/hooks.rs` with `include_str!`-backed
    constants, `deploy_hooks()`, and settings-JSON generation via
