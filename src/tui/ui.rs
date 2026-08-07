@@ -631,6 +631,16 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
             lines.push(Line::from(line.clone()));
         }
     }
+    if !detail.agent_usage.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Agent usage",
+            theme::SECTION_HEADER,
+        )));
+        for line in &detail.agent_usage {
+            lines.push(Line::from(line.clone()));
+        }
+    }
     lines.push(Line::from(""));
 
     if let Some(checklist) = &detail.checklist {
@@ -1538,6 +1548,7 @@ mod tests {
             checklist: None,
             tool_counts: vec![],
             model_usage: None,
+            agent_usage: vec![],
         };
         let app = App {
             show_run_detail: true,
@@ -1710,6 +1721,33 @@ mod tests {
     }
 
     #[test]
+    fn run_detail_overlay_renders_agent_usage_section() {
+        let detail = crate::tui::app::RunDetail {
+            agent_usage: vec!["elixir-implementer  3x, out 1.1k, in 2, cache-read 87.5k, cache-write 3.0k, tools 38".to_string()],
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Agent usage"));
+        assert!(text.contains("elixir-implementer"));
+    }
+
+    #[test]
+    fn run_detail_overlay_with_no_agent_usage_has_no_agent_usage_section() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Agent usage"));
+    }
+
+    #[test]
     fn run_detail_overlay_with_no_tool_events_has_no_tools_line() {
         let app = App {
             show_run_detail: true,
@@ -1741,6 +1779,7 @@ mod tests {
             checklist: None,
             tool_counts: vec![],
             model_usage: None,
+            agent_usage: vec![],
         }
     }
 

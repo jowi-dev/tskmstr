@@ -247,6 +247,15 @@ pub struct RunDetail {
     /// the latest `usage` event while the run is still running (see
     /// [`crate::runs::latest_usage`]). `None` when neither is available.
     pub model_usage: Option<RunModelUsage>,
+    /// Per-agent-type token usage lines (see
+    /// [`crate::runs::format_agent_usage`]), computed from every
+    /// `agent_usage` event the run has emitted (see
+    /// [`crate::runs::collect_agent_usage`] and
+    /// [`crate::runs::aggregate_agent_usage`]). Unlike `model_usage` there
+    /// is no authoritative-vs-live distinction: agent usage always comes
+    /// from events, never from a finish-time column. Empty when the run
+    /// has emitted no `agent_usage` events.
+    pub agent_usage: Vec<String>,
 }
 
 /// A [`RunDetail`]'s model usage breakdown, labeled so the UI can
@@ -2588,6 +2597,7 @@ mod tests {
             checklist: None,
             tool_counts: vec![],
             model_usage: None,
+            agent_usage: vec![],
         }
     }
 

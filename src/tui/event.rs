@@ -292,6 +292,9 @@ fn run_to_detail(
     let checklist = crate::runs::latest_checklist(&events);
     let tool_counts = crate::runs::tool_counts(&events);
     let model_usage = run_model_usage(run.model_usage.as_deref(), run.status, &events);
+    let agent_usage = crate::runs::format_agent_usage(&crate::runs::aggregate_agent_usage(
+        &crate::runs::collect_agent_usage(&events),
+    ));
     crate::tui::app::RunDetail {
         id: run.id,
         ticket: run.ticket,
@@ -319,6 +322,7 @@ fn run_to_detail(
         checklist,
         tool_counts,
         model_usage,
+        agent_usage,
     }
 }
 
@@ -924,6 +928,49 @@ mod tests {
         match msgs.as_slice() {
             [Msg::RunDetailLoaded(detail)] => {
                 assert!(detail.model_usage.is_none());
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_populates_agent_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .add_event(
+                run_id,
+                "agent_usage",
+                Some(
+                    r#"{"agentType":"elixir-implementer","description":"Implement thing",
+                    "model":"claude-sonnet-5","outputTokens":1143,"inputTokens":2,
+                    "cacheReadInputTokens":87519,"cacheCreationInputTokens":3012,
+                    "totalToolUseCount":38,"durationMs":193659}"#,
+                ),
+            )
+            .unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                assert_eq!(detail.agent_usage.len(), 1);
+                assert!(detail.agent_usage[0].contains("elixir-implementer"));
+            }
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_run_detail_with_no_agent_usage_events_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadRunDetail { run_id });
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => {
+                assert!(detail.agent_usage.is_empty());
             }
             other => panic!("expected RunDetailLoaded, got {other:?}"),
         }
