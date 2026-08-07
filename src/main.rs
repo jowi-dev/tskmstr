@@ -42,7 +42,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
-        Command::Runs { cmd } => run_runs(cmd),
+        Command::Runs { kind, cmd } => run_runs(kind, cmd),
         Command::Work { cmd } => run_work(cmd, &paths),
     }
 }
@@ -293,7 +293,23 @@ fn run_ticket(
             };
             let mut prompter = RealPrompter;
             let mut stdout = std::io::stdout();
-            tskmstr::cli::ticket::create(&ctx, &opts, &mut prompter, &mut stdout)?;
+            // Opened leniently (`.ok()`), unlike `run_ticket_audit`'s hard
+            // error on a missing config: a broken/absent runs DB must never
+            // block ticket creation, since session registration is pure
+            // telemetry (see `docs/plans/session-usage.md`).
+            let session_store =
+                tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
+            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
+            tskmstr::cli::ticket::create(
+                &ctx,
+                &opts,
+                &mut prompter,
+                session_store.as_ref(),
+                &session_env,
+                &sessions_dir,
+                &mut stdout,
+            )?;
             Ok(())
         }
         (None, Some(TicketCmd::Transition { key, status })) => {
@@ -417,6 +433,8 @@ fn run_ticket_audit(
     let config = config::load(paths)?;
     let db_path = run_db_path_from_config(&config);
     let mut stdout = std::io::stdout();
+    let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+    let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
 
     match record {
         Some(verdict) => {
@@ -426,6 +444,8 @@ fn run_ticket_audit(
                 &key,
                 verdict.as_str(),
                 notes.as_deref(),
+                &session_env,
+                &sessions_dir,
                 &mut stdout,
             )?;
         }
@@ -438,12 +458,26 @@ fn run_ticket_audit(
             match tskmstr::runs::RunStore::open(&db_path) {
                 Ok(store) => {
                     let status = tskmstr::cli::ticket::AuditStoreStatus::Open(&store);
-                    tskmstr::cli::ticket::audit_read(jira.as_ref(), &status, &key, &mut stdout)?;
+                    tskmstr::cli::ticket::audit_read(
+                        jira.as_ref(),
+                        &status,
+                        &key,
+                        &session_env,
+                        &sessions_dir,
+                        &mut stdout,
+                    )?;
                 }
                 Err(err) => {
                     let status =
                         tskmstr::cli::ticket::AuditStoreStatus::Unavailable(err.to_string());
-                    tskmstr::cli::ticket::audit_read(jira.as_ref(), &status, &key, &mut stdout)?;
+                    tskmstr::cli::ticket::audit_read(
+                        jira.as_ref(),
+                        &status,
+                        &key,
+                        &session_env,
+                        &sessions_dir,
+                        &mut stdout,
+                    )?;
                 }
             }
         }
@@ -505,18 +539,19 @@ fn run_ready(
 /// in the strict (error-if-missing) sense: `tm runs` must work on a machine
 /// with no Jira config at all, so config loading here is best-effort (see
 /// [`resolve_run_db_path`]).
-fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
     let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
     let mut stdout = std::io::stdout();
 
     match cmd {
-        None => tskmstr::cli::runs::list(&store, &mut stdout)?,
+        None => tskmstr::cli::runs::list(&store, kind.as_deref(), &mut stdout)?,
         Some(RunsCmd::Start {
             ticket,
             lane,
             worktree,
             branch,
             pid,
+            kind,
         }) => {
             let params = tskmstr::runs::StartRun {
                 ticket,
@@ -524,7 +559,7 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
                 worktree,
                 branch,
                 pid,
-                kind: "lane".to_string(),
+                kind,
             };
             tskmstr::cli::runs::start(&store, &params, &mut stdout)?;
         }
@@ -568,8 +603,8 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
                 &mut stdout,
             )?;
         }
-        Some(RunsCmd::Show { ticket, json }) => {
-            tskmstr::cli::runs::show(&store, &ticket, json, &mut stdout)?;
+        Some(RunsCmd::Show { ticket, json, kind }) => {
+            tskmstr::cli::runs::show(&store, &ticket, kind.as_deref(), json, &mut stdout)?;
         }
         Some(RunsCmd::Resume { ticket }) => {
             tskmstr::cli::runs::resume(&store, &ticket, &mut stdout)?;

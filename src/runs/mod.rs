@@ -758,6 +758,28 @@ struct ToolDetail {
     agent: Option<String>,
 }
 
+/// Renders a [`ModelUsageMap`] as one compact line, e.g. `fable-5 58.6k out
+/// / sonnet-5 30.7k out`: one `{model} {out} out` segment per model, joined
+/// by ` / `, with a leading `claude-` stripped from each model name for
+/// brevity. Returns `None` for an empty map.
+///
+/// Shared by [`format_event_detail`]'s `"usage"` rendering and `tm ticket
+/// audit`'s `Last audit usage:` line (see
+/// `docs/plans/session-usage.md`'s "Surfaces" section).
+pub fn format_model_usage_compact(map: &ModelUsageMap) -> Option<String> {
+    if map.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = map
+        .iter()
+        .map(|(name, usage)| {
+            let short = name.strip_prefix("claude-").unwrap_or(name);
+            format!("{short} {} out", format_token_count(usage.output_tokens))
+        })
+        .collect();
+    Some(parts.join(" / "))
+}
+
 /// Renders a human-friendly one-line summary of a `run_events` row's
 /// `detail`, for the known conventions a lane-run hook emits:
 ///
@@ -795,18 +817,7 @@ pub fn format_event_detail(kind: &str, detail: Option<&str>) -> Option<String> {
         }
         "usage" => {
             let parsed: UsageDetail = serde_json::from_str(detail).ok()?;
-            if parsed.models.is_empty() {
-                return None;
-            }
-            let parts: Vec<String> = parsed
-                .models
-                .iter()
-                .map(|(name, usage)| {
-                    let short = name.strip_prefix("claude-").unwrap_or(name);
-                    format!("{short} {} out", format_token_count(usage.output_tokens))
-                })
-                .collect();
-            Some(parts.join(" / "))
+            format_model_usage_compact(&parsed.models)
         }
         _ => None,
     }

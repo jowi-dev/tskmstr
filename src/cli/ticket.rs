@@ -3,6 +3,7 @@
 //! `tm ticket update`, and `tm ticket audit`.
 
 use std::io::Write;
+use std::path::Path;
 
 use regex::Regex;
 use thiserror::Error;
@@ -11,6 +12,7 @@ use crate::config::Config;
 use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::types::CreateLinkRequest;
+use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
@@ -107,10 +109,23 @@ pub struct CreateOptions {
 /// override), else `Config::status_on_create`, else none. This resolved
 /// target is passed straight through to [`create_ticket`], which no longer
 /// looks at config itself.
+///
+/// Session registration (see `docs/plans/session-usage.md`): when
+/// `session_store` is `Some`, registers a `create`-kind session run for the
+/// new ticket's key immediately after [`create_ticket`] succeeds — the
+/// first point the new key exists. Registration failures are swallowed
+/// (`register_session`'s error contract requires callers to do this): a
+/// broken runs DB must never block ticket creation. `session_store` is
+/// `None` when the caller couldn't open the runs DB at all (main.rs opens
+/// it leniently for exactly this reason) or on a plain terminal invocation
+/// with no session id — either way, `create` still succeeds.
 pub fn create(
     ctx: &CreateTicketContext,
     opts: &CreateOptions,
     prompter: &mut dyn super::Prompter,
+    session_store: Option<&RunStore>,
+    session_env: &SessionEnv,
+    sessions_dir: &Path,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let title = match &opts.title {
@@ -130,6 +145,17 @@ pub fn create(
     };
 
     let outcome = create_ticket(ctx, &title, opts.body.as_deref(), status_target)?;
+
+    if let Some(store) = session_store {
+        let _ = register_session(
+            store,
+            sessions_dir,
+            session_env,
+            "create",
+            &outcome.issue_key,
+        );
+    }
+
     writeln!(
         out,
         "Created ticket {}: {}",
@@ -477,21 +503,37 @@ pub enum AuditStoreStatus<'a> {
 /// `tm ticket audit <KEY>` (no `--record`): print `KEY`'s raw Jira data —
 /// the material for an interactive audit conversation, which is a Claude
 /// skill concern out of scope for `tm` itself — plus its last recorded audit
-/// verdict.
+/// verdict and usage.
 ///
 /// Field order: `KEY  <summary>`, `Status: ...`, `Assignee: ...`, `Links:`
 /// (a line per existing issue link, in the same `<verb> <key> (<status>):
 /// <summary>` style as `tm ticket link <KEY>`'s bare-list rendering; the
-/// whole section is omitted when there are no links), `Last audit: ...`, a
-/// blank line, then the description rendered via [`adf_to_text`] (or `(no
-/// description)`).
+/// whole section is omitted when there are no links), `Last audit: ...`,
+/// `Last audit usage: ...` (only when the store is open and a finished
+/// `audit`-kind run for this ticket recorded parseable `model_usage`; see
+/// `docs/plans/session-usage.md`'s "Surfaces" section), a blank line, then
+/// the description rendered via [`adf_to_text`] (or `(no description)`).
+///
+/// Session registration (see `docs/plans/session-usage.md`): when `store`
+/// is [`AuditStoreStatus::Open`], registers an `audit`-kind session run for
+/// `key` before reading Jira, so tool/agent-usage events flow for the whole
+/// audit conversation that follows this command. Registration failures are
+/// swallowed (`register_session`'s error contract requires callers to do
+/// this) — a broken runs DB or marker directory never blocks this read.
 pub fn audit_read(
     jira: &dyn JiraClient,
     store: &AuditStoreStatus,
     key: &str,
+    session_env: &SessionEnv,
+    sessions_dir: &Path,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
+
+    if let AuditStoreStatus::Open(store) = store {
+        let _ = register_session(store, sessions_dir, session_env, "audit", &normalized);
+    }
+
     let issue = jira.get_issue(&normalized).map_err(TicketingError::Jira)?;
 
     writeln!(out, "{}  {}", normalized, issue.fields.summary)?;
@@ -535,17 +577,30 @@ pub fn audit_read(
     }
 
     match store {
-        AuditStoreStatus::Open(store) => match store.latest_audit_for_ticket(&normalized)? {
-            Some(audit) => match &audit.notes {
-                Some(notes) => writeln!(
-                    out,
-                    "Last audit: {} at {} -- {}",
-                    audit.verdict, audit.audited_at, notes
-                )?,
-                None => writeln!(out, "Last audit: {} at {}", audit.verdict, audit.audited_at)?,
-            },
-            None => writeln!(out, "Last audit: never")?,
-        },
+        AuditStoreStatus::Open(store) => {
+            match store.latest_audit_for_ticket(&normalized)? {
+                Some(audit) => match &audit.notes {
+                    Some(notes) => writeln!(
+                        out,
+                        "Last audit: {} at {} -- {}",
+                        audit.verdict, audit.audited_at, notes
+                    )?,
+                    None => writeln!(out, "Last audit: {} at {}", audit.verdict, audit.audited_at)?,
+                },
+                None => writeln!(out, "Last audit: never")?,
+            }
+
+            if let Some(line) = store
+                .latest_finished_run_for_ticket_kind(&normalized, "audit")
+                .ok()
+                .flatten()
+                .and_then(|run| run.model_usage)
+                .and_then(|raw| crate::runs::parse_model_usage(&raw))
+                .and_then(|usage| crate::runs::format_model_usage_compact(&usage))
+            {
+                writeln!(out, "Last audit usage: {line}")?;
+            }
+        }
         AuditStoreStatus::Unavailable(err) => writeln!(out, "Last audit: unavailable ({err})")?,
     }
 
@@ -568,16 +623,31 @@ pub fn audit_read(
 /// persist an audit verdict, timestamped by the runs DB itself (see
 /// [`RunStore::record_audit`]). Never touches Jira, so this works fully
 /// offline.
+///
+/// Session registration (see `docs/plans/session-usage.md`): after
+/// recording succeeds, finishes the session's `audit`-kind run
+/// ([`RunStatus::Done`]) — recording a verdict is the natural end of an
+/// audit conversation. Swallows any [`crate::runs::session::SessionError`]
+/// (same contract as [`audit_read`]/[`create`]): a broken runs DB or an
+/// already-finished/absent marker never blocks this command's own output.
 pub fn audit_record(
     store: &RunStore,
     key: &str,
     verdict: &str,
     notes: Option<&str>,
+    session_env: &SessionEnv,
+    sessions_dir: &Path,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
     store.record_audit(&normalized, verdict, notes)?;
     writeln!(out, "Recorded audit for {normalized}: {verdict}")?;
+    let _ = finish_session(
+        store,
+        sessions_dir,
+        session_env,
+        crate::runs::RunStatus::Done,
+    );
     Ok(())
 }
 
@@ -607,6 +677,7 @@ mod tests {
     use crate::jira::client::JiraError;
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
+    use crate::runs::{FinishRun, RunStatus, StartRun};
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -648,6 +719,37 @@ mod tests {
             review_bots: vec!["cursor[bot]".to_string()],
             board_column_order: Vec::new(),
             work: crate::config::WorkConfig::default(),
+        }
+    }
+
+    /// A [`SessionEnv`] with no session id, so [`register_session`]/
+    /// [`finish_session`] are guaranteed no-ops — the right default for
+    /// every test in this module that isn't specifically exercising session
+    /// registration. Paired with [`no_sessions_dir`], which is never
+    /// touched by a no-op.
+    fn no_session_env() -> SessionEnv {
+        SessionEnv {
+            session_id: None,
+            claude_pid: None,
+            lane_run_id: None,
+            cwd: std::path::PathBuf::from("/tmp/wt"),
+        }
+    }
+
+    /// A sessions directory path that [`no_session_env`] guarantees is
+    /// never touched.
+    fn no_sessions_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/unused-sessions-dir")
+    }
+
+    /// A [`SessionEnv`] with a session id, for tests that exercise
+    /// [`register_session`]/[`finish_session`]'s active path.
+    fn session_env_with_id(session_id: &str) -> SessionEnv {
+        SessionEnv {
+            session_id: Some(session_id.to_string()),
+            claude_pid: Some(4242),
+            lane_run_id: None,
+            cwd: std::path::PathBuf::from("/tmp/wt"),
         }
     }
 
@@ -751,7 +853,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(
@@ -774,7 +885,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new().with_line("Add the widget");
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         assert_eq!(jira.create_issue_calls()[0].summary, "Add the widget");
         assert_eq!(prompter.messages, vec!["Ticket title".to_string()]);
@@ -789,7 +909,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new().with_line("");
         let mut out = Vec::new();
 
-        let err = create(&ctx, &opts, &mut prompter, &mut out).expect_err("should fail");
+        let err = create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect_err("should fail");
         assert!(matches!(err, TicketCliError::TitleRequired));
         assert!(jira.create_issue_calls().is_empty());
     }
@@ -807,7 +936,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let description = jira.create_issue_calls()[0].description.to_string();
         assert!(
@@ -829,7 +967,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         assert_eq!(
             jira.create_issue_calls()[0].description,
@@ -867,7 +1014,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Moved PROJ-9 to In Progress"));
@@ -889,7 +1045,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("warning:"));
@@ -908,7 +1073,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Moved"));
@@ -937,7 +1111,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Moved PROJ-9 to In Review"));
@@ -969,7 +1152,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Moved"));
@@ -991,7 +1183,16 @@ mod tests {
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
 
-        create(&ctx, &opts, &mut prompter, &mut out).expect("should succeed");
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("warning:"));
@@ -1836,7 +2037,15 @@ mod tests {
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
 
-        audit_read(&jira, &status, "proj-372", &mut out).expect("should succeed");
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -1860,7 +2069,15 @@ mod tests {
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
 
-        audit_read(&jira, &status, "PROJ-372", &mut out).expect("should succeed");
+        audit_read(
+            &jira,
+            &status,
+            "PROJ-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Assignee: unassigned\n"));
@@ -1879,7 +2096,15 @@ mod tests {
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
 
-        audit_read(&jira, &status, "proj-372", &mut out).expect("should succeed");
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Last audit: ready at "));
@@ -1892,7 +2117,15 @@ mod tests {
         let status = AuditStoreStatus::Unavailable("disk full".to_string());
         let mut out = Vec::new();
 
-        audit_read(&jira, &status, "proj-372", &mut out).expect("should still succeed");
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should still succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Last audit: unavailable (disk full)\n"));
@@ -1906,7 +2139,15 @@ mod tests {
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
 
-        let err = audit_read(&jira, &status, "not-a-key!", &mut out).expect_err("should fail");
+        let err = audit_read(
+            &jira,
+            &status,
+            "not-a-key!",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect_err("should fail");
         match err {
             TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
             other => panic!("expected InvalidKey, got {other:?}"),
@@ -1921,7 +2162,15 @@ mod tests {
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
 
-        let err = audit_read(&jira, &status, "proj-404", &mut out).expect_err("should fail");
+        let err = audit_read(
+            &jira,
+            &status,
+            "proj-404",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect_err("should fail");
         match err {
             TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
                 assert_eq!(key, "PROJ-404")
@@ -1936,8 +2185,16 @@ mod tests {
         let store = open_run_store(dir.path());
         let mut out = Vec::new();
 
-        audit_record(&store, "proj-372", "ready", Some("looks good"), &mut out)
-            .expect("should succeed");
+        audit_record(
+            &store,
+            "proj-372",
+            "ready",
+            Some("looks good"),
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "Recorded audit for PROJ-372: ready\n");
@@ -1956,11 +2213,258 @@ mod tests {
         let store = open_run_store(dir.path());
         let mut out = Vec::new();
 
-        let err =
-            audit_record(&store, "not-a-key!", "ready", None, &mut out).expect_err("should fail");
+        let err = audit_record(
+            &store,
+            "not-a-key!",
+            "ready",
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect_err("should fail");
         match err {
             TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
             other => panic!("expected InvalidKey, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn audit_read_prints_last_audit_usage_when_a_finished_audit_run_has_model_usage() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let run_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-372".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(
+                run_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    model_usage: Some(r#"{"claude-sonnet-5":{"outputTokens":58564}}"#.to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Last audit usage: sonnet-5 58.6k out\n"));
+    }
+
+    #[test]
+    fn audit_read_omits_last_audit_usage_when_no_finished_audit_run_exists() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("Last audit usage"));
+    }
+
+    #[test]
+    fn audit_read_omits_last_audit_usage_when_only_a_running_audit_run_exists() {
+        // A still-running audit run (e.g. the very session doing this read)
+        // must not be mistaken for a finished one with usable model_usage.
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-372".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("Last audit usage"));
+    }
+
+    #[test]
+    fn audit_read_registers_a_session_run_when_a_session_id_is_present() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let markers_dir = tempfile::tempdir().unwrap();
+        let env = session_env_with_id("sess-1");
+        let mut out = Vec::new();
+
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &env,
+            markers_dir.path(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].ticket, "PROJ-372");
+        assert_eq!(runs[0].kind, "audit");
+        assert!(markers_dir.path().join("sess-1").exists());
+    }
+
+    #[test]
+    fn audit_read_registers_no_session_run_without_a_session_id() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let mut out = Vec::new();
+
+        audit_read(
+            &jira,
+            &status,
+            "proj-372",
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_record_finishes_the_session_run_and_removes_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let markers_dir = tempfile::tempdir().unwrap();
+        let env = session_env_with_id("sess-1");
+
+        // Simulate the read-mode registration that would have happened
+        // earlier in the same Claude Code session.
+        register_session(&store, markers_dir.path(), &env, "audit", "PROJ-372").unwrap();
+        let marker = markers_dir.path().join("sess-1");
+        assert!(marker.exists());
+
+        let mut out = Vec::new();
+        audit_record(
+            &store,
+            "proj-372",
+            "ready",
+            None,
+            &env,
+            markers_dir.path(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Done);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn create_registers_a_session_run_with_kind_create_when_store_is_present() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            ..Default::default()
+        };
+        let mut prompter = crate::cli::FakePrompter::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let markers_dir = tempfile::tempdir().unwrap();
+        let env = session_env_with_id("sess-1");
+        let mut out = Vec::new();
+
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            Some(&store),
+            &env,
+            markers_dir.path(),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].ticket, "PROJ-9");
+        assert_eq!(runs[0].kind, "create");
+    }
+
+    #[test]
+    fn create_succeeds_when_session_store_is_none() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            body: None,
+            ..Default::default()
+        };
+        let mut prompter = crate::cli::FakePrompter::new();
+        let mut out = Vec::new();
+
+        create(
+            &ctx,
+            &opts,
+            &mut prompter,
+            None,
+            &session_env_with_id("sess-1"),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed even with no runs store to register a session in");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Created ticket PROJ-9"));
     }
 }

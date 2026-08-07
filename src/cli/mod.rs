@@ -97,7 +97,13 @@ pub enum Command {
     Board,
     /// Inspect and record autonomous lane runs (local SQLite; see
     /// docs/decisions/0001-run-state.md).
+    #[command(args_conflicts_with_subcommands = true)]
     Runs {
+        /// Filter the listing to runs whose `kind` column matches (e.g.
+        /// `lane`, `audit`, `create`); omit to list every kind. Only
+        /// meaningful without a subcommand (plain `tm runs`).
+        #[arg(long)]
+        kind: Option<String>,
         /// Which runs action to perform. Omit to list current runs.
         #[command(subcommand)]
         cmd: Option<RunsCmd>,
@@ -438,6 +444,10 @@ pub enum RunsCmd {
         /// PID of the runner process, if known.
         #[arg(long)]
         pid: Option<u32>,
+        /// Discriminates what kind of run this is, e.g. `lane`, `audit`,
+        /// `create` (see `docs/plans/session-usage.md`).
+        #[arg(long, default_value = "lane")]
+        kind: String,
     },
     /// Record a run's terminal outcome.
     Finish {
@@ -502,6 +512,11 @@ pub enum RunsCmd {
         /// instead of the human-oriented rendering.
         #[arg(long)]
         json: bool,
+        /// Restrict to the latest run of this kind (e.g. `lane`, `audit`,
+        /// `create`) instead of the latest run of any kind, disambiguating
+        /// the case where a session run shadows a lane run.
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Print the session id of the latest run of a ticket, for `claude --resume`.
     Resume {
@@ -1293,7 +1308,22 @@ mod tests {
     fn parses_bare_runs_as_list() {
         let cli = Cli::try_parse_from(["tm", "runs"]).expect("should parse");
         match cli.command {
-            Some(Command::Runs { cmd }) => assert!(cmd.is_none()),
+            Some(Command::Runs { kind, cmd }) => {
+                assert!(kind.is_none());
+                assert!(cmd.is_none());
+            }
+            other => panic!("expected Runs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_with_kind_filter() {
+        let cli = Cli::try_parse_from(["tm", "runs", "--kind", "audit"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs { kind, cmd }) => {
+                assert_eq!(kind, Some("audit".to_string()));
+                assert!(cmd.is_none());
+            }
             other => panic!("expected Runs, got {other:?}"),
         }
     }
@@ -1314,6 +1344,8 @@ mod tests {
             "proj-123",
             "--pid",
             "4242",
+            "--kind",
+            "audit",
         ])
         .expect("should parse");
         match cli.command {
@@ -1325,13 +1357,16 @@ mod tests {
                         worktree,
                         branch,
                         pid,
+                        kind,
                     }),
+                ..
             }) => {
                 assert_eq!(ticket, "PROJ-123");
                 assert_eq!(lane, "backend");
                 assert_eq!(worktree, "/tmp/wt");
                 assert_eq!(branch, Some("proj-123".to_string()));
                 assert_eq!(pid, Some(4242));
+                assert_eq!(kind, "audit");
             }
             other => panic!("expected Runs Start, got {other:?}"),
         }
@@ -1360,13 +1395,16 @@ mod tests {
                         worktree,
                         branch,
                         pid,
+                        kind,
                     }),
+                ..
             }) => {
                 assert_eq!(ticket, "PROJ-123");
                 assert_eq!(lane, "backend");
                 assert_eq!(worktree, "/tmp/wt");
                 assert_eq!(branch, None);
                 assert_eq!(pid, None);
+                assert_eq!(kind, "lane");
             }
             other => panic!("expected Runs Start, got {other:?}"),
         }
@@ -1379,6 +1417,7 @@ mod tests {
         match cli.command {
             Some(Command::Runs {
                 cmd: Some(RunsCmd::Finish { run_id, status, .. }),
+                ..
             }) => {
                 assert_eq!(run_id, 3);
                 assert!(matches!(status, FinishStatusArg::Done));
@@ -1420,6 +1459,7 @@ mod tests {
                         kind,
                         detail,
                     }),
+                ..
             }) => {
                 assert_eq!(run_id, 3);
                 assert_eq!(kind, "tool_use");
@@ -1441,6 +1481,7 @@ mod tests {
                         kind,
                         detail,
                     }),
+                ..
             }) => {
                 assert_eq!(run_id, 3);
                 assert_eq!(kind, "stop");
@@ -1456,6 +1497,7 @@ mod tests {
         match cli.command {
             Some(Command::Runs {
                 cmd: Some(RunsCmd::Reap { stale_after }),
+                ..
             }) => {
                 assert_eq!(stale_after, 10);
             }
@@ -1470,6 +1512,7 @@ mod tests {
         match cli.command {
             Some(Command::Runs {
                 cmd: Some(RunsCmd::Reap { stale_after }),
+                ..
             }) => {
                 assert_eq!(stale_after, 0);
             }
@@ -1482,10 +1525,12 @@ mod tests {
         let cli = Cli::try_parse_from(["tm", "runs", "show", "PROJ-1"]).expect("should parse");
         match cli.command {
             Some(Command::Runs {
-                cmd: Some(RunsCmd::Show { ticket, json }),
+                cmd: Some(RunsCmd::Show { ticket, json, kind }),
+                ..
             }) => {
                 assert_eq!(ticket, "PROJ-1");
                 assert!(!json);
+                assert!(kind.is_none());
             }
             other => panic!("expected Runs Show, got {other:?}"),
         }
@@ -1497,10 +1542,27 @@ mod tests {
             Cli::try_parse_from(["tm", "runs", "show", "PROJ-1", "--json"]).expect("should parse");
         match cli.command {
             Some(Command::Runs {
-                cmd: Some(RunsCmd::Show { ticket, json }),
+                cmd: Some(RunsCmd::Show { ticket, json, .. }),
+                ..
             }) => {
                 assert_eq!(ticket, "PROJ-1");
                 assert!(json);
+            }
+            other => panic!("expected Runs Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_show_with_kind_filter() {
+        let cli = Cli::try_parse_from(["tm", "runs", "show", "PROJ-1", "--kind", "audit"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Show { ticket, kind, .. }),
+                ..
+            }) => {
+                assert_eq!(ticket, "PROJ-1");
+                assert_eq!(kind, Some("audit".to_string()));
             }
             other => panic!("expected Runs Show, got {other:?}"),
         }
@@ -1512,6 +1574,7 @@ mod tests {
         match cli.command {
             Some(Command::Runs {
                 cmd: Some(RunsCmd::Resume { ticket }),
+                ..
             }) => {
                 assert_eq!(ticket, "PROJ-1");
             }
@@ -1899,7 +1962,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Runs {
-                cmd: Some(RunsCmd::Watch)
+                cmd: Some(RunsCmd::Watch),
+                ..
             })
         ));
     }

@@ -62,19 +62,19 @@ tm auth status
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
 | `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
-| `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit, and description — the material for an audit conversation |
+| `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
-| `tm runs` | List every recorded lane run in a table |
-| `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid]` | Record the start of a lane run; prints the new run id |
+| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
+| `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
 | `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`), optionally with the authoritative per-model token/cost breakdown |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
-| `tm runs show <KEY> [--json]` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
+| `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
@@ -256,6 +256,7 @@ set. `checklist` and `model_usage` are `null` when the run has none;
     "id": 12,
     "ticket": "PROJ-123",
     "lane": "backend",
+    "kind": "lane",
     "status": "done",
     "session_id": "sess-abc",
     "worktree": "/path/to/wt",
@@ -530,6 +531,19 @@ there are none), its last recorded audit verdict (or `Last audit: never`),
 and its description. `tm` only owns the state/data side of an audit: the
 actual human + Claude conversation that decides whether a ticket is ready
 for an autonomous run is a Claude skill, not something `tm` runs itself.
+
+This command also runs inside its own tracked run: if it's invoked from a
+Claude Code session (an interactive `/ticket-audit` skill, not a plain
+terminal command), `tm` registers an `audit`-kind run in the same runs
+database `tm runs` uses, keyed by the session's identity, so the
+conversation's tool and model usage get recorded exactly like a `tm work
+run` lane's. `--record` (below) finishes that run. This is pure telemetry —
+a plain terminal invocation, or one with no runs database available,
+registers nothing and behaves exactly as before. When a finished `audit`-kind
+run for `<KEY>` recorded model usage, a `Last audit usage: <model> <n>k
+out / ...` line follows `Last audit: ...` (omitted otherwise, or on a
+runs-DB error). `tm runs --kind audit` and `tm runs show <KEY> --kind audit`
+surface these runs directly.
 
 `tm ticket audit <KEY> --record <ready|needs-work> [--notes "..."]` persists
 that conversation's verdict, timestamped, to the same local SQLite database
