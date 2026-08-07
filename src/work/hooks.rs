@@ -52,12 +52,14 @@ pub enum HooksError {
     },
 }
 
-/// The seven hook scripts, embedded from `hooks/*.sh` at the repo root, in
+/// The eight hook scripts, embedded from `hooks/*.sh` at the repo root, in
 /// the exact order `work.ml`'s `tm_hook_names` lists them (plus
 /// `tm-session-end.sh`, new for session-usage tracking — see
-/// `docs/plans/session-usage.md`). Order here doesn't affect the generated
-/// settings JSON (each script is referenced by name where it's wired), but
-/// is kept identical to the OCaml source for easy comparison.
+/// `docs/plans/session-usage.md` — and `tm-session-state.sh`, new for
+/// waiting-for-input telemetry — see `docs/plans/board-audits.md`). Order
+/// here doesn't affect the generated settings JSON (each script is
+/// referenced by name where it's wired), but is kept identical to the OCaml
+/// source for easy comparison.
 const HOOK_SOURCES: &[(&str, &str)] = &[
     ("tm-event.sh", include_str!("../../hooks/tm-event.sh")),
     (
@@ -69,6 +71,10 @@ const HOOK_SOURCES: &[(&str, &str)] = &[
     (
         "tm-session-end.sh",
         include_str!("../../hooks/tm-session-end.sh"),
+    ),
+    (
+        "tm-session-state.sh",
+        include_str!("../../hooks/tm-session-state.sh"),
     ),
     (
         "guard-delegate.sh",
@@ -140,18 +146,23 @@ fn set_executable(_path: &Path) -> Result<(), HooksError> {
 ///       { "matcher": "TaskCreate|TaskUpdate", "hooks": [ tm-tasklist.sh ] },
 ///       { "matcher": "*", "hooks": [ tm-event.sh ] }
 ///     ],
-///     "Stop": [ { "hooks": [ tm-usage.sh ] } ],
+///     "Stop": [ { "hooks": [ tm-usage.sh, tm-session-state.sh ] } ],
 ///     "SubagentStop": [ { "hooks": [ tm-usage.sh ] } ],
-///     "SessionEnd": [ { "hooks": [ tm-session-end.sh ] } ]
+///     "SessionEnd": [ { "hooks": [ tm-session-end.sh ] } ],
+///     "Notification": [ { "hooks": [ tm-session-state.sh ] } ],
+///     "UserPromptSubmit": [ { "hooks": [ tm-session-state.sh ] } ]
 /// } }
 /// ```
 ///
 /// `tm-usage.sh` is wired into both `Stop` and `SubagentStop`, exactly as
-/// `work.ml` does (it's the only script referenced twice). `SessionEnd` is
-/// new for session-usage tracking (`docs/plans/session-usage.md`) — it has
-/// no `work.ml` counterpart, since lane runs never fire `SessionEnd`
-/// (the wrapper process, not an interactive Claude Code session, owns
-/// finish there).
+/// `work.ml` does. `SessionEnd` is new for session-usage tracking
+/// (`docs/plans/session-usage.md`) — it has no `work.ml` counterpart, since
+/// lane runs never fire `SessionEnd` (the wrapper process, not an
+/// interactive Claude Code session, owns finish there). `tm-session-state.sh`
+/// is new for waiting-for-input telemetry (`docs/plans/board-audits.md`):
+/// it rides alongside `tm-usage.sh` on `Stop` (a second command entry in the
+/// same hook-event array) and is the sole hook on the two new event keys,
+/// `Notification` and `UserPromptSubmit`.
 fn settings_json(deploy_dir: &Path) -> Value {
     let cmd = |name: &str| {
         json!({
@@ -172,13 +183,19 @@ fn settings_json(deploy_dir: &Path) -> Value {
                 { "matcher": "*", "hooks": [ cmd("tm-event.sh") ] }
             ],
             "Stop": [
-                { "hooks": [ cmd("tm-usage.sh") ] }
+                { "hooks": [ cmd("tm-usage.sh"), cmd("tm-session-state.sh") ] }
             ],
             "SubagentStop": [
                 { "hooks": [ cmd("tm-usage.sh") ] }
             ],
             "SessionEnd": [
                 { "hooks": [ cmd("tm-session-end.sh") ] }
+            ],
+            "Notification": [
+                { "hooks": [ cmd("tm-session-state.sh") ] }
+            ],
+            "UserPromptSubmit": [
+                { "hooks": [ cmd("tm-session-state.sh") ] }
             ]
         }
     })
@@ -195,18 +212,19 @@ mod tests {
             "tm-usage.sh",
             "tm-tasklist.sh",
             "tm-session-end.sh",
+            "tm-session-state.sh",
             "guard-delegate.sh",
             "graphify-nudge.sh",
         ]
     }
 
     #[test]
-    fn hook_scripts_returns_all_seven_by_name() {
+    fn hook_scripts_returns_all_eight_by_name() {
         let names: Vec<&str> = hook_scripts().iter().map(|(n, _)| *n).collect();
         for expected in all_hook_names() {
             assert!(names.contains(&expected), "missing hook script {expected}");
         }
-        assert_eq!(hook_scripts().len(), 7);
+        assert_eq!(hook_scripts().len(), 8);
     }
 
     #[test]
@@ -298,6 +316,8 @@ mod tests {
             "Stop",
             "SubagentStop",
             "SessionEnd",
+            "Notification",
+            "UserPromptSubmit",
         ] {
             assert!(
                 hooks.contains_key(expected_event),
@@ -389,6 +409,53 @@ mod tests {
         let subagent_stop = settings["hooks"]["SubagentStop"].as_array().expect("array");
         assert_eq!(subagent_stop.len(), 1);
         assert_eq!(subagent_stop[0]["hooks"][0]["command"], usage_path);
+    }
+
+    #[test]
+    fn settings_json_stop_also_wires_tm_session_state_sh_as_a_second_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = deploy_hooks(dir.path()).expect("deploy_hooks");
+
+        let state_path = dir
+            .path()
+            .join("tm-session-state.sh")
+            .to_string_lossy()
+            .into_owned();
+
+        let stop = settings["hooks"]["Stop"].as_array().expect("array");
+        assert_eq!(stop.len(), 1);
+        let stop_hooks = stop[0]["hooks"].as_array().expect("array");
+        assert_eq!(stop_hooks.len(), 2, "Stop should carry two hook commands");
+        assert_eq!(stop_hooks[1]["command"], state_path);
+
+        // SubagentStop must not gain tm-session-state.sh — only Stop does.
+        let subagent_stop = settings["hooks"]["SubagentStop"].as_array().expect("array");
+        assert_eq!(
+            subagent_stop[0]["hooks"].as_array().expect("array").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_json_notification_and_user_prompt_submit_wire_tm_session_state_sh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = deploy_hooks(dir.path()).expect("deploy_hooks");
+
+        let state_path = dir
+            .path()
+            .join("tm-session-state.sh")
+            .to_string_lossy()
+            .into_owned();
+
+        let notification = settings["hooks"]["Notification"].as_array().expect("array");
+        assert_eq!(notification.len(), 1);
+        assert_eq!(notification[0]["hooks"][0]["command"], state_path.clone());
+
+        let user_prompt_submit = settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .expect("array");
+        assert_eq!(user_prompt_submit.len(), 1);
+        assert_eq!(user_prompt_submit[0]["hooks"][0]["command"], state_path);
     }
 
     #[test]
@@ -524,6 +591,32 @@ mod tests {
         assert!(
             !contents.contains(r#"[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
             "tm-session-end.sh must not exit on unset TSKMSTR_RUN_ID — that would skip every interactive session"
+        );
+    }
+
+    #[test]
+    fn parity_tm_session_state_dispatches_on_hook_event_name_and_keeps_inverted_lane_gate() {
+        let (_, contents) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "tm-session-state.sh")
+            .unwrap();
+        assert!(
+            contents.contains("hook_event_name"),
+            "tm-session-state.sh lost its hook_event_name dispatch"
+        );
+        assert!(contents.contains("--kind await"));
+        assert!(contents.contains("--kind resume"));
+        // Gate polarity matches tm-session-end.sh, opposite to the other
+        // telemetry hooks: exit when TSKMSTR_RUN_ID IS set (lane runs are
+        // headless — awaiting input is meaningless there) and proceed when
+        // it is not.
+        assert!(
+            contents.contains(r#"[ -n "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
+            "tm-session-state.sh lost its inverted lane-run gate"
+        );
+        assert!(
+            !contents.contains(r#"[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
+            "tm-session-state.sh must not exit on unset TSKMSTR_RUN_ID — that would skip every interactive session"
         );
     }
 }
