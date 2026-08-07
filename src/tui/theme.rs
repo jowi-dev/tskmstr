@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::runs::RunStatus;
-use crate::tui::app::{AuditIndicator, RunIndicator};
+use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
 
 /// Bold, default color. Used for board/runs column titles and every other
 /// floating window's border title.
@@ -172,6 +172,69 @@ pub fn run_indicator_label(indicator: RunIndicator) -> &'static str {
     }
 }
 
+/// The style for a board ticket's [`BotWatchIndicator`] badge: `Ready` is the
+/// loud one (bold yellow, matching [`AWAITING_INPUT`] -- it is the state that
+/// wants a keypress, exactly like an audit session waiting on input),
+/// `Watching` cyan (active), `Clean` green (nothing to do), `Failed` red
+/// (needs attention).
+pub fn bot_watch_indicator_style(indicator: BotWatchIndicator) -> Style {
+    match indicator {
+        BotWatchIndicator::Ready => AWAITING_INPUT,
+        BotWatchIndicator::Watching => Style::new().fg(Color::Cyan),
+        BotWatchIndicator::Clean => Style::new().fg(Color::Green),
+        BotWatchIndicator::Failed => Style::new().fg(Color::Red),
+    }
+}
+
+/// Short label text for `indicator`, rendered as a board ticket card's
+/// bot-watch badge line (see [`bot_watch_indicator_style`] for its color).
+pub fn bot_watch_indicator_label(indicator: BotWatchIndicator) -> &'static str {
+    match indicator {
+        BotWatchIndicator::Watching => "bots: watching",
+        BotWatchIndicator::Ready => "bots: ready",
+        BotWatchIndicator::Clean => "bots: clean",
+        BotWatchIndicator::Failed => "bots: failed",
+    }
+}
+
+/// The `bots:` badge shown while a `tm pr watch` launcher child is still in
+/// flight, before any `review-watch` run row exists (see
+/// [`crate::tui::app::App::pending_bot_watch_launches`]). Styled [`DIM`], the
+/// same not-live-yet treatment [`crate::tui::app::RunIndicator::Starting`]
+/// gets. Its own constant rather than a [`BotWatchIndicator`] variant because
+/// no watcher run status ever maps to it -- it exists only ahead of the run
+/// row.
+pub const BOT_WATCH_STARTING_LABEL: &str = "bots: starting";
+
+/// The style for a board ticket's bugbot-cleanup badge. Takes an
+/// [`AuditIndicator`] because a cleanup session *is* an audit-shaped
+/// tmux-hosted session (see `docs/plans/bugbot-watch.md`'s "Board
+/// integration"), but gets its own accent for the active state -- magenta
+/// rather than [`audit_indicator_style`]'s cyan -- so the two badges stay
+/// tellable apart on a card carrying both. `Waiting` is loud
+/// ([`AWAITING_INPUT`]) for the same reason it is on an audit.
+pub fn cleanup_indicator_style(indicator: AuditIndicator) -> Style {
+    match indicator {
+        AuditIndicator::Waiting => AWAITING_INPUT,
+        AuditIndicator::Running => Style::new().fg(Color::Magenta),
+        AuditIndicator::Starting => DIM,
+        AuditIndicator::Done => Style::new().fg(Color::Green),
+        AuditIndicator::Failed => Style::new().fg(Color::Red),
+    }
+}
+
+/// Short label text for `indicator`, rendered as a board ticket card's
+/// bugbot-cleanup badge line (see [`cleanup_indicator_style`] for its color).
+pub fn cleanup_indicator_label(indicator: AuditIndicator) -> &'static str {
+    match indicator {
+        AuditIndicator::Starting => "clean: starting",
+        AuditIndicator::Running => "clean: running",
+        AuditIndicator::Waiting => "clean: waiting",
+        AuditIndicator::Done => "clean: done",
+        AuditIndicator::Failed => "clean: failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +374,130 @@ mod tests {
             RunIndicator::Failed,
         ] {
             assert_eq!(run_indicator_style(indicator).bg, None);
+        }
+    }
+
+    #[test]
+    fn bot_watch_indicator_style_maps_every_indicator_to_a_distinct_color() {
+        let ready = bot_watch_indicator_style(BotWatchIndicator::Ready);
+        assert_eq!(ready.fg, Some(Color::Yellow));
+        assert!(
+            ready.add_modifier.contains(Modifier::BOLD),
+            "Ready is the act-on-me state and must be loud"
+        );
+        assert_eq!(
+            bot_watch_indicator_style(BotWatchIndicator::Watching).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            bot_watch_indicator_style(BotWatchIndicator::Clean).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            bot_watch_indicator_style(BotWatchIndicator::Failed).fg,
+            Some(Color::Red)
+        );
+        let colors: std::collections::HashSet<_> = [
+            BotWatchIndicator::Watching,
+            BotWatchIndicator::Ready,
+            BotWatchIndicator::Clean,
+            BotWatchIndicator::Failed,
+        ]
+        .iter()
+        .map(|i| bot_watch_indicator_style(*i).fg)
+        .collect();
+        assert_eq!(colors.len(), 4, "each variant needs its own fg");
+    }
+
+    #[test]
+    fn bot_watch_indicator_style_never_sets_a_background() {
+        for indicator in [
+            BotWatchIndicator::Watching,
+            BotWatchIndicator::Ready,
+            BotWatchIndicator::Clean,
+            BotWatchIndicator::Failed,
+        ] {
+            assert_eq!(bot_watch_indicator_style(indicator).bg, None);
+        }
+    }
+
+    #[test]
+    fn bot_watch_indicator_label_is_short_and_distinct() {
+        let labels = [
+            bot_watch_indicator_label(BotWatchIndicator::Watching),
+            bot_watch_indicator_label(BotWatchIndicator::Ready),
+            bot_watch_indicator_label(BotWatchIndicator::Clean),
+            bot_watch_indicator_label(BotWatchIndicator::Failed),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinct");
+        for label in labels {
+            assert!(label.starts_with("bots: "));
+        }
+        assert!(BOT_WATCH_STARTING_LABEL.starts_with("bots: "));
+    }
+
+    #[test]
+    fn cleanup_indicator_style_maps_every_indicator_to_a_distinct_color() {
+        let waiting = cleanup_indicator_style(AuditIndicator::Waiting);
+        assert_eq!(waiting.fg, Some(Color::Yellow));
+        assert!(waiting.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            cleanup_indicator_style(AuditIndicator::Running).fg,
+            Some(Color::Magenta),
+            "a cleanup session gets its own accent, not audit's cyan"
+        );
+        assert_eq!(
+            cleanup_indicator_style(AuditIndicator::Starting).fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            cleanup_indicator_style(AuditIndicator::Done).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            cleanup_indicator_style(AuditIndicator::Failed).fg,
+            Some(Color::Red)
+        );
+        let colors: std::collections::HashSet<_> = [
+            AuditIndicator::Starting,
+            AuditIndicator::Running,
+            AuditIndicator::Waiting,
+            AuditIndicator::Done,
+            AuditIndicator::Failed,
+        ]
+        .iter()
+        .map(|i| cleanup_indicator_style(*i).fg)
+        .collect();
+        assert_eq!(colors.len(), 5, "each variant needs its own fg");
+    }
+
+    #[test]
+    fn cleanup_indicator_style_never_sets_a_background() {
+        for indicator in [
+            AuditIndicator::Starting,
+            AuditIndicator::Running,
+            AuditIndicator::Waiting,
+            AuditIndicator::Done,
+            AuditIndicator::Failed,
+        ] {
+            assert_eq!(cleanup_indicator_style(indicator).bg, None);
+        }
+    }
+
+    #[test]
+    fn cleanup_indicator_label_is_short_and_distinct() {
+        let labels = [
+            cleanup_indicator_label(AuditIndicator::Starting),
+            cleanup_indicator_label(AuditIndicator::Running),
+            cleanup_indicator_label(AuditIndicator::Waiting),
+            cleanup_indicator_label(AuditIndicator::Done),
+            cleanup_indicator_label(AuditIndicator::Failed),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinct");
+        for label in labels {
+            assert!(label.starts_with("clean: "));
         }
     }
 

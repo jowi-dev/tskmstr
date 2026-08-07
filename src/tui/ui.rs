@@ -21,8 +21,8 @@ use ratatui::widgets::{
 use crate::cli::runs::format_age;
 use crate::runs::RunStatus;
 use crate::tui::app::{
-    App, AssigneeFilter, AuditStatusEntry, Column, RUN_COLUMNS, RunCard, RunIndicator, Screen,
-    TicketSummary,
+    App, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, RUN_COLUMNS, RunCard,
+    RunIndicator, Screen, TicketSummary,
 };
 use crate::tui::theme;
 
@@ -38,14 +38,44 @@ const CARD_BORDER_ROWS: u16 = 2;
 
 /// A board ticket's badge-worthy status maps, bundled so [`draw_column`],
 /// [`draw_card`], and [`card_height`] can each take one reference instead of
-/// two -- keeping their arity down now that a ticket can carry both an audit
-/// badge and a lane-run badge (see `docs/plans/board-lane-runs.md`'s
-/// "Badges" decision).
+/// four -- keeping their arity down now that a ticket can carry an audit
+/// badge, a lane-run badge (see `docs/plans/board-lane-runs.md`'s "Badges"
+/// decision), a bot-watch badge and a cleanup badge (see
+/// `docs/plans/bugbot-watch.md`'s "Board integration") all at once.
 struct BoardBadges<'a> {
     /// Per-ticket audit badge state, from [`App::audit_status`].
     audit_status: &'a HashMap<String, AuditStatusEntry>,
     /// Per-ticket lane-run badge state, from [`App::lane_run_status`].
     lane_run_status: &'a HashMap<String, RunIndicator>,
+    /// Per-ticket PR bot-watch badge state, from [`App::bot_watch_status`].
+    bot_watch_status: &'a HashMap<String, BotWatchIndicator>,
+    /// Ticket keys with a `tm pr watch` launcher child in flight, from
+    /// [`App::pending_bot_watch_launches`]. Renders a starting-style `bots:`
+    /// badge for any ticket that has no `bot_watch_status` entry yet -- unlike
+    /// lane runs, whose pending state is overlaid reducer-side, because
+    /// [`BotWatchIndicator`] deliberately has no `Starting` variant (no watcher
+    /// run status maps to one).
+    pending_bot_watch: &'a std::collections::HashSet<String>,
+    /// Per-ticket bugbot-cleanup badge state, from [`App::cleanup_status`].
+    cleanup_status: &'a HashMap<String, AuditStatusEntry>,
+}
+
+/// The `bots:` badge to render for `ticket_key`, if any: its loaded
+/// [`BotWatchIndicator`], or the starting overlay when a launcher child is
+/// still in flight with no run row recorded yet. A loaded run row always wins,
+/// for the same "the row is fresher truth than the pending flag" reason
+/// [`crate::tui::app::lane_run_indicator`] documents.
+fn bot_watch_badge<'a>(badges: &BoardBadges<'a>, ticket_key: &str) -> Option<(&'a str, Style)> {
+    match badges.bot_watch_status.get(ticket_key) {
+        Some(indicator) => Some((
+            theme::bot_watch_indicator_label(*indicator),
+            theme::bot_watch_indicator_style(*indicator),
+        )),
+        None if badges.pending_bot_watch.contains(ticket_key) => {
+            Some((theme::BOT_WATCH_STARTING_LABEL, theme::DIM))
+        }
+        None => None,
+    }
 }
 
 /// Draw the current screen (and the help overlay, if shown) into `frame`.
@@ -132,7 +162,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  w work  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  w work  b bots  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -166,6 +196,9 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
     let badges = BoardBadges {
         audit_status: &app.audit_status,
         lane_run_status: &app.lane_run_status,
+        bot_watch_status: &app.bot_watch_status,
+        pending_bot_watch: &app.pending_bot_watch_launches,
+        cleanup_status: &app.cleanup_status,
     };
 
     for (index, column) in app.columns.iter().enumerate() {
@@ -319,6 +352,15 @@ fn draw_card(
             style.patch(theme::run_indicator_style(*indicator)),
         )));
     }
+    if let Some((label, badge_style)) = bot_watch_badge(badges, &ticket.key) {
+        lines.push(Line::from(Span::styled(label, style.patch(badge_style))));
+    }
+    if let Some(entry) = badges.cleanup_status.get(&ticket.key) {
+        lines.push(Line::from(Span::styled(
+            theme::cleanup_indicator_label(entry.indicator),
+            style.patch(theme::cleanup_indicator_style(entry.indicator)),
+        )));
+    }
 
     let paragraph = Paragraph::new(lines).style(style).block(block);
     frame.render_widget(paragraph, area);
@@ -337,9 +379,12 @@ fn assignee_line(ticket: &TicketSummary) -> String {
 /// The rendered height of `ticket`'s card at `content_width`: its wrapped,
 /// capped summary plus top/bottom border rows, plus one more row each for
 /// the assignee line (when `show_assignee` is set), the audit badge line
-/// (when `ticket.key` has an entry in `badges.audit_status`), and the
-/// lane-run badge line (when it has an entry in `badges.lane_run_status`) --
-/// both badge lines can render on the same card at once.
+/// (when `ticket.key` has an entry in `badges.audit_status`), the lane-run
+/// badge line (when it has an entry in `badges.lane_run_status`), the
+/// bot-watch badge line (when [`bot_watch_badge`] yields one), and the
+/// bugbot-cleanup badge line (when it has an entry in
+/// `badges.cleanup_status`) -- every badge line can render on the same card at
+/// once.
 fn card_height(
     ticket: &TicketSummary,
     content_width: usize,
@@ -358,7 +403,17 @@ fn card_height(
     } else {
         0
     };
-    lines + assignee_row + audit_row + lane_run_row + CARD_BORDER_ROWS
+    let bot_watch_row = if bot_watch_badge(badges, &ticket.key).is_some() {
+        1
+    } else {
+        0
+    };
+    let cleanup_row = if badges.cleanup_status.contains_key(&ticket.key) {
+        1
+    } else {
+        0
+    };
+    lines + assignee_row + audit_row + lane_run_row + bot_watch_row + cleanup_row + CARD_BORDER_ROWS
 }
 
 /// Word-wrap `summary` to `width` columns, hard-breaking any single word
@@ -1486,6 +1541,170 @@ mod tests {
             modifier.contains(Modifier::REVERSED),
             "selection contract (REVERSED) must survive on a badged card"
         );
+    }
+
+    #[test]
+    fn card_with_bot_watch_status_renders_the_badge_styled() {
+        use crate::tui::app::BotWatchIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Watching);
+        let buffer = render_with_size(&app, 80, 24);
+        let cell = cell_at(&buffer, "bots: watching").expect("bots badge renders");
+        assert_eq!(
+            Some(cell.fg),
+            theme::bot_watch_indicator_style(BotWatchIndicator::Watching).fg
+        );
+    }
+
+    #[test]
+    fn card_with_ready_bot_watch_status_renders_the_loud_accent() {
+        use crate::tui::app::BotWatchIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        let buffer = render_with_size(&app, 80, 24);
+        let cell = cell_at(&buffer, "bots: ready").expect("bots badge renders");
+        assert_eq!(Some(cell.fg), theme::AWAITING_INPUT.fg);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn card_with_no_bot_watch_status_renders_no_bots_badge() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("bots:"));
+    }
+
+    #[test]
+    fn card_with_a_pending_bot_watch_launch_renders_the_starting_overlay() {
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.pending_bot_watch_launches.insert("PROJ-1".to_string());
+        let buffer = render_with_size(&app, 80, 24);
+        let cell = cell_at(&buffer, theme::BOT_WATCH_STARTING_LABEL)
+            .expect("starting overlay badge renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
+    }
+
+    #[test]
+    fn a_loaded_bot_watch_run_wins_over_a_pending_launch_overlay() {
+        use crate::tui::app::BotWatchIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.pending_bot_watch_launches.insert("PROJ-1".to_string());
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Watching);
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        assert!(text.contains("bots: watching"));
+        assert!(!text.contains("bots: starting"));
+    }
+
+    #[test]
+    fn card_with_cleanup_status_renders_the_clean_badge_styled() {
+        use crate::tui::app::AuditIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.cleanup_status.insert(
+            "PROJ-1".to_string(),
+            AuditStatusEntry {
+                indicator: AuditIndicator::Running,
+                has_session: true,
+            },
+        );
+        let buffer = render_with_size(&app, 80, 24);
+        let cell = cell_at(&buffer, "clean: running").expect("clean badge renders");
+        assert_eq!(
+            Some(cell.fg),
+            theme::cleanup_indicator_style(AuditIndicator::Running).fg
+        );
+    }
+
+    #[test]
+    fn card_with_no_cleanup_status_renders_no_clean_badge() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("clean:"));
+    }
+
+    #[test]
+    fn card_can_render_every_badge_family_at_once() {
+        use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.audit_status.insert(
+            "PROJ-1".to_string(),
+            AuditStatusEntry {
+                indicator: AuditIndicator::Done,
+                has_session: true,
+            },
+        );
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Done);
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
+        app.cleanup_status.insert(
+            "PROJ-1".to_string(),
+            AuditStatusEntry {
+                indicator: AuditIndicator::Waiting,
+                has_session: true,
+            },
+        );
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        assert!(text.contains("audit: done"));
+        assert!(text.contains("run: done"));
+        assert!(text.contains("bots: ready"));
+        assert!(text.contains("clean: waiting"));
+    }
+
+    #[test]
+    fn selected_card_with_bots_badge_still_carries_reversed_modifier() {
+        use crate::tui::app::BotWatchIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            selected_col: 0,
+            selected_row: 0,
+            ..App::new()
+        };
+        app.bot_watch_status
+            .insert("PROJ-1".to_string(), BotWatchIndicator::Watching);
+        let buffer = render_with_size(&app, 80, 24);
+        let modifier = modifier_at(&buffer, "bots: watching");
+        assert!(
+            modifier.contains(Modifier::REVERSED),
+            "selection contract (REVERSED) must survive on a badged card"
+        );
+    }
+
+    #[test]
+    fn board_hint_documents_the_bots_key() {
+        assert!(hint_for(Screen::Board, false).contains("b bots"));
     }
 
     #[test]
