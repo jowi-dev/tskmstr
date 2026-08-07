@@ -21,7 +21,7 @@ use std::process::Command;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::bot_findings::{PrReview, ReviewThread};
+use super::bot_findings::{FindingDetail, PrReview, ReviewThread};
 use super::pr::PrInfo;
 
 /// Errors that can occur while shelling out to `gh` or `git`.
@@ -138,6 +138,14 @@ pub trait GhCli {
     /// --json state,merged`).
     fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError>;
 
+    /// List the review threads on pull request `number`, same as
+    /// [`GhCli::pr_review_threads`] but with each thread's first comment's
+    /// full body/path/line/URL, for handing bot findings to a cleanup
+    /// session prompt. A separate GraphQL query from
+    /// [`GhCli::pr_review_threads`]'s: that counting path never needed
+    /// comment bodies/locations, so this doesn't touch it.
+    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError>;
+
     /// List open pull requests in the current repository, fetching the same
     /// fields as [`GhCli::pr_view`] (`gh pr list --state open --json
     /// number,url,title,body,headRefName`) so one [`PrInfo`] parser serves
@@ -182,6 +190,26 @@ const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $numb
         nodes {
           isResolved
           comments(first: 1) { nodes { author { login } } }
+        }
+      }
+    }
+  }
+}";
+
+/// GraphQL query fetching a pull request's review threads' resolution state
+/// plus each thread's first comment in full: author, body, path, line, and
+/// URL. A separate query from [`REVIEW_THREADS_QUERY`], not an extension of
+/// it (see [`GhCli::pr_bot_finding_details`]).
+///
+/// Fetches only the first 100 threads, same limitation as
+/// [`REVIEW_THREADS_QUERY`] (see [`GhCli::pr_review_threads`]).
+const FINDING_DETAILS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 1) { nodes { author { login } body path line url } }
         }
       }
     }
@@ -362,6 +390,40 @@ impl GhCli for ShellGhCli {
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError> {
+        let repo = self.resolve_repo()?;
+
+        let query_arg = format!("query={FINDING_DETAILS_QUERY}");
+        let owner_arg = format!("owner={}", repo.owner);
+        let name_arg = format!("name={}", repo.name);
+        let number_arg = format!("number={number}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-F",
+                &owner_arg,
+                "-F",
+                &name_arg,
+                "-F",
+                &number_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_finding_details_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            number,
         )
     }
 
@@ -602,6 +664,129 @@ fn interpret_review_threads_output(
                         .next()
                         .and_then(|comment| comment.author)
                         .map(|author| author.login),
+                })
+                .collect())
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Raw shape of the `gh api graphql` response body for
+/// [`FINDING_DETAILS_QUERY`], for deserialization only. Deliberately not
+/// shared with [`RawGraphQlResponse`]'s types (see
+/// [`GhCli::pr_bot_finding_details`]).
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlResponse {
+    data: Option<RawFindingGraphQlData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlData {
+    repository: Option<RawFindingGraphQlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<RawFindingGraphQlPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlPullRequest {
+    #[serde(rename = "reviewThreads")]
+    review_threads: RawFindingGraphQlReviewThreads,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlReviewThreads {
+    nodes: Vec<RawFindingGraphQlReviewThreadNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    comments: RawFindingGraphQlComments,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlComments {
+    nodes: Vec<RawFindingGraphQlComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFindingGraphQlComment {
+    author: Option<RawGraphQlAuthor>,
+    body: String,
+    path: Option<String>,
+    line: Option<i64>,
+    url: String,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`FINDING_DETAILS_QUERY`] for pull request `number`.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. A review thread with
+/// no first comment (shouldn't happen in practice — a thread always starts
+/// with a comment) degrades to empty `body`/`url` and `None` `path`/`line`/
+/// `author_login` rather than erroring. A null `data.repository.pullRequest`
+/// (pull request not found) is a [`GhError::Parse`] naming `number`, same as
+/// [`interpret_review_threads_output`].
+fn interpret_finding_details_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    number: u64,
+) -> Result<Vec<FindingDetail>, GhError> {
+    match exit_code {
+        Some(0) => {
+            let response =
+                serde_json::from_str::<RawFindingGraphQlResponse>(stdout).map_err(|err| {
+                    GhError::Parse {
+                        command: "gh api graphql".to_string(),
+                        message: err.to_string(),
+                    }
+                })?;
+
+            let pull_request = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.pull_request)
+                .ok_or_else(|| GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: format!("pull request #{number} not found"),
+                })?;
+
+            Ok(pull_request
+                .review_threads
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    let comment = node.comments.nodes.into_iter().next();
+                    FindingDetail {
+                        author_login: comment
+                            .as_ref()
+                            .and_then(|comment| comment.author.as_ref())
+                            .map(|author| author.login.clone()),
+                        is_resolved: node.is_resolved,
+                        path: comment.as_ref().and_then(|comment| comment.path.clone()),
+                        line: comment.as_ref().and_then(|comment| comment.line),
+                        body: comment
+                            .as_ref()
+                            .map(|comment| comment.body.clone())
+                            .unwrap_or_default(),
+                        url: comment.map(|comment| comment.url).unwrap_or_default(),
+                    }
                 })
                 .collect())
         }
@@ -897,6 +1082,8 @@ pub struct FakeGhCli {
     pr_reviews_calls: RefCell<Vec<u64>>,
     pr_state_results: RefCell<HashMap<u64, Result<PrLifecycle, GhError>>>,
     pr_state_calls: RefCell<Vec<u64>>,
+    finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
+    finding_details_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrInfo>, GhError>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
@@ -927,6 +1114,8 @@ impl Default for FakeGhCli {
             pr_reviews_calls: RefCell::new(Vec::new()),
             pr_state_results: RefCell::new(HashMap::new()),
             pr_state_calls: RefCell::new(Vec::new()),
+            finding_details_results: RefCell::new(HashMap::new()),
+            finding_details_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
@@ -1027,6 +1216,29 @@ impl FakeGhCli {
         self.pr_state_calls.borrow().clone()
     }
 
+    /// Set the result `pr_bot_finding_details` will return for pull request
+    /// `number`.
+    ///
+    /// A PR number with no configured result returns `Ok(vec![])`, mirroring
+    /// [`FakeGhCli::with_review_threads`]'s unconfigured-is-trivially-empty
+    /// convention.
+    pub fn with_pr_bot_finding_details(
+        self,
+        number: u64,
+        result: Result<Vec<FindingDetail>, GhError>,
+    ) -> Self {
+        self.finding_details_results
+            .borrow_mut()
+            .insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_bot_finding_details`, in call
+    /// order.
+    pub fn pr_bot_finding_details_calls(&self) -> Vec<u64> {
+        self.finding_details_calls.borrow().clone()
+    }
+
     /// Set the result `pr_list` will return.
     pub fn with_pr_list(self, result: Result<Vec<PrInfo>, GhError>) -> Self {
         *self.pr_list_result.borrow_mut() = result;
@@ -1091,6 +1303,14 @@ impl GhCli for FakeGhCli {
         match self.pr_state_results.borrow().get(&number) {
             Some(result) => result.clone(),
             None => Ok(PrLifecycle::Open),
+        }
+    }
+
+    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError> {
+        self.finding_details_calls.borrow_mut().push(number);
+        match self.finding_details_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -1416,6 +1636,117 @@ mod tests {
     fn review_threads_failure_is_a_command_error() {
         let err = interpret_review_threads_output(Some(1), "", "gh: not found", 42).unwrap_err();
         assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn finding_details_parses_body_path_line_url_and_author() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [{
+                                            "author": { "login": "cursor" },
+                                            "body": "This looks off.",
+                                            "path": "src/lib.rs",
+                                            "line": 42,
+                                            "url": "https://github.com/example/repo/pull/1#comment-1"
+                                        }]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let details = interpret_finding_details_output(Some(0), stdout, "", 42).unwrap();
+        assert_eq!(
+            details,
+            vec![FindingDetail {
+                author_login: Some("cursor".to_string()),
+                is_resolved: false,
+                path: Some("src/lib.rs".to_string()),
+                line: Some(42),
+                body: "This looks off.".to_string(),
+                url: "https://github.com/example/repo/pull/1#comment-1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn finding_details_null_author_becomes_none() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": true,
+                                    "comments": {
+                                        "nodes": [{
+                                            "author": null,
+                                            "body": "note",
+                                            "path": null,
+                                            "line": null,
+                                            "url": "https://github.com/example/repo/pull/1#comment-2"
+                                        }]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let details = interpret_finding_details_output(Some(0), stdout, "", 42).unwrap();
+        assert_eq!(details[0].author_login, None);
+        assert_eq!(details[0].path, None);
+        assert_eq!(details[0].line, None);
+        assert!(details[0].is_resolved);
+    }
+
+    #[test]
+    fn finding_details_null_pull_request_is_a_parse_error_naming_number() {
+        let stdout = r#"{"data":{"repository":{"pullRequest":null}}}"#;
+        let err = interpret_finding_details_output(Some(0), stdout, "", 42).unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("42")),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finding_details_failure_is_a_command_error() {
+        let err = interpret_finding_details_output(Some(1), "", "gh: not found", 42).unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_returns_configured_pr_bot_finding_details_for_pr_number() {
+        let details = vec![FindingDetail {
+            author_login: Some("cursor".to_string()),
+            is_resolved: false,
+            path: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            body: "finding".to_string(),
+            url: "https://github.com/example/repo/pull/1#comment-1".to_string(),
+        }];
+        let fake = FakeGhCli::new().with_pr_bot_finding_details(42, Ok(details.clone()));
+
+        assert_eq!(fake.pr_bot_finding_details(42).unwrap(), details);
+        assert_eq!(fake.pr_bot_finding_details_calls(), vec![42]);
+    }
+
+    #[test]
+    fn fake_gh_cli_unconfigured_pr_bot_finding_details_returns_empty() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.pr_bot_finding_details(99).unwrap(), Vec::new());
     }
 
     #[test]

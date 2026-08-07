@@ -45,6 +45,53 @@ pub struct PrReview {
     pub author_login: Option<String>,
 }
 
+/// A review thread's resolution state plus its first comment's full detail
+/// (body, location, URL), for handing bot findings to a cleanup session
+/// prompt.
+///
+/// A superset of [`ReviewThread`]'s data, but deliberately not built from the
+/// same GraphQL query: `tm pr status`'s counting path never needed comment
+/// bodies/locations, and this finding-details path never needs to touch
+/// [`ReviewThread`] or the query behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingDetail {
+    /// Login of the author of the thread's first comment.
+    ///
+    /// `None` when the author is null, e.g. a deleted account.
+    pub author_login: Option<String>,
+    /// Whether the thread has been marked resolved.
+    pub is_resolved: bool,
+    /// Path of the file the first comment is anchored to, if any.
+    pub path: Option<String>,
+    /// Line number the first comment is anchored to, if any.
+    pub line: Option<i64>,
+    /// Body text of the first comment.
+    pub body: String,
+    /// Web URL of the first comment.
+    pub url: String,
+}
+
+/// Filter `details` down to unresolved findings authored by one of
+/// `bot_logins`, preserving input order.
+///
+/// Uses the same suffix-and-case [`bot_login_matches`] rule
+/// [`count_bot_findings`] uses, so a `FindingDetail` counts as a bot finding
+/// under exactly the same conditions a `ReviewThread` would.
+pub fn bot_finding_details(details: &[FindingDetail], bot_logins: &[String]) -> Vec<FindingDetail> {
+    details
+        .iter()
+        .filter(|detail| {
+            !detail.is_resolved
+                && detail.author_login.as_deref().is_some_and(|author| {
+                    bot_logins
+                        .iter()
+                        .any(|login| bot_login_matches(login, author))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Count how many of `threads` were opened by one of `bot_logins`, and how
 /// many of those remain unresolved.
 ///
@@ -254,5 +301,55 @@ mod tests {
     fn bots_have_reviewed_ignores_null_author_reviews() {
         let reviews = vec![review(None)];
         assert!(!bots_have_reviewed(&reviews, &cursor_bot()));
+    }
+
+    fn finding(is_resolved: bool, author_login: Option<&str>, body: &str) -> FindingDetail {
+        FindingDetail {
+            author_login: author_login.map(str::to_string),
+            is_resolved,
+            path: Some("src/lib.rs".to_string()),
+            line: Some(42),
+            body: body.to_string(),
+            url: "https://github.com/example/repo/pull/1#comment-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn bot_finding_details_excludes_resolved() {
+        let details = vec![finding(true, Some("cursor"), "resolved finding")];
+        assert_eq!(bot_finding_details(&details, &cursor_bot()), Vec::new());
+    }
+
+    #[test]
+    fn bot_finding_details_excludes_non_bot_authors() {
+        let details = vec![finding(false, Some("some-human"), "human comment")];
+        assert_eq!(bot_finding_details(&details, &cursor_bot()), Vec::new());
+    }
+
+    #[test]
+    fn bot_finding_details_excludes_null_authors() {
+        let details = vec![finding(false, None, "no author")];
+        assert_eq!(bot_finding_details(&details, &cursor_bot()), Vec::new());
+    }
+
+    #[test]
+    fn bot_finding_details_includes_unresolved_bot_findings_preserving_order() {
+        let details = vec![
+            finding(false, Some("cursor"), "first finding"),
+            finding(true, Some("cursor"), "resolved, excluded"),
+            finding(false, Some("cursor"), "second finding"),
+        ];
+        let filtered = bot_finding_details(&details, &cursor_bot());
+        assert_eq!(
+            filtered.iter().map(|f| f.body.as_str()).collect::<Vec<_>>(),
+            vec!["first finding", "second finding"]
+        );
+    }
+
+    #[test]
+    fn bot_finding_details_matches_suffixed_login_from_graphql_unsuffixed_author() {
+        let details = vec![finding(false, Some("cursor"), "finding")];
+        let filtered = bot_finding_details(&details, &cursor_bot());
+        assert_eq!(filtered.len(), 1);
     }
 }
