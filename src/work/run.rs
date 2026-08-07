@@ -392,7 +392,7 @@ pub fn run_lane_fg(
         Some(std::process::id()),
         out,
     )?;
-    run_claude_and_finish(deps.spawner, deps.run_store, &prepared, out)
+    run_claude_and_finish(deps.spawner, deps.gh, deps.run_store, &prepared, out)
 }
 
 /// Steps 1-9 of the module doc's ported sequence: resolve the lane, preflight
@@ -562,14 +562,43 @@ pub fn prepare_run_lane(
     })
 }
 
+/// Regex matching a GitHub pull-request URL in free-form text, mirroring
+/// `work.ml`'s `grep -oE 'https://github[^ )]*/pull/[0-9]+'` fallback scrape
+/// of the run's result text.
+fn pr_url_regex() -> regex::Regex {
+    regex::Regex::new(r"https://github[^\s)]*/pull/[0-9]+").expect("static regex is valid")
+}
+
+/// Resolve the PR URL for a finished run, mirroring `work.ml`'s
+/// belt-and-suspenders order: prefer asking `gh` directly (accurate even if
+/// the summary text never mentions the URL), then fall back to scraping the
+/// first GitHub pull-request URL out of the run's result text. Both steps
+/// degrade to `None` on any failure — a missing PR is the normal case for a
+/// run that never opened one, never an error worth surfacing.
+fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Option<String> {
+    if let Ok(Some(url)) = gh.pr_url_for_branch(branch)
+        && !url.is_empty()
+    {
+        return Some(url);
+    }
+    let text = result_text?;
+    pr_url_regex().find(text).map(|m| m.as_str().to_string())
+}
+
 /// Steps 10-13 of the module doc's ported sequence: spawn `claude`, wait,
 /// parse its result JSON, [`RunStore::finish_run`], and print the summary to
 /// `out`. The one tail both `--fg` ([`run_lane_fg`]) and the detached
 /// supervisor ([`supervise_run`]) call — per
 /// `docs/plans/runner-port.md` §4, there is exactly one spawn-wait-parse
 /// path, not one per run mode.
+///
+/// `gh` is used for the post-run PR-URL lookup (`gh pr list --head <branch>`,
+/// falling back to scraping the result text — see [`resolve_pr_url`]),
+/// ported from `work.ml`'s detached wrapper script so both `--fg` and
+/// detached runs record `pr_url` the same way.
 pub fn run_claude_and_finish(
     spawner: &dyn ProcessSpawner,
+    gh: &dyn GhCli,
     run_store: &RunStore,
     prepared: &PreparedRun,
     out: &mut dyn Write,
@@ -596,6 +625,11 @@ pub fn run_claude_and_finish(
         .as_ref()
         .and_then(|o| o.model_usage.as_ref())
         .and_then(|m| serde_json::to_string(m).ok());
+    let pr_url = resolve_pr_url(
+        gh,
+        &prepared.branch,
+        parsed.as_ref().and_then(|o| o.result.as_deref()),
+    );
     run_store.finish_run(
         prepared.run_id,
         &FinishRun {
@@ -609,7 +643,7 @@ pub fn run_claude_and_finish(
             cost_usd: parsed.as_ref().and_then(|o| o.cost_usd),
             num_turns: parsed.as_ref().and_then(|o| o.num_turns).map(|t| t as i64),
             blocker: None,
-            pr_url: None,
+            pr_url,
             transcript: Some(prepared.out_json_path.to_string_lossy().into_owned()),
             model_usage: model_usage_json,
         },
@@ -668,13 +702,14 @@ pub fn run_claude_and_finish(
 /// re-exec, setsid, or file I/O involved in the test.
 pub fn supervise_run(
     spawner: &dyn ProcessSpawner,
+    gh: &dyn GhCli,
     run_store: &RunStore,
     prepared: &PreparedRun,
     supervisor_pid: u32,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
-    run_claude_and_finish(spawner, run_store, prepared, out)
+    run_claude_and_finish(spawner, gh, run_store, prepared, out)
 }
 
 #[cfg(test)]
@@ -1288,6 +1323,154 @@ mod tests {
         assert_eq!(run.ticket, "ABC-123");
     }
 
+    // --- pr_url resolution: gh lookup, falling back to a result-text scrape,
+    // tolerant of neither resolving (see resolve_pr_url). ---
+
+    #[test]
+    fn run_claude_and_finish_records_pr_url_from_gh_lookup() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_url_for_branch(Ok(Some(
+            "https://github.com/example/repo/pull/7".to_string(),
+        )));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        // gh was asked about this run's own branch, not some other one.
+        assert_eq!(gh.pr_url_for_branch_calls(), vec![outcome.branch.clone()]);
+
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(
+            run.pr_url,
+            Some("https://github.com/example/repo/pull/7".to_string())
+        );
+    }
+
+    #[test]
+    fn run_claude_and_finish_falls_back_to_scraping_result_text_when_gh_finds_nothing() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let json = r#"{"session_id":"sess-1","total_cost_usd":0.5,"num_turns":3,"is_error":false,"result":"opened https://github.com/example/repo/pull/42 for review"}"#;
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new(); // no gh pr_url_for_branch configured -> None
+        let spawner = FakeProcessSpawner::success(json.to_string());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(
+            run.pr_url,
+            Some("https://github.com/example/repo/pull/42".to_string())
+        );
+    }
+
+    #[test]
+    fn run_claude_and_finish_pr_url_is_none_when_neither_gh_nor_scrape_find_one() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let json = r#"{"session_id":"sess-1","total_cost_usd":0.5,"num_turns":3,"is_error":false,"result":"all done, no PR opened"}"#;
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(json.to_string());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        // No PR URL resolved, but the run still finishes normally.
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.pr_url, None);
+        assert_eq!(run.status, RunStatus::Done);
+        assert!(!outcome.is_error);
+    }
+
     // --- prepare_run_lane / run_claude_and_finish / supervise_run:
     // the detached path's split of run_lane_fg's sequence. ---
 
@@ -1539,6 +1722,7 @@ mod tests {
 
         let outcome = supervise_run(
             &supervisor_spawner,
+            &gh,
             &run_store,
             &prepared,
             9999,
@@ -1600,6 +1784,7 @@ mod tests {
 
         let outcome = supervise_run(
             &supervisor_spawner,
+            &gh,
             &run_store,
             &prepared,
             4321,

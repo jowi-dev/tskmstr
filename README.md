@@ -77,6 +77,12 @@ tm auth status
 | `tm runs show <KEY> [--json]` | Print the latest run for a ticket, its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
+| `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
+| `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
+| `tm work list` | List every current tmux session with a worktree/session kind column |
+| `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
+| `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
+| `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--fg]` | Provision (if needed) and run one autonomous headless Claude Code session for a configured lane, tracked in `tm runs`; detached by default, `--fg` runs synchronously |
 
 ## `tm runs`
 
@@ -298,6 +304,27 @@ set. `checklist` and `model_usage` are `null` when the run has none;
 (in the configured default project, assigned to the configured default
 assignee) when no key can be resolved from the PR's title, body, or
 branch name.
+
+## `tm work`
+
+`tm work` provisions per-lane git worktrees and tmux sessions, and can run
+one autonomous headless `claude -p` session per lane, tracked in `tm runs`
+(ported from a personal `j work` runner; see
+`docs/plans/runner-port.md`/`docs/decisions/0002-runner-absorption.md`).
+Each lane is configured under `[work.lanes.<name>]` in `config.toml`
+(`repo` is required; `prompt_file`, `base_branch`, `model`, `max_turns`,
+`permission_mode` fall back to the `[work]`-level defaults, then to
+built-in defaults). `tm work run <lane>` provisions the lane's worktree if
+missing, cuts a fresh timestamped branch off the resolved base for this
+run, and invokes `claude -p` with the lane's prompt (`~/.claude/prompts/
+<lane>.md` by convention). Detached by default — provisioning/preflight run
+in the foreground so errors surface immediately, then a supervisor process
+runs `claude` and records the outcome while the initiating invocation
+returns the terminal right away; `--fg` instead runs synchronously. On
+completion it records the PR URL, if any, on the run's `pr_url` field:
+first by asking `gh` directly for the branch's open PR, falling back to
+scraping the first GitHub pull-request URL out of the run's result text —
+no PR is a normal outcome, not an error.
 
 ## TUI keybindings
 

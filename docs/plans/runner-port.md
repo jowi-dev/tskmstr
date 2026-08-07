@@ -1,5 +1,8 @@
 # Plan: Port the lane runner (`j work`) to `tm work`
 
+Landed 2026-08-07: all 12 steps in §6 complete (see git log for the
+individual checkpoint commits). `docs/ROADMAP.md` stream 1 is marked done.
+
 Governing decisions: `docs/decisions/0002-runner-absorption.md` (port, don't
 vendor; the seam is "tskmstr owns what it needs to do its job") and
 `docs/decisions/0001-run-state.md` (SQLite run state, hooks telemetry, no
@@ -196,13 +199,18 @@ codebase.
     run row still reaches `done`.
 11. **`tm work run` CLI wiring end-to-end.** Full clap surface matching
     `work.ml`'s options (`--from`, `--model`, `--max-turns`,
-    `--permission-mode`, `--prompt`, `--fg`); dispatch to steps 9/10.
+    `--permission-mode`, `--prompt`, `--fg`); dispatch to steps 9/10. —
+    **done**: the clap surface already had full parity when audited; added
+    the missing parse tests.
 12. **PR URL + docs.** Reuse `github::gh_cli` for the PR lookup (replacing
     the ad hoc `gh pr list`/regex-scrape fallback with the existing typed
     module, keeping both the direct-lookup and result-text-scrape fallback
     since the OCaml version's belt-and-suspenders approach is deliberate).
     Update `tm work --help` and this repo's docs; note in ROADMAP that
-    stream 1 is complete.
+    stream 1 is complete. — **done**: added `GhCli::pr_url_for_branch`,
+    wired into `run_claude_and_finish`'s shared spawn-parse-finish tail
+    (gh lookup, then result-text regex scrape fallback); README/ROADMAP
+    updated.
 
 Step 10 is the one to budget extra review time for; everything else follows
 established patterns already in this codebase (trait + fake, pure-function

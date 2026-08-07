@@ -120,6 +120,16 @@ pub trait GhCli {
     /// with fallbacks above it in the branch-owner chain, not a hard
     /// dependency, so a failure here is not an error condition.
     fn current_user_login(&self) -> Result<Option<String>, GhError>;
+
+    /// The URL of the open pull request for `branch`, if any (`gh pr list
+    /// --head <branch> --json url -q '.[0].url'`), used by `tm work run`'s
+    /// post-run PR-URL resolution (see `crate::work::run::run_claude_and_finish`).
+    ///
+    /// Returns `Ok(None)` when there is no open pull request for `branch`,
+    /// `gh` isn't installed, or the lookup otherwise fails — a missing PR is
+    /// normal (most runs don't open one), not an error condition, mirroring
+    /// `work.ml`'s tolerant `gh pr list ... 2>>'log'` call.
+    fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError>;
 }
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
@@ -305,6 +315,21 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
         ))
     }
+
+    fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError> {
+        let output = Command::new("gh")
+            .args(["pr", "list", "--head", branch, "--json", "url"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            })?;
+
+        Ok(interpret_pr_url_for_branch_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    }
 }
 
 /// Interpret `gh api user -q .login` output: a non-zero exit or empty
@@ -320,6 +345,26 @@ fn interpret_current_user_login_output(exit_code: Option<i32>, stdout: &str) -> 
     } else {
         Some(login.to_string())
     }
+}
+
+/// Raw shape of one entry in `gh pr list --head <branch> --json url` output,
+/// for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawPrListUrlEntry {
+    url: String,
+}
+
+/// Interpret the result of a `gh pr list --head <branch> --json url`
+/// invocation. Tolerant by design (see [`GhCli::pr_url_for_branch`]): any
+/// non-zero exit, unparseable output, or empty array is `None` rather than
+/// an error — a missing/absent PR for a branch is the normal case, not a
+/// failure.
+fn interpret_pr_url_for_branch_output(exit_code: Option<i32>, stdout: &str) -> Option<String> {
+    if exit_code != Some(0) {
+        return None;
+    }
+    let entries = serde_json::from_str::<Vec<RawPrListUrlEntry>>(stdout).ok()?;
+    entries.into_iter().next().map(|entry| entry.url)
 }
 
 /// An `owner`/`name` repository reference, as returned by
@@ -665,6 +710,8 @@ pub struct FakeGhCli {
     review_threads_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrSummary>, GhError>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
+    pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
+    pr_url_for_branch_calls: RefCell<Vec<String>>,
 }
 
 impl Default for FakeGhCli {
@@ -689,6 +736,8 @@ impl Default for FakeGhCli {
             review_threads_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
             current_user_login_result: RefCell::new(Ok(None)),
+            pr_url_for_branch_result: RefCell::new(Ok(None)),
+            pr_url_for_branch_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -766,6 +815,17 @@ impl FakeGhCli {
         *self.current_user_login_result.borrow_mut() = result;
         self
     }
+
+    /// Set the result `pr_url_for_branch` will return.
+    pub fn with_pr_url_for_branch(self, result: Result<Option<String>, GhError>) -> Self {
+        *self.pr_url_for_branch_result.borrow_mut() = result;
+        self
+    }
+
+    /// The branches passed to `pr_url_for_branch`, in call order.
+    pub fn pr_url_for_branch_calls(&self) -> Vec<String> {
+        self.pr_url_for_branch_calls.borrow().clone()
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -801,6 +861,13 @@ impl GhCli for FakeGhCli {
 
     fn current_user_login(&self) -> Result<Option<String>, GhError> {
         self.current_user_login_result.borrow().clone()
+    }
+
+    fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError> {
+        self.pr_url_for_branch_calls
+            .borrow_mut()
+            .push(branch.to_string());
+        self.pr_url_for_branch_result.borrow().clone()
     }
 }
 
@@ -1130,6 +1197,56 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn pr_url_for_branch_parses_first_url() {
+        let stdout = r#"[{"url":"https://github.com/example/repo/pull/7"}]"#;
+        assert_eq!(
+            interpret_pr_url_for_branch_output(Some(0), stdout),
+            Some("https://github.com/example/repo/pull/7".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_url_for_branch_empty_array_is_none() {
+        assert_eq!(interpret_pr_url_for_branch_output(Some(0), "[]"), None);
+    }
+
+    #[test]
+    fn pr_url_for_branch_nonzero_exit_is_none() {
+        assert_eq!(interpret_pr_url_for_branch_output(Some(1), ""), None);
+    }
+
+    #[test]
+    fn pr_url_for_branch_malformed_json_is_none() {
+        assert_eq!(
+            interpret_pr_url_for_branch_output(Some(0), "not json"),
+            None
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_url_for_branch_records_call_and_returns_configured_result() {
+        let fake = FakeGhCli::new().with_pr_url_for_branch(Ok(Some(
+            "https://github.com/example/repo/pull/9".to_string(),
+        )));
+
+        assert_eq!(
+            fake.pr_url_for_branch("claude/mylane-20260101-090503")
+                .unwrap(),
+            Some("https://github.com/example/repo/pull/9".to_string())
+        );
+        assert_eq!(
+            fake.pr_url_for_branch_calls(),
+            vec!["claude/mylane-20260101-090503".to_string()]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_url_for_branch_defaults_to_none() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.pr_url_for_branch("some-branch").unwrap(), None);
     }
 
     #[test]

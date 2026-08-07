@@ -356,12 +356,14 @@ pub fn run(
 /// [`run`] above.
 pub fn supervise(
     spawner: &dyn ProcessSpawner,
+    gh: &dyn GhCli,
     run_store: &RunStore,
     state: &crate::work::detach::SupervisorState,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let outcome = crate::work::run::supervise_run(
         spawner,
+        gh,
         run_store,
         &state.prepared,
         std::process::id(),
@@ -1533,7 +1535,7 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(canned_claude_json());
         let mut out = Vec::new();
 
-        let succeeded = supervise(&supervisor_spawner, &run_store, &state, &mut out).unwrap();
+        let succeeded = supervise(&supervisor_spawner, &gh, &run_store, &state, &mut out).unwrap();
 
         assert!(succeeded);
         let run_row = run_store.run_by_id(state.prepared.run_id).unwrap().unwrap();

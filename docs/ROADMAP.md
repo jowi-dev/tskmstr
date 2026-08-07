@@ -3,19 +3,25 @@
 Prioritized workstreams as of 2026-08-06. Ordering within this file is
 rough priority; dependencies are called out per stream.
 
-## 1. Absorb the `j work` lane runner into tskmstr
+## 1. Absorb the `j work` lane runner into tskmstr — done
 
-The lane runner (`j work run` and friends, currently OCaml in the devtools
-repo) is now intertwined with tm at several layers: it calls `tm runs
+The lane runner (`j work run` and friends, formerly OCaml in the devtools
+repo) was intertwined with tm at several layers: it calls `tm runs
 start/finish`, deploys the tm telemetry hooks, exports `TSKMSTR_RUN_ID`,
 and its behavior is analyzed through `tm runs show`. The integration
-surface has grown to the point where the runner should live here.
+surface had grown to the point where the runner needed to live here.
 
 Decided 2026-08-06 — see `docs/decisions/0002-runner-absorption.md`:
 session spawning is in scope (supersedes 0001's boundary), the runner is
 ported to Rust as `tm work ...` rather than vendored, and the seam is
 "tskmstr owns what it needs to do its job; personal config stays in the
 user's own tooling."
+
+Completed 2026-08-07: full `tm work` CLI surface (`new`/`remove`/`list`/
+`restore`/`start`/`run`), config-driven lanes, hooks, and PR-URL recording
+landed per `docs/plans/runner-port.md` (see that file's steps 1-12).
+`devtools`' `j work` still exists unchanged pending dogfooding, per the
+plan's migration path (§5).
 
 ## 2. Cost and usage analytics for `tm ticket audit` / `tm ticket create`
 

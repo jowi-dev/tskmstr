@@ -1713,6 +1713,175 @@ mod tests {
     }
 
     #[test]
+    fn parses_work_run_with_no_optional_args() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Run {
+                        lane,
+                        ticket,
+                        from,
+                        model,
+                        max_turns,
+                        permission_mode,
+                        prompt,
+                        fg,
+                    },
+            }) => {
+                assert_eq!(lane, "my-lane");
+                assert_eq!(ticket, None);
+                assert_eq!(from, None);
+                assert_eq!(model, None);
+                assert_eq!(max_turns, None);
+                assert_eq!(permission_mode, None);
+                assert_eq!(prompt, None);
+                assert!(!fg);
+            }
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_ticket() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "PROJ-123"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { lane, ticket, .. },
+            }) => {
+                assert_eq!(lane, "my-lane");
+                assert_eq!(ticket, Some("PROJ-123".to_string()));
+            }
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_from() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "--from", "origin/staging"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { from, .. },
+            }) => assert_eq!(from, Some("origin/staging".to_string())),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_model() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "--model", "sonnet"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { model, .. },
+            }) => assert_eq!(model, Some("sonnet".to_string())),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_max_turns() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "--max-turns", "300"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { max_turns, .. },
+            }) => assert_eq!(max_turns, Some("300".to_string())),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_permission_mode() {
+        let cli =
+            Cli::try_parse_from(["tm", "work", "run", "my-lane", "--permission-mode", "plan"])
+                .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run {
+                    permission_mode, ..
+                },
+            }) => assert_eq!(permission_mode, Some("plan".to_string())),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_prompt() {
+        let cli =
+            Cli::try_parse_from(["tm", "work", "run", "my-lane", "--prompt", "/tmp/custom.md"])
+                .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { prompt, .. },
+            }) => assert_eq!(prompt, Some("/tmp/custom.md".to_string())),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_fg() {
+        let cli =
+            Cli::try_parse_from(["tm", "work", "run", "my-lane", "--fg"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { fg, .. },
+            }) => assert!(fg),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_run_with_all_flags_combined() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "work",
+            "run",
+            "my-lane",
+            "PROJ-123",
+            "--from",
+            "origin/staging",
+            "--model",
+            "sonnet",
+            "--max-turns",
+            "300",
+            "--permission-mode",
+            "plan",
+            "--prompt",
+            "/tmp/custom.md",
+            "--fg",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Run {
+                        lane,
+                        ticket,
+                        from,
+                        model,
+                        max_turns,
+                        permission_mode,
+                        prompt,
+                        fg,
+                    },
+            }) => {
+                assert_eq!(lane, "my-lane");
+                assert_eq!(ticket, Some("PROJ-123".to_string()));
+                assert_eq!(from, Some("origin/staging".to_string()));
+                assert_eq!(model, Some("sonnet".to_string()));
+                assert_eq!(max_turns, Some("300".to_string()));
+                assert_eq!(permission_mode, Some("plan".to_string()));
+                assert_eq!(prompt, Some("/tmp/custom.md".to_string()));
+                assert!(fg);
+            }
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn work_supervise_is_hidden_from_help() {
         let mut cmd = Cli::command();
         let work_cmd = cmd

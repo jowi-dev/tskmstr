@@ -139,8 +139,9 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
             let state: tskmstr::work::detach::SupervisorState = serde_json::from_str(&raw)?;
             let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
             let spawner = tskmstr::work::runner::StdProcessSpawner;
+            let gh = ShellGhCli::new();
             let succeeded =
-                tskmstr::cli::work::supervise(&spawner, &run_store, &state, &mut stdout)?;
+                tskmstr::cli::work::supervise(&spawner, &gh, &run_store, &state, &mut stdout)?;
             // The state file has served its one-shot handoff purpose; a
             // failed removal isn't worth failing the (already recorded) run
             // over. On a supervisor crash it survives for debugging.
