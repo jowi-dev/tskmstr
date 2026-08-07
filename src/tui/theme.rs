@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::runs::RunStatus;
-use crate::tui::app::AuditIndicator;
+use crate::tui::app::{AuditIndicator, RunIndicator};
 
 /// Bold, default color. Used for board/runs column titles and every other
 /// floating window's border title.
@@ -145,6 +145,33 @@ pub fn audit_indicator_label(indicator: AuditIndicator) -> &'static str {
     }
 }
 
+/// The style for a board ticket's [`RunIndicator`] badge: identical per-state
+/// colors to [`audit_indicator_style`] (`Waiting` bold yellow, `Running`
+/// cyan, `Starting` dim, `Done` green, `Failed` red), since both badges
+/// signal the same underlying run lifecycle -- just for different `kind`s of
+/// run.
+pub fn run_indicator_style(indicator: RunIndicator) -> Style {
+    match indicator {
+        RunIndicator::Waiting => AWAITING_INPUT,
+        RunIndicator::Running => Style::new().fg(Color::Cyan),
+        RunIndicator::Starting => DIM,
+        RunIndicator::Done => Style::new().fg(Color::Green),
+        RunIndicator::Failed => Style::new().fg(Color::Red),
+    }
+}
+
+/// Short label text for `indicator`, rendered as a board ticket card's
+/// lane-run badge line (see [`run_indicator_style`] for its color).
+pub fn run_indicator_label(indicator: RunIndicator) -> &'static str {
+    match indicator {
+        RunIndicator::Starting => "run: starting",
+        RunIndicator::Running => "run: running",
+        RunIndicator::Waiting => "run: waiting",
+        RunIndicator::Done => "run: done",
+        RunIndicator::Failed => "run: failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +275,58 @@ mod tests {
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
         for label in labels {
             assert!(label.starts_with("audit: "));
+        }
+    }
+
+    #[test]
+    fn run_indicator_style_maps_every_indicator_to_its_color() {
+        let waiting = run_indicator_style(RunIndicator::Waiting);
+        assert_eq!(waiting.fg, Some(Color::Yellow));
+        assert!(waiting.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            run_indicator_style(RunIndicator::Running).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            run_indicator_style(RunIndicator::Starting).fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            run_indicator_style(RunIndicator::Done).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            run_indicator_style(RunIndicator::Failed).fg,
+            Some(Color::Red)
+        );
+    }
+
+    #[test]
+    fn run_indicator_style_never_sets_a_background() {
+        for indicator in [
+            RunIndicator::Starting,
+            RunIndicator::Running,
+            RunIndicator::Waiting,
+            RunIndicator::Done,
+            RunIndicator::Failed,
+        ] {
+            assert_eq!(run_indicator_style(indicator).bg, None);
+        }
+    }
+
+    #[test]
+    fn run_indicator_label_is_short_and_distinct() {
+        let labels = [
+            run_indicator_label(RunIndicator::Starting),
+            run_indicator_label(RunIndicator::Running),
+            run_indicator_label(RunIndicator::Waiting),
+            run_indicator_label(RunIndicator::Done),
+            run_indicator_label(RunIndicator::Failed),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinct");
+        for label in labels {
+            assert!(label.starts_with("run: "));
         }
     }
 }
