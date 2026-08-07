@@ -346,6 +346,64 @@ pub fn audit_indicator(
     }
 }
 
+/// A ticket's board-launched lane run state, per
+/// `docs/plans/board-lane-runs.md`. Derived, never stored:
+/// [`lane_run_indicator`] computes it fresh each poll from the ticket's
+/// latest `kind = "lane"` run plus the pending-launch set. Unlike
+/// [`AuditIndicator`] there is no tmux-session liveness input -- the
+/// indicator comes purely from the run row (which outlives the process), so
+/// terminal badges persist until a newer run replaces them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunIndicator {
+    /// A launcher child is in flight (no run row yet -- `prepare_run_lane`
+    /// creates none until preflight succeeds).
+    Starting,
+    /// The latest lane run is [`RunStatus::Queued`] or [`RunStatus::Running`],
+    /// not currently awaiting input.
+    Running,
+    /// The latest lane run is [`RunStatus::Running`] and its most recent
+    /// event was `await` (see [`crate::runs::is_awaiting_input`]), or it is
+    /// [`RunStatus::Blocked`].
+    Waiting,
+    /// The latest lane run finished successfully ([`RunStatus::Review`] or
+    /// [`RunStatus::Done`]).
+    Done,
+    /// The latest lane run finished with an error.
+    Failed,
+}
+
+/// Pure precedence rule for deriving a ticket's [`RunIndicator`] from
+/// whether a launcher child is in flight for it (`pending`) and its latest
+/// `kind = "lane"` run's `(status, awaiting_input)`, if any exists.
+///
+/// A run row, once it exists, is fresher truth than the pending flag -- it
+/// reflects what `prepare_run_lane` actually recorded, whereas `pending`
+/// only covers the window before preflight succeeds. So `pending` wins as
+/// [`RunIndicator::Starting`] only when there is no run row at all; once one
+/// exists, its status decides the indicator regardless of `pending`.
+///
+/// Mapping, per `docs/plans/board-lane-runs.md`'s "Indicator mapping" table:
+/// 1. `Running` + awaiting input, or `Blocked` -> [`RunIndicator::Waiting`].
+/// 2. `Queued`/`Running`, not awaiting -> [`RunIndicator::Running`].
+/// 3. `Review`/`Done` -> [`RunIndicator::Done`].
+/// 4. `Failed` -> [`RunIndicator::Failed`].
+/// 5. No run recorded at all, but a launch is pending ->
+///    [`RunIndicator::Starting`].
+/// 6. Otherwise: no badge.
+pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Option<RunIndicator> {
+    match run {
+        Some((RunStatus::Running, true)) => Some(RunIndicator::Waiting),
+        Some((RunStatus::Blocked, _)) => Some(RunIndicator::Waiting),
+        Some((RunStatus::Queued, _)) => Some(RunIndicator::Running),
+        Some((RunStatus::Running, false)) => Some(RunIndicator::Running),
+        Some((RunStatus::Review, _)) => Some(RunIndicator::Done),
+        Some((RunStatus::Done, _)) => Some(RunIndicator::Done),
+        Some((RunStatus::Failed, _)) => Some(RunIndicator::Failed),
+        None if pending => Some(RunIndicator::Starting),
+        None => None,
+    }
+}
+
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
 /// columns always render, even when empty.
 pub const RUN_COLUMNS: [crate::runs::RunStatus; 6] = [
@@ -3024,6 +3082,89 @@ mod tests {
             assert_eq!(audit_indicator(true, Some((status, false))), None);
             assert_eq!(audit_indicator(false, Some((status, false))), None);
         }
+    }
+
+    // --- lane_run_indicator ---
+
+    #[test]
+    fn lane_run_indicator_running_and_awaiting_is_waiting() {
+        assert_eq!(
+            lane_run_indicator(true, Some((RunStatus::Running, true))),
+            Some(RunIndicator::Waiting)
+        );
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Running, true))),
+            Some(RunIndicator::Waiting)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_blocked_is_waiting() {
+        assert_eq!(
+            lane_run_indicator(true, Some((RunStatus::Blocked, false))),
+            Some(RunIndicator::Waiting)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_running_not_awaiting_is_running() {
+        assert_eq!(
+            lane_run_indicator(true, Some((RunStatus::Running, false))),
+            Some(RunIndicator::Running)
+        );
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Running, false))),
+            Some(RunIndicator::Running)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_queued_is_running() {
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Queued, false))),
+            Some(RunIndicator::Running)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_review_and_done_are_done() {
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Review, false))),
+            Some(RunIndicator::Done)
+        );
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Done, false))),
+            Some(RunIndicator::Done)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_failed_is_failed() {
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Failed, false))),
+            Some(RunIndicator::Failed)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_pending_with_no_run_is_starting() {
+        assert_eq!(lane_run_indicator(true, None), Some(RunIndicator::Starting));
+    }
+
+    #[test]
+    fn lane_run_indicator_no_pending_and_no_run_is_none() {
+        assert_eq!(lane_run_indicator(false, None), None);
+    }
+
+    #[test]
+    fn lane_run_indicator_prefers_run_row_over_pending() {
+        // A run row exists (Done) even though a launch is still marked
+        // pending: the row is fresher truth, so the terminal indicator wins
+        // rather than Starting.
+        assert_eq!(
+            lane_run_indicator(true, Some((RunStatus::Done, false))),
+            Some(RunIndicator::Done)
+        );
     }
 
     // --- Msg::AuditAction / Msg::AuditStatusLoaded / Msg::AuditActionResult ---
