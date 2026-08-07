@@ -23,18 +23,25 @@ landed per `docs/plans/runner-port.md` (see that file's steps 1-12).
 `devtools`' `j work` still exists unchanged pending dogfooding, per the
 plan's migration path (§5).
 
-## 2. Cost and usage analytics for `tm ticket audit` / `tm ticket create`
+## 2. Cost and usage analytics for `tm ticket audit` / `tm ticket create` — done
 
 Ticket audit and ticket create are Claude-driven processes (axiom skills
-call tm), but their token cost is invisible today — usage telemetry only
-exists for lane runs (`tm runs`, keyed by TSKMSTR_RUN_ID). Goal: the same
+call tm), but their token cost was invisible — usage telemetry only
+existed for lane runs (`tm runs`, keyed by TSKMSTR_RUN_ID). Goal: the same
 per-model usage capture for audit/create sessions, so the cost of grooming
 a ticket is as measurable as the cost of working it.
 
-Likely shape: a lightweight session-record analog to runs (or a run
-`kind` discriminator) plus hook gating that recognizes audit/create
-sessions. Needs design: what identifies such a session, and where the
-Stop-hook usage snapshot lands.
+Implemented 2026-08-07 per `docs/plans/session-usage.md`: sessions became
+runs with a `kind` discriminator (`lane`/`audit`/`create`), identified via
+`CLAUDE_CODE_SESSION_ID` and registered by the ticket commands themselves
+through marker files the telemetry hooks read as a fallback gate; a new
+`SessionEnd` hook finishes abandoned session runs. Surfaces: `tm runs
+--kind`, a `KIND` column, `tm ticket audit`'s `Last audit usage:` line,
+and kind badges in the watch TUI (which also gained a color pass).
+
+Remaining operational step: sync the axiom repo's hook copies and its
+`settings.json` (SessionEnd wiring) so interactive sessions pick up the
+new gating.
 
 ## 3. Per-agent cost breakdown in run telemetry
 
