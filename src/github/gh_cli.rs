@@ -110,6 +110,16 @@ pub trait GhCli {
     /// List open pull requests in the current repository
     /// (`gh pr list --state open --json number,title`).
     fn pr_list(&self) -> Result<Vec<PrSummary>, GhError>;
+
+    /// The login of the currently authenticated `gh` user
+    /// (`gh api user -q .login`), used by `tm work run`'s branch-owner
+    /// resolution (see `crate::work::run`).
+    ///
+    /// Returns `Ok(None)` when `gh` isn't authenticated, isn't installed, or
+    /// otherwise fails to resolve a login — this is a "best effort" lookup
+    /// with fallbacks above it in the branch-owner chain, not a hard
+    /// dependency, so a failure here is not an error condition.
+    fn current_user_login(&self) -> Result<Option<String>, GhError>;
 }
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
@@ -279,6 +289,36 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         )
+    }
+
+    fn current_user_login(&self) -> Result<Option<String>, GhError> {
+        let output = Command::new("gh")
+            .args(["api", "user", "-q", ".login"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api user".to_string(),
+                message: err.to_string(),
+            })?;
+
+        Ok(interpret_current_user_login_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    }
+}
+
+/// Interpret `gh api user -q .login` output: a non-zero exit or empty
+/// stdout is tolerated as "no login resolved" rather than an error — see
+/// [`GhCli::current_user_login`]'s doc comment.
+fn interpret_current_user_login_output(exit_code: Option<i32>, stdout: &str) -> Option<String> {
+    if exit_code != Some(0) {
+        return None;
+    }
+    let login = stdout.trim();
+    if login.is_empty() {
+        None
+    } else {
+        Some(login.to_string())
     }
 }
 
@@ -624,6 +664,7 @@ pub struct FakeGhCli {
     review_threads_results: RefCell<HashMap<u64, Result<Vec<ReviewThread>, GhError>>>,
     review_threads_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrSummary>, GhError>>,
+    current_user_login_result: RefCell<Result<Option<String>, GhError>>,
 }
 
 impl Default for FakeGhCli {
@@ -647,6 +688,7 @@ impl Default for FakeGhCli {
             review_threads_results: RefCell::new(HashMap::new()),
             review_threads_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
+            current_user_login_result: RefCell::new(Ok(None)),
         }
     }
 }
@@ -718,6 +760,12 @@ impl FakeGhCli {
         *self.pr_list_result.borrow_mut() = result;
         self
     }
+
+    /// Set the result `current_user_login` will return.
+    pub fn with_current_user_login(self, result: Result<Option<String>, GhError>) -> Self {
+        *self.current_user_login_result.borrow_mut() = result;
+        self
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -750,11 +798,48 @@ impl GhCli for FakeGhCli {
     fn pr_list(&self) -> Result<Vec<PrSummary>, GhError> {
         self.pr_list_result.borrow().clone()
     }
+
+    fn current_user_login(&self) -> Result<Option<String>, GhError> {
+        self.current_user_login_result.borrow().clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_user_login_parses_trimmed_login() {
+        assert_eq!(
+            interpret_current_user_login_output(Some(0), "jowi-dev\n"),
+            Some("jowi-dev".to_string())
+        );
+    }
+
+    #[test]
+    fn current_user_login_none_on_nonzero_exit() {
+        assert_eq!(interpret_current_user_login_output(Some(1), ""), None);
+    }
+
+    #[test]
+    fn current_user_login_none_on_empty_stdout() {
+        assert_eq!(interpret_current_user_login_output(Some(0), "\n"), None);
+    }
+
+    #[test]
+    fn fake_gh_cli_current_user_login_defaults_to_none() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.current_user_login().unwrap(), None);
+    }
+
+    #[test]
+    fn fake_gh_cli_current_user_login_is_configurable() {
+        let fake = FakeGhCli::new().with_current_user_login(Ok(Some("jowi-dev".to_string())));
+        assert_eq!(
+            fake.current_user_login().unwrap(),
+            Some("jowi-dev".to_string())
+        );
+    }
 
     #[test]
     fn pr_view_parses_successful_json() {

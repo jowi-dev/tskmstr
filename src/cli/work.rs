@@ -48,8 +48,12 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::WorkConfig;
+use crate::github::gh_cli::GhCli;
+use crate::runs::RunStore;
 use crate::work::git::{GitError, GitOps};
 use crate::work::naming::{self, expand_tilde};
+use crate::work::run::{Clock, RunLaneError, RunLaneRequest};
+use crate::work::runner::ProcessSpawner;
 use crate::work::tmux::{TmuxError, TmuxOps};
 
 /// Errors surfaced by `tm work new/remove/list/restore/start`.
@@ -85,6 +89,16 @@ pub enum WorkCliError {
     /// explicit error rather than a silent empty-string fallback.
     #[error("cannot derive a repo name from `{}`", .0.display())]
     UnresolvableRepoName(PathBuf),
+
+    /// `tm work run` was invoked without `--fg`. The detached default
+    /// (`docs/plans/runner-port.md` step 10) isn't implemented yet.
+    #[error("detached `tm work run` is not yet implemented, use --fg")]
+    DetachedRunNotImplemented,
+
+    /// The foreground lane-run core failed. See
+    /// [`crate::work::run::RunLaneError`] for the specific cause.
+    #[error(transparent)]
+    Run(#[from] RunLaneError),
 }
 
 /// Dependencies `tm work` subcommands need, gathered so callers don't have
@@ -190,6 +204,66 @@ fn create_session(ctx: &WorkContext<'_>, name: &str, dir: &str) -> Result<(), Wo
     }
     ctx.tmux.select_window(name, primary)?;
     Ok(())
+}
+
+/// Dependencies `tm work run` needs beyond [`WorkContext`]'s
+/// `git`/`config`/`home` (which it reuses): the extra seams
+/// [`crate::work::run::run_lane_fg`] requires. Kept separate from
+/// [`WorkContext`] rather than folded into it so the four existing
+/// `new`/`remove`/`list`/`restore`/`start` commands (and every existing test
+/// constructing a bare `WorkContext`) are unaffected by `run`'s wider
+/// dependency set.
+pub struct RunDeps<'a> {
+    /// `gh` CLI operations (real or fake), for branch-owner resolution.
+    pub gh: &'a dyn GhCli,
+    /// Process spawning (real or fake).
+    pub spawner: &'a dyn ProcessSpawner,
+    /// The run-state store `start_run`/`finish_run` are called against.
+    pub run_store: &'a RunStore,
+    /// "Now" source for the run's timestamp.
+    pub clock: &'a dyn Clock,
+}
+
+/// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
+/// [--permission-mode m] [--prompt path] --fg`: run one foreground lane
+/// run. Thin CLI wiring over [`crate::work::run::run_lane_fg`], which owns
+/// the actual sequencing (see that module's doc comment) so it stays
+/// callable from a future TUI without going through this CLI layer at all.
+///
+/// `fg` must be `true` — the detached default
+/// (`docs/plans/runner-port.md` step 10) isn't implemented yet.
+///
+/// Returns `Ok(true)` when the run completed successfully, `Ok(false)` when
+/// it completed but was recorded as failed (a non-zero `claude` exit or
+/// `is_error: true`) — mirroring `work.ml`'s `if is_err then exit 1 else
+/// exit 0`, which is not itself an error condition worth an `Err`.
+pub fn run(
+    ctx: &WorkContext<'_>,
+    deps: &RunDeps<'_>,
+    lane: &str,
+    request: RunLaneRequest,
+    fg: bool,
+    out: &mut dyn Write,
+) -> Result<bool, WorkCliError> {
+    if !fg {
+        return Err(WorkCliError::DetachedRunNotImplemented);
+    }
+
+    let paths = crate::work::run::RunLanePaths {
+        home: ctx.home.to_path_buf(),
+        state_dir: ctx.home.join(".local/state/tskmstr/work"),
+        hooks_deploy_dir: ctx.home.join(".local/share/tskmstr/hooks"),
+    };
+    let run_deps = crate::work::run::RunLaneDeps {
+        git: ctx.git,
+        gh: deps.gh,
+        spawner: deps.spawner,
+        run_store: deps.run_store,
+        clock: deps.clock,
+    };
+
+    let outcome = crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
+    Ok(!outcome.is_error)
 }
 
 /// `tm work start [<dir>]`: attach to (or create) the tmux session for

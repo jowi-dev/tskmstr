@@ -147,6 +147,42 @@ pub enum WorkCmd {
         /// Directory to start/attach a session for. Defaults to `cwd`.
         dir: Option<String>,
     },
+    /// Run one autonomous headless Claude Code session for a configured
+    /// lane, tracked in the run-state store.
+    ///
+    /// Only `--fg` (synchronous, this invocation waits for `claude` to
+    /// finish) is implemented so far; the detached default (return the
+    /// terminal immediately, let the run finish in the background) is
+    /// `docs/plans/runner-port.md` step 10, not yet built.
+    Run {
+        /// Configured lane name (must match a `[work.lanes.<name>]` entry).
+        lane: String,
+        /// Ticket key to scope the worktree/branch to and append to the
+        /// prompt, if given.
+        ticket: Option<String>,
+        /// Base branch to cut this run's branch from, overriding the
+        /// lane's `base_branch` and the repo's default branch.
+        #[arg(long)]
+        from: Option<String>,
+        /// Driver model override, e.g. `sonnet`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Max-turns budget override for the driver process.
+        #[arg(long = "max-turns")]
+        max_turns: Option<String>,
+        /// Permission mode override for the driver process.
+        #[arg(long = "permission-mode")]
+        permission_mode: Option<String>,
+        /// Prompt file path override, instead of the lane's configured
+        /// `prompt_file`/the `~/.claude/prompts/<lane>.md` default.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Run synchronously in the foreground, waiting for `claude` to
+        /// finish before returning. Currently required — the detached
+        /// default isn't implemented yet.
+        #[arg(long)]
+        fg: bool,
+    },
 }
 
 /// `tm ticket` subcommands.

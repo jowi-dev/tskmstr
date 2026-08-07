@@ -94,6 +94,40 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
             let dir_path = dir.map(PathBuf::from);
             tskmstr::cli::work::start(&ctx, dir_path.as_deref(), &cwd, &mut stdout)?;
         }
+        WorkCmd::Run {
+            lane,
+            ticket,
+            from,
+            model,
+            max_turns,
+            permission_mode,
+            prompt,
+            fg,
+        } => {
+            let gh = ShellGhCli::new();
+            let spawner = tskmstr::work::runner::StdProcessSpawner;
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let clock = tskmstr::work::run::SystemClock;
+            let run_deps = tskmstr::cli::work::RunDeps {
+                gh: &gh,
+                spawner: &spawner,
+                run_store: &run_store,
+                clock: &clock,
+            };
+            let request = tskmstr::work::run::RunLaneRequest {
+                ticket,
+                from_base: from,
+                model,
+                max_turns,
+                permission_mode,
+                prompt_override: prompt,
+            };
+            let succeeded =
+                tskmstr::cli::work::run(&ctx, &run_deps, &lane, request, fg, &mut stdout)?;
+            if !succeeded {
+                return Err("lane run failed".into());
+            }
+        }
     }
     Ok(())
 }

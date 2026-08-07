@@ -123,6 +123,13 @@ pub trait GitOps {
     /// error (which suggests `--force`) rather than this trait forcing the
     /// removal itself.
     fn remove_worktree(&self, repo_dir: &Path, wt_path: &Path) -> Result<(), GitError>;
+
+    /// Read a single git config value (`git config --get <key>`), used by
+    /// [`crate::work::run`]'s branch-owner resolution chain (`j.branchOwner`,
+    /// `github.user`). A missing key is `git config --get`'s normal exit
+    /// code of 1, which is `Ok(None)` here, not an error — only a failure
+    /// to spawn `git` itself is an error.
+    fn config_get(&self, dir: &Path, key: &str) -> Result<Option<String>, GitError>;
 }
 
 /// [`GitOps`] implementation that shells out to the real `git` binary.
@@ -314,6 +321,24 @@ impl GitOps for ShellGitOps {
             &output.stderr,
         )
     }
+
+    fn config_get(&self, dir: &Path, key: &str) -> Result<Option<String>, GitError> {
+        let output = run_git(
+            dir,
+            &["config".to_string(), "--get".to_string(), key.to_string()],
+            "git config --get",
+        )?;
+
+        match output.status.code() {
+            Some(0) => {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(if value.is_empty() { None } else { Some(value) })
+            }
+            // A missing key is git config --get's normal exit code 1, not a
+            // failure to report.
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Build the argument list for `git show-ref --verify --quiet <ref>`, shared
@@ -499,6 +524,7 @@ pub struct FakeGitOps {
     provision_worktree_calls: std::cell::RefCell<Vec<ProvisionWorktreeCall>>,
     switch_new_branch_calls: std::cell::RefCell<Vec<SwitchNewBranchCall>>,
     remove_worktree_calls: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
+    config_values: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
 impl Default for FakeGitOps {
@@ -521,6 +547,7 @@ impl Default for FakeGitOps {
             provision_worktree_calls: std::cell::RefCell::new(Vec::new()),
             switch_new_branch_calls: std::cell::RefCell::new(Vec::new()),
             remove_worktree_calls: std::cell::RefCell::new(Vec::new()),
+            config_values: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -609,6 +636,16 @@ impl FakeGitOps {
     pub fn switch_new_branch_calls(&self) -> Vec<SwitchNewBranchCall> {
         self.switch_new_branch_calls.borrow().clone()
     }
+
+    /// Configure `config_get(_, key)` to return `Some(value)`. Keys with no
+    /// configured value return `Ok(None)`, mirroring a real unset git config
+    /// key.
+    pub fn with_config_value(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config_values
+            .borrow_mut()
+            .insert(key.into(), value.into());
+        self
+    }
 }
 
 impl GitOps for FakeGitOps {
@@ -686,6 +723,10 @@ impl GitOps for FakeGitOps {
             .borrow_mut()
             .push((repo_dir.to_path_buf(), wt_path.to_path_buf()));
         self.remove_worktree_result.borrow().clone()
+    }
+
+    fn config_get(&self, _dir: &Path, key: &str) -> Result<Option<String>, GitError> {
+        Ok(self.config_values.borrow().get(key).cloned())
     }
 }
 
@@ -895,6 +936,26 @@ mod tests {
     }
 
     #[test]
+    fn fake_git_ops_config_get_returns_none_for_unconfigured_key() {
+        let fake = FakeGitOps::new();
+        assert_eq!(
+            fake.config_get(Path::new("/repo"), "j.branchOwner")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_config_get_returns_configured_value() {
+        let fake = FakeGitOps::new().with_config_value("j.branchOwner", "jowi-dev");
+        assert_eq!(
+            fake.config_get(Path::new("/repo"), "j.branchOwner")
+                .unwrap(),
+            Some("jowi-dev".to_string())
+        );
+    }
+
+    #[test]
     fn fake_git_ops_returns_configured_error() {
         let fake = FakeGitOps::new().with_status_is_clean(Err(GitError::Command {
             command: "git status".to_string(),
@@ -1067,6 +1128,33 @@ mod tests {
 
         let err = ops.remove_worktree(tmp.path(), &wt_path).unwrap_err();
         assert!(matches!(err, GitError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_git_ops_config_get_returns_none_for_unset_key() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+
+        let ops = ShellGitOps::new();
+        assert_eq!(ops.config_get(tmp.path(), "j.branchOwner").unwrap(), None);
+    }
+
+    #[test]
+    fn shell_git_ops_config_get_returns_set_value() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["config", "j.branchOwner", "jowi-dev"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        assert_eq!(
+            ops.config_get(tmp.path(), "j.branchOwner").unwrap(),
+            Some("jowi-dev".to_string())
+        );
     }
 
     #[test]

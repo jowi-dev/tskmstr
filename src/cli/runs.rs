@@ -823,8 +823,8 @@ mod tests {
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        let err = event(&store, id, "agent_usage", Some("not json"), &mut out)
-            .expect_err("should fail");
+        let err =
+            event(&store, id, "agent_usage", Some("not json"), &mut out).expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::InvalidDetailJson(_)));
         assert!(out.is_empty());
