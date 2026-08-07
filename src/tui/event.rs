@@ -30,9 +30,12 @@ use thiserror::Error;
 use crate::jira::adf::adf_to_text;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::Issue;
-use crate::tui::app::{App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator};
+use crate::tui::app::{
+    App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, lane_run_indicator,
+};
 use crate::tui::app::{jql_for_filter, update};
 use crate::tui::keymap::map_key;
+use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
 use crate::work::tmux::TmuxOps;
 
@@ -78,6 +81,27 @@ pub struct TuiDeps {
     /// The user's home directory, used to expand a leading `~` in
     /// `audit.dir`.
     pub home: std::path::PathBuf,
+    /// Launcher used to spawn `tm work run <lane> <key>` for
+    /// [`Cmd::LaunchLaneRun`] (see `docs/plans/board-lane-runs.md`). Boxed
+    /// for the same trait+fake reason as `tmux`.
+    pub launcher: Box<dyn LaneLauncher>,
+    /// `config.work.lanes` keys, threaded into
+    /// [`crate::tui::app::App::with_lane_names`] at construction (see that
+    /// method's doc comment).
+    pub lane_names: Vec<String>,
+}
+
+/// One board-launched lane run whose launcher child hasn't yet reported
+/// completion, tracked by [`run`]'s event loop between [`run_cmds`]'s
+/// [`Cmd::LaunchLaneRun`] interception (which creates the entry) and
+/// [`poll_pending_launches`] (which removes it once
+/// [`crate::tui::launcher::LaunchHandle::try_finish`] resolves).
+struct PendingLaunch {
+    /// The ticket key the launch was for, echoed back in
+    /// [`Msg::LaneRunLaunchResult`].
+    key: String,
+    /// The in-flight launcher child.
+    handle: Box<dyn crate::tui::launcher::LaunchHandle>,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -103,8 +127,13 @@ impl Drop for TerminalGuard {
 /// through [`crate::tui::app::update`], executing any resulting [`Cmd`]s; a
 /// timed-out poll feeds [`Msg::Tick`] through the same path (mirroring
 /// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic
-/// [`Cmd::LoadAuditStatus`] polling. The terminal is always restored before
-/// returning, including on error.
+/// [`Cmd::LoadAuditStatus`]/[`Cmd::LoadLaneRunStatus`] polling. Every
+/// iteration also polls `launches` (the board-launched lane runs still in
+/// flight, per [`run_cmds`]'s [`Cmd::LaunchLaneRun`] interception) via
+/// [`poll_pending_launches`], feeding each completion's
+/// [`Msg::LaneRunLaunchResult`] through `update` the same way a key press or
+/// tick would. The terminal is always restored before returning, including
+/// on error.
 ///
 /// [`Screen::Board`]: crate::tui::app::Screen::Board
 pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
@@ -114,18 +143,25 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut launches: Vec<PendingLaunch> = Vec::new();
 
     let mut app = App {
         project_key: deps.project_key.clone(),
         board_column_order: deps.board_column_order.clone(),
         ..App::new()
-    };
+    }
+    .with_lane_names(deps.lane_names.clone());
     let jql = jql_for_filter(&app.filter, &app.project_key);
     app = run_cmds(
         app,
-        vec![Cmd::FetchTickets { jql }, Cmd::LoadAuditStatus],
+        vec![
+            Cmd::FetchTickets { jql },
+            Cmd::LoadAuditStatus,
+            Cmd::LoadLaneRunStatus,
+        ],
         &deps,
         &mut terminal,
+        &mut launches,
     );
 
     while !app.quit {
@@ -145,11 +181,16 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                 )
             {
                 let (next_app, cmds) = update(app, msg);
-                app = run_cmds(next_app, cmds, &deps, &mut terminal);
+                app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
             }
         } else {
             let (next_app, cmds) = update(app, Msg::Tick);
-            app = run_cmds(next_app, cmds, &deps, &mut terminal);
+            app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+        }
+
+        for msg in poll_pending_launches(&mut launches) {
+            let (next_app, cmds) = update(app, msg);
+            app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
         }
     }
 
@@ -161,14 +202,23 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// transitions after opening the detail screen).
 ///
 /// [`Cmd::AttachAudit`] is intercepted here rather than passed to `execute`:
-/// see the module docs. Generic over the terminal backend (rather than fixed
-/// to [`CrosstermBackend`]) purely so tests can drive it with
+/// see the module docs. [`Cmd::LaunchLaneRun`] is intercepted for the same
+/// kind of reason -- it needs mutable access to `launches`, the in-flight
+/// launcher registry, which `execute`'s signature has no access to. A spawn
+/// failure feeds an immediate [`Msg::LaneRunLaunchResult`] error straight
+/// through `update`; a spawn success instead pushes a [`PendingLaunch`] onto
+/// `launches` for [`poll_pending_launches`] to resolve later, once its
+/// [`crate::tui::launcher::LaunchHandle::try_finish`] reports completion.
+///
+/// Generic over the terminal backend (rather than fixed to
+/// [`CrosstermBackend`]) purely so tests can drive it with
 /// `ratatui::backend::TestBackend` instead of a real terminal.
 fn run_cmds<B: Backend>(
     mut app: App,
     cmds: Vec<Cmd>,
     deps: &TuiDeps,
     terminal: &mut Terminal<B>,
+    launches: &mut Vec<PendingLaunch>,
 ) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
@@ -179,6 +229,23 @@ fn run_cmds<B: Backend>(
             pending.extend(more_cmds);
             continue;
         }
+        if let Cmd::LaunchLaneRun { lane, key } = cmd {
+            match deps.launcher.spawn(&lane, &key) {
+                Ok(handle) => launches.push(PendingLaunch { key, handle }),
+                Err(err) => {
+                    let (next_app, more_cmds) = update(
+                        app,
+                        Msg::LaneRunLaunchResult {
+                            key,
+                            result: Err(err),
+                        },
+                    );
+                    app = next_app;
+                    pending.extend(more_cmds);
+                }
+            }
+            continue;
+        }
         for msg in execute(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -186,6 +253,28 @@ fn run_cmds<B: Backend>(
         }
     }
     app
+}
+
+/// Poll every entry in `launches` for completion (non-blocking, via
+/// [`crate::tui::launcher::LaunchHandle::try_finish`]), removing each one
+/// that finishes and returning its [`Msg::LaneRunLaunchResult`]. Entries
+/// still in flight are left in `launches` untouched. Pure with respect to
+/// `App` -- it only mutates the registry and returns `Msg`s -- so it's
+/// tested here without a real event loop; [`run`] feeds the returned `Msg`s
+/// through `update` itself.
+fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
+    let mut msgs = Vec::new();
+    launches.retain_mut(|pending| match pending.handle.try_finish() {
+        Some(result) => {
+            msgs.push(Msg::LaneRunLaunchResult {
+                key: pending.key.clone(),
+                result,
+            });
+            false
+        }
+        None => true,
+    });
+    msgs
 }
 
 /// Suspend the board's alternate screen and raw mode, run `tmux
@@ -498,26 +587,23 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
+        Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
-        // alternate screen around the blocking `tmux attach` call), which
-        // this function's signature intentionally has no access to;
-        // `run_cmds` always intercepts it before calling `execute` (see the
-        // module docs), so it's unreachable here in practice.
+        // alternate screen around the blocking `tmux attach` call) and
+        // `Cmd::LaunchLaneRun` needs `&mut Vec<PendingLaunch>` (the in-flight
+        // launcher registry) -- neither of which this function's signature
+        // has access to; `run_cmds` always intercepts both before calling
+        // `execute` (see the module docs), so they're unreachable here in
+        // practice.
         //
         // The Jira board never enters `Screen::Runs`, so `update` can never
         // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
         // `run`/`execute` to handle either.
-        // Stubs pending the executor side of `docs/plans/board-lane-runs.md`
-        // (chunk 2): `Cmd::LaunchLaneRun` needs a mutable launcher registry
-        // (like `Cmd::AttachAudit`'s terminal access) and `LoadLaneRunStatus`
-        // mirrors `load_audit_status`. Left as no-op stubs here only because
-        // `Cmd` is matched exhaustively; `update` already emits them once
-        // chunk 1's board reducer is live.
-        Cmd::LaunchLaneRun { .. } | Cmd::LoadLaneRunStatus => Vec::new(),
         other @ (Cmd::LoadRuns
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
-        | Cmd::AttachAudit { .. }) => {
+        | Cmd::AttachAudit { .. }
+        | Cmd::LaunchLaneRun { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -581,6 +667,49 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
     }
 
     vec![Msg::AuditStatusLoaded(status)]
+}
+
+/// Run `Cmd::LoadLaneRunStatus`: build the board's per-ticket lane-run badge
+/// map from the latest `kind = "lane"` run per ticket, via
+/// [`lane_run_indicator`]'s pure precedence rule.
+///
+/// `deps.store` being `None`, or `list_runs_filtered` failing, yields an
+/// empty map rather than an error, mirroring [`load_audit_status`]'s
+/// leniency: this is best-effort background enrichment, not a primary data
+/// load. Unlike `load_audit_status` there is no tmux-session liveness signal
+/// to fold in here -- a lane run's indicator comes purely from its run row
+/// (see `docs/plans/board-lane-runs.md`'s "Indicator mapping"), so this
+/// always calls [`lane_run_indicator`] with `pending: false`. The
+/// pending-launch overlay (`RunIndicator::Starting` for a ticket whose
+/// launcher child is still in flight with no run row yet) is applied
+/// reducer-side instead, by `Msg::LaneRunStatusLoaded` in `app.rs`, since
+/// this function only sees `TuiDeps` and has no access to
+/// `App::pending_lane_launches`.
+fn load_lane_run_status(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::LaneRunStatusLoaded(HashMap::new())];
+    };
+
+    // `list_runs_filtered` orders active runs before terminal ones, and by
+    // `started_at` descending within each group (see
+    // `crate::runs::RunStore::list_runs_filtered`), so the first run seen
+    // per ticket here is exactly "the live run if one exists, otherwise the
+    // most recent terminal one" -- precisely what `lane_run_indicator` wants.
+    let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
+    for run in store.list_runs_filtered(Some("lane")).unwrap_or_default() {
+        latest_by_ticket
+            .entry(run.ticket)
+            .or_insert((run.status, run.awaiting_input));
+    }
+
+    let mut status = HashMap::new();
+    for (key, run) in latest_by_ticket {
+        if let Some(indicator) = lane_run_indicator(false, Some(run)) {
+            status.insert(key, indicator);
+        }
+    }
+
+    vec![Msg::LaneRunStatusLoaded(status)]
 }
 
 /// Maps a live tmux session name back to the ticket key it was launched for,
@@ -794,6 +923,8 @@ mod tests {
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             audit: crate::config::AuditConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
+            launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
+            lane_names: Vec::new(),
         }
     }
 
@@ -1018,6 +1149,7 @@ mod tests {
             next_page_token: None,
         });
         let mut terminal = test_terminal();
+        let mut launches = Vec::new();
         let app = run_cmds(
             App::new(),
             vec![Cmd::FetchTickets {
@@ -1025,6 +1157,7 @@ mod tests {
             }],
             &deps(jira),
             &mut terminal,
+            &mut launches,
         );
         assert_eq!(app.columns.len(), 1);
         assert_eq!(app.selected_col, 0);
@@ -1440,6 +1573,7 @@ mod tests {
     fn run_cmds_intercepts_attach_audit_and_reports_status_line() {
         let d = deps(FakeJiraClient::new());
         let mut terminal = test_terminal();
+        let mut launches = Vec::new();
         let app = run_cmds(
             App::new(),
             vec![Cmd::AttachAudit {
@@ -1447,7 +1581,276 @@ mod tests {
             }],
             &d,
             &mut terminal,
+            &mut launches,
         );
         assert_eq!(app.status_line, "detached from tm-audit-proj-1");
+    }
+
+    // --- Cmd::LaunchLaneRun routing (run_cmds intercepts it before `execute`) ---
+
+    #[test]
+    fn run_cmds_launch_lane_run_success_registers_pending_launch() {
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchLaneRun {
+                lane: "backend".to_string(),
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].key, "PROJ-1");
+        // No result has been fed through `update` yet -- the launcher's
+        // fake handle hasn't been polled -- so `app` is untouched.
+        assert_eq!(app.status_line, "");
+    }
+
+    #[test]
+    fn run_cmds_launch_lane_run_spawn_failure_feeds_immediate_launch_result() {
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher = Box::new(
+            crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("no such lane"),
+        );
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchLaneRun {
+                lane: "bogus".to_string(),
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert!(launches.is_empty());
+        assert_eq!(
+            app.status_line,
+            "lane run launch failed for PROJ-1: no such lane"
+        );
+    }
+
+    // --- poll_pending_launches ---
+
+    #[test]
+    fn poll_pending_launches_leaves_still_running_entries_in_place() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![None]);
+        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert!(msgs.is_empty());
+        assert_eq!(launches.len(), 1);
+    }
+
+    #[test]
+    fn poll_pending_launches_removes_and_reports_completed_entries() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
+        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::LaneRunLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Ok(()),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_nonzero_exit_as_err() {
+        let launcher = crate::tui::launcher::FakeLaneLauncher::new()
+            .with_finish_sequence(vec![Some(Err("boom".to_string()))]);
+        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::LaneRunLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Err("boom".to_string()),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    // --- Cmd::LoadLaneRunStatus / load_lane_run_status ---
+
+    fn lane_start_params(ticket: &str) -> crate::runs::StartRun {
+        crate::runs::StartRun {
+            kind: "lane".to_string(),
+            ..start_params(ticket)
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_with_no_store_yields_empty_map() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = load_lane_run_status(&deps);
+        assert_eq!(msgs, vec![Msg::LaneRunStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_lane_run_status_running_maps_to_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&lane_start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Running)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_running_and_awaiting_maps_to_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store.add_event(run_id, "await", None).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Waiting)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_blocked_maps_to_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Blocked,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Waiting)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_done_maps_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Done)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_failed_maps_to_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Failed,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Failed)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_lane_run_status_excludes_audit_kind_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&audit_start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_lane_run_status(&deps);
+        assert_eq!(msgs, vec![Msg::LaneRunStatusLoaded(HashMap::new())]);
     }
 }

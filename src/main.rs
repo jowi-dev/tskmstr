@@ -173,6 +173,7 @@ fn run_board(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
+    let lane_names: Vec<String> = config.work.lanes.keys().cloned().collect();
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
@@ -182,6 +183,8 @@ fn run_board(
         tmux: Box::new(tmux),
         audit: config.work.audit,
         home,
+        launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
+        lane_names,
     })?;
     Ok(())
 }
