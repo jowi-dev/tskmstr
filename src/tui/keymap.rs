@@ -104,6 +104,7 @@ pub fn map_key(
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
+        KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         _ => None,
     }
 }
@@ -367,6 +368,36 @@ mod tests {
         for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(&screen, false, false, false, false, KeyCode::Char('p')),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_triggers_audit_action_on_board() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                KeyCode::Char('a')
+            ),
+            Some(Msg::AuditAction)
+        );
+    }
+
+    #[test]
+    fn a_is_unbound_off_the_board_screen() {
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(&screen, false, false, false, false, KeyCode::Char('a')),
                 None
             );
         }

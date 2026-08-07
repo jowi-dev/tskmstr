@@ -5,8 +5,17 @@
 //! [`Cmd`] to the [`Msg`] it produces, kept separate so it can be unit tested
 //! with [`crate::jira::fake::FakeJiraClient`] instead of a live Jira and a
 //! real terminal.
+//!
+//! [`Cmd::AttachAudit`] is the one exception to that split: attaching needs
+//! `&mut Terminal` to suspend and restore the alternate screen around the
+//! blocking `tmux attach-session` call, which `execute`'s signature has no
+//! access to (and shouldn't grow one just for this). [`run_cmds`] intercepts
+//! it before it ever reaches `execute`, handles the suspend/restore itself
+//! (see [`attach_audit`]), and feeds the result back through `update` as an
+//! ordinary [`Msg`] -- every other `Cmd` still flows through `execute`
+//! unchanged.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CEvent, KeyEventKind};
@@ -15,15 +24,17 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
 use crate::jira::adf::adf_to_text;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::Issue;
-use crate::tui::app::{App, Cmd, Msg, TicketSummary, jql_for_filter, update};
+use crate::tui::app::{App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator};
+use crate::tui::app::{jql_for_filter, update};
 use crate::tui::keymap::map_key;
 use crate::tui::ui::draw;
+use crate::work::tmux::TmuxOps;
 
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -36,7 +47,9 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
-/// Dependencies the TUI needs to talk to Jira and build browsable URLs.
+/// Dependencies the TUI needs to talk to Jira, build browsable URLs, and
+/// (per `docs/plans/board-audits.md`'s "Board integration" design) launch
+/// and attach to board-launched ticket-audit sessions.
 pub struct TuiDeps {
     /// Client used to fetch tickets, transitions, and apply transitions.
     pub jira: Box<dyn JiraClient>,
@@ -50,6 +63,21 @@ pub struct TuiDeps {
     /// [`crate::config::Config::board_column_order`]. Empty when
     /// unconfigured, leaving the board's default column ordering unchanged.
     pub board_column_order: Vec<String>,
+    /// Handle to the run-state database, or `None` if it failed to open.
+    /// Lenient by design (mirroring
+    /// [`crate::cli::ticket::AuditStoreStatus`]'s stance for `tm ticket
+    /// audit`'s read mode): a broken runs DB must never block the Jira
+    /// board itself, only degrade audit status/launch to unavailable.
+    pub store: Option<crate::runs::RunStore>,
+    /// tmux operations used to list/launch/attach audit sessions.
+    pub tmux: Box<dyn TmuxOps>,
+    /// Validated `[work.audit]` settings; launching is disabled (a
+    /// status-line error) when `dir` is unset. See
+    /// [`crate::work::audit::launch_audit`].
+    pub audit: crate::config::AuditConfig,
+    /// The user's home directory, used to expand a leading `~` in
+    /// `audit.dir`.
+    pub home: std::path::PathBuf,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -69,11 +97,16 @@ impl Drop for TerminalGuard {
 
 /// Run the interactive board until the user quits.
 ///
-/// Enters raw mode and the alternate screen, fetches the initial ticket list,
-/// then loops: draw the current screen, wait up to `POLL_INTERVAL` for a key
-/// press, map it to a [`Msg`], run it through [`crate::tui::app::update`], and
-/// execute any resulting [`Cmd`]s. The terminal is always restored before
+/// Enters raw mode and the alternate screen, fetches the initial ticket list
+/// and audit status, then loops: draw the current screen, wait up to
+/// `POLL_INTERVAL` for a key press. A key press maps to a [`Msg`] which runs
+/// through [`crate::tui::app::update`], executing any resulting [`Cmd`]s; a
+/// timed-out poll feeds [`Msg::Tick`] through the same path (mirroring
+/// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic
+/// [`Cmd::LoadAuditStatus`] polling. The terminal is always restored before
 /// returning, including on error.
+///
+/// [`Screen::Board`]: crate::tui::app::Screen::Board
 pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -88,25 +121,34 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         ..App::new()
     };
     let jql = jql_for_filter(&app.filter, &app.project_key);
-    app = run_cmds(app, vec![Cmd::FetchTickets { jql }], &deps);
+    app = run_cmds(
+        app,
+        vec![Cmd::FetchTickets { jql }, Cmd::LoadAuditStatus],
+        &deps,
+        &mut terminal,
+    );
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app))?;
 
-        if event::poll(POLL_INTERVAL)?
-            && let CEvent::Key(key_event) = event::read()?
-            && key_event.kind == KeyEventKind::Press
-            && let Some(msg) = map_key(
-                &app.screen,
-                app.show_help,
-                app.show_filter_picker,
-                app.is_rank_grabbed(),
-                app.show_run_detail,
-                key_event.code,
-            )
-        {
-            let (next_app, cmds) = update(app, msg);
-            app = run_cmds(next_app, cmds, &deps);
+        if event::poll(POLL_INTERVAL)? {
+            if let CEvent::Key(key_event) = event::read()?
+                && key_event.kind == KeyEventKind::Press
+                && let Some(msg) = map_key(
+                    &app.screen,
+                    app.show_help,
+                    app.show_filter_picker,
+                    app.is_rank_grabbed(),
+                    app.show_run_detail,
+                    key_event.code,
+                )
+            {
+                let (next_app, cmds) = update(app, msg);
+                app = run_cmds(next_app, cmds, &deps, &mut terminal);
+            }
+        } else {
+            let (next_app, cmds) = update(app, Msg::Tick);
+            app = run_cmds(next_app, cmds, &deps, &mut terminal);
         }
     }
 
@@ -116,9 +158,26 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// Execute every `Cmd` in `cmds`, feeding each resulting `Msg` back through
 /// `update` (which may itself produce further `Cmd`s, e.g. loading
 /// transitions after opening the detail screen).
-fn run_cmds(mut app: App, cmds: Vec<Cmd>, deps: &TuiDeps) -> App {
+///
+/// [`Cmd::AttachAudit`] is intercepted here rather than passed to `execute`:
+/// see the module docs. Generic over the terminal backend (rather than fixed
+/// to [`CrosstermBackend`]) purely so tests can drive it with
+/// `ratatui::backend::TestBackend` instead of a real terminal.
+fn run_cmds<B: Backend>(
+    mut app: App,
+    cmds: Vec<Cmd>,
+    deps: &TuiDeps,
+    terminal: &mut Terminal<B>,
+) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
+        if let Cmd::AttachAudit { session_name } = cmd {
+            let message = attach_audit(terminal, deps.tmux.as_ref(), &session_name);
+            let (next_app, more_cmds) = update(app, Msg::AuditActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
         for msg in execute(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -126,6 +185,65 @@ fn run_cmds(mut app: App, cmds: Vec<Cmd>, deps: &TuiDeps) -> App {
         }
     }
     app
+}
+
+/// Suspend the board's alternate screen and raw mode, run `tmux
+/// attach-session -t <session_name>` with inherited stdio (blocking until
+/// the user detaches, e.g. `C-b d`, or the session ends), then restore the
+/// alternate screen and raw mode and clear the terminal so the board redraws
+/// cleanly. Returns a status-line message describing the outcome.
+///
+/// Ordering rationale: restore runs [`run`]'s setup operations in their
+/// original order (`enable_raw_mode` then `EnterAlternateScreen`), and
+/// suspend is its exact reverse (`LeaveAlternateScreen` then
+/// `disable_raw_mode`), so the round trip unwinds and rebuilds the terminal
+/// state symmetrically. Note this suspend order is the *reverse* of
+/// [`TerminalGuard::drop`]'s (which disables raw mode first); both orders
+/// restore a usable terminal, but the symmetric one is used here because
+/// this pair must compose with a re-entry rather than end the program. Every step is best-effort (`let _ =`): if `tmux attach` itself
+/// fails, the terminal must still be restored before the error is reported,
+/// so a restore step failing too must not short-circuit the ones after it.
+///
+/// ## Manual test plan
+///
+/// The suspend/restore mechanics need a real terminal and a real `tmux`, so
+/// (like `src/work/detach.rs`'s `RealDetachSpawner`, see its "What's
+/// unit-tested vs. deferred to manual verification" section) they aren't
+/// unit-tested; [`Cmd`] routing and the resulting status-line message are
+/// (see this module's tests). Verify manually:
+///
+/// 1. Configure `[work.audit].dir` and launch a session from the board
+///    (`a` on a ticket with no live audit session; the badge should read
+///    `Starting` then `Running`).
+/// 2. Press `a` again: confirm the board's alternate screen is left, the
+///    terminal shows the `claude` session's own output, and typing works
+///    normally (tmux's own raw mode takes over; this process's is off).
+/// 3. Detach with `C-b d`: confirm the board's alternate screen re-enters,
+///    the screen clears and redraws cleanly (no leftover tmux output visible
+///    behind it), and the status line reads `detached from tm-audit-<key>`.
+/// 4. Kill the tmux session from another terminal while attached (`tmux
+///    kill-session -t tm-audit-<key>`); confirm `tmux attach-session`
+///    exiting with an error still leaves this terminal fully usable (raw
+///    mode re-enabled, alternate screen re-entered, board redrawn) rather
+///    than stranding the shell.
+fn attach_audit<B: Backend>(
+    terminal: &mut Terminal<B>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+) -> String {
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+
+    let result = tmux.attach(session_name);
+
+    let _ = enable_raw_mode();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = terminal.clear();
+
+    match result {
+        Ok(()) => format!("detached from {session_name}"),
+        Err(err) => format!("attach to {session_name} failed: {err}"),
+    }
 }
 
 /// Dependencies for `tm runs watch`: just the run store.
@@ -376,9 +494,21 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::OpenUrl(url) => open_url(&url),
         Cmd::FetchRankTickets { jql } => fetch_rank_tickets(deps, &jql),
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
+        Cmd::LoadAuditStatus => load_audit_status(deps),
+        Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
+        // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
+        // alternate screen around the blocking `tmux attach` call), which
+        // this function's signature intentionally has no access to;
+        // `run_cmds` always intercepts it before calling `execute` (see the
+        // module docs), so it's unreachable here in practice.
+        //
         // The Jira board never enters `Screen::Runs`, so `update` can never
-        // produce one of these for `run`/`execute` to handle.
-        other @ (Cmd::LoadRuns | Cmd::LoadRunDetail { .. } | Cmd::ReapRuns) => {
+        // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
+        // `run`/`execute` to handle either.
+        other @ (Cmd::LoadRuns
+        | Cmd::LoadRunDetail { .. }
+        | Cmd::ReapRuns
+        | Cmd::AttachAudit { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -386,6 +516,104 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
             Vec::new()
         }
     }
+}
+
+/// Run `Cmd::LoadAuditStatus`: build the board's per-ticket audit badge map
+/// from live `tm-audit-<key>` tmux sessions and the latest `kind = "audit"`
+/// run per ticket, via [`audit_indicator`]'s pure precedence rule.
+///
+/// `deps.store` being `None` (an unopenable runs DB) yields an empty map
+/// rather than an error -- the Jira board must keep working without run-store
+/// access. A `tmux.list_sessions()` or `store.list_runs_filtered()` failure
+/// is likewise treated as "nothing to report" rather than a board-wide error,
+/// matching this command's role as best-effort background enrichment, not a
+/// primary data load.
+fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::AuditStatusLoaded(HashMap::new())];
+    };
+
+    let sessions: HashSet<String> = deps
+        .tmux
+        .list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|session| audit_session_ticket_key(&session.name))
+        .collect();
+
+    // `list_runs_filtered` orders active runs before terminal ones, and by
+    // `started_at` descending within each group (see
+    // `crate::runs::RunStore::list_runs_filtered`), so the first run seen
+    // per ticket here is exactly "the live run if one exists, otherwise the
+    // most recent terminal one" -- precisely the run `audit_indicator` wants.
+    let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
+    for run in store.list_runs_filtered(Some("audit")).unwrap_or_default() {
+        latest_by_ticket
+            .entry(run.ticket)
+            .or_insert((run.status, run.awaiting_input));
+    }
+
+    let mut keys: HashSet<&String> = sessions.iter().collect();
+    keys.extend(latest_by_ticket.keys());
+
+    let mut status = HashMap::new();
+    for key in keys {
+        let has_session = sessions.contains(key);
+        let run = latest_by_ticket.get(key).copied();
+        if let Some(indicator) = audit_indicator(has_session, run) {
+            status.insert(
+                key.clone(),
+                AuditStatusEntry {
+                    indicator,
+                    has_session,
+                },
+            );
+        }
+    }
+
+    vec![Msg::AuditStatusLoaded(status)]
+}
+
+/// Maps a live tmux session name back to the ticket key it was launched for,
+/// per [`crate::work::audit::audit_session_name`]'s `tm-audit-<lowercased
+/// key>` convention: strips the `tm-audit-` prefix and uppercases the
+/// remainder. `None` for any session name that doesn't start with that
+/// prefix (an unrelated tmux session).
+///
+/// Round-trip assumption: Jira ticket keys are always uppercase
+/// (`PROJ-123`), and `audit_session_name` only ever lowercases -- never
+/// otherwise transforms -- the key, so uppercasing the stripped suffix
+/// recovers the original key exactly.
+fn audit_session_ticket_key(session_name: &str) -> Option<String> {
+    session_name
+        .strip_prefix("tm-audit-")
+        .map(str::to_uppercase)
+}
+
+/// Run `Cmd::LaunchAudit`: launch a ticket-audit session for `key` via
+/// [`crate::work::audit::launch_audit`], mapping the outcome to a
+/// status-line message. `deps.store` being `None` surfaces as `runs db
+/// unavailable` rather than attempting a launch that has nowhere to
+/// pre-register a run row.
+fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::AuditActionResult("runs db unavailable".to_string())];
+    };
+
+    let message = match crate::work::audit::launch_audit(
+        store,
+        deps.tmux.as_ref(),
+        &deps.audit,
+        &deps.home,
+        key,
+    ) {
+        Ok(_) => format!("launched audit for {key} -- press a to attach"),
+        Err(crate::work::audit::AuditLaunchError::AlreadyRunning { session_name }) => {
+            format!("audit already running ({session_name}) -- press a to attach")
+        }
+        Err(err) => err.to_string(),
+    };
+    vec![Msg::AuditActionResult(message)]
 }
 
 /// Search for tickets matching `jql` and map them to
@@ -540,12 +768,23 @@ mod tests {
         }
     }
 
+    /// A minimal in-memory terminal for tests that need to call [`run_cmds`]
+    /// (which requires `&mut Terminal` for [`Cmd::AttachAudit`]'s
+    /// suspend/restore, even though most tests never exercise that path).
+    fn test_terminal() -> Terminal<ratatui::backend::TestBackend> {
+        Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal should build")
+    }
+
     fn deps(jira: FakeJiraClient) -> TuiDeps {
         TuiDeps {
             jira: Box::new(jira),
             base_url: "https://example.atlassian.net".to_string(),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),
+            store: None,
+            tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
+            audit: crate::config::AuditConfig::default(),
+            home: std::path::PathBuf::from("/home/test"),
         }
     }
 
@@ -769,12 +1008,14 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
+        let mut terminal = test_terminal();
         let app = run_cmds(
             App::new(),
             vec![Cmd::FetchTickets {
                 jql: my_open_tickets_jql(),
             }],
             &deps(jira),
+            &mut terminal,
         );
         assert_eq!(app.columns.len(), 1);
         assert_eq!(app.selected_col, 0);
@@ -996,5 +1237,208 @@ mod tests {
 
         let msgs = execute_watch(&watch_deps(store), Cmd::ReapRuns);
         assert_eq!(msgs, vec![Msg::RunsReaped(0)]);
+    }
+
+    // --- audit_session_ticket_key ---
+
+    #[test]
+    fn audit_session_ticket_key_strips_prefix_and_uppercases() {
+        assert_eq!(
+            audit_session_ticket_key("tm-audit-proj-123"),
+            Some("PROJ-123".to_string())
+        );
+    }
+
+    #[test]
+    fn audit_session_ticket_key_returns_none_for_unrelated_session() {
+        assert_eq!(audit_session_ticket_key("some-other-session"), None);
+    }
+
+    // --- Cmd::LoadAuditStatus / load_audit_status ---
+
+    fn audit_start_params(ticket: &str) -> crate::runs::StartRun {
+        crate::runs::StartRun {
+            kind: "audit".to_string(),
+            lane: "audit".to_string(),
+            ..start_params(ticket)
+        }
+    }
+
+    #[test]
+    fn load_audit_status_with_no_store_yields_empty_map() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = load_audit_status(&deps);
+        assert_eq!(msgs, vec![Msg::AuditStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_audit_status_marks_running_audit_with_matching_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&audit_start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_sessions(Ok(vec![
+                crate::work::tmux::TmuxSession {
+                    name: "tm-audit-proj-1".to_string(),
+                    path: "/repo/axiom".to_string(),
+                },
+            ])),
+        );
+
+        let msgs = load_audit_status(&deps);
+        match msgs.as_slice() {
+            [Msg::AuditStatusLoaded(status)] => {
+                let entry = status.get("PROJ-1").expect("PROJ-1 should have an entry");
+                assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Running);
+                assert!(entry.has_session);
+            }
+            other => panic!("expected AuditStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_audit_status_marks_starting_when_session_exists_with_no_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_sessions(Ok(vec![
+                crate::work::tmux::TmuxSession {
+                    name: "tm-audit-proj-2".to_string(),
+                    path: "/repo/axiom".to_string(),
+                },
+            ])),
+        );
+
+        let msgs = load_audit_status(&deps);
+        match msgs.as_slice() {
+            [Msg::AuditStatusLoaded(status)] => {
+                let entry = status.get("PROJ-2").expect("PROJ-2 should have an entry");
+                assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Starting);
+                assert!(entry.has_session);
+            }
+            other => panic!("expected AuditStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_audit_status_omits_finished_run_with_no_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&audit_start_params("PROJ-3")).unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        // No live `tm-audit-proj-3` session: `FakeTmuxOps::new()`'s default
+        // `list_sessions` is `Ok(vec![])`.
+
+        let msgs = load_audit_status(&deps);
+        assert_eq!(msgs, vec![Msg::AuditStatusLoaded(HashMap::new())]);
+    }
+
+    // --- Cmd::LaunchAudit / launch_audit_cmd ---
+
+    #[test]
+    fn launch_audit_cmd_with_no_store_reports_unavailable() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditActionResult("runs db unavailable".to_string())]
+        );
+    }
+
+    #[test]
+    fn launch_audit_cmd_success_reports_launched_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.audit = crate::config::AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+        };
+
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditActionResult(
+                "launched audit for PROJ-1 -- press a to attach".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_audit_cmd_not_configured_surfaces_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        // `deps.audit` defaults to `AuditConfig::default()`: no `dir` set.
+
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::AuditActionResult(message)] => {
+                assert!(message.contains("[work.audit].dir"));
+            }
+            other => panic!("expected AuditActionResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_audit_cmd_already_running_reports_attach_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.audit = crate::config::AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+        };
+        deps.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_has_session(Ok(true)));
+
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditActionResult(
+                "audit already running (tm-audit-proj-1) -- press a to attach".to_string()
+            )]
+        );
+    }
+
+    // --- Cmd::AttachAudit routing (run_cmds intercepts it before `execute`) ---
+
+    #[test]
+    fn run_cmds_intercepts_attach_audit_and_reports_status_line() {
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AttachAudit {
+                session_name: "tm-audit-proj-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+        );
+        assert_eq!(app.status_line, "detached from tm-audit-proj-1");
     }
 }

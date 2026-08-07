@@ -155,6 +155,11 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
 }
 
 /// The interactive terminal board.
+///
+/// Opens the run-state database leniently (like [`run_ticket_audit`]'s read
+/// mode, via [`tskmstr::cli::ticket::AuditStoreStatus`]'s stance): a broken
+/// runs DB must never block the Jira board itself, only degrade the audit
+/// status badge/launch to unavailable.
 fn run_board(
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
@@ -163,11 +168,20 @@ fn run_board(
     let config = config::load(paths)?;
     let token = resolve_token(keychain, env_token)?;
     let jira = jira_client_for(&config, &token);
+    let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
+    let tmux = ShellTmuxOps::new();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
         project_key: config.default_project_key,
         board_column_order: config.board_column_order,
+        store,
+        tmux: Box::new(tmux),
+        audit: config.work.audit,
+        home,
     })?;
     Ok(())
 }

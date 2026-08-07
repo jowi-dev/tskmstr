@@ -6,12 +6,15 @@
 //! should perform next, and *Failed messages let callers feed I/O errors back
 //! in without `update` ever needing to panic.
 
+use std::collections::HashMap;
+
 use crate::jira::client::RankAnchor;
 use crate::jira::jql::{
     assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
     unassigned_tickets_jql,
 };
 use crate::jira::types::{JiraUser, Transition};
+use crate::runs::RunStatus;
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::jira::types::Issue`] plus the configured Jira base URL.
@@ -273,6 +276,76 @@ pub struct RunModelUsage {
     pub lines: Vec<String>,
 }
 
+/// A ticket's board-launched audit session state, per
+/// `docs/plans/board-audits.md`'s "Board integration" design. Derived, never
+/// stored: [`audit_indicator`] computes it fresh each poll from a live
+/// `tm-audit-<key>` tmux session and the ticket's latest `kind = "audit"`
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditIndicator {
+    /// A `tm-audit-<key>` tmux session exists but no run has reached
+    /// [`RunStatus::Running`] yet (or none was ever registered for it).
+    Starting,
+    /// The latest audit run is [`RunStatus::Running`], not currently
+    /// awaiting input.
+    Running,
+    /// The latest audit run is [`RunStatus::Running`] and its most recent
+    /// event was `await` (see [`crate::runs::is_awaiting_input`]).
+    Waiting,
+    /// The latest audit run finished successfully and its tmux session is
+    /// still up: attachable aftermath. Once the session goes away the badge
+    /// disappears entirely -- history lives in `tm runs`, not the board.
+    Done,
+    /// The latest audit run finished with an error and its tmux session is
+    /// still up: attachable aftermath, same lifecycle as `Done`.
+    Failed,
+}
+
+/// A ticket's full audit badge state on the board: its [`AuditIndicator`]
+/// plus whether a live `tm-audit-<key>` tmux session exists.
+///
+/// Kept separate from `AuditIndicator` (rather than deriving `has_session`
+/// back out of it) because attach-vs-launch (see [`Msg::AuditAction`]) must
+/// key off session existence alone: `Running`/`Waiting` can, in principle, be
+/// reported for an audit run with no live session on this machine (e.g. one
+/// launched and later killed on another host sharing the same runs DB), and
+/// attaching is only ever possible when the session itself is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditStatusEntry {
+    /// The badge to render on the ticket's card.
+    pub indicator: AuditIndicator,
+    /// Whether a live `tm-audit-<key>` tmux session exists for this ticket.
+    pub has_session: bool,
+}
+
+/// Pure precedence rule for deriving a ticket's [`AuditIndicator`] from
+/// whether its `tm-audit-<key>` tmux session (`has_session`) is live and its
+/// latest `kind = "audit"` run's `(status, awaiting_input)`, if any exists.
+/// `None` when neither a session nor a run at [`RunStatus::Done`]/
+/// [`RunStatus::Failed`] with a live session applies -- no badge.
+///
+/// Precedence, per `docs/plans/board-audits.md`'s "Board integration"
+/// design:
+/// 1. Running + awaiting input -> [`AuditIndicator::Waiting`].
+/// 2. Running, not awaiting -> [`AuditIndicator::Running`].
+/// 3. No run recorded at all, but the session exists -> [`AuditIndicator::Starting`].
+/// 4. A finished (`Done`/`Failed`) run *and* the session still exists ->
+///    the matching terminal indicator (attachable aftermath).
+/// 5. Otherwise: no badge.
+pub fn audit_indicator(
+    has_session: bool,
+    run: Option<(RunStatus, bool)>,
+) -> Option<AuditIndicator> {
+    match run {
+        Some((RunStatus::Running, true)) => Some(AuditIndicator::Waiting),
+        Some((RunStatus::Running, false)) => Some(AuditIndicator::Running),
+        Some((RunStatus::Done, _)) if has_session => Some(AuditIndicator::Done),
+        Some((RunStatus::Failed, _)) if has_session => Some(AuditIndicator::Failed),
+        None if has_session => Some(AuditIndicator::Starting),
+        _ => None,
+    }
+}
+
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All six
 /// columns always render, even when empty.
 pub const RUN_COLUMNS: [crate::runs::RunStatus; 6] = [
@@ -361,9 +434,17 @@ pub struct App {
     pub run_detail: Option<RunDetail>,
     /// Scroll offset into the run detail window's event timeline.
     pub run_detail_scroll: u16,
-    /// Number of [`Msg::Tick`]s processed since `tm runs watch` started,
-    /// used to throttle polling and periodic reaping.
+    /// Number of [`Msg::Tick`]s processed since the event loop started, used
+    /// to throttle [`Screen::Runs`]'s polling/periodic reaping and
+    /// [`Screen::Board`]'s audit-status polling. Shared across both screens
+    /// since only one is ever active at a time.
     pub watch_tick: u64,
+    /// Per-ticket audit badge state for [`Screen::Board`], keyed by ticket
+    /// key. Populated by [`Cmd::LoadAuditStatus`], polled every 8th
+    /// [`Msg::Tick`] (~2s at the 250ms poll interval) plus once at startup.
+    /// Empty when the runs DB is unavailable or no ticket has ever had an
+    /// audit session.
+    pub audit_status: HashMap<String, AuditStatusEntry>,
 }
 
 impl App {
@@ -510,6 +591,21 @@ pub enum Msg {
     /// A reap pass completed, having reaped `0` reports as a no-op status
     /// line.
     RunsReaped(usize),
+    /// The `a` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// attach to its live `tm-audit-<key>` session if one exists, otherwise
+    /// launch a new one. See [`audit_action`].
+    AuditAction,
+    /// [`Cmd::LoadAuditStatus`] finished loading, replacing
+    /// `app.audit_status` wholesale.
+    AuditStatusLoaded(HashMap<String, AuditStatusEntry>),
+    /// The outcome of [`Cmd::LaunchAudit`] or [`Cmd::AttachAudit`], already
+    /// rendered to a human-readable status-line message (e.g. `launched
+    /// audit for PROJ-1 -- press a to attach`, or `detached from
+    /// tm-audit-proj-1`). Kept as a single string variant (mirroring
+    /// [`Msg::RankApplied`]/[`Msg::TicketsFailed`]'s reuse pattern) rather
+    /// than a dedicated success/failure pair, since every outcome is purely
+    /// a status-line update from `update`'s point of view.
+    AuditActionResult(String),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -567,6 +663,25 @@ pub enum Cmd {
     },
     /// Reap abandoned runs in the run store.
     ReapRuns,
+    /// Reload [`Screen::Board`]'s per-ticket audit status (live
+    /// `tm-audit-<key>` tmux sessions plus the latest `kind = "audit"` run
+    /// per ticket).
+    LoadAuditStatus,
+    /// Launch a ticket-audit session for `key` (see
+    /// [`crate::work::audit::launch_audit`]).
+    LaunchAudit {
+        /// Ticket key to launch an audit session for.
+        key: String,
+    },
+    /// Attach the terminal to `session_name` (a live `tm-audit-<key>`
+    /// session), suspending and restoring the board's terminal state around
+    /// the blocking `tmux attach-session` call. Handled specially by the
+    /// board's event loop, unlike every other `Cmd` here -- see
+    /// `crate::tui::event`'s module docs.
+    AttachAudit {
+        /// Name of the tmux session to attach to.
+        session_name: String,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -747,35 +862,82 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             }
             (app, Vec::new())
         }
+        Msg::AuditAction => audit_action(app),
+        Msg::AuditStatusLoaded(status) => {
+            app.audit_status = status;
+            (app, Vec::new())
+        }
+        Msg::AuditActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
     }
 }
 
-/// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]. On it, increments
-/// `watch_tick` and emits [`Cmd::LoadRuns`] every 2nd tick (plus
-/// [`Cmd::LoadRunDetail`] when the detail window is open) and
-/// [`Cmd::ReapRuns`] every 120th tick (~30s at the 250ms poll interval).
-fn tick(mut app: App) -> (App, Vec<Cmd>) {
-    if app.screen != Screen::Runs {
+/// Handle [`Msg::AuditAction`]: for the selected board ticket, attach to its
+/// live `tm-audit-<key>` session if [`App::audit_status`] reports one,
+/// otherwise launch a new one. A no-op when no ticket is selected.
+fn audit_action(app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
-    }
-
-    app.watch_tick += 1;
-    let mut cmds = Vec::new();
-
-    if app.watch_tick.is_multiple_of(2) {
-        cmds.push(Cmd::LoadRuns);
-        if app.show_run_detail
-            && let Some(card) = app.selected_run_card()
-        {
-            cmds.push(Cmd::LoadRunDetail { run_id: card.id });
+    };
+    let key = ticket.key.clone();
+    let has_session = app
+        .audit_status
+        .get(&key)
+        .is_some_and(|entry| entry.has_session);
+    let cmd = if has_session {
+        Cmd::AttachAudit {
+            session_name: crate::work::audit::audit_session_name(&key),
         }
-    }
+    } else {
+        Cmd::LaunchAudit { key }
+    };
+    (app, vec![cmd])
+}
 
-    if app.watch_tick.is_multiple_of(120) {
-        cmds.push(Cmd::ReapRuns);
-    }
+/// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]/[`Screen::Board`].
+///
+/// On [`Screen::Runs`], increments `watch_tick` and emits [`Cmd::LoadRuns`]
+/// every 2nd tick (plus [`Cmd::LoadRunDetail`] when the detail window is
+/// open) and [`Cmd::ReapRuns`] every 120th tick (~30s at the 250ms poll
+/// interval).
+///
+/// On [`Screen::Board`], increments the same counter and emits
+/// [`Cmd::LoadAuditStatus`] every 8th tick (~2s) -- the board polls audit
+/// status on its own clock while leaving the Jira ticket list itself on
+/// manual refresh (`r`).
+fn tick(mut app: App) -> (App, Vec<Cmd>) {
+    match app.screen {
+        Screen::Runs => {
+            app.watch_tick += 1;
+            let mut cmds = Vec::new();
 
-    (app, cmds)
+            if app.watch_tick.is_multiple_of(2) {
+                cmds.push(Cmd::LoadRuns);
+                if app.show_run_detail
+                    && let Some(card) = app.selected_run_card()
+                {
+                    cmds.push(Cmd::LoadRunDetail { run_id: card.id });
+                }
+            }
+
+            if app.watch_tick.is_multiple_of(120) {
+                cmds.push(Cmd::ReapRuns);
+            }
+
+            (app, cmds)
+        }
+        Screen::Board => {
+            app.watch_tick += 1;
+            let mut cmds = Vec::new();
+            if app.watch_tick.is_multiple_of(8) {
+                cmds.push(Cmd::LoadAuditStatus);
+            }
+            (app, cmds)
+        }
+        _ => (app, Vec::new()),
+    }
 }
 
 /// Handle [`Msg::RunsLoaded`]: replace `app.runs` with server truth,
@@ -2464,7 +2626,15 @@ mod tests {
 
     #[test]
     fn tick_is_a_noop_off_the_runs_screen() {
-        let app = App::new();
+        // `App::new()` defaults to `Screen::Board`, which (unlike when this
+        // test was written) now also reacts to `Msg::Tick` -- see
+        // `tick_on_board_emits_load_audit_status_every_8th_tick`. Pick a
+        // screen that reacts to neither, to keep testing the true off-both
+        // case.
+        let app = App {
+            screen: Screen::Detail,
+            ..App::new()
+        };
         let (app, cmds) = update(app, Msg::Tick);
         assert_eq!(app.watch_tick, 0);
         assert!(cmds.is_empty());
@@ -2779,5 +2949,196 @@ mod tests {
         };
         let (_app, cmds) = update(app, Msg::Refresh);
         assert_eq!(cmds, vec![Cmd::LoadRuns, Cmd::LoadRunDetail { run_id: 4 }]);
+    }
+
+    // --- audit_indicator ---
+
+    #[test]
+    fn audit_indicator_running_and_awaiting_is_waiting() {
+        assert_eq!(
+            audit_indicator(true, Some((RunStatus::Running, true))),
+            Some(AuditIndicator::Waiting)
+        );
+        // Session existence is irrelevant once there's a running run: the
+        // run itself is the signal.
+        assert_eq!(
+            audit_indicator(false, Some((RunStatus::Running, true))),
+            Some(AuditIndicator::Waiting)
+        );
+    }
+
+    #[test]
+    fn audit_indicator_running_not_awaiting_is_running() {
+        assert_eq!(
+            audit_indicator(true, Some((RunStatus::Running, false))),
+            Some(AuditIndicator::Running)
+        );
+        assert_eq!(
+            audit_indicator(false, Some((RunStatus::Running, false))),
+            Some(AuditIndicator::Running)
+        );
+    }
+
+    #[test]
+    fn audit_indicator_session_with_no_run_is_starting() {
+        assert_eq!(audit_indicator(true, None), Some(AuditIndicator::Starting));
+    }
+
+    #[test]
+    fn audit_indicator_no_session_and_no_run_is_none() {
+        assert_eq!(audit_indicator(false, None), None);
+    }
+
+    #[test]
+    fn audit_indicator_done_with_live_session_is_done() {
+        assert_eq!(
+            audit_indicator(true, Some((RunStatus::Done, false))),
+            Some(AuditIndicator::Done)
+        );
+    }
+
+    #[test]
+    fn audit_indicator_done_without_session_is_none() {
+        assert_eq!(audit_indicator(false, Some((RunStatus::Done, false))), None);
+    }
+
+    #[test]
+    fn audit_indicator_failed_with_live_session_is_failed() {
+        assert_eq!(
+            audit_indicator(true, Some((RunStatus::Failed, false))),
+            Some(AuditIndicator::Failed)
+        );
+    }
+
+    #[test]
+    fn audit_indicator_failed_without_session_is_none() {
+        assert_eq!(
+            audit_indicator(false, Some((RunStatus::Failed, false))),
+            None
+        );
+    }
+
+    #[test]
+    fn audit_indicator_other_statuses_are_none_regardless_of_session() {
+        for status in [RunStatus::Queued, RunStatus::Blocked, RunStatus::Review] {
+            assert_eq!(audit_indicator(true, Some((status, false))), None);
+            assert_eq!(audit_indicator(false, Some((status, false))), None);
+        }
+    }
+
+    // --- Msg::AuditAction / Msg::AuditStatusLoaded / Msg::AuditActionResult ---
+
+    fn audit_entry(indicator: AuditIndicator, has_session: bool) -> AuditStatusEntry {
+        AuditStatusEntry {
+            indicator,
+            has_session,
+        }
+    }
+
+    #[test]
+    fn audit_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::AuditAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn audit_action_with_no_status_entry_launches() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (_app, cmds) = update(app, Msg::AuditAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchAudit {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn audit_action_with_live_session_attaches() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.audit_status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Running, true),
+        );
+        let (_app, cmds) = update(app, Msg::AuditAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachAudit {
+                session_name: "tm-audit-proj-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn audit_action_with_terminal_status_but_no_session_launches() {
+        // Running/Waiting/Done/Failed with `has_session: false` must still
+        // launch, not attach: there's nothing live to attach to.
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.audit_status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Done, false),
+        );
+        let (_app, cmds) = update(app, Msg::AuditAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchAudit {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn audit_status_loaded_replaces_audit_status() {
+        let app = App::new();
+        let mut status = HashMap::new();
+        status.insert(
+            "PROJ-1".to_string(),
+            audit_entry(AuditIndicator::Starting, true),
+        );
+        let (app, cmds) = update(app, Msg::AuditStatusLoaded(status.clone()));
+        assert_eq!(app.audit_status, status);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn audit_action_result_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::AuditActionResult("launched audit for PROJ-1 -- press a to attach".to_string()),
+        );
+        assert_eq!(
+            app.status_line,
+            "launched audit for PROJ-1 -- press a to attach"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::Tick on Screen::Board ---
+
+    #[test]
+    fn tick_on_board_is_a_noop_before_the_8th_tick() {
+        let mut app = board_with(vec![], 0);
+        let mut cmds = Vec::new();
+        for _ in 0..7 {
+            let (next_app, next_cmds) = update(app, Msg::Tick);
+            app = next_app;
+            cmds = next_cmds;
+        }
+        assert!(cmds.is_empty());
+        assert_eq!(app.watch_tick, 7);
+    }
+
+    #[test]
+    fn tick_on_board_emits_load_audit_status_every_8th_tick() {
+        let mut app = board_with(vec![], 0);
+        let mut cmds = Vec::new();
+        for _ in 0..8 {
+            let (next_app, next_cmds) = update(app, Msg::Tick);
+            app = next_app;
+            cmds = next_cmds;
+        }
+        assert_eq!(cmds, vec![Cmd::LoadAuditStatus]);
     }
 }
