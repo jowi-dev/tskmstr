@@ -73,6 +73,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_filter_picker {
         draw_filter_picker(frame, app);
     }
+
+    if app.show_lane_picker {
+        draw_lane_picker(frame, app);
+    }
 }
 
 /// The status bar's left-hand text: the active assignee filter (when it
@@ -115,7 +119,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  w work  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -900,6 +904,38 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A centered floating window listing the configured `[work.lanes]` names
+/// (`app.lane_names`, in `BTreeMap` order), for [`Msg::LaneRunAction`]'s lane
+/// picker. Unlike [`draw_filter_picker`], the data is synchronous (no lazy
+/// fetch, so no loading/error line) and there's no "active lane" to mark --
+/// only the highlighted row, via the list's own `highlight_style`.
+///
+/// [`Msg::LaneRunAction`]: crate::tui::app::Msg::LaneRunAction
+fn draw_lane_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = app
+        .lane_names
+        .iter()
+        .map(|lane| ListItem::new(format!("  {lane}")))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Lane")),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    if !app.lane_names.is_empty() {
+        state.select(Some(app.lane_picker_selected.min(app.lane_names.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` percent of its
 /// width/height.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1034,6 +1070,7 @@ mod tests {
             "f filter",
             "p priority",
             "a audit",
+            "w work",
             "?",
             "q",
         ] {
@@ -1450,6 +1487,34 @@ mod tests {
         };
         let text = buffer_text(&render(&app));
         assert!(text.contains("Error: boom"));
+    }
+
+    #[test]
+    fn draws_lane_picker_overlay_with_lane_names() {
+        let app = App {
+            show_lane_picker: true,
+            lane_names: vec!["backend".to_string(), "frontend".to_string()],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Lane"));
+        assert!(text.contains("backend"));
+        assert!(text.contains("frontend"));
+    }
+
+    #[test]
+    fn draws_lane_picker_highlights_the_selected_lane() {
+        let app = App {
+            show_lane_picker: true,
+            lane_picker_selected: 1,
+            lane_names: vec!["backend".to_string(), "frontend".to_string()],
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let modifier = modifier_at(&buffer, "frontend");
+        assert!(modifier.contains(Modifier::REVERSED));
+        let modifier = modifier_at(&buffer, "backend");
+        assert!(!modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
