@@ -1,5 +1,41 @@
 # Bugbot follow-through on code review (roadmap stream 7)
 
+Status: implemented 2026-08-07 (commits `ddda3e3`..`2d3ae5a`). Steps 1-12
+below all landed; steps 13-14 remain open operational (axiom-side) work.
+Deviations from the design as written:
+
+- **Step 3: `PrSummary` didn't survive.** Rather than folding `PrSummary`
+  into `PrInfo` alongside a separate caller, `PrSummary` was removed
+  outright — its one real caller, `find_issue_key_with_source`'s use in
+  `src/cli/ready.rs`, now takes the full `PrInfo` `pr_list` returns, same
+  as `pr_view`/`pr_create` already did. No type carries the old
+  `{number, title}` shape anymore.
+- **Step 10: `launch_cleanup` does not (re)write the findings file.**
+  The findings file is written once, by the poll loop
+  (`src/work/review_watch.rs`'s `poll_once`), before it finishes the run
+  as `Review`. `launch_cleanup` only reads the path back (via
+  `findings_file_path`) to fill the prompt's `{findings_file}`
+  placeholder — the design section's phrasing ("write the findings
+  file") is corrected here; the file already exists by the time
+  `launch_cleanup` runs.
+- **Step 11: board wiring, minor shape deviations.**
+  - The pending-launch overlay for the `bots:` badge lives in a
+    ui-side set, `App::pending_bot_watch_launches`, mirroring
+    `pending_lane_launches` rather than threading a flag through the
+    loaded status map.
+  - `PendingLaunch` (the event loop's in-flight watched-child registry)
+    gained a `kind: PendingLaunchKind` field (`LaneRun` | `BotWatch`)
+    instead of a parallel struct, since `LaneLauncher::spawn` is now
+    shared by both launch paths.
+  - The audit-session-name-to-ticket-key helper was generalized to
+    `session_ticket_key(session_name, prefix)` (parametrized over
+    `AUDIT_SESSION_PREFIX`/`CLEANUP_SESSION_PREFIX`) rather than adding a
+    second bespoke parser for `tm-bugbot-<key>`.
+  - Cleanup-launch failures from the `b` key surface through a new
+    `Msg::BotsActionResult(String)`, the bot-watch counterpart of
+    whatever status-line messaging the lane-run path already used,
+    rather than reusing a lane-run-specific message variant.
+
 Stated 2026-08-07. Once a ticket's PR is up for review, its bots
 (`review_bots`, e.g. `cursor[bot]`) take anywhere from seconds to tens of
 minutes to post their findings. Today noticing that they've finished — and

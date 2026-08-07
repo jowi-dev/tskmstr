@@ -133,7 +133,7 @@ work runs — a second hosting mode the overlay makes unnecessary.
 Interactive flows that genuinely need a terminal — audits — already
 have one via stream 4.)
 
-## 7. Bugbot follow-through on code review (future)
+## 7. Bugbot follow-through on code review — done
 
 Stated 2026-08-07. When a ticket reaches code review its PR sits waiting
 on bot review (`review_bots`, e.g. cursor bugbot); today noticing that
@@ -162,10 +162,30 @@ findings fixed.
   closing; dedup (one watcher per PR); what happens on bot findings =
   zero (badge straight to done, no cleanup session).
 
-Streams 5-7 together make the board the control surface for the whole
+Implemented 2026-08-07 per `docs/plans/bugbot-watch.md` (see its status
+section): `tm pr watch <KEY>` resolves the ticket's open PR via a widened
+`pr_list`, dedups against a running `review-watch` run, and detaches via
+the same `setsid` re-exec idiom the lane runner uses (`--foreground` runs
+the poll loop in-process). The loop polls `gh` every `poll_secs` (default
+45) for PR lifecycle and whether every configured bot has reviewed; zero
+unresolved findings finishes the run `Done`, findings write a
+`$XDG_DATA_HOME/tskmstr/findings/<key>.json` file and finish the run
+`Review`, and `on_bots_done = "launch"` auto-launches the cleanup session
+(default `"notify"` just flips the badge). The cleanup session is a
+detached `tm-bugbot-<key>` tmux session, structurally identical to
+stream 4's audit launch, running `/bugbot-triage {key} {findings_file}`
+by default. On the board, `b` arms the watcher, attaches to a live
+cleanup session, launches one once the watcher is ready, or reports a
+status-line message while still watching; cards carry `bots:` and
+`clean:` badges alongside the audit/run badges. Operational remainder:
+the axiom-side `/bugbot-triage` skill needs its documented first step,
+`tm runs register --kind bugbot-cleanup {key}`, and reads the findings
+file itself; no new hook syncing is expected beyond streams 2/4's, since
+the await/resume/session-end hooks are reused unchanged.
+
+Streams 5-7 landed the board as the control surface for the whole
 ticket lifecycle: groom (audit) → execute (lane run) → observe (run
-overlay) → land (bot cleanup). Each stream is independently shippable
-in that order.
+overlay) → land (bot cleanup).
 
 ## Non-tskmstr chores tracked elsewhere
 

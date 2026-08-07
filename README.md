@@ -68,6 +68,7 @@ tm auth status
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
+| `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
@@ -76,6 +77,7 @@ tm auth status
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
+| `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -350,6 +352,7 @@ to" windows.
 | `f` | Open the assignee filter picker (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
+| `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
@@ -426,6 +429,64 @@ events; `tm runs watch` renders the same state as a `waiting` marker on
 running audit/create cards. The board polls the run store and tmux for
 badge updates every ~2s; the ticket list itself still refreshes only on
 `r`.
+
+### Board-launched bot-findings watch
+
+Once a ticket's PR is up for review, its bots (`review_bots`) take anywhere
+from seconds to tens of minutes to post their findings. Pressing `b` on a
+board ticket arms a watcher for it: `tm pr watch <KEY>` resolves the
+ticket's open PR and polls `gh` in a detached process, never on the
+board's own tick — the board only ever reads the local run db. The card
+shows a `bots:` badge: `bots: starting` while the launcher child is still
+resolving the PR, `bots: watching` once the poll loop is running, `bots:
+ready` (bold — the watcher finished and left unresolved findings) when a
+cleanup session is worth launching, `bots: clean` when the bots reviewed
+and found nothing (no cleanup needed), and `bots: failed` if the watcher
+gave up (repeated `gh` failures, or the PR sat open past
+`max_wait_mins`).
+
+Pressing `b` again is context-sensitive, mirroring `a`'s attach-or-launch
+shape:
+
+- A live cleanup session (see below) → attach to it.
+- No cleanup session, but the watcher is `bots: ready` → launch the
+  cleanup session.
+- The watcher is still `bots: watching` → a status-line message, no
+  action.
+- Otherwise (no watcher yet, or the last one is `bots: clean`/`bots:
+  failed`) → arm a new watcher.
+
+Watching requires:
+
+```toml
+[work.review_watch]
+dir = "~/Projects/axiom"          # optional; falls back to [work.audit].dir
+# prompt = "/bugbot-triage {key} {findings_file}"  # optional; this is the default
+# poll_secs = 45                  # optional, default 45
+# max_wait_mins = 1440            # optional, default 1440 (24h)
+# on_bots_done = "notify"         # optional, "notify" | "launch"; default "notify"
+```
+
+`poll_secs` is the cadence `tm pr watch`'s foreground loop sleeps between
+`gh` checks; `max_wait_mins` is how long it keeps polling an open PR
+before giving up. `on_bots_done` gates whether finding unresolved bot
+comments spends tokens automatically: `"notify"` (the default) just
+leaves the card at `bots: ready` for you to launch by hand; `"launch"`
+launches the cleanup session itself the moment the watcher sees
+unresolved findings. Zero unresolved findings always goes straight to
+`bots: clean` — no cleanup session either way.
+
+When there are findings, the watcher writes them to
+`${XDG_DATA_HOME:-~/.local/share}/tskmstr/findings/<key>.json` before
+finishing, and the cleanup session (a detached tmux session named
+`tm-bugbot-<key>`, launched the same way `tm-audit-<key>` is) runs
+`prompt` with both `{key}` and `{findings_file}` substituted. Unlike the
+audit session, nothing in this repo calls `tm ticket audit` for you
+inside the cleanup conversation — the axiom-side `/bugbot-triage` skill's
+documented first step is `tm runs register --kind bugbot-cleanup <KEY>`,
+which adopts the pre-registered run via `TSKMSTR_SESSION_RUN_ID` so the
+whole conversation's telemetry lands on it, the same way `tm ticket
+audit`/`create` adopt theirs.
 
 ## Configuration
 
