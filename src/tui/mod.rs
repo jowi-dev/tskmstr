@@ -5,5 +5,6 @@
 pub mod app;
 pub mod event;
 pub mod keymap;
+pub mod launcher;
 pub mod theme;
 pub mod ui;
