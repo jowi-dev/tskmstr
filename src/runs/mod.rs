@@ -2722,6 +2722,68 @@ mod tests {
     }
 
     #[test]
+    fn review_watch_and_bugbot_cleanup_kinds_round_trip_with_no_migration() {
+        // `kind` is unconstrained free text (`TEXT NOT NULL DEFAULT 'lane'`,
+        // no `CHECK`), so the two new kinds bugbot-watch introduces
+        // (`review-watch` for the watcher, `bugbot-cleanup` for the triage
+        // session) need no migration — this confirms it end to end through
+        // start_run, list_runs, and latest_run_for_ticket_kind, mirroring
+        // latest_run_for_ticket_kind_filters_to_the_given_kind above.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let watch_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/tmp/wt-watch".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+            })
+            .unwrap();
+        let cleanup_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "bugbot-cleanup".to_string(),
+                worktree: "/tmp/wt-cleanup".to_string(),
+                branch: None,
+                pid: None,
+                kind: "bugbot-cleanup".to_string(),
+            })
+            .unwrap();
+
+        let watch_run = store.run_by_id(watch_id).unwrap().expect("expected a run");
+        let cleanup_run = store
+            .run_by_id(cleanup_id)
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(watch_run.kind, "review-watch");
+        assert_eq!(cleanup_run.kind, "bugbot-cleanup");
+
+        let kinds_in_list: Vec<String> = store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(kinds_in_list.contains(&"review-watch".to_string()));
+        assert!(kinds_in_list.contains(&"bugbot-cleanup".to_string()));
+
+        let latest_watch = store
+            .latest_run_for_ticket_kind("PROJ-1", Some("review-watch"))
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(latest_watch.id, watch_id);
+
+        let latest_cleanup = store
+            .latest_run_for_ticket_kind("PROJ-1", Some("bugbot-cleanup"))
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(latest_cleanup.id, cleanup_id);
+    }
+
+    #[test]
     fn latest_finished_run_for_ticket_kind_ignores_running_and_other_kinds() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
