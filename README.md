@@ -349,6 +349,7 @@ to" windows.
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
+| `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
@@ -394,6 +395,37 @@ Every filter other than `Me` scopes the query to `default_project_key`
 non-`Me` filter is active, the status line shows `Filter: <name>` and each
 ticket card also shows its assignee (`Assignee: <name>` or `Assignee:
 Unassigned`).
+
+### Board-launched audit sessions
+
+Pressing `a` on a board ticket launches a ticket-audit Claude session for
+it in a detached tmux session named `tm-audit-<key>` — several can run
+concurrently. Pressing `a` again on the same ticket attaches the terminal
+to that session (the board suspends, tmux takes over; detach with `C-b d`
+to land back on the board). Launching requires:
+
+```toml
+[work.audit]
+dir = "~/Projects/axiom"            # required: where the session runs
+# prompt = "/ticket-audit {key}"    # optional; this is the default
+```
+
+`dir` is the repo whose `.claude/` provides the audit skill and telemetry
+hook settings; `{key}` in `prompt` is replaced with the ticket key. The
+launch pre-registers a `kind = "audit"` run, and the in-session
+`tm ticket audit <KEY>` adopts it (via `TSKMSTR_SESSION_RUN_ID`), so the
+whole conversation's telemetry lands on one run.
+
+Each card with a session (or a live audit run) shows a badge: `audit:
+starting` (session up, run not registered yet), `audit: running`, `audit:
+waiting` (bold yellow — Claude stopped or asked a question and is waiting
+for you; attach and answer), and `audit: done` / `audit: failed` while
+the session is still up. Waiting-state telemetry comes from the `Stop` /
+`Notification` / `UserPromptSubmit` hooks emitting `await`/`resume`
+events; `tm runs watch` renders the same state as a `waiting` marker on
+running audit/create cards. The board polls the run store and tmux for
+badge updates every ~2s; the ticket list itself still refreshes only on
+`r`.
 
 ## Configuration
 

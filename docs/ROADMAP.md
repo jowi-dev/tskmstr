@@ -64,11 +64,11 @@ axiom hook/settings sync. The reconciliation gap between `model_usage`
 and summed `agent_usage` should be eyeballed on the first few real
 runs (see the plan's status section).
 
-## 4. Board-launched ticket-audit sessions (future)
+## 4. Board-launched ticket-audit sessions — done
 
-Once streams 1-3 are in place: from the `tm board` TUI, select a ticket in
-Prioritized for Dev and launch a ticket-audit Claude session for it in a
-tmux session (attach/detach), enabling several concurrent audits. Requires:
+Once streams 1-3 are in place: from the `tm board` TUI, select a ticket
+and launch a ticket-audit Claude session for it in a tmux session
+(attach/detach), enabling several concurrent audits. Requires:
 
 - The runner living in tm (stream 1) so the board can launch sessions.
 - A status channel back to the board so the user knows when a session is
@@ -77,8 +77,22 @@ tmux session (attach/detach), enabling several concurrent audits. Requires:
 - Board UI: per-ticket session indicator (running / waiting-for-input /
   done), attach action.
 
-Not started; captured here so the earlier streams are designed with this
-destination in mind.
+Implemented 2026-08-07 per `docs/plans/board-audits.md` (see its status
+section): `a` on a board ticket launches a detached `tm-audit-<key>` tmux
+session running interactive `claude` with the audit prompt (config
+`[work.audit]`), pre-registering a `kind = "audit"` run that the
+in-session `tm ticket audit` adopts via `TSKMSTR_SESSION_RUN_ID`; a new
+`tm-session-state.sh` hook (`Stop`/`Notification`/`UserPromptSubmit`)
+emits `await`/`resume` events from which a display-only waiting state is
+derived (no new `RunStatus`); cards show starting/running/waiting/done
+badges polled every ~2s, and `a` attaches (terminal suspend/restore)
+when the session is live. The board also gained the accent-color pass
+the watch screen got in stream 2.
+
+Operational step remaining: the axiom repo's hook copies and its
+`settings.json` need the new script and the three hook wirings before
+waiting-state telemetry flows in real sessions (superset of the stream
+2/3 sync chore).
 
 ## Non-tskmstr chores tracked elsewhere
 

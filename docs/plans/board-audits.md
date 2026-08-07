@@ -225,6 +225,38 @@ Each step is TDD'd and lands as one commit; tests + clippy green via
 - Emitting `await` telemetry for lane runs (headless; nothing to wait
   on).
 
+## Status (2026-08-07)
+
+All eight steps landed 2026-08-07 (commits `b95c8d4`..HEAD; 1104 tests,
+clippy clean). Resolutions worth recording:
+
+- Step 1 added a `Status: ` label to the ticket detail overlay (the bare
+  status line gave the `SECTION_HEADER` style nothing to attach to).
+- `launch_audit` takes `home: &Path` for tilde expansion, matching
+  `expand_tilde`'s pure-caller convention; the tmux command string is the
+  one place in the codebase needing shell quoting (tmux hands it to
+  `$SHELL -c`), handled by a local `shell_quote`.
+- The board reuses `watch_tick` for its poll counter and `Msg::Tick` now
+  handles `Screen::Board` (audit status every 8th tick); Detail /
+  TransitionMenu overlays pause the polling — acceptable, the badges
+  freeze only while an overlay is open.
+- `AuditStatusEntry` carries `has_session` separately from the indicator
+  because attach-vs-launch keys off session existence alone.
+- `Cmd::AttachAudit` is intercepted in `run_cmds` (which went generic
+  over the ratatui backend for testability) rather than `execute`, since
+  it needs `&mut Terminal`. Suspend is the exact reverse of setup
+  (`LeaveAlternateScreen` then `disable_raw_mode`) — note this is the
+  reverse of `TerminalGuard::drop`'s order; the symmetric order is
+  deliberate since this pair must compose with re-entry.
+- Hook E2E smoke-tested against a scratch `XDG_DATA_HOME`:
+  `Stop`/`Notification`/`UserPromptSubmit` payloads piped through
+  `tm-session-state.sh` produced exactly `await`, `await`+message
+  detail, and `resume`; `TSKMSTR_RUN_ID`-gated and unknown-event calls
+  emitted nothing.
+- The attach suspend/restore has a manual test checklist on
+  `attach_audit` in `src/tui/event.rs`; run it once on a real terminal
+  before relying on attach day-to-day.
+
 ## Operational follow-up
 
 The axiom repo's hook copies and `settings.json` must be re-synced after
