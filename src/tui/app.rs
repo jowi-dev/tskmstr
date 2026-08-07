@@ -503,12 +503,41 @@ pub struct App {
     /// Empty when the runs DB is unavailable or no ticket has ever had an
     /// audit session.
     pub audit_status: HashMap<String, AuditStatusEntry>,
+    /// Whether the lane picker overlay is shown (see [`Msg::LaneRunAction`]).
+    pub show_lane_picker: bool,
+    /// Index into `lane_names` of the currently highlighted lane in the
+    /// picker.
+    pub lane_picker_selected: usize,
+    /// Configured `[work.lanes]` names, in `BTreeMap` order. Threaded from
+    /// config at construction (see [`App::with_lane_names`]); empty until
+    /// wired up, which disables `w`'s launch entirely (see
+    /// [`Msg::LaneRunAction`]'s "no lanes configured" case).
+    pub lane_names: Vec<String>,
+    /// Ticket keys with a lane-run launcher child currently in flight (no
+    /// run row recorded yet). Populated by [`Msg::LaneRunAction`]/
+    /// [`Msg::LanePickerSelect`], cleared by [`Msg::LaneRunLaunchResult`].
+    pub pending_lane_launches: std::collections::HashSet<String>,
+    /// Per-ticket lane-run badge state for [`Screen::Board`], keyed by ticket
+    /// key. Populated by [`Cmd::LoadLaneRunStatus`], polled every 8th
+    /// [`Msg::Tick`] (~2s at the 250ms poll interval), same cadence as
+    /// `audit_status`. Empty when the runs DB is unavailable or no ticket has
+    /// ever had a lane run.
+    pub lane_run_status: HashMap<String, RunIndicator>,
 }
 
 impl App {
     /// An app with no tickets, showing the board.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set `lane_names`, for threading `config.work.lanes.keys()` into the
+    /// board at construction (see [`App::lane_names`]'s doc comment). Not
+    /// yet wired into `main.rs`/`tui::event`; chunk 2 of
+    /// `docs/plans/board-lane-runs.md` calls this from the executor side.
+    pub fn with_lane_names(mut self, lane_names: Vec<String>) -> Self {
+        self.lane_names = lane_names;
+        self
     }
 
     /// The currently selected ticket, if any.
@@ -664,6 +693,33 @@ pub enum Msg {
     /// than a dedicated success/failure pair, since every outcome is purely
     /// a status-line update from `update`'s point of view.
     AuditActionResult(String),
+    /// The `w` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// launch a lane run for it, per [`lane_run_action`]'s precedence rule
+    /// (already-active guard, zero/one/many configured lanes).
+    LaneRunAction,
+    /// Move the lane picker's highlighted lane up.
+    LanePickerUp,
+    /// Move the lane picker's highlighted lane down.
+    LanePickerDown,
+    /// Launch a lane run for the selected ticket using the picker's
+    /// highlighted lane, and close the picker.
+    LanePickerSelect,
+    /// Close the lane picker without launching anything.
+    LanePickerClose,
+    /// The outcome of [`Cmd::LaunchLaneRun`] for `key`: removes it from
+    /// `pending_lane_launches` and sets a human-readable status-line message
+    /// either way.
+    LaneRunLaunchResult {
+        /// Ticket key the launch was for.
+        key: String,
+        /// `Ok(())` if the launcher child exited zero (the run row now
+        /// exists; badge polling takes over), `Err` with a status-line
+        /// message otherwise.
+        result: Result<(), String>,
+    },
+    /// [`Cmd::LoadLaneRunStatus`] finished loading, replacing
+    /// `app.lane_run_status` wholesale.
+    LaneRunStatusLoaded(HashMap<String, RunIndicator>),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -740,6 +796,19 @@ pub enum Cmd {
         /// Name of the tmux session to attach to.
         session_name: String,
     },
+    /// Launch a lane run for `key` on `lane` (see `tm work run <lane>
+    /// <key>`, spawned via `std::env::current_exe()` as a watched child
+    /// process -- see `docs/plans/board-lane-runs.md`'s "Launch mechanism").
+    LaunchLaneRun {
+        /// Configured lane name to run on.
+        lane: String,
+        /// Ticket key to launch a lane run for.
+        key: String,
+    },
+    /// Reload [`Screen::Board`]'s per-ticket lane-run status (the latest
+    /// `kind = "lane"` run per ticket, mapped through
+    /// [`lane_run_indicator`]).
+    LoadLaneRunStatus,
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -929,7 +998,100 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = message;
             (app, Vec::new())
         }
+        Msg::LaneRunAction => lane_run_action(app),
+        Msg::LanePickerUp => {
+            app.lane_picker_selected = app.lane_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::LanePickerDown => {
+            let count = app.lane_names.len();
+            if count > 0 {
+                app.lane_picker_selected = (app.lane_picker_selected + 1).min(count - 1);
+            }
+            (app, Vec::new())
+        }
+        Msg::LanePickerSelect => lane_picker_select(app),
+        Msg::LanePickerClose => {
+            app.show_lane_picker = false;
+            (app, Vec::new())
+        }
+        Msg::LaneRunLaunchResult { key, result } => {
+            app.pending_lane_launches.remove(&key);
+            app.status_line = match result {
+                Ok(()) => format!("launched lane run for {key}"),
+                Err(err) => format!("lane run launch failed for {key}: {err}"),
+            };
+            (app, Vec::new())
+        }
+        Msg::LaneRunStatusLoaded(status) => {
+            app.lane_run_status = status;
+            (app, Vec::new())
+        }
     }
+}
+
+/// Handle [`Msg::LaneRunAction`]: launch a lane run for the selected board
+/// ticket, per `docs/plans/board-lane-runs.md`'s "Decisions" section.
+///
+/// A no-op when no ticket is selected. If the ticket already has an active
+/// lane run (pending launch, or [`RunIndicator::Starting`]/`Running`/
+/// `Waiting` in `lane_run_status`), sets a status message instead of
+/// launching another one -- terminal indicators (`Done`/`Failed`) don't
+/// block a relaunch. Otherwise: zero configured lanes sets a status message;
+/// exactly one lane launches directly (marking the ticket pending); more
+/// than one opens the lane picker, highlighting the first lane.
+fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+
+    let active = app.pending_lane_launches.contains(&key)
+        || matches!(
+            app.lane_run_status.get(&key),
+            Some(RunIndicator::Starting | RunIndicator::Running | RunIndicator::Waiting)
+        );
+    if active {
+        app.status_line = format!("lane run already active for {key}");
+        return (app, Vec::new());
+    }
+
+    match app.lane_names.len() {
+        0 => {
+            app.status_line = "no lanes configured".to_string();
+            (app, Vec::new())
+        }
+        1 => {
+            let lane = app.lane_names[0].clone();
+            app.pending_lane_launches.insert(key.clone());
+            (app, vec![Cmd::LaunchLaneRun { lane, key }])
+        }
+        _ => {
+            app.show_lane_picker = true;
+            app.lane_picker_selected = 0;
+            (app, Vec::new())
+        }
+    }
+}
+
+/// Handle [`Msg::LanePickerSelect`]: launch a lane run for the selected board
+/// ticket using the picker's highlighted lane, and close the picker.
+///
+/// A no-op (picker stays open) when `lane_picker_selected` is out of range,
+/// mirroring [`filter_picker_select`]'s out-of-range behavior. If somehow no
+/// ticket is selected, closes the picker without launching anything.
+fn lane_picker_select(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(lane) = app.lane_names.get(app.lane_picker_selected).cloned() else {
+        return (app, Vec::new());
+    };
+    let Some(ticket) = app.selected_ticket() else {
+        app.show_lane_picker = false;
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    app.show_lane_picker = false;
+    app.pending_lane_launches.insert(key.clone());
+    (app, vec![Cmd::LaunchLaneRun { lane, key }])
 }
 
 /// Handle [`Msg::AuditAction`]: for the selected board ticket, attach to its
@@ -962,9 +1124,11 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
 /// interval).
 ///
 /// On [`Screen::Board`], increments the same counter and emits
-/// [`Cmd::LoadAuditStatus`] every 8th tick (~2s) -- the board polls audit
-/// status on its own clock while leaving the Jira ticket list itself on
-/// manual refresh (`r`).
+/// [`Cmd::LoadAuditStatus`] and [`Cmd::LoadLaneRunStatus`] every 8th tick
+/// (~2s) -- the board polls audit and lane-run status on its own clock while
+/// leaving the Jira ticket list itself on manual refresh (`r`). The two
+/// polls stay separate `Cmd`s (not merged into one query) since a ticket can
+/// legitimately carry both an audit session and a lane run.
 fn tick(mut app: App) -> (App, Vec<Cmd>) {
     match app.screen {
         Screen::Runs => {
@@ -991,6 +1155,7 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             let mut cmds = Vec::new();
             if app.watch_tick.is_multiple_of(8) {
                 cmds.push(Cmd::LoadAuditStatus);
+                cmds.push(Cmd::LoadLaneRunStatus);
             }
             (app, cmds)
         }
@@ -3280,6 +3445,213 @@ mod tests {
             app = next_app;
             cmds = next_cmds;
         }
-        assert_eq!(cmds, vec![Cmd::LoadAuditStatus]);
+        assert_eq!(cmds, vec![Cmd::LoadAuditStatus, Cmd::LoadLaneRunStatus]);
+    }
+
+    // --- lane_names / with_lane_names ---
+
+    #[test]
+    fn with_lane_names_sets_lane_names() {
+        let app = App::new().with_lane_names(vec!["backend".to_string(), "frontend".to_string()]);
+        assert_eq!(app.lane_names, vec!["backend", "frontend"]);
+    }
+
+    #[test]
+    fn app_defaults_to_no_lane_names() {
+        assert!(App::new().lane_names.is_empty());
+    }
+
+    // --- Msg::LaneRunAction / Msg::LanePicker* / Msg::LaneRunLaunchResult / Msg::LaneRunStatusLoaded ---
+
+    #[test]
+    fn lane_run_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0).with_lane_names(vec!["backend".to_string()]);
+        let (_app, cmds) = update(app, Msg::LaneRunAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_action_with_zero_lanes_sets_status_message() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert_eq!(app.status_line, "no lanes configured");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_action_with_one_lane_launches_directly_and_marks_pending() {
+        let app =
+            board_with(vec![ticket("PROJ-1")], 0).with_lane_names(vec!["backend".to_string()]);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchLaneRun {
+                lane: "backend".to_string(),
+                key: "PROJ-1".to_string(),
+            }]
+        );
+        assert!(app.pending_lane_launches.contains("PROJ-1"));
+        assert!(!app.show_lane_picker);
+    }
+
+    #[test]
+    fn lane_run_action_with_multiple_lanes_opens_picker() {
+        let app = board_with(vec![ticket("PROJ-1")], 0)
+            .with_lane_names(vec!["backend".to_string(), "frontend".to_string()]);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert!(app.show_lane_picker);
+        assert_eq!(app.lane_picker_selected, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_action_with_pending_launch_sets_message_and_no_picker() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0)
+            .with_lane_names(vec!["backend".to_string(), "frontend".to_string()]);
+        app.pending_lane_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert_eq!(app.status_line, "lane run already active for PROJ-1");
+        assert!(!app.show_lane_picker);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_action_with_active_indicator_sets_message_and_no_picker() {
+        for indicator in [
+            RunIndicator::Starting,
+            RunIndicator::Running,
+            RunIndicator::Waiting,
+        ] {
+            let mut app = board_with(vec![ticket("PROJ-1")], 0)
+                .with_lane_names(vec!["backend".to_string(), "frontend".to_string()]);
+            app.lane_run_status.insert("PROJ-1".to_string(), indicator);
+            let (app, cmds) = update(app, Msg::LaneRunAction);
+            assert_eq!(app.status_line, "lane run already active for PROJ-1");
+            assert!(!app.show_lane_picker);
+            assert!(cmds.is_empty());
+        }
+    }
+
+    #[test]
+    fn lane_run_action_with_terminal_indicator_relaunches() {
+        for indicator in [RunIndicator::Done, RunIndicator::Failed] {
+            let mut app =
+                board_with(vec![ticket("PROJ-1")], 0).with_lane_names(vec!["backend".to_string()]);
+            app.lane_run_status.insert("PROJ-1".to_string(), indicator);
+            let (_app, cmds) = update(app, Msg::LaneRunAction);
+            assert_eq!(
+                cmds,
+                vec![Cmd::LaunchLaneRun {
+                    lane: "backend".to_string(),
+                    key: "PROJ-1".to_string(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn lane_picker_up_and_down_navigate_and_clamp() {
+        let app = App {
+            show_lane_picker: true,
+            lane_picker_selected: 0,
+            lane_names: vec!["backend".to_string(), "frontend".to_string()],
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::LanePickerUp);
+        assert_eq!(app.lane_picker_selected, 0);
+        let (app, _) = update(app, Msg::LanePickerDown);
+        assert_eq!(app.lane_picker_selected, 1);
+        let (app, _) = update(app, Msg::LanePickerDown);
+        assert_eq!(app.lane_picker_selected, 1);
+        let (app, _) = update(app, Msg::LanePickerUp);
+        assert_eq!(app.lane_picker_selected, 0);
+    }
+
+    #[test]
+    fn lane_picker_select_launches_chosen_lane_and_closes_picker() {
+        let app = App {
+            show_lane_picker: true,
+            lane_picker_selected: 1,
+            lane_names: vec!["backend".to_string(), "frontend".to_string()],
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::LanePickerSelect);
+        assert!(!app.show_lane_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchLaneRun {
+                lane: "frontend".to_string(),
+                key: "PROJ-1".to_string(),
+            }]
+        );
+        assert!(app.pending_lane_launches.contains("PROJ-1"));
+    }
+
+    #[test]
+    fn lane_picker_select_out_of_range_is_a_noop() {
+        let app = App {
+            show_lane_picker: true,
+            lane_picker_selected: 10,
+            lane_names: vec!["backend".to_string()],
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::LanePickerSelect);
+        assert!(app.show_lane_picker);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_picker_close_leaves_state_unchanged() {
+        let app = App {
+            show_lane_picker: true,
+            lane_names: vec!["backend".to_string()],
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::LanePickerClose);
+        assert!(!app.show_lane_picker);
+        assert!(app.pending_lane_launches.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_launch_result_ok_removes_pending_and_sets_message() {
+        let mut app = App::new();
+        app.pending_lane_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(
+            app,
+            Msg::LaneRunLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Ok(()),
+            },
+        );
+        assert!(!app.pending_lane_launches.contains("PROJ-1"));
+        assert_eq!(app.status_line, "launched lane run for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_launch_result_err_removes_pending_and_sets_message() {
+        let mut app = App::new();
+        app.pending_lane_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(
+            app,
+            Msg::LaneRunLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Err("boom".to_string()),
+            },
+        );
+        assert!(!app.pending_lane_launches.contains("PROJ-1"));
+        assert_eq!(app.status_line, "lane run launch failed for PROJ-1: boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_status_loaded_replaces_lane_run_status() {
+        let app = App::new();
+        let mut status = HashMap::new();
+        status.insert("PROJ-1".to_string(), RunIndicator::Running);
+        let (app, cmds) = update(app, Msg::LaneRunStatusLoaded(status.clone()));
+        assert_eq!(app.lane_run_status, status);
+        assert!(cmds.is_empty());
     }
 }

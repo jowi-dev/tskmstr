@@ -505,6 +505,13 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // The Jira board never enters `Screen::Runs`, so `update` can never
         // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
         // `run`/`execute` to handle either.
+        // Stubs pending the executor side of `docs/plans/board-lane-runs.md`
+        // (chunk 2): `Cmd::LaunchLaneRun` needs a mutable launcher registry
+        // (like `Cmd::AttachAudit`'s terminal access) and `LoadLaneRunStatus`
+        // mirrors `load_audit_status`. Left as no-op stubs here only because
+        // `Cmd` is matched exhaustively; `update` already emits them once
+        // chunk 1's board reducer is live.
+        Cmd::LaunchLaneRun { .. } | Cmd::LoadLaneRunStatus => Vec::new(),
         other @ (Cmd::LoadRuns
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
