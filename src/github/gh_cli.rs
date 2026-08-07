@@ -21,7 +21,7 @@ use std::process::Command;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::bot_findings::ReviewThread;
+use super::bot_findings::{PrReview, ReviewThread};
 use super::pr::{PrInfo, PrSummary};
 
 /// Errors that can occur while shelling out to `gh` or `git`.
@@ -55,6 +55,22 @@ pub enum GhError {
         /// The underlying parse error message.
         message: String,
     },
+}
+
+/// The lifecycle state of a pull request, as reported by `gh pr view --json
+/// state,merged`.
+///
+/// `gh`'s `state` field alone only distinguishes `OPEN`/`CLOSED` (merged PRs
+/// still report `CLOSED`), so this also consults the separate `merged`
+/// boolean to tell "closed because merged" apart from "closed unmerged".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrLifecycle {
+    /// The pull request is open.
+    Open,
+    /// The pull request was merged.
+    Merged,
+    /// The pull request was closed without merging.
+    Closed,
 }
 
 /// Request body for creating a pull request via `gh pr create`.
@@ -106,6 +122,21 @@ pub trait GhCli {
     /// sufficient for tskmstr's current use (bot review findings rarely
     /// exceed one page of threads).
     fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError>;
+
+    /// List the review submissions on pull request `number`, one entry per
+    /// review regardless of how many comments (if any) it left.
+    ///
+    /// Unlike [`GhCli::pr_review_threads`] (GraphQL-only, unsuffixed bot
+    /// logins), this shells out to `gh api
+    /// repos/{owner}/{repo}/pulls/{number}/reviews` (REST), which reports bot
+    /// logins *with* the `[bot]` suffix. This is the only way to see that a
+    /// bot has run at all: a bot that finds nothing posts a review with zero
+    /// comments, leaving no trace in review-thread data.
+    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError>;
+
+    /// The lifecycle state of pull request `number` (`gh pr view <number>
+    /// --json state,merged`).
+    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError>;
 
     /// List open pull requests in the current repository
     /// (`gh pr list --state open --json number,title`).
@@ -167,6 +198,28 @@ impl ShellGhCli {
 impl Default for ShellGhCli {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ShellGhCli {
+    /// Resolve the current repository's owner and name (`gh repo view --json
+    /// owner,name`), shared by [`GhCli::pr_review_threads`] and
+    /// [`GhCli::pr_reviews`], both of which need it to build a REST/GraphQL
+    /// path for the repository.
+    fn resolve_repo(&self) -> Result<RepoRef, GhError> {
+        let output = Command::new("gh")
+            .args(["repo", "view", "--json", "owner,name"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh repo view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_repo_view_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 }
 
@@ -240,19 +293,7 @@ impl GhCli for ShellGhCli {
     }
 
     fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError> {
-        let repo_output = Command::new("gh")
-            .args(["repo", "view", "--json", "owner,name"])
-            .output()
-            .map_err(|err| GhError::Spawn {
-                command: "gh repo view".to_string(),
-                message: err.to_string(),
-            })?;
-
-        let repo = interpret_repo_view_output(
-            repo_output.status.code(),
-            &String::from_utf8_lossy(&repo_output.stdout),
-            &String::from_utf8_lossy(&repo_output.stderr),
-        )?;
+        let repo = self.resolve_repo()?;
 
         let query_arg = format!("query={REVIEW_THREADS_QUERY}");
         let owner_arg = format!("owner={}", repo.owner);
@@ -282,6 +323,41 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
             number,
+        )
+    }
+
+    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError> {
+        let repo = self.resolve_repo()?;
+
+        let path = format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name);
+        let output = Command::new("gh")
+            .args(["api", &path])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api pulls/reviews".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_reviews_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError> {
+        let output = Command::new("gh")
+            .args(["pr", "view", &number.to_string(), "--json", "state,merged"])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_state_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
         )
     }
 
@@ -531,6 +607,102 @@ fn interpret_review_threads_output(
     }
 }
 
+/// Raw shape of one entry in `gh api repos/{owner}/{repo}/pulls/{number}/reviews`
+/// output, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawPrReviewEntry {
+    user: Option<RawPrReviewUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPrReviewUser {
+    login: String,
+}
+
+/// Interpret the result of a `gh api repos/{owner}/{repo}/pulls/{number}/reviews`
+/// invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_pr_reviews_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<PrReview>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<RawPrReviewEntry>>(stdout)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| PrReview {
+                        author_login: entry.user.map(|user| user.login),
+                    })
+                    .collect()
+            })
+            .map_err(|err| GhError::Parse {
+                command: "gh api pulls/reviews".to_string(),
+                message: err.to_string(),
+            }),
+        Some(code) => Err(GhError::Command {
+            command: "gh api pulls/reviews".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api pulls/reviews".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Raw shape of `gh pr view --json state,merged` output, for deserialization
+/// only.
+#[derive(Debug, Deserialize)]
+struct RawPrState {
+    state: String,
+    merged: bool,
+}
+
+/// Interpret the result of a `gh pr view <number> --json state,merged`
+/// invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. `merged` takes
+/// precedence over `state` (see [`PrLifecycle`]'s doc comment): a merged PR
+/// reports `state: "CLOSED"` too, so `merged` is checked first.
+fn interpret_pr_state_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<PrLifecycle, GhError> {
+    match exit_code {
+        Some(0) => {
+            let raw = serde_json::from_str::<RawPrState>(stdout).map_err(|err| GhError::Parse {
+                command: "gh pr view".to_string(),
+                message: err.to_string(),
+            })?;
+            Ok(if raw.merged {
+                PrLifecycle::Merged
+            } else if raw.state.eq_ignore_ascii_case("closed") {
+                PrLifecycle::Closed
+            } else {
+                PrLifecycle::Open
+            })
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Interpret the result of a `gh pr list --state open --json number,title`
 /// invocation.
 ///
@@ -708,6 +880,10 @@ pub struct FakeGhCli {
     pr_edit_calls: RefCell<Vec<(u64, PrEditRequest)>>,
     review_threads_results: RefCell<HashMap<u64, Result<Vec<ReviewThread>, GhError>>>,
     review_threads_calls: RefCell<Vec<u64>>,
+    pr_reviews_results: RefCell<HashMap<u64, Result<Vec<PrReview>, GhError>>>,
+    pr_reviews_calls: RefCell<Vec<u64>>,
+    pr_state_results: RefCell<HashMap<u64, Result<PrLifecycle, GhError>>>,
+    pr_state_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrSummary>, GhError>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
@@ -734,6 +910,10 @@ impl Default for FakeGhCli {
             pr_edit_calls: RefCell::new(Vec::new()),
             review_threads_results: RefCell::new(HashMap::new()),
             review_threads_calls: RefCell::new(Vec::new()),
+            pr_reviews_results: RefCell::new(HashMap::new()),
+            pr_reviews_calls: RefCell::new(Vec::new()),
+            pr_state_results: RefCell::new(HashMap::new()),
+            pr_state_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
@@ -804,6 +984,36 @@ impl FakeGhCli {
         self.review_threads_calls.borrow().clone()
     }
 
+    /// Set the result `pr_reviews` will return for pull request `number`.
+    ///
+    /// A PR number with no configured result returns `Ok(vec![])`, mirroring
+    /// [`FakeGhCli::with_review_threads`]'s unconfigured-is-trivially-empty
+    /// convention.
+    pub fn with_pr_reviews(self, number: u64, result: Result<Vec<PrReview>, GhError>) -> Self {
+        self.pr_reviews_results.borrow_mut().insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_reviews`, in call order.
+    pub fn pr_reviews_calls(&self) -> Vec<u64> {
+        self.pr_reviews_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_state` will return for pull request `number`.
+    ///
+    /// A PR number with no configured result returns `Ok(PrLifecycle::Open)`
+    /// — an unconfigured PR is trivially still open, the same "nothing
+    /// interesting configured" default other Fake lookups use.
+    pub fn with_pr_state(self, number: u64, result: Result<PrLifecycle, GhError>) -> Self {
+        self.pr_state_results.borrow_mut().insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_state`, in call order.
+    pub fn pr_state_calls(&self) -> Vec<u64> {
+        self.pr_state_calls.borrow().clone()
+    }
+
     /// Set the result `pr_list` will return.
     pub fn with_pr_list(self, result: Result<Vec<PrSummary>, GhError>) -> Self {
         *self.pr_list_result.borrow_mut() = result;
@@ -852,6 +1062,22 @@ impl GhCli for FakeGhCli {
         match self.review_threads_results.borrow().get(&number) {
             Some(result) => result.clone(),
             None => Ok(Vec::new()),
+        }
+    }
+
+    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError> {
+        self.pr_reviews_calls.borrow_mut().push(number);
+        match self.pr_reviews_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError> {
+        self.pr_state_calls.borrow_mut().push(number);
+        match self.pr_state_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(PrLifecycle::Open),
         }
     }
 
@@ -1271,6 +1497,112 @@ mod tests {
     fn fake_gh_cli_unconfigured_review_threads_returns_empty() {
         let fake = FakeGhCli::new();
         assert_eq!(fake.pr_review_threads(99).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn pr_reviews_parses_login_and_null_author() {
+        let stdout = r#"[
+            {"user": {"login": "cursor[bot]"}},
+            {"user": null}
+        ]"#;
+        let reviews = interpret_pr_reviews_output(Some(0), stdout, "").unwrap();
+        assert_eq!(
+            reviews,
+            vec![
+                PrReview {
+                    author_login: Some("cursor[bot]".to_string()),
+                },
+                PrReview { author_login: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_reviews_empty_array_is_empty_vec() {
+        assert_eq!(interpret_pr_reviews_output(Some(0), "[]", "").unwrap(), []);
+    }
+
+    #[test]
+    fn pr_reviews_malformed_json_is_a_parse_error() {
+        let err = interpret_pr_reviews_output(Some(0), "not json", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn pr_reviews_failure_is_a_command_error() {
+        let err =
+            interpret_pr_reviews_output(Some(1), "", "gh: authentication required").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn pr_state_open_when_not_merged_and_state_open() {
+        let stdout = r#"{"state":"OPEN","merged":false}"#;
+        assert_eq!(
+            interpret_pr_state_output(Some(0), stdout, "").unwrap(),
+            PrLifecycle::Open
+        );
+    }
+
+    #[test]
+    fn pr_state_merged_when_merged_true_even_if_state_closed() {
+        let stdout = r#"{"state":"CLOSED","merged":true}"#;
+        assert_eq!(
+            interpret_pr_state_output(Some(0), stdout, "").unwrap(),
+            PrLifecycle::Merged
+        );
+    }
+
+    #[test]
+    fn pr_state_closed_when_unmerged_and_state_closed() {
+        let stdout = r#"{"state":"CLOSED","merged":false}"#;
+        assert_eq!(
+            interpret_pr_state_output(Some(0), stdout, "").unwrap(),
+            PrLifecycle::Closed
+        );
+    }
+
+    #[test]
+    fn pr_state_malformed_json_is_a_parse_error() {
+        let err = interpret_pr_state_output(Some(0), "not json", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn pr_state_failure_is_a_command_error() {
+        let err = interpret_pr_state_output(Some(1), "", "gh: not found").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_returns_configured_pr_reviews_for_pr_number() {
+        let reviews = vec![PrReview {
+            author_login: Some("cursor[bot]".to_string()),
+        }];
+        let fake = FakeGhCli::new().with_pr_reviews(42, Ok(reviews.clone()));
+
+        assert_eq!(fake.pr_reviews(42).unwrap(), reviews);
+        assert_eq!(fake.pr_reviews_calls(), vec![42]);
+    }
+
+    #[test]
+    fn fake_gh_cli_unconfigured_pr_reviews_returns_empty() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.pr_reviews(99).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn fake_gh_cli_returns_configured_pr_state_for_pr_number() {
+        let fake = FakeGhCli::new().with_pr_state(42, Ok(PrLifecycle::Merged));
+
+        assert_eq!(fake.pr_state(42).unwrap(), PrLifecycle::Merged);
+        assert_eq!(fake.pr_state_calls(), vec![42]);
+    }
+
+    #[test]
+    fn fake_gh_cli_unconfigured_pr_state_defaults_to_open() {
+        let fake = FakeGhCli::new();
+        assert_eq!(fake.pr_state(99).unwrap(), PrLifecycle::Open);
     }
 
     #[test]
