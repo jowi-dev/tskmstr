@@ -1,15 +1,19 @@
-//! Child-process seam for board-launched lane runs (`w` on the Jira board),
-//! per `docs/plans/board-lane-runs.md`'s "Launch mechanism" decision.
+//! Child-process seam for board-launched `tm` subcommands: lane runs (`w` on
+//! the Jira board, per `docs/plans/board-lane-runs.md`'s "Launch mechanism"
+//! decision) and PR bot watchers (`b`, per
+//! `docs/plans/bugbot-watch.md`'s "Board integration").
 //!
-//! [`LaneLauncher::spawn`] starts a short-lived *launcher* child -- `tm work
-//! run <lane> <key>` via `std::env::current_exe()` -- with piped
-//! stdout/stderr. `tm work run` (no `--fg`) deliberately does all
-//! provisioning/preflight in the foreground and creates no run row until it
-//! succeeds (see `crate::work::run::prepare_run_lane`'s doc comment), then
-//! re-execs and detaches the actual supervisor (see
-//! `crate::work::detach::RealDetachSpawner`) and exits within seconds -- so
-//! this watched child resolves quickly either way: exit 0 means the run row
-//! exists and badge polling (`Cmd::LoadLaneRunStatus`) takes over; a nonzero
+//! [`LaneLauncher::spawn`] starts a short-lived *launcher* child -- the given
+//! argv run against `std::env::current_exe()`, e.g. `work run <lane> <key>` or
+//! `pr watch <key>` -- with piped stdout/stderr. Both subcommands are
+//! deliberately shaped the same way: they do all resolution/preflight in the
+//! foreground and create no run row until it succeeds (see
+//! `crate::work::run::prepare_run_lane`'s doc comment, and `tm pr watch`'s
+//! resolve-then-dedup step), then re-exec and detach the actual long-lived
+//! process (see `crate::work::detach::RealDetachSpawner`) and exit within
+//! seconds -- so this watched child resolves quickly either way: exit 0 means
+//! the run row exists (or soon will) and badge polling
+//! (`Cmd::LoadLaneRunStatus`/`Cmd::LoadBotWatchStatus`) takes over; a nonzero
 //! exit means preflight failed and the launcher's stderr has the reason.
 //!
 //! [`LaunchHandle::try_finish`] polls non-blockingly (`Child::try_wait`) so
@@ -29,14 +33,16 @@ use std::process::{Child, Command, Stdio};
 /// per `docs/plans/board-lane-runs.md`.
 const STDERR_SNIPPET_LIMIT: usize = 200;
 
-/// Spawns the launcher child for a board-triggered lane run.
+/// Spawns the launcher child for a board-triggered `tm` subcommand.
 pub trait LaneLauncher {
-    /// Spawn `tm work run <lane> <key>` with piped stdout/stderr, returning a
-    /// handle to poll for completion. An `Err` here means the launcher
-    /// process itself could not be spawned at all (e.g. `current_exe()`
-    /// failed) -- distinct from the *launched* process later exiting
-    /// nonzero, which [`LaunchHandle::try_finish`] reports instead.
-    fn spawn(&self, lane: &str, key: &str) -> Result<Box<dyn LaunchHandle>, String>;
+    /// Spawn `tm <argv...>` with piped stdout/stderr, returning a handle to
+    /// poll for completion. `argv` carries the subcommand and its arguments
+    /// only (e.g. `["work", "run", "backend", "PROJ-1"]` or `["pr", "watch",
+    /// "PROJ-1"]`); the program itself is always this binary. An `Err` here
+    /// means the launcher process could not be spawned at all (e.g.
+    /// `current_exe()` failed) -- distinct from the *launched* process later
+    /// exiting nonzero, which [`LaunchHandle::try_finish`] reports instead.
+    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String>;
 }
 
 /// A launcher child in flight, polled non-blockingly for completion.
@@ -48,16 +54,15 @@ pub trait LaunchHandle {
     fn try_finish(&mut self) -> Option<Result<(), String>>;
 }
 
-/// Production [`LaneLauncher`]: spawns `std::env::current_exe() work run
-/// <lane> <key>`.
+/// Production [`LaneLauncher`]: spawns `std::env::current_exe() <argv...>`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealLaneLauncher;
 
 impl LaneLauncher for RealLaneLauncher {
-    fn spawn(&self, lane: &str, key: &str) -> Result<Box<dyn LaunchHandle>, String> {
+    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String> {
         let program = std::env::current_exe().map_err(|err| err.to_string())?;
         let child = Command::new(program)
-            .args(["work", "run", lane, key])
+            .args(argv)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -77,13 +82,16 @@ impl LaneLauncher for RealLaneLauncher {
 /// logic is exercised directly against real short-lived `sh -c` children in
 /// this module's tests (constructing [`RealLaunchHandle`] around them,
 /// bypassing [`RealLaneLauncher::spawn`]'s `current_exe()` argv). The actual
-/// `tm work run <lane> <key>` argv and its interaction with a real board
-/// session are not unit-tested -- see `crate::work::detach`'s "What's
-/// unit-tested vs. deferred" section for why that class of mechanics isn't;
-/// verify manually per `docs/plans/board-lane-runs.md`: press `w` on a
-/// ticket with a configured lane, confirm the badge reads `Starting` then
-/// `Running`/`Waiting`/`Done`, and confirm an unconfigured/unknown lane
-/// surfaces its preflight error text in the status line.
+/// `tm work run <lane> <key>` / `tm pr watch <key>` argv and its interaction
+/// with a real board session are not unit-tested -- see
+/// `crate::work::detach`'s "What's unit-tested vs. deferred" section for why
+/// that class of mechanics isn't; verify manually per
+/// `docs/plans/board-lane-runs.md`: press `w` on a ticket with a configured
+/// lane, confirm the badge reads `Starting` then `Running`/`Waiting`/`Done`,
+/// and confirm an unconfigured/unknown lane surfaces its preflight error text
+/// in the status line. Per `docs/plans/bugbot-watch.md`, press `b` on a ticket
+/// with an open PR and confirm the `bots:` badge appears, and that a ticket
+/// with no open PR surfaces `tm pr watch`'s stderr in the status line.
 struct RealLaunchHandle {
     child: Child,
 }
@@ -142,7 +150,7 @@ fn truncate(s: &str, max: usize) -> String {
 pub struct FakeLaneLauncher {
     spawn_result: RefCell<Result<(), String>>,
     finish_sequence: Vec<Option<Result<(), String>>>,
-    calls: RefCell<Vec<(String, String)>>,
+    calls: RefCell<Vec<Vec<String>>>,
 }
 
 impl FakeLaneLauncher {
@@ -170,8 +178,8 @@ impl FakeLaneLauncher {
         self
     }
 
-    /// Every `(lane, key)` pair passed to `spawn`, in call order.
-    pub fn calls(&self) -> Vec<(String, String)> {
+    /// Every argv passed to `spawn`, in call order.
+    pub fn calls(&self) -> Vec<Vec<String>> {
         self.calls.borrow().clone()
     }
 }
@@ -183,10 +191,8 @@ impl Default for FakeLaneLauncher {
 }
 
 impl LaneLauncher for FakeLaneLauncher {
-    fn spawn(&self, lane: &str, key: &str) -> Result<Box<dyn LaunchHandle>, String> {
-        self.calls
-            .borrow_mut()
-            .push((lane.to_string(), key.to_string()));
+    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String> {
+        self.calls.borrow_mut().push(argv.to_vec());
         self.spawn_result.borrow().clone()?;
         Ok(Box::new(FakeLaunchHandle {
             sequence: self.finish_sequence.clone(),
@@ -275,29 +281,43 @@ mod tests {
 
     // --- FakeLaneLauncher / FakeLaunchHandle ---
 
+    /// The argv a board-launched lane run spawns, as owned `String`s.
+    fn lane_argv() -> Vec<String> {
+        ["work", "run", "backend", "PROJ-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     #[test]
-    fn fake_spawn_records_lane_and_key() {
+    fn fake_spawn_records_the_whole_argv() {
         let fake = FakeLaneLauncher::new();
-        let _ = fake.spawn("backend", "PROJ-1");
-        assert_eq!(
-            fake.calls(),
-            vec![("backend".to_string(), "PROJ-1".to_string())]
-        );
+        let _ = fake.spawn(&lane_argv());
+        assert_eq!(fake.calls(), vec![lane_argv()]);
+    }
+
+    #[test]
+    fn fake_spawn_records_a_non_lane_argv_too() {
+        let fake = FakeLaneLauncher::new();
+        let argv: Vec<String> = ["pr", "watch", "PROJ-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let _ = fake.spawn(&argv);
+        assert_eq!(fake.calls(), vec![argv]);
     }
 
     #[test]
     fn fake_spawn_error_surfaces_as_err() {
         let fake = FakeLaneLauncher::new().with_spawn_error("boom");
-        let result = fake.spawn("backend", "PROJ-1");
+        let result = fake.spawn(&lane_argv());
         assert_eq!(result.err(), Some("boom".to_string()));
     }
 
     #[test]
     fn fake_handle_replays_scripted_finish_sequence() {
         let fake = FakeLaneLauncher::new().with_finish_sequence(vec![None, None, Some(Ok(()))]);
-        let mut handle = fake
-            .spawn("backend", "PROJ-1")
-            .expect("spawn should succeed");
+        let mut handle = fake.spawn(&lane_argv()).expect("spawn should succeed");
         assert_eq!(handle.try_finish(), None);
         assert_eq!(handle.try_finish(), None);
         assert_eq!(handle.try_finish(), Some(Ok(())));
@@ -307,9 +327,7 @@ mod tests {
     fn fake_handle_repeats_last_entry_once_exhausted() {
         let fake =
             FakeLaneLauncher::new().with_finish_sequence(vec![Some(Err("boom".to_string()))]);
-        let mut handle = fake
-            .spawn("backend", "PROJ-1")
-            .expect("spawn should succeed");
+        let mut handle = fake.spawn(&lane_argv()).expect("spawn should succeed");
         assert_eq!(handle.try_finish(), Some(Err("boom".to_string())));
         assert_eq!(handle.try_finish(), Some(Err("boom".to_string())));
     }

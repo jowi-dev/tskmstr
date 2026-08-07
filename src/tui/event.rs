@@ -230,7 +230,7 @@ fn run_cmds<B: Backend>(
             continue;
         }
         if let Cmd::LaunchLaneRun { lane, key } = cmd {
-            match deps.launcher.spawn(&lane, &key) {
+            match deps.launcher.spawn(&lane_run_argv(&lane, &key)) {
                 Ok(handle) => launches.push(PendingLaunch { key, handle }),
                 Err(err) => {
                     let (next_app, more_cmds) = update(
@@ -253,6 +253,19 @@ fn run_cmds<B: Backend>(
         }
     }
     app
+}
+
+/// The argv [`Cmd::LaunchLaneRun`] spawns through
+/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm work run <lane> <key>`,
+/// as owned `String`s (the trait takes a general argv, not a lane/key pair,
+/// so it can also spawn `tm pr watch <key>`).
+fn lane_run_argv(lane: &str, key: &str) -> Vec<String> {
+    vec![
+        "work".to_string(),
+        "run".to_string(),
+        lane.to_string(),
+        key.to_string(),
+    ]
 }
 
 /// Poll every entry in `launches` for completion (non-blocking, via
@@ -1635,13 +1648,60 @@ mod tests {
         );
     }
 
+    /// A [`LaneLauncher`] that records the argv it was handed into a shared
+    /// buffer the test can inspect after [`run_cmds`] has consumed
+    /// [`TuiDeps`]'s boxed launcher. [`crate::tui::launcher::FakeLaneLauncher`]
+    /// records the same thing but is moved into the box, so its `calls()` is
+    /// no longer reachable from the test.
+    struct RecordingLauncher(std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>);
+
+    impl crate::tui::launcher::LaneLauncher for RecordingLauncher {
+        fn spawn(
+            &self,
+            argv: &[String],
+        ) -> Result<Box<dyn crate::tui::launcher::LaunchHandle>, String> {
+            self.0.borrow_mut().push(argv.to_vec());
+            crate::tui::launcher::FakeLaneLauncher::new()
+                .with_finish_sequence(vec![None])
+                .spawn(argv)
+        }
+    }
+
+    #[test]
+    fn run_cmds_launch_lane_run_spawns_work_run_argv() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher = Box::new(RecordingLauncher(calls.clone()));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        run_cmds(
+            App::new(),
+            vec![Cmd::LaunchLaneRun {
+                lane: "backend".to_string(),
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            calls.borrow().clone(),
+            vec![vec![
+                "work".to_string(),
+                "run".to_string(),
+                "backend".to_string(),
+                "PROJ-1".to_string(),
+            ]]
+        );
+    }
+
     // --- poll_pending_launches ---
 
     #[test]
     fn poll_pending_launches_leaves_still_running_entries_in_place() {
         let launcher =
             crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![None]);
-        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
             handle,
@@ -1655,7 +1715,7 @@ mod tests {
     fn poll_pending_launches_removes_and_reports_completed_entries() {
         let launcher =
             crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
-        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
             handle,
@@ -1675,7 +1735,7 @@ mod tests {
     fn poll_pending_launches_reports_nonzero_exit_as_err() {
         let launcher = crate::tui::launcher::FakeLaneLauncher::new()
             .with_finish_sequence(vec![Some(Err("boom".to_string()))]);
-        let handle = launcher.spawn("backend", "PROJ-1").unwrap();
+        let handle = launcher.spawn(&lane_run_argv("backend", "PROJ-1")).unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
             handle,
