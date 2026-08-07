@@ -5,4 +5,6 @@
 // subcommands wire `naming` (and friends) into the CLI dispatch.
 #![allow(dead_code)]
 
+pub mod git;
 pub mod naming;
+pub mod tmux;
