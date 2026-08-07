@@ -734,6 +734,7 @@ mod tests {
             session_id: None,
             claude_pid: None,
             lane_run_id: None,
+            session_run_id: None,
             cwd: std::path::PathBuf::from("/tmp/wt"),
         }
     }
@@ -751,6 +752,7 @@ mod tests {
             session_id: Some(session_id.to_string()),
             claude_pid: Some(4242),
             lane_run_id: None,
+            session_run_id: None,
             cwd: std::path::PathBuf::from("/tmp/wt"),
         }
     }
