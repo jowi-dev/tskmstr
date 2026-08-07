@@ -1,5 +1,41 @@
 # Plan: Per-agent usage breakdown in `tm runs show`
 
+## Status (2026-08-07): implemented
+
+All eight steps have landed. Steps 1-6 (event parsing, aggregation,
+rendering, `tm runs show` human + `--json`, kind validation) and step 7
+(the `hooks/tm-event.sh` producer) shipped alongside the runner port;
+step 8 (watch run-detail overlay section) landed after.
+
+Resolutions to this plan's open questions:
+
+- **Open question 1 (async agents): resolved.** A background spawn's
+  `PostToolUse` payload carries no `usage` (just `agentId`/`status`);
+  the completion arrives on a later `PostToolUse` that does. The hook
+  gates emission on `tool_response.usage` being non-null, which skips
+  the spawn and captures the completion whenever it lands. Verified by
+  piping seven payload shapes (sync completion, async spawn,
+  `agentType` fallback, missing `resolvedModel`, missing agent type,
+  missing cache fields, non-Agent tool) through the hook against a
+  scratch DB — all emitted (or correctly declined to emit) and exited
+  0 silently. That validation also caught a bug, since fixed: a payload
+  with usage and model but no agent type anywhere emitted an
+  `"agentType": null` event that the Rust side silently dropped; the
+  hook now skips emission when the agent type is absent.
+- **Orchestrator remainder row: dropped**, from both human and JSON
+  output (consumers can compute `model_usage - sum(agent_usage)` if
+  they want it). The reconciliation gap is still unmeasured — no real
+  run has produced `agent_usage` events yet; the emitter reached the
+  deployed devtools hook copy only after the last lane run. Revisit
+  only if the measured gap turns out small enough to make a remainder
+  row honest.
+
+The devtools `claude-hooks/tm-event.sh` mirror is synced byte-identical
+(the discipline holds until `tm work` replaces `j work`), so the next
+lane run produces `agent_usage` events. Remaining operational step
+(stream 2's): sync the axiom repo's hook copies and `settings.json` so
+interactive audit/create sessions produce them too.
+
 ## Problem
 
 `tm runs show <TICKET>` breaks down usage/cost by **model** (`claude-fable-

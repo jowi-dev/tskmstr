@@ -43,18 +43,26 @@ Remaining operational step: sync the axiom repo's hook copies and its
 `settings.json` (SessionEnd wiring) so interactive sessions pick up the
 new gating.
 
-## 3. Per-agent cost breakdown in run telemetry
+## 3. Per-agent cost breakdown in run telemetry — done
 
-`tm runs` currently breaks usage down by model. Add a second dimension:
-by agent — the orchestrating session vs. each subagent (elixir-implementer,
-elixir-reviewer, Explore, audit-hook-logging, ...). This shows where in
-the pipeline tokens burn and where to optimize (e.g. is review or
-implementation the expensive phase?).
+`tm runs` broke usage down by model only. Added a second dimension:
+by agent — each subagent invocation (elixir-implementer, Explore, ...)
+keyed by `(agent_type, model)`. This shows where in the pipeline tokens
+burn and where to optimize (e.g. is review or implementation the
+expensive phase?).
 
-Building blocks that already exist: tool events carry an `agent` field,
-and the SubagentStop hook fires per subagent — the usage snapshot needs
-the same attribution. Surface as `tm runs show --by-agent` (and in the
-`--json` output).
+Implemented 2026-08-07 per `docs/plans/per-agent-usage.md` (see its
+status section): `hooks/tm-event.sh` emits an `agent_usage` event per
+completed `Agent`/`Task` call from the `PostToolUse` payload's usage
+summary; `tm runs show` renders an always-on "Agent usage" section
+(human, `--json`, and the watch run-detail overlay). Tokens only — no
+per-agent cost exists anywhere upstream, so none is invented.
+
+The devtools hook mirror is synced, so the next lane run produces the
+events; interactive audit/create sessions need stream 2's remaining
+axiom hook/settings sync. The reconciliation gap between `model_usage`
+and summed `agent_usage` should be eyeballed on the first few real
+runs (see the plan's status section).
 
 ## 4. Board-launched ticket-audit sessions (future)
 
