@@ -1,6 +1,13 @@
 # In-progress run visibility from the board (roadmap stream 6)
 
-Status: planned 2026-08-07.
+Status: implemented 2026-08-07 (commits `93e67c0`, `82846da`). Deviations
+from the plan below: the `v view run` hint landed in the status bar's
+`hint_for` (where `a`/`w`/`b` are documented) rather than the modal help
+overlay, which never listed board-only keys; the Usage panel's title falls
+back to a literal `"Usage"` when no model usage has loaded, keeping the
+panel frame stable; the middle row is fixed at 8 rows. Manual
+verification still open: a real `v` press against a live run on the
+board.
 
 For a ticket with an active (or recent) run: inspect it without leaving the
 board. Per the roadmap decision, lane runs stay headless and visibility is

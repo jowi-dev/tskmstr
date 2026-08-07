@@ -113,7 +113,7 @@ starting/running/waiting/done/failed` badge alongside the audit badge,
 polled on the same ~2s cadence from `kind = "lane"` runs; an active run
 guards against double-launch.
 
-## 6. In-progress run visibility from the board (future)
+## 6. In-progress run visibility from the board — done
 
 Stated 2026-08-07. For a ticket with an active (or recent) run: inspect
 it without leaving the board.
@@ -132,6 +132,21 @@ have no controlling terminal, so attaching would require tmux-hosting
 work runs — a second hosting mode the overlay makes unnecessary.
 Interactive flows that genuinely need a terminal — audits — already
 have one via stream 4.)
+
+Implemented 2026-08-07 per `docs/plans/board-run-detail.md`: `v` on a
+board ticket opens the run-detail overlay on the ticket's latest run of
+any kind, loaded via a ticket-keyed `Cmd::LoadTicketRunDetail` (lenient
+when the runs DB is unavailable; a load failure before anything renders
+closes the overlay via the status line instead of sticking on
+"Loading..."), refreshed every ~500ms while open. The overlay itself was
+rebuilt from a single scrolling paragraph into grouped panels — a
+three-column header grid (identity / timing / cost), side-by-side Usage
+and Checklist panels with truncation markers and stable placeholders,
+and a full-width Events timeline that is now the only scrolling region —
+with the run's status color as the window accent and per-kind event
+accents (`await` yellow, `bots_done` green, `give_up`/`poll_error` red).
+The watch screen shares the renderer, so `tm runs watch` got the same
+redesign for free.
 
 ## 7. Bugbot follow-through on code review — done
 
@@ -185,8 +200,7 @@ the await/resume/session-end hooks are reused unchanged.
 
 Streams 5-7 together make the board the control surface for the whole
 ticket lifecycle: groom (audit) → execute (lane run) → observe (run
-overlay) → land (bot cleanup). Streams 5 and 7 have landed; stream 6
-(the observe leg) is still open.
+overlay) → land (bot cleanup). All three streams have landed.
 
 ## Non-tskmstr chores tracked elsewhere
 
