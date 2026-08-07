@@ -119,23 +119,20 @@ one keypress, and see its status on the card.
 Stated 2026-08-07. For a ticket with an active (or recent) run: inspect
 it without leaving the board.
 
-- **Run-detail overlay on the board** — the watch screen's `RunDetail`
-  floating window (header, checklist, model/agent usage, event timeline),
-  opened for the selected ticket's latest run. Small delta: the board
-  already carries a lenient `RunStore`, and the overlay rendering exists;
-  it needs a keybinding, a `LoadRunDetail`-by-ticket path, and the watch
-  screen's ~500ms detail-refresh tick while open. Build this first — it
-  is most of the value.
-- **Attach to the run's session** — only possible when the run is
-  tmux-hosted. Headless lane runs are `setsid` processes with no
-  controlling terminal; there is nothing to attach to. This half depends
-  on the "host work runs in detached tmux sessions" config knob sketched
-  in the session-hosting discussion (2026-08-07): `tmux new-session -d
-  'tm work __supervise --state-file ...'` — `__supervise` was designed to
-  be runnable as a tmux window command, so the delta is the knob plus
-  session naming (`tm-work-<lane>-<key>`?) and reusing stream 4's
-  attach/suspend-restore machinery. With the knob on, the board's action
-  key can mean "attach" for tmux-hosted runs and "overlay" otherwise.
+Decided 2026-08-07: lane runs **stay headless**, and visibility is the
+watch screen's existing `RunDetail` floating window (header, checklist,
+model/agent usage, event timeline) opened on the board for the selected
+ticket's latest run — build on the infrastructure that exists rather
+than adding a second hosting mode. Small delta: the board already
+carries a lenient `RunStore`, and the overlay rendering exists; it needs
+a keybinding, a `LoadRunDetail`-by-ticket path, and the watch screen's
+~500ms detail-refresh tick while open.
+
+(Attach-to-run was considered and set aside: headless `setsid` runs
+have no controlling terminal, so attaching would require tmux-hosting
+work runs — a second hosting mode the overlay makes unnecessary.
+Interactive flows that genuinely need a terminal — audits — already
+have one via stream 4.)
 
 ## 7. Bugbot follow-through on code review (future)
 
@@ -145,10 +142,11 @@ the bots finished — and cleaning up their findings — is manual. Goal:
 from the board, arm a watcher that notices bot completion and gets the
 findings fixed.
 
-- **The poller must not be a Claude session.** A Claude session idling in
-  a check-PR/sleep loop burns tokens doing nothing. tm already knows the
-  bots and how to read their reviews (the `tm pr` bot-findings machinery)
-  — the watcher should be a plain detached tm process polling `gh` on a
+- **The poller is a plain tm process, not a Claude session** (decided
+  2026-08-07): bot-completion detection is deterministic and automatable
+  through `gh`, so no tokens are spent waiting. tm already knows the
+  bots and how to read their reviews (the `tm pr` bot-findings
+  machinery) — the watcher is a detached tm process polling `gh` on a
   slow cadence (30-60s; never the board's 2s tick — the board must not
   make network calls per tick), recorded as a run row (`kind =
   "review-watch"`?) so the existing badge/event machinery shows
@@ -166,9 +164,9 @@ findings fixed.
   zero (badge straight to done, no cleanup session).
 
 Streams 5-7 together make the board the control surface for the whole
-ticket lifecycle: groom (audit) → execute (lane run) → observe (overlay/
-attach) → land (bot cleanup). Each stream is independently shippable in
-that order; 6's attach half and 5 share the tmux-hosting knob.
+ticket lifecycle: groom (audit) → execute (lane run) → observe (run
+overlay) → land (bot cleanup). Each stream is independently shippable
+in that order.
 
 ## Non-tskmstr chores tracked elsewhere
 
