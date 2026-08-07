@@ -568,7 +568,33 @@ fn load_run_detail(deps: &WatchDeps, run_id: i64) -> Vec<Msg> {
         Ok(None) => return vec![Msg::RunDetailFailed(format!("no run with id {run_id}"))],
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
     };
-    let events = match deps.store.events_for_run(run_id) {
+    load_run_detail_tail(&deps.store, run)
+}
+
+/// Run `Cmd::LoadTicketRunDetail`: resolve `key`'s latest run (any `kind`)
+/// and load its full detail, for the run detail floating window opened from
+/// the board. Unlike [`load_run_detail`], `deps.store` may be absent (a
+/// broken runs DB must never block the Jira board), so that case gets its
+/// own `Msg::RunDetailFailed` rather than the debug-assert `execute` uses for
+/// truly unreachable `Cmd`s.
+fn load_ticket_run_detail(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::RunDetailFailed("run database unavailable".to_string())];
+    };
+    let run = match store.latest_run_for_ticket(key) {
+        Ok(Some(run)) => run,
+        Ok(None) => return vec![Msg::RunDetailFailed(format!("no runs for {key}"))],
+        Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
+    };
+    load_run_detail_tail(store, run)
+}
+
+/// Shared tail of [`load_run_detail`]/[`load_ticket_run_detail`]: given a
+/// resolved [`crate::runs::Run`], load its event timeline and produce
+/// [`Msg::RunDetailLoaded`], or [`Msg::RunDetailFailed`] if the events can't
+/// be read.
+fn load_run_detail_tail(store: &crate::runs::RunStore, run: crate::runs::Run) -> Vec<Msg> {
+    let events = match store.events_for_run(run.id) {
         Ok(events) => events,
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
     };
@@ -673,6 +699,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
+        Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
         // alternate screen around the blocking `tmux attach` call), and
         // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
@@ -1725,6 +1752,67 @@ mod tests {
 
         let msgs = load_audit_status(&deps);
         assert_eq!(msgs, vec![Msg::AuditStatusLoaded(HashMap::new())]);
+    }
+
+    // --- Cmd::LoadTicketRunDetail / load_ticket_run_detail ---
+
+    #[test]
+    fn load_ticket_run_detail_with_no_store_reports_unavailable() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = load_ticket_run_detail(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::RunDetailFailed("run database unavailable".to_string())]
+        );
+    }
+
+    #[test]
+    fn load_ticket_run_detail_with_no_runs_reports_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_ticket_run_detail(&deps, "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::RunDetailFailed("no runs for PROJ-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn load_ticket_run_detail_picks_the_latest_of_several_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&start_params("PROJ-1")).unwrap();
+        let latest_id = store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_ticket_run_detail(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => assert_eq!(detail.id, latest_id),
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_ticket_run_detail_is_kind_agnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&audit_start_params("PROJ-1")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = load_ticket_run_detail(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::RunDetailLoaded(detail)] => assert_eq!(detail.kind, "audit"),
+            other => panic!("expected RunDetailLoaded, got {other:?}"),
+        }
     }
 
     // --- Cmd::LaunchAudit / launch_audit_cmd ---

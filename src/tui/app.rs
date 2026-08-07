@@ -733,8 +733,15 @@ pub enum Msg {
     RunsFailed(String),
     /// The run detail window's data finished loading.
     RunDetailLoaded(Box<RunDetail>),
-    /// The run detail window's data failed to load.
+    /// The run detail window's data failed to load. Closes the overlay if
+    /// nothing had loaded yet (`run_detail == None`); a refresh failure
+    /// after a successful load leaves the loaded content up.
     RunDetailFailed(String),
+    /// The `v` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// open the run detail overlay on its latest run (any `kind`), per
+    /// `docs/plans/board-run-detail.md`'s "Decisions" section. A no-op when
+    /// no ticket is selected.
+    ViewRunAction,
     /// A reap pass completed, having reaped `0` reports as a no-op status
     /// line.
     RunsReaped(usize),
@@ -860,6 +867,16 @@ pub enum Cmd {
     LoadRunDetail {
         /// Row id of the run to load.
         run_id: i64,
+    },
+    /// Load the full detail of `key`'s latest run (any `kind`), for the run
+    /// detail floating window opened from [`Screen::Board`] via
+    /// [`Msg::ViewRunAction`]. Unlike [`Cmd::LoadRunDetail`], resolves by
+    /// ticket rather than run id, so a refresh always picks up whichever run
+    /// is now the latest -- see `docs/plans/board-run-detail.md`'s "Ticket-
+    /// keyed load Cmd" decision.
+    LoadTicketRunDetail {
+        /// Ticket key to load the latest run for.
+        key: String,
     },
     /// Reap abandoned runs in the run store.
     ReapRuns,
@@ -1092,8 +1109,15 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::RunDetailFailed(err) => {
             app.status_line = err;
+            // A failed refresh after a successful load leaves the loaded
+            // content up; a failure before anything ever loaded closes the
+            // overlay rather than leaving the user stuck on "Loading...".
+            if app.run_detail.is_none() {
+                app.show_run_detail = false;
+            }
             (app, Vec::new())
         }
+        Msg::ViewRunAction => view_run_action(app),
         Msg::RunsReaped(count) => {
             if count > 0 {
                 app.status_line = format!("Reaped {count} dead run(s)");
@@ -1314,6 +1338,27 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
     (app, vec![cmd])
 }
 
+/// Handle [`Msg::ViewRunAction`]: open the run detail overlay on
+/// [`Screen::Board`] for the selected ticket's latest run, per
+/// `docs/plans/board-run-detail.md`. A no-op when no ticket is selected or
+/// off [`Screen::Board`] -- [`crate::tui::keymap::map_key`] only ever emits
+/// this from there, but the check is kept explicit (rather than relying
+/// solely on that gating, unlike [`audit_action`]/[`lane_run_action`]) so
+/// this stays independently testable.
+fn view_run_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    app.show_run_detail = true;
+    app.run_detail = None;
+    app.run_detail_scroll = 0;
+    (app, vec![Cmd::LoadTicketRunDetail { key }])
+}
+
 /// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]/[`Screen::Board`].
 ///
 /// On [`Screen::Runs`], increments `watch_tick` and emits [`Cmd::LoadRuns`]
@@ -1328,6 +1373,9 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
 /// the Jira ticket list itself on manual refresh (`r`). The four polls stay
 /// separate `Cmd`s (not merged into one query) since a ticket can legitimately
 /// carry all four badges at once, each keyed off a different run `kind`.
+/// Additionally, while the run detail overlay is open (`show_run_detail`),
+/// emits [`Cmd::LoadTicketRunDetail`] for the selected ticket every 2nd tick
+/// (~500ms), matching the watch screen's detail refresh cadence.
 fn tick(mut app: App) -> (App, Vec<Cmd>) {
     match app.screen {
         Screen::Runs => {
@@ -1357,6 +1405,14 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
                 cmds.push(Cmd::LoadLaneRunStatus);
                 cmds.push(Cmd::LoadBotWatchStatus);
                 cmds.push(Cmd::LoadCleanupStatus);
+            }
+            if app.watch_tick.is_multiple_of(2)
+                && app.show_run_detail
+                && let Some(ticket) = app.selected_ticket()
+            {
+                cmds.push(Cmd::LoadTicketRunDetail {
+                    key: ticket.key.clone(),
+                });
             }
             (app, cmds)
         }
@@ -1595,10 +1651,19 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
 /// one is active (so `Esc`/`q` can never quit or navigate away mid-grab). On
 /// the runs screen, closes the detail window if one is open instead of
 /// quitting (`tm runs watch` has no screen to fall back to, so `Back` quits
-/// only once the window is already closed).
+/// only once the window is already closed). The board mirrors that: if the
+/// run detail overlay ([`Msg::ViewRunAction`]) is open, `Back` closes it
+/// instead of quitting.
 fn back(app: &mut App) {
     match app.screen {
-        Screen::Board => app.quit = true,
+        Screen::Board => {
+            if app.show_run_detail {
+                app.show_run_detail = false;
+                app.run_detail = None;
+            } else {
+                app.quit = true;
+            }
+        }
         Screen::Detail => app.screen = Screen::Board,
         Screen::TransitionMenu => app.screen = Screen::Detail,
         Screen::Rank => {
@@ -1624,7 +1689,13 @@ fn back(app: &mut App) {
 /// instead of just the cursor while a grab is active.
 fn move_up(app: &mut App) {
     match app.screen {
-        Screen::Board => app.selected_row = app.selected_row.saturating_sub(1),
+        Screen::Board => {
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_sub(1);
+            } else {
+                app.selected_row = app.selected_row.saturating_sub(1);
+            }
+        }
         Screen::Detail => app.detail_scroll = app.detail_scroll.saturating_sub(1),
         Screen::TransitionMenu => {
             app.transition_selected = app.transition_selected.saturating_sub(1);
@@ -1652,7 +1723,9 @@ fn move_up(app: &mut App) {
 fn move_down(app: &mut App) {
     match app.screen {
         Screen::Board => {
-            if let Some(len) = current_column_len(app) {
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_add(1);
+            } else if let Some(len) = current_column_len(app) {
                 app.selected_row = (app.selected_row + 1).min(len - 1);
             }
         }
@@ -2245,6 +2318,46 @@ mod tests {
         let app = board_with(vec![ticket("PROJ-1")], 0);
         let (app, _) = update(app, Msg::Back);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn back_on_board_with_run_detail_open_closes_it_without_quitting() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail(1)),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert!(!app.show_run_detail);
+        assert_eq!(app.run_detail, None);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn back_on_board_closes_overlay_then_quits_on_next_back() {
+        let app = App {
+            show_run_detail: true,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert!(!app.quit);
+        let (app, _) = update(app, Msg::Back);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn up_and_down_on_board_scroll_run_detail_when_open() {
+        let app = App {
+            show_run_detail: true,
+            run_detail_scroll: 2,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.run_detail_scroll, 3);
+        assert_eq!(app.selected_row, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.run_detail_scroll, 2);
+        assert_eq!(app.selected_row, 0);
     }
 
     #[test]
@@ -3208,6 +3321,33 @@ mod tests {
     }
 
     #[test]
+    fn run_detail_failed_with_nothing_loaded_yet_closes_the_overlay() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: None,
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::RunDetailFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn run_detail_failed_after_a_successful_load_leaves_the_overlay_open() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail(1)),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::RunDetailFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(app.show_run_detail);
+        assert_eq!(app.run_detail, Some(run_detail(1)));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
     fn runs_reaped_zero_is_a_noop() {
         let app = App::new();
         let (app, cmds) = update(app, Msg::RunsReaped(0));
@@ -3836,6 +3976,42 @@ mod tests {
         assert!(cmds.is_empty());
     }
 
+    // --- Msg::ViewRunAction ---
+
+    #[test]
+    fn view_run_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::ViewRunAction);
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_run_action_opens_overlay_and_emits_load_ticket_run_detail() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::ViewRunAction);
+        assert!(app.show_run_detail);
+        assert_eq!(app.run_detail, None);
+        assert_eq!(app.run_detail_scroll, 0);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadTicketRunDetail {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn view_run_action_off_the_board_screen_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::ViewRunAction);
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
     // --- Msg::Tick on Screen::Board ---
 
     #[test]
@@ -3869,6 +4045,34 @@ mod tests {
                 Cmd::LoadCleanupStatus,
             ]
         );
+    }
+
+    #[test]
+    fn tick_on_board_loads_ticket_run_detail_every_2nd_tick_while_open() {
+        let mut app = App {
+            show_run_detail: true,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (next_app, cmds) = update(app, Msg::Tick);
+        app = next_app;
+        assert!(cmds.is_empty());
+
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(app.watch_tick, 2);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadTicketRunDetail {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn tick_on_board_does_not_load_run_detail_when_overlay_is_closed() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, _) = update(app, Msg::Tick);
+        let (_app, cmds) = update(app, Msg::Tick);
+        assert!(cmds.is_empty());
     }
 
     // --- lane_names / with_lane_names ---

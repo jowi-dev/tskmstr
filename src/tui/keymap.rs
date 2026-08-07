@@ -48,10 +48,10 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// inert: refreshing would silently discard the pending, undropped reorder.
 /// `rank_grabbed` is ignored on every other screen.
 ///
-/// While the run detail overlay is shown on [`Screen::Runs`]
-/// (`show_run_detail`), only `j`/`k`/arrows (scroll), `Esc`/`q` (close the
-/// overlay), and `r` (refresh) are bound; every other key is inert.
-/// `show_run_detail` is ignored on every other screen.
+/// While the run detail overlay is shown on [`Screen::Runs`] or
+/// [`Screen::Board`] (`show_run_detail`), only `j`/`k`/arrows (scroll),
+/// `Esc`/`q` (close the overlay), and `r` (refresh) are bound; every other
+/// key is inert. `show_run_detail` is ignored on every other screen.
 pub fn map_key(
     screen: &Screen,
     show_help: bool,
@@ -88,7 +88,7 @@ pub fn map_key(
         };
     }
 
-    if *screen == Screen::Runs && show_run_detail {
+    if matches!(screen, Screen::Runs | Screen::Board) && show_run_detail {
         return match key {
             KeyCode::Char('j') | KeyCode::Down => Some(Msg::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::Up),
@@ -122,6 +122,7 @@ pub fn map_key(
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
+        KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
         _ => None,
     }
 }
@@ -1074,8 +1075,8 @@ mod tests {
     }
 
     #[test]
-    fn show_run_detail_flag_is_ignored_off_the_runs_screen() {
-        for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
+    fn show_run_detail_flag_is_ignored_off_runs_and_board_screens() {
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(
                     &screen,
@@ -1087,6 +1088,62 @@ mod tests {
                     KeyCode::Char('r')
                 ),
                 Some(Msg::Refresh)
+            );
+        }
+    }
+
+    #[test]
+    fn v_maps_to_view_run_action_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                KeyCode::Char('v')
+            ),
+            Some(Msg::ViewRunAction)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Char('v')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn show_run_detail_gating_branch_is_active_on_board() {
+        let cases = [
+            (KeyCode::Char('j'), Some(Msg::Down)),
+            (KeyCode::Down, Some(Msg::Down)),
+            (KeyCode::Char('k'), Some(Msg::Up)),
+            (KeyCode::Up, Some(Msg::Up)),
+            (KeyCode::Esc, Some(Msg::Back)),
+            (KeyCode::Char('q'), Some(Msg::Back)),
+            (KeyCode::Char('r'), Some(Msg::Refresh)),
+            (KeyCode::Char('v'), None),
+            (KeyCode::Char('a'), None),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                map_key(&Screen::Board, false, false, false, false, true, key),
+                expected
             );
         }
     }
