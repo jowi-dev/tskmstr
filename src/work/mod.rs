@@ -4,5 +4,6 @@
 //! deployment (steps 6+) are not yet.
 
 pub mod git;
+pub mod hooks;
 pub mod naming;
 pub mod tmux;
