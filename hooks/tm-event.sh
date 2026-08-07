@@ -11,6 +11,16 @@
 # the hook payload, which is present only inside a subagent call — so it
 # attributes subagent tool calls and is absent for main-loop calls.
 #
+# For a completed Agent/Task call whose tool_response carries a `usage`
+# object, a second "agent_usage" event is additionally emitted:
+# {"agentType": <string>, "description": <string>, "model": <string>,
+#  "outputTokens"/"inputTokens"/"cacheReadInputTokens"/
+#  "cacheCreationInputTokens": <int>, "totalToolUseCount": <int>,
+#  "durationMs": <int>} — the additive per-agent usage breakdown consumed by
+# `tm runs show`'s "Agent usage" section. description is omitted when empty;
+# the whole emission is skipped when resolvedModel/usage is absent (async
+# spawn responses, or a model-less row that can't aggregate).
+#
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
 
@@ -69,5 +79,41 @@ DETAIL=$(jq -nc \
 [ -z "$DETAIL" ] && exit 0
 
 tm runs event "$TSKMSTR_RUN_ID" --kind tool --detail "$DETAIL" >/dev/null 2>&1
+
+# For completed Agent/Task calls, additionally emit an agent_usage event
+# carrying the harness's own per-invocation usage summary (tool_response),
+# alongside — never instead of — the tool event above. A background/async
+# spawn's PostToolUse payload has no `usage` yet (just agentId/status); its
+# eventual completion arrives as a *later* PostToolUse (for whichever call
+# polls/awaits it) that does carry usage, so gating on `.tool_response.usage`
+# being non-null naturally skips the spawn and captures the real completion
+# whenever it lands.
+if [ "$TOOL_NAME" = "Agent" ] || [ "$TOOL_NAME" = "Task" ]; then
+  AGENT_DETAIL=$(printf '%s' "$INPUT" | jq -c '
+    .tool_response as $r
+    | ($r.usage // null) as $u
+    | if $r == null or $u == null then null else
+        ($r.resolvedModel // null) as $model
+        | if $model == null then null else
+            (.tool_input.subagent_type // $r.agentType // null) as $agentType
+            | (.tool_input.description // "") as $desc
+            | {agentType: $agentType, model: $model}
+              + (if $desc != "" then {description: $desc} else {} end)
+              + {
+                  outputTokens: ($u.output_tokens // 0),
+                  inputTokens: ($u.input_tokens // 0),
+                  cacheReadInputTokens: ($u.cache_read_input_tokens // 0),
+                  cacheCreationInputTokens: ($u.cache_creation_input_tokens // 0),
+                  totalToolUseCount: ($r.totalToolUseCount // 0),
+                  durationMs: ($r.totalDurationMs // 0)
+                }
+        end
+      end
+  ' 2>/dev/null)
+
+  if [ -n "$AGENT_DETAIL" ] && [ "$AGENT_DETAIL" != "null" ]; then
+    tm runs event "$TSKMSTR_RUN_ID" --kind agent_usage --detail "$AGENT_DETAIL" >/dev/null 2>&1
+  fi
+fi
 
 exit 0

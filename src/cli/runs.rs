@@ -812,6 +812,33 @@ mod tests {
     }
 
     #[test]
+    fn event_agent_usage_kind_rejects_non_json_detail() {
+        // Pins that `--kind agent_usage` goes through the same generic
+        // JSON validation as every other kind (see `event`'s doc comment)
+        // rather than some kind-specific check, so a future refactor that
+        // special-cases kinds can't silently drop this validation for
+        // agent_usage.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        let err = event(&store, id, "agent_usage", Some("not json"), &mut out)
+            .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::InvalidDetailJson(_)));
+        assert!(out.is_empty());
+
+        let mut list_out = Vec::new();
+        list(&store, &mut list_out).unwrap();
+        let list_output = String::from_utf8(list_out).unwrap();
+        assert!(
+            !list_output.contains("agent_usage"),
+            "no event should have been recorded: {list_output}"
+        );
+    }
+
+    #[test]
     fn event_unknown_run_id_errors() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
