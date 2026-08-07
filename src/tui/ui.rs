@@ -164,8 +164,9 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
 /// plain [`theme::COLUMN_TITLE`].
 fn column_title_style(column: &Column) -> Style {
     match column.tickets.first() {
-        Some(ticket) => theme::ticket_status_style(&ticket.status_category)
-            .add_modifier(Modifier::BOLD),
+        Some(ticket) => {
+            theme::ticket_status_style(&ticket.status_category).add_modifier(Modifier::BOLD)
+        }
         None => theme::COLUMN_TITLE,
     }
 }
@@ -526,7 +527,10 @@ fn draw_run_column(
 
 /// One run's card: three lines (ticket, lane, age/last-event), reversed when
 /// selected. A running card whose heartbeat is older than
-/// [`STALE_HEARTBEAT_SECS`] gets a trailing red `!` on its ticket line.
+/// [`STALE_HEARTBEAT_SECS`] gets a trailing red `!` on its ticket line. A
+/// card whose run is awaiting input (see
+/// [`crate::runs::is_awaiting_input`]) gets a trailing bold-yellow
+/// ` waiting` badge on its lane line.
 fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: bool) {
     let style = if is_selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -563,6 +567,9 @@ fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: boo
     let mut lane_spans = vec![Span::styled(lane_line, style)];
     if let Some(badge) = theme::kind_badge(&card.kind) {
         lane_spans.push(Span::styled(badge.content, style.patch(badge.style)));
+    }
+    if card.awaiting_input {
+        lane_spans.push(Span::styled(" waiting", style.patch(theme::AWAITING_INPUT)));
     }
 
     let lines = vec![
@@ -603,9 +610,18 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         format!("Run {}: {} ({})", detail.id, detail.ticket, detail.kind)
     };
 
+    let awaiting_input = crate::runs::is_awaiting_input(
+        detail.status,
+        detail.events.last().map(|event| event.kind.as_str()),
+    );
+    let mut status_spans = vec![Span::raw(format!("status: {:?}", detail.status))];
+    if awaiting_input {
+        status_spans.push(Span::styled(" (waiting)", theme::AWAITING_INPUT));
+    }
+
     let mut lines = vec![
         Line::from(format!("lane: {}", detail.lane)),
-        Line::from(format!("status: {:?}", detail.status)),
+        Line::from(status_spans),
         Line::from(format!("worktree: {}", detail.worktree)),
     ];
     if let Some(branch) = &detail.branch {
@@ -1506,6 +1522,7 @@ mod tests {
             heartbeat_age_secs: Some(30),
             last_event_kind: Some("tool_use".to_string()),
             last_event_age_secs: Some(5),
+            awaiting_input: false,
             checklist: None,
         }
     }
@@ -1599,6 +1616,51 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_run_card_shows_waiting_marker_styled_bold_yellow() {
+        let card = RunCard {
+            awaiting_input: true,
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        let buffer = render_with_size(&runs_app(vec![card]), 160, 24);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("waiting"));
+        let cell = cell_at(&buffer, "waiting").expect("waiting marker renders");
+        assert_eq!(Some(cell.fg), theme::AWAITING_INPUT.fg);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn non_awaiting_run_card_shows_no_waiting_marker() {
+        let card = run_card(1, "PROJ-1", "backend", RunStatus::Running);
+        assert!(!card.awaiting_input);
+        let text = buffer_text(&render(&runs_app(vec![card])));
+        assert!(!text.contains("waiting"));
+    }
+
+    #[test]
+    fn selected_awaiting_run_card_still_carries_reversed_modifier() {
+        let card = RunCard {
+            awaiting_input: true,
+            ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
+        };
+        // RunStatus::Running is RUN_COLUMNS[1]; selecting its only row picks
+        // this card.
+        let app = App {
+            runs_selected_col: 1,
+            runs_selected_row: 0,
+            ..runs_app(vec![card])
+        };
+        // A wide terminal so the lane name plus the appended waiting badge
+        // renders unclipped, per non_lane_run_card_renders_its_kind_badge_styled.
+        let buffer = render_with_size(&app, 160, 24);
+        let modifier = modifier_at(&buffer, "waiting");
+        assert!(
+            modifier.contains(Modifier::REVERSED),
+            "selection contract (REVERSED) must survive on a waiting card"
+        );
+    }
+
+    #[test]
     fn run_detail_overlay_leaves_column_titles_visible() {
         let app = App {
             show_run_detail: true,
@@ -1647,6 +1709,74 @@ mod tests {
         assert!(text.contains("Run 1: PROJ-1"));
         assert!(text.contains("sess-abc"));
         assert!(text.contains("tool_use"));
+    }
+
+    fn run_detail_with_last_event(
+        status: RunStatus,
+        last_event_kind: &str,
+    ) -> crate::tui::app::RunDetail {
+        crate::tui::app::RunDetail {
+            id: 1,
+            ticket: "PROJ-1".to_string(),
+            lane: "backend".to_string(),
+            kind: "lane".to_string(),
+            status,
+            worktree: "/tmp/wt".to_string(),
+            branch: None,
+            pid: None,
+            session_id: None,
+            cost_usd: None,
+            num_turns: None,
+            pr_url: None,
+            blocker: None,
+            started_at: "2020-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            events: vec![crate::tui::app::RunDetailEvent {
+                at: "2020-01-01T00:00:01.000Z".to_string(),
+                kind: last_event_kind.to_string(),
+                detail: None,
+            }],
+            checklist: None,
+            tool_counts: vec![],
+            model_usage: None,
+            agent_usage: vec![],
+        }
+    }
+
+    #[test]
+    fn run_detail_overlay_shows_waiting_next_to_status_when_awaiting_input() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_with_last_event(RunStatus::Running, "await")),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let buffer = render(&app);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("(waiting)"));
+        let cell = cell_at(&buffer, "(waiting)").expect("waiting marker renders");
+        assert_eq!(Some(cell.fg), theme::AWAITING_INPUT.fg);
+    }
+
+    #[test]
+    fn run_detail_overlay_omits_waiting_when_last_event_is_not_await() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_with_last_event(RunStatus::Running, "tool")),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("(waiting)"));
+    }
+
+    #[test]
+    fn run_detail_overlay_omits_waiting_for_a_finished_run_with_trailing_await() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_with_last_event(RunStatus::Done, "await")),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("(waiting)"));
     }
 
     #[test]

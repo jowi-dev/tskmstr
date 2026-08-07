@@ -264,6 +264,7 @@ fn run_summary_to_card(
         heartbeat_age_secs: summary.heartbeat_age_secs,
         last_event_kind: summary.last_event_kind,
         last_event_age_secs: summary.last_event_age_secs,
+        awaiting_input: summary.awaiting_input,
         checklist,
     }
 }

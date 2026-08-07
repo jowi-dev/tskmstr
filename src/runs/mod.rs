@@ -263,6 +263,22 @@ pub struct RunSummary {
     pub last_event_kind: Option<String>,
     /// Seconds since the most recent event, if any.
     pub last_event_age_secs: Option<i64>,
+    /// Whether the run is currently awaiting user input; see
+    /// [`is_awaiting_input`].
+    pub awaiting_input: bool,
+}
+
+/// Derives whether a run is currently awaiting user input: `status` is
+/// [`RunStatus::Running`] and its most recent event is `await` (emitted by
+/// `hooks/tm-session-state.sh` on `Stop`/`Notification` for a registered
+/// interactive session). This is a pure, read-side derivation — no schema
+/// change and no new [`RunStatus`] variant (ADR-0001) — so any later event
+/// with a different `kind` (`resume` from `UserPromptSubmit`, or a plain
+/// `tool`/`usage` event) flips it back to `false` by replacing
+/// `last_event_kind`, and a run that has already finished is never
+/// "awaiting" even if `await` happened to be its last recorded event.
+pub fn is_awaiting_input(status: RunStatus, last_event_kind: Option<&str>) -> bool {
+    status == RunStatus::Running && last_event_kind == Some("await")
 }
 
 /// Full row from `runs`, used by `tm runs show`/`resume` and (later) the
@@ -1113,6 +1129,8 @@ impl RunStore {
         let rows = stmt.query_map(params![kind], |row| {
             let status_str: String = row.get(4)?;
             let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+            let last_event_kind: Option<String> = row.get(7)?;
+            let awaiting_input = is_awaiting_input(status, last_event_kind.as_deref());
             Ok(RunSummary {
                 id: row.get(0)?,
                 ticket: row.get(1)?,
@@ -1121,8 +1139,9 @@ impl RunStore {
                 status,
                 age_secs: row.get(5)?,
                 heartbeat_age_secs: row.get(6)?,
-                last_event_kind: row.get(7)?,
+                last_event_kind,
                 last_event_age_secs: row.get(8)?,
+                awaiting_input,
             })
         })?;
 
@@ -1994,6 +2013,151 @@ mod tests {
         let ids: Vec<i64> = all.iter().map(|r| r.id).collect();
         assert!(ids.contains(&lane_id));
         assert!(ids.contains(&audit_id));
+    }
+
+    #[test]
+    fn is_awaiting_input_true_only_for_running_with_last_event_await() {
+        assert!(is_awaiting_input(RunStatus::Running, Some("await")));
+        assert!(!is_awaiting_input(RunStatus::Running, Some("resume")));
+        assert!(!is_awaiting_input(RunStatus::Running, Some("tool")));
+        assert!(!is_awaiting_input(RunStatus::Running, None));
+        assert!(!is_awaiting_input(RunStatus::Done, Some("await")));
+        assert!(!is_awaiting_input(RunStatus::Failed, Some("await")));
+        assert!(!is_awaiting_input(RunStatus::Blocked, Some("await")));
+        assert!(!is_awaiting_input(RunStatus::Queued, Some("await")));
+        assert!(!is_awaiting_input(RunStatus::Review, Some("await")));
+    }
+
+    #[test]
+    fn list_runs_filtered_marks_running_run_awaiting_after_await_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-AWAIT".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-await".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store.add_event(id, "await", None).unwrap();
+
+        let run = store
+            .list_runs_filtered(None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(run.last_event_kind.as_deref(), Some("await"));
+        assert!(run.awaiting_input, "await should flip awaiting_input on");
+    }
+
+    #[test]
+    fn list_runs_filtered_clears_awaiting_after_resume_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-RESUME".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-resume".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store.add_event(id, "await", None).unwrap();
+        store.add_event(id, "resume", None).unwrap();
+
+        let run = store
+            .list_runs_filtered(None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(run.last_event_kind.as_deref(), Some("resume"));
+        assert!(!run.awaiting_input, "resume should flip awaiting_input off");
+    }
+
+    #[test]
+    fn list_runs_filtered_clears_awaiting_after_later_tool_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-TOOL".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-tool".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store.add_event(id, "await", None).unwrap();
+        store.add_event(id, "tool", None).unwrap();
+
+        let run = store
+            .list_runs_filtered(None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(run.last_event_kind.as_deref(), Some("tool"));
+        assert!(
+            !run.awaiting_input,
+            "a later non-await event should flip awaiting_input off"
+        );
+    }
+
+    #[test]
+    fn list_runs_filtered_never_marks_a_finished_run_awaiting() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-DONE".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-done".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store.add_event(id, "await", None).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    exit_code: None,
+                    session_id: None,
+                    cost_usd: None,
+                    num_turns: None,
+                    blocker: None,
+                    pr_url: None,
+                    transcript: None,
+                    model_usage: None,
+                },
+            )
+            .unwrap();
+
+        let run = store
+            .list_runs_filtered(None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(run.last_event_kind.as_deref(), Some("await"));
+        assert!(
+            !run.awaiting_input,
+            "a finished run must never read as awaiting input, even with a trailing await event"
+        );
     }
 
     #[test]

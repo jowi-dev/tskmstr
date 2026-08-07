@@ -180,6 +180,9 @@ pub struct RunCard {
     pub last_event_kind: Option<String>,
     /// Seconds since the most recent event, if any.
     pub last_event_age_secs: Option<i64>,
+    /// Whether the run is currently awaiting user input; see
+    /// [`crate::runs::is_awaiting_input`].
+    pub awaiting_input: bool,
     /// The run's latest checklist snapshot (see
     /// [`crate::runs::latest_checklist`]), if it has emitted one.
     pub checklist: Option<crate::runs::ChecklistState>,
@@ -2444,6 +2447,7 @@ mod tests {
             heartbeat_age_secs: Some(5),
             last_event_kind: None,
             last_event_age_secs: None,
+            awaiting_input: false,
             checklist: None,
         }
     }

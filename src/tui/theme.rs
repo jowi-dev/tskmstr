@@ -46,6 +46,12 @@ pub const SECTION_HEADER: Style = Style::new().fg(Color::Cyan).add_modifier(Modi
 /// gone quiet: bold red. Predates this module; kept exactly as it was.
 pub const STALE_MARKER: Style = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
 
+/// The waiting-for-input marker on a running run card whose most recent
+/// event is `await` (see [`crate::runs::is_awaiting_input`]): bold yellow,
+/// the loud one — an idling session that looks identical to a hung one
+/// otherwise.
+pub const AWAITING_INPUT: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+
 /// The active filter's leading `*` marker in the assignee filter picker:
 /// yellow.
 pub const ACTIVE_FILTER_MARKER: Style = Style::new().fg(Color::Yellow);
@@ -154,5 +160,14 @@ mod tests {
         let badge = kind_badge("audit").expect("audit gets a badge");
         assert_eq!(badge.content.as_ref(), " audit");
         assert_eq!(badge.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn awaiting_input_is_bold_yellow() {
+        assert_eq!(AWAITING_INPUT.fg, Some(Color::Yellow));
+        assert!(AWAITING_INPUT.add_modifier.contains(Modifier::BOLD));
+        // fg-accent-only doctrine: no background color anywhere in the
+        // theme, including this new marker.
+        assert_eq!(AWAITING_INPUT.bg, None);
     }
 }
