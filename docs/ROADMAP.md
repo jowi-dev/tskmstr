@@ -94,6 +94,82 @@ Operational step remaining: the axiom repo's hook copies and its
 waiting-state telemetry flows in real sessions (superset of the stream
 2/3 sync chore).
 
+## 5. Board-launched lane runs (future)
+
+Stated 2026-08-07. The board's lifecycle story so far covers grooming
+(stream 4's `a` audit action); the next column over is execution: from a
+ready-for-work ticket, launch the normal headless `tm work run` flow with
+one keypress, and see its status on the card.
+
+- Launch: selected ticket → `tm work run <lane> <key>`. Lane selection
+  needs a decision: a floating lane picker (consistent with the board's
+  overlay idiom) vs. a `default_lane` config; picker preferred when more
+  than one lane exists.
+- `prepare_run_lane` runs git fetch + worktree provisioning in the
+  foreground (seconds) — it must not run on the TUI thread. Either a
+  background thread feeding a `Msg` back, or re-exec `tm work run`
+  fully detached and let the run row report preflight failures.
+- Generalize stream 4's audit badge machinery to lane runs: the card
+  should show the launched run's status (running / waiting / done /
+  failed) using the same `LoadAuditStatus`-style poll, widened beyond
+  `kind = "audit"`.
+
+## 6. In-progress run visibility from the board (future)
+
+Stated 2026-08-07. For a ticket with an active (or recent) run: inspect
+it without leaving the board.
+
+- **Run-detail overlay on the board** — the watch screen's `RunDetail`
+  floating window (header, checklist, model/agent usage, event timeline),
+  opened for the selected ticket's latest run. Small delta: the board
+  already carries a lenient `RunStore`, and the overlay rendering exists;
+  it needs a keybinding, a `LoadRunDetail`-by-ticket path, and the watch
+  screen's ~500ms detail-refresh tick while open. Build this first — it
+  is most of the value.
+- **Attach to the run's session** — only possible when the run is
+  tmux-hosted. Headless lane runs are `setsid` processes with no
+  controlling terminal; there is nothing to attach to. This half depends
+  on the "host work runs in detached tmux sessions" config knob sketched
+  in the session-hosting discussion (2026-08-07): `tmux new-session -d
+  'tm work __supervise --state-file ...'` — `__supervise` was designed to
+  be runnable as a tmux window command, so the delta is the knob plus
+  session naming (`tm-work-<lane>-<key>`?) and reusing stream 4's
+  attach/suspend-restore machinery. With the knob on, the board's action
+  key can mean "attach" for tmux-hosted runs and "overlay" otherwise.
+
+## 7. Bugbot follow-through on code review (future)
+
+Stated 2026-08-07. When a ticket reaches code review its PR sits waiting
+on bot review (`review_bots`, e.g. cursor bugbot); today noticing that
+the bots finished — and cleaning up their findings — is manual. Goal:
+from the board, arm a watcher that notices bot completion and gets the
+findings fixed.
+
+- **The poller must not be a Claude session.** A Claude session idling in
+  a check-PR/sleep loop burns tokens doing nothing. tm already knows the
+  bots and how to read their reviews (the `tm pr` bot-findings machinery)
+  — the watcher should be a plain detached tm process polling `gh` on a
+  slow cadence (30-60s; never the board's 2s tick — the board must not
+  make network calls per tick), recorded as a run row (`kind =
+  "review-watch"`?) so the existing badge/event machinery shows
+  `bots: pending / done` on the card for free.
+- **On completion, then spend tokens**: launch a cleanup session against
+  the bot findings (a lane run whose prompt consumes the findings, or an
+  interactive tmux session like stream 4's audits — decide during
+  design; the findings-to-prompt plumbing is the real work).
+- **Auto-launch is config-gated**: `on_bots_done = "notify" | "launch"`,
+  default `notify` — an unattended trigger that spawns Claude sessions
+  is an explicit opt-in. The notify path flips the board badge (and the
+  waiting-style bold accent) so cleanup is still one keypress.
+- Watcher lifecycle questions for design: dies with the PR merging/
+  closing; dedup (one watcher per PR); what happens on bot findings =
+  zero (badge straight to done, no cleanup session).
+
+Streams 5-7 together make the board the control surface for the whole
+ticket lifecycle: groom (audit) → execute (lane run) → observe (overlay/
+attach) → land (bot cleanup). Each stream is independently shippable in
+that order; 6's attach half and 5 share the tmux-hosting knob.
+
 ## Non-tskmstr chores tracked elsewhere
 
 - Devtools nixpkgs pin update (April 2026 → current): operational task in
