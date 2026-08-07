@@ -16,6 +16,9 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # The work::git suite integration-tests ShellGitOps against real
+          # `git init` repos, so the check phase needs git on PATH.
+          nativeCheckInputs = [ pkgs.git ];
         };
 
         devShells.default = pkgs.mkShell {
