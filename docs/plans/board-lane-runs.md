@@ -1,6 +1,14 @@
 # Board-launched lane runs (roadmap stream 5)
 
-Status: planned 2026-08-07.
+Status: implemented 2026-08-07 (commits `534287c`..`d593d34`). Deviations
+from the plan below: no separate `LaneRunLaunched` msg (pending-insertion
+happens inline in the reducer); a `BoardBadges` struct bundles the two badge
+maps into card rendering to cap arity; the pending-`Starting` overlay is
+applied reducer-side in `Msg::LaneRunStatusLoaded` (`or_insert`, so a real
+run row wins) because the executor has no access to
+`App::pending_lane_launches`. Manual verification still open: a real
+board-launched run against a configured lane (the `current_exe` argv path is
+untestable in-process, matching `RealDetachSpawner`'s precedent).
 
 From the `tm board` TUI, launch the headless `tm work run <lane> <key>` flow
 for the selected ticket with one keypress, and show the run's status on the

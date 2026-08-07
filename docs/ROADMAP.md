@@ -94,25 +94,24 @@ Operational step remaining: the axiom repo's hook copies and its
 waiting-state telemetry flows in real sessions (superset of the stream
 2/3 sync chore).
 
-## 5. Board-launched lane runs (future)
+## 5. Board-launched lane runs — done
 
 Stated 2026-08-07. The board's lifecycle story so far covers grooming
 (stream 4's `a` audit action); the next column over is execution: from a
 ready-for-work ticket, launch the normal headless `tm work run` flow with
 one keypress, and see its status on the card.
 
-- Launch: selected ticket → `tm work run <lane> <key>`. Lane selection
-  needs a decision: a floating lane picker (consistent with the board's
-  overlay idiom) vs. a `default_lane` config; picker preferred when more
-  than one lane exists.
-- `prepare_run_lane` runs git fetch + worktree provisioning in the
-  foreground (seconds) — it must not run on the TUI thread. Either a
-  background thread feeding a `Msg` back, or re-exec `tm work run`
-  fully detached and let the run row report preflight failures.
-- Generalize stream 4's audit badge machinery to lane runs: the card
-  should show the launched run's status (running / waiting / done /
-  failed) using the same `LoadAuditStatus`-style poll, widened beyond
-  `kind = "audit"`.
+Implemented 2026-08-07 per `docs/plans/board-lane-runs.md`: `w` on a board
+ticket launches `tm work run <lane> <key>`, via a floating lane picker when
+more than one lane is configured (direct launch for exactly one). The
+launcher runs as a watched child process polled with `try_wait` from the
+existing event loop — chosen over fire-and-forget detach because
+`prepare_run_lane` creates no run row until preflight succeeds, so preflight
+failures (dirty worktree, missing prompt) must surface via the child's
+captured stderr in the status line. Cards carry a `run:
+starting/running/waiting/done/failed` badge alongside the audit badge,
+polled on the same ~2s cadence from `kind = "lane"` runs; an active run
+guards against double-launch.
 
 ## 6. In-progress run visibility from the board (future)
 
