@@ -1,15 +1,20 @@
-//! `tm pr create` and `tm pr status`.
+//! `tm pr create`, `tm pr status`, and `tm pr watch`.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::github::bot_findings::count_bot_findings;
 use crate::github::gh_cli::{GhError, PrCreateRequest};
+use crate::github::pr::find_pr_for_ticket;
+use crate::runs::{RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::{
     TicketingContext, TicketingError, associate_existing_ticket_for_pr_create,
     auto_create_and_associate, resolve_existing_key,
 };
+use crate::work::detach::{DetachError, DetachSpawner};
+use crate::work::review_watch::{self, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper};
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
 #[derive(Debug, Error)]
@@ -37,6 +42,32 @@ pub enum PrCliError {
     /// A prompt or output write failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// `tm pr watch <KEY>` found no open pull request resolving to `key` via
+    /// [`find_pr_for_ticket`].
+    #[error("no open pull request found for {key}. Run `tm pr create` first.")]
+    NoPrForTicket {
+        /// The ticket key that has no resolvable open pull request.
+        key: String,
+    },
+
+    /// `tm pr watch <KEY>` found a `review-watch` run for `key` already
+    /// `Running`.
+    #[error("already watching {key} (run {run_id})")]
+    AlreadyWatching {
+        /// The ticket key already being watched.
+        key: String,
+        /// The id of the already-running watch run.
+        run_id: i64,
+    },
+
+    /// A run-state store operation failed.
+    #[error(transparent)]
+    RunStore(#[from] RunStoreError),
+
+    /// Spawning the detached watcher failed.
+    #[error(transparent)]
+    Detach(#[from] DetachError),
 }
 
 /// Options for `tm pr create`, mirroring its CLI flags.
@@ -175,6 +206,167 @@ pub fn status(
     }
 
     Ok(())
+}
+
+/// Dependencies `tm pr watch` needs beyond [`TicketingContext`] (`jira`
+/// isn't used by this command at all, but the same context is threaded
+/// through for consistency with `create`/`status`): the run-state store, the
+/// detached-spawn seam, and the poll loop's own seams
+/// ([`Clock`]/[`Sleeper`]/[`CleanupLauncher`]).
+pub struct PrWatchDeps<'a> {
+    /// The run-state store `start_run`/dedup-lookup is called against.
+    pub run_store: &'a RunStore,
+    /// Detached-child process spawning (real or fake). Only used without
+    /// `--foreground`.
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path, re-exec'd as the detached
+    /// `--foreground` child. Only used without `--foreground`.
+    pub current_exe: &'a Path,
+    /// "Now" source for the poll loop's give-up timeout. Only used with
+    /// `--foreground`.
+    pub clock: &'a dyn Clock,
+    /// Sleep between poll ticks (real or fake). Only used with
+    /// `--foreground`.
+    pub sleeper: &'a dyn Sleeper,
+    /// Cleanup-session launch seam. Only used with `--foreground`.
+    pub cleanup_launcher: &'a dyn CleanupLauncher,
+    /// The invoking user's home directory, for the detached child's log
+    /// file location and the findings-file path fallback.
+    pub home: &'a Path,
+    /// `$XDG_DATA_HOME`, if set, for the findings-file path.
+    pub xdg_data_home: Option<&'a Path>,
+}
+
+/// The outcome of `tm pr watch`, mapped by the CLI layer to exit codes
+/// `0`/`0`/`1`/`2` respectively (see `docs/plans/bugbot-watch.md`'s "CLI
+/// surface").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchOutcome {
+    /// Re-exec'd a detached `--foreground` child and returned without
+    /// waiting for it.
+    Detached,
+    /// The foreground poll loop reached a terminal, handled state (PR
+    /// closed/merged, or bots finished).
+    Handled,
+    /// The foreground poll loop gave up after repeated `gh` failures.
+    Failed,
+    /// The foreground poll loop gave up after `max_wait_mins` elapsed.
+    GaveUp,
+}
+
+/// Directory the detached watcher's log file lives in:
+/// `<home>/.local/state/tskmstr/review-watch`.
+fn watch_log_dir(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("state")
+        .join("tskmstr")
+        .join("review-watch")
+}
+
+/// `tm pr watch <KEY> [--foreground]`: resolve `KEY`'s open pull request,
+/// refuse to double-watch, then either re-exec a detached `--foreground`
+/// child or run the poll loop synchronously.
+///
+/// **Dedup race, accepted, not engineered around**: this same dedup check
+/// (`store.latest_run_for_ticket_kind(key, "review-watch")` still
+/// `Running`) runs every time this function is called — once in the
+/// un-detached parent before it spawns the child, and again in the re-exec'd
+/// `--foreground` child itself, since both invocations go through this one
+/// function. The parent's `start_run` doesn't happen until the
+/// `--foreground` branch runs (in whichever process reaches it first: the
+/// detached child, or a direct `--foreground` caller), so there is a
+/// sub-second window between the parent process exiting and the child's own
+/// `start_run` call during which a second `tm pr watch KEY` invocation would
+/// see nothing running yet and also proceed. This is the identical
+/// check-then-act race `docs/plans/board-audits.md`'s `launch_audit` already
+/// accepts for `tmux.has_session` (single board process; two independent
+/// CLI invocations racing is an operator error, not designed against) — not
+/// engineered around here either.
+///
+/// **Detach mechanics are not unit-tested**: the actual re-exec/`setsid`
+/// path (`--foreground: false`) is exercised here only insofar as
+/// [`DetachSpawner::spawn_detached`] is called with the expected argv/log
+/// path; the real spawn-and-detach mechanics are `RealDetachSpawner`'s job
+/// and, per `src/work/detach.rs`'s own doc comment and stream 5's
+/// precedent, are manually verified rather than unit-tested (they spawn a
+/// real detached process outliving the test's own process tree).
+pub fn watch(
+    ctx: &TicketingContext,
+    deps: &PrWatchDeps<'_>,
+    key: &str,
+    foreground: bool,
+    out: &mut dyn Write,
+) -> Result<WatchOutcome, PrCliError> {
+    let prs = ctx.gh.pr_list()?;
+    let pr = find_pr_for_ticket(&prs, key).ok_or_else(|| PrCliError::NoPrForTicket {
+        key: key.to_string(),
+    })?;
+    let pr_number = pr.number;
+
+    if let Some(existing) = deps
+        .run_store
+        .latest_run_for_ticket_kind(key, Some("review-watch"))?
+        && existing.status == RunStatus::Running
+    {
+        return Err(PrCliError::AlreadyWatching {
+            key: key.to_string(),
+            run_id: existing.id,
+        });
+    }
+
+    if !foreground {
+        let log_dir = watch_log_dir(deps.home);
+        std::fs::create_dir_all(&log_dir)?;
+        let log_path = log_dir.join(format!("{}.log", key.to_lowercase()));
+        let argv = vec![
+            "pr".to_string(),
+            "watch".to_string(),
+            key.to_string(),
+            "--foreground".to_string(),
+        ];
+        deps.detach
+            .spawn_detached(deps.current_exe, &argv, deps.home, &log_path)?;
+        writeln!(
+            out,
+            "watching {key} (detached; log: {})",
+            log_path.display()
+        )?;
+        return Ok(WatchOutcome::Detached);
+    }
+
+    let run_id = deps.run_store.start_run(&StartRun {
+        ticket: key.to_string(),
+        lane: "review-watch".to_string(),
+        worktree: deps.home.to_string_lossy().into_owned(),
+        branch: None,
+        pid: Some(std::process::id()),
+        kind: "review-watch".to_string(),
+    })?;
+
+    let started_at_unix = deps.clock.now_unix_secs();
+    let poll_deps = PollDeps {
+        gh: ctx.gh,
+        store: deps.run_store,
+        clock: deps.clock,
+        sleeper: deps.sleeper,
+        cleanup_launcher: deps.cleanup_launcher,
+    };
+    let poll_req = PollRequest {
+        run_id,
+        ticket: key,
+        pr_number,
+        bot_logins: &ctx.config.review_bots,
+        config: &ctx.config.work.review_watch,
+        started_at_unix,
+        home: deps.home,
+        xdg_data_home: deps.xdg_data_home,
+    };
+
+    Ok(match review_watch::run_poll_loop(&poll_deps, &poll_req) {
+        review_watch::PollOutcome::Handled => WatchOutcome::Handled,
+        review_watch::PollOutcome::Failed => WatchOutcome::Failed,
+        review_watch::PollOutcome::GaveUp => WatchOutcome::GaveUp,
+    })
 }
 
 #[cfg(test)]
@@ -746,5 +938,319 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Bot findings: 1 unresolved (of 1)"));
+    }
+
+    // --- watch: resolution / dedup / detach / foreground outcome mapping ---
+
+    use crate::github::gh_cli::PrLifecycle;
+    use crate::work::detach::FakeDetachSpawner;
+    use crate::work::review_watch::{FakeCleanupLauncher, FakeClock, FakeSleeper};
+    use tempfile::tempdir;
+
+    fn open_run_store(dir: &Path) -> RunStore {
+        RunStore::open(&dir.join("runs.db")).expect("open should succeed")
+    }
+
+    fn watch_deps<'a>(
+        run_store: &'a RunStore,
+        detach: &'a FakeDetachSpawner,
+        current_exe: &'a Path,
+        clock: &'a FakeClock,
+        sleeper: &'a FakeSleeper,
+        cleanup: &'a FakeCleanupLauncher,
+        home: &'a Path,
+    ) -> PrWatchDeps<'a> {
+        PrWatchDeps {
+            run_store,
+            detach,
+            current_exe,
+            clock,
+            sleeper,
+            cleanup_launcher: cleanup,
+            home,
+            xdg_data_home: None,
+        }
+    }
+
+    #[test]
+    fn watch_errors_when_no_open_pr_resolves_to_the_ticket() {
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![]));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = PathBuf::from("/Users/jowi");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let err = watch(&ctx, &deps, "PROJ-1", false, &mut out).expect_err("should fail");
+        match err {
+            PrCliError::NoPrForTicket { key } => assert_eq!(key, "PROJ-1"),
+            other => panic!("expected NoPrForTicket, got {other:?}"),
+        }
+        assert!(detach.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_errors_when_already_watching() {
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let existing_id = run_store
+            .start_run(&StartRun {
+                ticket: "PROJ-372".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/irrelevant".to_string(),
+                branch: None,
+                pid: Some(1),
+                kind: "review-watch".to_string(),
+            })
+            .unwrap();
+
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = PathBuf::from("/Users/jowi");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let err = watch(&ctx, &deps, "PROJ-372", false, &mut out).expect_err("should fail");
+        match err {
+            PrCliError::AlreadyWatching { key, run_id } => {
+                assert_eq!(key, "PROJ-372");
+                assert_eq!(run_id, existing_id);
+            }
+            other => panic!("expected AlreadyWatching, got {other:?}"),
+        }
+        assert!(detach.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_without_foreground_spawns_a_detached_reexec_and_creates_no_run() {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", false, &mut out).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::Detached);
+        assert!(
+            run_store.list_runs().unwrap().is_empty(),
+            "the parent must not start_run"
+        );
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].program, current_exe);
+        assert_eq!(
+            recorded[0].argv,
+            vec![
+                "pr".to_string(),
+                "watch".to_string(),
+                "PROJ-372".to_string(),
+                "--foreground".to_string(),
+            ]
+        );
+        assert_eq!(recorded[0].working_dir, home);
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("watching PROJ-372"));
+    }
+
+    #[test]
+    fn watch_foreground_merged_pr_starts_a_run_and_returns_handled() {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]))
+            .with_pr_state(42, Ok(PrLifecycle::Merged));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", true, &mut out).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::Handled);
+        assert!(detach.recorded.lock().unwrap().is_empty());
+        let runs = run_store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].kind, "review-watch");
+        assert_eq!(runs[0].status, RunStatus::Done);
+    }
+
+    #[test]
+    fn watch_foreground_gh_failure_backoff_returns_failed() {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]))
+            .with_pr_state(
+                42,
+                Err(GhError::Command {
+                    command: "gh pr view".to_string(),
+                    exit_code: Some(1),
+                    stderr: "boom".to_string(),
+                }),
+            );
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", true, &mut out).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::Failed);
+        assert_eq!(sleeper.calls().len(), 9);
+    }
+
+    #[test]
+    fn watch_foreground_wall_clock_timeout_returns_gave_up() {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]));
+        let cfg = Config {
+            work: crate::config::WorkConfig {
+                review_watch: crate::config::ReviewWatchConfig {
+                    max_wait_mins: 10,
+                    ..crate::config::ReviewWatchConfig::default()
+                },
+                ..crate::config::WorkConfig::default()
+            },
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        // First call (capturing `started_at_unix`) reports 0; every call
+        // after that (the loop's own elapsed-time check) reports well past
+        // the 10-minute deadline.
+        let clock = FakeClock::advancing(0, 10 * 60 + 2);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+        );
+        let mut out = Vec::new();
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", true, &mut out).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::GaveUp);
+        assert!(
+            gh.pr_state_calls().is_empty(),
+            "must give up before calling gh"
+        );
     }
 }

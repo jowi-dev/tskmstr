@@ -21,8 +21,90 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Board);
 
+    // `tm pr watch` is special-cased ahead of `dispatch`/`Command`'s usual
+    // `Result<(), _>` plumbing because it alone needs a three-way exit code
+    // (0 handled/detached, 1 failed, 2 gave up) rather than the uniform
+    // 0/1 every other command produces — see
+    // `docs/plans/bugbot-watch.md`'s "CLI surface".
+    if let Command::Pr {
+        cmd: PrCmd::Watch { key, foreground },
+    } = command
+    {
+        return run_pr_watch(key, foreground);
+    }
+
     match dispatch(command) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tm pr watch <KEY> [--foreground]`: build real dependencies and run
+/// [`tskmstr::cli::pr::watch`], mapping its [`tskmstr::cli::pr::WatchOutcome`]
+/// to an exit code (`0` detached/handled, `1` failed, `2` gave up).
+fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
+    let paths = default_config_paths();
+    let env_token = std::env::var("JIRA_API_TOKEN").ok();
+    let keychain = MacosKeychain::new();
+
+    let (config, jira, gh) = match build_ticketing_deps(&paths, &keychain, env_token) {
+        Ok(deps) => deps,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ctx = TicketingContext {
+        jira: &jira,
+        gh: &gh,
+        config: &config,
+    };
+
+    let run_db_path = run_db_path_from_config(&config);
+    let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+
+    let detach = tskmstr::work::detach::RealDetachSpawner;
+    let clock = tskmstr::work::review_watch::SystemClock;
+    let sleeper = tskmstr::work::review_watch::RealSleeper;
+    let cleanup_launcher = tskmstr::work::review_watch::UnimplementedCleanupLauncher;
+    let deps = tskmstr::cli::pr::PrWatchDeps {
+        run_store: &run_store,
+        detach: &detach,
+        current_exe: &current_exe,
+        clock: &clock,
+        sleeper: &sleeper,
+        cleanup_launcher: &cleanup_launcher,
+        home: &home,
+        xdg_data_home: xdg_data_home.as_deref(),
+    };
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::cli::pr::watch(&ctx, &deps, &key, foreground, &mut stdout) {
+        Ok(tskmstr::cli::pr::WatchOutcome::Detached | tskmstr::cli::pr::WatchOutcome::Handled) => {
+            ExitCode::SUCCESS
+        }
+        Ok(tskmstr::cli::pr::WatchOutcome::Failed) => ExitCode::FAILURE,
+        Ok(tskmstr::cli::pr::WatchOutcome::GaveUp) => ExitCode::from(2),
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
@@ -678,6 +760,13 @@ fn run_pr(
         PrCmd::Status { auto_ticket } => {
             let opts = tskmstr::cli::pr::PrStatusOptions { auto_ticket };
             tskmstr::cli::pr::status(&ctx, &opts, &mut prompter, &mut stdout)?;
+        }
+        PrCmd::Watch { .. } => {
+            // Handled entirely by `main`'s pre-`dispatch` special case (see
+            // its doc comment) so `tm pr watch` can produce its own 0/1/2
+            // exit codes instead of `dispatch`'s uniform 0/1. Unreachable in
+            // practice; kept only so this match stays exhaustive.
+            unreachable!("tm pr watch is dispatched before reaching run_pr");
         }
     }
     Ok(())

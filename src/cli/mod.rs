@@ -422,6 +422,19 @@ pub enum PrCmd {
         #[arg(long)]
         auto_ticket: bool,
     },
+    /// Watch a ticket's open pull request for its configured review bots to
+    /// finish, notifying (or launching a cleanup session) once they do. See
+    /// `docs/plans/bugbot-watch.md`'s "CLI surface".
+    Watch {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Run the poll loop synchronously in this process instead of
+        /// re-exec'ing a detached child. Used internally by the detached
+        /// path's re-exec'd child, and directly useful for manual
+        /// debugging.
+        #[arg(long)]
+        foreground: bool,
+    },
 }
 
 /// `tm runs` subcommands.

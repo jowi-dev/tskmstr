@@ -426,13 +426,94 @@ fn write_findings_file(path: &Path, findings: &[FindingDetail]) -> Result<(), Po
     })
 }
 
+/// A [`Clock`] test double returning a fixed, settable value.
+///
+/// A plain public struct (not `#[cfg(test)]`-gated), matching
+/// [`crate::github::gh_cli::FakeGhCli`]'s convention, so other test code in
+/// the crate (e.g. `cli::pr`'s `tm pr watch` tests) can depend on it
+/// directly.
+#[derive(Debug)]
+pub struct FakeClock {
+    current: std::cell::Cell<i64>,
+    step: i64,
+}
+
+impl FakeClock {
+    /// A clock that always reports `secs`.
+    pub fn at(secs: i64) -> Self {
+        FakeClock {
+            current: std::cell::Cell::new(secs),
+            step: 0,
+        }
+    }
+
+    /// A clock that reports `start` on its first call, then advances by
+    /// `step` seconds on every subsequent call. For tests where wall time
+    /// needs to visibly pass between two calls (e.g. a caller capturing
+    /// `started_at_unix` from one call, then [`run_poll_loop`] checking
+    /// elapsed time against it on the next).
+    pub fn advancing(start: i64, step: i64) -> Self {
+        FakeClock {
+            current: std::cell::Cell::new(start),
+            step,
+        }
+    }
+}
+
+impl Clock for FakeClock {
+    fn now_unix_secs(&self) -> i64 {
+        let value = self.current.get();
+        self.current.set(value + self.step);
+        value
+    }
+}
+
+/// A [`Sleeper`] test double that records calls instead of sleeping. Plain
+/// public struct, same rationale as [`FakeClock`].
+#[derive(Debug, Default)]
+pub struct FakeSleeper {
+    calls: std::cell::RefCell<Vec<u64>>,
+}
+
+impl FakeSleeper {
+    /// The `secs` arguments passed to `sleep`, in call order.
+    pub fn calls(&self) -> Vec<u64> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl Sleeper for FakeSleeper {
+    fn sleep(&self, secs: u64) {
+        self.calls.borrow_mut().push(secs);
+    }
+}
+
+/// A [`CleanupLauncher`] test double that records calls instead of launching
+/// anything. Plain public struct, same rationale as [`FakeClock`].
+#[derive(Debug, Default)]
+pub struct FakeCleanupLauncher {
+    calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeCleanupLauncher {
+    /// The ticket keys passed to `launch_cleanup`, in call order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl CleanupLauncher for FakeCleanupLauncher {
+    fn launch_cleanup(&self, key: &str) {
+        self.calls.borrow_mut().push(key.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github::bot_findings::PrReview;
     use crate::github::gh_cli::FakeGhCli;
     use crate::runs::{RunStore, StartRun};
-    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -446,46 +527,6 @@ mod tests {
 
     fn config() -> ReviewWatchConfig {
         ReviewWatchConfig::default()
-    }
-
-    /// A [`Clock`] test double returning a fixed value on every call.
-    struct FakeClock(Cell<i64>);
-
-    impl FakeClock {
-        fn at(secs: i64) -> Self {
-            FakeClock(Cell::new(secs))
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now_unix_secs(&self) -> i64 {
-            self.0.get()
-        }
-    }
-
-    /// A [`Sleeper`] test double that records calls instead of sleeping.
-    #[derive(Default)]
-    struct FakeSleeper {
-        calls: RefCell<Vec<u64>>,
-    }
-
-    impl Sleeper for FakeSleeper {
-        fn sleep(&self, secs: u64) {
-            self.calls.borrow_mut().push(secs);
-        }
-    }
-
-    /// A [`CleanupLauncher`] test double that records calls instead of
-    /// launching anything.
-    #[derive(Default)]
-    struct FakeCleanupLauncher {
-        calls: RefCell<Vec<String>>,
-    }
-
-    impl CleanupLauncher for FakeCleanupLauncher {
-        fn launch_cleanup(&self, key: &str) {
-            self.calls.borrow_mut().push(key.to_string());
-        }
     }
 
     fn start_watch_run(store: &RunStore, ticket: &str) -> i64 {
@@ -698,7 +739,7 @@ mod tests {
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Review);
         assert!(
-            fx.cleanup.calls.borrow().is_empty(),
+            fx.cleanup.calls().is_empty(),
             "notify mode must not launch cleanup"
         );
 
@@ -744,7 +785,7 @@ mod tests {
 
         poll_once(&fx.deps(), &req).unwrap();
 
-        assert_eq!(fx.cleanup.calls.borrow().as_slice(), ["PROJ-1"]);
+        assert_eq!(fx.cleanup.calls(), vec!["PROJ-1".to_string()]);
     }
 
     // --- run_poll_loop: backoff / give-up ---
