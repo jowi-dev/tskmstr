@@ -517,6 +517,7 @@ pub fn prepare_run_lane(
         worktree: wt_path.to_string_lossy().into_owned(),
         branch: Some(branch.clone()),
         pid,
+        kind: "lane".to_string(),
     })?;
 
     // Build the claude invocation (still part of step 9's "safe to do in the

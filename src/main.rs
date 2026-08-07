@@ -524,6 +524,7 @@ fn run_runs(cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
                 worktree,
                 branch,
                 pid,
+                kind: "lane".to_string(),
             };
             tskmstr::cli::runs::start(&store, &params, &mut stdout)?;
         }

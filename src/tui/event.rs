@@ -258,6 +258,7 @@ fn run_summary_to_card(
         id: summary.id,
         ticket: summary.ticket,
         lane: summary.lane,
+        kind: summary.kind,
         status: summary.status,
         age_secs: summary.age_secs,
         heartbeat_age_secs: summary.heartbeat_age_secs,
@@ -785,6 +786,7 @@ mod tests {
             worktree: "/tmp/wt".to_string(),
             branch: None,
             pid: None,
+            kind: "lane".to_string(),
         }
     }
 

@@ -622,6 +622,7 @@ mod tests {
             worktree: "/tmp/wt".to_string(),
             branch: None,
             pid: None,
+            kind: "lane".to_string(),
         }
     }
 
@@ -890,6 +891,7 @@ mod tests {
             id: 1,
             ticket: "PROJ-1".to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status: RunStatus::Running,
             age_secs: 120,
             heartbeat_age_secs: Some(5),
@@ -906,6 +908,7 @@ mod tests {
             id: 1,
             ticket: "PROJ-1".to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status: RunStatus::Running,
             age_secs: 120,
             heartbeat_age_secs: Some(5),

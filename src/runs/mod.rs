@@ -69,6 +69,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN model_usage TEXT;
     "#,
+    r#"
+    ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'lane';
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -170,6 +173,11 @@ pub struct StartRun {
     pub branch: Option<String>,
     /// PID of the runner process, if known.
     pub pid: Option<u32>,
+    /// Discriminates what kind of run this is, e.g. `lane`, `audit`,
+    /// `create` (see `docs/plans/session-usage.md`). Free-form text at this
+    /// layer, same stance as `lane` and event `kind`; existing `tm work run`
+    /// callers pass `"lane"`.
+    pub kind: String,
 }
 
 /// Outcome fields recorded when a run finishes.
@@ -241,6 +249,8 @@ pub struct RunSummary {
     pub ticket: String,
     /// Lane name.
     pub lane: String,
+    /// Discriminates what kind of run this is; see [`StartRun::kind`].
+    pub kind: String,
     /// Current status.
     pub status: RunStatus,
     /// Seconds since `started_at`.
@@ -264,6 +274,8 @@ pub struct Run {
     pub ticket: String,
     /// Lane name.
     pub lane: String,
+    /// Discriminates what kind of run this is; see [`StartRun::kind`].
+    pub kind: String,
     /// Current status.
     pub status: RunStatus,
     /// `claude -p` session id, if recorded.
@@ -898,8 +910,8 @@ impl RunStore {
     pub fn start_run(&self, params: &StartRun) -> Result<i64, RunStoreError> {
         self.conn.execute(
             &format!(
-                "INSERT INTO runs (ticket, lane, status, worktree, branch, pid, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW_SQL})"
+                "INSERT INTO runs (ticket, lane, status, worktree, branch, pid, kind, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW_SQL})"
             ),
             params![
                 params.ticket,
@@ -908,6 +920,7 @@ impl RunStore {
                 params.worktree,
                 params.branch,
                 params.pid,
+                params.kind,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1028,11 +1041,21 @@ impl RunStore {
     /// Lists all runs, ordered with active runs (queued/running/blocked/
     /// review) before terminal ones (done/failed), and by `started_at`
     /// descending within each group.
+    ///
+    /// Delegates to [`RunStore::list_runs_filtered`] with `kind: None`.
     pub fn list_runs(&self) -> Result<Vec<RunSummary>, RunStoreError> {
+        self.list_runs_filtered(None)
+    }
+
+    /// Like [`RunStore::list_runs`], restricted to runs whose `kind` column
+    /// equals `kind` when `Some`; `None` lists every kind (identical to
+    /// [`RunStore::list_runs`]).
+    pub fn list_runs_filtered(&self, kind: Option<&str>) -> Result<Vec<RunSummary>, RunStoreError> {
         let sql = "SELECT
                 r.id,
                 r.ticket,
                 r.lane,
+                r.kind,
                 r.status,
                 CAST((julianday('now') - julianday(r.started_at)) * 86400 AS INTEGER) AS age_secs,
                 CASE WHEN r.ended_at IS NULL THEN
@@ -1042,23 +1065,25 @@ impl RunStore {
                 (SELECT CAST((julianday('now') - julianday(e.at)) * 86400 AS INTEGER)
                     FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_age_secs
              FROM runs r
+             WHERE ?1 IS NULL OR r.kind = ?1
              ORDER BY
                 CASE r.status WHEN 'done' THEN 1 WHEN 'failed' THEN 1 ELSE 0 END ASC,
                 r.started_at DESC";
 
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
-            let status_str: String = row.get(3)?;
+        let rows = stmt.query_map(params![kind], |row| {
+            let status_str: String = row.get(4)?;
             let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
             Ok(RunSummary {
                 id: row.get(0)?,
                 ticket: row.get(1)?,
                 lane: row.get(2)?,
+                kind: row.get(3)?,
                 status,
-                age_secs: row.get(4)?,
-                heartbeat_age_secs: row.get(5)?,
-                last_event_kind: row.get(6)?,
-                last_event_age_secs: row.get(7)?,
+                age_secs: row.get(5)?,
+                heartbeat_age_secs: row.get(6)?,
+                last_event_kind: row.get(7)?,
+                last_event_age_secs: row.get(8)?,
             })
         })?;
 
@@ -1136,43 +1161,64 @@ impl RunStore {
 
     /// Returns the latest run for `ticket` (by `started_at`, breaking ties
     /// by `id`, both descending), or `None` if it has no runs.
+    ///
+    /// Delegates to [`RunStore::latest_run_for_ticket_kind`] with
+    /// `kind: None`.
     pub fn latest_run_for_ticket(&self, ticket: &str) -> Result<Option<Run>, RunStoreError> {
+        self.latest_run_for_ticket_kind(ticket, None)
+    }
+
+    /// Like [`RunStore::latest_run_for_ticket`], restricted to runs whose
+    /// `kind` column equals `kind` when `Some`; `None` matches every kind
+    /// (identical to [`RunStore::latest_run_for_ticket`]).
+    pub fn latest_run_for_ticket_kind(
+        &self,
+        ticket: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<Run>, RunStoreError> {
         let sql = "SELECT
-                id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
-             WHERE ticket = ?1
+             WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
              ORDER BY started_at DESC, id DESC
              LIMIT 1";
 
         self.conn
-            .query_row(sql, params![ticket], |row| {
-                let status_str: String = row.get(3)?;
-                let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
-                Ok(Run {
-                    id: row.get(0)?,
-                    ticket: row.get(1)?,
-                    lane: row.get(2)?,
-                    status,
-                    session_id: row.get(4)?,
-                    worktree: row.get(5)?,
-                    branch: row.get(6)?,
-                    pid: row.get(7)?,
-                    transcript: row.get(8)?,
-                    started_at: row.get(9)?,
-                    heartbeat_at: row.get(10)?,
-                    ended_at: row.get(11)?,
-                    exit_code: row.get(12)?,
-                    num_turns: row.get(13)?,
-                    cost_usd: row.get(14)?,
-                    blocker: row.get(15)?,
-                    pr_url: row.get(16)?,
-                    model_usage: row.get(17)?,
-                    age_secs: row.get(18)?,
-                })
-            })
+            .query_row(sql, params![ticket, kind], Self::row_to_run)
+            .optional()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Returns the latest **finished** run for `ticket` with kind `kind`
+    /// (status anything other than `queued`/`running`), by `started_at`
+    /// breaking ties by `id`, both descending — or `None` if there is no
+    /// such run.
+    ///
+    /// Used to find a ticket's most recent completed audit/create session
+    /// once one is running concurrently (see `docs/plans/session-usage.md`'s
+    /// "reap hazard" and "`tm runs show` resolves the latest run of any
+    /// kind" ground truth): a still-running run of the same kind must not
+    /// shadow the last *completed* one.
+    pub fn latest_finished_run_for_ticket_kind(
+        &self,
+        ticket: &str,
+        kind: &str,
+    ) -> Result<Option<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
+             ORDER BY started_at DESC, id DESC
+             LIMIT 1";
+
+        self.conn
+            .query_row(sql, params![ticket, kind], Self::row_to_run)
             .optional()
             .map_err(RunStoreError::from)
     }
@@ -1184,7 +1230,7 @@ impl RunStore {
     /// multiple runs can share a ticket key).
     pub fn run_by_id(&self, run_id: i64) -> Result<Option<Run>, RunStoreError> {
         let sql = "SELECT
-                id, ticket, lane, status, session_id, worktree, branch, pid, transcript,
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
@@ -1192,33 +1238,42 @@ impl RunStore {
              WHERE id = ?1";
 
         self.conn
-            .query_row(sql, params![run_id], |row| {
-                let status_str: String = row.get(3)?;
-                let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
-                Ok(Run {
-                    id: row.get(0)?,
-                    ticket: row.get(1)?,
-                    lane: row.get(2)?,
-                    status,
-                    session_id: row.get(4)?,
-                    worktree: row.get(5)?,
-                    branch: row.get(6)?,
-                    pid: row.get(7)?,
-                    transcript: row.get(8)?,
-                    started_at: row.get(9)?,
-                    heartbeat_at: row.get(10)?,
-                    ended_at: row.get(11)?,
-                    exit_code: row.get(12)?,
-                    num_turns: row.get(13)?,
-                    cost_usd: row.get(14)?,
-                    blocker: row.get(15)?,
-                    pr_url: row.get(16)?,
-                    model_usage: row.get(17)?,
-                    age_secs: row.get(18)?,
-                })
-            })
+            .query_row(sql, params![run_id], Self::row_to_run)
             .optional()
             .map_err(RunStoreError::from)
+    }
+
+    /// Maps one row of the `id, ticket, lane, kind, status, session_id,
+    /// worktree, branch, pid, transcript, started_at, heartbeat_at,
+    /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
+    /// model_usage, age_secs` projection (shared by [`RunStore::run_by_id`],
+    /// [`RunStore::latest_run_for_ticket_kind`], and
+    /// [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
+    fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+        let status_str: String = row.get(4)?;
+        let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+        Ok(Run {
+            id: row.get(0)?,
+            ticket: row.get(1)?,
+            lane: row.get(2)?,
+            kind: row.get(3)?,
+            status,
+            session_id: row.get(5)?,
+            worktree: row.get(6)?,
+            branch: row.get(7)?,
+            pid: row.get(8)?,
+            transcript: row.get(9)?,
+            started_at: row.get(10)?,
+            heartbeat_at: row.get(11)?,
+            ended_at: row.get(12)?,
+            exit_code: row.get(13)?,
+            num_turns: row.get(14)?,
+            cost_usd: row.get(15)?,
+            blocker: row.get(16)?,
+            pr_url: row.get(17)?,
+            model_usage: row.get(18)?,
+            age_secs: row.get(19)?,
+        })
     }
 
     /// Returns all events for `run_id`, oldest first.
@@ -1377,6 +1432,48 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_a_fresh_db_to_user_version_4() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn kind_column_defaults_to_lane_for_rows_inserted_without_it() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        // Bypass start_run to insert a row the way a pre-migration-4 writer
+        // would have (no `kind` column in its INSERT), proving the `ALTER
+        // TABLE ... DEFAULT 'lane'` migration backfills existing-shaped rows
+        // rather than only ever being satisfied by start_run's explicit
+        // value.
+        store
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO runs (ticket, lane, status, worktree, started_at)
+                     VALUES ('PROJ-1', 'backend', 'running', '/tmp/wt1', {NOW_SQL})"
+                ),
+                [],
+            )
+            .unwrap();
+
+        let kind: String = store
+            .conn
+            .query_row("SELECT kind FROM runs WHERE ticket = 'PROJ-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kind, "lane");
+    }
+
+    #[test]
     fn start_run_returns_incrementing_ids_and_round_trips() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -1388,6 +1485,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: Some("proj-1".to_string()),
                 pid: Some(1234),
+                kind: "lane".to_string(),
             })
             .unwrap();
         let id2 = store
@@ -1397,6 +1495,7 @@ mod tests {
                 worktree: "/tmp/wt2".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1422,6 +1521,38 @@ mod tests {
     }
 
     #[test]
+    fn start_run_round_trips_kind_for_lane_and_audit_runs() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-2".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        let lane_run = store.run_by_id(lane_id).unwrap().expect("expected a run");
+        let audit_run = store.run_by_id(audit_id).unwrap().expect("expected a run");
+        assert_eq!(lane_run.kind, "lane");
+        assert_eq!(audit_run.kind, "audit");
+    }
+
+    #[test]
     fn finish_run_sets_status_ended_at_and_optionals() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -1433,6 +1564,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1513,6 +1645,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1571,6 +1704,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: Some("owner/backend-20260101".to_string()),
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1607,6 +1741,7 @@ mod tests {
                 worktree: "/tmp/wt-done".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -1635,6 +1770,7 @@ mod tests {
                 worktree: "/tmp/wt-older".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -1652,6 +1788,7 @@ mod tests {
                 worktree: "/tmp/wt-newer".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -1691,6 +1828,7 @@ mod tests {
                 worktree: "/tmp/wt-evt".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1712,6 +1850,75 @@ mod tests {
     }
 
     #[test]
+    fn list_runs_surfaces_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-LANE".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-lane".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-AUDIT".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-audit".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        let runs = store.list_runs().unwrap();
+        let lane_run = runs.iter().find(|r| r.id == lane_id).unwrap();
+        let audit_run = runs.iter().find(|r| r.id == audit_id).unwrap();
+        assert_eq!(lane_run.kind, "lane");
+        assert_eq!(audit_run.kind, "audit");
+    }
+
+    #[test]
+    fn list_runs_filtered_returns_only_matching_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-LANE".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-lane".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-AUDIT".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-audit".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        let audit_only = store.list_runs_filtered(Some("audit")).unwrap();
+        assert_eq!(audit_only.len(), 1);
+        assert_eq!(audit_only[0].id, audit_id);
+
+        let all = store.list_runs_filtered(None).unwrap();
+        let ids: Vec<i64> = all.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&lane_id));
+        assert!(ids.contains(&audit_id));
+    }
+
+    #[test]
     fn add_event_writes_row_and_bumps_heartbeat() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -1723,6 +1930,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1768,6 +1976,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -1829,6 +2038,7 @@ mod tests {
                     worktree: "/tmp/wt1".to_string(),
                     branch: None,
                     pid: None,
+                    kind: "lane".to_string(),
                 })
                 .unwrap()
         };
@@ -1915,6 +2125,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: Some(4242),
+                kind: "lane".to_string(),
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -1960,6 +2171,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: Some(4242),
+                kind: "lane".to_string(),
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -1990,6 +2202,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: Some(4242),
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -2019,6 +2232,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -2041,6 +2255,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -2070,6 +2285,7 @@ mod tests {
                 worktree: "/tmp/wt2".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -2108,6 +2324,7 @@ mod tests {
                 worktree: "/tmp/wt-older".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -2125,6 +2342,7 @@ mod tests {
                 worktree: "/tmp/wt-newer".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         store
@@ -2157,6 +2375,7 @@ mod tests {
                 worktree: "/tmp/wt-first".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         let second_id = store
@@ -2166,6 +2385,7 @@ mod tests {
                 worktree: "/tmp/wt-second".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -2183,6 +2403,209 @@ mod tests {
             .unwrap()
             .expect("expected a run");
         assert_eq!(run.id, second_id);
+    }
+
+    #[test]
+    fn latest_run_for_ticket_kind_none_matches_latest_run_for_ticket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-lane".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-audit".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        let via_kind_none = store
+            .latest_run_for_ticket_kind("PROJ-1", None)
+            .unwrap()
+            .expect("expected a run");
+        let via_plain = store
+            .latest_run_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(via_kind_none.id, audit_id);
+        assert_eq!(via_kind_none.id, via_plain.id);
+    }
+
+    #[test]
+    fn latest_run_for_ticket_kind_filters_to_the_given_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-lane".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        // Started after the lane run, but a different kind, so it must not
+        // shadow the lane-kind lookup below.
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-audit".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        let run = store
+            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .unwrap()
+            .expect("expected a run");
+        assert_eq!(run.id, lane_id);
+        assert_eq!(run.kind, "lane");
+    }
+
+    #[test]
+    fn latest_finished_run_for_ticket_kind_ignores_running_and_other_kinds() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        // A still-running audit run for the ticket: must be ignored in
+        // favor of the finished one below, per the "reap hazard" / "show
+        // shadowing" ground truth in docs/plans/session-usage.md.
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-running".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        // A finished run of a different kind: must also be ignored.
+        let create_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "create".to_string(),
+                worktree: "/tmp/wt-create".to_string(),
+                branch: None,
+                pid: None,
+                kind: "create".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(
+                create_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        // An older finished audit run.
+        let older_audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-older".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(
+                older_audit_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![older_audit_id],
+            )
+            .unwrap();
+
+        // The latest finished audit run.
+        let newer_audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-newer".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(
+                newer_audit_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = '2020-06-01T00:00:00.000Z' WHERE id = ?1",
+                params![newer_audit_id],
+            )
+            .unwrap();
+
+        let run = store
+            .latest_finished_run_for_ticket_kind("PROJ-1", "audit")
+            .unwrap()
+            .expect("expected a finished audit run");
+        assert_eq!(run.id, newer_audit_id);
+        assert_eq!(run.kind, "audit");
+        assert_eq!(run.status, RunStatus::Done);
+    }
+
+    #[test]
+    fn latest_finished_run_for_ticket_kind_returns_none_when_none_finished() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-running".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .latest_finished_run_for_ticket_kind("PROJ-1", "audit")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2205,6 +2628,7 @@ mod tests {
                 worktree: "/tmp/wt-other".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
         let id = store
@@ -2214,6 +2638,7 @@ mod tests {
                 worktree: "/tmp/wt-target".to_string(),
                 branch: Some("proj-1".to_string()),
                 pid: Some(4242),
+                kind: "lane".to_string(),
             })
             .unwrap();
         assert_ne!(other_id, id);
@@ -2237,6 +2662,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 
@@ -2255,6 +2681,7 @@ mod tests {
                 worktree: "/tmp/wt1".to_string(),
                 branch: None,
                 pid: None,
+                kind: "lane".to_string(),
             })
             .unwrap();
 

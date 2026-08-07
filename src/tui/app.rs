@@ -167,6 +167,9 @@ pub struct RunCard {
     pub ticket: String,
     /// Lane name.
     pub lane: String,
+    /// Discriminates what kind of run this is, e.g. `lane`, `audit`,
+    /// `create`; see [`crate::runs::StartRun::kind`].
+    pub kind: String,
     /// Current status.
     pub status: crate::runs::RunStatus,
     /// Seconds since the run started.
@@ -2423,6 +2426,7 @@ mod tests {
             id,
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
+            kind: "lane".to_string(),
             status,
             age_secs: 10,
             heartbeat_age_secs: Some(5),

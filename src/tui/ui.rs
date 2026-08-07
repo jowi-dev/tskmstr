@@ -1334,6 +1334,7 @@ mod tests {
             id,
             ticket: ticket.to_string(),
             lane: lane.to_string(),
+            kind: "lane".to_string(),
             status,
             age_secs: 90,
             heartbeat_age_secs: Some(30),
