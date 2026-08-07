@@ -22,7 +22,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::bot_findings::{PrReview, ReviewThread};
-use super::pr::{PrInfo, PrSummary};
+use super::pr::PrInfo;
 
 /// Errors that can occur while shelling out to `gh` or `git`.
 #[derive(Debug, Clone, Error)]
@@ -138,9 +138,13 @@ pub trait GhCli {
     /// --json state,merged`).
     fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError>;
 
-    /// List open pull requests in the current repository
-    /// (`gh pr list --state open --json number,title`).
-    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError>;
+    /// List open pull requests in the current repository, fetching the same
+    /// fields as [`GhCli::pr_view`] (`gh pr list --state open --json
+    /// number,url,title,body,headRefName`) so one [`PrInfo`] parser serves
+    /// both and callers like [`super::pr::find_pr_for_ticket`] have the
+    /// title/body/branch data they need to resolve a ticket key without a
+    /// second lookup.
+    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError>;
 
     /// The login of the currently authenticated `gh` user
     /// (`gh api user -q .login`), used by `tm work run`'s branch-owner
@@ -361,9 +365,16 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError> {
+    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError> {
         let output = Command::new("gh")
-            .args(["pr", "list", "--state", "open", "--json", "number,title"])
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                PR_VIEW_JSON_FIELDS,
+            ])
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh pr list".to_string(),
@@ -703,18 +714,20 @@ fn interpret_pr_state_output(
     }
 }
 
-/// Interpret the result of a `gh pr list --state open --json number,title`
-/// invocation.
+/// Interpret the result of a `gh pr list --state open --json
+/// number,url,title,body,headRefName` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
-/// testability reasons as [`interpret_pr_view_output`].
+/// testability reasons as [`interpret_pr_view_output`]. Shares [`PrInfo`]'s
+/// deserialization with [`interpret_pr_view_output`] since both commands
+/// request the same field set ([`PR_VIEW_JSON_FIELDS`]).
 fn interpret_pr_list_output(
     exit_code: Option<i32>,
     stdout: &str,
     stderr: &str,
-) -> Result<Vec<PrSummary>, GhError> {
+) -> Result<Vec<PrInfo>, GhError> {
     match exit_code {
-        Some(0) => serde_json::from_str::<Vec<PrSummary>>(stdout).map_err(|err| GhError::Parse {
+        Some(0) => serde_json::from_str::<Vec<PrInfo>>(stdout).map_err(|err| GhError::Parse {
             command: "gh pr list".to_string(),
             message: err.to_string(),
         }),
@@ -884,7 +897,7 @@ pub struct FakeGhCli {
     pr_reviews_calls: RefCell<Vec<u64>>,
     pr_state_results: RefCell<HashMap<u64, Result<PrLifecycle, GhError>>>,
     pr_state_calls: RefCell<Vec<u64>>,
-    pr_list_result: RefCell<Result<Vec<PrSummary>, GhError>>,
+    pr_list_result: RefCell<Result<Vec<PrInfo>, GhError>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
@@ -1015,7 +1028,7 @@ impl FakeGhCli {
     }
 
     /// Set the result `pr_list` will return.
-    pub fn with_pr_list(self, result: Result<Vec<PrSummary>, GhError>) -> Self {
+    pub fn with_pr_list(self, result: Result<Vec<PrInfo>, GhError>) -> Self {
         *self.pr_list_result.borrow_mut() = result;
         self
     }
@@ -1081,7 +1094,7 @@ impl GhCli for FakeGhCli {
         }
     }
 
-    fn pr_list(&self) -> Result<Vec<PrSummary>, GhError> {
+    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError> {
         self.pr_list_result.borrow().clone()
     }
 
@@ -1406,20 +1419,40 @@ mod tests {
     }
 
     #[test]
-    fn pr_list_parses_number_and_title() {
-        let stdout =
-            r#"[{"number":1,"title":"Fix the thing"},{"number":2,"title":"Add the widget"}]"#;
+    fn pr_list_parses_number_url_title_body_and_branch() {
+        let stdout = r#"[
+            {
+                "number": 1,
+                "url": "https://github.com/example/repo/pull/1",
+                "title": "Fix the thing",
+                "body": "Resolves PROJ-372",
+                "headRefName": "proj-372-fix"
+            },
+            {
+                "number": 2,
+                "url": "https://github.com/example/repo/pull/2",
+                "title": "Add the widget",
+                "body": "",
+                "headRefName": "add-widget"
+            }
+        ]"#;
         let prs = interpret_pr_list_output(Some(0), stdout, "").unwrap();
         assert_eq!(
             prs,
             vec![
-                PrSummary {
+                PrInfo {
                     number: 1,
-                    title: "Fix the thing".to_string()
+                    url: "https://github.com/example/repo/pull/1".to_string(),
+                    title: "Fix the thing".to_string(),
+                    body: "Resolves PROJ-372".to_string(),
+                    head_ref_name: "proj-372-fix".to_string(),
                 },
-                PrSummary {
+                PrInfo {
                     number: 2,
-                    title: "Add the widget".to_string()
+                    url: "https://github.com/example/repo/pull/2".to_string(),
+                    title: "Add the widget".to_string(),
+                    body: String::new(),
+                    head_ref_name: "add-widget".to_string(),
                 },
             ]
         );
@@ -1607,9 +1640,12 @@ mod tests {
 
     #[test]
     fn fake_gh_cli_returns_configured_pr_list() {
-        let prs = vec![PrSummary {
+        let prs = vec![PrInfo {
             number: 1,
+            url: "https://github.com/example/repo/pull/1".to_string(),
             title: "Fix the thing".to_string(),
+            body: String::new(),
+            head_ref_name: "proj-372-fix".to_string(),
         }];
         let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
         assert_eq!(fake.pr_list().unwrap(), prs);

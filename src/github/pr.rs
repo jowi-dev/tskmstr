@@ -24,15 +24,6 @@ pub struct PrInfo {
     pub head_ref_name: String,
 }
 
-/// A pull request summary, as returned by `gh pr list --json number,title`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct PrSummary {
-    /// Pull request number.
-    pub number: u64,
-    /// Pull request title.
-    pub title: String,
-}
-
 /// Which part of a pull request an issue key resolved by
 /// [`find_issue_key_with_source`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +68,33 @@ pub fn find_issue_key_with_source(pr: &PrInfo) -> Option<(String, KeySource)> {
         return Some((key, KeySource::Body));
     }
     branch_key(&pr.head_ref_name).map(|key| (key, KeySource::Branch))
+}
+
+/// Find the first pull request (by ascending PR number, for determinism)
+/// resolving to Jira issue key `key`, per [`find_issue_key_with_source`]'s
+/// title/body/branch precedence.
+///
+/// `key` is compared case-insensitively (both sides uppercased), so callers
+/// don't need to normalize a ticket key's case before calling this. Returns
+/// `None` if no PR in `prs` resolves to `key`.
+///
+/// Known gap, documented not "fixed": a PR opened by hand with no key in its
+/// title or body and a branch name that doesn't match the `key-123` shape
+/// won't resolve, the same limitation [`find_issue_key_with_source`] already
+/// has everywhere else it's used.
+pub fn find_pr_for_ticket<'a>(prs: &'a [PrInfo], key: &str) -> Option<&'a PrInfo> {
+    let key = key.to_uppercase();
+    let mut matches: Vec<&PrInfo> = prs
+        .iter()
+        .filter(|pr| {
+            find_issue_key_with_source(pr)
+                .map(|(found, _)| found.to_uppercase())
+                .as_deref()
+                == Some(key.as_str())
+        })
+        .collect();
+    matches.sort_by_key(|pr| pr.number);
+    matches.into_iter().next()
 }
 
 /// Prefix `title` with `[KEY]` unless it is already prefixed with that exact
@@ -222,6 +240,37 @@ mod tests {
                 "title={title:?} body={body:?} branch={branch:?}"
             );
         }
+    }
+
+    #[test]
+    fn find_pr_for_ticket_matches_by_title_body_or_branch() {
+        let prs = vec![pr("[PROJ-372] Fix the thing", "", "fix-branch")];
+        let found = find_pr_for_ticket(&prs, "PROJ-372").expect("expected a match");
+        assert_eq!(found.number, 1);
+    }
+
+    #[test]
+    fn find_pr_for_ticket_no_match_is_none() {
+        let prs = vec![pr("Fix the thing", "no key here", "some-branch-name")];
+        assert_eq!(find_pr_for_ticket(&prs, "PROJ-372"), None);
+    }
+
+    #[test]
+    fn find_pr_for_ticket_picks_lowest_number_among_multiple_matches() {
+        let mut second = pr("[PROJ-372] Second attempt", "", "proj-372-again");
+        second.number = 7;
+        let mut first = pr("[PROJ-372] First attempt", "", "proj-372-fix");
+        first.number = 3;
+        let prs = vec![second, first];
+        let found = find_pr_for_ticket(&prs, "PROJ-372").expect("expected a match");
+        assert_eq!(found.number, 3);
+    }
+
+    #[test]
+    fn find_pr_for_ticket_compares_key_case_insensitively() {
+        let prs = vec![pr("[PROJ-372] Fix the thing", "", "fix-branch")];
+        let found = find_pr_for_ticket(&prs, "proj-372").expect("expected a match");
+        assert_eq!(found.number, 1);
     }
 
     #[test]

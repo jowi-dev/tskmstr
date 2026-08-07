@@ -281,24 +281,12 @@ fn print_bot_finding_note(
     Ok(())
 }
 
-/// Find the number of the open PR (from `gh pr list`) whose title resolves
-/// to `key`, reusing [`find_issue_key`] — the same title/body/branch
-/// extraction `tm pr status` uses — rather than re-implementing key
-/// parsing. `gh pr list` only returns `number`/`title`, so body and branch
-/// are left empty in the synthetic [`PrInfo`] passed in; this only ever
-/// matches on the title.
-fn matching_pr_number(prs: &[crate::github::pr::PrSummary], key: &str) -> Option<u64> {
+/// Find the number of the open PR (from `gh pr list`) resolving to `key`,
+/// reusing [`find_issue_key`] — the same title/body/branch extraction `tm pr
+/// status` uses — rather than re-implementing key parsing.
+fn matching_pr_number(prs: &[PrInfo], key: &str) -> Option<u64> {
     prs.iter()
-        .find(|pr| {
-            let synthetic = PrInfo {
-                number: pr.number,
-                url: String::new(),
-                title: pr.title.clone(),
-                body: String::new(),
-                head_ref_name: String::new(),
-            };
-            find_issue_key(&synthetic).as_deref() == Some(key)
-        })
+        .find(|pr| find_issue_key(pr).as_deref() == Some(key))
         .map(|pr| pr.number)
 }
 
@@ -307,7 +295,6 @@ mod tests {
     use super::*;
     use crate::github::bot_findings::ReviewThread;
     use crate::github::gh_cli::{FakeGhCli, GhError};
-    use crate::github::pr::PrSummary;
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, SearchResult,
@@ -331,10 +318,13 @@ mod tests {
         }
     }
 
-    fn pr_summary(number: u64, title: &str) -> PrSummary {
-        PrSummary {
+    fn pr_summary(number: u64, title: &str) -> PrInfo {
+        PrInfo {
             number,
+            url: String::new(),
             title: title.to_string(),
+            body: String::new(),
+            head_ref_name: String::new(),
         }
     }
 
