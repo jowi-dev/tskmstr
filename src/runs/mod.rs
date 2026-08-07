@@ -470,6 +470,116 @@ pub fn parse_model_usage(json: &str) -> Option<ModelUsageMap> {
     serde_json::from_str(json).ok()
 }
 
+/// One completed `Agent`/`Task` invocation, as reported by an `agent_usage`
+/// event's `detail`: `{"agentType": "elixir-implementer", "description":
+/// "...", "model": "claude-sonnet-5", "outputTokens": 1143, "inputTokens": 2,
+/// "cacheReadInputTokens": 87519, "cacheCreationInputTokens": 3012,
+/// "totalToolUseCount": 38, "durationMs": 193659}`.
+///
+/// Unlike `checklist`/`usage` events, each `agent_usage` event is a discrete,
+/// finished unit of work rather than a mutable snapshot — see
+/// [`collect_agent_usage`] for why every event is kept rather than only the
+/// newest. The token fields are `#[serde(flatten)]`ed from [`ModelUsage`] so
+/// this struct reuses its field naming (`inputTokens`/`outputTokens`/
+/// `cacheReadInputTokens`/`cacheCreationInputTokens`) rather than duplicating
+/// it; `ModelUsage::cost_usd` is always `None` here since no per-agent cost
+/// is ever available (see `docs/plans/per-agent-usage.md`).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct AgentUsageEvent {
+    /// The subagent type invoked, e.g. `elixir-implementer` or `Explore`.
+    #[serde(rename = "agentType")]
+    pub agent_type: String,
+    /// The free-text description passed to the `Agent`/`Task` call, if any.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The model the agent resolved to, e.g. `claude-sonnet-5`.
+    pub model: String,
+    /// Token usage for this invocation.
+    #[serde(flatten)]
+    pub usage: ModelUsage,
+    /// Total tool calls the agent made during this invocation.
+    #[serde(rename = "totalToolUseCount", default)]
+    pub total_tool_use_count: u64,
+    /// Wall-clock duration of the invocation, in milliseconds.
+    #[serde(rename = "durationMs", default)]
+    pub duration_ms: u64,
+}
+
+/// Scans `events` (as returned by [`RunStore::events_for_run`], oldest
+/// first) for every event with `kind == "agent_usage"` whose `detail` parses
+/// as [`AgentUsageEvent`], and returns them **in the same oldest-first
+/// order** — deliberately not named `latest_*` like [`latest_checklist`]/
+/// [`latest_usage`]: each `agent_usage` event is a discrete, finished
+/// invocation rather than a snapshot of a mutable total, so repeat
+/// invocations of the same agent type must all be kept rather than
+/// collapsed to the newest one.
+///
+/// Tolerant by design, same as [`latest_checklist`]: an event with kind
+/// `agent_usage` but missing or malformed `detail` is skipped rather than
+/// erroring. Returns an empty `Vec` if no event parses.
+pub fn collect_agent_usage(events: &[RunEvent]) -> Vec<AgentUsageEvent> {
+    events
+        .iter()
+        .filter(|event| event.kind == "agent_usage")
+        .filter_map(|event| {
+            let detail = event.detail.as_deref()?;
+            serde_json::from_str(detail).ok()
+        })
+        .collect()
+}
+
+/// Summed usage for one `(agent_type, model)` pair, across every invocation
+/// captured by [`collect_agent_usage`]. See [`aggregate_agent_usage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentUsageTotals {
+    /// Number of `agent_usage` events folded into this total.
+    pub invocations: u64,
+    /// Summed output tokens.
+    pub output_tokens: u64,
+    /// Summed input tokens (excluding cache reads/writes).
+    pub input_tokens: u64,
+    /// Summed tokens read from the prompt cache.
+    pub cache_read_input_tokens: u64,
+    /// Summed tokens written to the prompt cache.
+    pub cache_creation_input_tokens: u64,
+    /// Summed tool calls across all invocations.
+    pub total_tool_use_count: u64,
+    /// Summed wall-clock duration, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Groups `events` by `(agent_type, model)` and sums their token/tool-use/
+/// duration fields, counting invocations per group.
+///
+/// Keyed by the compound `(agent_type, model)` pair, not `agent_type` alone
+/// — per `docs/plans/per-agent-usage.md`'s "cross-model agents" hard part,
+/// an agent type (e.g. `general-purpose`) can resolve to different models
+/// across invocations, and merging their tokens under one row would make a
+/// cost-conscious read of "which agent is expensive" wrong. Returns an
+/// empty map for empty input. Uses a [`std::collections::BTreeMap`] rather
+/// than a `HashMap` so renderers get a deterministic iteration order, same
+/// rationale as [`ModelUsageMap`].
+pub fn aggregate_agent_usage(
+    events: &[AgentUsageEvent],
+) -> std::collections::BTreeMap<(String, String), AgentUsageTotals> {
+    let mut totals: std::collections::BTreeMap<(String, String), AgentUsageTotals> =
+        std::collections::BTreeMap::new();
+
+    for event in events {
+        let key = (event.agent_type.clone(), event.model.clone());
+        let entry = totals.entry(key).or_default();
+        entry.invocations += 1;
+        entry.output_tokens += event.usage.output_tokens;
+        entry.input_tokens += event.usage.input_tokens;
+        entry.cache_read_input_tokens += event.usage.cache_read_input_tokens;
+        entry.cache_creation_input_tokens += event.usage.cache_creation_input_tokens;
+        entry.total_tool_use_count += event.total_tool_use_count;
+        entry.duration_ms += event.duration_ms;
+    }
+
+    totals
+}
+
 /// Formats a token count human-readably: under 1,000 as a plain integer,
 /// under 1,000,000 as `{n.n}k`, otherwise as `{n.n}M`. E.g. `58564` ->
 /// `"58.6k"`, `6535803` -> `"6.5M"`.
@@ -2414,6 +2524,189 @@ mod tests {
     #[test]
     fn parse_model_usage_returns_none_for_malformed_json() {
         assert!(parse_model_usage("not json").is_none());
+    }
+
+    fn agent_usage_event(id: i64, detail: Option<&str>) -> RunEvent {
+        RunEvent {
+            id,
+            at: format!("2020-01-01T00:00:{id:02}.000Z"),
+            kind: "agent_usage".to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    /// The plan's example `agent_usage` detail JSON
+    /// (`docs/plans/per-agent-usage.md`, "Schema/event design").
+    const AGENT_USAGE_FIXTURE: &str = r#"{"agentType": "elixir-implementer", "description": "Implement AX-404 UI threading", "model": "claude-sonnet-5", "outputTokens": 1143, "inputTokens": 2, "cacheReadInputTokens": 87519, "cacheCreationInputTokens": 3012, "totalToolUseCount": 38, "durationMs": 193659}"#;
+
+    #[test]
+    fn collect_agent_usage_parses_happy_path() {
+        let events = vec![agent_usage_event(1, Some(AGENT_USAGE_FIXTURE))];
+
+        let collected = collect_agent_usage(&events);
+
+        assert_eq!(collected.len(), 1);
+        let event = &collected[0];
+        assert_eq!(event.agent_type, "elixir-implementer");
+        assert_eq!(
+            event.description.as_deref(),
+            Some("Implement AX-404 UI threading")
+        );
+        assert_eq!(event.model, "claude-sonnet-5");
+        assert_eq!(event.usage.output_tokens, 1143);
+        assert_eq!(event.usage.input_tokens, 2);
+        assert_eq!(event.usage.cache_read_input_tokens, 87519);
+        assert_eq!(event.usage.cache_creation_input_tokens, 3012);
+        assert_eq!(event.usage.cost_usd, None);
+        assert_eq!(event.total_tool_use_count, 38);
+        assert_eq!(event.duration_ms, 193659);
+    }
+
+    #[test]
+    fn collect_agent_usage_skips_malformed_detail() {
+        let events = vec![
+            agent_usage_event(1, Some(AGENT_USAGE_FIXTURE)),
+            agent_usage_event(2, Some("not json")),
+            agent_usage_event(3, None),
+            agent_usage_event(4, Some(r#"{"description":"missing required fields"}"#)),
+        ];
+
+        let collected = collect_agent_usage(&events);
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].agent_type, "elixir-implementer");
+    }
+
+    #[test]
+    fn collect_agent_usage_preserves_order_oldest_first() {
+        let events = vec![
+            agent_usage_event(
+                1,
+                Some(r#"{"agentType":"Explore","model":"claude-fable-5","outputTokens":1}"#),
+            ),
+            agent_usage_event(
+                2,
+                Some(
+                    r#"{"agentType":"elixir-implementer","model":"claude-sonnet-5","outputTokens":2}"#,
+                ),
+            ),
+        ];
+
+        let collected = collect_agent_usage(&events);
+
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].agent_type, "Explore");
+        assert_eq!(collected[1].agent_type, "elixir-implementer");
+    }
+
+    #[test]
+    fn collect_agent_usage_returns_empty_when_no_agent_usage_events() {
+        let events = vec![make_event(1, "tool", None), checklist_event(2, None)];
+
+        assert_eq!(collect_agent_usage(&events), Vec::new());
+    }
+
+    #[test]
+    fn collect_agent_usage_picks_real_event_out_of_mixed_kinds() {
+        let events = vec![
+            make_event(1, "tool", Some(r#"{"tool":"Bash","summary":"cargo test"}"#)),
+            usage_event(
+                2,
+                Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
+            ),
+            checklist_event(3, Some(r#"{"items":[{"text":"a","done":true}]}"#)),
+            agent_usage_event(4, Some(AGENT_USAGE_FIXTURE)),
+        ];
+
+        let collected = collect_agent_usage(&events);
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].agent_type, "elixir-implementer");
+        assert_eq!(collected[0].model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn aggregate_agent_usage_sums_a_single_invocation() {
+        let events = collect_agent_usage(&[agent_usage_event(1, Some(AGENT_USAGE_FIXTURE))]);
+
+        let totals = aggregate_agent_usage(&events);
+
+        let key = (
+            "elixir-implementer".to_string(),
+            "claude-sonnet-5".to_string(),
+        );
+        let entry = totals.get(&key).expect("expected an entry");
+        assert_eq!(totals.len(), 1);
+        assert_eq!(entry.invocations, 1);
+        assert_eq!(entry.output_tokens, 1143);
+        assert_eq!(entry.input_tokens, 2);
+        assert_eq!(entry.cache_read_input_tokens, 87519);
+        assert_eq!(entry.cache_creation_input_tokens, 3012);
+        assert_eq!(entry.total_tool_use_count, 38);
+        assert_eq!(entry.duration_ms, 193659);
+    }
+
+    #[test]
+    fn aggregate_agent_usage_sums_repeated_same_type_invocations() {
+        let events = collect_agent_usage(&[
+            agent_usage_event(
+                1,
+                Some(
+                    r#"{"agentType":"elixir-implementer","model":"claude-sonnet-5","outputTokens":100,"totalToolUseCount":5,"durationMs":1000}"#,
+                ),
+            ),
+            agent_usage_event(
+                2,
+                Some(
+                    r#"{"agentType":"elixir-implementer","model":"claude-sonnet-5","outputTokens":200,"totalToolUseCount":7,"durationMs":2000}"#,
+                ),
+            ),
+        ]);
+
+        let totals = aggregate_agent_usage(&events);
+
+        let key = (
+            "elixir-implementer".to_string(),
+            "claude-sonnet-5".to_string(),
+        );
+        let entry = totals.get(&key).expect("expected an entry");
+        assert_eq!(totals.len(), 1);
+        assert_eq!(entry.invocations, 2);
+        assert_eq!(entry.output_tokens, 300);
+        assert_eq!(entry.total_tool_use_count, 12);
+        assert_eq!(entry.duration_ms, 3000);
+    }
+
+    #[test]
+    fn aggregate_agent_usage_keeps_same_agent_type_under_two_models_separate() {
+        let events = collect_agent_usage(&[
+            agent_usage_event(
+                1,
+                Some(
+                    r#"{"agentType":"general-purpose","model":"claude-haiku-5","outputTokens":10}"#,
+                ),
+            ),
+            agent_usage_event(
+                2,
+                Some(
+                    r#"{"agentType":"general-purpose","model":"claude-sonnet-5","outputTokens":20}"#,
+                ),
+            ),
+        ]);
+
+        let totals = aggregate_agent_usage(&events);
+
+        assert_eq!(totals.len(), 2);
+        let haiku_key = ("general-purpose".to_string(), "claude-haiku-5".to_string());
+        let sonnet_key = ("general-purpose".to_string(), "claude-sonnet-5".to_string());
+        assert_eq!(totals.get(&haiku_key).unwrap().output_tokens, 10);
+        assert_eq!(totals.get(&sonnet_key).unwrap().output_tokens, 20);
+    }
+
+    #[test]
+    fn aggregate_agent_usage_returns_empty_map_for_empty_input() {
+        let totals = aggregate_agent_usage(&[]);
+        assert!(totals.is_empty());
     }
 
     #[test]
