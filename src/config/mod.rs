@@ -117,6 +117,9 @@ pub struct RawWorkConfig {
     /// [`AuditConfig::dir`] is required for [`crate::work::audit::launch_audit`]
     /// to do anything.
     pub audit: Option<RawAuditConfig>,
+    /// `[work.review_watch]` settings for the bugbot-follow-through watcher
+    /// and cleanup session. See [`RawReviewWatchConfig`].
+    pub review_watch: Option<RawReviewWatchConfig>,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -133,6 +136,29 @@ pub struct RawAuditConfig {
     /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
     /// `/ticket-audit {key}` when unset.
     pub prompt: Option<String>,
+}
+
+/// Raw, partially-specified `[work.review_watch]` subsection as parsed
+/// directly from TOML. See `docs/plans/bugbot-watch.md`'s "Config" design.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawReviewWatchConfig {
+    /// Directory the launched bugbot-cleanup session runs in. When unset,
+    /// falls back to [`RawAuditConfig::dir`] (applied in [`merge_work`],
+    /// not here — see [`ReviewWatchConfig::dir`]).
+    pub dir: Option<String>,
+    /// Prompt template fed to `claude` on cleanup-session launch, with
+    /// `{key}` and `{findings_file}` replaced. Defaults to
+    /// `/bugbot-triage {key} {findings_file}` when unset.
+    pub prompt: Option<String>,
+    /// Seconds between PR polls while watching. Defaults to 45 when unset.
+    pub poll_secs: Option<u64>,
+    /// Minutes to keep watching before giving up. Defaults to 1440 (24h)
+    /// when unset.
+    pub max_wait_mins: Option<u64>,
+    /// What to do once every configured bot has reviewed and left
+    /// unresolved findings: `"notify"` or `"launch"`. Defaults to
+    /// `"notify"` when unset; an unrecognized value is a [`ConfigError`].
+    pub on_bots_done: Option<String>,
 }
 
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
@@ -227,6 +253,8 @@ pub struct WorkConfig {
     /// `dir`/`prompt` set, launching disabled) when the `[work.audit]`
     /// section is absent from both global and repo config.
     pub audit: AuditConfig,
+    /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
+    pub review_watch: ReviewWatchConfig,
 }
 
 /// Fully validated `[work.audit]` subsection.
@@ -243,6 +271,74 @@ pub struct AuditConfig {
     pub dir: Option<String>,
     /// See [`RawAuditConfig::prompt`].
     pub prompt: Option<String>,
+}
+
+/// Fully validated `[work.review_watch]` subsection.
+///
+/// `dir` resolves through a two-step fallback: `review_watch.dir` then
+/// `audit.dir`, applied once in [`merge_work`] after both subsections have
+/// been merged (not in [`merge_review_watch`], which stays
+/// `review_watch`-only, mirroring [`merge_audit`]'s "single section, no
+/// whole-vs-field ambiguity" scoping). `poll_secs`/`max_wait_mins`/
+/// `on_bots_done` always carry a concrete value — unlike `dir`/`prompt`,
+/// the poll loop needs a usable number no matter what config supplies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewWatchConfig {
+    /// See [`RawReviewWatchConfig::dir`]; falls back to [`AuditConfig::dir`]
+    /// when unset in both global and repo `[work.review_watch]`.
+    pub dir: Option<String>,
+    /// See [`RawReviewWatchConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawReviewWatchConfig::poll_secs`]. Defaults to 45.
+    pub poll_secs: u64,
+    /// See [`RawReviewWatchConfig::max_wait_mins`]. Defaults to 1440 (24h).
+    pub max_wait_mins: u64,
+    /// See [`RawReviewWatchConfig::on_bots_done`]. Defaults to
+    /// [`OnBotsDone::Notify`].
+    pub on_bots_done: OnBotsDone,
+}
+
+impl Default for ReviewWatchConfig {
+    fn default() -> Self {
+        ReviewWatchConfig {
+            dir: None,
+            prompt: None,
+            poll_secs: 45,
+            max_wait_mins: 1440,
+            on_bots_done: OnBotsDone::Notify,
+        }
+    }
+}
+
+/// What to do once a `tm pr watch` run finds every configured bot has
+/// reviewed and left unresolved findings. See [`RawReviewWatchConfig::on_bots_done`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnBotsDone {
+    /// Leave the board badge (`Review` run status) as the only signal; no
+    /// cleanup session is launched automatically.
+    #[default]
+    Notify,
+    /// Launch (or attach to) the bugbot-cleanup session automatically.
+    Launch,
+}
+
+impl OnBotsDone {
+    /// Returns the lowercase string stored in config for this value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnBotsDone::Notify => "notify",
+            OnBotsDone::Launch => "launch",
+        }
+    }
+
+    /// Parses a config string. Returns `None` for unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "notify" => Some(OnBotsDone::Notify),
+            "launch" => Some(OnBotsDone::Launch),
+            _ => None,
+        }
+    }
 }
 
 /// Fully validated `[work.lanes.<name>]` subsection.
@@ -327,6 +423,16 @@ pub enum ConfigError {
         lane: String,
         /// Name of the missing field (currently always `"repo"`).
         field: &'static str,
+    },
+
+    /// `[work.review_watch].on_bots_done` was set to something other than
+    /// `"notify"` or `"launch"`.
+    #[error(
+        "invalid [work.review_watch].on_bots_done value `{value}`; expected \"notify\" or \"launch\""
+    )]
+    InvalidOnBotsDone {
+        /// The unrecognized value as written in config.
+        value: String,
     },
 
     /// A parent directory for a config file could not be created.
@@ -509,6 +615,14 @@ fn merge_work(
         .unwrap_or_default();
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
     let audit = merge_audit(global.audit, repo.audit);
+    let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
+    // Fallback applied here, not inside merge_review_watch: [work.audit] and
+    // [work.review_watch] are otherwise merged independently, field by
+    // field, within their own section; only `dir` reaches across sections,
+    // and only once both are fully merged.
+    if review_watch.dir.is_none() {
+        review_watch.dir = audit.dir.clone();
+    }
 
     let mut raw_lanes = global.lanes;
     for (name, lane) in repo.lanes {
@@ -545,6 +659,7 @@ fn merge_work(
         tmux_primary_window,
         lanes,
         audit,
+        review_watch,
     })
 }
 
@@ -561,6 +676,44 @@ fn merge_audit(global: Option<RawAuditConfig>, repo: Option<RawAuditConfig>) -> 
         dir: repo.dir.or(global.dir),
         prompt: repo.prompt.or(global.prompt),
     }
+}
+
+/// Merge a repo-local `[work.review_watch]` section on top of a global one,
+/// field by field, exactly like [`merge_audit`] — same "single section, no
+/// whole-vs-field ambiguity" rationale. Unlike `merge_audit`, this can fail:
+/// an unrecognized `on_bots_done` value is a [`ConfigError`], not a silent
+/// default, matching other enum-shaped config values' validation posture.
+///
+/// Does not apply the `dir`-falls-back-to-`[work.audit].dir` rule; see
+/// [`ReviewWatchConfig::dir`] and [`merge_work`], which applies it once
+/// after both subsections are merged.
+fn merge_review_watch(
+    global: Option<RawReviewWatchConfig>,
+    repo: Option<RawReviewWatchConfig>,
+) -> Result<ReviewWatchConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let on_bots_done = match repo.on_bots_done.or(global.on_bots_done) {
+        Some(value) => OnBotsDone::parse(&value).ok_or_else(|| ConfigError::InvalidOnBotsDone {
+            value: value.clone(),
+        })?,
+        None => OnBotsDone::default(),
+    };
+
+    Ok(ReviewWatchConfig {
+        dir: repo.dir.or(global.dir),
+        prompt: repo.prompt.or(global.prompt),
+        poll_secs: repo
+            .poll_secs
+            .or(global.poll_secs)
+            .unwrap_or(ReviewWatchConfig::default().poll_secs),
+        max_wait_mins: repo
+            .max_wait_mins
+            .or(global.max_wait_mins)
+            .unwrap_or(ReviewWatchConfig::default().max_wait_mins),
+        on_bots_done,
+    })
 }
 
 /// Return `value`, or a [`ConfigError::MissingField`] naming `field` and the
@@ -1507,6 +1660,99 @@ mod tests {
     }
 
     #[test]
+    fn load_full_work_review_watch_section_parses_all_fields() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.review_watch]
+            dir = "~/Projects/axiom"
+            prompt = "/bugbot-triage {key} {findings_file}"
+            poll_secs = 30
+            max_wait_mins = 600
+            on_bots_done = "launch"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+
+        assert_eq!(
+            cfg.work.review_watch.dir,
+            Some("~/Projects/axiom".to_string())
+        );
+        assert_eq!(
+            cfg.work.review_watch.prompt,
+            Some("/bugbot-triage {key} {findings_file}".to_string())
+        );
+        assert_eq!(cfg.work.review_watch.poll_secs, 30);
+        assert_eq!(cfg.work.review_watch.max_wait_mins, 600);
+        assert_eq!(cfg.work.review_watch.on_bots_done, OnBotsDone::Launch);
+    }
+
+    #[test]
+    fn load_review_watch_section_absent_uses_defaults() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+
+        assert_eq!(cfg.work.review_watch, ReviewWatchConfig::default());
+        assert_eq!(cfg.work.review_watch.poll_secs, 45);
+        assert_eq!(cfg.work.review_watch.max_wait_mins, 1440);
+        assert_eq!(cfg.work.review_watch.on_bots_done, OnBotsDone::Notify);
+        assert_eq!(cfg.work.review_watch.prompt, None);
+        assert_eq!(cfg.work.review_watch.dir, None);
+    }
+
+    #[test]
+    fn load_review_watch_bad_on_bots_done_is_a_config_error() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.review_watch]
+            on_bots_done = "sometimes"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let err = load(&paths).expect_err("should reject bad on_bots_done value");
+        assert!(matches!(err, ConfigError::InvalidOnBotsDone { .. }));
+    }
+
+    #[test]
     fn lane_with_repo_present_is_valid() {
         let mut lanes = BTreeMap::new();
         lanes.insert(
@@ -1573,6 +1819,7 @@ mod tests {
             tmux_primary_window: Some("code".to_string()),
             lanes: BTreeMap::new(),
             audit: None,
+            review_watch: None,
         };
         let repo = RawWorkConfig {
             worktree_root: Some("/repo/worktrees".to_string()),
@@ -1583,6 +1830,7 @@ mod tests {
             tmux_primary_window: None,
             lanes: BTreeMap::new(),
             audit: None,
+            review_watch: None,
         };
         let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -1622,6 +1870,97 @@ mod tests {
     fn merge_work_audit_absent_from_both_is_default() {
         let cfg = merge_work(None, None).expect("should merge");
         assert_eq!(cfg.audit, AuditConfig::default());
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_review_watch_fields_field_by_field() {
+        let global = RawWorkConfig {
+            review_watch: Some(RawReviewWatchConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: Some("/global-bugbot-triage {key} {findings_file}".to_string()),
+                poll_secs: Some(30),
+                max_wait_mins: Some(600),
+                on_bots_done: Some("launch".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            review_watch: Some(RawReviewWatchConfig {
+                dir: Some("/repo-local/axiom".to_string()),
+                prompt: None,
+                poll_secs: None,
+                max_wait_mins: Some(120),
+                on_bots_done: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        // Overridden fields win.
+        assert_eq!(cfg.review_watch.dir, Some("/repo-local/axiom".to_string()));
+        assert_eq!(cfg.review_watch.max_wait_mins, 120);
+        // Non-overridden fields fall back to global.
+        assert_eq!(
+            cfg.review_watch.prompt,
+            Some("/global-bugbot-triage {key} {findings_file}".to_string())
+        );
+        assert_eq!(cfg.review_watch.poll_secs, 30);
+        assert_eq!(cfg.review_watch.on_bots_done, OnBotsDone::Launch);
+    }
+
+    #[test]
+    fn merge_work_review_watch_absent_from_both_is_default() {
+        let cfg = merge_work(None, None).expect("should merge");
+        assert_eq!(cfg.review_watch, ReviewWatchConfig::default());
+    }
+
+    #[test]
+    fn merge_work_review_watch_dir_falls_back_to_audit_dir_when_unset() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None).expect("should merge");
+        assert_eq!(
+            cfg.review_watch.dir,
+            Some("~/Projects/axiom".to_string()),
+            "review_watch.dir should fall back to audit.dir when unset"
+        );
+    }
+
+    #[test]
+    fn merge_work_review_watch_dir_set_does_not_fall_back_to_audit_dir() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: None,
+            }),
+            review_watch: Some(RawReviewWatchConfig {
+                dir: Some("~/Projects/other".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None).expect("should merge");
+        assert_eq!(cfg.review_watch.dir, Some("~/Projects/other".to_string()));
+    }
+
+    #[test]
+    fn merge_work_review_watch_bad_on_bots_done_is_a_config_error() {
+        let global = RawWorkConfig {
+            review_watch: Some(RawReviewWatchConfig {
+                on_bots_done: Some("sometimes".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = merge_work(Some(global), None).expect_err("should reject bad value");
+        match err {
+            ConfigError::InvalidOnBotsDone { value } => assert_eq!(value, "sometimes"),
+            other => panic!("expected InvalidOnBotsDone, got {other:?}"),
+        }
     }
 
     #[test]

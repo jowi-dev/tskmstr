@@ -559,6 +559,7 @@ mod tests {
             tmux_primary_window: Some("code".to_string()),
             lanes,
             audit: crate::config::AuditConfig::default(),
+            review_watch: crate::config::ReviewWatchConfig::default(),
         }
     }
 
