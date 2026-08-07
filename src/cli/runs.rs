@@ -6,9 +6,11 @@
 //! the bare run id — easy for a shell to capture into a variable.
 
 use std::io::Write;
+use std::path::Path;
 
 use thiserror::Error;
 
+use crate::runs::session::{SessionEnv, register_session};
 use crate::runs::{FinishRun, RunEvent, RunStore, RunStoreError, RunSummary, StartRun};
 
 /// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
@@ -595,6 +597,24 @@ pub fn resume(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(),
 
     writeln!(out, "{session_id}")?;
     Ok(())
+}
+
+/// `tm runs register --kind <KIND> <KEY>`: a thin wrapper around
+/// [`register_session`], letting a skill invoked directly (e.g.
+/// `/bugbot-triage`, which has no reason to call `tm ticket audit`/`create`)
+/// adopt the same session-registration path those Rust commands already
+/// call as their own first turn. See `docs/plans/bugbot-watch.md`'s
+/// "Adoption" section.
+///
+/// No new logic beyond uppercasing `key` into a ticket: a no-op (does
+/// nothing, prints nothing) when `env.session_id` is absent, matching
+/// [`register_session`]'s own no-op contract. Registration failures are
+/// swallowed here too, matching every existing call site
+/// (`tm ticket audit`/`create`): a broken runs DB or marker directory must
+/// never fail this command, since registration is pure telemetry.
+pub fn register(store: &RunStore, sessions_dir: &Path, env: &SessionEnv, kind: &str, key: &str) {
+    let ticket = key.to_uppercase();
+    let _ = register_session(store, sessions_dir, env, kind, &ticket);
 }
 
 /// Format `secs` as a short human-readable age.
@@ -1865,5 +1885,83 @@ mod tests {
             )
         );
         assert!(out.is_empty());
+    }
+
+    // --- register ---
+
+    fn env_with_session(session_id: &str) -> SessionEnv {
+        SessionEnv {
+            session_id: Some(session_id.to_string()),
+            claude_pid: Some(4242),
+            lane_run_id: None,
+            session_run_id: None,
+            cwd: std::path::PathBuf::from("/tmp/wt"),
+        }
+    }
+
+    #[test]
+    fn register_is_a_noop_without_a_session_id() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = SessionEnv {
+            session_id: None,
+            claude_pid: None,
+            lane_run_id: None,
+            session_run_id: None,
+            cwd: std::path::PathBuf::from("/tmp/wt"),
+        };
+
+        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "PROJ-1");
+
+        assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_adopts_when_session_id_is_set() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "proj-1");
+
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1, "expected exactly one registered run");
+        let run = &runs[0];
+        assert_eq!(run.ticket, "PROJ-1", "key should be uppercased");
+        assert_eq!(run.kind, "bugbot-cleanup");
+        assert_eq!(run.status, RunStatus::Running);
+
+        let marker = markers_dir.path().join("sess-1");
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn register_adopts_a_preregistered_run_matching_kind_and_ticket() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+
+        let pre_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "bugbot-cleanup".to_string(),
+                worktree: "/repo/axiom".to_string(),
+                branch: None,
+                pid: None,
+                kind: "bugbot-cleanup".to_string(),
+            })
+            .unwrap();
+
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "PROJ-1");
+
+        assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
+        let run = store.run_by_id(pre_id).unwrap().expect("run row exists");
+        assert_eq!(run.session_id, Some("sess-1".to_string()));
+        assert_eq!(run.status, RunStatus::Running);
     }
 }

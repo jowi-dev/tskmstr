@@ -626,6 +626,11 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
         Some(RunsCmd::Resume { ticket }) => {
             tskmstr::cli::runs::resume(&store, &ticket, &mut stdout)?;
         }
+        Some(RunsCmd::Register { kind, key }) => {
+            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
+            tskmstr::cli::runs::register(&store, &sessions_dir, &session_env, &kind, &key);
+        }
         Some(RunsCmd::Watch) => {
             tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
         }

@@ -523,6 +523,17 @@ pub enum RunsCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         ticket: String,
     },
+    /// Adopts (or starts) a session run for `kind`/`KEY`, for skills invoked
+    /// directly rather than through `tm ticket audit`/`create` (e.g.
+    /// `/bugbot-triage`). See `docs/plans/bugbot-watch.md`'s "Adoption"
+    /// section. No-op when `CLAUDE_CODE_SESSION_ID` is unset.
+    Register {
+        /// Discriminates what kind of run this is, e.g. `bugbot-cleanup`.
+        #[arg(long)]
+        kind: String,
+        /// Jira ticket key, e.g. `PROJ-123`.
+        key: String,
+    },
     /// Live board of lane runs (polls the local run db).
     Watch,
 }
