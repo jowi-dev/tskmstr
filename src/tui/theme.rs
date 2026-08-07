@@ -235,6 +235,26 @@ pub fn cleanup_indicator_label(indicator: AuditIndicator) -> &'static str {
     }
 }
 
+/// The style for a run-detail event's `kind` token in the events panel,
+/// keyed on the exact kinds emitted by the hook scripts
+/// (`hooks/tm-session-state.sh`, `hooks/tm-event.sh`, `hooks/tm-usage.sh`,
+/// `hooks/tm-checklist.sh`) and by `src/work/review_watch.rs`: `await` is the
+/// loud one (bold yellow, matching [`AWAITING_INPUT`] -- the same
+/// idling-vs-hung ambiguity a card's waiting marker calls out), `bots_done`
+/// (bugbot-watch's clean-finish terminal event) green, `give_up` and
+/// `poll_error` (bugbot-watch's two failure terminal events) red. Every
+/// other kind (`tool`, `agent_usage`, `checklist`, `usage`, `resume`,
+/// `bot_poll`, `pr_closed`, ...) gets the terminal's default color rather
+/// than guessing at a substring match.
+pub fn event_kind_style(kind: &str) -> Style {
+    match kind {
+        "await" => AWAITING_INPUT,
+        "bots_done" => Style::new().fg(Color::Green),
+        "give_up" | "poll_error" => Style::new().fg(Color::Red),
+        _ => Style::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +518,36 @@ mod tests {
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
         for label in labels {
             assert!(label.starts_with("clean: "));
+        }
+    }
+
+    #[test]
+    fn event_kind_style_maps_known_kinds_to_distinct_colors() {
+        let await_style = event_kind_style("await");
+        assert_eq!(await_style.fg, Some(Color::Yellow));
+        assert!(await_style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(event_kind_style("bots_done").fg, Some(Color::Green));
+        assert_eq!(event_kind_style("give_up").fg, Some(Color::Red));
+        assert_eq!(event_kind_style("poll_error").fg, Some(Color::Red));
+        assert_eq!(
+            event_kind_style("tool").fg,
+            None,
+            "unmapped kinds stay default"
+        );
+        assert_eq!(event_kind_style("agent_usage").fg, None);
+    }
+
+    #[test]
+    fn event_kind_style_never_sets_a_background() {
+        for kind in [
+            "await",
+            "bots_done",
+            "give_up",
+            "poll_error",
+            "tool",
+            "resume",
+        ] {
+            assert_eq!(event_kind_style(kind).bg, None);
         }
     }
 

@@ -89,7 +89,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     match app.screen {
-        Screen::Board | Screen::Rank => {}
+        Screen::Board => {
+            if app.show_run_detail {
+                draw_run_detail_window(frame, app);
+            }
+        }
+        Screen::Rank => {}
         Screen::Detail => draw_detail_window(frame, app),
         Screen::TransitionMenu => {
             draw_detail_window(frame, app);
@@ -158,9 +163,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 }
 
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
-/// only affects [`Screen::Runs`]'s hint, picking the detail-window variant.
+/// picks the detail-window variant on both [`Screen::Board`] and
+/// [`Screen::Runs`] -- the run-detail overlay's keymap (scroll/close/refresh)
+/// is shared between the two hosts (see `docs/plans/board-run-detail.md`'s
+/// "Key gating" decision).
 fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
+        Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
             "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  w work  b bots  v view run  ? help  q quit"
         }
@@ -703,14 +712,24 @@ fn draw_run_card(frame: &mut Frame, area: Rect, card: &RunCard, is_selected: boo
     frame.render_widget(Paragraph::new(lines).style(style), area);
 }
 
-/// A centered floating window (~80% wide, ~70% tall) showing the selected
-/// run's full detail and event timeline, drawn over the runs board.
+/// Fixed height (in rows) of the run-detail window's middle row -- the
+/// side-by-side Usage/Checklist panels. Each panel's border consumes the top
+/// and bottom row, leaving `MIDDLE_ROW_HEIGHT - 2` for content before
+/// [`truncate_lines`] kicks in.
+const MIDDLE_ROW_HEIGHT: u16 = 8;
+
+/// A centered floating window (~90% wide, ~80% tall) showing the selected
+/// run's full detail and event timeline, drawn over the runs board (or, per
+/// `docs/plans/board-run-detail.md`, the ticket board).
 ///
 /// While `app.run_detail` is still loading (`None`), shows a placeholder
-/// instead. Event lines are truncated to width rather than wrapped, and
-/// scrolled by `app.run_detail_scroll`.
+/// instead. Otherwise the window is a header grid (identity/timing/cost
+/// facts, see [`draw_header_grid`]), a middle row of Usage/Checklist panels
+/// (see [`draw_middle_row`]), and an events panel (see
+/// [`draw_events_panel`]) that alone scrolls with `app.run_detail_scroll` --
+/// the header and middle row are bounded summaries, the timeline isn't.
 fn draw_run_detail_window(frame: &mut Frame, app: &App) {
-    let area = centered_rect(80, 70, frame.area());
+    let area = centered_rect(90, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let Some(detail) = &app.run_detail else {
@@ -723,124 +742,360 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let title = if detail.kind == "lane" {
+    // fg-only accent (see theme.rs's doctrine): the run's status color on
+    // both the outer border and its title, so the window carries the same
+    // at-a-glance signal as the card badges that led here.
+    let accent = theme::run_status_style(detail.status);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(accent)
+        .title(Line::from(Span::styled(
+            run_detail_title(detail),
+            theme::BOLD.patch(accent),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_grid_height(detail)),
+            Constraint::Length(MIDDLE_ROW_HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    draw_header_grid(frame, rows[0], detail);
+    draw_middle_row(frame, rows[1], detail);
+    draw_events_panel(frame, rows[2], detail, app.run_detail_scroll);
+}
+
+/// The run-detail window's title: `Run {id}: {ticket}` for the common `lane`
+/// kind, `Run {id}: {ticket} ({kind})` for everything else (`audit`,
+/// `create`, `review-watch`, ...).
+fn run_detail_title(detail: &crate::tui::app::RunDetail) -> String {
+    if detail.kind == "lane" {
         format!("Run {}: {}", detail.id, detail.ticket)
     } else {
         format!("Run {}: {} ({})", detail.id, detail.ticket, detail.kind)
-    };
+    }
+}
 
+/// One header-grid line: `"{label}: "` dim, `value` styled `value_style`.
+fn label_value_line(label: &str, value: impl Into<String>, value_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), theme::DIM),
+        Span::styled(value.into(), value_style),
+    ])
+}
+
+/// The header grid's identity column: lane, kind (colored via
+/// [`theme::kind_style`]), and status (colored via
+/// [`theme::run_status_style`], with the `(waiting)` marker computed exactly
+/// as the pre-redesign window did).
+fn identity_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
     let awaiting_input = crate::runs::is_awaiting_input(
         detail.status,
         detail.events.last().map(|event| event.kind.as_str()),
     );
-    let mut status_spans = vec![Span::raw(format!("status: {:?}", detail.status))];
+    let mut status_spans = vec![
+        Span::styled("status: ", theme::DIM),
+        Span::styled(
+            detail.status.as_str().to_string(),
+            theme::run_status_style(detail.status),
+        ),
+    ];
     if awaiting_input {
         status_spans.push(Span::styled(" (waiting)", theme::AWAITING_INPUT));
     }
-
-    let mut lines = vec![
-        Line::from(format!("lane: {}", detail.lane)),
+    vec![
+        label_value_line("lane", detail.lane.clone(), Style::default()),
+        label_value_line("kind", detail.kind.clone(), theme::kind_style(&detail.kind)),
         Line::from(status_spans),
-        Line::from(format!("worktree: {}", detail.worktree)),
-    ];
-    if let Some(branch) = &detail.branch {
-        lines.push(Line::from(format!("branch: {branch}")));
-    }
-    if let Some(pid) = detail.pid {
-        lines.push(Line::from(format!("pid: {pid}")));
-    }
-    if let Some(session_id) = &detail.session_id {
-        lines.push(Line::from(format!("session: {session_id}")));
-    }
-    if let Some(cost) = detail.cost_usd {
-        lines.push(Line::from(format!("cost: ${cost:.2}")));
+    ]
+}
+
+/// The header grid's timing column: started (always present), ended and
+/// turns (only when known).
+fn timing_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![label_value_line(
+        "started",
+        detail.started_at.clone(),
+        Style::default(),
+    )];
+    if let Some(ended_at) = &detail.ended_at {
+        lines.push(label_value_line(
+            "ended",
+            ended_at.clone(),
+            Style::default(),
+        ));
     }
     if let Some(turns) = detail.num_turns {
-        lines.push(Line::from(format!("turns: {turns}")));
+        lines.push(label_value_line(
+            "turns",
+            turns.to_string(),
+            Style::default(),
+        ));
+    }
+    lines
+}
+
+/// The header grid's cost/process column: cost, pid, session -- all
+/// optional, omitted when absent.
+fn cost_process_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(cost) = detail.cost_usd {
+        lines.push(label_value_line(
+            "cost",
+            format!("${cost:.2}"),
+            Style::default(),
+        ));
+    }
+    if let Some(pid) = detail.pid {
+        lines.push(label_value_line("pid", pid.to_string(), Style::default()));
+    }
+    if let Some(session_id) = &detail.session_id {
+        lines.push(label_value_line(
+            "session",
+            session_id.clone(),
+            Style::default(),
+        ));
+    }
+    lines
+}
+
+/// The header grid's full-width lines below the three columns: worktree
+/// (always present), branch/pr/blocker (only when present) -- paths too long
+/// for a column.
+fn full_width_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![label_value_line(
+        "worktree",
+        detail.worktree.clone(),
+        Style::default(),
+    )];
+    if let Some(branch) = &detail.branch {
+        lines.push(label_value_line("branch", branch.clone(), Style::default()));
     }
     if let Some(pr_url) = &detail.pr_url {
-        lines.push(Line::from(format!("pr: {pr_url}")));
+        lines.push(label_value_line("pr", pr_url.clone(), Style::default()));
     }
     if let Some(blocker) = &detail.blocker {
-        lines.push(Line::from(format!("blocker: {blocker}")));
+        lines.push(label_value_line(
+            "blocker",
+            blocker.clone(),
+            Style::default(),
+        ));
     }
-    lines.push(Line::from(format!("started: {}", detail.started_at)));
-    if let Some(ended_at) = &detail.ended_at {
-        lines.push(Line::from(format!("ended: {ended_at}")));
-    }
-    if let Some(tools_line) = crate::runs::format_tool_counts(&detail.tool_counts) {
-        lines.push(Line::from(Span::styled(tools_line, theme::SECTION_HEADER)));
-    }
+    lines
+}
 
+/// The header grid's total height: its tallest column plus the full-width
+/// lines beneath it.
+fn header_grid_height(detail: &crate::tui::app::RunDetail) -> u16 {
+    let max_col = identity_lines(detail)
+        .len()
+        .max(timing_lines(detail).len())
+        .max(cost_process_lines(detail).len());
+    (max_col + full_width_lines(detail).len()) as u16
+}
+
+/// Draws the run-detail window's header: three side-by-side label-value
+/// columns (identity, timing, cost/process; see [`identity_lines`],
+/// [`timing_lines`], [`cost_process_lines`]) over full-width lines (see
+/// [`full_width_lines`]).
+fn draw_header_grid(frame: &mut Frame, area: Rect, detail: &crate::tui::app::RunDetail) {
+    if area.height == 0 {
+        return;
+    }
+    let identity = identity_lines(detail);
+    let timing = timing_lines(detail);
+    let cost = cost_process_lines(detail);
+    let full_width = full_width_lines(detail);
+    let grid_height = identity.len().max(timing.len()).max(cost.len()) as u16;
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(grid_height),
+            Constraint::Length(full_width.len() as u16),
+        ])
+        .split(area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(rows[0]);
+
+    frame.render_widget(Paragraph::new(identity), cols[0]);
+    frame.render_widget(Paragraph::new(timing), cols[1]);
+    frame.render_widget(Paragraph::new(cost), cols[2]);
+    frame.render_widget(Paragraph::new(full_width), rows[1]);
+}
+
+/// Truncates `lines` to `max_height` rows, replacing the last row with a dim
+/// `"... +N more"` marker (ASCII dots, matching the house no-emoji rule) when
+/// content overflows. A no-op when `lines` already fits or `max_height` is
+/// `0` (nothing would be visible either way).
+fn truncate_lines(lines: Vec<Line<'static>>, max_height: usize) -> Vec<Line<'static>> {
+    let total = lines.len();
+    if max_height == 0 || total <= max_height {
+        return lines;
+    }
+    let keep = max_height - 1;
+    let mut out: Vec<Line<'static>> = lines.into_iter().take(keep).collect();
+    out.push(Line::from(Span::styled(
+        format!("... +{} more", total - keep),
+        theme::DIM,
+    )));
+    out
+}
+
+/// The Usage panel's content: model usage lines (if any), then agent usage
+/// lines under an inline dim "Agent usage" sub-header, then the tool-counts
+/// line (dim) if present. A dim placeholder when none of the three apply, so
+/// the panel never collapses across refreshes.
+fn usage_panel_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if let Some(usage) = &detail.model_usage {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(usage.label, theme::SECTION_HEADER)));
         for line in &usage.lines {
             lines.push(Line::from(line.clone()));
         }
     }
     if !detail.agent_usage.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Agent usage",
-            theme::SECTION_HEADER,
-        )));
+        lines.push(Line::from(Span::styled("Agent usage", theme::DIM)));
         for line in &detail.agent_usage {
             lines.push(Line::from(line.clone()));
         }
     }
-    lines.push(Line::from(""));
-
-    if let Some(checklist) = &detail.checklist {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Checklist ({}/{} done)",
-                checklist.done_count(),
-                checklist.items.len()
-            ),
-            theme::SECTION_HEADER,
-        )));
-        for item in &checklist.items {
-            let (marker, item_style) = if item.done {
-                ("[x]", theme::CHECKLIST_DONE)
-            } else {
-                ("[ ]", theme::CHECKLIST_PENDING)
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{marker} {}", item.text),
-                item_style,
-            )));
-        }
-        lines.push(Line::from(""));
+    if let Some(tools_line) = crate::runs::format_tool_counts(&detail.tool_counts) {
+        lines.push(Line::from(Span::styled(tools_line, theme::DIM)));
     }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("no usage yet", theme::DIM)));
+    }
+    lines
+}
 
+/// Draws the Usage panel: bordered, titled with the model usage's label
+/// (`"Model usage"` / `"Model usage (live)"`, see [`RunModelUsage`](
+/// crate::tui::app::RunModelUsage)) when known, else the generic `"Usage"`.
+fn draw_usage_panel(frame: &mut Frame, area: Rect, detail: &crate::tui::app::RunDetail) {
+    let title = detail
+        .model_usage
+        .as_ref()
+        .map(|usage| usage.label)
+        .unwrap_or("Usage");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, theme::SECTION_HEADER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = truncate_lines(usage_panel_lines(detail), inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The Checklist panel's content: `[x]`/`[ ]` items (green/dim, see
+/// [`theme::CHECKLIST_DONE`]/[`theme::CHECKLIST_PENDING`]), or a dim
+/// placeholder when there's no checklist or it's empty.
+fn checklist_panel_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+    match &detail.checklist {
+        Some(checklist) if !checklist.items.is_empty() => checklist
+            .items
+            .iter()
+            .map(|item| {
+                let (marker, item_style) = if item.done {
+                    ("[x]", theme::CHECKLIST_DONE)
+                } else {
+                    ("[ ]", theme::CHECKLIST_PENDING)
+                };
+                Line::from(Span::styled(format!("{marker} {}", item.text), item_style))
+            })
+            .collect(),
+        _ => vec![Line::from(Span::styled("no checklist", theme::DIM))],
+    }
+}
+
+/// Draws the Checklist panel: bordered, titled `"Checklist {done}/{total}"`
+/// when a checklist exists, else the bare `"Checklist"`.
+fn draw_checklist_panel(frame: &mut Frame, area: Rect, detail: &crate::tui::app::RunDetail) {
+    let title = match &detail.checklist {
+        Some(checklist) => format!(
+            "Checklist {}/{}",
+            checklist.done_count(),
+            checklist.items.len()
+        ),
+        None => "Checklist".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, theme::SECTION_HEADER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = truncate_lines(checklist_panel_lines(detail), inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draws the run-detail window's middle row: the Usage and Checklist panels
+/// side by side, ~50/50.
+fn draw_middle_row(frame: &mut Frame, area: Rect, detail: &crate::tui::app::RunDetail) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    draw_usage_panel(frame, cols[0], detail);
+    draw_checklist_panel(frame, cols[1], detail);
+}
+
+/// One event timeline line: timestamp (dim), kind (accented via
+/// [`theme::event_kind_style`]), then the friendly detail from
+/// [`crate::runs::format_event_detail`] (falling back to the raw detail
+/// payload, then to nothing) -- the same fallback chain the pre-redesign
+/// window used, just with the kind pulled into its own styled span.
+fn event_line(event: &crate::tui::app::RunDetailEvent) -> Line<'static> {
+    let detail_text = crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
+        .or_else(|| event.detail.clone());
+    let mut spans = vec![
+        Span::styled(event.at.clone(), theme::DIM),
+        Span::raw("  "),
+        Span::styled(event.kind.clone(), theme::event_kind_style(&event.kind)),
+    ];
+    if let Some(text) = detail_text {
+        spans.push(Span::raw(format!("  {text}")));
+    }
+    Line::from(spans)
+}
+
+/// The events panel's content: the timeline, newest first, or a dim
+/// `"(no events)"` placeholder.
+fn event_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
     if detail.events.is_empty() {
-        lines.push(Line::from("(no events)"));
-    } else {
-        for event in detail.events.iter().rev() {
-            let rest = match crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
-            {
-                Some(friendly) => format!("{}  {friendly}", event.kind),
-                None => match &event.detail {
-                    Some(d) => format!("{}  {d}", event.kind),
-                    None => event.kind.clone(),
-                },
-            };
-            lines.push(Line::from(vec![
-                Span::styled(event.at.clone(), theme::DIM),
-                Span::raw(format!("  {rest}")),
-            ]));
-        }
+        return vec![Line::from(Span::styled("(no events)", theme::DIM))];
     }
+    detail.events.iter().rev().map(event_line).collect()
+}
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(bold_title(title)),
-        )
-        .scroll((app.run_detail_scroll, 0));
-    frame.render_widget(paragraph, area);
+/// Draws the run-detail window's Events panel: bordered, titled "Events",
+/// scrolled by `scroll` -- the only part of the window that scrolls, per
+/// `docs/plans/board-run-detail.md`'s "Overlay redesign" decision.
+fn draw_events_panel(
+    frame: &mut Frame,
+    area: Rect,
+    detail: &crate::tui::app::RunDetail,
+    scroll: u16,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled("Events", theme::SECTION_HEADER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let paragraph = Paragraph::new(event_lines(detail)).scroll((scroll, 0));
+    frame.render_widget(paragraph, inner);
 }
 
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
@@ -2225,7 +2480,11 @@ mod tests {
             run_detail: Some(run_detail_with_last_event(RunStatus::Running, "await")),
             ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
         };
-        let buffer = render(&app);
+        // The identity column is roughly a third of the window's width; a
+        // narrow terminal clips "status: running (waiting)" before the
+        // marker, same as non_lane_run_card_renders_its_kind_badge_styled's
+        // rationale for widening its render.
+        let buffer = render_with_size(&app, 160, 24);
         let text = buffer_text(&buffer);
         assert!(text.contains("(waiting)"));
         let cell = cell_at(&buffer, "(waiting)").expect("waiting marker renders");
@@ -2313,7 +2572,7 @@ mod tests {
             ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("Checklist (2/3 done)"));
+        assert!(text.contains("Checklist 2/3"));
         assert!(text.contains("[x] write tests"));
         assert!(text.contains("[x] implement"));
         assert!(text.contains("[ ] review"));
@@ -2338,14 +2597,21 @@ mod tests {
     }
 
     #[test]
-    fn run_detail_overlay_with_no_checklist_has_no_checklist_section() {
+    fn run_detail_overlay_with_no_checklist_shows_a_placeholder() {
+        // Rewritten for the panel-grid redesign: the Checklist panel always
+        // renders (a stable frame across refreshes), so an absent checklist
+        // now means a placeholder, not a missing section.
         let app = App {
             show_run_detail: true,
             run_detail: Some(run_detail_fixture()),
             ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
         };
-        let text = buffer_text(&render(&app));
-        assert!(!text.contains("Checklist"));
+        let buffer = render(&app);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Checklist"));
+        assert!(text.contains("no checklist"));
+        let cell = cell_at(&buffer, "no checklist").expect("placeholder renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
     }
 
     #[test]
@@ -2474,6 +2740,146 @@ mod tests {
             model_usage: None,
             agent_usage: vec![],
         }
+    }
+
+    #[test]
+    fn run_detail_overlay_with_no_usage_shows_a_placeholder() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let buffer = render(&app);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Usage"));
+        assert!(text.contains("no usage yet"));
+        let cell = cell_at(&buffer, "no usage yet").expect("placeholder renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
+    }
+
+    #[test]
+    fn run_detail_overlay_truncates_an_overflowing_checklist_with_a_more_marker() {
+        let items: Vec<(&str, bool)> = (0..20).map(|_| ("task", false)).collect();
+        let detail = crate::tui::app::RunDetail {
+            checklist: Some(checklist(&items)),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render_with_size(&app, 100, 40));
+        assert!(
+            text.contains("more"),
+            "20 checklist items must overflow the fixed-height panel: {text}"
+        );
+        assert!(
+            !text.contains("\u{2026}"),
+            "house rule is ASCII dots, not an ellipsis"
+        );
+        assert!(text.contains("..."));
+    }
+
+    #[test]
+    fn run_detail_overlay_truncates_overflowing_agent_usage_with_a_more_marker() {
+        let agent_usage: Vec<String> = (0..20).map(|n| format!("agent-{n} usage")).collect();
+        let detail = crate::tui::app::RunDetail {
+            agent_usage,
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render_with_size(&app, 100, 40));
+        assert!(
+            text.contains("... +"),
+            "20 agent usage lines must overflow the fixed-height panel: {text}"
+        );
+    }
+
+    #[test]
+    fn run_detail_overlay_scroll_moves_events_but_leaves_header_intact() {
+        let events: Vec<crate::tui::app::RunDetailEvent> = (0..8)
+            .map(|n| crate::tui::app::RunDetailEvent {
+                at: format!("2020-01-01T00:00:{n:02}.000Z"),
+                kind: format!("event-{n}"),
+                detail: None,
+            })
+            .collect();
+        let detail = crate::tui::app::RunDetail {
+            events,
+            ..run_detail_fixture()
+        };
+        let app_at = |scroll: u16| App {
+            show_run_detail: true,
+            run_detail: Some(detail.clone()),
+            run_detail_scroll: scroll,
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+
+        let unscrolled = render_with_size(&app_at(0), 100, 40);
+        let scrolled = render_with_size(&app_at(1), 100, 40);
+
+        // The header's "lane: backend" line does not move when only the
+        // events panel scrolls.
+        let lane_before = cell_pos(&unscrolled, "backend").expect("lane value renders");
+        let lane_after = cell_pos(&scrolled, "backend").expect("lane value renders after scroll");
+        assert_eq!(lane_before, lane_after);
+
+        // Newest-first events: unscrolled shows "event-7" as the topmost
+        // event line; scrolling by one row drops it off the top.
+        assert!(buffer_text(&unscrolled).contains("event-7"));
+        assert!(!buffer_text(&scrolled).contains("event-7"));
+    }
+
+    #[test]
+    fn run_detail_overlay_renders_on_board_when_show_run_detail() {
+        let app = App {
+            screen: Screen::Board,
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Run 1: PROJ-1"));
+    }
+
+    #[test]
+    fn run_detail_overlay_does_not_render_on_board_when_show_run_detail_is_false() {
+        let app = App {
+            screen: Screen::Board,
+            show_run_detail: false,
+            run_detail: Some(run_detail_fixture()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Run 1: PROJ-1"));
+    }
+
+    #[test]
+    fn run_detail_overlay_does_not_render_on_rank_even_when_show_run_detail() {
+        let app = App {
+            screen: Screen::Rank,
+            show_run_detail: true,
+            run_detail: Some(run_detail_fixture()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("Run 1: PROJ-1"));
+    }
+
+    #[test]
+    fn board_hint_switches_to_the_overlay_variant_while_open() {
+        let closed = hint_for(Screen::Board, false);
+        let open = hint_for(Screen::Board, true);
+        assert!(closed.contains("v view run"));
+        assert!(open.contains("Esc/q close"));
+        assert!(open.contains("j/k scroll"));
+        assert!(open.contains("r refresh"));
+        assert_ne!(closed, open);
     }
 
     #[test]
