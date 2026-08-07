@@ -183,9 +183,10 @@ the axiom-side `/bugbot-triage` skill needs its documented first step,
 file itself; no new hook syncing is expected beyond streams 2/4's, since
 the await/resume/session-end hooks are reused unchanged.
 
-Streams 5-7 landed the board as the control surface for the whole
+Streams 5-7 together make the board the control surface for the whole
 ticket lifecycle: groom (audit) → execute (lane run) → observe (run
-overlay) → land (bot cleanup).
+overlay) → land (bot cleanup). Streams 5 and 7 have landed; stream 6
+(the observe leg) is still open.
 
 ## Non-tskmstr chores tracked elsewhere
 
