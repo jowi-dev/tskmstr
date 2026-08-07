@@ -580,6 +580,82 @@ pub fn aggregate_agent_usage(
     totals
 }
 
+/// Renders [`aggregate_agent_usage`]'s output as one line per `agent_type`,
+/// mirroring [`format_model_usage`]'s column layout (padded name column
+/// followed by a comma-separated detail string).
+///
+/// [`aggregate_agent_usage`] keys by the compound `(agent_type, model)` pair
+/// (see its doc comment for why), but most agent types only ever resolve to
+/// one model, so this collapses each `agent_type` to a single line when it
+/// has exactly one model. Only when an `agent_type` spans more than one
+/// model does it expand into one line per model, named `{agent_type}
+/// ({model})` — see `docs/plans/per-agent-usage.md`'s "cross-model agents"
+/// hard part.
+///
+/// Unlike [`format_model_usage`], there is no cost column and no trailing
+/// `total` line: `model_usage` and `agent_usage` are overlapping slices of
+/// the same underlying tokens (subagent usage is already folded into the
+/// authoritative per-model total), not additive line items, so summing
+/// agent rows and presenting a total would misrepresent the run's cost.
+///
+/// Returns an empty `Vec` for an empty map.
+pub fn format_agent_usage(
+    totals: &std::collections::BTreeMap<(String, String), AgentUsageTotals>,
+) -> Vec<String> {
+    if totals.is_empty() {
+        return Vec::new();
+    }
+
+    // BTreeMap iteration order sorts by (agent_type, model), so entries for
+    // the same agent_type are already adjacent — a single pass groups them.
+    let mut groups: Vec<(&str, Vec<(&str, &AgentUsageTotals)>)> = Vec::new();
+    for ((agent_type, model), agent_totals) in totals {
+        match groups.last_mut() {
+            Some((last_type, models)) if *last_type == agent_type => {
+                models.push((model.as_str(), agent_totals));
+            }
+            _ => groups.push((agent_type.as_str(), vec![(model.as_str(), agent_totals)])),
+        }
+    }
+
+    let rows: Vec<(String, &AgentUsageTotals)> = groups
+        .into_iter()
+        .flat_map(|(agent_type, models)| {
+            if models.len() == 1 {
+                let (_, agent_totals) = models[0];
+                vec![(agent_type.to_string(), agent_totals)]
+            } else {
+                models
+                    .into_iter()
+                    .map(|(model, agent_totals)| (format!("{agent_type} ({model})"), agent_totals))
+                    .collect()
+            }
+        })
+        .collect();
+
+    let name_w = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    rows.into_iter()
+        .map(|(name, agent_totals)| {
+            let detail = format!(
+                "{}x, out {}, in {}, cache-read {}, cache-write {}, tools {}",
+                agent_totals.invocations,
+                format_token_count(agent_totals.output_tokens),
+                format_token_count(agent_totals.input_tokens),
+                format_token_count(agent_totals.cache_read_input_tokens),
+                format_token_count(agent_totals.cache_creation_input_tokens),
+                agent_totals.total_tool_use_count,
+            );
+            format!("{name:<name_w$}{detail}")
+        })
+        .collect()
+}
+
 /// Formats a token count human-readably: under 1,000 as a plain integer,
 /// under 1,000,000 as `{n.n}k`, otherwise as `{n.n}M`. E.g. `58564` ->
 /// `"58.6k"`, `6535803` -> `"6.5M"`.
@@ -2775,6 +2851,118 @@ mod tests {
         assert!(lines[1].starts_with("claude-sonnet-5"));
         assert!(lines[1].contains("$2.81"));
         assert_eq!(lines[2], format!("total{}${:.2}", " ".repeat(12), 15.806));
+    }
+
+    #[test]
+    fn format_agent_usage_returns_empty_vec_for_empty_map() {
+        assert_eq!(
+            format_agent_usage(&std::collections::BTreeMap::new()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn format_agent_usage_renders_single_row() {
+        let mut totals = std::collections::BTreeMap::new();
+        totals.insert(
+            (
+                "elixir-implementer".to_string(),
+                "claude-sonnet-5".to_string(),
+            ),
+            AgentUsageTotals {
+                invocations: 3,
+                output_tokens: 1143,
+                input_tokens: 2,
+                cache_read_input_tokens: 87519,
+                cache_creation_input_tokens: 3012,
+                total_tool_use_count: 38,
+                duration_ms: 193659,
+            },
+        );
+
+        let lines = format_agent_usage(&totals);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("elixir-implementer"));
+        assert!(!lines[0].contains("claude-sonnet-5"));
+        assert!(lines[0].contains("3x"));
+        assert!(lines[0].contains("out 1.1k"));
+        assert!(lines[0].contains("in 2"));
+        assert!(lines[0].contains("cache-read 87.5k"));
+        assert!(lines[0].contains("cache-write 3.0k"));
+        assert!(lines[0].contains("tools 38"));
+    }
+
+    #[test]
+    fn format_agent_usage_renders_multiple_rows_aligned() {
+        let mut totals = std::collections::BTreeMap::new();
+        totals.insert(
+            ("Explore".to_string(), "claude-haiku-5".to_string()),
+            AgentUsageTotals {
+                invocations: 1,
+                output_tokens: 10,
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tool_use_count: 4,
+                duration_ms: 100,
+            },
+        );
+        totals.insert(
+            (
+                "elixir-implementer".to_string(),
+                "claude-sonnet-5".to_string(),
+            ),
+            AgentUsageTotals {
+                invocations: 3,
+                output_tokens: 1143,
+                input_tokens: 2,
+                cache_read_input_tokens: 87519,
+                cache_creation_input_tokens: 3012,
+                total_tool_use_count: 38,
+                duration_ms: 193659,
+            },
+        );
+
+        let lines = format_agent_usage(&totals);
+        assert_eq!(lines.len(), 2);
+        // Both name columns padded to the same width before the detail text
+        // starts, mirroring format_model_usage's alignment.
+        let detail_start = |line: &str| line.find("1x,").or_else(|| line.find("3x,")).unwrap();
+        assert_eq!(detail_start(&lines[0]), detail_start(&lines[1]));
+    }
+
+    #[test]
+    fn format_agent_usage_expands_agent_type_with_two_models_into_two_lines() {
+        let mut totals = std::collections::BTreeMap::new();
+        totals.insert(
+            ("general-purpose".to_string(), "claude-haiku-5".to_string()),
+            AgentUsageTotals {
+                invocations: 1,
+                output_tokens: 10,
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tool_use_count: 2,
+                duration_ms: 50,
+            },
+        );
+        totals.insert(
+            ("general-purpose".to_string(), "claude-sonnet-5".to_string()),
+            AgentUsageTotals {
+                invocations: 1,
+                output_tokens: 20,
+                input_tokens: 2,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 1,
+                total_tool_use_count: 6,
+                duration_ms: 75,
+            },
+        );
+
+        let lines = format_agent_usage(&totals);
+        assert_eq!(lines.len(), 2, "expected one line per model: {lines:?}");
+        assert!(lines[0].starts_with("general-purpose (claude-haiku-5)"));
+        assert!(lines[1].starts_with("general-purpose (claude-sonnet-5)"));
     }
 
     #[test]

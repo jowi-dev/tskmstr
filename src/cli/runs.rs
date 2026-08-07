@@ -275,6 +275,16 @@ pub fn show(
         }
     }
 
+    let agent_usage_events = crate::runs::collect_agent_usage(&events);
+    if !agent_usage_events.is_empty() {
+        let agent_usage = crate::runs::aggregate_agent_usage(&agent_usage_events);
+        writeln!(out)?;
+        writeln!(out, "Agent usage")?;
+        for line in crate::runs::format_agent_usage(&agent_usage) {
+            writeln!(out, "{line}")?;
+        }
+    }
+
     if let Some(checklist) = crate::runs::latest_checklist(&events) {
         writeln!(out)?;
         writeln!(
@@ -360,6 +370,31 @@ struct ToolCountJson<'a> {
     count: usize,
 }
 
+/// JSON projection of one `(agent_type, model)` -> [`crate::runs::AgentUsageTotals`]
+/// aggregate for [`show_json`]. Field naming mirrors [`ModelUsageJson`]'s
+/// token fields; unlike [`ModelUsageJson`] there is no `source`/`costUSD` —
+/// per-agent cost is never available (see `docs/plans/per-agent-usage.md`).
+/// Deliberately omits any derived "orchestrator" remainder row; consumers
+/// can compute `model_usage total - sum(agent_usage)` themselves.
+#[derive(serde::Serialize)]
+struct AgentUsageJson<'a> {
+    agent_type: &'a str,
+    model: &'a str,
+    invocations: u64,
+    #[serde(rename = "outputTokens")]
+    output_tokens: u64,
+    #[serde(rename = "inputTokens")]
+    input_tokens: u64,
+    #[serde(rename = "cacheReadInputTokens")]
+    cache_read_input_tokens: u64,
+    #[serde(rename = "cacheCreationInputTokens")]
+    cache_creation_input_tokens: u64,
+    #[serde(rename = "totalToolUseCount")]
+    total_tool_use_count: u64,
+    #[serde(rename = "durationMs")]
+    duration_ms: u64,
+}
+
 /// JSON projection of one [`RunEvent`] for [`show_json`]: `detail` is the
 /// raw stored string verbatim, never the friendly rendering [`show`] uses.
 #[derive(serde::Serialize)]
@@ -376,6 +411,7 @@ struct ShowJson<'a> {
     checklist: Option<ChecklistJson<'a>>,
     model_usage: Option<ModelUsageJson<'a>>,
     tool_counts: Vec<ToolCountJson<'a>>,
+    agent_usage: Vec<AgentUsageJson<'a>>,
     events: Vec<EventJson<'a>>,
 }
 
@@ -446,6 +482,23 @@ fn show_json(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), 
         })
         .collect();
 
+    let agent_usage_events = crate::runs::collect_agent_usage(&events);
+    let agent_usage_totals = crate::runs::aggregate_agent_usage(&agent_usage_events);
+    let agent_usage: Vec<AgentUsageJson> = agent_usage_totals
+        .iter()
+        .map(|((agent_type, model), totals)| AgentUsageJson {
+            agent_type,
+            model,
+            invocations: totals.invocations,
+            output_tokens: totals.output_tokens,
+            input_tokens: totals.input_tokens,
+            cache_read_input_tokens: totals.cache_read_input_tokens,
+            cache_creation_input_tokens: totals.cache_creation_input_tokens,
+            total_tool_use_count: totals.total_tool_use_count,
+            duration_ms: totals.duration_ms,
+        })
+        .collect();
+
     let events_json: Vec<EventJson> = events
         .iter()
         .map(|event| EventJson {
@@ -479,6 +532,7 @@ fn show_json(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), 
         checklist,
         model_usage,
         tool_counts,
+        agent_usage,
         events: events_json,
     };
 
@@ -1203,6 +1257,65 @@ mod tests {
         assert!(!output.contains("Model usage"));
     }
 
+    const AGENT_USAGE_FIXTURE: &str = r#"{"agentType": "elixir-implementer", "description": "Implement AX-404 UI threading", "model": "claude-sonnet-5", "outputTokens": 1143, "inputTokens": 2, "cacheReadInputTokens": 87519, "cacheCreationInputTokens": 3012, "totalToolUseCount": 38, "durationMs": 193659}"#;
+
+    #[test]
+    fn show_prints_agent_usage_section_after_model_usage() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-sonnet-5":{"outputTokens":58564,"costUSD":12.996}}"#.to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(
+            &store,
+            id,
+            "agent_usage",
+            Some(AGENT_USAGE_FIXTURE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("Agent usage"));
+        assert!(output.contains("elixir-implementer"));
+        assert!(output.contains("out 1.1k"));
+
+        let model_usage_pos = output.find("Model usage").unwrap();
+        let agent_usage_pos = output.find("Agent usage").unwrap();
+        assert!(
+            model_usage_pos < agent_usage_pos,
+            "expected Agent usage section after Model usage: {output}"
+        );
+    }
+
+    #[test]
+    fn show_with_no_agent_usage_events_has_no_agent_usage_section() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(!output.contains("Agent usage"));
+    }
+
     #[test]
     fn show_with_no_events_prints_placeholder() {
         let dir = tempdir().unwrap();
@@ -1430,6 +1543,104 @@ mod tests {
                 .get("costUSD")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn show_json_agent_usage_is_empty_array_when_absent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.start_run(&start_params("PROJ-1")).unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["agent_usage"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn show_json_agent_usage_has_expected_shape() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "agent_usage",
+            Some(AGENT_USAGE_FIXTURE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        let agent_usage = value["agent_usage"]
+            .as_array()
+            .expect("agent_usage should be an array");
+        assert_eq!(agent_usage.len(), 1);
+        let row = &agent_usage[0];
+        assert_eq!(row["agent_type"], "elixir-implementer");
+        assert_eq!(row["model"], "claude-sonnet-5");
+        assert_eq!(row["invocations"], 1);
+        assert_eq!(row["outputTokens"], 1143);
+        assert_eq!(row["inputTokens"], 2);
+        assert_eq!(row["cacheReadInputTokens"], 87519);
+        assert_eq!(row["cacheCreationInputTokens"], 3012);
+        assert_eq!(row["totalToolUseCount"], 38);
+        assert_eq!(row["durationMs"], 193659);
+        // No derived orchestrator remainder row per the plan.
+        assert!(
+            agent_usage
+                .iter()
+                .all(|row| row["agent_type"] != "orchestrator")
+        );
+    }
+
+    #[test]
+    fn show_json_agent_usage_matches_human_aggregation_for_repeated_agent_type() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        event(
+            &store,
+            id,
+            "agent_usage",
+            Some(AGENT_USAGE_FIXTURE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        event(
+            &store,
+            id,
+            "agent_usage",
+            Some(AGENT_USAGE_FIXTURE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        let agent_usage = value["agent_usage"].as_array().unwrap();
+        assert_eq!(
+            agent_usage.len(),
+            1,
+            "two invocations of the same (agent_type, model) should aggregate to one row"
+        );
+        assert_eq!(agent_usage[0]["invocations"], 2);
+        assert_eq!(agent_usage[0]["outputTokens"], 1143 * 2);
+
+        let mut human_out = Vec::new();
+        show(&store, "PROJ-1", false, &mut human_out).expect("should succeed");
+        let human_output = String::from_utf8(human_out).unwrap();
+        assert!(human_output.contains("2x"));
+        assert!(human_output.contains("out 2.3k"));
     }
 
     #[test]
