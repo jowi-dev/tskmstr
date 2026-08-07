@@ -646,6 +646,8 @@ pub fn audit_record(
         store,
         sessions_dir,
         session_env,
+        "audit",
+        &normalized,
         crate::runs::RunStatus::Done,
     );
     Ok(())

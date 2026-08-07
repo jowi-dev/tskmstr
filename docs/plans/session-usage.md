@@ -98,8 +98,13 @@ containing the bare run id (tm's usual bare-output style; trivially
 - Opportunistic hygiene: sweep sibling markers whose run is no longer
   running (bounded: one small dir, local SQLite lookups).
 
-`finish_session(store, env, status)` finishes the marker's run and
-unlinks the marker.
+`finish_session(store, env, kind, ticket, status)` finishes the marker's
+run and unlinks the marker — but only when that run matches the given
+kind and ticket. The marker tracks the session's *latest* registration:
+a session that audits PROJ-1, then reads PROJ-2 for context, has its
+marker pointing at PROJ-2's run, and recording PROJ-1's verdict must not
+finish PROJ-2's run (or delete the marker and silence telemetry for the
+rest of the session).
 
 Registration and finishing are telemetry — every failure path degrades
 silently; the ticket command's own output and exit code are never

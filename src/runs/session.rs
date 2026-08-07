@@ -297,16 +297,23 @@ fn sweep(store: &RunStore, dir: &Path, just_written: &Path) -> Result<(), Sessio
 /// `docs/plans/session-usage.md`'s `finish_session`.
 ///
 /// Returns `Ok(None)` (a no-op) when `env.session_id` is absent,
-/// `env.lane_run_id` is present, or there is no marker (or the marker's
-/// contents don't parse) for the session — every case where there is no run
-/// this call is responsible for finishing. Otherwise finishes the marker's
-/// run with `status` (all other [`FinishRun`] fields left `None`, so
-/// `finish_run`'s `COALESCE` semantics preserve whatever was already
-/// recorded), unlinks the marker, and returns `Ok(Some(id))`.
+/// `env.lane_run_id` is present, there is no marker (or the marker's
+/// contents don't parse) for the session, or the marker's run is not for
+/// this `kind` and `ticket` — every case where there is no run this call is
+/// responsible for finishing. The kind/ticket match matters because the
+/// marker tracks the session's *latest* registration: a session that audits
+/// PROJ-1, then reads PROJ-2 for context, has its marker pointing at
+/// PROJ-2's run, and recording PROJ-1's verdict must leave that run (and
+/// the marker) alone. Otherwise finishes the marker's run with `status`
+/// (all other [`FinishRun`] fields left `None`, so `finish_run`'s
+/// `COALESCE` semantics preserve whatever was already recorded), unlinks
+/// the marker, and returns `Ok(Some(id))`.
 pub fn finish_session(
     store: &RunStore,
     dir: &Path,
     env: &SessionEnv,
+    kind: &str,
+    ticket: &str,
     status: RunStatus,
 ) -> Result<Option<i64>, SessionError> {
     let Some(session_id) = env.session_id.as_deref() else {
@@ -320,6 +327,11 @@ pub fn finish_session(
     let Some(run_id) = read_marker(&path) else {
         return Ok(None);
     };
+
+    match store.run_by_id(run_id)? {
+        Some(run) if run.kind == kind && run.ticket == ticket => {}
+        _ => return Ok(None),
+    }
 
     store.finish_run(
         run_id,
@@ -568,7 +580,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let finished = finish_session(&store, markers_dir.path(), &env, RunStatus::Done).unwrap();
+        let finished = finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
 
         assert_eq!(finished, Some(id));
         assert_eq!(
@@ -579,13 +599,84 @@ mod tests {
     }
 
     #[test]
+    fn finish_session_ignores_a_marker_run_for_a_different_ticket() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        // The session audits PROJ-1, then reads PROJ-2 for context — the
+        // marker now points at PROJ-2's run. Recording PROJ-1's verdict must
+        // not finish PROJ-2's run or delete its marker.
+        register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        let b_id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-2")
+            .unwrap()
+            .unwrap();
+
+        let finished = finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
+
+        assert_eq!(finished, None);
+        assert_eq!(
+            store.run_by_id(b_id).unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert!(markers_dir.path().join("sess-1").exists());
+    }
+
+    #[test]
+    fn finish_session_ignores_a_marker_run_of_a_different_kind() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let id = register_session(&store, markers_dir.path(), &env, "create", "PROJ-1")
+            .unwrap()
+            .unwrap();
+
+        let finished = finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
+
+        assert_eq!(finished, None);
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
     fn finish_session_is_a_noop_without_a_marker() {
         let db_dir = tempdir().unwrap();
         let markers_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-nomarker");
 
-        let result = finish_session(&store, markers_dir.path(), &env, RunStatus::Done).unwrap();
+        let result = finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
 
         assert_eq!(result, None);
     }
@@ -602,7 +693,15 @@ mod tests {
             cwd: PathBuf::from("/tmp/wt"),
         };
 
-        let result = finish_session(&store, markers_dir.path(), &env, RunStatus::Done).unwrap();
+        let result = finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
 
         assert_eq!(result, None);
     }
@@ -621,8 +720,15 @@ mod tests {
         let mut lane_env = env.clone();
         lane_env.lane_run_id = Some("77".to_string());
 
-        let result =
-            finish_session(&store, markers_dir.path(), &lane_env, RunStatus::Done).unwrap();
+        let result = finish_session(
+            &store,
+            markers_dir.path(),
+            &lane_env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
 
         assert_eq!(result, None);
         assert!(markers_dir.path().join("sess-1").exists());
