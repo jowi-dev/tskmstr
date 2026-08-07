@@ -21,7 +21,8 @@ use ratatui::widgets::{
 use crate::cli::runs::format_age;
 use crate::runs::RunStatus;
 use crate::tui::app::{
-    App, AssigneeFilter, AuditStatusEntry, Column, RUN_COLUMNS, RunCard, Screen, TicketSummary,
+    App, AssigneeFilter, AuditStatusEntry, Column, RUN_COLUMNS, RunCard, RunIndicator, Screen,
+    TicketSummary,
 };
 use crate::tui::theme;
 
@@ -34,6 +35,18 @@ const MAX_SUMMARY_LINES: usize = 3;
 /// Border rows (top + bottom) added to every card in addition to its wrapped
 /// summary lines.
 const CARD_BORDER_ROWS: u16 = 2;
+
+/// A board ticket's badge-worthy status maps, bundled so [`draw_column`],
+/// [`draw_card`], and [`card_height`] can each take one reference instead of
+/// two -- keeping their arity down now that a ticket can carry both an audit
+/// badge and a lane-run badge (see `docs/plans/board-lane-runs.md`'s
+/// "Badges" decision).
+struct BoardBadges<'a> {
+    /// Per-ticket audit badge state, from [`App::audit_status`].
+    audit_status: &'a HashMap<String, AuditStatusEntry>,
+    /// Per-ticket lane-run badge state, from [`App::lane_run_status`].
+    lane_run_status: &'a HashMap<String, RunIndicator>,
+}
 
 /// Draw the current screen (and the help overlay, if shown) into `frame`.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -150,6 +163,10 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let show_assignee = app.filter != AssigneeFilter::Me;
+    let badges = BoardBadges {
+        audit_status: &app.audit_status,
+        lane_run_status: &app.lane_run_status,
+    };
 
     for (index, column) in app.columns.iter().enumerate() {
         let is_selected_column = index == app.selected_col;
@@ -161,7 +178,7 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
             is_selected_column,
             selected_row,
             show_assignee,
-            &app.audit_status,
+            &badges,
         );
     }
 }
@@ -195,7 +212,7 @@ fn draw_column(
     is_selected: bool,
     selected_row: Option<usize>,
     show_assignee: bool,
-    audit_status: &HashMap<String, AuditStatusEntry>,
+    badges: &BoardBadges,
 ) {
     let title = Line::from(Span::styled(
         format!("{} ({})", column.title, column.tickets.len()),
@@ -222,7 +239,7 @@ fn draw_column(
     let heights: Vec<u16> = column
         .tickets
         .iter()
-        .map(|t| card_height(t, content_width, show_assignee, audit_status))
+        .map(|t| card_height(t, content_width, show_assignee, badges))
         .collect();
 
     let selected = selected_row.unwrap_or(0).min(column.tickets.len() - 1);
@@ -247,7 +264,7 @@ fn draw_column(
             is_selected_card,
             content_width,
             show_assignee,
-            audit_status,
+            badges,
         );
     }
 }
@@ -263,7 +280,7 @@ fn draw_card(
     is_selected: bool,
     content_width: usize,
     show_assignee: bool,
-    audit_status: &HashMap<String, AuditStatusEntry>,
+    badges: &BoardBadges,
 ) {
     let style = if is_selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -285,7 +302,7 @@ fn draw_card(
     if show_assignee {
         lines.push(Line::from(Span::styled(assignee_line(ticket), theme::DIM)));
     }
-    if let Some(entry) = audit_status.get(&ticket.key) {
+    if let Some(entry) = badges.audit_status.get(&ticket.key) {
         // `style.patch(...)` (mirroring `key_style` above) merges the
         // indicator's fg color/bold onto `style` rather than replacing it,
         // so a selected card's `REVERSED` modifier survives on the badge
@@ -294,6 +311,12 @@ fn draw_card(
         lines.push(Line::from(Span::styled(
             theme::audit_indicator_label(entry.indicator),
             style.patch(theme::audit_indicator_style(entry.indicator)),
+        )));
+    }
+    if let Some(indicator) = badges.lane_run_status.get(&ticket.key) {
+        lines.push(Line::from(Span::styled(
+            theme::run_indicator_label(*indicator),
+            style.patch(theme::run_indicator_style(*indicator)),
         )));
     }
 
@@ -313,22 +336,29 @@ fn assignee_line(ticket: &TicketSummary) -> String {
 
 /// The rendered height of `ticket`'s card at `content_width`: its wrapped,
 /// capped summary plus top/bottom border rows, plus one more row each for
-/// the assignee line (when `show_assignee` is set) and the audit badge line
-/// (when `ticket.key` has an entry in `audit_status`).
+/// the assignee line (when `show_assignee` is set), the audit badge line
+/// (when `ticket.key` has an entry in `badges.audit_status`), and the
+/// lane-run badge line (when it has an entry in `badges.lane_run_status`) --
+/// both badge lines can render on the same card at once.
 fn card_height(
     ticket: &TicketSummary,
     content_width: usize,
     show_assignee: bool,
-    audit_status: &HashMap<String, AuditStatusEntry>,
+    badges: &BoardBadges,
 ) -> u16 {
     let lines = wrapped_summary(&ticket.summary, content_width).len() as u16;
     let assignee_row = if show_assignee { 1 } else { 0 };
-    let audit_row = if audit_status.contains_key(&ticket.key) {
+    let audit_row = if badges.audit_status.contains_key(&ticket.key) {
         1
     } else {
         0
     };
-    lines + assignee_row + audit_row + CARD_BORDER_ROWS
+    let lane_run_row = if badges.lane_run_status.contains_key(&ticket.key) {
+        1
+    } else {
+        0
+    };
+    lines + assignee_row + audit_row + lane_run_row + CARD_BORDER_ROWS
 }
 
 /// Word-wrap `summary` to `width` columns, hard-breaking any single word
@@ -1361,6 +1391,76 @@ mod tests {
         };
         let text = buffer_text(&render(&app));
         assert!(!text.contains("audit:"));
+    }
+
+    #[test]
+    fn card_with_lane_run_status_renders_the_badge_styled() {
+        use crate::tui::app::RunIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Waiting);
+        let buffer = render_with_size(&app, 80, 24);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("run: waiting"));
+        let cell = cell_at(&buffer, "run: waiting").expect("lane run badge renders");
+        assert_eq!(Some(cell.fg), theme::AWAITING_INPUT.fg);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn card_with_no_lane_run_status_renders_no_run_badge() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("run:"));
+    }
+
+    #[test]
+    fn card_with_both_audit_and_lane_run_status_renders_both_badges() {
+        use crate::tui::app::{AuditIndicator, RunIndicator};
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.audit_status.insert(
+            "PROJ-1".to_string(),
+            AuditStatusEntry {
+                indicator: AuditIndicator::Running,
+                has_session: true,
+            },
+        );
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Done);
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        assert!(text.contains("audit: running"));
+        assert!(text.contains("run: done"));
+    }
+
+    #[test]
+    fn selected_card_with_lane_run_badge_still_carries_reversed_modifier() {
+        use crate::tui::app::RunIndicator;
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            selected_col: 0,
+            selected_row: 0,
+            ..App::new()
+        };
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Running);
+        let buffer = render_with_size(&app, 80, 24);
+        let modifier = modifier_at(&buffer, "run: running");
+        assert!(
+            modifier.contains(Modifier::REVERSED),
+            "selection contract (REVERSED) must survive on a badged card"
+        );
     }
 
     #[test]
