@@ -2,9 +2,12 @@
 # PostToolUse hook — matcher: *
 #
 # Emits a `tm runs event` telemetry entry for every tool call made during an
-# autonomous lane run (TSKMSTR_RUN_ID set), so tm runs watch/reap can see
-# activity and heartbeat freshness. Interactive human sessions do not have
-# TSKMSTR_RUN_ID set and must pay near-zero cost here.
+# autonomous lane run (TSKMSTR_RUN_ID set) or a registered interactive session
+# (audit/create), so tm runs watch/reap can see activity and heartbeat
+# freshness. Registered sessions are looked up via a marker file at
+# ${XDG_DATA_HOME:-~/.local/share}/tskmstr/sessions/<session_id> containing
+# the run id. Unregistered interactive sessions must pay near-zero cost here
+# — a single directory-emptiness check, before stdin is even read.
 #
 # detail JSON: {"tool": <name>, "summary": <string>, "agent": <agent_type>}
 # summary and agent are omitted when empty. "agent" comes from agent_type in
@@ -24,7 +27,11 @@
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
 
-[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0
+RUN_ID="${TSKMSTR_RUN_ID:-}"
+if [ -z "$RUN_ID" ]; then
+  SESSIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tskmstr/sessions"
+  [ -n "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ] || exit 0
+fi
 
 command -v jq >/dev/null 2>&1 || exit 0
 command -v tm >/dev/null 2>&1 || exit 0
@@ -32,6 +39,16 @@ command -v tm >/dev/null 2>&1 || exit 0
 set -uo pipefail
 
 INPUT=$(cat)
+
+if [ -z "$RUN_ID" ]; then
+  SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+  [ -n "$SESSION_ID" ] || exit 0
+  MARKER="$SESSIONS_DIR/$SESSION_ID"
+  [ -f "$MARKER" ] || exit 0
+  RUN_ID=$(cat "$MARKER" 2>/dev/null)
+  [ -n "$RUN_ID" ] || exit 0
+fi
+
 TOOL_NAME=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 
 [ -z "$TOOL_NAME" ] && exit 0
@@ -78,7 +95,7 @@ DETAIL=$(jq -nc \
 
 [ -z "$DETAIL" ] && exit 0
 
-tm runs event "$TSKMSTR_RUN_ID" --kind tool --detail "$DETAIL" >/dev/null 2>&1
+tm runs event "$RUN_ID" --kind tool --detail "$DETAIL" >/dev/null 2>&1
 
 # For completed Agent/Task calls, additionally emit an agent_usage event
 # carrying the harness's own per-invocation usage summary (tool_response),
@@ -112,7 +129,7 @@ if [ "$TOOL_NAME" = "Agent" ] || [ "$TOOL_NAME" = "Task" ]; then
   ' 2>/dev/null)
 
   if [ -n "$AGENT_DETAIL" ] && [ "$AGENT_DETAIL" != "null" ]; then
-    tm runs event "$TSKMSTR_RUN_ID" --kind agent_usage --detail "$AGENT_DETAIL" >/dev/null 2>&1
+    tm runs event "$RUN_ID" --kind agent_usage --detail "$AGENT_DETAIL" >/dev/null 2>&1
   fi
 fi
 

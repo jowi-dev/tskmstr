@@ -7,13 +7,21 @@
 # mutate a single task per call rather than handing over the whole list, so
 # state is accumulated across calls in a small per-run JSON file
 # (taskId -> {text, done, deleted}) and the full snapshot is re-derived and
-# re-emitted after every mutation. Only fires during autonomous lane runs
-# (TSKMSTR_RUN_ID set).
+# re-emitted after every mutation. Fires during autonomous lane runs
+# (TSKMSTR_RUN_ID set) or a registered interactive session (audit/create),
+# looked up via a marker file at
+# ${XDG_DATA_HOME:-~/.local/share}/tskmstr/sessions/<session_id> containing
+# the run id. Unregistered interactive sessions pay only a cheap
+# directory-emptiness check per hook fire.
 #
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
 
-[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0
+RUN_ID="${TSKMSTR_RUN_ID:-}"
+if [ -z "$RUN_ID" ]; then
+  SESSIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tskmstr/sessions"
+  [ -n "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ] || exit 0
+fi
 
 command -v jq >/dev/null 2>&1 || exit 0
 command -v tm >/dev/null 2>&1 || exit 0
@@ -22,11 +30,20 @@ set -uo pipefail
 
 INPUT=$(cat)
 
+if [ -z "$RUN_ID" ]; then
+  SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+  [ -n "$SESSION_ID" ] || exit 0
+  MARKER="$SESSIONS_DIR/$SESSION_ID"
+  [ -f "$MARKER" ] || exit 0
+  RUN_ID=$(cat "$MARKER" 2>/dev/null)
+  [ -n "$RUN_ID" ] || exit 0
+fi
+
 TOOL_NAME=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 [ "$TOOL_NAME" = "TaskCreate" ] || [ "$TOOL_NAME" = "TaskUpdate" ] || exit 0
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tm-hooks"
-STATE_FILE="$STATE_DIR/tasklist-$TSKMSTR_RUN_ID.json"
+STATE_FILE="$STATE_DIR/tasklist-$RUN_ID.json"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
@@ -107,6 +124,6 @@ DETAIL=$(printf '%s' "$UPDATED" | jq -c '
 
 [ -z "$DETAIL" ] && exit 0
 
-tm runs event "$TSKMSTR_RUN_ID" --kind checklist --detail "$DETAIL" >/dev/null 2>&1
+tm runs event "$RUN_ID" --kind checklist --detail "$DETAIL" >/dev/null 2>&1
 
 exit 0

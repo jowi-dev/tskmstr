@@ -52,11 +52,12 @@ pub enum HooksError {
     },
 }
 
-/// The six hook scripts, embedded from `hooks/*.sh` at the repo root, in the
-/// exact order `work.ml`'s `tm_hook_names` lists them. Order here doesn't
-/// affect the generated settings JSON (each script is referenced by name
-/// where it's wired), but is kept identical to the OCaml source for easy
-/// comparison.
+/// The seven hook scripts, embedded from `hooks/*.sh` at the repo root, in
+/// the exact order `work.ml`'s `tm_hook_names` lists them (plus
+/// `tm-session-end.sh`, new for session-usage tracking — see
+/// `docs/plans/session-usage.md`). Order here doesn't affect the generated
+/// settings JSON (each script is referenced by name where it's wired), but
+/// is kept identical to the OCaml source for easy comparison.
 const HOOK_SOURCES: &[(&str, &str)] = &[
     ("tm-event.sh", include_str!("../../hooks/tm-event.sh")),
     (
@@ -65,6 +66,10 @@ const HOOK_SOURCES: &[(&str, &str)] = &[
     ),
     ("tm-usage.sh", include_str!("../../hooks/tm-usage.sh")),
     ("tm-tasklist.sh", include_str!("../../hooks/tm-tasklist.sh")),
+    (
+        "tm-session-end.sh",
+        include_str!("../../hooks/tm-session-end.sh"),
+    ),
     (
         "guard-delegate.sh",
         include_str!("../../hooks/guard-delegate.sh"),
@@ -136,12 +141,17 @@ fn set_executable(_path: &Path) -> Result<(), HooksError> {
 ///       { "matcher": "*", "hooks": [ tm-event.sh ] }
 ///     ],
 ///     "Stop": [ { "hooks": [ tm-usage.sh ] } ],
-///     "SubagentStop": [ { "hooks": [ tm-usage.sh ] } ]
+///     "SubagentStop": [ { "hooks": [ tm-usage.sh ] } ],
+///     "SessionEnd": [ { "hooks": [ tm-session-end.sh ] } ]
 /// } }
 /// ```
 ///
 /// `tm-usage.sh` is wired into both `Stop` and `SubagentStop`, exactly as
-/// `work.ml` does (it's the only script referenced twice).
+/// `work.ml` does (it's the only script referenced twice). `SessionEnd` is
+/// new for session-usage tracking (`docs/plans/session-usage.md`) — it has
+/// no `work.ml` counterpart, since lane runs never fire `SessionEnd`
+/// (the wrapper process, not an interactive Claude Code session, owns
+/// finish there).
 fn settings_json(deploy_dir: &Path) -> Value {
     let cmd = |name: &str| {
         json!({
@@ -166,6 +176,9 @@ fn settings_json(deploy_dir: &Path) -> Value {
             ],
             "SubagentStop": [
                 { "hooks": [ cmd("tm-usage.sh") ] }
+            ],
+            "SessionEnd": [
+                { "hooks": [ cmd("tm-session-end.sh") ] }
             ]
         }
     })
@@ -181,18 +194,19 @@ mod tests {
             "tm-checklist.sh",
             "tm-usage.sh",
             "tm-tasklist.sh",
+            "tm-session-end.sh",
             "guard-delegate.sh",
             "graphify-nudge.sh",
         ]
     }
 
     #[test]
-    fn hook_scripts_returns_all_six_by_name() {
+    fn hook_scripts_returns_all_seven_by_name() {
         let names: Vec<&str> = hook_scripts().iter().map(|(n, _)| *n).collect();
         for expected in all_hook_names() {
             assert!(names.contains(&expected), "missing hook script {expected}");
         }
-        assert_eq!(hook_scripts().len(), 6);
+        assert_eq!(hook_scripts().len(), 7);
     }
 
     #[test]
@@ -278,7 +292,13 @@ mod tests {
             .expect("hooks key")
             .as_object()
             .expect("object");
-        for expected_event in ["PreToolUse", "PostToolUse", "Stop", "SubagentStop"] {
+        for expected_event in [
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SubagentStop",
+            "SessionEnd",
+        ] {
             assert!(
                 hooks.contains_key(expected_event),
                 "missing hook event {expected_event}"
@@ -372,6 +392,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_json_session_end_wires_tm_session_end_sh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = deploy_hooks(dir.path()).expect("deploy_hooks");
+
+        let session_end = settings["hooks"]["SessionEnd"].as_array().expect("array");
+        assert_eq!(session_end.len(), 1);
+        assert_eq!(
+            session_end[0]["hooks"][0]["command"],
+            dir.path()
+                .join("tm-session-end.sh")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
     fn settings_json_round_trips_through_serde_json_string() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = deploy_hooks(dir.path()).expect("deploy_hooks");
@@ -426,6 +462,68 @@ mod tests {
         assert!(
             contents.contains("AGENT_ID") && contents.contains("exit 0"),
             "guard-delegate.sh lost its subagent bypass (agent_id present -> allow)"
+        );
+    }
+
+    // --- Session-usage gating parity (docs/plans/session-usage.md "Hook
+    // gating: marker fallback") — the four telemetry scripts must keep the
+    // marker-fallback path so registered interactive sessions (audit/create)
+    // get telemetry, while guard-delegate.sh must NOT gain it (that would
+    // start denying edits in registered interactive sessions, not just lane
+    // runs).
+
+    #[test]
+    fn parity_telemetry_scripts_keep_session_marker_fallback() {
+        for name in [
+            "tm-event.sh",
+            "tm-usage.sh",
+            "tm-checklist.sh",
+            "tm-tasklist.sh",
+        ] {
+            let (_, contents) = hook_scripts().iter().find(|(n, _)| *n == name).unwrap();
+            assert!(
+                contents.contains("tskmstr/sessions"),
+                "{name} lost its session-marker fallback path"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_guard_delegate_excludes_session_marker_fallback() {
+        let (_, contents) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "guard-delegate.sh")
+            .unwrap();
+        assert!(
+            !contents.contains("tskmstr/sessions"),
+            "guard-delegate.sh must not gain the session-marker fallback — it would start denying edits in registered interactive sessions"
+        );
+    }
+
+    #[test]
+    fn parity_tm_session_end_finishes_run_and_removes_marker() {
+        let (_, contents) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "tm-session-end.sh")
+            .unwrap();
+        assert!(
+            contents.contains("--status done"),
+            "tm-session-end.sh lost its finish-with-done-status call"
+        );
+        assert!(
+            contents.contains("rm -f"),
+            "tm-session-end.sh lost its marker cleanup"
+        );
+        // Gate polarity matters here, opposite to every other telemetry
+        // hook: this hook must exit when TSKMSTR_RUN_ID IS set (the lane
+        // wrapper owns finish) and proceed when it is not.
+        assert!(
+            contents.contains(r#"[ -n "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
+            "tm-session-end.sh lost its inverted lane-run gate"
+        );
+        assert!(
+            !contents.contains(r#"[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
+            "tm-session-end.sh must not exit on unset TSKMSTR_RUN_ID — that would skip every interactive session"
         );
     }
 }
