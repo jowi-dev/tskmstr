@@ -1023,7 +1023,18 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             };
             (app, Vec::new())
         }
-        Msg::LaneRunStatusLoaded(status) => {
+        Msg::LaneRunStatusLoaded(mut status) => {
+            // The executor's `load_lane_run_status` has no access to
+            // `pending_lane_launches` (see its doc comment), so a ticket
+            // whose launcher child is still in flight but has no run row
+            // yet would otherwise drop out of `lane_run_status` -- and thus
+            // its badge, which `ui.rs` reads only from this map -- on every
+            // refresh. Overlay `Starting` for any such ticket here;
+            // `or_insert` leaves an already-loaded run row's real status
+            // untouched.
+            for key in &app.pending_lane_launches {
+                status.entry(key.clone()).or_insert(RunIndicator::Starting);
+            }
             app.lane_run_status = status;
             (app, Vec::new())
         }
@@ -3653,5 +3664,42 @@ mod tests {
         let (app, cmds) = update(app, Msg::LaneRunStatusLoaded(status.clone()));
         assert_eq!(app.lane_run_status, status);
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_status_loaded_overlays_starting_for_pending_with_no_run_row() {
+        // The executor's `load_lane_run_status` has no access to
+        // `pending_lane_launches` (it only sees `TuiDeps`), so a ticket
+        // whose launcher child is still in flight but has no run row yet
+        // would otherwise vanish from `lane_run_status` -- and therefore
+        // from the board's badge, which reads only that map (see
+        // `crate::tui::ui`) -- on every `Cmd::LoadLaneRunStatus` refresh.
+        // `update` overlays `RunIndicator::Starting` here instead.
+        let mut app = App::new();
+        app.pending_lane_launches.insert("PROJ-1".to_string());
+        let status = HashMap::new();
+        let (app, cmds) = update(app, Msg::LaneRunStatusLoaded(status));
+        assert_eq!(
+            app.lane_run_status.get("PROJ-1"),
+            Some(&RunIndicator::Starting)
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_status_loaded_prefers_loaded_run_row_over_pending_overlay() {
+        // Once the run row exists, its real status wins over the
+        // pending-launch overlay -- the ticket stays pending only until its
+        // launch result arrives, but the badge should reflect the run row
+        // as soon as one shows up.
+        let mut app = App::new();
+        app.pending_lane_launches.insert("PROJ-1".to_string());
+        let mut status = HashMap::new();
+        status.insert("PROJ-1".to_string(), RunIndicator::Running);
+        let (app, _cmds) = update(app, Msg::LaneRunStatusLoaded(status));
+        assert_eq!(
+            app.lane_run_status.get("PROJ-1"),
+            Some(&RunIndicator::Running)
+        );
     }
 }
