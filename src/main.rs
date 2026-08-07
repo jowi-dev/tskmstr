@@ -86,7 +86,14 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
     let detach = tskmstr::work::detach::RealDetachSpawner;
     let clock = tskmstr::work::review_watch::SystemClock;
     let sleeper = tskmstr::work::review_watch::RealSleeper;
-    let cleanup_launcher = tskmstr::work::review_watch::UnimplementedCleanupLauncher;
+    let tmux = ShellTmuxOps::new();
+    let cleanup_launcher = tskmstr::work::bugbot::RealCleanupLauncher {
+        store: &run_store,
+        tmux: &tmux,
+        cfg: &config.work.review_watch,
+        home: &home,
+        xdg_data_home: xdg_data_home.as_deref(),
+    };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
         detach: &detach,

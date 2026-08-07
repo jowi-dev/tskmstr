@@ -24,11 +24,9 @@
 //!   [`run_poll_loop`]'s give-up-timeout and backoff paths are exercised in
 //!   tests without a real 24-hour wait.
 //! - [`CleanupLauncher`] stands in for launching the bugbot-cleanup session
-//!   when `on_bots_done == Launch`. The real implementation
-//!   (`src/work/bugbot.rs::launch_cleanup`, `docs/plans/bugbot-watch.md` step
-//!   10) doesn't exist yet; [`UnimplementedCleanupLauncher`] is a temporary
-//!   stand-in `tm pr watch`'s CLI wiring uses until then (see its doc
-//!   comment).
+//!   when `on_bots_done == Launch`. `src/work/bugbot.rs::launch_cleanup` is
+//!   the real implementation; `tm pr watch`'s CLI wiring (`src/main.rs`)
+//!   passes `bugbot::RealCleanupLauncher`, an adapter over it.
 
 use std::path::{Path, PathBuf};
 
@@ -119,24 +117,6 @@ impl Sleeper for RealSleeper {
 pub trait CleanupLauncher {
     /// Launch (or attach to) the cleanup session for ticket `key`.
     fn launch_cleanup(&self, key: &str);
-}
-
-/// Temporary [`CleanupLauncher`] wired in by `tm pr watch`'s CLI layer
-/// (`src/main.rs`) until `docs/plans/bugbot-watch.md` step 10 lands
-/// `src/work/bugbot.rs::launch_cleanup`. Prints a warning instead of
-/// launching anything, so `on_bots_done = "launch"` fails loudly rather than
-/// silently doing nothing.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UnimplementedCleanupLauncher;
-
-impl CleanupLauncher for UnimplementedCleanupLauncher {
-    fn launch_cleanup(&self, key: &str) {
-        eprintln!(
-            "warning: [work.review_watch].on_bots_done = \"launch\" is configured, but the \
-             bugbot-cleanup launcher isn't wired up yet (ticket {key}); see \
-             docs/plans/bugbot-watch.md step 10"
-        );
-    }
 }
 
 /// Dependencies [`poll_once`]/[`run_poll_loop`] need, gathered so callers
