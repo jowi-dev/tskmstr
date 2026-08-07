@@ -7,4 +7,5 @@ pub mod claude;
 pub mod git;
 pub mod hooks;
 pub mod naming;
+pub mod runner;
 pub mod tmux;
