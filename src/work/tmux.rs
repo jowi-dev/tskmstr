@@ -98,6 +98,27 @@ pub trait TmuxOps {
     /// (`tmux new-session -d -s <name> -c <dir> -n <primary_window>`).
     fn new_session(&self, name: &str, dir: &str, primary_window: &str) -> Result<(), TmuxError>;
 
+    /// Create a new detached session named `name`, rooted at `dir`, with
+    /// its first window named `window_name`, running `command` as that
+    /// window's pane command instead of the default shell
+    /// (`tmux new-session -d -s <name> -c <dir> -n <window_name> [-e
+    /// KEY=VAL ...] <command>`).
+    ///
+    /// `env` becomes one `-e KEY=VAL` pair per entry — tmux ≥ 3.2's
+    /// per-session environment flag (the nix-pinned tmux satisfies this).
+    /// `command` is a single positional argument, not shell-wrapped by this
+    /// method; see [`crate::work::audit::launch_audit`] for why its caller
+    /// must itself produce a string tmux's own shell can parse (tmux hands
+    /// a single trailing command string to the user's `$SHELL -c`).
+    fn new_session_with_command(
+        &self,
+        name: &str,
+        dir: &str,
+        window_name: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError>;
+
     /// Create an additional window named `window_name` in session `name`,
     /// rooted at `dir` (`tmux new-window -t <name> -n <window_name> -c
     /// <dir>`).
@@ -165,6 +186,26 @@ fn new_session_args(name: &str, dir: &str, primary_window: &str) -> Vec<String> 
         "-n".to_string(),
         primary_window.to_string(),
     ]
+}
+
+/// Builds the argv for [`TmuxOps::new_session_with_command`]: the same
+/// `new-session -d -s <name> -c <dir> -n <window_name>` prefix as
+/// [`new_session_args`], followed by one `-e KEY=VAL` pair per `env` entry
+/// (in order), followed by `command` as the final positional argument.
+fn new_session_with_command_args(
+    name: &str,
+    dir: &str,
+    window_name: &str,
+    env: &[(String, String)],
+    command: &str,
+) -> Vec<String> {
+    let mut args = new_session_args(name, dir, window_name);
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(command.to_string());
+    args
 }
 
 fn new_window_args(name: &str, window_name: &str, dir: &str) -> Vec<String> {
@@ -283,6 +324,21 @@ impl TmuxOps for ShellTmuxOps {
         require_success("tmux new-session", &output)
     }
 
+    fn new_session_with_command(
+        &self,
+        name: &str,
+        dir: &str,
+        window_name: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        let output = run(
+            "tmux new-session",
+            &new_session_with_command_args(name, dir, window_name, env, command),
+        )?;
+        require_success("tmux new-session", &output)
+    }
+
     fn new_window(&self, name: &str, window_name: &str, dir: &str) -> Result<(), TmuxError> {
         let output = run("tmux new-window", &new_window_args(name, window_name, dir))?;
         require_success("tmux new-window", &output)
@@ -366,6 +422,19 @@ pub enum TmuxCall {
         /// Primary window name.
         primary_window: String,
     },
+    /// `new_session_with_command(name, dir, window_name, env, command)`.
+    NewSessionWithCommand {
+        /// Session name.
+        name: String,
+        /// Session working directory.
+        dir: String,
+        /// First window name.
+        window_name: String,
+        /// Per-session environment pairs.
+        env: Vec<(String, String)>,
+        /// Pane command.
+        command: String,
+    },
     /// `new_window(name, window_name, dir)`.
     NewWindow {
         /// Session name.
@@ -436,6 +505,26 @@ impl TmuxOps for FakeTmuxOps {
         Ok(())
     }
 
+    fn new_session_with_command(
+        &self,
+        name: &str,
+        dir: &str,
+        window_name: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        self.calls
+            .borrow_mut()
+            .push(TmuxCall::NewSessionWithCommand {
+                name: name.to_string(),
+                dir: dir.to_string(),
+                window_name: window_name.to_string(),
+                env: env.to_vec(),
+                command: command.to_string(),
+            });
+        Ok(())
+    }
+
     fn new_window(&self, name: &str, window_name: &str, dir: &str) -> Result<(), TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::NewWindow {
             name: name.to_string(),
@@ -500,6 +589,56 @@ mod tests {
                 "/repo/lane",
                 "-n",
                 "code"
+            ]
+        );
+    }
+
+    #[test]
+    fn new_session_with_command_args_with_no_env_appends_bare_command() {
+        assert_eq!(
+            new_session_with_command_args("tm-audit-proj-1", "/repo/axiom", "audit", &[], "claude"),
+            vec![
+                "new-session",
+                "-d",
+                "-s",
+                "tm-audit-proj-1",
+                "-c",
+                "/repo/axiom",
+                "-n",
+                "audit",
+                "claude"
+            ]
+        );
+    }
+
+    #[test]
+    fn new_session_with_command_args_adds_one_e_flag_per_env_pair_in_order() {
+        let env = vec![
+            ("TSKMSTR_SESSION_RUN_ID".to_string(), "42".to_string()),
+            ("OTHER".to_string(), "value".to_string()),
+        ];
+        assert_eq!(
+            new_session_with_command_args(
+                "tm-audit-proj-1",
+                "/repo/axiom",
+                "audit",
+                &env,
+                "claude '/ticket-audit PROJ-1'"
+            ),
+            vec![
+                "new-session",
+                "-d",
+                "-s",
+                "tm-audit-proj-1",
+                "-c",
+                "/repo/axiom",
+                "-n",
+                "audit",
+                "-e",
+                "TSKMSTR_SESSION_RUN_ID=42",
+                "-e",
+                "OTHER=value",
+                "claude '/ticket-audit PROJ-1'"
             ]
         );
     }
@@ -694,6 +833,31 @@ mod tests {
         let fake = FakeTmuxOps::new().with_list_sessions(Ok(sessions.clone()));
         assert_eq!(fake.list_sessions().unwrap(), sessions);
         assert_eq!(fake.calls(), vec![TmuxCall::ListSessions]);
+    }
+
+    #[test]
+    fn fake_records_new_session_with_command_call() {
+        let fake = FakeTmuxOps::new();
+        let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string())];
+        fake.new_session_with_command(
+            "tm-audit-proj-1",
+            "/repo/axiom",
+            "audit",
+            &env,
+            "claude '/ticket-audit PROJ-1'",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fake.calls(),
+            vec![TmuxCall::NewSessionWithCommand {
+                name: "tm-audit-proj-1".to_string(),
+                dir: "/repo/axiom".to_string(),
+                window_name: "audit".to_string(),
+                env,
+                command: "claude '/ticket-audit PROJ-1'".to_string(),
+            }]
+        );
     }
 
     #[test]

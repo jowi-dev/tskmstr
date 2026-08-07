@@ -558,6 +558,7 @@ mod tests {
             tmux_windows: vec!["fish".to_string()],
             tmux_primary_window: Some("code".to_string()),
             lanes,
+            audit: crate::config::AuditConfig::default(),
         }
     }
 

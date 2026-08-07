@@ -109,6 +109,30 @@ pub struct RawWorkConfig {
     /// ("the repo-local `.tskmstr.toml` fully owns any lane it names").
     #[serde(default)]
     pub lanes: BTreeMap<String, RawLaneConfig>,
+    /// `[work.audit]` settings for board-launched ticket-audit sessions. See
+    /// [`RawAuditConfig`].
+    ///
+    /// When unset in both global and repo config, launching an audit session
+    /// is disabled (see `docs/plans/board-audits.md`'s "Launch" design):
+    /// [`AuditConfig::dir`] is required for [`crate::work::audit::launch_audit`]
+    /// to do anything.
+    pub audit: Option<RawAuditConfig>,
+}
+
+/// Raw, partially-specified `[work.audit]` subsection as parsed directly from
+/// TOML. See `docs/plans/board-audits.md`'s "Launch" design.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawAuditConfig {
+    /// Directory a launched ticket-audit session runs in (the repo whose
+    /// `.claude/` provides the audit skill and hook settings), e.g.
+    /// `~/Projects/axiom`. Tilde is not expanded by this module, matching
+    /// [`RawWorkConfig::worktree_root`); expansion is the launching caller's
+    /// responsibility. Required to enable launching at all.
+    pub dir: Option<String>,
+    /// Prompt template fed to `claude` on launch, with `{key}` replaced by
+    /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
+    /// `/ticket-audit {key}` when unset.
+    pub prompt: Option<String>,
 }
 
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
@@ -199,6 +223,26 @@ pub struct WorkConfig {
     pub tmux_primary_window: Option<String>,
     /// Validated per-lane definitions, keyed by lane name.
     pub lanes: BTreeMap<String, LaneConfig>,
+    /// Validated `[work.audit]` settings. See [`AuditConfig`]; empty (no
+    /// `dir`/`prompt` set, launching disabled) when the `[work.audit]`
+    /// section is absent from both global and repo config.
+    pub audit: AuditConfig,
+}
+
+/// Fully validated `[work.audit]` subsection.
+///
+/// Unlike [`LaneConfig::repo`], `dir` is not required at merge time — an
+/// absent `dir` means audit launching is disabled, which
+/// [`crate::work::audit::launch_audit`] reports as a status-line error, not
+/// a config-load failure (see `docs/plans/board-audits.md`'s "Launch"
+/// design: "Launching without `[work.audit].dir` is a status-line error, not
+/// a crash").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditConfig {
+    /// See [`RawAuditConfig::dir`].
+    pub dir: Option<String>,
+    /// See [`RawAuditConfig::prompt`].
+    pub prompt: Option<String>,
 }
 
 /// Fully validated `[work.lanes.<name>]` subsection.
@@ -464,6 +508,7 @@ fn merge_work(
         .or(global.tmux_windows)
         .unwrap_or_default();
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
+    let audit = merge_audit(global.audit, repo.audit);
 
     let mut raw_lanes = global.lanes;
     for (name, lane) in repo.lanes {
@@ -499,7 +544,23 @@ fn merge_work(
         tmux_windows,
         tmux_primary_window,
         lanes,
+        audit,
     })
+}
+
+/// Merge a repo-local `[work.audit]` section on top of a global one, field by
+/// field — the same scalar-merge rule as [`RawWorkConfig`]'s top-level
+/// fields (`default_model`, `tmux_primary_window`, etc.), not the lane map's
+/// whole-section replacement: `[work.audit]` is a single section, not a
+/// keyed collection, so there's no "which entry" ambiguity for whole-section
+/// replacement to resolve.
+fn merge_audit(global: Option<RawAuditConfig>, repo: Option<RawAuditConfig>) -> AuditConfig {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+    AuditConfig {
+        dir: repo.dir.or(global.dir),
+        prompt: repo.prompt.or(global.prompt),
+    }
 }
 
 /// Return `value`, or a [`ConfigError::MissingField`] naming `field` and the
@@ -1372,6 +1433,7 @@ mod tests {
         assert_eq!(cfg.work.tmux_windows, Vec::<String>::new());
         assert_eq!(cfg.work.tmux_primary_window, None);
         assert!(cfg.work.lanes.is_empty());
+        assert_eq!(cfg.work.audit, AuditConfig::default());
     }
 
     #[test]
@@ -1392,6 +1454,10 @@ mod tests {
             default_permission_mode = "acceptEdits"
             tmux_windows = ["shell"]
             tmux_primary_window = "code"
+
+            [work.audit]
+            dir = "~/Projects/axiom"
+            prompt = "/ticket-audit {key}"
 
             [work.lanes.partner-integrations]
             repo = "/Users/jowi/Projects/axiom"
@@ -1418,6 +1484,11 @@ mod tests {
         );
         assert_eq!(cfg.work.tmux_windows, vec!["shell".to_string()]);
         assert_eq!(cfg.work.tmux_primary_window, Some("code".to_string()));
+        assert_eq!(cfg.work.audit.dir, Some("~/Projects/axiom".to_string()));
+        assert_eq!(
+            cfg.work.audit.prompt,
+            Some("/ticket-audit {key}".to_string())
+        );
 
         let lane = cfg
             .work
@@ -1501,6 +1572,7 @@ mod tests {
             tmux_windows: Some(vec!["shell".to_string()]),
             tmux_primary_window: Some("code".to_string()),
             lanes: BTreeMap::new(),
+            audit: None,
         };
         let repo = RawWorkConfig {
             worktree_root: Some("/repo/worktrees".to_string()),
@@ -1510,6 +1582,7 @@ mod tests {
             tmux_windows: None,
             tmux_primary_window: None,
             lanes: BTreeMap::new(),
+            audit: None,
         };
         let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -1520,6 +1593,35 @@ mod tests {
         assert_eq!(cfg.default_permission_mode, Some("acceptEdits".to_string()));
         assert_eq!(cfg.tmux_windows, vec!["shell".to_string()]);
         assert_eq!(cfg.tmux_primary_window, Some("code".to_string()));
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_audit_dir_field_by_field() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: Some("/global-audit {key}".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("/repo-local/axiom".to_string()),
+                prompt: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        // Overridden field wins.
+        assert_eq!(cfg.audit.dir, Some("/repo-local/axiom".to_string()));
+        // Non-overridden field falls back to global.
+        assert_eq!(cfg.audit.prompt, Some("/global-audit {key}".to_string()));
+    }
+
+    #[test]
+    fn merge_work_audit_absent_from_both_is_default() {
+        let cfg = merge_work(None, None).expect("should merge");
+        assert_eq!(cfg.audit, AuditConfig::default());
     }
 
     #[test]

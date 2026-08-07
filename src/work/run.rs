@@ -746,6 +746,7 @@ mod tests {
             tmux_windows: vec![],
             tmux_primary_window: None,
             lanes,
+            audit: crate::config::AuditConfig::default(),
         }
     }
 
