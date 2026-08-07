@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod pid;
+pub mod session;
 
 /// A SQL expression yielding the current UTC time as
 /// `YYYY-MM-DDTHH:MM:SS.sssZ`. Takes no user input, so it is safe to splice
@@ -1001,6 +1002,33 @@ impl RunStore {
         Ok(())
     }
 
+    /// Updates a run row's recorded `session_id` in place, without touching
+    /// status, heartbeat, or any other column.
+    ///
+    /// Exists for [`crate::runs::session::register_session`]
+    /// (`docs/plans/session-usage.md`): [`StartRun`] has no `session_id`
+    /// field (it's normally only known at [`RunStore::finish_run`] time, via
+    /// `claude -p`'s result), but a session run's id is known up front — it's
+    /// the marker filename — so this stamps it onto the row [`start_run`]
+    /// just created.
+    ///
+    /// [`start_run`]: RunStore::start_run
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_session_id(&self, run_id: i64, session_id: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET session_id = ?1 WHERE id = ?2",
+            params![session_id, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Appends an event to a run and bumps the run's heartbeat, atomically.
     ///
     /// `detail` is stored as-is; validating it (e.g. as JSON) is the CLI
@@ -1722,6 +1750,45 @@ mod tests {
         let store = open_store(dir.path());
 
         let err = store.update_pid(999, 1).expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_session_id_overwrites_the_recorded_session_id_and_leaves_other_columns_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+            })
+            .unwrap();
+
+        store.update_session_id(id, "sess-abc").unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.session_id, Some("sess-abc".to_string()));
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn update_session_id_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .update_session_id(999, "sess-abc")
+            .expect_err("expected RunNotFound");
 
         match err {
             RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
