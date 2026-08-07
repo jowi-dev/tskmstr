@@ -21,8 +21,8 @@
 #  "cacheCreationInputTokens": <int>, "totalToolUseCount": <int>,
 #  "durationMs": <int>} — the additive per-agent usage breakdown consumed by
 # `tm runs show`'s "Agent usage" section. description is omitted when empty;
-# the whole emission is skipped when resolvedModel/usage is absent (async
-# spawn responses, or a model-less row that can't aggregate).
+# the whole emission is skipped when usage, resolvedModel, or the agent type
+# is absent (async spawn responses, or a row that can't aggregate).
 #
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
@@ -111,9 +111,9 @@ if [ "$TOOL_NAME" = "Agent" ] || [ "$TOOL_NAME" = "Task" ]; then
     | ($r.usage // null) as $u
     | if $r == null or $u == null then null else
         ($r.resolvedModel // null) as $model
-        | if $model == null then null else
-            (.tool_input.subagent_type // $r.agentType // null) as $agentType
-            | (.tool_input.description // "") as $desc
+        | (.tool_input.subagent_type // $r.agentType // null) as $agentType
+        | if $model == null or $agentType == null then null else
+            (.tool_input.description // "") as $desc
             | {agentType: $agentType, model: $model}
               + (if $desc != "" then {description: $desc} else {} end)
               + {
