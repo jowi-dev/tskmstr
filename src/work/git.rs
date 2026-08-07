@@ -113,6 +113,16 @@ pub trait GitOps {
     /// mirroring `work.ml`'s `default_base`
     /// (`git rev-parse --abbrev-ref origin/HEAD`).
     fn default_base(&self, dir: &Path) -> Result<String, GitError>;
+
+    /// Remove the worktree at `wt_path`, mirroring `work.ml`'s
+    /// `worktree_remove` (`git worktree remove <wt_path>`, run from
+    /// `repo_dir`).
+    ///
+    /// `work.ml` doesn't pass `--force`: a worktree with uncommitted changes
+    /// fails this call, and the caller is expected to surface git's own
+    /// error (which suggests `--force`) rather than this trait forcing the
+    /// removal itself.
+    fn remove_worktree(&self, repo_dir: &Path, wt_path: &Path) -> Result<(), GitError>;
 }
 
 /// [`GitOps`] implementation that shells out to the real `git` binary.
@@ -291,6 +301,19 @@ impl GitOps for ShellGitOps {
             }),
         }
     }
+
+    fn remove_worktree(&self, repo_dir: &Path, wt_path: &Path) -> Result<(), GitError> {
+        let output = run_git(
+            repo_dir,
+            &remove_worktree_args(wt_path),
+            "git worktree remove",
+        )?;
+        interpret_success_or_command_error(
+            "git worktree remove",
+            output.status.code(),
+            &output.stderr,
+        )
+    }
 }
 
 /// Build the argument list for `git show-ref --verify --quiet <ref>`, shared
@@ -344,6 +367,16 @@ fn worktree_add_args(
         args.push(base.to_string());
     }
     args
+}
+
+/// Build the argument list for `git worktree remove <wt_path>`, mirroring
+/// `work.ml`'s `worktree_remove`. No `--force`: see [`GitOps::remove_worktree`].
+fn remove_worktree_args(wt_path: &Path) -> Vec<String> {
+    vec![
+        "worktree".to_string(),
+        "remove".to_string(),
+        wt_path.display().to_string(),
+    ]
 }
 
 /// Build the argument list for `git switch -q --no-track -c <branch> <base>`,
@@ -459,11 +492,13 @@ pub struct FakeGitOps {
     status_is_clean_result: std::cell::RefCell<Result<bool, GitError>>,
     switch_new_branch_result: std::cell::RefCell<Result<(), GitError>>,
     default_base_result: std::cell::RefCell<Result<String, GitError>>,
+    remove_worktree_result: std::cell::RefCell<Result<(), GitError>>,
 
     branch_exists_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     branch_exists_remote_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     provision_worktree_calls: std::cell::RefCell<Vec<ProvisionWorktreeCall>>,
     switch_new_branch_calls: std::cell::RefCell<Vec<SwitchNewBranchCall>>,
+    remove_worktree_calls: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl Default for FakeGitOps {
@@ -480,10 +515,12 @@ impl Default for FakeGitOps {
             status_is_clean_result: std::cell::RefCell::new(Ok(true)),
             switch_new_branch_result: std::cell::RefCell::new(Ok(())),
             default_base_result: std::cell::RefCell::new(Ok("origin/main".to_string())),
+            remove_worktree_result: std::cell::RefCell::new(Ok(())),
             branch_exists_local_calls: std::cell::RefCell::new(Vec::new()),
             branch_exists_remote_calls: std::cell::RefCell::new(Vec::new()),
             provision_worktree_calls: std::cell::RefCell::new(Vec::new()),
             switch_new_branch_calls: std::cell::RefCell::new(Vec::new()),
+            remove_worktree_calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -540,6 +577,17 @@ impl FakeGitOps {
     pub fn with_default_base(self, result: Result<String, GitError>) -> Self {
         *self.default_base_result.borrow_mut() = result;
         self
+    }
+
+    /// Set the result `remove_worktree` will return.
+    pub fn with_remove_worktree_result(self, result: Result<(), GitError>) -> Self {
+        *self.remove_worktree_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo_dir, wt_path)` pairs passed to `remove_worktree`, in call order.
+    pub fn remove_worktree_calls(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.remove_worktree_calls.borrow().clone()
     }
 
     /// The `(dir, branch)` pairs passed to `branch_exists_local`, in call order.
@@ -601,7 +649,17 @@ impl GitOps for FakeGitOps {
                 branch: branch.to_string(),
                 from_base: from_base.map(str::to_string),
             });
-        self.provision_worktree_result.borrow().clone()
+        let result = self.provision_worktree_result.borrow().clone();
+        // On a configured success, actually create `wt_path` on disk. A
+        // real `git worktree add` does this; callers layered on top of
+        // this fake (e.g. `cli::work::new`, which checks the directory
+        // exists before starting a session in it) need that same
+        // real-filesystem effect to be exercisable in tests without
+        // shelling out to `git`.
+        if result.is_ok() {
+            let _ = std::fs::create_dir_all(wt_path);
+        }
+        result
     }
 
     fn status_is_clean(&self, _dir: &Path) -> Result<bool, GitError> {
@@ -621,6 +679,13 @@ impl GitOps for FakeGitOps {
 
     fn default_base(&self, _dir: &Path) -> Result<String, GitError> {
         self.default_base_result.borrow().clone()
+    }
+
+    fn remove_worktree(&self, repo_dir: &Path, wt_path: &Path) -> Result<(), GitError> {
+        self.remove_worktree_calls
+            .borrow_mut()
+            .push((repo_dir.to_path_buf(), wt_path.to_path_buf()));
+        self.remove_worktree_result.borrow().clone()
     }
 }
 
@@ -715,6 +780,12 @@ mod tests {
                 "origin/staging",
             ]
         );
+    }
+
+    #[test]
+    fn remove_worktree_args_match_work_ml() {
+        let args = remove_worktree_args(Path::new("/Worktrees/axiom/lane"));
+        assert_eq!(args, vec!["worktree", "remove", "/Worktrees/axiom/lane"]);
     }
 
     #[test]
@@ -966,6 +1037,36 @@ mod tests {
             !output.status.success(),
             "expected no upstream to be configured for a --no-track branch"
         );
+    }
+
+    #[test]
+    fn shell_git_ops_remove_worktree_removes_it() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let wt_path = tmp.path().join("wt");
+
+        let ops = ShellGitOps::new();
+        ops.provision_worktree(tmp.path(), &wt_path, "removable-branch", None)
+            .unwrap();
+        assert!(wt_path.exists());
+
+        ops.remove_worktree(tmp.path(), &wt_path).unwrap();
+        assert!(!wt_path.exists());
+    }
+
+    #[test]
+    fn shell_git_ops_remove_worktree_fails_on_dirty_worktree() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let wt_path = tmp.path().join("wt");
+
+        let ops = ShellGitOps::new();
+        ops.provision_worktree(tmp.path(), &wt_path, "dirty-branch", None)
+            .unwrap();
+        std::fs::write(wt_path.join("dirty.txt"), "uncommitted\n").unwrap();
+
+        let err = ops.remove_worktree(tmp.path(), &wt_path).unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }));
     }
 
     #[test]

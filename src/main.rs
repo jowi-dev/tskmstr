@@ -7,13 +7,15 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, RunsCmd, TicketCmd};
+use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, RunsCmd, TicketCmd, WorkCmd};
 use tskmstr::config::{self, Config, ConfigPaths};
 use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
 use tskmstr::ticketing::{CreateTicketContext, TicketingContext};
 use tskmstr::tui::event::{TuiDeps, run};
+use tskmstr::work::git::ShellGitOps;
+use tskmstr::work::tmux::ShellTmuxOps;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -41,7 +43,59 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Runs { cmd } => run_runs(cmd),
+        Command::Work { cmd } => run_work(cmd, &paths),
     }
+}
+
+/// Dispatch `tm work new/remove/list/restore/start`.
+///
+/// Loads config leniently (like `tm runs`, unlike every other command):
+/// `tm work` should still work with an absent/invalid Jira config, since
+/// none of its subcommands touch Jira. A missing `[work]` section just
+/// means no lanes and every default falls back to `tskmstr::cli::work`'s
+/// own hardcoded fallbacks (e.g. `~/Worktrees`).
+fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error::Error>> {
+    let work_config = config::load(paths).map(|cfg| cfg.work).unwrap_or_default();
+    let git = ShellGitOps::new();
+    let tmux = ShellTmuxOps::new();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let cwd = std::env::current_dir()?;
+    let ctx = tskmstr::cli::work::WorkContext {
+        git: &git,
+        tmux: &tmux,
+        config: &work_config,
+        home: &home,
+    };
+    let mut stdout = std::io::stdout();
+
+    match cmd {
+        WorkCmd::New { name, branch, from } => {
+            tskmstr::cli::work::new(
+                &ctx,
+                &name,
+                branch.as_deref(),
+                from.as_deref(),
+                &cwd,
+                &mut stdout,
+            )?;
+        }
+        WorkCmd::Remove { name } => {
+            tskmstr::cli::work::remove(&ctx, &name, &cwd, &mut stdout)?;
+        }
+        WorkCmd::List => {
+            tskmstr::cli::work::list(&ctx, &mut stdout)?;
+        }
+        WorkCmd::Restore => {
+            tskmstr::cli::work::restore(&ctx, &mut stdout)?;
+        }
+        WorkCmd::Start { dir } => {
+            let dir_path = dir.map(PathBuf::from);
+            tskmstr::cli::work::start(&ctx, dir_path.as_deref(), &cwd, &mut stdout)?;
+        }
+    }
+    Ok(())
 }
 
 /// The interactive terminal board.

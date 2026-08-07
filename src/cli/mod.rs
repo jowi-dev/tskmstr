@@ -17,6 +17,7 @@ pub mod pr;
 pub mod ready;
 pub mod runs;
 pub mod ticket;
+pub mod work;
 
 use crate::ticketing::StatusTransition;
 
@@ -100,6 +101,51 @@ pub enum Command {
         /// Which runs action to perform. Omit to list current runs.
         #[command(subcommand)]
         cmd: Option<RunsCmd>,
+    },
+    /// Provision and manage lane worktrees and their tmux sessions (see
+    /// `docs/plans/runner-port.md`).
+    Work {
+        /// Which work action to perform.
+        #[command(subcommand)]
+        cmd: WorkCmd,
+    },
+}
+
+/// `tm work` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum WorkCmd {
+    /// Provision (if needed) a lane's worktree and start/attach its tmux
+    /// session.
+    ///
+    /// `NAME` resolves to a configured lane's `repo` if one matches;
+    /// otherwise the repo is resolved from the current working directory
+    /// (see `tskmstr::cli::work` module docs).
+    New {
+        /// Lane/worktree name.
+        name: String,
+        /// Branch to create/attach, if different from `NAME`.
+        branch: Option<String>,
+        /// Base branch to cut a new branch from, if the branch doesn't
+        /// already exist locally or on `origin`.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Kill the worktree's tmux session (if any) and remove the worktree.
+    Remove {
+        /// Lane/worktree name.
+        name: String,
+    },
+    /// List every current tmux session with a worktree/session kind
+    /// column.
+    List,
+    /// Recreate tmux sessions for every existing worktree that doesn't
+    /// already have one running (e.g. after a reboot).
+    Restore,
+    /// Attach to (or create) the tmux session for a directory, defaulting
+    /// to the current working directory.
+    Start {
+        /// Directory to start/attach a session for. Defaults to `cwd`.
+        dir: Option<String>,
     },
 }
 
@@ -1503,6 +1549,99 @@ mod tests {
     fn ticket_audit_without_key_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "audit"]);
         assert!(result.is_err(), "audit requires a key");
+    }
+
+    #[test]
+    fn parses_work_new_with_no_optional_args() {
+        let cli = Cli::try_parse_from(["tm", "work", "new", "my-lane"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::New { name, branch, from },
+            }) => {
+                assert_eq!(name, "my-lane");
+                assert_eq!(branch, None);
+                assert_eq!(from, None);
+            }
+            other => panic!("expected Work New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_new_with_branch_and_from() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "work",
+            "new",
+            "my-lane",
+            "custom-branch",
+            "--from",
+            "origin/staging",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::New { name, branch, from },
+            }) => {
+                assert_eq!(name, "my-lane");
+                assert_eq!(branch, Some("custom-branch".to_string()));
+                assert_eq!(from, Some("origin/staging".to_string()));
+            }
+            other => panic!("expected Work New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_remove() {
+        let cli = Cli::try_parse_from(["tm", "work", "remove", "my-lane"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Remove { name },
+            }) => assert_eq!(name, "my-lane"),
+            other => panic!("expected Work Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_list() {
+        let cli = Cli::try_parse_from(["tm", "work", "list"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Work { cmd: WorkCmd::List })
+        ));
+    }
+
+    #[test]
+    fn parses_work_restore() {
+        let cli = Cli::try_parse_from(["tm", "work", "restore"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Work {
+                cmd: WorkCmd::Restore
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_work_start_with_no_dir() {
+        let cli = Cli::try_parse_from(["tm", "work", "start"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Start { dir },
+            }) => assert_eq!(dir, None),
+            other => panic!("expected Work Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_start_with_dir() {
+        let cli =
+            Cli::try_parse_from(["tm", "work", "start", "/tmp/some-dir"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Start { dir },
+            }) => assert_eq!(dir, Some("/tmp/some-dir".to_string())),
+            other => panic!("expected Work Start, got {other:?}"),
+        }
     }
 
     #[test]

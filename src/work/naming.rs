@@ -83,6 +83,33 @@ pub fn branch_name(owner: &str, lane: &str, timestamp: &str) -> String {
     format!("{owner}/{lane}-{timestamp}")
 }
 
+/// Expand a leading `~` (or `~/...`) in `path` to `home`, mirroring the
+/// convention `work.ml` gets for free from the OCaml stdlib not doing any
+/// such expansion at all — `work.ml` hardcodes `worktrees_root` via
+/// `Filename.concat (Sys.getenv "HOME") "Worktrees"` rather than storing a
+/// `~`-prefixed string anywhere. `tm work`'s config stores
+/// `worktree_root`/`repo` as plain strings that *may* contain a literal
+/// `~` (e.g. `~/Worktrees` in a config file), and
+/// [`crate::config::RawWorkConfig::worktree_root`]'s doc comment is explicit
+/// that expansion is the caller's responsibility, not `config`'s — this is
+/// that caller-side expansion, kept pure (no env read) so it can be tested
+/// without touching `$HOME`.
+///
+/// Only a leading `~` is special-cased, matching shell tilde-expansion for
+/// the current user (no `~otheruser` support, since none of `work.ml`'s
+/// ported paths need it). A bare `~` expands to `home` itself; `~/rest`
+/// expands to `home` joined with `rest`. Any other path (including one
+/// merely containing a `~` elsewhere) is returned unchanged.
+pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +191,39 @@ mod tests {
         assert_eq!(
             branch_name("jowi-dev", "partner-integrations", "20260806-090503"),
             "jowi-dev/partner-integrations-20260806-090503"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_tilde_slash() {
+        assert_eq!(
+            expand_tilde("~/Worktrees", Path::new("/Users/jowi")),
+            PathBuf::from("/Users/jowi/Worktrees")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_expands_bare_tilde() {
+        assert_eq!(
+            expand_tilde("~", Path::new("/Users/jowi")),
+            PathBuf::from("/Users/jowi")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_path_unchanged() {
+        assert_eq!(
+            expand_tilde("/Worktrees", Path::new("/Users/jowi")),
+            PathBuf::from("/Worktrees")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_leading_tilde_unchanged() {
+        // Only a *leading* ~ is special-cased, matching shell semantics.
+        assert_eq!(
+            expand_tilde("/foo/~bar", Path::new("/Users/jowi")),
+            PathBuf::from("/foo/~bar")
         );
     }
 
