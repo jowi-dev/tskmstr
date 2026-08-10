@@ -64,6 +64,7 @@ tm auth status
 | `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
+| `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
@@ -654,6 +655,19 @@ in `config.toml` points instead). Recording never touches Jira and works
 fully offline; every past verdict is kept (no upsert), and the read mode
 above always shows the most recent one. `--notes` only makes sense alongside
 `--record`, so it requires it.
+
+### Searching
+
+`tm ticket search <TEXT>` searches the configured default project
+(`default_project_key`) for open (non-`Done`) tickets whose text matches
+`<TEXT>`, most recently updated first. It's meant for a quick sweep — e.g. a
+Claude skill checking for potential blockers or duplicates before creating a
+new ticket — not for browsing: it prints one line per match, `KEY  STATUS
+SUMMARY`, or a friendly "no matches" message (exit 0) when nothing is found.
+`<TEXT>` must not be empty or all-whitespace; unlike a missing match, that's
+rejected up front as a usage error, mirroring `tm ticket assign`'s empty-name
+check. Any other Jira/config failure is a hard error, same as every other
+`tm ticket` subcommand.
 
 ### Readiness
 
