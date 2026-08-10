@@ -590,6 +590,13 @@ pub struct FakeGitOps {
     remove_worktree_calls: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
     fetch_origin_calls: std::cell::RefCell<Vec<PathBuf>>,
     config_values: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    /// Branch names that report as existing (both `branch_exists_local` and
+    /// `branch_exists_remote`) regardless of those methods' blanket
+    /// `_result` overrides — see [`Self::with_existing_branches`]. Used by
+    /// [`crate::work::run`]'s branch-name-collision tests, where different
+    /// candidate names (e.g. a slug and its `-2` suffix) need different
+    /// existence answers in the same test.
+    existing_branches: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Method names, in call order, across every traced method — currently
     /// just [`GitOps::fetch_origin`] and [`GitOps::switch_new_branch`], the
     /// pair whose relative order [`crate::work::run::run_lane_fg`]'s tests
@@ -620,6 +627,7 @@ impl Default for FakeGitOps {
             remove_worktree_calls: std::cell::RefCell::new(Vec::new()),
             fetch_origin_calls: std::cell::RefCell::new(Vec::new()),
             config_values: std::cell::RefCell::new(std::collections::HashMap::new()),
+            existing_branches: std::cell::RefCell::new(std::collections::HashSet::new()),
             call_log: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -652,6 +660,26 @@ impl FakeGitOps {
     /// Set the result `branch_exists_remote` will return.
     pub fn with_branch_exists_remote(self, result: Result<bool, GitError>) -> Self {
         *self.branch_exists_remote_result.borrow_mut() = result;
+        self
+    }
+
+    /// Mark specific branch names as already existing, for both
+    /// `branch_exists_local` and `branch_exists_remote` — used by
+    /// branch-name-collision tests (see
+    /// [`crate::work::naming::resolve_branch_collision`]) that need
+    /// different candidate names to report different existence answers in
+    /// the same test, which the blanket `with_branch_exists_local`/
+    /// `with_branch_exists_remote` overrides can't express. A name in this
+    /// set always reports as existing regardless of those overrides; a name
+    /// not in it falls back to whatever they (or their `Ok(false)` default)
+    /// say.
+    pub fn with_existing_branches(
+        self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.existing_branches
+            .borrow_mut()
+            .extend(names.into_iter().map(Into::into));
         self
     }
 
@@ -751,6 +779,9 @@ impl GitOps for FakeGitOps {
         self.branch_exists_local_calls
             .borrow_mut()
             .push((dir.to_path_buf(), branch.to_string()));
+        if self.existing_branches.borrow().contains(branch) {
+            return Ok(true);
+        }
         self.branch_exists_local_result.borrow().clone()
     }
 
@@ -758,6 +789,9 @@ impl GitOps for FakeGitOps {
         self.branch_exists_remote_calls
             .borrow_mut()
             .push((dir.to_path_buf(), branch.to_string()));
+        if self.existing_branches.borrow().contains(branch) {
+            return Ok(true);
+        }
         self.branch_exists_remote_result.borrow().clone()
     }
 

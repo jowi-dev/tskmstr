@@ -49,6 +49,7 @@ use thiserror::Error;
 
 use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
+use crate::jira::client::JiraClient;
 use crate::runs::{RunStore, RunStoreError};
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
@@ -245,6 +246,13 @@ pub struct RunDeps<'a> {
     /// this one) knows which `RunStore` to open. Only used when `fg` is
     /// `false`.
     pub run_db_path: &'a Path,
+    /// Jira client used to look up a run's ticket summary for the
+    /// human-readable branch-name slug (see
+    /// [`crate::work::run::RunLaneDeps::jira`]), or `None` when Jira isn't
+    /// configured/authenticated. Absence — like any lookup failure through
+    /// it — silently falls back to the timestamp-based branch name; it is
+    /// never a hard error for `tm work run` to have no Jira access.
+    pub jira: Option<&'a dyn JiraClient>,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -289,6 +297,7 @@ pub fn run(
         spawner: deps.spawner,
         run_store: deps.run_store,
         clock: deps.clock,
+        jira: deps.jira,
     };
 
     if fg {
@@ -1324,6 +1333,7 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            jira: None,
         };
         let mut out = Vec::new();
 
@@ -1412,6 +1422,7 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            jira: None,
         };
         let mut out = Vec::new();
 
@@ -1464,6 +1475,7 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            jira: None,
         };
         let mut out = Vec::new();
 
@@ -1511,6 +1523,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),

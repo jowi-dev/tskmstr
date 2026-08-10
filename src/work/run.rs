@@ -41,8 +41,17 @@
 //!    run may have left work behind) — `work.ml`'s `git status --porcelain`
 //!    guard.
 //! 6. Resolve the branch owner (see [`resolve_branch_owner`]) and cut this
-//!    run's fresh timestamped branch off the resolved base
-//!    (`GitOps::switch_new_branch`, always `--no-track`).
+//!    run's fresh branch off the resolved base (`GitOps::switch_new_branch`,
+//!    always `--no-track`). The branch name is `<owner>/<wt_name>-<slug>`
+//!    when a Jira summary is available for the run's ticket (see
+//!    [`resolve_ticket_slug`] and [`naming::branch_name_with_slug`]),
+//!    falling back to the original `<owner>/<wt_name>-<timestamp>`
+//!    (`naming::branch_name`]) whenever it isn't — no ticket, no Jira
+//!    dependency, a failed lookup, or an empty summary all land on the
+//!    fallback, silently, since a Jira hiccup must never fail a run. Either
+//!    way, the candidate branch name is resolved against
+//!    [`naming::resolve_branch_collision`] first, since (unlike the
+//!    timestamp) a slug does not guarantee uniqueness across re-runs.
 //! 7. Read the prompt file and append `"\n\nWork ticket: <ticket>."` when a
 //!    ticket was given.
 //! 8. Deploy the hooks and write the generated `--settings` JSON to
@@ -70,6 +79,7 @@ use thiserror::Error;
 
 use crate::config::WorkConfig;
 use crate::github::gh_cli::{GhCli, GhError};
+use crate::jira::client::JiraClient;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::work::claude::{ClaudeInvocationInputs, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
@@ -198,6 +208,15 @@ pub struct RunLaneDeps<'a> {
     pub run_store: &'a RunStore,
     /// "Now" source for the run's timestamp.
     pub clock: &'a dyn Clock,
+    /// Jira client used to look up a run's ticket summary, for the
+    /// human-readable branch-name slug (step 6 of this module's doc
+    /// comment). `None` when Jira isn't configured/authenticated for this
+    /// invocation — `tm work run` still works without Jira access, it just
+    /// falls back to the original timestamp-based branch name (see
+    /// [`resolve_ticket_slug`]). Never treated as a hard requirement: `tm
+    /// work run` has always worked without Jira, and this feature must not
+    /// change that.
+    pub jira: Option<&'a dyn JiraClient>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -328,6 +347,34 @@ pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> Str
         .or_else(|| non_empty(gh.current_user_login().ok().flatten()))
         .or_else(|| non_empty(git.config_get(dir, "github.user").ok().flatten()))
         .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Resolve the human-readable slug to fold into a lane run's branch name
+/// (see [`naming::branch_name_with_slug`]), from the run's ticket's Jira
+/// summary.
+///
+/// Returns `None` — meaning [`prepare_run_lane`]'s step 6 falls back to the
+/// original timestamp-based [`naming::branch_name`] — whenever any of these
+/// hold:
+/// - `ticket` is `None` (the run isn't scoped to a ticket at all, e.g. a
+///   bare lane run keyed by lane name).
+/// - `jira` is `None` (Jira isn't configured/authenticated for this
+///   invocation).
+/// - The `get_issue` call fails for any reason (network error, 404, auth
+///   failure, ...).
+/// - The issue's summary is empty or contains no alphanumeric characters,
+///   per [`naming::slugify_summary`].
+///
+/// Every one of those is swallowed silently (no warning printed): a Jira
+/// hiccup must never fail a run, and the existing timestamp naming is a
+/// perfectly good branch name on its own — this is a "nice to have when
+/// available" enhancement, not a dependency `tm work run` should ever block
+/// on or complain about losing.
+fn resolve_ticket_slug(jira: Option<&dyn JiraClient>, ticket: Option<&str>) -> Option<String> {
+    let jira = jira?;
+    let ticket = ticket?;
+    let issue = jira.get_issue(ticket).ok()?;
+    naming::slugify_summary(&issue.fields.summary)
 }
 
 /// Resolve the prompt file path for a lane run: `--prompt` override, else
@@ -484,12 +531,30 @@ pub fn prepare_run_lane(
         return Err(RunLaneError::WorktreeDirty(wt_path));
     }
 
-    // Step 6: cut this run's fresh branch.
+    // Step 6: cut this run's fresh branch. When the run's ticket has a Jira
+    // summary available, the branch is named from a short slug of it
+    // (`<owner>/<wt_name>-<slug>`, e.g. `jowi-dev/ax-414-delete-bid-
+    // connector`) instead of the timestamp — see resolve_ticket_slug's doc
+    // comment for the full list of fallback conditions, all of which land
+    // back on the original `<owner>/<wt_name>-<timestamp>` naming. Unlike
+    // the timestamp, a slug doesn't guarantee uniqueness across re-runs of
+    // the same lane/ticket, so either way the candidate is run through
+    // resolve_branch_collision against both a local and an
+    // origin-remote-tracking ref before it's cut.
     let base = resolve_base(deps.git)?;
     let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root);
     let (year, month, day, hour, min, sec) = deps.clock.now_parts();
     let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);
-    let branch = naming::branch_name(&owner, &wt_name, &timestamp);
+    let candidate = match resolve_ticket_slug(deps.jira, request.ticket.as_deref()) {
+        Some(slug) => naming::branch_name_with_slug(&owner, &wt_name, &slug),
+        None => naming::branch_name(&owner, &wt_name, &timestamp),
+    };
+    let branch = naming::resolve_branch_collision(&candidate, |name| {
+        Ok::<bool, RunLaneError>(
+            deps.git.branch_exists_local(&wt_path, name)?
+                || deps.git.branch_exists_remote(&wt_path, name)?,
+        )
+    })?;
     deps.git.switch_new_branch(&wt_path, &branch, &base)?;
 
     writeln!(out, "worktree: {}  branch: {}", wt_path.display(), branch)?;
@@ -718,11 +783,33 @@ mod tests {
     use super::*;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
+    use crate::jira::fake::FakeJiraClient;
+    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory};
     use crate::runs::RunStore;
     use crate::work::git::FakeGitOps;
     use crate::work::runner::FakeProcessSpawner;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    /// A minimal Jira issue fixture with `summary` as its only field of
+    /// interest to these tests — see [`resolve_ticket_slug`].
+    fn issue(key: &str, summary: &str) -> Issue {
+        Issue {
+            key: key.to_string(),
+            fields: IssueFields {
+                summary: summary.to_string(),
+                status: Status {
+                    name: "To Do".to_string(),
+                    status_category: StatusCategory {
+                        key: "new".to_string(),
+                    },
+                },
+                description: None,
+                assignee: None,
+                issue_links: vec![],
+            },
+        }
+    }
 
     fn lane_config(repo: &str) -> LaneConfig {
         LaneConfig {
@@ -836,6 +923,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -899,6 +987,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -947,6 +1036,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -990,6 +1080,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1034,6 +1125,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1076,6 +1168,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1119,6 +1212,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1168,6 +1262,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1214,6 +1309,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1260,6 +1356,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1304,6 +1401,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1324,6 +1422,276 @@ mod tests {
 
         let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
         assert_eq!(run.ticket, "ABC-123");
+    }
+
+    // --- Jira-summary-slug branch naming and its fallbacks (module doc's
+    // step 6): a ticket with a Jira summary available produces
+    // `<owner>/<wt_name>-<slug>`; anything short of that (no ticket, no
+    // Jira dependency, a failed/empty lookup) falls back to the original
+    // `<owner>/<wt_name>-<timestamp>`, silently. See resolve_ticket_slug's
+    // doc comment for the exhaustive fallback list. ---
+
+    #[test]
+    fn run_lane_fg_uses_jira_summary_slug_for_branch_name_when_available() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira =
+            FakeJiraClient::new().with_issue("ABC-123", issue("ABC-123", "Delete bid connector"));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+
+        // No configured branch-owner source resolves ("claude" fallback);
+        // wt_name is the lowercased ticket; the slug carries no timestamp.
+        assert_eq!(outcome.branch, "claude/abc-123-delete-bid-connector");
+    }
+
+    #[test]
+    fn prepare_run_lane_falls_back_to_timestamp_naming_when_jira_is_none() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
+    }
+
+    #[test]
+    fn prepare_run_lane_falls_back_to_timestamp_naming_when_no_ticket_given() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        // Seeded so a bug that ignores "no ticket" and looks up anyway
+        // would still be caught (it has nothing to key a lookup on).
+        let jira =
+            FakeJiraClient::new().with_issue("ABC-123", issue("ABC-123", "Delete bid connector"));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.branch, "claude/mylane-20260806-090503");
+    }
+
+    #[test]
+    fn prepare_run_lane_falls_back_to_timestamp_naming_when_get_issue_fails() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira = FakeJiraClient::new().with_issue_not_found("ABC-123");
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        // A Jira lookup failure must not fail the run at all, let alone in
+        // a way that surfaces as an Err here.
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
+    }
+
+    #[test]
+    fn prepare_run_lane_falls_back_to_timestamp_naming_when_summary_is_empty() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira = FakeJiraClient::new().with_issue("ABC-123", issue("ABC-123", ""));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
+    }
+
+    #[test]
+    fn prepare_run_lane_appends_suffix_when_slug_branch_already_exists() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        // The first candidate and its "-2" retry are both already taken
+        // (e.g. left over from earlier runs of the same ticket); only
+        // "-3" is free.
+        let git = FakeGitOps::new().with_existing_branches([
+            "claude/abc-123-delete-bid-connector",
+            "claude/abc-123-delete-bid-connector-2",
+        ]);
+        let gh = FakeGhCli::new();
+        let jira =
+            FakeJiraClient::new().with_issue("ABC-123", issue("ABC-123", "Delete bid connector"));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(prepared.branch, "claude/abc-123-delete-bid-connector-3");
     }
 
     // --- pr_url resolution: gh lookup, falling back to a result-text scrape,
@@ -1352,6 +1720,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1402,6 +1771,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1449,6 +1819,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1498,6 +1869,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1547,6 +1919,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1596,6 +1969,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1643,6 +2017,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1693,6 +2068,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1763,6 +2139,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
+            jira: None,
         };
         let paths = RunLanePaths {
             home,

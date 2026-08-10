@@ -132,19 +132,35 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Runs { kind, cmd } => run_runs(kind, cmd),
-        Command::Work { cmd } => run_work(cmd, &paths),
+        Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
     }
 }
 
-/// Dispatch `tm work new/remove/list/restore/start`.
+/// Dispatch `tm work new/remove/list/restore/start/run`.
 ///
 /// Loads config leniently (like `tm runs`, unlike every other command):
 /// `tm work` should still work with an absent/invalid Jira config, since
-/// none of its subcommands touch Jira. A missing `[work]` section just
-/// means no lanes and every default falls back to `tskmstr::cli::work`'s
-/// own hardcoded fallbacks (e.g. `~/Worktrees`).
-fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error::Error>> {
-    let work_config = config::load(paths).map(|cfg| cfg.work).unwrap_or_default();
+/// most of its subcommands don't touch Jira at all. A missing `[work]`
+/// section just means no lanes and every default falls back to
+/// `tskmstr::cli::work`'s own hardcoded fallbacks (e.g. `~/Worktrees`).
+///
+/// `WorkCmd::Run` is the one exception that *can* use Jira (for the
+/// human-readable branch-name slug — see
+/// `tskmstr::work::run::resolve_ticket_slug`), but only opportunistically:
+/// it's still built from this same leniently-loaded `full_config`, and a
+/// missing/invalid config or unresolvable token just means no Jira client
+/// is wired in, not a hard error. See that match arm for the fallback.
+fn run_work(
+    cmd: WorkCmd,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_config = config::load(paths).ok();
+    let work_config = full_config
+        .as_ref()
+        .map(|cfg| cfg.work.clone())
+        .unwrap_or_default();
     let git = ShellGitOps::new();
     let tmux = ShellTmuxOps::new();
     let home = std::env::var_os("HOME")
@@ -200,6 +216,14 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
             let clock = tskmstr::work::run::SystemClock;
             let detach = tskmstr::work::detach::RealDetachSpawner;
             let current_exe = std::env::current_exe()?;
+            // Best-effort Jira client for the branch-name slug: absent
+            // config or an unresolvable token silently means no client,
+            // never a hard error — see this function's doc comment.
+            let jira: Option<Box<dyn JiraClient>> = full_config.as_ref().and_then(|cfg| {
+                resolve_token(keychain, env_token.clone())
+                    .ok()
+                    .map(|token| jira_client_for(cfg, &token))
+            });
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -208,6 +232,7 @@ fn run_work(cmd: WorkCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error:
                 detach: &detach,
                 current_exe: &current_exe,
                 run_db_path: &run_db_path,
+                jira: jira.as_deref(),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
