@@ -83,6 +83,142 @@ pub fn branch_name(owner: &str, lane: &str, timestamp: &str) -> String {
     format!("{owner}/{lane}-{timestamp}")
 }
 
+/// Build a lane run's branch name from a Jira-summary-derived slug rather
+/// than a timestamp, mirroring [`branch_name`]'s shape but for the
+/// human-readable naming scheme: `<owner>/<lane>-<slug>`. There is
+/// deliberately no timestamp component here — the whole point of this
+/// scheme is a readable branch name, and a timestamp would defeat that — so
+/// unlike [`branch_name`], this alone does not guarantee uniqueness across
+/// re-runs of the same lane/ticket. Callers are expected to run the
+/// candidate this produces through [`resolve_branch_collision`] before
+/// cutting the branch. See [`slugify_summary`] for how `slug` itself is
+/// derived, and [`crate::work::run::prepare_run_lane`]'s step 6 for the
+/// fallback that keeps using [`branch_name`] instead of this function
+/// whenever no slug is available.
+pub fn branch_name_with_slug(owner: &str, lane: &str, slug: &str) -> String {
+    format!("{owner}/{lane}-{slug}")
+}
+
+/// English stopwords dropped from [`slugify_summary`]'s word list before
+/// the first-3-words cut, so the slug carries content words
+/// ("delete-bid-connector") rather than being padded with grammatical
+/// glue ("the-delete-of"). Deliberately small and hand-picked rather than
+/// an exhaustive list — good enough for typical Jira summaries, not a
+/// general-purpose NLP stopword table.
+const STOPWORDS: &[&str] = &[
+    "the", "a", "an", "to", "of", "for", "in", "on", "at", "and", "or", "with", "from", "by", "is",
+    "are", "be",
+];
+
+/// The maximum length, in bytes, of a slug returned by [`slugify_summary`].
+/// A branch name is `<owner>/<lane>-<slug>` (or, with a collision suffix,
+/// `<owner>/<lane>-<slug>-<n>`), and an unbounded slug from a long Jira
+/// summary could make that unwieldy to type/read on a terminal — 40 is
+/// generous for "2-3 words" while still capping the worst case.
+const MAX_SLUG_LEN: usize = 40;
+
+/// Derive a short, branch-name-safe slug from a Jira issue summary, for the
+/// human-readable branch-naming scheme (see [`branch_name_with_slug`]).
+///
+/// The steps, in order:
+/// 1. Every character that isn't ASCII alphanumeric is treated as a word
+///    separator (mapped to a space) rather than simply dropped — this is
+///    what turns a hyphenated summary like "Delete bid-connector" into the
+///    three separate words `delete`, `bid`, `connector` rather than
+///    collapsing `bid-connector` into one word. Case is folded to
+///    lowercase in the same pass.
+/// 2. The cleaned string is split on whitespace into words; each word is
+///    therefore already restricted to `[a-z0-9]`.
+/// 3. Words in [`STOPWORDS`] are dropped. If that leaves nothing (e.g. a
+///    summary that's entirely stopwords, or one that's short enough that
+///    stripping them empties it), the *un-filtered* word list is used
+///    instead — a slug of stopwords beats no slug at all, and this
+///    function's only "no slug" outcome is a summary with no words in it.
+/// 4. The first three (possibly fewer) surviving words are joined with
+///    `-`, then truncated to [`MAX_SLUG_LEN`] bytes (dropping a trailing
+///    dangling `-` left by the cut, if any).
+///
+/// Returns `None` only when `summary` contains no alphanumeric characters
+/// at all (empty string, pure punctuation/whitespace) — the case that maps
+/// to `tm work run`'s existing timestamp-based fallback, per
+/// [`crate::work::run::prepare_run_lane`]'s step 6.
+pub fn slugify_summary(summary: &str) -> Option<String> {
+    let cleaned: String = summary
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    let non_stopwords: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| !STOPWORDS.contains(w))
+        .collect();
+    let chosen: Vec<&str> = if non_stopwords.is_empty() {
+        words
+    } else {
+        non_stopwords
+    };
+
+    let slug: String = chosen.into_iter().take(3).collect::<Vec<_>>().join("-");
+    Some(truncate_slug(&slug))
+}
+
+/// Cap `slug` to [`MAX_SLUG_LEN`] bytes, trimming a trailing `-` the cut may
+/// have left dangling. Every byte of `slug` is ASCII (guaranteed by
+/// [`slugify_summary`]'s character mapping), so byte-slicing at
+/// `MAX_SLUG_LEN` can never land mid-character.
+fn truncate_slug(slug: &str) -> String {
+    if slug.len() <= MAX_SLUG_LEN {
+        return slug.to_string();
+    }
+    let mut truncated = slug[..MAX_SLUG_LEN].to_string();
+    while truncated.ends_with('-') {
+        truncated.pop();
+    }
+    truncated
+}
+
+/// Resolve a naming collision against an arbitrary existence check, for the
+/// human-readable branch-naming scheme's uniqueness guarantee (see
+/// [`branch_name_with_slug`]'s doc comment): unlike a timestamp suffix, a
+/// slug can collide with a branch left over from an earlier run of the same
+/// lane/ticket.
+///
+/// `exists` is injected rather than reading git directly, keeping this
+/// function itself pure per the module doc comment; the real caller
+/// ([`crate::work::run::prepare_run_lane`]) passes a closure that checks
+/// both a local and an `origin`-remote-tracking ref. Starting from
+/// `candidate`, this tries `candidate`, then `<candidate>-2`,
+/// `<candidate>-3`, ... until `exists` reports one that's free, and returns
+/// that one. `exists`'s `Err` propagates immediately (a broken existence
+/// check should abort the run, not silently be treated as "free").
+pub fn resolve_branch_collision<E>(
+    candidate: &str,
+    mut exists: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<String, E> {
+    if !exists(candidate)? {
+        return Ok(candidate.to_string());
+    }
+    let mut n = 2;
+    loop {
+        let next = format!("{candidate}-{n}");
+        if !exists(&next)? {
+            return Ok(next);
+        }
+        n += 1;
+    }
+}
+
 /// Expand a leading `~` (or `~/...`) in `path` to `home`, mirroring the
 /// convention `work.ml` gets for free from the OCaml stdlib not doing any
 /// such expansion at all — `work.ml` hardcodes `worktrees_root` via
@@ -225,6 +361,101 @@ mod tests {
             expand_tilde("/foo/~bar", Path::new("/Users/jowi")),
             PathBuf::from("/foo/~bar")
         );
+    }
+
+    #[test]
+    fn branch_name_with_slug_has_no_timestamp_component() {
+        assert_eq!(
+            branch_name_with_slug("jowi-dev", "ax-414", "delete-bid-connector"),
+            "jowi-dev/ax-414-delete-bid-connector"
+        );
+    }
+
+    #[test]
+    fn slugify_summary_lowercases_and_takes_first_three_content_words() {
+        assert_eq!(
+            slugify_summary("Delete Bid Connector Integration"),
+            Some("delete-bid-connector".to_string())
+        );
+    }
+
+    #[test]
+    fn slugify_summary_splits_on_punctuation_including_hyphens() {
+        // A hyphenated summary word splits into separate words rather than
+        // collapsing into one — this is what makes the ticket's actual
+        // "Delete bid-connector" style summaries produce a 3-word slug
+        // instead of a 2-word one.
+        assert_eq!(
+            slugify_summary("Delete bid-connector"),
+            Some("delete-bid-connector".to_string())
+        );
+    }
+
+    #[test]
+    fn slugify_summary_drops_stopwords() {
+        assert_eq!(
+            slugify_summary("Fix the bug in the login flow"),
+            Some("fix-bug-login".to_string())
+        );
+    }
+
+    #[test]
+    fn slugify_summary_falls_back_to_raw_words_when_all_are_stopwords() {
+        assert_eq!(slugify_summary("to of for"), Some("to-of-for".to_string()));
+    }
+
+    #[test]
+    fn slugify_summary_none_for_empty_summary() {
+        assert_eq!(slugify_summary(""), None);
+    }
+
+    #[test]
+    fn slugify_summary_none_for_punctuation_only_summary() {
+        assert_eq!(slugify_summary("... !!! ---"), None);
+    }
+
+    #[test]
+    fn slugify_summary_uses_fewer_than_three_words_when_summary_is_short() {
+        assert_eq!(slugify_summary("Fix login"), Some("fix-login".to_string()));
+    }
+
+    #[test]
+    fn slugify_summary_caps_total_length() {
+        let long_summary = "Reticulate the extraordinarily long splines architecture";
+        let slug = slugify_summary(long_summary).unwrap();
+        assert!(slug.len() <= 40, "slug too long: {slug:?} ({})", slug.len());
+        assert!(!slug.ends_with('-'), "slug has dangling dash: {slug:?}");
+    }
+
+    #[test]
+    fn resolve_branch_collision_returns_candidate_when_free() {
+        let result =
+            resolve_branch_collision("jowi-dev/ax-414-fix-login", |_: &str| Ok::<bool, ()>(false));
+        assert_eq!(result, Ok("jowi-dev/ax-414-fix-login".to_string()));
+    }
+
+    #[test]
+    fn resolve_branch_collision_appends_dash_two_on_first_collision() {
+        let result = resolve_branch_collision("jowi-dev/ax-414-fix-login", |name: &str| {
+            Ok::<bool, ()>(name == "jowi-dev/ax-414-fix-login")
+        });
+        assert_eq!(result, Ok("jowi-dev/ax-414-fix-login-2".to_string()));
+    }
+
+    #[test]
+    fn resolve_branch_collision_keeps_incrementing_until_free() {
+        let taken = ["jowi-dev/ax-414-fix-login", "jowi-dev/ax-414-fix-login-2"];
+        let result = resolve_branch_collision("jowi-dev/ax-414-fix-login", |name: &str| {
+            Ok::<bool, ()>(taken.contains(&name))
+        });
+        assert_eq!(result, Ok("jowi-dev/ax-414-fix-login-3".to_string()));
+    }
+
+    #[test]
+    fn resolve_branch_collision_propagates_exists_error() {
+        let result: Result<String, &str> =
+            resolve_branch_collision("jowi-dev/ax-414-fix-login", |_: &str| Err("boom"));
+        assert_eq!(result, Err("boom"));
     }
 
     #[test]
