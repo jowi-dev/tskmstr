@@ -173,6 +173,39 @@ pub trait GhCli {
     /// normal (most runs don't open one), not an error condition, mirroring
     /// `work.ml`'s tolerant `gh pr list ... 2>>'log'` call.
     fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError>;
+
+    /// List every pull request in the current repository, open *or* merged
+    /// (`gh pr list --state all --json number,headRefName,state,merged,
+    /// updatedAt`).
+    ///
+    /// Used by `tm work run`'s blocked-ticket branch-off logic (see
+    /// [`crate::work::run::resolve_blocker_stacking`]) to find and classify
+    /// the PR (if any) for a blocking ticket's lane branch. Unlike
+    /// [`GhCli::pr_list`] (open-only, used elsewhere for ticket-branch
+    /// discovery), this must include merged PRs too — a blocker's PR being
+    /// merged is exactly the "already in staging, nothing to stack on"
+    /// outcome that logic needs to distinguish from "still open, unmerged".
+    /// No head-branch filter is applied server-side (`gh pr list` has none
+    /// for "starts with"); callers filter the returned list themselves.
+    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError>;
+}
+
+/// A summary of one pull request — its number, head branch, lifecycle state,
+/// and last-updated timestamp — as returned by [`GhCli::pr_list_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrSummary {
+    /// The pull request's number.
+    pub number: u64,
+    /// The pull request's head branch name.
+    pub head_ref_name: String,
+    /// The pull request's lifecycle state.
+    pub lifecycle: PrLifecycle,
+    /// `gh`'s reported `updatedAt`, an ISO-8601 timestamp. Only used to break
+    /// ties when more than one PR matches the same head-branch prefix (see
+    /// [`crate::work::run::resolve_blocker_stacking`]'s "most recently
+    /// updated" tiebreak) — lexical string comparison is sufficient since
+    /// ISO-8601 timestamps sort chronologically as strings.
+    pub updated_at: String,
 }
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
@@ -478,6 +511,29 @@ impl GhCli for ShellGhCli {
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
         ))
+    }
+
+    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--json",
+                "number,headRefName,state,merged,updatedAt",
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_list_all_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 }
 
@@ -929,6 +985,69 @@ fn interpret_pr_list_output(
     }
 }
 
+/// Raw shape of one entry in `gh pr list --state all --json
+/// number,headRefName,state,merged,updatedAt` output, for deserialization
+/// only; [`PrSummary`] is the flattened shape callers use.
+#[derive(Debug, Deserialize)]
+struct RawPrListAllEntry {
+    number: u64,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    state: String,
+    merged: bool,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+}
+
+/// Interpret the result of a `gh pr list --state all --json
+/// number,headRefName,state,merged,updatedAt` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. `merged` takes
+/// precedence over `state` when classifying [`PrLifecycle`], same as
+/// [`interpret_pr_state_output`] (a merged PR still reports `state:
+/// "CLOSED"`).
+fn interpret_pr_list_all_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<PrSummary>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<RawPrListAllEntry>>(stdout)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| PrSummary {
+                        number: entry.number,
+                        head_ref_name: entry.head_ref_name,
+                        lifecycle: if entry.merged {
+                            PrLifecycle::Merged
+                        } else if entry.state.eq_ignore_ascii_case("closed") {
+                            PrLifecycle::Closed
+                        } else {
+                            PrLifecycle::Open
+                        },
+                        updated_at: entry.updated_at,
+                    })
+                    .collect()
+            })
+            .map_err(|err| GhError::Parse {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            }),
+        Some(code) => Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Interpret the result of a `gh pr view --json ...` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr so parsing can be unit
@@ -1088,6 +1207,8 @@ pub struct FakeGhCli {
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
+    pr_list_all_result: RefCell<Result<Vec<PrSummary>, GhError>>,
+    pr_list_all_calls: RefCell<u32>,
 }
 
 impl Default for FakeGhCli {
@@ -1120,6 +1241,8 @@ impl Default for FakeGhCli {
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
+            pr_list_all_result: RefCell::new(Ok(Vec::new())),
+            pr_list_all_calls: RefCell::new(0),
         }
     }
 }
@@ -1261,6 +1384,19 @@ impl FakeGhCli {
     pub fn pr_url_for_branch_calls(&self) -> Vec<String> {
         self.pr_url_for_branch_calls.borrow().clone()
     }
+
+    /// Set the result `pr_list_all` will return.
+    pub fn with_pr_list_all(self, result: Result<Vec<PrSummary>, GhError>) -> Self {
+        *self.pr_list_all_result.borrow_mut() = result;
+        self
+    }
+
+    /// The number of times `pr_list_all` was called — used by blocker-
+    /// stacking tests to assert `gh` is never consulted when blocker logic
+    /// doesn't apply (e.g. `--from` given, or no ticket).
+    pub fn pr_list_all_calls(&self) -> u32 {
+        *self.pr_list_all_calls.borrow()
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -1327,6 +1463,11 @@ impl GhCli for FakeGhCli {
             .borrow_mut()
             .push(branch.to_string());
         self.pr_url_for_branch_result.borrow().clone()
+    }
+
+    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError> {
+        *self.pr_list_all_calls.borrow_mut() += 1;
+        self.pr_list_all_result.borrow().clone()
     }
 }
 
@@ -1539,6 +1680,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pr_list_all_classifies_open_merged_and_closed() {
+        let stdout = r#"[
+            {"number":1,"headRefName":"jowi-dev/ax-410-open","state":"OPEN","merged":false,"updatedAt":"2026-08-01T00:00:00Z"},
+            {"number":2,"headRefName":"jowi-dev/ax-410-merged","state":"CLOSED","merged":true,"updatedAt":"2026-08-02T00:00:00Z"},
+            {"number":3,"headRefName":"jowi-dev/ax-410-closed","state":"CLOSED","merged":false,"updatedAt":"2026-08-03T00:00:00Z"}
+        ]"#;
+        let prs = interpret_pr_list_all_output(Some(0), stdout, "").unwrap();
+        assert_eq!(prs[0].lifecycle, PrLifecycle::Open);
+        assert_eq!(prs[1].lifecycle, PrLifecycle::Merged);
+        assert_eq!(prs[2].lifecycle, PrLifecycle::Closed);
+    }
+
+    #[test]
+    fn pr_list_all_failure_is_a_command_error() {
+        let err =
+            interpret_pr_list_all_output(Some(1), "", "gh: authentication required").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_list_all_counts_calls() {
+        let fake = FakeGhCli::new();
+        fake.pr_list_all().unwrap();
+        fake.pr_list_all().unwrap();
+        assert_eq!(fake.pr_list_all_calls(), 2);
     }
 
     #[test]
