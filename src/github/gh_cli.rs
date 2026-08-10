@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -187,7 +188,17 @@ pub trait GhCli {
     /// outcome that logic needs to distinguish from "still open, unmerged".
     /// No head-branch filter is applied server-side (`gh pr list` has none
     /// for "starts with"); callers filter the returned list themselves.
-    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError>;
+    ///
+    /// Unlike this trait's other methods (all of which shell out with the
+    /// tm process's ambient cwd, since they're only ever called from `tm`
+    /// subcommands already running inside the target repo), `dir` is an
+    /// explicit repo root: `tm work run` resolves blockers for
+    /// `lane_config.repo`, which is generally *not* the invoking process's
+    /// cwd (e.g. running a lane from another directory, or from the board).
+    /// Shelling out with the ambient cwd would silently list PRs for the
+    /// wrong repository — or fail outright with "not a git repository" —
+    /// corrupting blocker resolution without any obviously-related error.
+    fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError>;
 }
 
 /// A summary of one pull request — its number, head branch, lifecycle state,
@@ -513,7 +524,7 @@ impl GhCli for ShellGhCli {
         ))
     }
 
-    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError> {
+    fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
         let output = Command::new("gh")
             .args([
                 "pr",
@@ -523,6 +534,7 @@ impl GhCli for ShellGhCli {
                 "--json",
                 "number,headRefName,state,merged,updatedAt",
             ])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh pr list".to_string(),
@@ -1208,7 +1220,7 @@ pub struct FakeGhCli {
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
     pr_list_all_result: RefCell<Result<Vec<PrSummary>, GhError>>,
-    pr_list_all_calls: RefCell<u32>,
+    pr_list_all_calls: RefCell<Vec<PathBuf>>,
 }
 
 impl Default for FakeGhCli {
@@ -1242,7 +1254,7 @@ impl Default for FakeGhCli {
             pr_url_for_branch_result: RefCell::new(Ok(None)),
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
             pr_list_all_result: RefCell::new(Ok(Vec::new())),
-            pr_list_all_calls: RefCell::new(0),
+            pr_list_all_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -1391,11 +1403,14 @@ impl FakeGhCli {
         self
     }
 
-    /// The number of times `pr_list_all` was called — used by blocker-
-    /// stacking tests to assert `gh` is never consulted when blocker logic
-    /// doesn't apply (e.g. `--from` given, or no ticket).
-    pub fn pr_list_all_calls(&self) -> u32 {
-        *self.pr_list_all_calls.borrow()
+    /// The `dir` arguments passed to `pr_list_all`, in call order. The
+    /// count doubles as "was `gh` consulted at all" for blocker-stacking
+    /// tests asserting it's skipped (e.g. `--from` given, or no ticket); the
+    /// values themselves let a test assert the repo root — not the test
+    /// process's cwd — is what gets passed (see [`GhCli::pr_list_all`]'s
+    /// doc comment on why that distinction matters).
+    pub fn pr_list_all_calls(&self) -> Vec<PathBuf> {
+        self.pr_list_all_calls.borrow().clone()
     }
 }
 
@@ -1465,8 +1480,8 @@ impl GhCli for FakeGhCli {
         self.pr_url_for_branch_result.borrow().clone()
     }
 
-    fn pr_list_all(&self) -> Result<Vec<PrSummary>, GhError> {
-        *self.pr_list_all_calls.borrow_mut() += 1;
+    fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
+        self.pr_list_all_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_all_result.borrow().clone()
     }
 }
@@ -1703,11 +1718,14 @@ mod tests {
     }
 
     #[test]
-    fn fake_gh_cli_pr_list_all_counts_calls() {
+    fn fake_gh_cli_pr_list_all_records_dir_of_each_call() {
         let fake = FakeGhCli::new();
-        fake.pr_list_all().unwrap();
-        fake.pr_list_all().unwrap();
-        assert_eq!(fake.pr_list_all_calls(), 2);
+        fake.pr_list_all(Path::new("/repo-a")).unwrap();
+        fake.pr_list_all(Path::new("/repo-b")).unwrap();
+        assert_eq!(
+            fake.pr_list_all_calls(),
+            vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")]
+        );
     }
 
     #[test]

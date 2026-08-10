@@ -429,16 +429,18 @@ fn head_branch_matches_ticket(head_ref_name: &str, key_lower: &str) -> bool {
     }
 }
 
-/// Find the PR (if any) for `blocker_key`'s lane branch: every PR returned by
-/// [`GhCli::pr_list_all`] whose head branch matches
-/// [`head_branch_matches_ticket`], preferring an open one and, among ties,
-/// the most recently updated — see [`resolve_blocker_stacking`]'s doc
-/// comment, point 1.
-fn find_blocker_pr(gh: &dyn GhCli, blocker_key: &str) -> Result<Option<PrSummary>, GhError> {
+/// Find the PR (if any) for `blocker_key`'s lane branch among `prs` — every
+/// entry whose head branch matches [`head_branch_matches_ticket`], preferring
+/// an open one and, among ties, the most recently updated.
+///
+/// Pure over an already-fetched PR list rather than calling
+/// [`GhCli::pr_list_all`] itself: [`resolve_blocker_stacking`] fetches once
+/// per run and calls this once per blocker, so a ticket with several
+/// blockers costs one `gh` invocation, not one per blocker.
+fn find_blocker_pr(prs: &[PrSummary], blocker_key: &str) -> Option<PrSummary> {
     let key_lower = blocker_key.to_lowercase();
-    let mut matches: Vec<PrSummary> = gh
-        .pr_list_all()?
-        .into_iter()
+    let mut matches: Vec<&PrSummary> = prs
+        .iter()
         .filter(|pr| head_branch_matches_ticket(&pr.head_ref_name, &key_lower))
         .collect();
     matches.sort_by(|a, b| {
@@ -446,7 +448,7 @@ fn find_blocker_pr(gh: &dyn GhCli, blocker_key: &str) -> Result<Option<PrSummary
         let b_open = b.lifecycle == PrLifecycle::Open;
         b_open.cmp(&a_open).then(b.updated_at.cmp(&a.updated_at))
     });
-    Ok(matches.into_iter().next())
+    matches.into_iter().next().cloned()
 }
 
 /// One of a run's ticket's direct blockers, after resolving its PR — the
@@ -518,13 +520,22 @@ impl BlockerResolution {
 ///   blocker resolution refuses the run outright rather than falling back.
 ///
 /// Any Jira or `gh` failure while resolving blockers (a bad `get_issue`, or
-/// [`find_blocker_pr`] erroring for any blocker) short-circuits to
-/// `stacked_base: None` plus a warning — a network hiccup must never fail a
-/// run; refusal is reserved for the confirmed ≥2-unmerged case above, which
-/// only fires once every blocker resolved cleanly.
+/// [`GhCli::pr_list_all`] erroring) short-circuits to `stacked_base: None`
+/// plus a warning — a network hiccup must never fail a run; refusal is
+/// reserved for the confirmed ≥2-unmerged case above, which only fires once
+/// every blocker resolved cleanly.
+///
+/// `repo_root` is passed through to [`GhCli::pr_list_all`] unchanged: a lane
+/// run targets `lane_config.repo`, not necessarily the invoking process's
+/// cwd, so `gh` must be told explicitly which repository's PRs to list (see
+/// [`GhCli::pr_list_all`]'s doc comment for the wrong-repo failure mode this
+/// avoids). All blockers are resolved against a single [`GhCli::pr_list_all`]
+/// call — one `gh` invocation per run, not one per blocker (see
+/// [`find_blocker_pr`]'s doc comment).
 pub fn resolve_blocker_stacking(
     jira: Option<&dyn JiraClient>,
     gh: &dyn GhCli,
+    repo_root: &Path,
     ticket: Option<&str>,
 ) -> Result<BlockerResolution, RunLaneError> {
     let Some(jira) = jira else {
@@ -548,18 +559,18 @@ pub fn resolve_blocker_stacking(
         return Ok(BlockerResolution::default());
     }
 
+    let prs = match gh.pr_list_all(repo_root) {
+        Ok(prs) => prs,
+        Err(err) => {
+            return Ok(BlockerResolution::warning(format!(
+                "warning: could not resolve PRs for blockers of {ticket} ({err}) — using normal base"
+            )));
+        }
+    };
+
     let mut unmerged = Vec::new();
     for blocker in blockers {
-        let pr = match find_blocker_pr(gh, &blocker.key) {
-            Ok(pr) => pr,
-            Err(err) => {
-                return Ok(BlockerResolution::warning(format!(
-                    "warning: could not resolve PR for blocker {} ({err}) — using normal base",
-                    blocker.key
-                )));
-            }
-        };
-        match pr {
+        match find_blocker_pr(&prs, &blocker.key) {
             Some(pr) if pr.lifecycle == PrLifecycle::Merged => {}
             Some(pr) if pr.lifecycle == PrLifecycle::Open => unmerged.push(UnmergedBlocker {
                 key: blocker.key.clone(),
@@ -731,7 +742,7 @@ pub fn prepare_run_lane(
     // must never be second-guessed by blocker logic. See
     // resolve_blocker_stacking's doc comment for the full decision table.
     let blocker_resolution = if request.from_base.is_none() {
-        resolve_blocker_stacking(deps.jira, deps.gh, request.ticket.as_deref())?
+        resolve_blocker_stacking(deps.jira, deps.gh, &repo_root, request.ticket.as_deref())?
     } else {
         BlockerResolution::default()
     };
@@ -2478,20 +2489,22 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
         let gh = FakeGhCli::new();
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, None).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), None).unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
-        assert_eq!(gh.pr_list_all_calls(), 0);
+        assert!(gh.pr_list_all_calls().is_empty());
     }
 
     #[test]
     fn resolve_blocker_stacking_no_jira_client_never_calls_gh() {
         let gh = FakeGhCli::new();
 
-        let resolution = resolve_blocker_stacking(None, &gh, Some("AX-1")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(None, &gh, Path::new("/repo"), Some("AX-1")).unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
-        assert_eq!(gh.pr_list_all_calls(), 0);
+        assert!(gh.pr_list_all_calls().is_empty());
     }
 
     #[test]
@@ -2499,7 +2512,8 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
         let gh = FakeGhCli::new();
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-1")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-1")).unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
     }
@@ -2515,7 +2529,8 @@ mod tests {
             PrLifecycle::Merged,
         )]));
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
     }
@@ -2531,7 +2546,10 @@ mod tests {
             PrLifecycle::Open,
         )]));
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+        let repo_root = Path::new("/repo");
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, repo_root, Some("AX-2")).unwrap();
+        assert_eq!(gh.pr_list_all_calls(), vec![repo_root.to_path_buf()]);
 
         assert_eq!(
             resolution.stacked_base,
@@ -2554,7 +2572,8 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
         let gh = FakeGhCli::new(); // no PR configured -> pr_list_all returns []
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
@@ -2576,7 +2595,8 @@ mod tests {
         // AX-411 has no matching PR at all; AX-410 has an open one — either
         // way both are unmerged, so this must refuse.
 
-        let err = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap_err();
+        let err = resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2"))
+            .unwrap_err();
 
         match err {
             RunLaneError::MultipleUnmergedBlockers { ticket, blockers } => {
@@ -2594,12 +2614,13 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue_not_found("AX-2");
         let gh = FakeGhCli::new();
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
         assert!(resolution.messages[0].contains("warning"));
-        assert_eq!(gh.pr_list_all_calls(), 0);
+        assert!(gh.pr_list_all_calls().is_empty());
     }
 
     #[test]
@@ -2613,7 +2634,8 @@ mod tests {
             stderr: "not authenticated".to_string(),
         }));
 
-        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
@@ -2667,6 +2689,11 @@ mod tests {
 
         prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
 
+        // gh must be asked about lane_config.repo (repo_root), not whatever
+        // directory the test process happens to be running in — see
+        // GhCli::pr_list_all's doc comment on the wrong-repo failure mode.
+        assert_eq!(gh.pr_list_all_calls(), vec![repo_root.clone()]);
+
         let calls = git.switch_new_branch_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].base, "origin/jowi-dev/ax-410-add-connector");
@@ -2719,7 +2746,7 @@ mod tests {
 
         prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
 
-        assert_eq!(gh.pr_list_all_calls(), 0);
+        assert!(gh.pr_list_all_calls().is_empty());
         let calls = git.switch_new_branch_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].base, "origin/staging");
