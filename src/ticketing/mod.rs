@@ -66,6 +66,15 @@
 //! [`JiraClient::delete_link`]. No matching `Blocks` link between the pair is
 //! a hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
 //! non-`Blocks` link found between them instead.
+//!
+//! [`search_tickets`] (`tm ticket search <TEXT>`) is a read-only discovery
+//! query, unrelated to a pull request: it searches
+//! [`Config::default_project_key`] for non-`Done` tickets matching `TEXT`
+//! (via [`ticket_search_jql`]), for a caller to sweep for potential
+//! blockers/duplicates before creating a new ticket. An empty/all-whitespace
+//! `TEXT` is rejected up front as [`TicketingError::EmptySearchText`], the
+//! same "don't send a meaningless match-everything query" rationale as
+//! [`TicketingError::EmptyAssigneeName`].
 
 use thiserror::Error;
 
@@ -74,7 +83,7 @@ use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
-use crate::jira::jql::ready_candidates_jql;
+use crate::jira::jql::{ready_candidates_jql, ticket_search_jql};
 use crate::jira::types::{
     CreateIssueRequest, CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue,
     RemoteLinkRequest,
@@ -217,6 +226,17 @@ pub enum TicketingError {
         /// The issue key that was to be assigned.
         key: String,
     },
+
+    /// `tm ticket search <TEXT>` was given an empty (or all-whitespace)
+    /// `TEXT`.
+    ///
+    /// Rejected explicitly rather than left to Jira's `text ~ ""` clause,
+    /// whose behavior is unhelpful/undefined for tskmstr's purposes here —
+    /// mirrors [`TicketingError::EmptyAssigneeName`]'s rationale for
+    /// rejecting an empty match target up front instead of sending it to the
+    /// API.
+    #[error("search text must not be empty")]
+    EmptySearchText,
 
     /// `tm ticket unlink <KEY> <OTHER>` found no `Blocks`-type link between
     /// `key` and `other`, in either direction. Unlike [`open_blockers`],
@@ -831,6 +851,27 @@ pub fn check_ready(jira: &dyn JiraClient, key: &str) -> Result<ReadyCheck, Ticke
         status_name,
         open_blockers,
     })
+}
+
+/// `tm ticket search <TEXT>`: search [`Config::default_project_key`] for
+/// open tickets whose text matches `text`, most recently updated first (via
+/// [`ticket_search_jql`]).
+///
+/// Fails with [`TicketingError::EmptySearchText`] if `text` is empty or
+/// all-whitespace, mirroring [`assign_ticket`]'s [`TicketingError::EmptyAssigneeName`]
+/// check: an empty search is never a meaningful request, and Jira's `text ~
+/// ""` behavior for it isn't worth relying on.
+pub fn search_tickets(
+    jira: &dyn JiraClient,
+    config: &Config,
+    text: &str,
+) -> Result<Vec<Issue>, TicketingError> {
+    if text.trim().is_empty() {
+        return Err(TicketingError::EmptySearchText);
+    }
+    let jql = ticket_search_jql(&config.default_project_key, text);
+    let result = jira.search(&jql)?;
+    Ok(result.issues)
 }
 
 /// Extract the project key prefix from an issue key, e.g. `PROJ` from
@@ -2812,6 +2853,66 @@ mod tests {
         match err {
             TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
             other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_tickets_returns_search_results_in_order() {
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1"), issue("PROJ-2")]));
+        let cfg = config();
+
+        let issues = search_tickets(&jira, &cfg, "login bug").expect("should succeed");
+
+        assert_eq!(
+            issues.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+            vec!["PROJ-1".to_string(), "PROJ-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn search_tickets_with_no_matches_is_empty() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![]));
+        let cfg = config();
+
+        let issues = search_tickets(&jira, &cfg, "login bug").expect("should succeed");
+
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn search_tickets_rejects_empty_text() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+
+        let err = search_tickets(&jira, &cfg, "").expect_err("empty text should fail");
+
+        assert!(matches!(err, TicketingError::EmptySearchText));
+    }
+
+    #[test]
+    fn search_tickets_rejects_whitespace_only_text() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+
+        let err = search_tickets(&jira, &cfg, "   ").expect_err("whitespace-only text should fail");
+
+        assert!(matches!(err, TicketingError::EmptySearchText));
+    }
+
+    #[test]
+    fn search_tickets_propagates_search_error() {
+        let jira = FakeJiraClient::new().with_search_error(500, "boom");
+        let cfg = config();
+
+        let err = search_tickets(&jira, &cfg, "login bug").expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::Api { status, message }) => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
 }
