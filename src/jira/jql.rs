@@ -48,11 +48,36 @@ pub fn ready_candidates_jql() -> String {
     "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC".to_string()
 }
 
+/// Escape `text` for embedding in a double-quoted JQL string literal:
+/// backslashes first (so a later-escaped quote doesn't get re-escaped), then
+/// double quotes. Without this, a search term containing `"` would either
+/// break out of the JQL string literal or produce a syntax error from the
+/// Jira API.
+fn escape_jql_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The JQL query used by `tm ticket search <TEXT>` to find open tickets in
+/// `project_key` whose text (summary, description, comments — whatever
+/// Jira's `text ~` operator indexes) matches `text`.
+///
+/// `text` is escaped via [`escape_jql_string`] before being embedded in the
+/// query's string literal, so search terms containing `"` or `\` can't break
+/// out of it or produce a malformed query. Ordered by `updated DESC` so the
+/// most recently touched matches surface first, the same rationale as
+/// [`unassigned_tickets_jql`]/[`everyone_tickets_jql`]/[`assignee_tickets_jql`].
+pub fn ticket_search_jql(project_key: &str, text: &str) -> String {
+    let escaped = escape_jql_string(text);
+    format!(
+        "project = {project_key} AND statusCategory != Done AND text ~ \"{escaped}\" ORDER BY updated DESC"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-        ready_candidates_jql, unassigned_tickets_jql,
+        ready_candidates_jql, ticket_search_jql, unassigned_tickets_jql,
     };
 
     #[test]
@@ -100,6 +125,42 @@ mod tests {
         assert_eq!(
             ready_candidates_jql(),
             "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC"
+        );
+    }
+
+    #[test]
+    fn ticket_search_jql_scopes_to_project_and_excludes_done() {
+        assert_eq!(
+            ticket_search_jql("PROJ", "login bug"),
+            "project = PROJ AND statusCategory != Done AND text ~ \"login bug\" ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn ticket_search_jql_escapes_double_quotes_in_text() {
+        assert_eq!(
+            ticket_search_jql("PROJ", "the \"login\" bug"),
+            "project = PROJ AND statusCategory != Done AND text ~ \"the \\\"login\\\" bug\" ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn ticket_search_jql_escapes_backslashes_in_text() {
+        assert_eq!(
+            ticket_search_jql("PROJ", "C:\\path\\to\\file"),
+            "project = PROJ AND statusCategory != Done AND text ~ \"C:\\\\path\\\\to\\\\file\" ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn ticket_search_jql_escapes_backslash_before_quote_so_order_matters() {
+        // A literal `\"` in the input must become `\\\"` (an escaped
+        // backslash followed by an escaped quote), not `\\"` (which would
+        // close the JQL string literal early). This only holds if
+        // backslashes are escaped before quotes.
+        assert_eq!(
+            ticket_search_jql("PROJ", "quote: \\\""),
+            "project = PROJ AND statusCategory != Done AND text ~ \"quote: \\\\\\\"\" ORDER BY updated DESC"
         );
     }
 }
