@@ -78,6 +78,13 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
@@ -87,6 +94,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
     let clock = tskmstr::work::review_watch::SystemClock;
     let sleeper = tskmstr::work::review_watch::RealSleeper;
     let tmux = ShellTmuxOps::new();
+    let git = ShellGitOps::new();
     let cleanup_launcher = tskmstr::work::bugbot::RealCleanupLauncher {
         store: &run_store,
         tmux: &tmux,
@@ -103,6 +111,8 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         cleanup_launcher: &cleanup_launcher,
         home: &home,
         xdg_data_home: xdg_data_home.as_deref(),
+        git: &git,
+        cwd: &cwd,
     };
     let mut stdout = std::io::stdout();
 

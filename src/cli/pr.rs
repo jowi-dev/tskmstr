@@ -14,6 +14,7 @@ use crate::ticketing::{
     auto_create_and_associate, resolve_existing_key,
 };
 use crate::work::detach::{DetachError, DetachSpawner};
+use crate::work::git::{GitError, GitOps};
 use crate::work::review_watch::{self, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper};
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
@@ -68,6 +69,11 @@ pub enum PrCliError {
     /// Spawning the detached watcher failed.
     #[error(transparent)]
     Detach(#[from] DetachError),
+
+    /// A `git` shell-out failed while resolving the ticket's repo root (see
+    /// [`resolve_watch_repo_root`]).
+    #[error(transparent)]
+    Git(#[from] GitError),
 }
 
 /// Options for `tm pr create`, mirroring its CLI flags.
@@ -156,7 +162,13 @@ pub fn status(
     writeln!(out, "PR #{}: {}", pr.number, pr.url)?;
     writeln!(out, "Title: {}", pr.title)?;
 
-    match ctx.gh.pr_review_threads(pr.number) {
+    // `tm pr status` is run from inside the repo, same as `pr_view`/
+    // `current_branch` above (both ambient-cwd trait methods); `dir` here is
+    // just that same ambient cwd made explicit for `pr_review_threads`,
+    // which (unlike those two) also needs to resolve owner/repo for a REST
+    // path (see `GhCli::pr_review_threads`'s doc comment).
+    let cwd = std::env::current_dir()?;
+    match ctx.gh.pr_review_threads(&cwd, pr.number) {
         Ok(threads) => {
             let counts = count_bot_findings(&threads, &ctx.config.review_bots);
             if counts.total > 0 {
@@ -235,6 +247,13 @@ pub struct PrWatchDeps<'a> {
     pub home: &'a Path,
     /// `$XDG_DATA_HOME`, if set, for the findings-file path.
     pub xdg_data_home: Option<&'a Path>,
+    /// Git operations (real or fake), used by [`resolve_watch_repo_root`]'s
+    /// cwd-repo-root fallback when `key` has no known lane run.
+    pub git: &'a dyn GitOps,
+    /// This process's own cwd at invocation time, used by
+    /// [`resolve_watch_repo_root`]'s fallback — distinct from `home`, which
+    /// is never the right answer for a repo-scoped `gh` call.
+    pub cwd: &'a Path,
 }
 
 /// The outcome of `tm pr watch`, mapped by the CLI layer to exit codes
@@ -252,6 +271,44 @@ pub enum WatchOutcome {
     Failed,
     /// The foreground poll loop gave up after `max_wait_mins` elapsed.
     GaveUp,
+}
+
+/// Resolve the repository `tm pr watch <key>` should run every `gh` shell-out
+/// against — the same "lane config repo, falling back to cwd's repo root"
+/// shape [`crate::cli::work::resolve_repo_root`] already uses for `tm work`,
+/// applied here because `tm pr watch` has no lane argument of its own.
+///
+/// Prefers the `repo` of the most recent `kind: "lane"` run for `key` (see
+/// [`RunStore::latest_run_for_ticket_kind`]) — the ticket's lane, if it's
+/// ever been run, is a far more reliable source of truth than whatever
+/// directory this process happens to be standing in, especially since this
+/// is called both from the board (ambient cwd: wherever `tm board` was
+/// launched from) and from the re-exec'd `--foreground` detached child,
+/// whose own cwd is whatever [`watch`] resolved for the *parent* invocation
+/// and passed as [`crate::work::detach::DetachSpawner::spawn_detached`]'s
+/// `working_dir` — see that call site's comment.
+///
+/// Falls back to `cwd`'s git repo root when `key` has no `lane`-kind run, or
+/// its lane is no longer configured (docs/plans/bugbot-watch.md's ground
+/// truth: "the watcher... has no reason to run from the ticket's worktree —
+/// the ticket may not even have an active lane run"). This fallback is only
+/// correct when the caller's `cwd` really is the ticket's repo (e.g. a
+/// developer running `tm pr watch KEY` by hand from inside it); it cannot be
+/// correct for a lane-less ticket watched from the board or spawned
+/// elsewhere, which is a known gap, not engineered around here.
+fn resolve_watch_repo_root(
+    lanes: &std::collections::BTreeMap<String, crate::config::LaneConfig>,
+    run_store: &RunStore,
+    git: &dyn GitOps,
+    cwd: &Path,
+    key: &str,
+) -> Result<PathBuf, PrCliError> {
+    if let Some(run) = run_store.latest_run_for_ticket_kind(key, Some("lane"))?
+        && let Some(lane) = lanes.get(&run.lane)
+    {
+        return Ok(PathBuf::from(&lane.repo));
+    }
+    Ok(git.repo_root(cwd)?)
 }
 
 /// Directory the detached watcher's log file lives in:
@@ -297,7 +354,15 @@ pub fn watch(
     foreground: bool,
     out: &mut dyn Write,
 ) -> Result<WatchOutcome, PrCliError> {
-    let prs = ctx.gh.pr_list()?;
+    let repo_root = resolve_watch_repo_root(
+        &ctx.config.work.lanes,
+        deps.run_store,
+        deps.git,
+        deps.cwd,
+        key,
+    )?;
+
+    let prs = ctx.gh.pr_list(&repo_root)?;
     let pr = find_pr_for_ticket(&prs, key).ok_or_else(|| PrCliError::NoPrForTicket {
         key: key.to_string(),
     })?;
@@ -324,8 +389,16 @@ pub fn watch(
             key.to_string(),
             "--foreground".to_string(),
         ];
+        // The detached `--foreground` child's cwd is `repo_root`, not
+        // `deps.home`: it re-derives its own `repo_root` via
+        // `resolve_watch_repo_root` the same way this invocation just did,
+        // and that function's cwd-fallback branch only produces a correct
+        // answer if the process's cwd is already inside the target repo.
+        // Spawning into `deps.home` (as a plain "somewhere stable to run
+        // from" choice) would make that fallback branch resolve nothing
+        // useful whenever `key` has no known lane run.
         deps.detach
-            .spawn_detached(deps.current_exe, &argv, deps.home, &log_path)?;
+            .spawn_detached(deps.current_exe, &argv, &repo_root, &log_path)?;
         writeln!(
             out,
             "watching {key} (detached; log: {})",
@@ -337,7 +410,7 @@ pub fn watch(
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: key.to_string(),
         lane: "review-watch".to_string(),
-        worktree: deps.home.to_string_lossy().into_owned(),
+        worktree: repo_root.to_string_lossy().into_owned(),
         branch: None,
         pid: Some(std::process::id()),
         kind: "review-watch".to_string(),
@@ -355,6 +428,7 @@ pub fn watch(
         run_id,
         ticket: key,
         pr_number,
+        repo_root: &repo_root,
         bot_logins: &ctx.config.review_bots,
         config: &ctx.config.work.review_watch,
         started_at_unix,
@@ -944,6 +1018,7 @@ mod tests {
 
     use crate::github::gh_cli::PrLifecycle;
     use crate::work::detach::FakeDetachSpawner;
+    use crate::work::git::FakeGitOps;
     use crate::work::review_watch::{FakeCleanupLauncher, FakeClock, FakeSleeper};
     use tempfile::tempdir;
 
@@ -951,6 +1026,7 @@ mod tests {
         RunStore::open(&dir.join("runs.db")).expect("open should succeed")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn watch_deps<'a>(
         run_store: &'a RunStore,
         detach: &'a FakeDetachSpawner,
@@ -959,6 +1035,8 @@ mod tests {
         sleeper: &'a FakeSleeper,
         cleanup: &'a FakeCleanupLauncher,
         home: &'a Path,
+        git: &'a FakeGitOps,
+        cwd: &'a Path,
     ) -> PrWatchDeps<'a> {
         PrWatchDeps {
             run_store,
@@ -969,6 +1047,8 @@ mod tests {
             cleanup_launcher: cleanup,
             home,
             xdg_data_home: None,
+            git,
+            cwd,
         }
     }
 
@@ -990,6 +1070,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = PathBuf::from("/Users/jowi");
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -998,6 +1080,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 
@@ -1038,6 +1122,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = PathBuf::from("/Users/jowi");
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -1046,6 +1132,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 
@@ -1058,6 +1146,130 @@ mod tests {
             other => panic!("expected AlreadyWatching, got {other:?}"),
         }
         assert!(detach.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_resolves_pr_list_against_the_ticket_lane_repo_not_the_process_cwd() {
+        // Regression test for the reported bug: `tm pr watch` used to call
+        // `gh.pr_list()` with no explicit dir, so it listed PRs for whatever
+        // repository the ambient process cwd happened to be — never the
+        // ticket's actual repo when launched from the board or the detached
+        // `--foreground` child. `resolve_watch_repo_root` must find AX-408's
+        // lane run and use its lane's configured repo, ignoring both `cwd`
+        // and `git.repo_root`'s fallback answer entirely.
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        run_store
+            .start_run(&StartRun {
+                ticket: "AX-408".to_string(),
+                lane: "axiom".to_string(),
+                worktree: "/worktrees/axiom-ax-408".to_string(),
+                branch: Some("jowi-dev/ax-408".to_string()),
+                pid: None,
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_with_title("[AX-408] Fix the thing")]));
+        let mut lanes = std::collections::BTreeMap::new();
+        lanes.insert(
+            "axiom".to_string(),
+            crate::config::LaneConfig {
+                repo: "/repos/axiom".to_string(),
+                prompt_file: None,
+                base_branch: None,
+                model: None,
+                max_turns: None,
+                permission_mode: None,
+            },
+        );
+        let cfg = Config {
+            work: crate::config::WorkConfig {
+                lanes,
+                ..crate::config::WorkConfig::default()
+            },
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = PathBuf::from("/Users/jowi");
+        // The board's own cwd and the git fallback's answer are both
+        // deliberately something *other* than the lane's repo, so this
+        // test fails if the lane-run lookup is skipped in favor of either.
+        let git = FakeGitOps::new().with_repo_root(Ok(PathBuf::from("/wrong-cwd-repo")));
+        let cwd = PathBuf::from("/home/jowi/wherever-the-board-was-launched-from");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+            &git,
+            &cwd,
+        );
+        let mut out = Vec::new();
+
+        watch(&ctx, &deps, "AX-408", false, &mut out).expect("should resolve and detach");
+
+        assert_eq!(
+            gh.pr_list_calls(),
+            vec![PathBuf::from("/repos/axiom")],
+            "gh pr list must be shelled out against the ticket's lane repo, not cwd"
+        );
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/repos/axiom"));
+    }
+
+    #[test]
+    fn watch_falls_back_to_git_repo_root_of_cwd_when_ticket_has_no_lane_run() {
+        // Ground truth from docs/plans/bugbot-watch.md: a watched ticket may
+        // have no active lane run at all. In that case the only reasonable
+        // source of truth left is the invoking process's own cwd.
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_list(Ok(vec![pr_with_title("[PROJ-9] Fix it")]));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = PathBuf::from("/Users/jowi");
+        let git = FakeGitOps::new().with_repo_root(Ok(PathBuf::from("/repos/fallback")));
+        let cwd = PathBuf::from("/repos/fallback/subdir");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+            &git,
+            &cwd,
+        );
+        let mut out = Vec::new();
+
+        watch(&ctx, &deps, "PROJ-9", false, &mut out).expect("should resolve and detach");
+
+        assert_eq!(gh.pr_list_calls(), vec![PathBuf::from("/repos/fallback")]);
     }
 
     #[test]
@@ -1079,6 +1291,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -1087,6 +1301,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 
@@ -1110,7 +1326,12 @@ mod tests {
                 "--foreground".to_string(),
             ]
         );
-        assert_eq!(recorded[0].working_dir, home);
+        // The detached child's cwd is the resolved repo root (here, the
+        // `FakeGitOps` fallback repo root, since no lane run exists for
+        // PROJ-372), never `home` — see `resolve_watch_repo_root`'s doc
+        // comment on why `home` would leave the fallback branch unable to
+        // resolve anything.
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/repo"));
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("watching PROJ-372"));
@@ -1137,6 +1358,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -1145,6 +1368,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 
@@ -1186,6 +1411,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -1194,6 +1421,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 
@@ -1234,6 +1463,8 @@ mod tests {
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
         let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
             &run_store,
             &detach,
@@ -1242,6 +1473,8 @@ mod tests {
             &sleeper,
             &cleanup,
             &home,
+            &git,
+            &cwd,
         );
         let mut out = Vec::new();
 

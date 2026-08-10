@@ -201,7 +201,13 @@ fn bot_finding_annotations(
 ) -> Result<HashMap<String, usize>, ReadyCliError> {
     let mut annotations = HashMap::new();
 
-    let prs = match ctx.gh.pr_list() {
+    // `tm ready` is run from inside the repo, so its own process cwd is the
+    // right `dir` to shell `gh` against — see `GhCli::pr_list`'s doc
+    // comment on why this argument exists at all (`tm pr watch`'s detached,
+    // not-necessarily-in-repo case, not this one).
+    let cwd = std::env::current_dir()?;
+
+    let prs = match ctx.gh.pr_list(&cwd) {
         Ok(prs) => prs,
         Err(err) => {
             writeln!(out, "warning: could not check bot findings: {err}")?;
@@ -214,7 +220,7 @@ fn bot_finding_annotations(
         let Some(number) = matching_pr_number(&prs, &issue.key) else {
             continue;
         };
-        match ctx.gh.pr_review_threads(number) {
+        match ctx.gh.pr_review_threads(&cwd, number) {
             Ok(threads) => {
                 let counts = count_bot_findings(&threads, ctx.review_bots);
                 if counts.unresolved > 0 {
@@ -245,7 +251,9 @@ fn print_bot_finding_note(
     key: &str,
     out: &mut dyn Write,
 ) -> Result<(), ReadyCliError> {
-    let prs = match ctx.gh.pr_list() {
+    let cwd = std::env::current_dir()?;
+
+    let prs = match ctx.gh.pr_list(&cwd) {
         Ok(prs) => prs,
         Err(err) => {
             writeln!(out, "warning: could not check bot findings: {err}")?;
@@ -257,7 +265,7 @@ fn print_bot_finding_note(
         return Ok(());
     };
 
-    match ctx.gh.pr_review_threads(number) {
+    match ctx.gh.pr_review_threads(&cwd, number) {
         Ok(threads) => {
             let counts = count_bot_findings(&threads, ctx.review_bots);
             if counts.unresolved > 0 {

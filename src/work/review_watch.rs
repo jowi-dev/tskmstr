@@ -147,6 +147,12 @@ pub struct PollRequest<'a> {
     pub ticket: &'a str,
     /// The pull request number being watched.
     pub pr_number: u64,
+    /// The repository root every `gh` call in this loop is shelled out
+    /// against (`.current_dir(repo_root)`) — see
+    /// [`crate::cli::pr::resolve_watch_repo_root`]'s doc comment for how
+    /// this is resolved. Necessary because this loop runs detached, with no
+    /// guarantee its own ambient cwd is the ticket's repo.
+    pub repo_root: &'a Path,
     /// Configured bot logins (`[review_bots]`), reused as-is for both the
     /// "bots have reviewed" predicate and the findings tally.
     pub bot_logins: &'a [String],
@@ -214,7 +220,7 @@ pub enum PollOutcome {
 /// [`PollError`] rather than being swallowed, so [`run_poll_loop`] can log it
 /// and count it toward the give-up backoff.
 pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutcome, PollError> {
-    let lifecycle = deps.gh.pr_state(req.pr_number)?;
+    let lifecycle = deps.gh.pr_state(req.repo_root, req.pr_number)?;
     if matches!(lifecycle, PrLifecycle::Merged | PrLifecycle::Closed) {
         let reason = if lifecycle == PrLifecycle::Merged {
             "merged"
@@ -236,13 +242,13 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
         return Ok(TickOutcome::Finished(PollOutcome::Handled));
     }
 
-    let reviews = deps.gh.pr_reviews(req.pr_number)?;
+    let reviews = deps.gh.pr_reviews(req.repo_root, req.pr_number)?;
     if !bots_have_reviewed(&reviews, req.bot_logins) {
         deps.store.add_event(req.run_id, "bot_poll", None)?;
         return Ok(TickOutcome::Continue);
     }
 
-    let threads = deps.gh.pr_review_threads(req.pr_number)?;
+    let threads = deps.gh.pr_review_threads(req.repo_root, req.pr_number)?;
     let counts = count_bot_findings(&threads, req.bot_logins);
     deps.store.add_event(
         req.run_id,
@@ -264,7 +270,9 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
         return Ok(TickOutcome::Finished(PollOutcome::Handled));
     }
 
-    let details = deps.gh.pr_bot_finding_details(req.pr_number)?;
+    let details = deps
+        .gh
+        .pr_bot_finding_details(req.repo_root, req.pr_number)?;
     let findings = bot_finding_details(&details, req.bot_logins);
     let path = findings_file_path(req.home, req.xdg_data_home, req.ticket);
     write_findings_file(&path, &findings)?;
@@ -567,6 +575,7 @@ mod tests {
                 run_id: self.run_id,
                 ticket: "PROJ-1",
                 pr_number: 42,
+                repo_root: &self.home,
                 bot_logins: &[],
                 config: &self.cfg,
                 started_at_unix: 1_000,

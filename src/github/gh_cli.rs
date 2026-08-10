@@ -122,7 +122,14 @@ pub trait GhCli {
     /// documented on [`crate::jira::client::JiraClient::search`] and is
     /// sufficient for tskmstr's current use (bot review findings rarely
     /// exceed one page of threads).
-    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError>;
+    ///
+    /// `dir` is an explicit repo root, shelled out against via
+    /// `.current_dir(dir)`, for the same reason documented on
+    /// [`GhCli::pr_list_all`]: callers (`tm pr status`, `tm ready`, and `tm pr
+    /// watch`'s poll loop) don't all run with the target repo as the ambient
+    /// cwd, and this method's own `gh repo view` owner/repo resolution would
+    /// silently resolve the wrong repository (or fail outright) otherwise.
+    fn pr_review_threads(&self, dir: &Path, number: u64) -> Result<Vec<ReviewThread>, GhError>;
 
     /// List the review submissions on pull request `number`, one entry per
     /// review regardless of how many comments (if any) it left.
@@ -133,11 +140,19 @@ pub trait GhCli {
     /// logins *with* the `[bot]` suffix. This is the only way to see that a
     /// bot has run at all: a bot that finds nothing posts a review with zero
     /// comments, leaving no trace in review-thread data.
-    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError>;
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment — this method's `tm pr
+    /// watch` poll-loop caller runs detached, not necessarily inside the
+    /// target repo.
+    fn pr_reviews(&self, dir: &Path, number: u64) -> Result<Vec<PrReview>, GhError>;
 
     /// The lifecycle state of pull request `number` (`gh pr view <number>
     /// --json state,merged`).
-    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError>;
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn pr_state(&self, dir: &Path, number: u64) -> Result<PrLifecycle, GhError>;
 
     /// List the review threads on pull request `number`, same as
     /// [`GhCli::pr_review_threads`] but with each thread's first comment's
@@ -145,15 +160,32 @@ pub trait GhCli {
     /// session prompt. A separate GraphQL query from
     /// [`GhCli::pr_review_threads`]'s: that counting path never needed
     /// comment bodies/locations, so this doesn't touch it.
-    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError>;
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn pr_bot_finding_details(
+        &self,
+        dir: &Path,
+        number: u64,
+    ) -> Result<Vec<FindingDetail>, GhError>;
 
-    /// List open pull requests in the current repository, fetching the same
-    /// fields as [`GhCli::pr_view`] (`gh pr list --state open --json
-    /// number,url,title,body,headRefName`) so one [`PrInfo`] parser serves
-    /// both and callers like [`super::pr::find_pr_for_ticket`] have the
-    /// title/body/branch data they need to resolve a ticket key without a
-    /// second lookup.
-    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError>;
+    /// List open pull requests in the repository rooted at `dir`, fetching
+    /// the same fields as [`GhCli::pr_view`] (`gh pr list --state open
+    /// --limit 200 --json number,url,title,body,headRefName`) so one
+    /// [`PrInfo`] parser serves both and callers like
+    /// [`super::pr::find_pr_for_ticket`] have the title/body/branch data they
+    /// need to resolve a ticket key without a second lookup.
+    ///
+    /// `dir` is an explicit repo root, shelled out against via
+    /// `.current_dir(dir)`, same rationale as [`GhCli::pr_list_all`]'s doc
+    /// comment: `tm pr watch`'s ticket-to-PR resolution is the original
+    /// motivating case — the board and the detached `--foreground` child both
+    /// run with an ambient cwd that is not reliably the ticket's repo. `tm
+    /// ready` and `tm pr status` pass their own process cwd, unaffected in
+    /// the normal case of running `tm` from inside the repo. `--limit 200`
+    /// (rather than `gh`'s default of 30) so a repo with more than 30 open
+    /// PRs doesn't silently hide the one being searched for.
+    fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError>;
 
     /// The login of the currently authenticated `gh` user
     /// (`gh api user -q .login`), used by `tm work run`'s branch-owner
@@ -278,13 +310,16 @@ impl Default for ShellGhCli {
 }
 
 impl ShellGhCli {
-    /// Resolve the current repository's owner and name (`gh repo view --json
-    /// owner,name`), shared by [`GhCli::pr_review_threads`] and
-    /// [`GhCli::pr_reviews`], both of which need it to build a REST/GraphQL
-    /// path for the repository.
-    fn resolve_repo(&self) -> Result<RepoRef, GhError> {
+    /// Resolve `dir`'s repository owner and name (`gh repo view --json
+    /// owner,name`), shared by [`GhCli::pr_review_threads`],
+    /// [`GhCli::pr_reviews`], and [`GhCli::pr_bot_finding_details`], all of
+    /// which need it to build a REST/GraphQL path for the repository. `dir`
+    /// is shelled out against via `.current_dir(dir)` rather than the
+    /// ambient cwd — see [`GhCli::pr_review_threads`]'s doc comment.
+    fn resolve_repo(&self, dir: &Path) -> Result<RepoRef, GhError> {
         let output = Command::new("gh")
             .args(["repo", "view", "--json", "owner,name"])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh repo view".to_string(),
@@ -368,8 +403,8 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError> {
-        let repo = self.resolve_repo()?;
+    fn pr_review_threads(&self, dir: &Path, number: u64) -> Result<Vec<ReviewThread>, GhError> {
+        let repo = self.resolve_repo(dir)?;
 
         let query_arg = format!("query={REVIEW_THREADS_QUERY}");
         let owner_arg = format!("owner={}", repo.owner);
@@ -388,6 +423,7 @@ impl GhCli for ShellGhCli {
                 "-F",
                 &number_arg,
             ])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh api graphql".to_string(),
@@ -402,12 +438,13 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError> {
-        let repo = self.resolve_repo()?;
+    fn pr_reviews(&self, dir: &Path, number: u64) -> Result<Vec<PrReview>, GhError> {
+        let repo = self.resolve_repo(dir)?;
 
         let path = format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name);
         let output = Command::new("gh")
             .args(["api", &path])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh api pulls/reviews".to_string(),
@@ -421,9 +458,10 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError> {
+    fn pr_state(&self, dir: &Path, number: u64) -> Result<PrLifecycle, GhError> {
         let output = Command::new("gh")
             .args(["pr", "view", &number.to_string(), "--json", "state,merged"])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh pr view".to_string(),
@@ -437,8 +475,12 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError> {
-        let repo = self.resolve_repo()?;
+    fn pr_bot_finding_details(
+        &self,
+        dir: &Path,
+        number: u64,
+    ) -> Result<Vec<FindingDetail>, GhError> {
+        let repo = self.resolve_repo(dir)?;
 
         let query_arg = format!("query={FINDING_DETAILS_QUERY}");
         let owner_arg = format!("owner={}", repo.owner);
@@ -457,6 +499,7 @@ impl GhCli for ShellGhCli {
                 "-F",
                 &number_arg,
             ])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh api graphql".to_string(),
@@ -471,16 +514,19 @@ impl GhCli for ShellGhCli {
         )
     }
 
-    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError> {
+    fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError> {
         let output = Command::new("gh")
             .args([
                 "pr",
                 "list",
                 "--state",
                 "open",
+                "--limit",
+                "200",
                 "--json",
                 PR_VIEW_JSON_FIELDS,
             ])
+            .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
                 command: "gh pr list".to_string(),
@@ -1216,6 +1262,7 @@ pub struct FakeGhCli {
     finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
     finding_details_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrInfo>, GhError>>,
+    pr_list_calls: RefCell<Vec<PathBuf>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
@@ -1250,6 +1297,7 @@ impl Default for FakeGhCli {
             finding_details_results: RefCell::new(HashMap::new()),
             finding_details_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
+            pr_list_calls: RefCell::new(Vec::new()),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
@@ -1380,6 +1428,13 @@ impl FakeGhCli {
         self
     }
 
+    /// The `dir` arguments passed to `pr_list`, in call order — lets a test
+    /// assert the resolved repo root (not the test process's cwd) is what
+    /// gets passed, same rationale as [`FakeGhCli::pr_list_all_calls`].
+    pub fn pr_list_calls(&self) -> Vec<PathBuf> {
+        self.pr_list_calls.borrow().clone()
+    }
+
     /// Set the result `current_user_login` will return.
     pub fn with_current_user_login(self, result: Result<Option<String>, GhError>) -> Self {
         *self.current_user_login_result.borrow_mut() = result;
@@ -1433,7 +1488,7 @@ impl GhCli for FakeGhCli {
         self.current_branch_result.borrow().clone()
     }
 
-    fn pr_review_threads(&self, number: u64) -> Result<Vec<ReviewThread>, GhError> {
+    fn pr_review_threads(&self, _dir: &Path, number: u64) -> Result<Vec<ReviewThread>, GhError> {
         self.review_threads_calls.borrow_mut().push(number);
         match self.review_threads_results.borrow().get(&number) {
             Some(result) => result.clone(),
@@ -1441,7 +1496,7 @@ impl GhCli for FakeGhCli {
         }
     }
 
-    fn pr_reviews(&self, number: u64) -> Result<Vec<PrReview>, GhError> {
+    fn pr_reviews(&self, _dir: &Path, number: u64) -> Result<Vec<PrReview>, GhError> {
         self.pr_reviews_calls.borrow_mut().push(number);
         match self.pr_reviews_results.borrow().get(&number) {
             Some(result) => result.clone(),
@@ -1449,7 +1504,7 @@ impl GhCli for FakeGhCli {
         }
     }
 
-    fn pr_state(&self, number: u64) -> Result<PrLifecycle, GhError> {
+    fn pr_state(&self, _dir: &Path, number: u64) -> Result<PrLifecycle, GhError> {
         self.pr_state_calls.borrow_mut().push(number);
         match self.pr_state_results.borrow().get(&number) {
             Some(result) => result.clone(),
@@ -1457,7 +1512,11 @@ impl GhCli for FakeGhCli {
         }
     }
 
-    fn pr_bot_finding_details(&self, number: u64) -> Result<Vec<FindingDetail>, GhError> {
+    fn pr_bot_finding_details(
+        &self,
+        _dir: &Path,
+        number: u64,
+    ) -> Result<Vec<FindingDetail>, GhError> {
         self.finding_details_calls.borrow_mut().push(number);
         match self.finding_details_results.borrow().get(&number) {
             Some(result) => result.clone(),
@@ -1465,7 +1524,8 @@ impl GhCli for FakeGhCli {
         }
     }
 
-    fn pr_list(&self) -> Result<Vec<PrInfo>, GhError> {
+    fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError> {
+        self.pr_list_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_result.borrow().clone()
     }
 
@@ -1926,14 +1986,20 @@ mod tests {
         }];
         let fake = FakeGhCli::new().with_pr_bot_finding_details(42, Ok(details.clone()));
 
-        assert_eq!(fake.pr_bot_finding_details(42).unwrap(), details);
+        assert_eq!(
+            fake.pr_bot_finding_details(Path::new("/repo"), 42).unwrap(),
+            details
+        );
         assert_eq!(fake.pr_bot_finding_details_calls(), vec![42]);
     }
 
     #[test]
     fn fake_gh_cli_unconfigured_pr_bot_finding_details_returns_empty() {
         let fake = FakeGhCli::new();
-        assert_eq!(fake.pr_bot_finding_details(99).unwrap(), Vec::new());
+        assert_eq!(
+            fake.pr_bot_finding_details(Path::new("/repo"), 99).unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -2040,14 +2106,20 @@ mod tests {
         }];
         let fake = FakeGhCli::new().with_review_threads(42, Ok(threads.clone()));
 
-        assert_eq!(fake.pr_review_threads(42).unwrap(), threads);
+        assert_eq!(
+            fake.pr_review_threads(Path::new("/repo"), 42).unwrap(),
+            threads
+        );
         assert_eq!(fake.pr_review_threads_calls(), vec![42]);
     }
 
     #[test]
     fn fake_gh_cli_unconfigured_review_threads_returns_empty() {
         let fake = FakeGhCli::new();
-        assert_eq!(fake.pr_review_threads(99).unwrap(), Vec::new());
+        assert_eq!(
+            fake.pr_review_threads(Path::new("/repo"), 99).unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -2132,28 +2204,34 @@ mod tests {
         }];
         let fake = FakeGhCli::new().with_pr_reviews(42, Ok(reviews.clone()));
 
-        assert_eq!(fake.pr_reviews(42).unwrap(), reviews);
+        assert_eq!(fake.pr_reviews(Path::new("/repo"), 42).unwrap(), reviews);
         assert_eq!(fake.pr_reviews_calls(), vec![42]);
     }
 
     #[test]
     fn fake_gh_cli_unconfigured_pr_reviews_returns_empty() {
         let fake = FakeGhCli::new();
-        assert_eq!(fake.pr_reviews(99).unwrap(), Vec::new());
+        assert_eq!(fake.pr_reviews(Path::new("/repo"), 99).unwrap(), Vec::new());
     }
 
     #[test]
     fn fake_gh_cli_returns_configured_pr_state_for_pr_number() {
         let fake = FakeGhCli::new().with_pr_state(42, Ok(PrLifecycle::Merged));
 
-        assert_eq!(fake.pr_state(42).unwrap(), PrLifecycle::Merged);
+        assert_eq!(
+            fake.pr_state(Path::new("/repo"), 42).unwrap(),
+            PrLifecycle::Merged
+        );
         assert_eq!(fake.pr_state_calls(), vec![42]);
     }
 
     #[test]
     fn fake_gh_cli_unconfigured_pr_state_defaults_to_open() {
         let fake = FakeGhCli::new();
-        assert_eq!(fake.pr_state(99).unwrap(), PrLifecycle::Open);
+        assert_eq!(
+            fake.pr_state(Path::new("/repo"), 99).unwrap(),
+            PrLifecycle::Open
+        );
     }
 
     #[test]
@@ -2166,6 +2244,17 @@ mod tests {
             head_ref_name: "proj-372-fix".to_string(),
         }];
         let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
-        assert_eq!(fake.pr_list().unwrap(), prs);
+        assert_eq!(fake.pr_list(Path::new("/repo")).unwrap(), prs);
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_list_records_dir_of_each_call() {
+        let fake = FakeGhCli::new();
+        fake.pr_list(Path::new("/repo-a")).unwrap();
+        fake.pr_list(Path::new("/repo-b")).unwrap();
+        assert_eq!(
+            fake.pr_list_calls(),
+            vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")]
+        );
     }
 }
