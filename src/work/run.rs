@@ -78,8 +78,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::WorkConfig;
-use crate::github::gh_cli::{GhCli, GhError};
+use crate::github::gh_cli::{GhCli, GhError, PrLifecycle, PrSummary};
 use crate::jira::client::JiraClient;
+use crate::jira::types::{Issue, LinkedIssue};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::work::claude::{ClaudeInvocationInputs, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
@@ -141,6 +142,24 @@ pub enum RunLaneError {
         "could not resolve a base branch for `{0}` (no --from, lane base_branch, or origin/HEAD)"
     )]
     NoBaseBranch(String),
+
+    /// The run's ticket has two or more direct Jira `Blocks` blockers that
+    /// are not yet merged (see [`resolve_blocker_stacking`]'s decision
+    /// table). A run branch can only be stacked on one unmerged dependency
+    /// at a time, so this refuses before any run row is created rather than
+    /// guessing which blocker to build on.
+    #[error(
+        "{ticket} has {} unmerged blockers, can't stack a single run branch on more than one: {}",
+        blockers.len(),
+        blockers.join(", ")
+    )]
+    MultipleUnmergedBlockers {
+        /// The ticket the run was requested for.
+        ticket: String,
+        /// One entry per unmerged blocker, formatted as `<KEY> (PR #N open)`
+        /// or `<KEY> (no PR)`.
+        blockers: Vec<String>,
+    },
 }
 
 /// A clock abstraction supplying "now" as already-broken-down local time
@@ -377,6 +396,216 @@ fn resolve_ticket_slug(jira: Option<&dyn JiraClient>, ticket: Option<&str>) -> O
     naming::slugify_summary(&issue.fields.summary)
 }
 
+/// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
+///
+/// Unlike [`crate::ticketing::open_blockers`] (which drops blockers whose
+/// Jira status is already `done`, since it's answering "is this ticket
+/// pickable right now"), [`resolve_blocker_stacking`] needs every direct
+/// blocker no matter its Jira status: per this feature's design, a blocker's
+/// *PR* merge state — not its Jira status — is what decides whether it's
+/// "satisfied", so filtering on Jira status here would let a blocker with a
+/// stale "Done" status but an unmerged PR slip through unstacked.
+fn direct_blockers(issue: &Issue) -> Vec<&LinkedIssue> {
+    issue
+        .fields
+        .issue_links
+        .iter()
+        .filter(|link| link.link_type.name == "Blocks")
+        .filter_map(|link| link.inward_issue.as_ref())
+        .collect()
+}
+
+/// Whether a PR's head branch (`head_ref_name`, e.g.
+/// `jowi-dev/ax-410-add-connector`) belongs to the ticket keyed by
+/// `key_lower`, per the lane-branch naming convention `<owner>/<ticket-key-
+/// lowercased>-<suffix>` ([`naming::branch_name`]/[`naming::branch_name_with_slug`]).
+/// `gh pr list` has no server-side "starts after the first slash with"
+/// filter, so this is applied client-side over [`GhCli::pr_list_all`]'s
+/// results.
+fn head_branch_matches_ticket(head_ref_name: &str, key_lower: &str) -> bool {
+    match head_ref_name.split_once('/') {
+        Some((_, rest)) => rest.starts_with(&format!("{key_lower}-")),
+        None => false,
+    }
+}
+
+/// Find the PR (if any) for `blocker_key`'s lane branch: every PR returned by
+/// [`GhCli::pr_list_all`] whose head branch matches
+/// [`head_branch_matches_ticket`], preferring an open one and, among ties,
+/// the most recently updated — see [`resolve_blocker_stacking`]'s doc
+/// comment, point 1.
+fn find_blocker_pr(gh: &dyn GhCli, blocker_key: &str) -> Result<Option<PrSummary>, GhError> {
+    let key_lower = blocker_key.to_lowercase();
+    let mut matches: Vec<PrSummary> = gh
+        .pr_list_all()?
+        .into_iter()
+        .filter(|pr| head_branch_matches_ticket(&pr.head_ref_name, &key_lower))
+        .collect();
+    matches.sort_by(|a, b| {
+        let a_open = a.lifecycle == PrLifecycle::Open;
+        let b_open = b.lifecycle == PrLifecycle::Open;
+        b_open.cmp(&a_open).then(b.updated_at.cmp(&a.updated_at))
+    });
+    Ok(matches.into_iter().next())
+}
+
+/// One of a run's ticket's direct blockers, after resolving its PR — the
+/// unit [`resolve_blocker_stacking`] collects before deciding what to do.
+struct UnmergedBlocker {
+    key: String,
+    /// `Some((number, head_ref_name))` when the blocker has an open PR to
+    /// stack on; `None` when it has no PR (or only a closed, unmerged one —
+    /// treated the same as "nothing to stack on", see this module's design
+    /// doc).
+    open_pr: Option<(u64, String)>,
+}
+
+/// The outcome of [`resolve_blocker_stacking`]: an optional base-branch
+/// override plus any info/warning lines to print, in order.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlockerResolution {
+    /// `Some(base)` — always `origin/<head_ref_name>` — when exactly one
+    /// direct blocker is unmerged and has an open PR to stack on. `None`
+    /// means "use the normal base" (no blockers, a merged blocker, a
+    /// no-PR/closed-PR blocker, or Jira/gh unavailable/failing).
+    pub stacked_base: Option<String>,
+    /// Lines [`prepare_run_lane`] prints, in order — the stacking
+    /// announcement, a no-PR warning, or a resolution-failure warning.
+    pub messages: Vec<String>,
+}
+
+impl BlockerResolution {
+    /// A resolution carrying a single warning line and no base override —
+    /// every "fall back to normal base" outcome that still has something
+    /// worth telling the caller (a no-PR blocker, or a Jira/gh failure).
+    fn warning(message: String) -> Self {
+        Self {
+            stacked_base: None,
+            messages: vec![message],
+        }
+    }
+}
+
+/// Resolve whether a lane run's branch should be cut from a blocking
+/// ticket's PR branch instead of the normal base, and what (if anything) to
+/// print about it.
+///
+/// Only consulted when the run has a ticket, a Jira client is configured,
+/// and no `--from` override was given — [`prepare_run_lane`] skips calling
+/// this at all in every other case, since `--from` is an explicit "use this
+/// base" instruction that blocker logic must never second-guess.
+///
+/// For each of the ticket's *direct* `Blocks` blockers (via
+/// [`direct_blockers`] — the transitive chain is never walked: if C is
+/// blocked by B which is blocked by A, B's own branch already contains A's
+/// work by the time B's PR exists, so C only ever needs to stack on B),
+/// resolve its PR via [`find_blocker_pr`] and classify:
+/// - PR **merged** → satisfied, ignore it (Jira status is never consulted —
+///   PR merge state is the source of truth).
+/// - PR **open** → an unmerged blocker, candidate for stacking.
+/// - **No PR** (including a closed-but-unmerged one) → nothing exists yet to
+///   stack on; treated as unstackable.
+///
+/// Then, across the ticket's blockers:
+/// - **Zero** unmerged blockers → `stacked_base: None` (normal base).
+/// - **Exactly one**, with an open PR → `stacked_base:
+///   Some("origin/<head_ref_name>")`, plus an announcement line.
+/// - **Exactly one**, with no PR → `stacked_base: None`, plus a warning line
+///   (nothing to stack on yet).
+/// - **Two or more** → `Err(RunLaneError::MultipleUnmergedBlockers)`, naming
+///   every unmerged blocker and its PR state — two parallel unmerged
+///   dependencies can't both be stacked on, and this is the one case where
+///   blocker resolution refuses the run outright rather than falling back.
+///
+/// Any Jira or `gh` failure while resolving blockers (a bad `get_issue`, or
+/// [`find_blocker_pr`] erroring for any blocker) short-circuits to
+/// `stacked_base: None` plus a warning — a network hiccup must never fail a
+/// run; refusal is reserved for the confirmed ≥2-unmerged case above, which
+/// only fires once every blocker resolved cleanly.
+pub fn resolve_blocker_stacking(
+    jira: Option<&dyn JiraClient>,
+    gh: &dyn GhCli,
+    ticket: Option<&str>,
+) -> Result<BlockerResolution, RunLaneError> {
+    let Some(jira) = jira else {
+        return Ok(BlockerResolution::default());
+    };
+    let Some(ticket) = ticket else {
+        return Ok(BlockerResolution::default());
+    };
+
+    let issue = match jira.get_issue(ticket) {
+        Ok(issue) => issue,
+        Err(err) => {
+            return Ok(BlockerResolution::warning(format!(
+                "warning: could not resolve blockers for {ticket} ({err}) — using normal base"
+            )));
+        }
+    };
+
+    let blockers = direct_blockers(&issue);
+    if blockers.is_empty() {
+        return Ok(BlockerResolution::default());
+    }
+
+    let mut unmerged = Vec::new();
+    for blocker in blockers {
+        let pr = match find_blocker_pr(gh, &blocker.key) {
+            Ok(pr) => pr,
+            Err(err) => {
+                return Ok(BlockerResolution::warning(format!(
+                    "warning: could not resolve PR for blocker {} ({err}) — using normal base",
+                    blocker.key
+                )));
+            }
+        };
+        match pr {
+            Some(pr) if pr.lifecycle == PrLifecycle::Merged => {}
+            Some(pr) if pr.lifecycle == PrLifecycle::Open => unmerged.push(UnmergedBlocker {
+                key: blocker.key.clone(),
+                open_pr: Some((pr.number, pr.head_ref_name)),
+            }),
+            _ => unmerged.push(UnmergedBlocker {
+                key: blocker.key.clone(),
+                open_pr: None,
+            }),
+        }
+    }
+
+    match unmerged.len() {
+        0 => Ok(BlockerResolution::default()),
+        1 => {
+            let blocker = &unmerged[0];
+            match &blocker.open_pr {
+                Some((number, head_ref_name)) => {
+                    let base = format!("origin/{head_ref_name}");
+                    Ok(BlockerResolution {
+                        stacked_base: Some(base.clone()),
+                        messages: vec![format!(
+                            "blocked by {} (PR #{number} open) — branching from {base}",
+                            blocker.key
+                        )],
+                    })
+                }
+                None => Ok(BlockerResolution::warning(format!(
+                    "warning: blocked by {} but no PR found to stack on yet — using normal base",
+                    blocker.key
+                ))),
+            }
+        }
+        _ => Err(RunLaneError::MultipleUnmergedBlockers {
+            ticket: ticket.to_string(),
+            blockers: unmerged
+                .iter()
+                .map(|b| match &b.open_pr {
+                    Some((number, _)) => format!("{} (PR #{number} open)", b.key),
+                    None => format!("{} (no PR)", b.key),
+                })
+                .collect(),
+        }),
+    }
+}
+
 /// Resolve the prompt file path for a lane run: `--prompt` override, else
 /// the lane's configured `prompt_file`, else `~/.claude/prompts/<lane>.md`
 /// (`work.ml`'s default), `~`-expanded against `home`.
@@ -494,15 +723,35 @@ pub fn prepare_run_lane(
     let repo = repo_name(&repo_root).unwrap_or_else(|| lane.to_string());
     let wt_path = naming::worktree_path(&worktree_root.to_string_lossy(), &repo, &wt_name);
 
+    // Blocked-ticket branch-off: resolved once, up front, before step 4's
+    // worktree provisioning (which needs a base too, if the worktree is
+    // new) and step 6's branch cut both consult it — resolving it inside
+    // resolve_base itself would make the Jira/gh calls twice per run.
+    // Skipped entirely when `--from` was given: an explicit base override
+    // must never be second-guessed by blocker logic. See
+    // resolve_blocker_stacking's doc comment for the full decision table.
+    let blocker_resolution = if request.from_base.is_none() {
+        resolve_blocker_stacking(deps.jira, deps.gh, request.ticket.as_deref())?
+    } else {
+        BlockerResolution::default()
+    };
+    for message in &blocker_resolution.messages {
+        writeln!(out, "{message}")?;
+    }
+
     // Step 4: provision the worktree if it doesn't exist yet.
-    let resolve_base = |git: &dyn GitOps| -> Result<String, RunLaneError> {
+    let resolve_base = |_git: &dyn GitOps| -> Result<String, RunLaneError> {
+        if let Some(base) = blocker_resolution.stacked_base.clone() {
+            return Ok(base);
+        }
         if let Some(base) = request.from_base.clone() {
             return Ok(base);
         }
         if let Some(base) = lane_config.base_branch.clone() {
             return Ok(base);
         }
-        git.default_base(&repo_root)
+        deps.git
+            .default_base(&repo_root)
             .map_err(RunLaneError::from)
             .or(Err(RunLaneError::NoBaseBranch(lane.to_string())))
     };
@@ -783,8 +1032,12 @@ mod tests {
     use super::*;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
+    use crate::github::gh_cli::PrSummary;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory};
+    use crate::jira::types::{
+        Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
+        StatusCategory,
+    };
     use crate::runs::RunStore;
     use crate::work::git::FakeGitOps;
     use crate::work::runner::FakeProcessSpawner;
@@ -808,6 +1061,45 @@ mod tests {
                 assignee: None,
                 issue_links: vec![],
             },
+        }
+    }
+
+    /// A `Blocks`-type inward link naming `blocker_key` as blocking the
+    /// issue this is attached to (see [`IssueLink`]'s doc comment on
+    /// direction) — the shape [`direct_blockers`]/[`resolve_blocker_stacking`]
+    /// read. `blocker_status_category` lets tests seed a Jira status that
+    /// disagrees with PR state, since PR state (not Jira status) is what
+    /// resolve_blocker_stacking's decision table consults.
+    fn blocks_link(blocker_key: &str, blocker_status_category: &str) -> IssueLink {
+        IssueLink {
+            id: format!("link-{blocker_key}"),
+            link_type: IssueLinkType {
+                name: "Blocks".to_string(),
+                inward: "is blocked by".to_string(),
+                outward: "blocks".to_string(),
+            },
+            inward_issue: Some(LinkedIssue {
+                key: blocker_key.to_string(),
+                fields: LinkedIssueFields {
+                    summary: "blocker".to_string(),
+                    status: Status {
+                        name: "In Progress".to_string(),
+                        status_category: StatusCategory {
+                            key: blocker_status_category.to_string(),
+                        },
+                    },
+                },
+            }),
+            outward_issue: None,
+        }
+    }
+
+    fn pr_summary(number: u64, head_ref_name: &str, lifecycle: PrLifecycle) -> PrSummary {
+        PrSummary {
+            number,
+            head_ref_name: head_ref_name.to_string(),
+            lifecycle,
+            updated_at: "2026-08-06T00:00:00Z".to_string(),
         }
     }
 
@@ -2176,5 +2468,306 @@ mod tests {
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.pid, Some(4321));
+    }
+
+    // --- resolve_blocker_stacking: the blocked-ticket branch-off decision
+    // table (see its doc comment for the full spec). ---
+
+    #[test]
+    fn resolve_blocker_stacking_no_ticket_never_calls_jira_or_gh() {
+        let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
+        let gh = FakeGhCli::new();
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, None).unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+        assert_eq!(gh.pr_list_all_calls(), 0);
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_no_jira_client_never_calls_gh() {
+        let gh = FakeGhCli::new();
+
+        let resolution = resolve_blocker_stacking(None, &gh, Some("AX-1")).unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+        assert_eq!(gh.pr_list_all_calls(), 0);
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_no_blockers_uses_normal_base() {
+        let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
+        let gh = FakeGhCli::new();
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-1")).unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_merged_blocker_pr_uses_normal_base() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            10,
+            "jowi-dev/ax-410-add-connector",
+            PrLifecycle::Merged,
+        )]));
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_one_open_pr_blocker_stacks_on_its_head_ref() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            123,
+            "jowi-dev/ax-410-add-connector",
+            PrLifecycle::Open,
+        )]));
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+
+        assert_eq!(
+            resolution.stacked_base,
+            Some("origin/jowi-dev/ax-410-add-connector".to_string())
+        );
+        assert_eq!(resolution.messages.len(), 1);
+        assert!(resolution.messages[0].contains("AX-410"));
+        assert!(resolution.messages[0].contains("PR #123 open"));
+        assert!(
+            resolution.messages[0].contains("origin/jowi-dev/ax-410-add-connector"),
+            "message was: {}",
+            resolution.messages[0]
+        );
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_one_blocker_with_no_pr_warns_and_uses_normal_base() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new(); // no PR configured -> pr_list_all returns []
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+
+        assert_eq!(resolution.stacked_base, None);
+        assert_eq!(resolution.messages.len(), 1);
+        assert!(resolution.messages[0].contains("warning"));
+        assert!(resolution.messages[0].contains("AX-410"));
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_two_unmerged_blockers_refuses() {
+        let mut blocked = issue("AX-2", "Depends on two things");
+        blocked.fields.issue_links =
+            vec![blocks_link("AX-410", "new"), blocks_link("AX-411", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            123,
+            "jowi-dev/ax-410-add-connector",
+            PrLifecycle::Open,
+        )]));
+        // AX-411 has no matching PR at all; AX-410 has an open one — either
+        // way both are unmerged, so this must refuse.
+
+        let err = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap_err();
+
+        match err {
+            RunLaneError::MultipleUnmergedBlockers { ticket, blockers } => {
+                assert_eq!(ticket, "AX-2");
+                assert_eq!(blockers.len(), 2);
+                assert!(blockers.iter().any(|b| b.contains("AX-410")));
+                assert!(blockers.iter().any(|b| b.contains("AX-411")));
+            }
+            other => panic!("expected MultipleUnmergedBlockers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_jira_error_warns_and_uses_normal_base() {
+        let jira = FakeJiraClient::new().with_issue_not_found("AX-2");
+        let gh = FakeGhCli::new();
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+
+        assert_eq!(resolution.stacked_base, None);
+        assert_eq!(resolution.messages.len(), 1);
+        assert!(resolution.messages[0].contains("warning"));
+        assert_eq!(gh.pr_list_all_calls(), 0);
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_gh_error_warns_and_uses_normal_base() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "not authenticated".to_string(),
+        }));
+
+        let resolution = resolve_blocker_stacking(Some(&jira), &gh, Some("AX-2")).unwrap();
+
+        assert_eq!(resolution.stacked_base, None);
+        assert_eq!(resolution.messages.len(), 1);
+        assert!(resolution.messages[0].contains("warning"));
+    }
+
+    // --- prepare_run_lane wiring: blocker stacking overrides the branch's
+    // cut base, --from bypasses it entirely, and >=2 unmerged blockers
+    // refuse before any run row exists. ---
+
+    #[test]
+    fn prepare_run_lane_cuts_branch_from_stacked_blocker_base() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            123,
+            "jowi-dev/ax-410-add-connector",
+            PrLifecycle::Open,
+        )]));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-2".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        let calls = git.switch_new_branch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].base, "origin/jowi-dev/ax-410-add-connector");
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("blocked by AX-410"));
+    }
+
+    #[test]
+    fn prepare_run_lane_with_explicit_from_skips_blocker_logic_entirely() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            123,
+            "jowi-dev/ax-410-add-connector",
+            PrLifecycle::Open,
+        )]));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-2".to_string()),
+            from_base: Some("origin/staging".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(gh.pr_list_all_calls(), 0);
+        let calls = git.switch_new_branch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].base, "origin/staging");
+    }
+
+    #[test]
+    fn run_lane_fg_refuses_before_any_run_row_when_two_blockers_are_unmerged() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-2", "Depends on two things");
+        blocked.fields.issue_links =
+            vec![blocks_link("AX-410", "new"), blocks_link("AX-411", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-2".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap_err();
+
+        assert!(matches!(err, RunLaneError::MultipleUnmergedBlockers { .. }));
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+        assert_eq!(run_store.list_runs().unwrap().len(), 0);
     }
 }
