@@ -411,6 +411,7 @@ to land back on the board). Launching requires:
 [work.audit]
 dir = "~/Projects/axiom"            # required: where the session runs
 # prompt = "/ticket-audit {key}"    # optional; this is the default
+# model = "fable"                   # optional; passed as `claude --model`
 ```
 
 `dir` is the repo whose `.claude/` provides the audit skill and telemetry
@@ -418,6 +419,13 @@ hook settings; `{key}` in `prompt` is replaced with the ticket key. The
 launch pre-registers a `kind = "audit"` run, and the in-session
 `tm ticket audit <KEY>` adopts it (via `TSKMSTR_SESSION_RUN_ID`), so the
 whole conversation's telemetry lands on one run.
+
+`model` is separate from `[work].default_model`, which only applies to
+headless `tm work run` lanes. Leave it unset and the session takes whatever
+model `claude` defaults to — under an enterprise-managed model pin, that is
+the pinned model, not anything tskmstr configures. Setting it emits an
+explicit `claude --model`, which overrides that pin. Since an audit is
+where digging quality matters most, it is worth setting deliberately.
 
 Each card with a session (or a live audit run) shows a badge: `audit:
 starting` (session up, run not registered yet), `audit: running`, `audit:
@@ -462,6 +470,7 @@ Watching requires:
 [work.review_watch]
 dir = "~/Projects/axiom"          # optional; falls back to [work.audit].dir
 # prompt = "/bugbot-triage {key} {findings_file}"  # optional; this is the default
+# model = "fable"                 # optional; falls back to [work.audit].model
 # poll_secs = 45                  # optional, default 45
 # max_wait_mins = 1440            # optional, default 1440 (24h)
 # on_bots_done = "notify"         # optional, "notify" | "launch"; default "notify"

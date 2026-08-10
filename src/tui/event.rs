@@ -1838,6 +1838,7 @@ mod tests {
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            model: None,
         };
 
         let msgs = launch_audit_cmd(&deps, "PROJ-1");
@@ -1877,6 +1878,7 @@ mod tests {
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            model: None,
         };
         deps.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_has_session(Ok(true)));
 

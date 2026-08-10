@@ -136,6 +136,17 @@ pub struct RawAuditConfig {
     /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
     /// `/ticket-audit {key}` when unset.
     pub prompt: Option<String>,
+    /// Model alias passed to the launched session as `claude --model <model>`,
+    /// e.g. `fable`. Deliberately separate from [`RawWorkConfig::default_model`],
+    /// which only governs headless `tm work run` lanes: an audit is an
+    /// interactive digging session whose model choice is worth setting
+    /// independently of the lane default.
+    ///
+    /// When unset, `claude` picks its own default — which, under an
+    /// enterprise-managed model pin, is whatever the policy pins rather than
+    /// anything tskmstr configures. Set this to launch audits on a specific
+    /// model regardless of that pin.
+    pub model: Option<String>,
 }
 
 /// Raw, partially-specified `[work.review_watch]` subsection as parsed
@@ -150,6 +161,11 @@ pub struct RawReviewWatchConfig {
     /// `{key}` and `{findings_file}` replaced. Defaults to
     /// `/bugbot-triage {key} {findings_file}` when unset.
     pub prompt: Option<String>,
+    /// Model alias passed to the launched cleanup session as
+    /// `claude --model <model>`. When unset, falls back to
+    /// [`RawAuditConfig::model`] (applied in [`merge_work`], not here — see
+    /// [`ReviewWatchConfig::model`]).
+    pub model: Option<String>,
     /// Seconds between PR polls while watching. Defaults to 45 when unset.
     pub poll_secs: Option<u64>,
     /// Minutes to keep watching before giving up. Defaults to 1440 (24h)
@@ -271,6 +287,8 @@ pub struct AuditConfig {
     pub dir: Option<String>,
     /// See [`RawAuditConfig::prompt`].
     pub prompt: Option<String>,
+    /// See [`RawAuditConfig::model`].
+    pub model: Option<String>,
 }
 
 /// Fully validated `[work.review_watch]` subsection.
@@ -289,6 +307,10 @@ pub struct ReviewWatchConfig {
     pub dir: Option<String>,
     /// See [`RawReviewWatchConfig::prompt`].
     pub prompt: Option<String>,
+    /// See [`RawReviewWatchConfig::model`]; falls back to
+    /// [`AuditConfig::model`] when unset in both global and repo
+    /// `[work.review_watch]`.
+    pub model: Option<String>,
     /// See [`RawReviewWatchConfig::poll_secs`]. Defaults to 45.
     pub poll_secs: u64,
     /// See [`RawReviewWatchConfig::max_wait_mins`]. Defaults to 1440 (24h).
@@ -303,6 +325,7 @@ impl Default for ReviewWatchConfig {
         ReviewWatchConfig {
             dir: None,
             prompt: None,
+            model: None,
             poll_secs: 45,
             max_wait_mins: 1440,
             on_bots_done: OnBotsDone::Notify,
@@ -616,12 +639,15 @@ fn merge_work(
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
     let audit = merge_audit(global.audit, repo.audit);
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
-    // Fallback applied here, not inside merge_review_watch: [work.audit] and
+    // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
-    // field, within their own section; only `dir` reaches across sections,
-    // and only once both are fully merged.
+    // field, within their own section; only `dir` and `model` reach across
+    // sections, and only once both are fully merged.
     if review_watch.dir.is_none() {
         review_watch.dir = audit.dir.clone();
+    }
+    if review_watch.model.is_none() {
+        review_watch.model = audit.model.clone();
     }
 
     let mut raw_lanes = global.lanes;
@@ -675,6 +701,7 @@ fn merge_audit(global: Option<RawAuditConfig>, repo: Option<RawAuditConfig>) -> 
     AuditConfig {
         dir: repo.dir.or(global.dir),
         prompt: repo.prompt.or(global.prompt),
+        model: repo.model.or(global.model),
     }
 }
 
@@ -684,9 +711,9 @@ fn merge_audit(global: Option<RawAuditConfig>, repo: Option<RawAuditConfig>) -> 
 /// an unrecognized `on_bots_done` value is a [`ConfigError`], not a silent
 /// default, matching other enum-shaped config values' validation posture.
 ///
-/// Does not apply the `dir`-falls-back-to-`[work.audit].dir` rule; see
-/// [`ReviewWatchConfig::dir`] and [`merge_work`], which applies it once
-/// after both subsections are merged.
+/// Does not apply the `dir`/`model`-fall-back-to-`[work.audit]` rules; see
+/// [`ReviewWatchConfig::dir`], [`ReviewWatchConfig::model`], and
+/// [`merge_work`], which applies them once after both subsections are merged.
 fn merge_review_watch(
     global: Option<RawReviewWatchConfig>,
     repo: Option<RawReviewWatchConfig>,
@@ -704,6 +731,7 @@ fn merge_review_watch(
     Ok(ReviewWatchConfig {
         dir: repo.dir.or(global.dir),
         prompt: repo.prompt.or(global.prompt),
+        model: repo.model.or(global.model),
         poll_secs: repo
             .poll_secs
             .or(global.poll_secs)
@@ -1611,6 +1639,7 @@ mod tests {
             [work.audit]
             dir = "~/Projects/axiom"
             prompt = "/ticket-audit {key}"
+            model = "opus"
 
             [work.lanes.partner-integrations]
             repo = "/Users/jowi/Projects/axiom"
@@ -1642,6 +1671,7 @@ mod tests {
             cfg.work.audit.prompt,
             Some("/ticket-audit {key}".to_string())
         );
+        assert_eq!(cfg.work.audit.model, Some("opus".to_string()));
 
         let lane = cfg
             .work
@@ -1849,6 +1879,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: Some("/global-audit {key}".to_string()),
+                model: Some("opus".to_string()),
             }),
             ..Default::default()
         };
@@ -1856,14 +1887,16 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("/repo-local/axiom".to_string()),
                 prompt: None,
+                model: None,
             }),
             ..Default::default()
         };
         let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
         // Overridden field wins.
         assert_eq!(cfg.audit.dir, Some("/repo-local/axiom".to_string()));
-        // Non-overridden field falls back to global.
+        // Non-overridden fields fall back to global.
         assert_eq!(cfg.audit.prompt, Some("/global-audit {key}".to_string()));
+        assert_eq!(cfg.audit.model, Some("opus".to_string()));
     }
 
     #[test]
@@ -1878,6 +1911,7 @@ mod tests {
             review_watch: Some(RawReviewWatchConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: Some("/global-bugbot-triage {key} {findings_file}".to_string()),
+                model: Some("fable".to_string()),
                 poll_secs: Some(30),
                 max_wait_mins: Some(600),
                 on_bots_done: Some("launch".to_string()),
@@ -1888,6 +1922,7 @@ mod tests {
             review_watch: Some(RawReviewWatchConfig {
                 dir: Some("/repo-local/axiom".to_string()),
                 prompt: None,
+                model: None,
                 poll_secs: None,
                 max_wait_mins: Some(120),
                 on_bots_done: None,
@@ -1904,6 +1939,7 @@ mod tests {
             Some("/global-bugbot-triage {key} {findings_file}".to_string())
         );
         assert_eq!(cfg.review_watch.poll_secs, 30);
+        assert_eq!(cfg.review_watch.model, Some("fable".to_string()));
         assert_eq!(cfg.review_watch.on_bots_done, OnBotsDone::Launch);
     }
 
@@ -1919,6 +1955,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                model: None,
             }),
             ..Default::default()
         };
@@ -1936,6 +1973,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                model: None,
             }),
             review_watch: Some(RawReviewWatchConfig {
                 dir: Some("~/Projects/other".to_string()),
@@ -1945,6 +1983,42 @@ mod tests {
         };
         let cfg = merge_work(Some(global), None).expect("should merge");
         assert_eq!(cfg.review_watch.dir, Some("~/Projects/other".to_string()));
+    }
+
+    #[test]
+    fn merge_work_review_watch_model_falls_back_to_audit_model_when_unset() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: None,
+                model: Some("fable".to_string()),
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None).expect("should merge");
+        assert_eq!(
+            cfg.review_watch.model,
+            Some("fable".to_string()),
+            "review_watch.model should fall back to audit.model when unset"
+        );
+    }
+
+    #[test]
+    fn merge_work_review_watch_model_set_does_not_fall_back_to_audit_model() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: None,
+                model: Some("fable".to_string()),
+            }),
+            review_watch: Some(RawReviewWatchConfig {
+                model: Some("sonnet".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None).expect("should merge");
+        assert_eq!(cfg.review_watch.model, Some("sonnet".to_string()));
     }
 
     #[test]

@@ -117,6 +117,28 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Builds the shell command line a tmux-hosted session runs: `claude` with an
+/// optional `--model` and `prompt` as its positional argument, every value
+/// [`shell_quote`]d.
+///
+/// `--model` is emitted only when `model` is `Some`, so an unconfigured launch
+/// keeps the exact command shape it had before the option existed. Passing the
+/// flag explicitly is what lets a launched session escape an
+/// enterprise-managed model pin — see [`crate::config::RawAuditConfig::model`].
+///
+/// Shared with [`crate::work::bugbot`]'s cleanup launcher, which hosts its
+/// sessions the same way.
+pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
+    match model {
+        Some(model) => format!(
+            "claude --model {} {}",
+            shell_quote(model),
+            shell_quote(prompt)
+        ),
+        None => format!("claude {}", shell_quote(prompt)),
+    }
+}
+
 /// Launches (or refuses to double-launch) a ticket-audit session for `key`.
 ///
 /// 1. Errors with [`AuditLaunchError::NotConfigured`] if `audit_cfg.dir` is
@@ -127,7 +149,8 @@ fn shell_quote(s: &str) -> String {
 ///    creates an orphaned pre-registration.
 /// 3. Otherwise pre-registers a run (`kind = "audit"`, `lane = "audit"`,
 ///    `pid = None`; see the module docs) and starts the tmux session running
-///    `claude <prompt>`, with `SESSION_RUN_ID_ENV` set to the new run's id so
+///    `claude <prompt>` (with `--model` when `audit_cfg.model` is set — see
+///    [`claude_command`]), and `SESSION_RUN_ID_ENV` set to the new run's id so
 ///    the in-session `tm ticket audit` can adopt it.
 ///
 /// `home` resolves a leading `~` in `audit_cfg.dir` via
@@ -163,7 +186,7 @@ pub fn launch_audit(
     })?;
 
     let prompt = audit_prompt(audit_cfg.prompt.as_deref(), key);
-    let command = format!("claude {}", shell_quote(&prompt));
+    let command = claude_command(audit_cfg.model.as_deref(), &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
     tmux.new_session_with_command(&session_name, &dir_str, AUDIT_WINDOW_NAME, &env, &command)?;
@@ -190,7 +213,17 @@ mod tests {
         AuditConfig {
             dir: Some(dir.to_string()),
             prompt: None,
+            model: None,
         }
+    }
+
+    /// The `command` string of the single `NewSessionWithCommand` call `tmux`
+    /// recorded, for the tests that only care about how `claude` was invoked.
+    fn launched_command(tmux: &FakeTmuxOps) -> Option<String> {
+        tmux.calls().iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        })
     }
 
     #[test]
@@ -298,15 +331,34 @@ mod tests {
         let audit_cfg = AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: Some("/custom-audit {key}".to_string()),
+            model: None,
         };
 
         launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-9").unwrap();
 
-        let calls = tmux.calls();
-        let command = calls.iter().find_map(|call| match call {
-            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
-            _ => None,
-        });
-        assert_eq!(command, Some("claude '/custom-audit PROJ-9'".to_string()));
+        assert_eq!(
+            launched_command(&tmux),
+            Some("claude '/custom-audit PROJ-9'".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_audit_passes_configured_model_to_claude() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            model: Some("opus".to_string()),
+        };
+
+        launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-9").unwrap();
+
+        assert_eq!(
+            launched_command(&tmux),
+            Some("claude --model 'opus' '/ticket-audit PROJ-9'".to_string())
+        );
     }
 }

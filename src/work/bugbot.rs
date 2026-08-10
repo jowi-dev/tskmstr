@@ -89,14 +89,6 @@ pub fn cleanup_session_name(key: &str) -> String {
     format!("tm-bugbot-{}", key.to_lowercase())
 }
 
-/// Quotes `s` as a single POSIX shell word, identical to
-/// [`crate::work::audit`]'s private helper of the same shape — needed for
-/// the same reason: [`TmuxOps::new_session_with_command`]'s `command`
-/// argument is a single string tmux hands to `$SHELL -c`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Substitutes `{key}` and `{findings_file}` in `template` (or
 /// [`DEFAULT_PROMPT_TEMPLATE`] when `template` is `None`), producing the
 /// prompt text handed to `claude` on launch. Mirrors
@@ -185,7 +177,7 @@ pub fn launch_cleanup(
 
     let findings_file = findings_file_path(req.home, req.xdg_data_home, req.key);
     let prompt = cleanup_prompt(req.cfg.prompt.as_deref(), req.key, &findings_file);
-    let command = format!("claude {}", shell_quote(&prompt));
+    let command = crate::work::audit::claude_command(req.cfg.model.as_deref(), &prompt);
     let env = [(
         crate::work::audit::SESSION_RUN_ID_ENV.to_string(),
         run_id.to_string(),
@@ -439,6 +431,45 @@ mod tests {
             command,
             Some(format!(
                 "claude '/custom-triage PROJ-9 reading {}'",
+                findings_file.to_string_lossy()
+            ))
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_passes_configured_model_to_claude() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            model: Some("fable".to_string()),
+            ..ReviewWatchConfig::default()
+        };
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            key: "PROJ-9",
+        };
+
+        launch_cleanup(&deps, &req).unwrap();
+
+        let findings_file = findings_file_path(&home, None, "PROJ-9");
+        let calls = tmux.calls();
+        let command = calls.iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            command,
+            Some(format!(
+                "claude --model 'fable' '/bugbot-triage PROJ-9 {}'",
                 findings_file.to_string_lossy()
             ))
         );
