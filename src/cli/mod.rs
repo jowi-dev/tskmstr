@@ -367,6 +367,18 @@ pub enum TicketCmd {
         #[arg(long, requires = "record")]
         notes: Option<String>,
     },
+    /// Search the configured default project for open tickets matching
+    /// `TEXT`.
+    ///
+    /// Intended for a quick sweep of non-completed tickets — spotting
+    /// potential blockers or duplicates — before creating a new one. Prints
+    /// one line per match (`KEY  STATUS  SUMMARY`), most recently updated
+    /// first, or a friendly "no matches" message if none are found. `TEXT`
+    /// must not be empty or all-whitespace.
+    Search {
+        /// Free text to search for, e.g. a ticket title or keyword.
+        text: String,
+    },
 }
 
 /// Verdicts accepted by `tm ticket audit --record`.

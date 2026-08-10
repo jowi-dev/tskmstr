@@ -1,6 +1,6 @@
 //! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
 //! ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
-//! `tm ticket update`, and `tm ticket audit`.
+//! `tm ticket update`, `tm ticket audit`, and `tm ticket search`.
 
 use std::io::Write;
 use std::path::Path;
@@ -17,7 +17,7 @@ use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
     TransitionOutcome, assign_ticket, associate_ticket, create_ticket, link_ticket, list_links,
-    list_transitions, rank_ticket, transition_ticket, unlink_ticket,
+    list_transitions, rank_ticket, search_tickets, transition_ticket, unlink_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -481,6 +481,38 @@ pub fn update(
     jira.update_description(&normalized, &description)
         .map_err(TicketingError::Jira)?;
     writeln!(out, "Description updated for {normalized}")?;
+    Ok(())
+}
+
+/// `tm ticket search <TEXT>`: search `config`'s default project for open
+/// tickets matching `text`, via [`search_tickets`].
+///
+/// Prints one line per match, `KEY  STATUS  SUMMARY`, in the search result's
+/// order (most recently updated first). Prints a friendly "no matches"
+/// message and returns `Ok(())` (exit 0) when nothing matches, rather than
+/// treating an empty result as an error — an empty sweep is a normal, useful
+/// outcome for this command's "check before creating a duplicate" purpose.
+/// An empty/all-whitespace `text` surfaces as
+/// [`TicketingError::EmptySearchText`] via [`TicketCliError::Ticketing`];
+/// any other Jira/config failure is likewise a hard error.
+pub fn search(
+    jira: &dyn JiraClient,
+    config: &Config,
+    text: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let issues = search_tickets(jira, config, text)?;
+    if issues.is_empty() {
+        writeln!(out, "No open tickets match \"{text}\".")?;
+        return Ok(());
+    }
+    for issue in &issues {
+        writeln!(
+            out,
+            "{}  {}  {}",
+            issue.key, issue.fields.status.name, issue.fields.summary
+        )?;
+    }
     Ok(())
 }
 
@@ -1527,6 +1559,69 @@ mod tests {
         match err {
             TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, .. })) => {
                 assert_eq!(status, 404)
+            }
+            other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_happy_path_prints_key_status_and_summary_per_line() {
+        let jira = FakeJiraClient::new().with_search_result(crate::jira::types::SearchResult {
+            issues: vec![issue("PROJ-1"), issue("PROJ-2")],
+            next_page_token: None,
+        });
+        let cfg = config();
+        let mut out = Vec::new();
+
+        search(&jira, &cfg, "login bug", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            "PROJ-1  To Do  Fix the thing\nPROJ-2  To Do  Fix the thing\n"
+        );
+    }
+
+    #[test]
+    fn search_with_no_matches_prints_friendly_message() {
+        let jira = FakeJiraClient::new().with_search_result(crate::jira::types::SearchResult {
+            issues: vec![],
+            next_page_token: None,
+        });
+        let cfg = config();
+        let mut out = Vec::new();
+
+        search(&jira, &cfg, "login bug", &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "No open tickets match \"login bug\".\n");
+    }
+
+    #[test]
+    fn search_rejects_empty_text() {
+        let jira = FakeJiraClient::new();
+        let cfg = config();
+        let mut out = Vec::new();
+
+        let err = search(&jira, &cfg, "   ", &mut out).expect_err("empty text should fail");
+
+        assert!(matches!(
+            err,
+            TicketCliError::Ticketing(TicketingError::EmptySearchText)
+        ));
+    }
+
+    #[test]
+    fn search_propagates_jira_search_error() {
+        let jira = FakeJiraClient::new().with_search_error(500, "boom");
+        let cfg = config();
+        let mut out = Vec::new();
+
+        let err = search(&jira, &cfg, "login bug", &mut out).expect_err("should fail");
+
+        match err {
+            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, .. })) => {
+                assert_eq!(status, 500)
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
