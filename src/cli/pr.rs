@@ -1069,7 +1069,8 @@ mod tests {
         let clock = FakeClock::at(0);
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
-        let home = PathBuf::from("/Users/jowi");
+        let home_dir = tempdir().unwrap();
+        let home = home_dir.path().to_path_buf();
         let git = FakeGitOps::new();
         let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
@@ -1121,7 +1122,8 @@ mod tests {
         let clock = FakeClock::at(0);
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
-        let home = PathBuf::from("/Users/jowi");
+        let home_dir = tempdir().unwrap();
+        let home = home_dir.path().to_path_buf();
         let git = FakeGitOps::new();
         let cwd = PathBuf::from("/repo");
         let deps = watch_deps(
@@ -1201,7 +1203,8 @@ mod tests {
         let clock = FakeClock::at(0);
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
-        let home = PathBuf::from("/Users/jowi");
+        let home_dir = tempdir().unwrap();
+        let home = home_dir.path().to_path_buf();
         // The board's own cwd and the git fallback's answer are both
         // deliberately something *other* than the lane's repo, so this
         // test fails if the lane-run lookup is skipped in favor of either.
@@ -1251,7 +1254,8 @@ mod tests {
         let clock = FakeClock::at(0);
         let sleeper = FakeSleeper::default();
         let cleanup = FakeCleanupLauncher::default();
-        let home = PathBuf::from("/Users/jowi");
+        let home_dir = tempdir().unwrap();
+        let home = home_dir.path().to_path_buf();
         let git = FakeGitOps::new().with_repo_root(Ok(PathBuf::from("/repos/fallback")));
         let cwd = PathBuf::from("/repos/fallback/subdir");
         let deps = watch_deps(
