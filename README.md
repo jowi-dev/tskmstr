@@ -73,11 +73,12 @@ tm auth status
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
-| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`), optionally with the authoritative per-model token/cost breakdown |
+| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
-| `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume` |
+| `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
+| `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`) |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
@@ -131,8 +132,8 @@ parse — a malformed emission never crashes the watch board, it just falls
 back.
 
 `tm runs watch` opens a full-screen kanban board of every run, one column
-per status (Queued, Running, Blocked, Review, Done, Failed), refreshing from
-the database every ~500ms. `h`/`l` move between columns, `j`/`k` move within
+per status (Queued, Running, Blocked, Review, Done, Failed, Interrupted),
+refreshing from the database every ~500ms. `h`/`l` move between columns, `j`/`k` move within
 a column, `Enter` opens a floating window with the selected run's full
 detail and event timeline (`j`/`k` scroll it, `Esc`/`q` closes it), `r`
 refreshes immediately, and `q`/`Esc` quits when no detail window is open. A
@@ -146,6 +147,34 @@ non-interactive one-shot view.
 Both `tm runs show` and the watch detail window print the event timeline
 newest first — the most recent event is always the first line, so you don't
 have to scroll to see what a run just did.
+
+### `Interrupted` vs. `Failed`, and recovering a run
+
+`Failed` means the agent ran and reported failure (a non-zero `claude` exit,
+or an explicit `is_error: true` in its result). `Interrupted` means the run's
+outcome couldn't be determined at all — its result JSON didn't parse, or it
+parsed but never got an `is_error` field one way or the other. That absent
+field is exactly the shape a mid-run event like a usage-limit forced model
+switch can leave behind: the turn ends gracefully (`claude` exits 0) but
+never records whether it succeeded, and treating that silence as success is
+what used to mark a still-in-flight ticket `done`.
+
+If a run lands on `Interrupted` (or was wrongly marked `done`/`failed`) and
+you want to pick it back up, reopen it first:
+
+```
+tm runs reopen PROJ-123          # or a numeric run id; --to defaults to queued
+tm runs resume PROJ-123          # claude --resume <the printed session id>
+```
+
+`tm runs reopen` only accepts a run whose status is already terminal
+(`done`/`failed`/`interrupted`) — reopening a `queued`/`running`/`blocked`/
+`review` run is a hard error, since those aren't finished yet. It defaults to
+`--to queued` rather than `--to running`: reopening straight to `running`
+would leave a pid-less row that `tm runs reap` could immediately re-mark
+failed once its (inherited, already-old) `started_at` looks stale.
+`tm runs resume` still works on a terminal run without reopening it first —
+it just warns on stderr and points here, without blocking.
 
 ### Per-model token/cost usage
 
