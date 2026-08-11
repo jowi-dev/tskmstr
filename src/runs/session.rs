@@ -315,6 +315,7 @@ pub fn register_session(
         branch: None,
         pid: env.claude_pid,
         kind: kind.to_string(),
+        log_path: None,
     })?;
     store.update_session_id(new_id, session_id)?;
 
@@ -515,6 +516,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -552,6 +554,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "create".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -585,6 +588,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -631,6 +635,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store.finish_run(pre_id, &FinishRun::default()).unwrap();

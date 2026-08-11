@@ -173,6 +173,7 @@ pub fn launch_cleanup(
         branch: None,
         pid: None,
         kind: CLEANUP_KIND.to_string(),
+        log_path: None,
     })?;
 
     let findings_file = findings_file_path(req.home, req.xdg_data_home, req.key);

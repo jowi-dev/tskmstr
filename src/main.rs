@@ -713,6 +713,7 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
                 branch,
                 pid,
                 kind,
+                log_path: None,
             };
             tskmstr::cli::runs::start(&store, &params, &mut stdout)?;
         }

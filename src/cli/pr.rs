@@ -414,6 +414,7 @@ pub fn watch(
         branch: None,
         pid: Some(std::process::id()),
         kind: "review-watch".to_string(),
+        log_path: None,
     })?;
 
     let started_at_unix = deps.clock.now_unix_secs();
@@ -1108,6 +1109,7 @@ mod tests {
                 branch: None,
                 pid: Some(1),
                 kind: "review-watch".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -1171,6 +1173,7 @@ mod tests {
                 branch: Some("jowi-dev/ax-408".to_string()),
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 

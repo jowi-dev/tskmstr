@@ -183,6 +183,7 @@ pub fn launch_audit(
         branch: None,
         pid: None,
         kind: "audit".to_string(),
+        log_path: None,
     })?;
 
     let prompt = audit_prompt(audit_cfg.prompt.as_deref(), key);

@@ -2341,6 +2341,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2407,6 +2408,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         let status = AuditStoreStatus::Open(&store);

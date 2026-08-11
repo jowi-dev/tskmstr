@@ -890,6 +890,7 @@ pub fn prepare_run_lane(
         branch: Some(branch.clone()),
         pid,
         kind: "lane".to_string(),
+        log_path: None,
     })?;
 
     // Build the claude invocation (still part of step 9's "safe to do in the

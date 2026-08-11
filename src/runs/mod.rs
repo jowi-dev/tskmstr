@@ -73,6 +73,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'lane';
     "#,
+    r#"
+    ALTER TABLE runs ADD COLUMN log_path TEXT;
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -217,6 +220,12 @@ pub struct StartRun {
     /// layer, same stance as `lane` and event `kind`; existing `tm work run`
     /// callers pass `"lane"`.
     pub kind: String,
+    /// Path of the log file this run's detached process (if any) writes its
+    /// stdout/stderr to, e.g. `~/.local/state/tskmstr/review-watch/proj-1.log`.
+    /// `None` for runs with no detached process (interactive sessions,
+    /// `tm work run --fg`) or wherever the caller doesn't yet know the path
+    /// at `start_run` time — see [`RunStore::update_log_path`] for that case.
+    pub log_path: Option<String>,
 }
 
 /// Outcome fields recorded when a run finishes.
@@ -378,6 +387,11 @@ pub struct Run {
     /// [`FinishRun::model_usage`]), if known. Parse with
     /// [`parse_model_usage`].
     pub model_usage: Option<String>,
+    /// Path of this run's detached-process log file, if recorded; see
+    /// [`StartRun::log_path`]. `None` for runs with no detached process, and
+    /// for any run started before this column existed — `tm runs logs`
+    /// falls back to the by-convention path for `kind` in that case.
+    pub log_path: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -989,8 +1003,8 @@ impl RunStore {
     pub fn start_run(&self, params: &StartRun) -> Result<i64, RunStoreError> {
         self.conn.execute(
             &format!(
-                "INSERT INTO runs (ticket, lane, status, worktree, branch, pid, kind, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {NOW_SQL})"
+                "INSERT INTO runs (ticket, lane, status, worktree, branch, pid, kind, log_path, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_SQL})"
             ),
             params![
                 params.ticket,
@@ -1000,9 +1014,33 @@ impl RunStore {
                 params.branch,
                 params.pid,
                 params.kind,
+                params.log_path,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Updates a run row's recorded `log_path` in place, without touching
+    /// status or any other column.
+    ///
+    /// Exists for callers (`tm work run`'s detached path) that only know the
+    /// log file's path *after* [`RunStore::start_run`] has already returned
+    /// a row id — mirrors [`RunStore::update_pid`]'s shape for the same
+    /// reason (the supervisor only learns its own pid after it starts).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_log_path(&self, run_id: i64, log_path: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET log_path = ?1 WHERE id = ?2",
+            params![log_path, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
     }
 
     /// Records the outcome of a finished run.
@@ -1349,7 +1387,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage,
+                blocker, pr_url, model_usage, log_path,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
@@ -1380,7 +1418,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage,
+                blocker, pr_url, model_usage, log_path,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
@@ -1402,7 +1440,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage,
+                blocker, pr_url, model_usage, log_path,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE id = ?1";
@@ -1444,7 +1482,8 @@ impl RunStore {
             blocker: row.get(16)?,
             pr_url: row.get(17)?,
             model_usage: row.get(18)?,
-            age_secs: row.get(19)?,
+            log_path: row.get(19)?,
+            age_secs: row.get(20)?,
         })
     }
 
@@ -1624,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_4() {
+    fn open_migrates_a_fresh_db_to_user_version_5() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -1632,7 +1671,101 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn log_path_column_defaults_to_null_for_rows_inserted_without_it() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/irrelevant".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.log_path, None);
+    }
+
+    #[test]
+    fn start_run_round_trips_log_path() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/irrelevant".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+                log_path: Some(
+                    "/home/user/.local/state/tskmstr/review-watch/proj-1.log".to_string(),
+                ),
+            })
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            run.log_path.as_deref(),
+            Some("/home/user/.local/state/tskmstr/review-watch/proj-1.log")
+        );
+    }
+
+    #[test]
+    fn update_log_path_overwrites_the_recorded_log_path_and_leaves_other_columns_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: Some("owner/backend-20260101".to_string()),
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .update_log_path(
+                id,
+                "/home/user/.local/state/tskmstr/work/backend-20260101.log",
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            run.log_path.as_deref(),
+            Some("/home/user/.local/state/tskmstr/work/backend-20260101.log")
+        );
+        assert_eq!(run.branch.as_deref(), Some("owner/backend-20260101"));
+    }
+
+    #[test]
+    fn update_log_path_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .update_log_path(999, "/irrelevant.log")
+            .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1678,6 +1811,7 @@ mod tests {
                 branch: Some("proj-1".to_string()),
                 pid: Some(1234),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let id2 = store
@@ -1688,6 +1822,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -1725,6 +1860,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let audit_id = store
@@ -1735,6 +1871,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -1757,6 +1894,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -1838,6 +1976,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -1894,6 +2033,7 @@ mod tests {
                 branch: None,
                 pid: Some(4242),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -1956,6 +2096,7 @@ mod tests {
                     branch: None,
                     pid: None,
                     kind: "lane".to_string(),
+                    log_path: None,
                 })
                 .unwrap();
             if status != RunStatus::Running {
@@ -2019,6 +2160,7 @@ mod tests {
                 branch: Some("owner/backend-20260101".to_string()),
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2056,6 +2198,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2095,6 +2238,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2124,6 +2268,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2142,6 +2287,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2182,6 +2328,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2215,6 +2362,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let audit_id = store
@@ -2225,6 +2373,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2248,6 +2397,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let audit_id = store
@@ -2258,6 +2408,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2297,6 +2448,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store.add_event(id, "await", None).unwrap();
@@ -2324,6 +2476,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store.add_event(id, "await", None).unwrap();
@@ -2352,6 +2505,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store.add_event(id, "await", None).unwrap();
@@ -2383,6 +2537,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store.add_event(id, "await", None).unwrap();
@@ -2429,6 +2584,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2475,6 +2631,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2537,6 +2694,7 @@ mod tests {
                     branch: None,
                     pid: None,
                     kind: "lane".to_string(),
+                    log_path: None,
                 })
                 .unwrap()
         };
@@ -2624,6 +2782,7 @@ mod tests {
                 branch: None,
                 pid: Some(4242),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -2670,6 +2829,7 @@ mod tests {
                 branch: None,
                 pid: Some(4242),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -2701,6 +2861,7 @@ mod tests {
                 branch: None,
                 pid: Some(4242),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2731,6 +2892,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         backdate_heartbeat(&store, id, 20);
@@ -2754,6 +2916,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2784,6 +2947,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2823,6 +2987,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2841,6 +3006,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -2874,6 +3040,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let second_id = store
@@ -2884,6 +3051,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2916,6 +3084,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let audit_id = store
@@ -2926,6 +3095,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2954,6 +3124,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         // Started after the lane run, but a different kind, so it must not
@@ -2966,6 +3137,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -2996,6 +3168,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "review-watch".to_string(),
+                log_path: None,
             })
             .unwrap();
         let cleanup_id = store
@@ -3006,6 +3179,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "bugbot-cleanup".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -3055,6 +3229,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -3067,6 +3242,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "create".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -3088,6 +3264,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -3116,6 +3293,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
         store
@@ -3157,6 +3335,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "audit".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -3189,6 +3368,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         let id = store
@@ -3199,6 +3379,7 @@ mod tests {
                 branch: Some("proj-1".to_string()),
                 pid: Some(4242),
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
         assert_ne!(other_id, id);
@@ -3223,6 +3404,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 
@@ -3242,6 +3424,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "lane".to_string(),
+                log_path: None,
             })
             .unwrap();
 

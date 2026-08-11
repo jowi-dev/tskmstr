@@ -619,6 +619,7 @@ mod tests {
                 branch: None,
                 pid: Some(4242),
                 kind: "review-watch".to_string(),
+                log_path: None,
             })
             .unwrap()
     }

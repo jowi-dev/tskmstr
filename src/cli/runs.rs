@@ -747,6 +747,7 @@ mod tests {
             branch: None,
             pid: None,
             kind: "lane".to_string(),
+            log_path: None,
         }
     }
 
@@ -2190,6 +2191,7 @@ mod tests {
                 branch: None,
                 pid: None,
                 kind: "bugbot-cleanup".to_string(),
+                log_path: None,
             })
             .unwrap();
 

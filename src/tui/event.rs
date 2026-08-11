@@ -1418,6 +1418,7 @@ mod tests {
             branch: None,
             pid: None,
             kind: "lane".to_string(),
+            log_path: None,
         }
     }
 
