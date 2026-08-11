@@ -77,10 +77,10 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::blocker_stacking::{self, StackDecision};
 use crate::config::WorkConfig;
-use crate::github::gh_cli::{GhCli, GhError, PrLifecycle, PrSummary};
+use crate::github::gh_cli::{GhCli, GhError};
 use crate::jira::client::JiraClient;
-use crate::jira::types::{Issue, LinkedIssue};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::work::claude::{ClaudeInvocationInputs, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
@@ -424,72 +424,6 @@ fn resolve_ticket_slug(jira: Option<&dyn JiraClient>, ticket: Option<&str>) -> O
     naming::slugify_summary(&issue.fields.summary)
 }
 
-/// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
-///
-/// Unlike [`crate::ticketing::open_blockers`] (which drops blockers whose
-/// Jira status is already `done`, since it's answering "is this ticket
-/// pickable right now"), [`resolve_blocker_stacking`] needs every direct
-/// blocker no matter its Jira status: per this feature's design, a blocker's
-/// *PR* merge state — not its Jira status — is what decides whether it's
-/// "satisfied", so filtering on Jira status here would let a blocker with a
-/// stale "Done" status but an unmerged PR slip through unstacked.
-fn direct_blockers(issue: &Issue) -> Vec<&LinkedIssue> {
-    issue
-        .fields
-        .issue_links
-        .iter()
-        .filter(|link| link.link_type.name == "Blocks")
-        .filter_map(|link| link.inward_issue.as_ref())
-        .collect()
-}
-
-/// Whether a PR's head branch (`head_ref_name`, e.g.
-/// `jowi-dev/ax-410-add-connector`) belongs to the ticket keyed by
-/// `key_lower`, per the lane-branch naming convention `<owner>/<ticket-key-
-/// lowercased>-<suffix>` ([`naming::branch_name`]/[`naming::branch_name_with_slug`]).
-/// `gh pr list` has no server-side "starts after the first slash with"
-/// filter, so this is applied client-side over [`GhCli::pr_list_all`]'s
-/// results.
-fn head_branch_matches_ticket(head_ref_name: &str, key_lower: &str) -> bool {
-    match head_ref_name.split_once('/') {
-        Some((_, rest)) => rest.starts_with(&format!("{key_lower}-")),
-        None => false,
-    }
-}
-
-/// Find the PR (if any) for `blocker_key`'s lane branch among `prs` — every
-/// entry whose head branch matches [`head_branch_matches_ticket`], preferring
-/// an open one and, among ties, the most recently updated.
-///
-/// Pure over an already-fetched PR list rather than calling
-/// [`GhCli::pr_list_all`] itself: [`resolve_blocker_stacking`] fetches once
-/// per run and calls this once per blocker, so a ticket with several
-/// blockers costs one `gh` invocation, not one per blocker.
-fn find_blocker_pr(prs: &[PrSummary], blocker_key: &str) -> Option<PrSummary> {
-    let key_lower = blocker_key.to_lowercase();
-    let mut matches: Vec<&PrSummary> = prs
-        .iter()
-        .filter(|pr| head_branch_matches_ticket(&pr.head_ref_name, &key_lower))
-        .collect();
-    matches.sort_by(|a, b| {
-        let a_open = a.lifecycle == PrLifecycle::Open;
-        let b_open = b.lifecycle == PrLifecycle::Open;
-        b_open.cmp(&a_open).then(b.updated_at.cmp(&a.updated_at))
-    });
-    matches.into_iter().next().cloned()
-}
-
-/// One of a run's ticket's direct blockers, after resolving its PR — the
-/// unit [`resolve_blocker_stacking`] collects before deciding what to do.
-struct UnmergedBlocker {
-    key: String,
-    /// `Some((number, head_ref_name))` when the blocker has an open PR to
-    /// stack on; `None` when it has no PR (or only a closed, unmerged one —
-    /// treated the same as "nothing to stack on", see this module's design
-    /// doc).
-    open_pr: Option<(u64, String)>,
-}
-
 /// The outcome of [`resolve_blocker_stacking`]: an optional base-branch
 /// override plus any info/warning lines to print, in order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -525,27 +459,25 @@ impl BlockerResolution {
 /// this at all in every other case, since `--from` is an explicit "use this
 /// base" instruction that blocker logic must never second-guess.
 ///
-/// For each of the ticket's *direct* `Blocks` blockers (via
-/// [`direct_blockers`] — the transitive chain is never walked: if C is
-/// blocked by B which is blocked by A, B's own branch already contains A's
-/// work by the time B's PR exists, so C only ever needs to stack on B),
-/// resolve its PR via [`find_blocker_pr`] and classify:
-/// - PR **merged** → satisfied, ignore it (Jira status is never consulted —
-///   PR merge state is the source of truth).
-/// - PR **open** → an unmerged blocker, candidate for stacking.
-/// - **No PR** (including a closed-but-unmerged one) → nothing exists yet to
-///   stack on; treated as unstackable.
-///
-/// Then, across the ticket's blockers:
-/// - **Zero** unmerged blockers → `stacked_base: None` (normal base).
-/// - **Exactly one**, with an open PR → `stacked_base:
+/// The actual decision table (direct blockers only — the transitive chain is
+/// never walked: if C is blocked by B which is blocked by A, B's own branch
+/// already contains A's work by the time B's PR exists, so C only ever needs
+/// to stack on B) lives in [`crate::blocker_stacking`], shared verbatim with
+/// `tm ready`'s report of the same ticket so the two can never disagree — see
+/// that module's doc comment for the incident this split fixes and the full
+/// rule. This function's job is only to fetch the inputs
+/// ([`JiraClient::get_issue`], [`GhCli::pr_list_all`]) and act on the
+/// resulting [`StackDecision`]:
+/// - [`StackDecision::Ready`] → `stacked_base: None` (normal base).
+/// - [`StackDecision::Stackable`] → `stacked_base:
 ///   Some("origin/<head_ref_name>")`, plus an announcement line.
-/// - **Exactly one**, with no PR → `stacked_base: None`, plus a warning line
-///   (nothing to stack on yet).
-/// - **Two or more** → `Err(RunLaneError::MultipleUnmergedBlockers)`, naming
-///   every unmerged blocker and its PR state — two parallel unmerged
-///   dependencies can't both be stacked on, and this is the one case where
-///   blocker resolution refuses the run outright rather than falling back.
+/// - [`StackDecision::BlockedNoPr`] → `stacked_base: None`, plus a warning
+///   line (nothing to stack on yet).
+/// - [`StackDecision::BlockedMultiple`] →
+///   `Err(RunLaneError::MultipleUnmergedBlockers)`, naming every unmerged
+///   blocker and its PR state — two parallel unmerged dependencies can't
+///   both be stacked on, and this is the one case where blocker resolution
+///   refuses the run outright rather than falling back.
 ///
 /// Any Jira failure while resolving blockers (a bad `get_issue`), or a
 /// **transient** `gh` failure from [`GhCli::pr_list_all`] (network error,
@@ -576,7 +508,7 @@ impl BlockerResolution {
 /// [`GhCli::pr_list_all`]'s doc comment for the wrong-repo failure mode this
 /// avoids). All blockers are resolved against a single [`GhCli::pr_list_all`]
 /// call — one `gh` invocation per run, not one per blocker (see
-/// [`find_blocker_pr`]'s doc comment).
+/// [`crate::blocker_stacking::find_blocker_pr`]'s doc comment).
 pub fn resolve_blocker_stacking(
     jira: Option<&dyn JiraClient>,
     gh: &dyn GhCli,
@@ -599,8 +531,7 @@ pub fn resolve_blocker_stacking(
         }
     };
 
-    let blockers = direct_blockers(&issue);
-    if blockers.is_empty() {
+    if blocker_stacking::direct_blockers(&issue).is_empty() {
         return Ok(BlockerResolution::default());
     }
 
@@ -625,52 +556,35 @@ pub fn resolve_blocker_stacking(
         }
     };
 
-    let mut unmerged = Vec::new();
-    for blocker in blockers {
-        match find_blocker_pr(&prs, &blocker.key) {
-            Some(pr) if pr.lifecycle == PrLifecycle::Merged => {}
-            Some(pr) if pr.lifecycle == PrLifecycle::Open => unmerged.push(UnmergedBlocker {
-                key: blocker.key.clone(),
-                open_pr: Some((pr.number, pr.head_ref_name)),
-            }),
-            _ => unmerged.push(UnmergedBlocker {
-                key: blocker.key.clone(),
-                open_pr: None,
-            }),
+    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
+    match blocker_stacking::decide(unmerged) {
+        StackDecision::Ready => Ok(BlockerResolution::default()),
+        StackDecision::Stackable {
+            blocker_key,
+            pr_number,
+            head_ref_name,
+        } => {
+            let base = format!("origin/{head_ref_name}");
+            Ok(BlockerResolution {
+                stacked_base: Some(base.clone()),
+                messages: vec![format!(
+                    "blocked by {blocker_key} (PR #{pr_number} open) — branching from {base}"
+                )],
+            })
         }
-    }
-
-    match unmerged.len() {
-        0 => Ok(BlockerResolution::default()),
-        1 => {
-            let blocker = &unmerged[0];
-            match &blocker.open_pr {
-                Some((number, head_ref_name)) => {
-                    let base = format!("origin/{head_ref_name}");
-                    Ok(BlockerResolution {
-                        stacked_base: Some(base.clone()),
-                        messages: vec![format!(
-                            "blocked by {} (PR #{number} open) — branching from {base}",
-                            blocker.key
-                        )],
-                    })
-                }
-                None => Ok(BlockerResolution::warning(format!(
-                    "warning: blocked by {} but no PR found to stack on yet — using normal base",
-                    blocker.key
-                ))),
-            }
+        StackDecision::BlockedNoPr { blocker } => Ok(BlockerResolution::warning(format!(
+            "warning: blocked by {} but no PR found to stack on yet — using normal base",
+            blocker.key
+        ))),
+        StackDecision::BlockedMultiple { blockers } => {
+            Err(RunLaneError::MultipleUnmergedBlockers {
+                ticket: ticket.to_string(),
+                blockers: blockers
+                    .iter()
+                    .map(blocker_stacking::format_unmerged_blocker)
+                    .collect(),
+            })
         }
-        _ => Err(RunLaneError::MultipleUnmergedBlockers {
-            ticket: ticket.to_string(),
-            blockers: unmerged
-                .iter()
-                .map(|b| match &b.open_pr {
-                    Some((number, _)) => format!("{} (PR #{number} open)", b.key),
-                    None => format!("{} (no PR)", b.key),
-                })
-                .collect(),
-        }),
     }
 }
 
@@ -1220,7 +1134,7 @@ mod tests {
     use super::*;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
-    use crate::github::gh_cli::PrSummary;
+    use crate::github::gh_cli::{PrLifecycle, PrSummary};
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
