@@ -1088,6 +1088,95 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records the outcome of a finished run the way `tm work run`'s
+    /// supervisor does (see [`crate::work::run::run_claude_and_finish`]),
+    /// without letting the supervisor's own inferred status clobber one the
+    /// in-session agent already set by calling `tm runs finish` itself
+    /// (e.g. `tm runs finish <id> --status blocked --blocker "..."` before
+    /// `claude -p` exits).
+    ///
+    /// This is deliberately a *separate* method from [`RunStore::finish_run`]
+    /// rather than a change to it: other callers (the session/audit
+    /// registration path in `crate::runs::session`, and `tm ticket audit
+    /// --record` followed by the `SessionEnd` hook) rely on `finish_run`
+    /// always writing the status they pass, and a double-finish there is
+    /// deliberately tolerated by design. Scoping the precondition to this
+    /// method keeps that behavior untouched.
+    ///
+    /// `force_status` must be `true` for an unambiguous crash signal -- a
+    /// non-zero `claude -p` exit or an explicit `is_error: true` in its
+    /// result JSON -- in which case this behaves exactly like `finish_run`:
+    /// `status` and `ended_at` are overwritten unconditionally, because a
+    /// crashed run is not "blocked" or "done" no matter what the session
+    /// claimed. Otherwise (the supervisor's own inferred `Done` or
+    /// `Interrupted`), `status` and `ended_at` are left untouched when the
+    /// row has already been finished (`ended_at IS NOT NULL`) -- the
+    /// in-session agent's deliberate status wins. Deliberately keyed off
+    /// `ended_at` rather than [`RunStatus::is_terminal`]: `finish_run`
+    /// stamps `ended_at` for *every* status it writes, including
+    /// [`RunStatus::Blocked`], which `is_terminal` does not consider
+    /// terminal (it isn't reopenable via [`RunStore::reopen_run`]) but which
+    /// is exactly the status this method exists to protect. Every other field
+    /// (`exit_code`, `session_id`, `cost_usd`, `num_turns`, `pr_url`,
+    /// `transcript`, `model_usage`) is still recorded via the same
+    /// COALESCE-a-null-doesn't-clobber semantics as `finish_run`, since the
+    /// supervisor is often the only source of that telemetry -- losing it
+    /// would be a regression even though the status write is suppressed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn finish_run_from_supervisor(
+        &self,
+        run_id: i64,
+        outcome: &FinishRun,
+        force_status: bool,
+    ) -> Result<(), RunStoreError> {
+        if force_status {
+            return self.finish_run(run_id, outcome);
+        }
+
+        let changes = self.conn.execute(
+            &format!(
+                "UPDATE runs SET
+                    status = CASE
+                        WHEN ended_at IS NOT NULL THEN status
+                        ELSE ?1
+                    END,
+                    ended_at = CASE
+                        WHEN ended_at IS NULL THEN {NOW_SQL}
+                        ELSE ended_at
+                    END,
+                    exit_code = COALESCE(?2, exit_code),
+                    session_id = COALESCE(?3, session_id),
+                    cost_usd = COALESCE(?4, cost_usd),
+                    num_turns = COALESCE(?5, num_turns),
+                    blocker = COALESCE(?6, blocker),
+                    pr_url = COALESCE(?7, pr_url),
+                    transcript = COALESCE(?8, transcript),
+                    model_usage = COALESCE(?9, model_usage)
+                 WHERE id = ?10"
+            ),
+            params![
+                outcome.status.as_str(),
+                outcome.exit_code,
+                outcome.session_id,
+                outcome.cost_usd,
+                outcome.num_turns,
+                outcome.blocker,
+                outcome.pr_url,
+                outcome.transcript,
+                outcome.model_usage,
+                run_id,
+            ],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Reopens a finished run, moving it back to `to` so it can be worked
     /// (or resumed) again.
     ///
@@ -2006,6 +2095,146 @@ mod tests {
             run.model_usage,
             Some(r#"{"claude-fable-5":{"inputTokens":1}}"#.to_string())
         );
+    }
+
+    #[test]
+    fn finish_run_from_supervisor_does_not_clobber_a_session_set_blocked_status() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("waiting on PROJ-0".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        store
+            .finish_run_from_supervisor(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    exit_code: Some(0),
+                    session_id: Some("sess-abc".to_string()),
+                    cost_usd: Some(1.23),
+                    num_turns: Some(7),
+                    ..FinishRun::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.status, RunStatus::Blocked);
+        assert_eq!(run.blocker.as_deref(), Some("waiting on PROJ-0"));
+        // Telemetry only the supervisor knows still gets recorded.
+        assert_eq!(run.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(run.cost_usd, Some(1.23));
+        assert_eq!(run.num_turns, Some(7));
+    }
+
+    #[test]
+    fn finish_run_from_supervisor_force_status_overwrites_a_session_set_status() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("waiting on PROJ-0".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        store
+            .finish_run_from_supervisor(
+                id,
+                &FinishRun {
+                    status: RunStatus::Failed,
+                    exit_code: Some(1),
+                    ..FinishRun::default()
+                },
+                true,
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn finish_run_from_supervisor_writes_status_on_a_still_running_row() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run_from_supervisor(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.status, RunStatus::Done);
+        assert!(run.ended_at.is_some());
+    }
+
+    #[test]
+    fn finish_run_from_supervisor_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .finish_run_from_supervisor(999, &FinishRun::default(), false)
+            .unwrap_err();
+        assert!(matches!(err, RunStoreError::RunNotFound(999)));
     }
 
     #[test]

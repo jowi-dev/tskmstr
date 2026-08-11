@@ -1027,7 +1027,17 @@ pub fn run_claude_and_finish(
         &prepared.branch,
         parsed.as_ref().and_then(|o| o.result.as_deref()),
     );
-    run_store.finish_run(
+    // Only a non-zero exit or an explicit `is_error: true` (both folded into
+    // `run_status == Failed` above) may clobber a status the in-session
+    // agent already set for itself via `tm runs finish` -- a crashed run is
+    // never actually "blocked" or "done". The supervisor's own inferred
+    // `Done`/`Interrupted` must defer to an already-terminal row instead.
+    // See `RunStore::finish_run_from_supervisor`'s doc comment and the
+    // regression this exists for: an agent ending its own run with
+    // `--status blocked --blocker "..."` before `claude -p` exits 0, only
+    // for this unconditional write to silently overwrite it back to `Done`.
+    let force_status = run_status == RunStatus::Failed;
+    run_store.finish_run_from_supervisor(
         prepared.run_id,
         &FinishRun {
             status: run_status,
@@ -1040,6 +1050,7 @@ pub fn run_claude_and_finish(
             transcript: Some(prepared.out_json_path.to_string_lossy().into_owned()),
             model_usage: model_usage_json,
         },
+        force_status,
     )?;
 
     // Print the summary, mirroring work.ml's final printf block.
@@ -1572,6 +1583,240 @@ mod tests {
         assert!(outcome.is_error);
         let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    /// The regression this suite exists for: the in-session agent
+    /// deliberately finishes its own run (`tm runs finish <id> --status
+    /// blocked --blocker "..."`) before `claude -p` exits 0. The
+    /// supervisor's own `run_claude_and_finish` tail must not clobber that
+    /// status back to `Done` -- but it should still fill in the telemetry
+    /// (turns, cost, session id) that only it can observe, since the
+    /// session-set outcome leaves those fields `None`.
+    #[test]
+    fn run_claude_and_finish_preserves_session_set_blocked_status_on_zero_exit() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+
+        // The in-session agent finishes its own run before `claude -p`
+        // exits.
+        run_store
+            .finish_run(
+                prepared.run_id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("waiting on AX-408 / PR #490".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        // `claude -p` then exits 0 with an `is_error: false` result -- the
+        // supervisor thinks this run is `Done`.
+        let supervisor_spawner = FakeProcessSpawner::success(canned_json());
+        let mut supervisor_out = Vec::new();
+
+        run_claude_and_finish(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &mut supervisor_out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Blocked);
+        assert_eq!(
+            run.blocker.as_deref(),
+            Some("waiting on AX-408 / PR #490")
+        );
+        // Telemetry only the supervisor can observe is still recorded.
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(run.num_turns, Some(3));
+        assert_eq!(run.cost_usd, Some(0.5));
+    }
+
+    /// Precedence must still hold in the other direction: a non-zero exit
+    /// is an unambiguous crash signal and must mark the run `Failed` even
+    /// if the in-session agent already set some other status for itself.
+    #[test]
+    fn run_claude_and_finish_nonzero_exit_overrides_session_set_status_to_failed() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+
+        run_store
+            .finish_run(
+                prepared.run_id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("waiting on something".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let supervisor_spawner = FakeProcessSpawner::with_exit_code(canned_json(), 1);
+        let mut supervisor_out = Vec::new();
+
+        run_claude_and_finish(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &mut supervisor_out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    /// Same precedence rule for the `Interrupted` classification added
+    /// alongside the absent/unparseable `is_error` handling: it must not
+    /// override a status the in-session agent already set, since an
+    /// ambiguous exit-0-but-no-`is_error` result is a weaker signal than a
+    /// deliberate `tm runs finish` call.
+    #[test]
+    fn run_claude_and_finish_does_not_interrupt_a_session_set_blocked_status() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+
+        run_store
+            .finish_run(
+                prepared.run_id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("waiting on something".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        // Exit 0, but the JSON never got an `is_error` field at all -- the
+        // supervisor would classify this as `Interrupted` on a fresh run.
+        let json = r#"{"session_id":"sess-1","result":"partial work"}"#;
+        let supervisor_spawner = FakeProcessSpawner::success(json.to_string());
+        let mut supervisor_out = Vec::new();
+
+        run_claude_and_finish(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &mut supervisor_out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Blocked);
     }
 
     #[test]
