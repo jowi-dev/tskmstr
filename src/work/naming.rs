@@ -22,6 +22,36 @@ pub fn worktree_path(worktree_root: &str, repo_name: &str, name: &str) -> PathBu
     Path::new(worktree_root).join(repo_name).join(name)
 }
 
+/// Belt-and-suspenders check for [`worktree_path`]'s empty-component
+/// hazard: `PathBuf::join("")` is a no-op, so an empty `repo_name` or
+/// `name` silently collapses the result one level short of a real
+/// worktree path — landing on `worktree_root/repo_name` (or `worktree_root`
+/// itself) rather than `worktree_root/repo_name/name`. That collapsed path
+/// is exactly a project's per-repo *worktree directory*, so a caller that
+/// doesn't catch this can end up running `git worktree add` directly into
+/// it — which is how a real incident produced a worktree checkout sitting
+/// at the root of `~/Worktrees/<repo>`, with `tm work restore` mistaking
+/// its subdirectories (`lib/`, `test/`, ...) for worktrees of their own.
+///
+/// This is deliberately independent of validating that `repo_name`/`name`
+/// are non-empty up front (see callers in `crate::work::run::prepare_run_lane`
+/// and `crate::cli::work::worktree_path_for`): callers should reject empty
+/// inputs before ever calling [`worktree_path`], and additionally re-check
+/// the *result* against this function right before `git worktree add`, so a
+/// bug in the emptiness check doesn't leave this hazard uncaught.
+///
+/// Returns `true` when `wt_path` is a real worktree path — its parent is
+/// exactly `worktree_root/repo_name`, i.e. it sits one level below the
+/// project's worktree directory, as a real worktree path always should.
+pub fn worktree_path_has_expected_parent(
+    worktree_root: &str,
+    repo_name: &str,
+    wt_path: &Path,
+) -> bool {
+    let expected_parent = Path::new(worktree_root).join(repo_name);
+    wt_path.parent() == Some(expected_parent.as_path())
+}
+
 /// Derive a tmux session name from a worktree/session directory, mirroring
 /// `work.ml`'s `session_name_of_dir`:
 ///
@@ -266,6 +296,55 @@ mod tests {
             path,
             PathBuf::from("/Users/jowi/Worktrees/axiom/partner-integrations")
         );
+    }
+
+    #[test]
+    fn worktree_path_collapses_one_level_short_on_empty_name() {
+        // Documents the hazard `worktree_path_has_expected_parent` guards
+        // against: an empty `name` makes the trailing `.join("")` a no-op,
+        // so the result lands on the project's worktree directory itself
+        // rather than a real worktree path one level below it.
+        let path = worktree_path("/Users/jowi/Worktrees", "axiom", "");
+        assert_eq!(path, PathBuf::from("/Users/jowi/Worktrees/axiom"));
+    }
+
+    #[test]
+    fn worktree_path_collapses_one_level_short_on_empty_repo_name() {
+        let path = worktree_path("/Users/jowi/Worktrees", "", "partner-integrations");
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/jowi/Worktrees/partner-integrations")
+        );
+    }
+
+    #[test]
+    fn worktree_path_has_expected_parent_true_for_a_real_worktree_path() {
+        let path = worktree_path("/Users/jowi/Worktrees", "axiom", "partner-integrations");
+        assert!(worktree_path_has_expected_parent(
+            "/Users/jowi/Worktrees",
+            "axiom",
+            &path
+        ));
+    }
+
+    #[test]
+    fn worktree_path_has_expected_parent_false_when_name_collapsed() {
+        let path = worktree_path("/Users/jowi/Worktrees", "axiom", "");
+        assert!(!worktree_path_has_expected_parent(
+            "/Users/jowi/Worktrees",
+            "axiom",
+            &path
+        ));
+    }
+
+    #[test]
+    fn worktree_path_has_expected_parent_false_when_repo_name_collapsed() {
+        let path = worktree_path("/Users/jowi/Worktrees", "", "partner-integrations");
+        assert!(!worktree_path_has_expected_parent(
+            "/Users/jowi/Worktrees",
+            "axiom",
+            &path
+        ));
     }
 
     #[test]

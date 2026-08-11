@@ -111,6 +111,24 @@ pub enum WorkCliError {
     /// `update_pid` call, outside [`RunLaneError`]'s scope).
     #[error(transparent)]
     RunStore(#[from] RunStoreError),
+
+    /// `tm work new`/`remove` was given an empty (or all-whitespace) name.
+    /// See [`worktree_path_for`]'s doc comment for why this is rejected
+    /// before ever calling `naming::worktree_path`.
+    #[error("worktree name cannot be empty")]
+    EmptyWorktreeName,
+
+    /// Belt-and-suspenders: the worktree path computed by
+    /// `naming::worktree_path` did not land exactly one level below the
+    /// project's worktree directory, as
+    /// [`naming::worktree_path_has_expected_parent`] expects. Should be
+    /// unreachable given [`WorkCliError::EmptyWorktreeName`]'s check, but
+    /// checked independently right before any `git worktree add`/`remove`.
+    #[error(
+        "refusing to touch computed worktree path {} — it does not sit one level below the expected worktree directory",
+        .0.display()
+    )]
+    WorktreePathMismatch(PathBuf),
 }
 
 /// Dependencies `tm work` subcommands need, gathered so callers don't have
@@ -162,14 +180,33 @@ fn repo_name(repo_root: &Path) -> Result<String, WorkCliError> {
 }
 
 /// Build a lane/worktree's full path, given an already-resolved repo root.
+///
+/// Rejects an empty (or all-whitespace) `name` up front: `naming::worktree_path`'s
+/// `PathBuf::join("")` no-op would otherwise silently collapse the result
+/// onto `<worktree_root>/<repo>` — the project's per-repo worktree
+/// directory — rather than a real worktree path one level below it. As a
+/// second, independent guard (a bug in the check above must not leave this
+/// uncaught), the computed path is also re-checked against
+/// [`naming::worktree_path_has_expected_parent`] before being returned to
+/// `new`/`remove`, both of which use it to provision/remove a worktree.
 fn worktree_path_for(
     ctx: &WorkContext<'_>,
     repo_root: &Path,
     name: &str,
 ) -> Result<PathBuf, WorkCliError> {
+    if name.trim().is_empty() {
+        return Err(WorkCliError::EmptyWorktreeName);
+    }
+
     let root = resolve_worktree_root(ctx);
     let repo = repo_name(repo_root)?;
-    Ok(naming::worktree_path(&root.to_string_lossy(), &repo, name))
+    let wt_path = naming::worktree_path(&root.to_string_lossy(), &repo, name);
+
+    if !naming::worktree_path_has_expected_parent(&root.to_string_lossy(), &repo, &wt_path) {
+        return Err(WorkCliError::WorktreePathMismatch(wt_path));
+    }
+
+    Ok(wt_path)
 }
 
 /// Create (or attach to an already-provisioned) session in `dir`, and
@@ -730,6 +767,35 @@ mod tests {
         assert!(printed.contains("Creating worktree:"));
         assert!(printed.contains("branch: my-lane"));
         assert!(printed.contains("Creating session:"));
+    }
+
+    #[test]
+    fn new_rejects_an_empty_name_instead_of_collapsing_the_worktree_path() {
+        // Regression test for Defect A: an empty name used to make
+        // `naming::worktree_path`'s trailing `.join("")` a no-op, landing
+        // `git worktree add` directly on `<worktree_root>/<repo>` — the
+        // project's per-repo worktree directory itself.
+        let tmp = TempDir::new().unwrap();
+        let worktree_root = tmp.path().join("Worktrees");
+        let config = WorkConfig {
+            worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
+            ..config_with_lanes(BTreeMap::new())
+        };
+        let git = FakeGitOps::new().with_repo_root(Ok(PathBuf::from("/repo/axiom")));
+        let tmux = FakeTmuxOps::new();
+        let home = tmp.path().to_path_buf();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        let err = new(&ctx, "", None, None, Path::new("/cwd"), &mut out).unwrap_err();
+
+        assert!(matches!(err, WorkCliError::EmptyWorktreeName));
+        assert!(git.provision_worktree_calls().is_empty());
     }
 
     #[test]

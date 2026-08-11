@@ -160,6 +160,30 @@ pub enum RunLaneError {
         /// or `<KEY> (no PR)`.
         blockers: Vec<String>,
     },
+
+    /// `request.ticket` was given as an empty (or all-whitespace) string.
+    /// Lowercased, this becomes the worktree/branch-name component
+    /// (`wt_name`), and `naming::worktree_path` silently collapses an empty
+    /// component via `PathBuf::join`'s no-op-on-empty-string behavior,
+    /// landing the "worktree" on the project's per-repo worktree directory
+    /// itself rather than a real worktree path. Rejected here, before
+    /// `naming::worktree_path` is ever called.
+    #[error("--ticket cannot be empty (an empty ticket collapses the worktree path)")]
+    EmptyWorktreeName,
+
+    /// Belt-and-suspenders: the worktree path computed by
+    /// `naming::worktree_path` did not land exactly one level below the
+    /// project's worktree directory as
+    /// [`naming::worktree_path_has_expected_parent`] expects. This should
+    /// be unreachable given the [`RunLaneError::EmptyWorktreeName`] check
+    /// above, but is checked independently right before any
+    /// `git worktree add` — a bug in that earlier check must not leave this
+    /// hazard uncaught.
+    #[error(
+        "refusing to provision worktree at {} — it does not sit one level below the expected worktree directory",
+        .0.display()
+    )]
+    WorktreePathMismatch(PathBuf),
 }
 
 /// A clock abstraction supplying "now" as already-broken-down local time
@@ -730,9 +754,28 @@ pub fn prepare_run_lane(
         .map(str::to_lowercase)
         .unwrap_or_else(|| lane.to_string());
 
+    // An empty ticket (`--ticket ""`) lowercases to an empty `wt_name`,
+    // which would make `naming::worktree_path`'s trailing `.join("")` a
+    // no-op and silently collapse the worktree path onto the project's
+    // worktree directory itself — see that function's doc comment. Reject
+    // it here, before it ever reaches `naming::worktree_path`.
+    if wt_name.trim().is_empty() {
+        return Err(RunLaneError::EmptyWorktreeName);
+    }
+
     let worktree_root = resolve_worktree_root(config, &paths.home);
     let repo = repo_name(&repo_root).unwrap_or_else(|| lane.to_string());
     let wt_path = naming::worktree_path(&worktree_root.to_string_lossy(), &repo, &wt_name);
+
+    // Belt-and-suspenders: re-check the *computed* path independently of
+    // the emptiness check above, right before anything below provisions a
+    // worktree at it. See `naming::worktree_path_has_expected_parent`'s doc
+    // comment for why this is a second, independent guard rather than
+    // redundant with the check above.
+    if !naming::worktree_path_has_expected_parent(&worktree_root.to_string_lossy(), &repo, &wt_path)
+    {
+        return Err(RunLaneError::WorktreePathMismatch(wt_path));
+    }
 
     // Blocked-ticket branch-off: resolved once, up front, before step 4's
     // worktree provisioning (which needs a base too, if the worktree is
