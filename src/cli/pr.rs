@@ -436,11 +436,13 @@ pub fn watch(
         xdg_data_home: deps.xdg_data_home,
     };
 
-    Ok(match review_watch::run_poll_loop(&poll_deps, &poll_req) {
-        review_watch::PollOutcome::Handled => WatchOutcome::Handled,
-        review_watch::PollOutcome::Failed => WatchOutcome::Failed,
-        review_watch::PollOutcome::GaveUp => WatchOutcome::GaveUp,
-    })
+    Ok(
+        match review_watch::run_poll_loop(&poll_deps, &poll_req, out) {
+            review_watch::PollOutcome::Handled => WatchOutcome::Handled,
+            review_watch::PollOutcome::Failed => WatchOutcome::Failed,
+            review_watch::PollOutcome::GaveUp => WatchOutcome::GaveUp,
+        },
+    )
 }
 
 #[cfg(test)]

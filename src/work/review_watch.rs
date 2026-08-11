@@ -28,6 +28,7 @@
 //!   the real implementation; `tm pr watch`'s CLI wiring (`src/main.rs`)
 //!   passes `bugbot::RealCleanupLauncher`, an adapter over it.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -219,7 +220,12 @@ pub enum PollOutcome {
 /// Any `gh`/store/filesystem failure along the way propagates as a
 /// [`PollError`] rather than being swallowed, so [`run_poll_loop`] can log it
 /// and count it toward the give-up backoff.
-pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutcome, PollError> {
+pub fn poll_once(
+    deps: &PollDeps<'_>,
+    req: &PollRequest<'_>,
+    out: &mut dyn Write,
+) -> Result<TickOutcome, PollError> {
+    let now = deps.clock.now_unix_secs();
     let lifecycle = deps.gh.pr_state(req.repo_root, req.pr_number)?;
     if matches!(lifecycle, PrLifecycle::Merged | PrLifecycle::Closed) {
         let reason = if lifecycle == PrLifecycle::Merged {
@@ -227,11 +233,10 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
         } else {
             "closed"
         };
-        deps.store.add_event(
-            req.run_id,
-            "pr_closed",
-            Some(&serde_json::json!({ "reason": reason }).to_string()),
-        )?;
+        let detail = serde_json::json!({ "reason": reason }).to_string();
+        deps.store
+            .add_event(req.run_id, "pr_closed", Some(&detail))?;
+        log_event(out, now, "pr_closed", Some(&detail));
         deps.store.finish_run(
             req.run_id,
             &FinishRun {
@@ -245,19 +250,17 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
     let reviews = deps.gh.pr_reviews(req.repo_root, req.pr_number)?;
     if !bots_have_reviewed(&reviews, req.bot_logins) {
         deps.store.add_event(req.run_id, "bot_poll", None)?;
+        log_event(out, now, "bot_poll", None);
         return Ok(TickOutcome::Continue);
     }
 
     let threads = deps.gh.pr_review_threads(req.repo_root, req.pr_number)?;
     let counts = count_bot_findings(&threads, req.bot_logins);
-    deps.store.add_event(
-        req.run_id,
-        "bots_done",
-        Some(
-            &serde_json::json!({ "total": counts.total, "unresolved": counts.unresolved })
-                .to_string(),
-        ),
-    )?;
+    let bots_done_detail =
+        serde_json::json!({ "total": counts.total, "unresolved": counts.unresolved }).to_string();
+    deps.store
+        .add_event(req.run_id, "bots_done", Some(&bots_done_detail))?;
+    log_event(out, now, "bots_done", Some(&bots_done_detail));
 
     if counts.unresolved == 0 {
         deps.store.finish_run(
@@ -276,6 +279,12 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
     let findings = bot_finding_details(&details, req.bot_logins);
     let path = findings_file_path(req.home, req.xdg_data_home, req.ticket);
     write_findings_file(&path, &findings)?;
+    log_event(
+        out,
+        now,
+        "findings_written",
+        Some(&serde_json::json!({ "path": path.display().to_string() }).to_string()),
+    );
 
     deps.store.finish_run(
         req.run_id,
@@ -309,14 +318,27 @@ pub fn poll_once(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> Result<TickOutco
 ///   the run `Failed` and returns [`PollOutcome::Failed`]. Any intervening
 ///   [`TickOutcome::Continue`] resets the counter — a single blip must not
 ///   accumulate toward an unrelated later blip.
-pub fn run_poll_loop(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> PollOutcome {
+pub fn run_poll_loop(
+    deps: &PollDeps<'_>,
+    req: &PollRequest<'_>,
+    out: &mut dyn Write,
+) -> PollOutcome {
     const MAX_CONSECUTIVE_FAILURES: u32 = 10;
     let mut consecutive_failures: u32 = 0;
 
+    log_event(
+        out,
+        deps.clock.now_unix_secs(),
+        "watch_started",
+        Some(&serde_json::json!({ "ticket": req.ticket, "pr": req.pr_number }).to_string()),
+    );
+
     loop {
-        let elapsed_secs = deps.clock.now_unix_secs() - req.started_at_unix;
+        let now = deps.clock.now_unix_secs();
+        let elapsed_secs = now - req.started_at_unix;
         if elapsed_secs > (req.config.max_wait_mins as i64) * 60 {
             let _ = deps.store.add_event(req.run_id, "give_up", None);
+            log_event(out, now, "give_up", None);
             let _ = deps.store.finish_run(
                 req.run_id,
                 &FinishRun {
@@ -324,21 +346,30 @@ pub fn run_poll_loop(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> PollOutcome 
                     ..FinishRun::default()
                 },
             );
+            log_event(out, now, "watch_finished", Some(r#"{"outcome":"gave_up"}"#));
             return PollOutcome::GaveUp;
         }
 
-        match poll_once(deps, req) {
+        match poll_once(deps, req, out) {
             Ok(TickOutcome::Continue) => {
                 consecutive_failures = 0;
                 deps.sleeper.sleep(req.config.poll_secs);
             }
-            Ok(TickOutcome::Finished(outcome)) => return outcome,
-            Err(err) => {
-                let _ = deps.store.add_event(
-                    req.run_id,
-                    "poll_error",
-                    Some(&serde_json::json!({ "message": err.to_string() }).to_string()),
+            Ok(TickOutcome::Finished(outcome)) => {
+                log_event(
+                    out,
+                    deps.clock.now_unix_secs(),
+                    "watch_finished",
+                    Some(&serde_json::json!({ "outcome": format!("{outcome:?}") }).to_string()),
                 );
+                return outcome;
+            }
+            Err(err) => {
+                let detail = serde_json::json!({ "message": err.to_string() }).to_string();
+                let _ = deps
+                    .store
+                    .add_event(req.run_id, "poll_error", Some(&detail));
+                log_event(out, deps.clock.now_unix_secs(), "poll_error", Some(&detail));
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     let _ = deps.store.finish_run(
@@ -348,10 +379,72 @@ pub fn run_poll_loop(deps: &PollDeps<'_>, req: &PollRequest<'_>) -> PollOutcome 
                             ..FinishRun::default()
                         },
                     );
+                    log_event(
+                        out,
+                        deps.clock.now_unix_secs(),
+                        "watch_finished",
+                        Some(r#"{"outcome":"failed"}"#),
+                    );
                     return PollOutcome::Failed;
                 }
                 deps.sleeper.sleep(req.config.poll_secs);
             }
+        }
+    }
+}
+
+/// Formats `unix_secs` as `YYYY-MM-DD HH:MM:SSZ` (UTC), for the
+/// human-readable lines [`log_event`] writes to a detached watch's log file.
+/// Deliberately UTC (`libc::gmtime`, not `localtime`) since a detached
+/// watcher may run under a differently-configured `TZ` than whoever later
+/// reads the log.
+fn format_log_ts(unix_secs: i64) -> String {
+    // SAFETY: `gmtime` takes a valid `time_t` pointer (a local, non-null
+    // stack value) and returns a pointer into a `libc`-owned static `tm`
+    // struct, which is copied out by value below before any other libc call
+    // can overwrite it — no reference escapes this function.
+    unsafe {
+        let t: libc::time_t = unix_secs as libc::time_t;
+        let tm_ptr = libc::gmtime(&t);
+        if tm_ptr.is_null() {
+            return format!("unix:{unix_secs}");
+        }
+        let tm = *tm_ptr;
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
+/// Writes one timestamped, human-readable line to `out`, mirroring a
+/// `run_events` row this call site also recorded via [`RunStore::add_event`]
+/// (or is about to, for the terminal `finish_run` cases). Additive, never a
+/// replacement: the SQLite event stays the durable record `tm runs show`
+/// reads; this line exists so a detached watcher's log file (see
+/// `crate::cli::pr::watch_log_dir`) shows *something* instead of sitting at
+/// zero bytes, which is exactly the gap that left the owner unable to
+/// diagnose a failed `tm pr watch` cron.
+///
+/// Best-effort: a write failure here (e.g. a full disk) must not fail the
+/// tick or the loop — [`PollDeps::store`]'s SQLite row is what actually
+/// matters, and `out` is only a convenience mirror of it — so failures are
+/// silently swallowed, matching this module's existing `let _ =` stance on
+/// [`RunStore::add_event`] calls in [`run_poll_loop`]'s give-up/backoff
+/// paths.
+fn log_event(out: &mut dyn Write, now_unix_secs: i64, kind: &str, detail: Option<&str>) {
+    let ts = format_log_ts(now_unix_secs);
+    match detail {
+        Some(detail) => {
+            let _ = writeln!(out, "[{ts}] {kind} {detail}");
+        }
+        None => {
+            let _ = writeln!(out, "[{ts}] {kind}");
         }
     }
 }
@@ -592,7 +685,7 @@ mod tests {
         let mut fx = Fixture::new();
         fx.gh = fx.gh.with_pr_state(42, Ok(PrLifecycle::Merged));
 
-        let outcome = poll_once(&fx.deps(), &fx.req()).unwrap();
+        let outcome = poll_once(&fx.deps(), &fx.req(), &mut Vec::new()).unwrap();
 
         assert!(matches!(
             outcome,
@@ -606,12 +699,100 @@ mod tests {
         assert_eq!(closed.detail.as_deref(), Some(r#"{"reason":"merged"}"#));
     }
 
+    // --- log content: the actual gap this module's log lines fix ---
+
+    #[test]
+    fn poll_once_merged_pr_writes_a_human_readable_pr_closed_line_to_out() {
+        let mut fx = Fixture::new();
+        fx.gh = fx.gh.with_pr_state(42, Ok(PrLifecycle::Merged));
+        let mut out = Vec::new();
+
+        poll_once(&fx.deps(), &fx.req(), &mut out).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("pr_closed"),
+            "expected a pr_closed line, got: {text:?}"
+        );
+        assert!(
+            text.contains(r#"{"reason":"merged"}"#),
+            "expected the same detail as the sqlite event, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn poll_once_not_done_writes_a_bot_poll_line_to_out() {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_state(42, Ok(PrLifecycle::Open))
+            .with_pr_reviews(42, Ok(vec![]));
+        let bots = cursor_bot();
+        let mut req = fx.req();
+        req.bot_logins = &bots;
+        let mut out = Vec::new();
+
+        poll_once(&fx.deps(), &req, &mut out).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("bot_poll"), "got: {text:?}");
+    }
+
+    #[test]
+    fn run_poll_loop_poll_error_writes_a_line_per_failure_to_out() {
+        let mut fx = Fixture::new();
+        fx.gh = fx.gh.with_pr_state(
+            42,
+            Err(GhError::Command {
+                command: "gh pr view".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            }),
+        );
+        let mut out = Vec::new();
+
+        let outcome = run_poll_loop(&fx.deps(), &fx.req(), &mut out);
+
+        assert_eq!(outcome, PollOutcome::Failed);
+        let text = String::from_utf8(out).unwrap();
+        let error_lines = text.matches("poll_error").count();
+        assert_eq!(
+            error_lines, 10,
+            "expected one log line per consecutive gh failure, got: {text:?}"
+        );
+        assert!(text.contains("boom"), "got: {text:?}");
+        assert!(
+            text.contains("watch_finished"),
+            "expected a terminal line, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn run_poll_loop_wall_clock_timeout_writes_a_give_up_line_to_out() {
+        let mut fx = Fixture::new();
+        fx.cfg.max_wait_mins = 10;
+        fx.clock = FakeClock::at(1_000 + 10 * 60 + 1);
+        let mut out = Vec::new();
+
+        let outcome = run_poll_loop(&fx.deps(), &fx.req(), &mut out);
+
+        assert_eq!(outcome, PollOutcome::GaveUp);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("give_up"), "got: {text:?}");
+    }
+
+    #[test]
+    fn format_log_ts_renders_utc_calendar_time() {
+        // 2026-08-11T00:00:00Z, per any epoch converter.
+        assert_eq!(format_log_ts(1_786_406_400), "2026-08-11 00:00:00Z");
+    }
+
     #[test]
     fn poll_once_closed_unmerged_pr_finishes_done_and_emits_pr_closed_closed() {
         let mut fx = Fixture::new();
         fx.gh = fx.gh.with_pr_state(42, Ok(PrLifecycle::Closed));
 
-        let outcome = poll_once(&fx.deps(), &fx.req()).unwrap();
+        let outcome = poll_once(&fx.deps(), &fx.req(), &mut Vec::new()).unwrap();
 
         assert!(matches!(
             outcome,
@@ -635,7 +816,7 @@ mod tests {
         let mut req = fx.req();
         req.bot_logins = &bots;
 
-        let outcome = poll_once(&fx.deps(), &req).unwrap();
+        let outcome = poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
 
         assert!(matches!(outcome, TickOutcome::Continue));
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
@@ -665,7 +846,7 @@ mod tests {
         let mut req = fx.req();
         req.bot_logins = &bots;
 
-        let outcome = poll_once(&fx.deps(), &req).unwrap();
+        let outcome = poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
 
         assert!(matches!(
             outcome,
@@ -719,7 +900,7 @@ mod tests {
         req.bot_logins = &bots;
         req.home = home_dir.path();
 
-        let outcome = poll_once(&fx.deps(), &req).unwrap();
+        let outcome = poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
 
         assert!(matches!(
             outcome,
@@ -772,7 +953,7 @@ mod tests {
         req.bot_logins = &bots;
         req.home = home_dir.path();
 
-        poll_once(&fx.deps(), &req).unwrap();
+        poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
 
         assert_eq!(fx.cleanup.calls(), vec!["PROJ-1".to_string()]);
     }
@@ -791,7 +972,7 @@ mod tests {
             }),
         );
 
-        let outcome = run_poll_loop(&fx.deps(), &fx.req());
+        let outcome = run_poll_loop(&fx.deps(), &fx.req(), &mut Vec::new());
 
         assert_eq!(outcome, PollOutcome::Failed);
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
@@ -807,7 +988,7 @@ mod tests {
         fx.cfg.max_wait_mins = 10;
         fx.clock = FakeClock::at(1_000 + 10 * 60 + 1);
 
-        let outcome = run_poll_loop(&fx.deps(), &fx.req());
+        let outcome = run_poll_loop(&fx.deps(), &fx.req(), &mut Vec::new());
 
         assert_eq!(outcome, PollOutcome::GaveUp);
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
