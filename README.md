@@ -65,8 +65,8 @@ tm auth status
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
-| `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order |
-| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready to pick up. Fails (non-zero exit) if it's blocked |
+| `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order, plus any blocked ticket that's stackable |
+| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, or blocked. Exits `0` (ready), `3` (stackable), or `1` (blocked/error) |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -210,12 +210,13 @@ the run row as `log_path`:
 For `tm work run`, that file can already have content in it by the time the
 detached process's stdio is redirected there: the blocked-ticket
 branch-off decision (stacking this run's branch on a blocking ticket's PR
-instead of the normal base) resolves before a run row even exists, and any
-warning or error it produces is appended to this same log file as soon as
-its path is known — not just printed to the invoking terminal, which for a
-detached run is gone the moment its launching shell closes. A permanent
-`gh` failure during that resolution (see below) fails the run outright, and
-that failure is logged here too before it propagates.
+instead of the normal base — see [The stack decision](#the-stack-decision)
+below, shared verbatim with `tm ready`) resolves before a run row even
+exists, and any warning or error it produces is appended to this same log
+file as soon as its path is known — not just printed to the invoking
+terminal, which for a detached run is gone the moment its launching shell
+closes. A permanent `gh` failure during that resolution (see below) fails
+the run outright, and that failure is logged here too before it propagates.
 
 `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]`
 resolves a run the same way `tm runs reopen` does (numeric row id, or ticket
@@ -770,33 +771,92 @@ check. Any other Jira/config failure is a hard error, same as every other
 
 ### Readiness
 
-A ticket is "ready" when it has no open `Blocks`-type blockers: a `Blocks`
-link where the linked issue isn't yet Done. A Done blocker doesn't count,
-and a ticket that merely blocks something else is never "blocked" by that
-relationship.
+A ticket is a *candidate* for readiness when it has no open `Blocks`-type
+blockers: a `Blocks` link where the linked issue isn't yet Done. A Done
+blocker doesn't count at this stage, and a ticket that merely blocks
+something else is never "blocked" by that relationship. Every ticket that
+fails this first, Jira-only check is then re-examined by the **stack
+decision** below before being reported ready, stackable, or blocked — this
+is what tells the difference between "genuinely stuck" and "safe to build
+on top of, without waiting for the blocker to merge".
+
+#### The stack decision
+
+`tm ready` and `tm work run` (which cuts a lane run's branch — see
+[Log files](#log-files) above) share one decision table so they can never
+disagree about a ticket's blockers, instead of `tm ready` trusting Jira
+status while `tm work run` trusted PR merge state, which is what happened
+before this was unified: a ticket blocked in Jira by an unmerged-but-open PR
+was stackable by `tm work run`'s own logic, but `tm ready` still reported it
+`BLOCKED`, and an autonomous lane prompt that treats `tm ready`'s word as
+final refused to touch it.
+
+For each of a ticket's *direct* `Blocks` blockers (regardless of Jira
+status — only PR merge state decides "satisfied" here):
+
+- PR **merged** → satisfied, doesn't count.
+- PR **open** → unmerged, a candidate to stack on.
+- **no PR** (including a closed-but-unmerged one) → unmerged, with nothing
+  to stack on yet.
+
+Then, across the ticket's unmerged blockers:
+
+- **zero** → **ready**.
+- **exactly one, with an open PR** → **stackable**: `tm work run` (with no
+  `--from` override) cuts the run's branch from that PR's head branch
+  instead of the normal base, rather than waiting for it to merge; `tm
+  ready <KEY>` reports the same branch so a human or an autonomous agent can
+  do the equivalent by hand.
+- **exactly one, with no PR yet** → **blocked**: nothing exists to build on.
+- **two or more** → **blocked**: a single branch can only be stacked on one
+  dependency at a time, so this refuses rather than guessing which one.
 
 `tm ready` (no key) lists tickets assigned to you that are ready, further
 restricted to your "To Do" tickets (something already In Progress has
 already been picked up) and printed in Jira's native backlog rank order,
-`KEY  Summary` per line. If any of your To Do tickets were excluded for
-having an open blocker, a final `(N blocked tickets hidden)` line says so,
-so a filtered list doesn't read as "this is everything assigned to you".
+`KEY  Summary` per line, followed by any candidate found stackable as `KEY
+Summary  [stackable on <branch> — blocked by <BLOCKER>, PR #<N> open]`. If
+any remaining candidates were excluded for being blocked (per the stack
+decision above), a final `(N blocked tickets hidden)` line says so, so a
+filtered list doesn't read as "this is everything assigned to you".
 
 `tm ready <KEY>` checks one specific ticket, regardless of assignee or
-status: it prints `KEY is ready (<status>)` on success, or `KEY is blocked
-by:` followed by one line per open blocker on failure, exiting non-zero so
-scripts can branch on it.
+status:
+
+- **ready** — prints `KEY is ready (<status>)`, exits `0`.
+- **stackable** — prints `KEY is stackable on <branch> (blocked by
+  <BLOCKER>, PR #<N> open)`, exits `3` — a distinct code from both `0` and
+  `1` so a script or an autonomous lane prompt can branch on "safe to
+  proceed by stacking" without parsing stdout.
+- **blocked** — prints `KEY is blocked by:` followed by one line per
+  unmerged blocker (plus, when there's more than one, a line explaining
+  that two parallel unmerged blockers can't both be stacked on), exits `1`.
+
+Resolving the stack decision needs `gh` (to check each blocker's PR state),
+but only when the ticket actually has a direct blocker — one with none never
+shells out. A **transient** `gh` failure (network error, rate limit, `gh`
+missing, expired auth) degrades quietly to the pre-stacking, Jira-status-only
+answer, printing a `warning: could not resolve blocker PRs for KEY (...) —
+falling back to Jira-only readiness check` line first (`list`'s equivalent
+warning is `warning: could not check stackability: ...`, and it hides every
+remaining blocked candidate rather than guessing). A **permanent** `gh`
+failure — `gh` telling `tm` it asked for something nonsensical, e.g. an
+invalid `--json` field — is not swallowed: `tm ready <KEY>` fails loudly with
+`bug in tm itself while resolving blockers for KEY: ... (this will not
+resolve on retry)` instead of silently misreporting the ticket's real
+stackability.
 
 Both forms also carry a best-effort, advisory annotation of unresolved
 GitHub bot review findings (see `review_bots` above and `Bot findings`
 below) on a ready ticket's associated open pull request (matched by title,
-the same way as `tm ticket`/`tm pr` association). `tm ready`'s list adds
-`  [N unresolved bot findings]` to a matched ticket's line when `N > 0`;
-`tm ready <KEY>` prints a `  note: N unresolved bot findings on PR #<number>`
-line after the ready message. This is purely visible, never blocks
-claimability, and never changes an exit code: if the GitHub lookup fails,
-`tm` prints a single `warning: could not check bot findings: ...` line and
-falls back to the unannotated output rather than failing the command.
+the same way as `tm ticket`/`tm pr` association) — stackable and blocked
+tickets never carry this annotation. `tm ready`'s list adds `  [N unresolved
+bot findings]` to a matched ready ticket's line when `N > 0`; `tm ready
+<KEY>` prints a `  note: N unresolved bot findings on PR #<number>` line
+after the ready message. This is purely visible, never blocks claimability,
+and never changes an exit code: if the GitHub lookup fails, `tm` prints a
+single `warning: could not check bot findings: ...` line and falls back to
+the unannotated output rather than failing the command.
 
 The Jira API token itself is never stored in either config file — it
 lives in the macOS keychain (service `tskmstr`, account `jira`), or comes
