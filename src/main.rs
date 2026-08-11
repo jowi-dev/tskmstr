@@ -33,6 +33,17 @@ fn main() -> ExitCode {
         return run_pr_watch(key, foreground);
     }
 
+    // `tm ready <KEY>` is special-cased the same way, ahead of `dispatch`'s
+    // uniform `Result<(), _>` plumbing, because it now needs a three-way
+    // exit code (0 ready, 3 stackable, 1 blocked/error) rather than the
+    // uniform 0/1 every other command produces — see
+    // `READY_EXIT_STACKABLE`'s doc comment. `tm ready` with no
+    // key (the list form) never errors and stays on the uniform 0/1 path
+    // via `dispatch`/`run_ready`.
+    if let Command::Ready { key: Some(key) } = command {
+        return run_ready_check(key);
+    }
+
     match dispatch(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -659,16 +670,22 @@ fn default_xdg_run_db_path() -> PathBuf {
     tskmstr::runs::default_db_path(&home, xdg_data_home.as_deref())
 }
 
-/// `tm ready` / `tm ready <KEY>`: needs a Jira client + config, same as the
+/// `tm ready` (no key): needs a Jira client + config, same as the
 /// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
-/// `review_bots` for the best-effort bot-findings annotation both forms now
-/// carry (see [`tskmstr::cli::ready::ReadyContext`]).
+/// `review_bots` for the best-effort bot-findings/stackability annotations
+/// both forms now carry (see [`tskmstr::cli::ready::ReadyContext`]). `tm
+/// ready <KEY>` is special-cased in `main` as [`run_ready_check`] instead —
+/// see its doc comment for why.
 fn run_ready(
     key: Option<String>,
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    debug_assert!(
+        key.is_none(),
+        "tm ready <KEY> is handled by run_ready_check"
+    );
     let config = config::load(paths)?;
     let token = resolve_token(keychain, env_token)?;
     let jira = jira_client_for(&config, &token);
@@ -679,11 +696,63 @@ fn run_ready(
         review_bots: &config.review_bots,
     };
     let mut stdout = std::io::stdout();
-    match key {
-        Some(key) => tskmstr::cli::ready::check(&ctx, &key, &mut stdout)?,
-        None => tskmstr::cli::ready::list(&ctx, &mut stdout)?,
-    }
+    tskmstr::cli::ready::list(&ctx, &mut stdout)?;
     Ok(())
+}
+
+/// Exit code for `tm ready <KEY>` reporting a ticket **stackable**: exactly
+/// one unmerged direct blocker, with an open PR to build on (see
+/// [`tskmstr::cli::ready::ReadyOutcome::Stackable`]) — distinct from `0`
+/// (ready) and `1` (blocked, or any other error) so an autonomous agent can
+/// branch on "safe to proceed by stacking" without parsing stdout. Chosen to
+/// avoid `2`, already used by `tm pr watch`'s `GaveUp` outcome, even though
+/// exit codes are scoped per-command — picking a different value keeps the
+/// two commands' schemes easy to tell apart at a glance. Documented in
+/// README.md's `tm ready` section.
+const READY_EXIT_STACKABLE: u8 = 3;
+
+/// `tm ready <KEY>`: build real dependencies and run
+/// [`tskmstr::cli::ready::check`], mapping its
+/// [`tskmstr::cli::ready::ReadyOutcome`] to an exit code (`0` ready, `3`
+/// stackable, `1` blocked or any other error) — see
+/// [`READY_EXIT_STACKABLE`]'s doc comment for why this needs its own
+/// three-way scheme rather than `dispatch`'s uniform 0/1.
+fn run_ready_check(key: String) -> ExitCode {
+    let paths = default_config_paths();
+    let env_token = std::env::var("JIRA_API_TOKEN").ok();
+    let keychain = MacosKeychain::new();
+
+    let config = match config::load(&paths) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let token = match resolve_token(&keychain, env_token) {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let jira = jira_client_for(&config, &token);
+    let gh = ShellGhCli::new();
+    let ctx = tskmstr::cli::ready::ReadyContext {
+        jira: jira.as_ref(),
+        gh: &gh,
+        review_bots: &config.review_bots,
+    };
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::cli::ready::check(&ctx, &key, &mut stdout) {
+        Ok(tskmstr::cli::ready::ReadyOutcome::Ready) => ExitCode::SUCCESS,
+        Ok(tskmstr::cli::ready::ReadyOutcome::Stackable) => ExitCode::from(READY_EXIT_STACKABLE),
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.
