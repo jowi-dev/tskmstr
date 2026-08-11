@@ -317,7 +317,20 @@ pub fn poll_once(
 ///   (roughly 7-8 minutes of backoff at the default 45s cadence), finishes
 ///   the run `Failed` and returns [`PollOutcome::Failed`]. Any intervening
 ///   [`TickOutcome::Continue`] resets the counter — a single blip must not
-///   accumulate toward an unrelated later blip.
+///   accumulate toward an unrelated later blip. This backoff-then-give-up
+///   shape is reserved for **transient** [`PollError::Gh`] failures (and
+///   every [`PollError::Store`]/[`PollError::FindingsFile`], which have no
+///   permanent/transient distinction of their own).
+/// - **Permanent `gh` failures**: a [`PollError::Gh`] whose
+///   [`GhError::is_permanent`] is true (an invalid `--json` field, an
+///   unknown flag/subcommand — `gh` telling us tm itself asked it something
+///   nonsensical) skips the backoff entirely and finishes the run `Failed`
+///   on the very first tick it's seen. It is going to fail identically on
+///   every one of the next 10 attempts too, so retrying through the full
+///   backoff window before giving up — exactly what happened to the bugbot
+///   watchers before this distinction existed, burning the whole ~7-8
+///   minute window on a bug that could never have resolved itself — buys
+///   nothing.
 pub fn run_poll_loop(
     deps: &PollDeps<'_>,
     req: &PollRequest<'_>,
@@ -370,8 +383,22 @@ pub fn run_poll_loop(
                     .store
                     .add_event(req.run_id, "poll_error", Some(&detail));
                 log_event(out, deps.clock.now_unix_secs(), "poll_error", Some(&detail));
+
+                // A permanent gh error (see `GhError::is_permanent`'s doc
+                // comment) fails on this tick alone, without retrying —
+                // this is the same incident `resolve_blocker_stacking`
+                // (src/work/run.rs) was fixed for: a permanent error is
+                // going to fail identically on every one of the remaining
+                // consecutive-failure attempts, so burning all
+                // `MAX_CONSECUTIVE_FAILURES` retries (~7-8 minutes of
+                // backoff at the default cadence) before giving up buys
+                // nothing and is exactly what happened to the bugbot
+                // watchers this fix is for. A transient failure (network,
+                // rate limit, auth expiry, ...) keeps the original
+                // tolerant retry-then-give-up behavior unchanged.
+                let is_permanent = matches!(&err, PollError::Gh(gh_err) if gh_err.is_permanent());
                 consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                if is_permanent || consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     let _ = deps.store.finish_run(
                         req.run_id,
                         &FinishRun {
@@ -981,6 +1008,52 @@ mod tests {
         let events = fx.store.events_for_run(fx.run_id).unwrap();
         let error_events = events.iter().filter(|e| e.kind == "poll_error").count();
         assert_eq!(error_events, 10);
+    }
+
+    #[test]
+    fn run_poll_loop_permanent_gh_error_fails_fast_instead_of_exhausting_the_backoff() {
+        // The incident this closes: a permanent gh error (an invalid
+        // --json field, here) failed identically on every single one of
+        // the 10 consecutive-failure attempts, burning the full ~7-8
+        // minute backoff window before finally giving up — for a failure
+        // mode that was never going to succeed on attempt 2, let alone 10.
+        // A permanent error must fail on the first tick instead.
+        let mut fx = Fixture::new();
+        fx.gh = fx.gh.with_pr_state(
+            42,
+            Err(GhError::Command {
+                command: "gh pr view".to_string(),
+                exit_code: Some(1),
+                stderr: r#"Unknown JSON field: "merged""#.to_string(),
+            }),
+        );
+        let mut out = Vec::new();
+
+        let outcome = run_poll_loop(&fx.deps(), &fx.req(), &mut out);
+
+        assert_eq!(outcome, PollOutcome::Failed);
+        let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+
+        let events = fx.store.events_for_run(fx.run_id).unwrap();
+        let error_events = events
+            .iter()
+            .filter(|e| e.kind == "poll_error")
+            .count();
+        assert_eq!(
+            error_events, 1,
+            "a permanent error must fail on the first tick, not after 10 retries"
+        );
+        assert!(
+            fx.sleeper.calls().is_empty(),
+            "must not sleep/retry at all on a permanent error"
+        );
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("Unknown JSON field"),
+            "expected the permanent error's message in the log, got: {text:?}"
+        );
     }
 
     #[test]
