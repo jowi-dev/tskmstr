@@ -207,6 +207,16 @@ the run row as `log_path`:
 - `tm pr watch` (`kind = review-watch`): `<home>/.local/state/tskmstr/review-watch/<lowercased key>.log`
 - `tm work run` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
 
+For `tm work run`, that file can already have content in it by the time the
+detached process's stdio is redirected there: the blocked-ticket
+branch-off decision (stacking this run's branch on a blocking ticket's PR
+instead of the normal base) resolves before a run row even exists, and any
+warning or error it produces is appended to this same log file as soon as
+its path is known — not just printed to the invoking terminal, which for a
+detached run is gone the moment its launching shell closes. A permanent
+`gh` failure during that resolution (see below) fails the run outright, and
+that failure is logged here too before it propagates.
+
 `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]`
 resolves a run the same way `tm runs reopen` does (numeric row id, or ticket
 key optionally disambiguated with `--kind`) and prints its log:
@@ -534,8 +544,14 @@ resolving the PR, `bots: watching` once the poll loop is running, `bots:
 ready` (bold — the watcher finished and left unresolved findings) when a
 cleanup session is worth launching, `bots: clean` when the bots reviewed
 and found nothing (no cleanup needed), and `bots: failed` if the watcher
-gave up (repeated `gh` failures, or the PR sat open past
-`max_wait_mins`).
+gave up: either the PR sat open past `max_wait_mins`, or `gh` failed —
+after 10 consecutive failures (~7-8 minutes of backoff at the default
+`poll_secs`) for an ordinary transient failure (network, rate limit,
+expired auth), or immediately, on the very first failed poll, for a
+permanent one (e.g. `gh` rejecting a request tm itself built wrong) —
+retrying a failure that's going to recur identically forever gains
+nothing, so that case skips the backoff. Either way, `tm runs logs
+<KEY> --kind review-watch` shows what `gh` actually said.
 
 Pressing `b` again is context-sensitive, mirroring `a`'s attach-or-launch
 shape:

@@ -584,8 +584,7 @@ mod tests {
         // and a blip that will. `tm ready list` still degrades to an
         // unannotated listing either way (a best-effort side annotation,
         // not worth hard-failing the whole command over).
-        let jira = FakeJiraClient::new()
-            .with_search_result(search_result(vec![issue("PROJ-1")]));
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
         let gh = FakeGhCli::new().with_pr_list(Err(GhError::Command {
             command: "gh pr list".to_string(),
             exit_code: Some(1),

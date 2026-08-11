@@ -1036,10 +1036,7 @@ mod tests {
         assert_eq!(run.status, RunStatus::Failed);
 
         let events = fx.store.events_for_run(fx.run_id).unwrap();
-        let error_events = events
-            .iter()
-            .filter(|e| e.kind == "poll_error")
-            .count();
+        let error_events = events.iter().filter(|e| e.kind == "poll_error").count();
         assert_eq!(
             error_events, 1,
             "a permanent error must fail on the first tick, not after 10 retries"

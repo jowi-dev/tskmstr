@@ -357,11 +357,8 @@ pub fn run(
     // via the same shared function, rather than re-deriving the filename
     // format independently, is what keeps the two computations from
     // silently drifting apart.
-    let log_path = crate::work::run::run_log_path(
-        &paths.state_dir,
-        &prepared.wt_name,
-        &prepared.timestamp,
-    );
+    let log_path =
+        crate::work::run::run_log_path(&paths.state_dir, &prepared.wt_name, &prepared.timestamp);
     let state_path = paths.state_dir.join(format!(
         "{}-{}.supervisor.json",
         prepared.wt_name, prepared.timestamp
