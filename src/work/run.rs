@@ -547,11 +547,28 @@ impl BlockerResolution {
 ///   dependencies can't both be stacked on, and this is the one case where
 ///   blocker resolution refuses the run outright rather than falling back.
 ///
-/// Any Jira or `gh` failure while resolving blockers (a bad `get_issue`, or
-/// [`GhCli::pr_list_all`] erroring) short-circuits to `stacked_base: None`
-/// plus a warning — a network hiccup must never fail a run; refusal is
+/// Any Jira failure while resolving blockers (a bad `get_issue`), or a
+/// **transient** `gh` failure from [`GhCli::pr_list_all`] (network error,
+/// rate limit, a `5xx`, expired auth, `gh` missing, a timeout — see
+/// [`GhError::is_permanent`]), short-circuits to `stacked_base: None` plus a
+/// warning — a network hiccup must never fail a run; refusal is otherwise
 /// reserved for the confirmed ≥2-unmerged case above, which only fires once
 /// every blocker resolved cleanly.
+///
+/// A **permanent** `gh` failure from [`GhCli::pr_list_all`] — `gh` telling us
+/// tm itself asked it something nonsensical, e.g. an invalid `--json` field —
+/// is a different case entirely and is *not* swallowed: it propagates as
+/// `Err`, refusing the run. A permanent error means blocker resolution never
+/// actually ran and never will until the code is fixed, so we genuinely
+/// cannot know whether the ticket's blocker is stackable; falling back to
+/// the normal base here would silently dispatch an autonomous run against
+/// the wrong base while pretending the feature worked — which is exactly
+/// what happened before this distinction existed (`gh pr list --json` was
+/// requesting an invalid `merged` field for months; every call failed
+/// identically, six lane runs were dispatched against the wrong base as a
+/// result, and nobody could tell because the "warning" went nowhere
+/// visible). See [`GhError::is_permanent`]'s doc comment for the full
+/// incident and the narrow stderr-based detection this relies on.
 ///
 /// `repo_root` is passed through to [`GhCli::pr_list_all`] unchanged: a lane
 /// run targets `lane_config.repo`, not necessarily the invoking process's
@@ -589,6 +606,18 @@ pub fn resolve_blocker_stacking(
 
     let prs = match gh.pr_list_all(repo_root) {
         Ok(prs) => prs,
+        // A permanent gh error (see `GhError::is_permanent`'s doc comment —
+        // this is the exact incident it exists for) means blocker
+        // resolution did not run at all, and never will until the code is
+        // fixed: we genuinely cannot know whether AX-2's blocker is
+        // stackable. Silently falling back to the normal base here would
+        // dispatch an autonomous run against the wrong base while
+        // pretending the feature worked, which is exactly what happened
+        // six times before this was caught — so this fails the run instead
+        // of warning. Contrast the `Err(err)` transient arm below, which
+        // preserves the original warn-and-fall-back-to-base behavior
+        // exactly.
+        Err(err) if err.is_permanent() => return Err(RunLaneError::Gh(err)),
         Err(err) => {
             return Ok(BlockerResolution::warning(format!(
                 "warning: could not resolve PRs for blockers of {ticket} ({err}) — using normal base"
@@ -3095,6 +3124,32 @@ mod tests {
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
         assert!(resolution.messages[0].contains("warning"));
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_gh_permanent_error_fails_the_run_instead_of_warning() {
+        // The motivating incident: `gh pr list --json ...` requesting an
+        // invalid field is a permanent, code-level defect, not a network
+        // hiccup. Falling back to "use the normal base" here would dispatch
+        // an autonomous run against the wrong base without anyone knowing
+        // blocker resolution never actually ran — this must fail loudly
+        // instead, unlike the transient case pinned just above.
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: r#"Unknown JSON field: "merged""#.to_string(),
+        }));
+
+        let err = resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2"))
+            .unwrap_err();
+
+        match err {
+            RunLaneError::Gh(gh_err) => assert!(gh_err.is_permanent()),
+            other => panic!("expected a permanent GhError, got {other:?}"),
+        }
     }
 
     // --- prepare_run_lane wiring: blocker stacking overrides the branch's
