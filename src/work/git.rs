@@ -63,10 +63,21 @@ pub trait GitOps {
     /// returns the *main* repository's root, matching the OCaml behavior.
     fn repo_root(&self, dir: &Path) -> Result<PathBuf, GitError>;
 
-    /// Whether `dir` is a linked worktree (as opposed to the main working
-    /// tree of a repository), mirroring `work.ml`'s `is_worktree`: a linked
-    /// worktree's git-dir contains a `commondir` file, the main repo's does
-    /// not.
+    /// Whether `dir` is the ROOT of a linked worktree (as opposed to the
+    /// main working tree of a repository, or an ordinary subdirectory
+    /// inside either).
+    ///
+    /// Two conditions must both hold:
+    ///   1. `dir`'s git-dir contains a `commondir` file — `work.ml`'s
+    ///      `is_worktree` check, which distinguishes a linked worktree from
+    ///      a main checkout.
+    ///   2. `git rev-parse --show-toplevel` run *from* `dir` reports `dir`
+    ///      itself (canonicalized) — because `git rev-parse` walks upward
+    ///      looking for a repo, condition 1 alone is also true for any
+    ///      ordinary subdirectory *inside* a linked worktree (e.g. `lib/`,
+    ///      `test/`), which is exactly what made `tm work restore` spin up
+    ///      a session per subdirectory of a misplaced worktree. Condition 2
+    ///      rules those out.
     fn is_worktree(&self, dir: &Path) -> Result<bool, GitError>;
 
     /// Whether `branch` exists as a local branch in the repository
@@ -214,20 +225,57 @@ impl GitOps for ShellGitOps {
             "git rev-parse --git-dir",
         )?;
 
-        match output.status.code() {
+        let has_commondir = match output.status.code() {
             Some(0) => {
                 let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                Ok(Path::new(&git_dir).join("commondir").exists())
+                Path::new(&git_dir).join("commondir").exists()
+            }
+            Some(code) => {
+                return Err(GitError::Command {
+                    command: "git rev-parse --git-dir".to_string(),
+                    exit_code: Some(code),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                });
+            }
+            None => {
+                return Err(GitError::Command {
+                    command: "git rev-parse --git-dir".to_string(),
+                    exit_code: None,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                });
+            }
+        };
+
+        if !has_commondir {
+            return Ok(false);
+        }
+
+        let toplevel_output = run_git(
+            dir,
+            &["rev-parse".to_string(), "--show-toplevel".to_string()],
+            "git rev-parse --show-toplevel",
+        )?;
+
+        match toplevel_output.status.code() {
+            Some(0) => {
+                let toplevel = String::from_utf8_lossy(&toplevel_output.stdout)
+                    .trim()
+                    .to_string();
+                Ok(is_same_dir(Path::new(&toplevel), dir))
             }
             Some(code) => Err(GitError::Command {
-                command: "git rev-parse --git-dir".to_string(),
+                command: "git rev-parse --show-toplevel".to_string(),
                 exit_code: Some(code),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                stderr: String::from_utf8_lossy(&toplevel_output.stderr)
+                    .trim()
+                    .to_string(),
             }),
             None => Err(GitError::Command {
-                command: "git rev-parse --git-dir".to_string(),
+                command: "git rev-parse --show-toplevel".to_string(),
                 exit_code: None,
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                stderr: String::from_utf8_lossy(&toplevel_output.stderr)
+                    .trim()
+                    .to_string(),
             }),
         }
     }
@@ -375,6 +423,22 @@ impl GitOps for ShellGitOps {
             output.status.code(),
             &output.stderr,
         )
+    }
+}
+
+/// Whether `toplevel` (the output of `git rev-parse --show-toplevel` run
+/// from `dir`) refers to `dir` itself, used by [`ShellGitOps::is_worktree`]
+/// to tell a worktree ROOT from an ordinary subdirectory inside one.
+/// Canonicalizes both sides before comparing: on macOS, tempdir paths (used
+/// throughout this module's tests) commonly resolve through a `/private`
+/// symlink that `git` itself resolves too, so a naive string compare would
+/// false-negative on the exact case this exists to get right. Falls back to
+/// comparing the un-canonicalized paths if canonicalization fails (e.g. the
+/// path no longer exists) rather than erroring out of an `is_worktree` call.
+fn is_same_dir(toplevel: &Path, dir: &Path) -> bool {
+    match (toplevel.canonicalize(), dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => toplevel == dir,
     }
 }
 
@@ -574,6 +638,15 @@ pub struct SwitchNewBranchCall {
 pub struct FakeGitOps {
     repo_root_result: std::cell::RefCell<Result<PathBuf, GitError>>,
     is_worktree_result: std::cell::RefCell<Result<bool, GitError>>,
+    /// Per-`dir` overrides for `is_worktree`, consulted before
+    /// `is_worktree_result`'s single blanket answer. Lets tests model
+    /// reality — a misplaced worktree whose root answers `true` but whose
+    /// ordinary subdirectories (`lib/`, `test/`) also answer `true` if you
+    /// naively walk upward, per [`GitOps::is_worktree`]'s "worktree ROOT
+    /// only" contract — without a fake that can only ever give one fixed
+    /// answer for every path. See [`Self::with_is_worktree_for_path`].
+    is_worktree_by_path:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<bool, GitError>>>,
     branch_exists_local_result: std::cell::RefCell<Result<bool, GitError>>,
     branch_exists_remote_result: std::cell::RefCell<Result<bool, GitError>>,
     provision_worktree_result: std::cell::RefCell<Result<(), GitError>>,
@@ -612,6 +685,7 @@ impl Default for FakeGitOps {
         Self {
             repo_root_result: std::cell::RefCell::new(Ok(PathBuf::from("/repo"))),
             is_worktree_result: std::cell::RefCell::new(Ok(false)),
+            is_worktree_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             branch_exists_local_result: std::cell::RefCell::new(Ok(false)),
             branch_exists_remote_result: std::cell::RefCell::new(Ok(false)),
             provision_worktree_result: std::cell::RefCell::new(Ok(())),
@@ -645,9 +719,27 @@ impl FakeGitOps {
         self
     }
 
-    /// Set the result `is_worktree` will return.
+    /// Set the result `is_worktree` will return for every path that doesn't
+    /// have a more specific answer configured via
+    /// [`Self::with_is_worktree_for_path`].
     pub fn with_is_worktree(self, result: Result<bool, GitError>) -> Self {
         *self.is_worktree_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `is_worktree` will return specifically for `path`,
+    /// overriding the blanket answer set by [`Self::with_is_worktree`] for
+    /// that path only. Lets a single test model both a worktree root and
+    /// its non-root subdirectories answering differently, the way real
+    /// `git rev-parse` behavior does.
+    pub fn with_is_worktree_for_path(
+        self,
+        path: impl Into<PathBuf>,
+        result: Result<bool, GitError>,
+    ) -> Self {
+        self.is_worktree_by_path
+            .borrow_mut()
+            .insert(path.into(), result);
         self
     }
 
@@ -771,7 +863,10 @@ impl GitOps for FakeGitOps {
         self.repo_root_result.borrow().clone()
     }
 
-    fn is_worktree(&self, _dir: &Path) -> Result<bool, GitError> {
+    fn is_worktree(&self, dir: &Path) -> Result<bool, GitError> {
+        if let Some(result) = self.is_worktree_by_path.borrow().get(dir) {
+            return result.clone();
+        }
         self.is_worktree_result.borrow().clone()
     }
 
@@ -1272,6 +1367,29 @@ mod tests {
                 .unwrap()
         );
         assert!(ops.is_worktree(&wt_path).unwrap());
+    }
+
+    #[test]
+    fn shell_git_ops_is_worktree_false_for_subdirectory_of_a_linked_worktree() {
+        // Regression test for the reported bug: `git rev-parse --git-dir`
+        // walks upward, so an ordinary subdirectory *inside* a linked
+        // worktree (e.g. `lib/`, `test/`) used to answer `true` too, which
+        // made `tm work restore` spin up a tmux session per subdirectory of
+        // a misplaced worktree. `is_worktree` must report `true` only for
+        // the worktree's own root.
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let wt_path = tmp.path().join("wt");
+
+        let ops = ShellGitOps::new();
+        ops.provision_worktree(tmp.path(), &wt_path, "new-lane-branch", None)
+            .unwrap();
+
+        let subdir = wt_path.join("lib");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert!(ops.is_worktree(&wt_path).unwrap());
+        assert!(!ops.is_worktree(&subdir).unwrap());
     }
 
     #[test]
