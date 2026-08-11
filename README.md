@@ -81,6 +81,7 @@ tm auth status
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`) |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
+| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
 | `tm work list` | List every current tmux session with a worktree/session kind column |
@@ -175,6 +176,36 @@ would leave a pid-less row that `tm runs reap` could immediately re-mark
 failed once its (inherited, already-old) `started_at` looks stale.
 `tm runs resume` still works on a terminal run without reopening it first —
 it just warns on stderr and points here, without blocking.
+
+### Log files
+
+Every detached run (`tm pr watch <KEY>` and `tm work run <lane> ... `, both
+detached by default) redirects its stdout/stderr to a log file, recorded on
+the run row as `log_path`:
+
+- `tm pr watch` (`kind = review-watch`): `<home>/.local/state/tskmstr/review-watch/<lowercased key>.log`
+- `tm work run` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
+
+`tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]`
+resolves a run the same way `tm runs reopen` does (numeric row id, or ticket
+key optionally disambiguated with `--kind`) and prints its log:
+
+```
+tm runs logs AX-408                    # last 200 lines
+tm runs logs AX-408 --kind review-watch --tail 500
+tm runs logs AX-408 --follow           # like tail -f
+```
+
+Runs started before the `log_path` column existed have it as `NULL`; for
+`kind = review-watch` specifically, `tm runs logs` falls back to the same
+by-convention path above, so even a run predating this feature stays
+viewable. Other kinds have no derivable fallback (a lane run's filename also
+bears a worktree name and timestamp that don't survive anywhere recoverable)
+and report a distinct "no recorded log path" error in that case. A
+zero-byte log file (the poll loop having emitted nothing) is reported
+distinctly too, pointing at `tm runs show <KEY>` for the recorded event
+timeline. On the board, pressing `L` on a ticket opens its latest run's log
+in `less` the same way `a`/`b` attach to a live tmux session.
 
 ### Per-model token/cost usage
 
@@ -383,6 +414,8 @@ to" windows.
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
+| `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
+| `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
