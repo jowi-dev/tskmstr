@@ -505,8 +505,31 @@ pub fn restore(ctx: &WorkContext<'_>, out: &mut dyn Write) -> Result<(), WorkCli
 
     let mut restored = 0u32;
     let mut skipped = 0u32;
+    let mut misplaced = 0u32;
 
     for repo_dir in sorted_subdirs(&root)? {
+        // A `repo_dir` (`<worktree_root>/<repo>`) that is ITSELF a worktree
+        // root means a worktree got provisioned directly onto the project's
+        // worktree directory — e.g. the `naming::worktree_path` empty-name
+        // collapse this module's `worktree_path_for` now rejects, or a
+        // manually-run `git worktree add` outside `tm`. Drilling into it as
+        // if it were a normal `<repo>` directory is exactly what made a
+        // real incident spin up a tmux session per ordinary subdirectory
+        // (`lib/`, `test/`, ...) of a misplaced worktree. Surface it as a
+        // warning naming the offending path and skip it entirely, rather
+        // than walking its contents. Counted separately from `skipped`
+        // (already-active sessions) so the summary line doesn't conflate
+        // the two.
+        if ctx.git.is_worktree(&repo_dir).unwrap_or(false) {
+            writeln!(
+                out,
+                "Warning: {} is itself a worktree, not a repo directory — skipping (this usually means a worktree was accidentally created without a name; see `tm work new`)",
+                repo_dir.display()
+            )?;
+            misplaced += 1;
+            continue;
+        }
+
         for wt_dir in sorted_subdirs(&repo_dir)? {
             if !ctx.git.is_worktree(&wt_dir).unwrap_or(false) {
                 continue;
@@ -525,7 +548,11 @@ pub fn restore(ctx: &WorkContext<'_>, out: &mut dyn Write) -> Result<(), WorkCli
     }
 
     writeln!(out)?;
-    writeln!(out, "{restored} restored, {skipped} already active.")?;
+    write!(out, "{restored} restored, {skipped} already active")?;
+    if misplaced > 0 {
+        write!(out, ", {misplaced} misplaced worktree(s) skipped")?;
+    }
+    writeln!(out, ".")?;
     Ok(())
 }
 
@@ -1053,7 +1080,10 @@ mod tests {
             worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
             ..config_with_lanes(BTreeMap::new())
         };
-        let git = FakeGitOps::new().with_is_worktree(Ok(true));
+        let git = FakeGitOps::new()
+            .with_is_worktree(Ok(false))
+            .with_is_worktree_for_path(lane_a.clone(), Ok(true))
+            .with_is_worktree_for_path(lane_b.clone(), Ok(true));
         // lane-a already has an active session; lane-b does not.
         let tmux = FakeTmuxOps::new();
         let home = tmp.path().to_path_buf();
@@ -1094,7 +1124,9 @@ mod tests {
             worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
             ..config_with_lanes(BTreeMap::new())
         };
-        let git = FakeGitOps::new().with_is_worktree(Ok(true));
+        let git = FakeGitOps::new()
+            .with_is_worktree(Ok(false))
+            .with_is_worktree_for_path(lane_a.clone(), Ok(true));
         let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
         let home = tmp.path().to_path_buf();
         let ctx = WorkContext {
@@ -1144,6 +1176,65 @@ mod tests {
 
         assert!(tmux.calls().is_empty());
         assert!(out_string(&out).contains("0 restored, 0 already active."));
+    }
+
+    #[test]
+    fn restore_skips_a_repo_dir_that_is_itself_a_misplaced_worktree() {
+        // Regression test for the reported incident: a worktree got
+        // provisioned directly at `<worktree_root>/<repo>` (e.g. via the
+        // `naming::worktree_path` empty-name collapse), so that directory
+        // now holds a checkout's ordinary subdirectories (`lib/`, `test/`)
+        // rather than per-lane worktree directories. Before the fix,
+        // `is_worktree` answered `true` for those subdirectories too
+        // (`git rev-parse` walks upward), so `restore` spun up a tmux
+        // session for each of them. The fix must skip the whole misplaced
+        // `repo_dir` — zero sessions for its subdirectories — and warn
+        // about it by name instead of silently ignoring it.
+        let tmp = TempDir::new().unwrap();
+        let worktree_root = tmp.path().join("Worktrees");
+        let misplaced = worktree_root.join("axiom");
+        let lib_subdir = misplaced.join("lib");
+        let test_subdir = misplaced.join("test");
+        std::fs::create_dir_all(&lib_subdir).unwrap();
+        std::fs::create_dir_all(&test_subdir).unwrap();
+
+        let config = WorkConfig {
+            worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
+            ..config_with_lanes(BTreeMap::new())
+        };
+        // Model the real upward-walking bug this guards against
+        // independently of: the misplaced worktree ROOT, and both of its
+        // ordinary subdirectories, all answer `true` — exactly what a
+        // pre-fix (or hypothetically regressed) `is_worktree` would report.
+        let git = FakeGitOps::new()
+            .with_is_worktree(Ok(false))
+            .with_is_worktree_for_path(misplaced.clone(), Ok(true))
+            .with_is_worktree_for_path(lib_subdir.clone(), Ok(true))
+            .with_is_worktree_for_path(test_subdir.clone(), Ok(true));
+        let tmux = FakeTmuxOps::new();
+        let home = tmp.path().to_path_buf();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let mut out = Vec::new();
+
+        restore(&ctx, &mut out).unwrap();
+
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSession { .. })),
+            "must not create a session for either subdirectory of the misplaced worktree"
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("Warning:"));
+        assert!(printed.contains(&misplaced.display().to_string()));
+        assert!(printed.contains("0 restored, 0 already active"));
+        assert!(printed.contains("1 misplaced worktree(s) skipped"));
     }
 
     // --- start ---
