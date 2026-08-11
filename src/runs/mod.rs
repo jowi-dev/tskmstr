@@ -114,6 +114,19 @@ pub enum RunStoreError {
     /// [`RunStore::finish_run`] was called with an id that has no matching row.
     #[error("no run with id {0}")]
     RunNotFound(i64),
+
+    /// [`RunStore::reopen_run`] was called on a run whose status isn't
+    /// terminal (see [`RunStatus::is_terminal`]) — reopening only makes sense
+    /// for a run that has already finished.
+    #[error(
+        "run {id} is not in a terminal state (status: {status}); only done/failed/interrupted runs can be reopened"
+    )]
+    NotTerminal {
+        /// Row id that was rejected.
+        id: i64,
+        /// Its current (non-terminal) status string.
+        status: String,
+    },
 }
 
 /// Lifecycle status of a run, stored in `runs.status` as its lowercase name.
@@ -129,8 +142,20 @@ pub enum RunStatus {
     Review,
     /// Finished successfully.
     Done,
-    /// Finished with an error.
+    /// Finished with an error: the agent ran and concluded it failed (a
+    /// non-zero `claude` exit, or an explicit `is_error: true` in its result
+    /// JSON).
     Failed,
+    /// Ended abnormally, or its outcome could not be determined — distinct
+    /// from [`RunStatus::Failed`]. `Failed` means the agent tried and
+    /// reported failure; `Interrupted` means the run's terminal JSON was
+    /// unparseable, or the `is_error` field was entirely absent (rather than
+    /// explicitly `false`), which is exactly the shape a mid-run event like a
+    /// usage-limit model switch can produce. Treating that as `Done` is the
+    /// bug this variant exists to avoid — see
+    /// [`crate::work::runner::parse_run_outcome`]'s doc comment. Terminal for
+    /// board/ordering purposes, same as `Done`/`Failed`.
+    Interrupted,
 }
 
 impl RunStatus {
@@ -143,6 +168,7 @@ impl RunStatus {
             RunStatus::Review => "review",
             RunStatus::Done => "done",
             RunStatus::Failed => "failed",
+            RunStatus::Interrupted => "interrupted",
         }
     }
 
@@ -156,8 +182,20 @@ impl RunStatus {
             "review" => Some(RunStatus::Review),
             "done" => Some(RunStatus::Done),
             "failed" => Some(RunStatus::Failed),
+            "interrupted" => Some(RunStatus::Interrupted),
             _ => None,
         }
+    }
+
+    /// Whether this status is terminal: the run has finished (successfully
+    /// or not) and isn't going to progress on its own. Used by [`RunStore`]'s
+    /// list ordering and by `tm runs reopen`'s precondition — a run must be
+    /// terminal before it can be reopened.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted
+        )
     }
 }
 
@@ -228,6 +266,19 @@ impl Default for FinishRun {
             model_usage: None,
         }
     }
+}
+
+/// A run reopened by [`RunStore::reopen_run`].
+#[derive(Debug, Clone)]
+pub struct ReopenedRun {
+    /// Row id.
+    pub id: i64,
+    /// Jira ticket key.
+    pub ticket: String,
+    /// The status it had before being reopened.
+    pub old_status: RunStatus,
+    /// The status it was moved to.
+    pub new_status: RunStatus,
 }
 
 /// A run marked failed by [`RunStore::reap`].
@@ -999,6 +1050,64 @@ impl RunStore {
         Ok(())
     }
 
+    /// Reopens a finished run, moving it back to `to` so it can be worked
+    /// (or resumed) again.
+    ///
+    /// The precondition — the run's current status must be terminal (see
+    /// [`RunStatus::is_terminal`]) — is enforced in the `UPDATE`'s `WHERE`
+    /// clause itself, not just checked beforehand, so a concurrent writer
+    /// can't race a non-terminal row past this guard. Clears `ended_at`,
+    /// `pid`, and `heartbeat_at`: `ended_at` because a reopened run hasn't
+    /// ended, and `pid`/`heartbeat_at` because the process that owned them is
+    /// long gone — a stale pid or heartbeat from the *original* run would
+    /// otherwise make the reopened row look like a live (or reapable) run
+    /// that it isn't.
+    ///
+    /// Callers choosing `to`: [`RunStore::reap`] only ever touches
+    /// `status = 'running'` rows, and reaps a `running` row with no pid on
+    /// staleness alone (see `reap`'s doc comment) — since this method always
+    /// clears `pid`, reopening straight to [`RunStatus::Running`] leaves the
+    /// row one `tm runs reap` away from being marked failed again the moment
+    /// its (inherited, already-old) `started_at` looks stale. Reopening to
+    /// [`RunStatus::Queued`] avoids that trap; `tm runs reopen` defaults to
+    /// it for exactly this reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching
+    /// row, or [`RunStoreError::NotTerminal`] if it exists but its status
+    /// isn't terminal.
+    pub fn reopen_run(&self, run_id: i64, to: RunStatus) -> Result<ReopenedRun, RunStoreError> {
+        let existing = self
+            .run_by_id(run_id)?
+            .ok_or(RunStoreError::RunNotFound(run_id))?;
+
+        let changes = self.conn.execute(
+            "UPDATE runs SET
+                status = ?1,
+                ended_at = NULL,
+                pid = NULL,
+                heartbeat_at = NULL
+             WHERE id = ?2
+               AND status IN ('done', 'failed', 'interrupted')",
+            params![to.as_str(), run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::NotTerminal {
+                id: run_id,
+                status: existing.status.as_str().to_string(),
+            });
+        }
+
+        Ok(ReopenedRun {
+            id: run_id,
+            ticket: existing.ticket,
+            old_status: existing.status,
+            new_status: to,
+        })
+    }
+
     /// Updates a run row's recorded `pid` in place, without touching status,
     /// heartbeat, or any other column.
     ///
@@ -1122,13 +1231,16 @@ impl RunStore {
              FROM runs r
              WHERE ?1 IS NULL OR r.kind = ?1
              ORDER BY
-                CASE r.status WHEN 'done' THEN 1 WHEN 'failed' THEN 1 ELSE 0 END ASC,
+                CASE r.status WHEN 'done' THEN 1 WHEN 'failed' THEN 1 WHEN 'interrupted' THEN 1 ELSE 0 END ASC,
                 r.started_at DESC";
 
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![kind], |row| {
             let status_str: String = row.get(4)?;
-            let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+            // Forward-compat fallback: a status string this binary doesn't
+            // recognize (e.g. written by a newer binary sharing the same DB)
+            // is ambiguous, not a known failure — Interrupted, not Failed.
+            let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
             let last_event_kind: Option<String> = row.get(7)?;
             let awaiting_input = is_awaiting_input(status, last_event_kind.as_deref());
             Ok(RunSummary {
@@ -1309,7 +1421,9 @@ impl RunStore {
     /// [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         let status_str: String = row.get(4)?;
-        let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Failed);
+        // Same forward-compat reasoning as list_runs_filtered: an
+        // unrecognized status string is ambiguous, not a known failure.
+        let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
         Ok(Run {
             id: row.get(0)?,
             ticket: row.get(1)?,
@@ -1430,6 +1544,23 @@ mod tests {
 
     fn open_store(dir: &Path) -> RunStore {
         RunStore::open(&dir.join("nested").join("runs.db")).expect("open should succeed")
+    }
+
+    #[test]
+    fn run_status_interrupted_round_trips_through_as_str_and_parse() {
+        assert_eq!(RunStatus::Interrupted.as_str(), "interrupted");
+        assert_eq!(RunStatus::parse("interrupted"), Some(RunStatus::Interrupted));
+    }
+
+    #[test]
+    fn run_status_is_terminal_matches_done_failed_interrupted_only() {
+        assert!(RunStatus::Done.is_terminal());
+        assert!(RunStatus::Failed.is_terminal());
+        assert!(RunStatus::Interrupted.is_terminal());
+        assert!(!RunStatus::Queued.is_terminal());
+        assert!(!RunStatus::Running.is_terminal());
+        assert!(!RunStatus::Blocked.is_terminal());
+        assert!(!RunStatus::Review.is_terminal());
     }
 
     #[test]
@@ -1742,6 +1873,128 @@ mod tests {
 
         let err = store
             .finish_run(999, &FinishRun::default())
+            .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+    }
+
+    /// Starts and finishes a run at `status`, returning its id.
+    fn finished_run(store: &RunStore, status: RunStatus) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: Some(4242),
+                kind: "lane".to_string(),
+            })
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn reopen_run_succeeds_from_each_terminal_status() {
+        for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Interrupted] {
+            let dir = tempdir().unwrap();
+            let store = open_store(dir.path());
+            let id = finished_run(&store, status);
+
+            let reopened = store.reopen_run(id, RunStatus::Queued).unwrap();
+
+            assert_eq!(reopened.id, id);
+            assert_eq!(reopened.ticket, "PROJ-1");
+            assert_eq!(reopened.old_status, status);
+            assert_eq!(reopened.new_status, RunStatus::Queued);
+
+            let run = store.run_by_id(id).unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Queued);
+            assert_eq!(run.ended_at, None);
+            assert_eq!(run.pid, None);
+            assert_eq!(run.heartbeat_at, None);
+        }
+    }
+
+    #[test]
+    fn reopen_run_can_target_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = finished_run(&store, RunStatus::Done);
+
+        let reopened = store.reopen_run(id, RunStatus::Running).unwrap();
+
+        assert_eq!(reopened.new_status, RunStatus::Running);
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn reopen_run_errors_on_non_terminal_status() {
+        for status in [RunStatus::Queued, RunStatus::Running, RunStatus::Blocked] {
+            let dir = tempdir().unwrap();
+            let store = open_store(dir.path());
+            let id = store
+                .start_run(&StartRun {
+                    ticket: "PROJ-1".to_string(),
+                    lane: "backend".to_string(),
+                    worktree: "/tmp/wt1".to_string(),
+                    branch: None,
+                    pid: None,
+                    kind: "lane".to_string(),
+                })
+                .unwrap();
+            if status != RunStatus::Running {
+                store
+                    .finish_run(
+                        id,
+                        &FinishRun {
+                            status,
+                            ..FinishRun::default()
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let err = store
+                .reopen_run(id, RunStatus::Queued)
+                .expect_err("expected NotTerminal");
+
+            match err {
+                RunStoreError::NotTerminal {
+                    id: err_id,
+                    status: err_status,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(err_status, status.as_str());
+                }
+                other => panic!("expected NotTerminal, got {other:?}"),
+            }
+
+            // Nothing changed.
+            let run = store.run_by_id(id).unwrap().unwrap();
+            assert_eq!(run.status, status);
+        }
+    }
+
+    #[test]
+    fn reopen_run_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .reopen_run(999, RunStatus::Queued)
             .expect_err("expected RunNotFound");
 
         match err {

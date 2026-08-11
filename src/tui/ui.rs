@@ -2268,19 +2268,25 @@ mod tests {
     #[test]
     fn draws_runs_board_with_all_six_column_titles() {
         let app = runs_app(vec![]);
-        let text = buffer_text(&render(&app));
+        // Seven columns (Queued/Running/Blocked/Review/Done/Failed/
+        // Interrupted) no longer fit the 80-column default without
+        // truncating a title -- widen the terminal like the other
+        // board-with-titles tests below. "Interrupted (0)" is the longest
+        // title, so this one needs more room than the rest.
+        let text = buffer_text(&render_with_size(&app, 140, 24));
         assert!(text.contains("Queued (0)"));
         assert!(text.contains("Running (0)"));
         assert!(text.contains("Blocked (0)"));
         assert!(text.contains("Review (0)"));
         assert!(text.contains("Done (0)"));
         assert!(text.contains("Failed (0)"));
+        assert!(text.contains("Interrupted (0)"));
     }
 
     #[test]
     fn draws_runs_board_with_a_cards_ticket_and_lane_visible() {
         let app = runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)]);
-        let text = buffer_text(&render(&app));
+        let text = buffer_text(&render_with_size(&app, 112, 24));
         assert!(text.contains("Running (1)"));
         assert!(text.contains("PROJ-1"));
         assert!(text.contains("backend"));
@@ -2289,7 +2295,7 @@ mod tests {
     #[test]
     fn running_column_title_carries_its_status_color() {
         let app = runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)]);
-        let buffer = render(&app);
+        let buffer = render_with_size(&app, 112, 24);
         let cell = cell_at(&buffer, "Running (1)").expect("Running column title renders");
         assert_eq!(
             Some(cell.fg),
@@ -2397,7 +2403,7 @@ mod tests {
             run_detail: None,
             ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
         };
-        let text = buffer_text(&render(&app));
+        let text = buffer_text(&render_with_size(&app, 112, 24));
         assert!(text.contains("Running (1)"));
         assert!(text.contains("Loading..."));
     }
@@ -2893,7 +2899,7 @@ mod tests {
             ])),
             ..run_card(1, "PROJ-1", "backend", RunStatus::Running)
         };
-        let text = buffer_text(&render(&runs_app(vec![card])));
+        let text = buffer_text(&render_with_size(&runs_app(vec![card]), 112, 24));
         assert!(text.contains("3/4"));
     }
 

@@ -299,6 +299,10 @@ pub enum AuditIndicator {
     /// The latest audit run finished with an error and its tmux session is
     /// still up: attachable aftermath, same lifecycle as `Done`.
     Failed,
+    /// The latest audit run ended abnormally, or its outcome couldn't be
+    /// determined ([`RunStatus::Interrupted`]), and its tmux session is still
+    /// up: attachable aftermath, same lifecycle as `Done`/`Failed`.
+    Interrupted,
 }
 
 /// A ticket's full audit badge state on the board: its [`AuditIndicator`]
@@ -329,8 +333,8 @@ pub struct AuditStatusEntry {
 /// 1. Running + awaiting input -> [`AuditIndicator::Waiting`].
 /// 2. Running, not awaiting -> [`AuditIndicator::Running`].
 /// 3. No run recorded at all, but the session exists -> [`AuditIndicator::Starting`].
-/// 4. A finished (`Done`/`Failed`) run *and* the session still exists ->
-///    the matching terminal indicator (attachable aftermath).
+/// 4. A finished (`Done`/`Failed`/`Interrupted`) run *and* the session still
+///    exists -> the matching terminal indicator (attachable aftermath).
 /// 5. Otherwise: no badge.
 pub fn audit_indicator(
     has_session: bool,
@@ -341,6 +345,7 @@ pub fn audit_indicator(
         Some((RunStatus::Running, false)) => Some(AuditIndicator::Running),
         Some((RunStatus::Done, _)) if has_session => Some(AuditIndicator::Done),
         Some((RunStatus::Failed, _)) if has_session => Some(AuditIndicator::Failed),
+        Some((RunStatus::Interrupted, _)) if has_session => Some(AuditIndicator::Interrupted),
         None if has_session => Some(AuditIndicator::Starting),
         _ => None,
     }
@@ -370,6 +375,10 @@ pub enum RunIndicator {
     Done,
     /// The latest lane run finished with an error.
     Failed,
+    /// The latest lane run ended abnormally, or its outcome couldn't be
+    /// determined ([`RunStatus::Interrupted`]) — distinct from `Failed`
+    /// because the agent never actually reported failure.
+    Interrupted,
 }
 
 /// Pure precedence rule for deriving a ticket's [`RunIndicator`] from
@@ -387,9 +396,10 @@ pub enum RunIndicator {
 /// 2. `Queued`/`Running`, not awaiting -> [`RunIndicator::Running`].
 /// 3. `Review`/`Done` -> [`RunIndicator::Done`].
 /// 4. `Failed` -> [`RunIndicator::Failed`].
-/// 5. No run recorded at all, but a launch is pending ->
+/// 5. `Interrupted` -> [`RunIndicator::Interrupted`].
+/// 6. No run recorded at all, but a launch is pending ->
 ///    [`RunIndicator::Starting`].
-/// 6. Otherwise: no badge.
+/// 7. Otherwise: no badge.
 pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Option<RunIndicator> {
     match run {
         Some((RunStatus::Running, true)) => Some(RunIndicator::Waiting),
@@ -399,6 +409,7 @@ pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Opti
         Some((RunStatus::Review, _)) => Some(RunIndicator::Done),
         Some((RunStatus::Done, _)) => Some(RunIndicator::Done),
         Some((RunStatus::Failed, _)) => Some(RunIndicator::Failed),
+        Some((RunStatus::Interrupted, _)) => Some(RunIndicator::Interrupted),
         None if pending => Some(RunIndicator::Starting),
         None => None,
     }
@@ -446,15 +457,16 @@ pub fn bot_watch_indicator(run: Option<RunStatus>) -> Option<BotWatchIndicator> 
     }
 }
 
-/// The fixed column order for [`Screen::Runs`]'s kanban board. All six
+/// The fixed column order for [`Screen::Runs`]'s kanban board. All seven
 /// columns always render, even when empty.
-pub const RUN_COLUMNS: [crate::runs::RunStatus; 6] = [
+pub const RUN_COLUMNS: [crate::runs::RunStatus; 7] = [
     crate::runs::RunStatus::Queued,
     crate::runs::RunStatus::Running,
     crate::runs::RunStatus::Blocked,
     crate::runs::RunStatus::Review,
     crate::runs::RunStatus::Done,
     crate::runs::RunStatus::Failed,
+    crate::runs::RunStatus::Interrupted,
 ];
 
 /// All state needed to render and drive the TUI.
@@ -3590,6 +3602,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_indicator_interrupted_with_live_session_is_interrupted() {
+        assert_eq!(
+            audit_indicator(true, Some((RunStatus::Interrupted, false))),
+            Some(AuditIndicator::Interrupted)
+        );
+    }
+
+    #[test]
+    fn audit_indicator_interrupted_without_session_is_none() {
+        assert_eq!(
+            audit_indicator(false, Some((RunStatus::Interrupted, false))),
+            None
+        );
+    }
+
     // --- lane_run_indicator ---
 
     #[test]
@@ -3649,6 +3677,14 @@ mod tests {
         assert_eq!(
             lane_run_indicator(false, Some((RunStatus::Failed, false))),
             Some(RunIndicator::Failed)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_interrupted_is_interrupted() {
+        assert_eq!(
+            lane_run_indicator(false, Some((RunStatus::Interrupted, false))),
+            Some(RunIndicator::Interrupted)
         );
     }
 

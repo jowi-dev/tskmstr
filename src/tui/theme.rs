@@ -65,7 +65,10 @@ pub const GRABBED_MARKER: Style = Style::new().fg(Color::Yellow).add_modifier(Mo
 ///
 /// Queued is dim gray (waiting, nothing happening yet), running is cyan
 /// (active), blocked is red (needs attention), review is magenta (needs a
-/// human), done is green (success), failed is red (needs attention).
+/// human), done is green (success), failed is red (needs attention),
+/// interrupted is yellow (ambiguous outcome, needs a human to look but isn't
+/// a confirmed failure — the same "look at me" hue as [`AWAITING_INPUT`],
+/// without stealing red from a genuine failure).
 pub const fn run_status_style(status: RunStatus) -> Style {
     let color = match status {
         RunStatus::Queued => Color::DarkGray,
@@ -74,6 +77,7 @@ pub const fn run_status_style(status: RunStatus) -> Style {
         RunStatus::Review => Color::Magenta,
         RunStatus::Done => Color::Green,
         RunStatus::Failed => Color::Red,
+        RunStatus::Interrupted => Color::Yellow,
     };
     Style::new().fg(color)
 }
@@ -130,6 +134,7 @@ pub fn audit_indicator_style(indicator: AuditIndicator) -> Style {
         AuditIndicator::Starting => DIM,
         AuditIndicator::Done => Style::new().fg(Color::Green),
         AuditIndicator::Failed => Style::new().fg(Color::Red),
+        AuditIndicator::Interrupted => Style::new().fg(Color::Yellow),
     }
 }
 
@@ -142,14 +147,15 @@ pub fn audit_indicator_label(indicator: AuditIndicator) -> &'static str {
         AuditIndicator::Waiting => "audit: waiting",
         AuditIndicator::Done => "audit: done",
         AuditIndicator::Failed => "audit: failed",
+        AuditIndicator::Interrupted => "audit: interrupted",
     }
 }
 
 /// The style for a board ticket's [`RunIndicator`] badge: identical per-state
 /// colors to [`audit_indicator_style`] (`Waiting` bold yellow, `Running`
-/// cyan, `Starting` dim, `Done` green, `Failed` red), since both badges
-/// signal the same underlying run lifecycle -- just for different `kind`s of
-/// run.
+/// cyan, `Starting` dim, `Done` green, `Failed` red, `Interrupted` yellow),
+/// since both badges signal the same underlying run lifecycle -- just for
+/// different `kind`s of run.
 pub fn run_indicator_style(indicator: RunIndicator) -> Style {
     match indicator {
         RunIndicator::Waiting => AWAITING_INPUT,
@@ -157,6 +163,7 @@ pub fn run_indicator_style(indicator: RunIndicator) -> Style {
         RunIndicator::Starting => DIM,
         RunIndicator::Done => Style::new().fg(Color::Green),
         RunIndicator::Failed => Style::new().fg(Color::Red),
+        RunIndicator::Interrupted => Style::new().fg(Color::Yellow),
     }
 }
 
@@ -169,6 +176,7 @@ pub fn run_indicator_label(indicator: RunIndicator) -> &'static str {
         RunIndicator::Waiting => "run: waiting",
         RunIndicator::Done => "run: done",
         RunIndicator::Failed => "run: failed",
+        RunIndicator::Interrupted => "run: interrupted",
     }
 }
 
@@ -220,6 +228,10 @@ pub fn cleanup_indicator_style(indicator: AuditIndicator) -> Style {
         AuditIndicator::Starting => DIM,
         AuditIndicator::Done => Style::new().fg(Color::Green),
         AuditIndicator::Failed => Style::new().fg(Color::Red),
+        // Plain (non-bold) yellow, matching the rest of the theme's
+        // Interrupted treatment (see `run_status_style`) -- distinct from
+        // `Waiting`'s bold yellow.
+        AuditIndicator::Interrupted => Style::new().fg(Color::LightYellow),
     }
 }
 
@@ -232,6 +244,7 @@ pub fn cleanup_indicator_label(indicator: AuditIndicator) -> &'static str {
         AuditIndicator::Waiting => "clean: waiting",
         AuditIndicator::Done => "clean: done",
         AuditIndicator::Failed => "clean: failed",
+        AuditIndicator::Interrupted => "clean: interrupted",
     }
 }
 
@@ -278,6 +291,10 @@ mod tests {
         assert_eq!(run_status_style(RunStatus::Review).fg, Some(Color::Magenta));
         assert_eq!(run_status_style(RunStatus::Done).fg, Some(Color::Green));
         assert_eq!(run_status_style(RunStatus::Failed).fg, Some(Color::Red));
+        assert_eq!(
+            run_status_style(RunStatus::Interrupted).fg,
+            Some(Color::Yellow)
+        );
     }
 
     #[test]
@@ -330,6 +347,10 @@ mod tests {
             audit_indicator_style(AuditIndicator::Failed).fg,
             Some(Color::Red)
         );
+        assert_eq!(
+            audit_indicator_style(AuditIndicator::Interrupted).fg,
+            Some(Color::Yellow)
+        );
     }
 
     #[test]
@@ -340,6 +361,7 @@ mod tests {
             AuditIndicator::Waiting,
             AuditIndicator::Done,
             AuditIndicator::Failed,
+            AuditIndicator::Interrupted,
         ] {
             assert_eq!(audit_indicator_style(indicator).bg, None);
         }
@@ -353,6 +375,7 @@ mod tests {
             audit_indicator_label(AuditIndicator::Waiting),
             audit_indicator_label(AuditIndicator::Done),
             audit_indicator_label(AuditIndicator::Failed),
+            audit_indicator_label(AuditIndicator::Interrupted),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
@@ -382,6 +405,10 @@ mod tests {
             run_indicator_style(RunIndicator::Failed).fg,
             Some(Color::Red)
         );
+        assert_eq!(
+            run_indicator_style(RunIndicator::Interrupted).fg,
+            Some(Color::Yellow)
+        );
     }
 
     #[test]
@@ -392,6 +419,7 @@ mod tests {
             RunIndicator::Waiting,
             RunIndicator::Done,
             RunIndicator::Failed,
+            RunIndicator::Interrupted,
         ] {
             assert_eq!(run_indicator_style(indicator).bg, None);
         }
@@ -479,17 +507,22 @@ mod tests {
             cleanup_indicator_style(AuditIndicator::Failed).fg,
             Some(Color::Red)
         );
+        assert_eq!(
+            cleanup_indicator_style(AuditIndicator::Interrupted).fg,
+            Some(Color::LightYellow)
+        );
         let colors: std::collections::HashSet<_> = [
             AuditIndicator::Starting,
             AuditIndicator::Running,
             AuditIndicator::Waiting,
             AuditIndicator::Done,
             AuditIndicator::Failed,
+            AuditIndicator::Interrupted,
         ]
         .iter()
         .map(|i| cleanup_indicator_style(*i).fg)
         .collect();
-        assert_eq!(colors.len(), 5, "each variant needs its own fg");
+        assert_eq!(colors.len(), 6, "each variant needs its own fg");
     }
 
     #[test]
@@ -500,6 +533,7 @@ mod tests {
             AuditIndicator::Waiting,
             AuditIndicator::Done,
             AuditIndicator::Failed,
+            AuditIndicator::Interrupted,
         ] {
             assert_eq!(cleanup_indicator_style(indicator).bg, None);
         }
@@ -513,6 +547,7 @@ mod tests {
             cleanup_indicator_label(AuditIndicator::Waiting),
             cleanup_indicator_label(AuditIndicator::Done),
             cleanup_indicator_label(AuditIndicator::Failed),
+            cleanup_indicator_label(AuditIndicator::Interrupted),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
@@ -559,6 +594,7 @@ mod tests {
             run_indicator_label(RunIndicator::Waiting),
             run_indicator_label(RunIndicator::Done),
             run_indicator_label(RunIndicator::Failed),
+            run_indicator_label(RunIndicator::Interrupted),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
