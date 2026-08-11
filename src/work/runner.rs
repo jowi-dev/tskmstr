@@ -25,7 +25,7 @@
 //! | `.session_id // empty` | `session_id: String` (required) | `--session-id` |
 //! | `.num_turns // empty` | `num_turns: Option<u64>` | (printed in `--fg` summary; not a finish flag) |
 //! | `.total_cost_usd // empty` | `cost_usd: Option<f64>` | (printed in `--fg` summary; not a finish flag) |
-//! | `.is_error // false` | `is_error: bool` (defaults `false`) | drives the `done`/`failed` status passed to `finish_run` |
+//! | `.is_error` | `is_error: Option<bool>` (absence is kept, not defaulted) | drives the `done`/`failed`/`interrupted` status passed to `finish_run` |
 //! | `.result // empty` / `.result // "no result field"` | `result: Option<String>` | scraped for the PR-URL fallback, not passed directly |
 //! | `.modelUsage // empty` | `model_usage: Option<ModelUsageMap>` | `--model-usage` (only when present and non-empty, per the wrapper's `[ -n "$MODEL_USAGE" ]` guard) |
 //!
@@ -283,11 +283,21 @@ pub struct RunOutcome {
     pub cost_usd: Option<f64>,
     /// `.num_turns`, absent when the field is missing.
     pub num_turns: Option<u64>,
-    /// `.is_error`, defaulting to `false` when absent (mirrors `jq`'s
-    /// `// false`). `work.ml`'s `--fg` path and the detached wrapper both
-    /// treat `is_error: true` as a failed run even when `claude` itself
-    /// exited 0.
-    pub is_error: bool,
+    /// `.is_error`, verbatim — `None` when the field is entirely absent from
+    /// the result JSON, distinct from an explicit `false`.
+    ///
+    /// This diverges from `work.ml`'s `jq '.is_error // false'` (which this
+    /// port originally mirrored, defaulting absence to `false`): an absent
+    /// `is_error` turned out to be exactly the shape a mid-run event like a
+    /// usage-limit forced model switch can leave behind — the turn ends
+    /// gracefully (`claude` exits 0) but never writes an `is_error` field at
+    /// all. Defaulting that to `false` silently misclassified an ambiguous
+    /// outcome as a confirmed success. The caller
+    /// ([`crate::work::run::run_claude_and_finish`]) now treats `None` here
+    /// as suspicious — `RunStatus::Interrupted`, not `Done` — while
+    /// `Some(true)`/`Some(false)` still drive `Failed`/`Done` exactly as
+    /// before.
+    pub is_error: Option<bool>,
     /// `.result`, the free-text summary/response. Absent when missing,
     /// distinct from an explicit empty string.
     pub result: Option<String>,
@@ -310,7 +320,7 @@ struct RawResult {
     #[serde(default)]
     num_turns: Option<u64>,
     #[serde(default)]
-    is_error: bool,
+    is_error: Option<bool>,
     #[serde(default)]
     result: Option<String>,
     #[serde(default, rename = "modelUsage")]
@@ -378,7 +388,7 @@ mod tests {
         assert_eq!(outcome.session_id, "sess-123");
         assert_eq!(outcome.cost_usd, Some(1.5));
         assert_eq!(outcome.num_turns, Some(12));
-        assert!(!outcome.is_error);
+        assert_eq!(outcome.is_error, Some(false));
         assert_eq!(
             outcome.result,
             Some("opened https://github.com/example/repo/pull/42".to_string())
@@ -397,21 +407,33 @@ mod tests {
         assert_eq!(outcome.session_id, "sess-abc");
         assert_eq!(outcome.cost_usd, None);
         assert_eq!(outcome.num_turns, None);
-        assert!(!outcome.is_error);
+        assert_eq!(outcome.is_error, None);
         assert_eq!(outcome.result, None);
         assert_eq!(outcome.model_usage, None);
     }
 
     #[test]
-    fn parse_run_outcome_defaults_is_error_to_false_when_absent() {
+    fn parse_run_outcome_leaves_is_error_none_when_absent() {
+        // An absent `is_error` is distinct from an explicit `false`: this is
+        // exactly the shape a mid-run usage-limit model switch can leave
+        // behind (the turn ends gracefully with no `is_error` field at all),
+        // and the caller (run_claude_and_finish) must be able to tell the
+        // two apart to avoid misclassifying it as a successful `Done` run.
+        // See RunStatus::Interrupted's doc comment.
         let json = r#"{"session_id": "sess-abc"}"#;
-        assert!(!parse_run_outcome(json).unwrap().is_error);
+        assert_eq!(parse_run_outcome(json).unwrap().is_error, None);
+    }
+
+    #[test]
+    fn parse_run_outcome_honors_is_error_explicit_false() {
+        let json = r#"{"session_id": "sess-abc", "is_error": false}"#;
+        assert_eq!(parse_run_outcome(json).unwrap().is_error, Some(false));
     }
 
     #[test]
     fn parse_run_outcome_honors_is_error_true() {
         let json = r#"{"session_id": "sess-abc", "is_error": true}"#;
-        assert!(parse_run_outcome(json).unwrap().is_error);
+        assert_eq!(parse_run_outcome(json).unwrap().is_error, Some(true));
     }
 
     #[test]

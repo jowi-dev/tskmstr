@@ -340,9 +340,13 @@ pub struct PreparedRun {
 pub struct RunLaneOutcome {
     /// The `RunStore` row id created for this run.
     pub run_id: i64,
-    /// Whether the run is considered failed — a non-zero `claude` exit
-    /// status, or `.is_error: true` in its result JSON. Callers (the CLI
-    /// layer) use this to decide the process's exit code.
+    /// Whether the run did *not* end in [`RunStatus::Done`] — a non-zero
+    /// `claude` exit status, an explicit `is_error: true` in its result
+    /// JSON, or an ambiguous/unparseable result classified as
+    /// [`RunStatus::Interrupted`]. Callers (the CLI layer) use this to
+    /// decide the process's exit code; it collapses `Failed` and
+    /// `Interrupted` into one bit because both mean "don't report success",
+    /// even though the run row itself keeps the finer-grained status.
     pub is_error: bool,
     /// The worktree path this run executed in.
     pub worktree: PathBuf,
@@ -983,11 +987,34 @@ pub fn run_claude_and_finish(
         stdout_path: &prepared.out_json_path,
     })?;
 
-    // Parse the outcome. A non-zero exit forces a failed outcome regardless
-    // of what (if anything) the JSON says.
+    // Parse the outcome and classify the run's terminal status. A non-zero
+    // exit is always Failed, regardless of what (if anything) the JSON says
+    // -- that's an unambiguous signal from the process itself. Otherwise:
+    //
+    // - JSON parsed and `is_error` was explicit -> Failed/Done, exactly as
+    //   before.
+    // - JSON failed to parse (or had no usable session_id) -> Interrupted:
+    //   we genuinely don't know what happened, which is a different claim
+    //   than "the agent failed".
+    // - JSON parsed but `is_error` was entirely absent -> Interrupted, not
+    //   Done. This is the fix for the bug this variant exists for: a mid-run
+    //   event that ends the turn gracefully (exit 0) without ever writing an
+    //   `is_error` field -- e.g. a usage-limit forced model switch -- used to
+    //   default straight to `Done` via `unwrap_or(false)`. See
+    //   `RunStatus::Interrupted`'s doc comment and
+    //   `parse_run_outcome_leaves_is_error_none_when_absent`.
     let raw_json = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
     let parsed = parse_run_outcome(&raw_json).ok();
-    let is_error = !status.success() || parsed.as_ref().map(|o| o.is_error).unwrap_or(true);
+    let run_status = if !status.success() {
+        RunStatus::Failed
+    } else {
+        match parsed.as_ref().map(|o| o.is_error) {
+            Some(Some(true)) => RunStatus::Failed,
+            Some(Some(false)) => RunStatus::Done,
+            Some(None) | None => RunStatus::Interrupted,
+        }
+    };
+    let is_error = run_status != RunStatus::Done;
 
     // Finish the tracked run.
     let model_usage_json = parsed
@@ -1002,11 +1029,7 @@ pub fn run_claude_and_finish(
     run_store.finish_run(
         prepared.run_id,
         &FinishRun {
-            status: if is_error {
-                RunStatus::Failed
-            } else {
-                RunStatus::Done
-            },
+            status: run_status,
             exit_code: status.code(),
             session_id: parsed.as_ref().map(|o| o.session_id.clone()),
             cost_usd: parsed.as_ref().and_then(|o| o.cost_usd),
@@ -1402,6 +1425,152 @@ mod tests {
         .unwrap();
 
         assert!(outcome.is_error);
+    }
+
+    #[test]
+    fn run_lane_fg_absent_is_error_on_zero_exit_marks_run_interrupted() {
+        // The usage-runout bug this variant exists to fix: `claude` exits 0
+        // and writes valid result JSON, but the JSON never got an
+        // `is_error` field at all (rather than an explicit `false`). That
+        // must not be treated as a confirmed `Done` -- it's ambiguous.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let json = r#"{"session_id":"sess-1","result":"partial work"}"#;
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(json.to_string());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Interrupted);
+    }
+
+    #[test]
+    fn run_lane_fg_unparseable_result_json_on_zero_exit_marks_run_interrupted() {
+        // Malformed/missing-session-id JSON is ambiguous, not a confirmed
+        // agent failure -- Interrupted, not Failed.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success("not json".to_string());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Interrupted);
+    }
+
+    #[test]
+    fn run_lane_fg_nonzero_exit_with_absent_is_error_still_marks_failed() {
+        // A non-zero exit is an unambiguous failure signal from the process
+        // itself, regardless of what (if anything) the JSON says -- it must
+        // win over the "absent is_error -> Interrupted" rule.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let json = r#"{"session_id":"sess-1","result":"partial work"}"#;
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::with_exit_code(json.to_string(), 1);
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
     }
 
     #[test]
