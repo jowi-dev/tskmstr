@@ -210,7 +210,8 @@ fn bot_finding_annotations(
     let prs = match ctx.gh.pr_list(&cwd) {
         Ok(prs) => prs,
         Err(err) => {
-            writeln!(out, "warning: could not check bot findings: {err}")?;
+            let note = crate::github::gh_cli::permanence_note(&err);
+            writeln!(out, "warning: could not check bot findings: {err}{note}")?;
             return Ok(annotations);
         }
     };
@@ -229,7 +230,8 @@ fn bot_finding_annotations(
             }
             Err(err) => {
                 if !warned {
-                    writeln!(out, "warning: could not check bot findings: {err}")?;
+                    let note = crate::github::gh_cli::permanence_note(&err);
+                    writeln!(out, "warning: could not check bot findings: {err}{note}")?;
                     warned = true;
                 }
             }
@@ -256,7 +258,8 @@ fn print_bot_finding_note(
     let prs = match ctx.gh.pr_list(&cwd) {
         Ok(prs) => prs,
         Err(err) => {
-            writeln!(out, "warning: could not check bot findings: {err}")?;
+            let note = crate::github::gh_cli::permanence_note(&err);
+            writeln!(out, "warning: could not check bot findings: {err}{note}")?;
             return Ok(());
         }
     };
@@ -282,7 +285,8 @@ fn print_bot_finding_note(
             }
         }
         Err(err) => {
-            writeln!(out, "warning: could not check bot findings: {err}")?;
+            let note = crate::github::gh_cli::permanence_note(&err);
+            writeln!(out, "warning: could not check bot findings: {err}{note}")?;
         }
     }
 
@@ -569,6 +573,33 @@ mod tests {
             "warning: could not check bot findings: `gh pr list` failed (exit Some(1)): boom\n\
              PROJ-1  Summary for PROJ-1\n\
              PROJ-2  Summary for PROJ-2\n"
+        );
+    }
+
+    #[test]
+    fn list_pr_list_permanent_failure_flags_the_warning_as_a_tm_bug() {
+        // A permanent gh error deserves a louder warning than a plain
+        // network hiccup — "surface it prominently", not a warning line
+        // that reads identically for a bug that will never resolve itself
+        // and a blip that will. `tm ready list` still degrades to an
+        // unannotated listing either way (a best-effort side annotation,
+        // not worth hard-failing the whole command over).
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new().with_pr_list(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: r#"unknown JSON field: "merged""#.to_string(),
+        }));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should still succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            output.contains("bug in tm itself"),
+            "expected the warning to flag this as a permanent tm bug, got: {output:?}"
         );
     }
 

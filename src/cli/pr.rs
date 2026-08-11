@@ -182,7 +182,8 @@ pub fn status(
             }
         }
         Err(err) => {
-            writeln!(out, "warning: could not check bot findings: {err}")?;
+            let note = crate::github::gh_cli::permanence_note(&err);
+            writeln!(out, "warning: could not check bot findings: {err}{note}")?;
         }
     }
 

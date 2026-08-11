@@ -123,6 +123,31 @@ fn is_permanent_stderr(stderr: &str) -> bool {
         || lower.contains("unknown command")
 }
 
+/// A short, appendable clause flagging a permanent [`GhError`] loudly in a
+/// warning line, empty for a transient one.
+///
+/// For every best-effort "catch a `gh` error and degrade to a fallback"
+/// call site that isn't important enough to hard-fail on (unlike
+/// [`crate::work::run::resolve_blocker_stacking`] or
+/// [`crate::work::review_watch::run_poll_loop`], which do), this is the
+/// minimum fix for the other half of the incident this whole
+/// permanent/transient distinction exists for: a warning that reads exactly
+/// the same for "the network hiccuped" and "tm has had a code-level bug for
+/// months" is not "surfaced prominently" — see
+/// [`GhError::is_permanent`]'s doc comment. Appending this clause is enough
+/// to tell a reader "this isn't going to fix itself; someone should file an
+/// issue" without changing what the call site does (still prints a warning
+/// and continues on the happy path — these are advisory annotations on an
+/// otherwise-successful command, not an autonomous run's only chance to
+/// notice the failure, so a hard fail here would be disproportionate).
+pub fn permanence_note(err: &GhError) -> &'static str {
+    if err.is_permanent() {
+        " (this looks like a bug in tm itself, not a network/gh issue — it will not resolve on retry)"
+    } else {
+        ""
+    }
+}
+
 /// The lifecycle state of a pull request, as reported by `gh pr view --json
 /// state`.
 ///
@@ -1729,6 +1754,26 @@ mod tests {
         };
         assert!(!spawn.is_permanent());
         assert!(!parse.is_permanent());
+    }
+
+    #[test]
+    fn permanence_note_is_non_empty_for_permanent_errors() {
+        let err = GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: r#"unknown JSON field: "merged""#.to_string(),
+        };
+        assert!(!permanence_note(&err).is_empty());
+    }
+
+    #[test]
+    fn permanence_note_is_empty_for_transient_errors() {
+        let err = GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "not authenticated".to_string(),
+        };
+        assert_eq!(permanence_note(&err), "");
     }
 
     #[test]
