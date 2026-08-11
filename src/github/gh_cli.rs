@@ -59,11 +59,13 @@ pub enum GhError {
 }
 
 /// The lifecycle state of a pull request, as reported by `gh pr view --json
-/// state,merged`.
+/// state`.
 ///
-/// `gh`'s `state` field alone only distinguishes `OPEN`/`CLOSED` (merged PRs
-/// still report `CLOSED`), so this also consults the separate `merged`
-/// boolean to tell "closed because merged" apart from "closed unmerged".
+/// `gh`'s `state` field reports `OPEN`, `CLOSED`, or `MERGED` directly (there
+/// is no separate `merged` boolean field on `gh pr view`/`gh pr list` — an
+/// earlier version of this code requested one and every call failed with
+/// `Unknown JSON field: "merged"`), so `state` alone is sufficient to tell
+/// "closed because merged" apart from "closed unmerged".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrLifecycle {
     /// The pull request is open.
@@ -148,7 +150,7 @@ pub trait GhCli {
     fn pr_reviews(&self, dir: &Path, number: u64) -> Result<Vec<PrReview>, GhError>;
 
     /// The lifecycle state of pull request `number` (`gh pr view <number>
-    /// --json state,merged`).
+    /// --json state`).
     ///
     /// `dir` is an explicit repo root, same rationale as
     /// [`GhCli::pr_review_threads`]'s doc comment.
@@ -208,8 +210,7 @@ pub trait GhCli {
     fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError>;
 
     /// List every pull request in the current repository, open *or* merged
-    /// (`gh pr list --state all --json number,headRefName,state,merged,
-    /// updatedAt`).
+    /// (`gh pr list --state all --json number,headRefName,state,updatedAt`).
     ///
     /// Used by `tm work run`'s blocked-ticket branch-off logic (see
     /// [`crate::work::run::resolve_blocker_stacking`]) to find and classify
@@ -254,6 +255,19 @@ pub struct PrSummary {
 /// Fields requested from `gh pr view --json`; shared so the flag and the
 /// [`PrInfo`] deserialization stay in lockstep.
 const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName";
+
+/// Fields requested from `gh pr view <number> --json` in [`GhCli::pr_state`];
+/// shared so the flag and [`RawPrState`] deserialization stay in lockstep.
+/// Deliberately just `state`, not `state,merged`: `gh pr view` has no
+/// `merged` JSON field (see [`PrLifecycle`]'s doc comment), and requesting it
+/// makes every call fail with `Unknown JSON field: "merged"`.
+const PR_STATE_JSON_FIELDS: &str = "state";
+
+/// Fields requested from `gh pr list --state all --json` in
+/// [`GhCli::pr_list_all`]; shared so the flag and [`RawPrListAllEntry`]
+/// deserialization stay in lockstep. Same `merged`-field pitfall as
+/// [`PR_STATE_JSON_FIELDS`] applies here.
+const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,state,updatedAt";
 
 /// GraphQL query fetching a pull request's review threads: resolution state
 /// plus the author of each thread's first comment.
@@ -460,7 +474,13 @@ impl GhCli for ShellGhCli {
 
     fn pr_state(&self, dir: &Path, number: u64) -> Result<PrLifecycle, GhError> {
         let output = Command::new("gh")
-            .args(["pr", "view", &number.to_string(), "--json", "state,merged"])
+            .args([
+                "pr",
+                "view",
+                &number.to_string(),
+                "--json",
+                PR_STATE_JSON_FIELDS,
+            ])
             .current_dir(dir)
             .output()
             .map_err(|err| GhError::Spawn {
@@ -578,7 +598,7 @@ impl GhCli for ShellGhCli {
                 "--state",
                 "all",
                 "--json",
-                "number,headRefName,state,merged,updatedAt",
+                PR_LIST_ALL_JSON_FIELDS,
             ])
             .current_dir(dir)
             .output()
@@ -966,21 +986,18 @@ fn interpret_pr_reviews_output(
     }
 }
 
-/// Raw shape of `gh pr view --json state,merged` output, for deserialization
-/// only.
+/// Raw shape of `gh pr view --json state` output, for deserialization only.
 #[derive(Debug, Deserialize)]
 struct RawPrState {
     state: String,
-    merged: bool,
 }
 
-/// Interpret the result of a `gh pr view <number> --json state,merged`
-/// invocation.
+/// Interpret the result of a `gh pr view <number> --json state` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
-/// testability reasons as [`interpret_pr_view_output`]. `merged` takes
-/// precedence over `state` (see [`PrLifecycle`]'s doc comment): a merged PR
-/// reports `state: "CLOSED"` too, so `merged` is checked first.
+/// testability reasons as [`interpret_pr_view_output`]. `gh` reports `state`
+/// as `OPEN`, `CLOSED`, or `MERGED` directly (see [`PrLifecycle`]'s doc
+/// comment), so no other field is needed to classify it.
 fn interpret_pr_state_output(
     exit_code: Option<i32>,
     stdout: &str,
@@ -992,7 +1009,7 @@ fn interpret_pr_state_output(
                 command: "gh pr view".to_string(),
                 message: err.to_string(),
             })?;
-            Ok(if raw.merged {
+            Ok(if raw.state.eq_ignore_ascii_case("merged") {
                 PrLifecycle::Merged
             } else if raw.state.eq_ignore_ascii_case("closed") {
                 PrLifecycle::Closed
@@ -1044,27 +1061,26 @@ fn interpret_pr_list_output(
 }
 
 /// Raw shape of one entry in `gh pr list --state all --json
-/// number,headRefName,state,merged,updatedAt` output, for deserialization
-/// only; [`PrSummary`] is the flattened shape callers use.
+/// number,headRefName,state,updatedAt` output, for deserialization only;
+/// [`PrSummary`] is the flattened shape callers use.
 #[derive(Debug, Deserialize)]
 struct RawPrListAllEntry {
     number: u64,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
     state: String,
-    merged: bool,
     #[serde(rename = "updatedAt")]
     updated_at: String,
 }
 
 /// Interpret the result of a `gh pr list --state all --json
-/// number,headRefName,state,merged,updatedAt` invocation.
+/// number,headRefName,state,updatedAt` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
-/// testability reasons as [`interpret_pr_view_output`]. `merged` takes
-/// precedence over `state` when classifying [`PrLifecycle`], same as
-/// [`interpret_pr_state_output`] (a merged PR still reports `state:
-/// "CLOSED"`).
+/// testability reasons as [`interpret_pr_view_output`]. `gh` reports `state`
+/// as `OPEN`, `CLOSED`, or `MERGED` directly, same as
+/// [`interpret_pr_state_output`], so no other field is needed to classify
+/// [`PrLifecycle`].
 fn interpret_pr_list_all_output(
     exit_code: Option<i32>,
     stdout: &str,
@@ -1078,7 +1094,7 @@ fn interpret_pr_list_all_output(
                     .map(|entry| PrSummary {
                         number: entry.number,
                         head_ref_name: entry.head_ref_name,
-                        lifecycle: if entry.merged {
+                        lifecycle: if entry.state.eq_ignore_ascii_case("merged") {
                             PrLifecycle::Merged
                         } else if entry.state.eq_ignore_ascii_case("closed") {
                             PrLifecycle::Closed
@@ -1760,9 +1776,9 @@ mod tests {
     #[test]
     fn pr_list_all_classifies_open_merged_and_closed() {
         let stdout = r#"[
-            {"number":1,"headRefName":"jowi-dev/ax-410-open","state":"OPEN","merged":false,"updatedAt":"2026-08-01T00:00:00Z"},
-            {"number":2,"headRefName":"jowi-dev/ax-410-merged","state":"CLOSED","merged":true,"updatedAt":"2026-08-02T00:00:00Z"},
-            {"number":3,"headRefName":"jowi-dev/ax-410-closed","state":"CLOSED","merged":false,"updatedAt":"2026-08-03T00:00:00Z"}
+            {"number":1,"headRefName":"jowi-dev/ax-410-open","state":"OPEN","updatedAt":"2026-08-01T00:00:00Z"},
+            {"number":2,"headRefName":"jowi-dev/ax-410-merged","state":"MERGED","updatedAt":"2026-08-02T00:00:00Z"},
+            {"number":3,"headRefName":"jowi-dev/ax-410-closed","state":"CLOSED","updatedAt":"2026-08-03T00:00:00Z"}
         ]"#;
         let prs = interpret_pr_list_all_output(Some(0), stdout, "").unwrap();
         assert_eq!(prs[0].lifecycle, PrLifecycle::Open);
@@ -2159,8 +2175,8 @@ mod tests {
     }
 
     #[test]
-    fn pr_state_open_when_not_merged_and_state_open() {
-        let stdout = r#"{"state":"OPEN","merged":false}"#;
+    fn pr_state_open_when_state_open() {
+        let stdout = r#"{"state":"OPEN"}"#;
         assert_eq!(
             interpret_pr_state_output(Some(0), stdout, "").unwrap(),
             PrLifecycle::Open
@@ -2168,8 +2184,8 @@ mod tests {
     }
 
     #[test]
-    fn pr_state_merged_when_merged_true_even_if_state_closed() {
-        let stdout = r#"{"state":"CLOSED","merged":true}"#;
+    fn pr_state_merged_when_state_merged() {
+        let stdout = r#"{"state":"MERGED"}"#;
         assert_eq!(
             interpret_pr_state_output(Some(0), stdout, "").unwrap(),
             PrLifecycle::Merged
@@ -2177,11 +2193,34 @@ mod tests {
     }
 
     #[test]
-    fn pr_state_closed_when_unmerged_and_state_closed() {
-        let stdout = r#"{"state":"CLOSED","merged":false}"#;
+    fn pr_state_closed_when_state_closed() {
+        let stdout = r#"{"state":"CLOSED"}"#;
         assert_eq!(
             interpret_pr_state_output(Some(0), stdout, "").unwrap(),
             PrLifecycle::Closed
+        );
+    }
+
+    /// Regression test for a real `gh` failure: `gh pr view` has no `merged`
+    /// JSON field (only `gh pr list --json merged` used to exist, and even
+    /// that field was removed from newer `gh` — see `PrLifecycle`'s doc
+    /// comment). Requesting it made `gh pr view <n> --json state,merged` fail
+    /// every call with `Unknown JSON field: "merged"`, which broke every `tm
+    /// pr watch` poll tick. Pin the exact field list here so a future edit
+    /// can't reintroduce it.
+    #[test]
+    fn pr_state_requests_only_the_state_field() {
+        assert_eq!(PR_STATE_JSON_FIELDS, "state");
+    }
+
+    /// Same regression as [`pr_state_requests_only_the_state_field`]: `gh pr
+    /// list` also has no `merged` JSON field on this `gh` version, so
+    /// [`GhCli::pr_list_all`] must not request one either.
+    #[test]
+    fn pr_list_all_does_not_request_the_merged_field() {
+        assert_eq!(
+            PR_LIST_ALL_JSON_FIELDS,
+            "number,headRefName,state,updatedAt"
         );
     }
 
