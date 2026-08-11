@@ -3004,6 +3004,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_blocker_stacking_done_blocker_no_pr_uses_normal_base() {
+        // A blocker that's Done in Jira with no discoverable PR at all (a
+        // config change, a spike, docs, manual ops work) must clear just
+        // like a merged-PR blocker does — this is the other half of
+        // `unmerged_direct_blockers`'s satisfaction rule.
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "done")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        let resolution =
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+    }
+
+    #[test]
     fn resolve_blocker_stacking_one_open_pr_blocker_stacks_on_its_head_ref() {
         let mut blocked = issue("AX-2", "Depends on AX-410");
         blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];

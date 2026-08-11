@@ -979,6 +979,47 @@ mod tests {
     }
 
     #[test]
+    fn check_blocked_ticket_is_an_error_listing_unmerged_blockers_and_excluding_a_done_one() {
+        // PROJ-3 is Done in Jira with no discoverable PR at all (a config
+        // change, a spike, docs, manual ops work — plenty of real tickets
+        // never have a PR), so it's satisfied without ever consulting `gh`
+        // for it specifically. PROJ-2 has no PR either, so it's the sole
+        // unmerged blocker and the ticket is `BlockedNoPr`, not
+        // `BlockedMultiple`.
+        let mut i = issue("PROJ-1");
+        i.fields.issue_links = vec![
+            IssueLink {
+                id: "10001".to_string(),
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-2", "In Progress", "indeterminate")),
+                outward_issue: None,
+            },
+            IssueLink {
+                id: "10002".to_string(),
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue("PROJ-3", "Done", "done")),
+                outward_issue: None,
+            },
+        ];
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", i);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        let err =
+            check(&ready_ctx(&jira, &gh, &bots), "proj-1", &mut out).expect_err("should fail");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("PROJ-1 is blocked by:"));
+        assert!(rendered.contains("PROJ-2 (In Progress): Summary for PROJ-2"));
+        assert!(
+            !rendered.contains("PROJ-3"),
+            "the Jira-Done blocker should not be listed: {rendered}"
+        );
+        assert!(out.is_empty(), "nothing should be printed on failure");
+    }
+
+    #[test]
     fn check_invalid_key_is_an_actionable_error() {
         let jira = FakeJiraClient::new();
         let gh = FakeGhCli::new();
@@ -1219,6 +1260,41 @@ mod tests {
             resolution.stacked_base,
             Some("origin/jowi-dev/ax-408-20260810-131418".to_string()),
             "tm work run must stack on exactly the branch tm ready named"
+        );
+    }
+
+    #[test]
+    fn check_ready_and_resolve_blocker_stacking_agree_a_done_blocker_with_no_pr_is_ready() {
+        // Same drift-proof shape as the stackable case above, but for the
+        // other half of the satisfaction rule: a blocker that's Done in
+        // Jira with no PR at all must read as `Ready` at both call sites,
+        // not just at `tm ready`'s Jira-only fallback path.
+        let mut ticket = issue("AX-409");
+        ticket.fields.issue_links = vec![IssueLink {
+            id: "1".to_string(),
+            link_type: blocks_link_type(),
+            inward_issue: Some(linked_issue("AX-408", "Done", "done")),
+            outward_issue: None,
+        }];
+        let jira = FakeJiraClient::new().with_issue("AX-409", ticket);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        let ready_outcome = check(&ready_ctx(&jira, &gh, &bots), "ax-409", &mut out)
+            .expect("tm ready should report this ticket ready, not blocked");
+        assert_eq!(ready_outcome, ReadyOutcome::Ready);
+
+        let resolution = crate::work::run::resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            std::path::Path::new("/repo"),
+            Some("AX-409"),
+        )
+        .expect("resolve_blocker_stacking should also treat this as ready, not refuse");
+        assert_eq!(
+            resolution.stacked_base, None,
+            "a Done blocker needs no stack base override"
         );
     }
 

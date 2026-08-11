@@ -791,13 +791,19 @@ was stackable by `tm work run`'s own logic, but `tm ready` still reported it
 `BLOCKED`, and an autonomous lane prompt that treats `tm ready`'s word as
 final refused to touch it.
 
-For each of a ticket's *direct* `Blocks` blockers (regardless of Jira
-status — only PR merge state decides "satisfied" here):
+For each of a ticket's *direct* `Blocks` blockers, satisfied means EITHER of
+these — a Jira status check and a PR merge-state check, either one clearing
+it independently:
 
-- PR **merged** → satisfied, doesn't count.
-- PR **open** → unmerged, a candidate to stack on.
-- **no PR** (including a closed-but-unmerged one) → unmerged, with nothing
-  to stack on yet.
+- Jira status category **done** → satisfied, doesn't count, regardless of
+  whether it ever had a PR at all (a config change, a spike, docs, or manual
+  ops work often has none to find).
+- PR **merged** → satisfied, doesn't count, regardless of whether Jira's
+  status has caught up yet.
+- otherwise, PR **open** → unmerged, a candidate to stack on.
+- otherwise, **no PR** (including a closed-but-unmerged one, or a PR whose
+  branch name doesn't match the lane-branch naming convention) → unmerged,
+  with nothing to stack on yet.
 
 Then, across the ticket's unmerged blockers:
 

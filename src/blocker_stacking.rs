@@ -26,13 +26,19 @@
 //!
 //! # The rule
 //!
-//! For each of a ticket's *direct* `Blocks`-type Jira links (any status —
-//! Jira status is never consulted, only whether a matching PR exists and
-//! whether it's merged):
-//! - PR **merged** → satisfied, not counted as unmerged.
+//! For each of a ticket's *direct* `Blocks`-type Jira links, a blocker is
+//! satisfied — cleared, not counted as unmerged — if EITHER of these holds:
+//! - its Jira status category is `done` (no PR needed at all: work that's
+//!   genuinely finished — a config change, a spike, docs, manual ops —
+//!   often has no PR to find in the first place), OR
+//! - it has a **merged** PR (its code is already in the base, whatever
+//!   Jira's status says).
+//!
+//! Otherwise it remains unmerged, split by PR state:
 //! - PR **open** → an unmerged blocker with something to stack on.
-//! - **no PR** (including a closed-but-unmerged one) → an unmerged blocker
-//!   with nothing to stack on yet.
+//! - **no PR** (including a closed-but-unmerged one, or a PR whose branch
+//!   name doesn't match [`find_blocker_pr`]'s naming convention) → an
+//!   unmerged blocker with nothing to stack on yet.
 //!
 //! Then, across the ticket's unmerged blockers ([`decide`]):
 //! - **zero** → [`StackDecision::Ready`].
@@ -49,13 +55,11 @@ use crate::jira::types::{Issue, LinkedIssue};
 
 /// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
 ///
-/// Unlike [`crate::ticketing::open_blockers`] (which drops blockers whose
-/// Jira status is already `done`, since it's answering "is this ticket
-/// pickable right now" from Jira's point of view alone), this module needs
-/// every direct blocker no matter its Jira status: a blocker's *PR* merge
-/// state — not its Jira status — is what decides whether it's "satisfied"
-/// here, so filtering on Jira status would let a blocker with a stale
-/// "Done" status but an unmerged PR slip through unstacked.
+/// Unlike [`crate::ticketing::open_blockers`] (which itself drops blockers
+/// whose Jira status is already `done` before returning), this returns every
+/// direct blocker unfiltered — [`unmerged_direct_blockers`] is where the
+/// done-or-merged satisfaction check actually happens, since it needs to
+/// look at PR state too, not just Jira status.
 pub fn direct_blockers(issue: &Issue) -> Vec<&LinkedIssue> {
     issue
         .fields
@@ -125,24 +129,38 @@ pub fn format_unmerged_blocker(blocker: &UnmergedBlocker) -> String {
 }
 
 /// Resolve `issue`'s direct blockers (via [`direct_blockers`]) against
-/// already-fetched `prs`, keeping only those not satisfied by a merged PR.
+/// already-fetched `prs`, keeping only those not satisfied — see this
+/// module's doc comment for the full rule.
 pub fn unmerged_direct_blockers(issue: &Issue, prs: &[PrSummary]) -> Vec<UnmergedBlocker> {
     direct_blockers(issue)
         .into_iter()
-        .filter_map(|blocker| match find_blocker_pr(prs, &blocker.key) {
-            Some(pr) if pr.lifecycle == PrLifecycle::Merged => None,
-            Some(pr) if pr.lifecycle == PrLifecycle::Open => Some(UnmergedBlocker {
+        .filter_map(|blocker| {
+            let pr = find_blocker_pr(prs, &blocker.key);
+            let is_done = blocker.fields.status.status_category.key == "done";
+            let is_merged = matches!(&pr, Some(pr) if pr.lifecycle == PrLifecycle::Merged);
+            // A blocker is cleared if EITHER condition holds, and the two
+            // are independent: a blocker Done in Jira needs no stacking
+            // regardless of whether it ever had a PR (config changes,
+            // spikes, docs, and manual ops work often don't), and a blocker
+            // with a merged PR has its code in the base regardless of
+            // whether Jira's status has caught up yet. Losing either half
+            // of this OR is exactly the regression this comment guards
+            // against — see the module doc comment for the incident.
+            if is_done || is_merged {
+                return None;
+            }
+            let open_pr = match &pr {
+                Some(pr) if pr.lifecycle == PrLifecycle::Open => {
+                    Some((pr.number, pr.head_ref_name.clone()))
+                }
+                _ => None,
+            };
+            Some(UnmergedBlocker {
                 key: blocker.key.clone(),
                 status_name: blocker.fields.status.name.clone(),
                 summary: blocker.fields.summary.clone(),
-                open_pr: Some((pr.number, pr.head_ref_name.clone())),
-            }),
-            _ => Some(UnmergedBlocker {
-                key: blocker.key.clone(),
-                status_name: blocker.fields.status.name.clone(),
-                summary: blocker.fields.summary.clone(),
-                open_pr: None,
-            }),
+                open_pr,
+            })
         })
         .collect()
 }
@@ -216,6 +234,14 @@ mod tests {
     }
 
     fn linked_issue(key: &str, status_name: &str) -> LinkedIssue {
+        linked_issue_with_category(key, status_name, "indeterminate")
+    }
+
+    fn linked_issue_with_category(
+        key: &str,
+        status_name: &str,
+        status_category_key: &str,
+    ) -> LinkedIssue {
         LinkedIssue {
             key: key.to_string(),
             fields: LinkedIssueFields {
@@ -223,7 +249,7 @@ mod tests {
                 status: Status {
                     name: status_name.to_string(),
                     status_category: StatusCategory {
-                        key: "indeterminate".to_string(),
+                        key: status_category_key.to_string(),
                     },
                 },
             },
@@ -278,6 +304,45 @@ mod tests {
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
         assert_eq!(decide(unmerged), StackDecision::Ready);
+    }
+
+    /// A blocker that's genuinely Done in Jira but has no discoverable PR at
+    /// all (a config change, a spike, docs, manual ops work — plenty of real
+    /// tickets never have a PR) must still clear the blocker. This is the
+    /// half of the rule that regressed when `unmerged_direct_blockers` was
+    /// extracted: only the merged-PR path cleared a blocker, so a Done
+    /// blocker with no PR fell into the catch-all "unmerged, no PR" arm and
+    /// wrongly stayed blocking.
+    #[test]
+    fn decide_ready_when_the_only_blocker_is_done_in_jira_with_no_pr_at_all() {
+        let issue = issue_blocked_by(vec![linked_issue_with_category("AX-408", "Done", "done")]);
+        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        assert_eq!(decide(unmerged), StackDecision::Ready);
+    }
+
+    /// Pins the exact incident this module's doc comment describes: AX-408
+    /// sat in Jira status "Code Review" (status category `indeterminate`,
+    /// NOT `done`) with an open PR #490, and AX-409/AX-436 must resolve to
+    /// `Stackable` on it rather than `BlockedNoPr`/`BlockedMultiple`. If a
+    /// future change makes Jira status alone (without checking the PR)
+    /// decide satisfaction, this is the test that catches it.
+    #[test]
+    fn ax_408_in_code_review_with_open_pr_is_stackable_not_blocked() {
+        let issue = issue_blocked_by(vec![linked_issue_with_category(
+            "AX-408",
+            "Code Review",
+            "indeterminate",
+        )]);
+        let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
+        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        assert_eq!(
+            decide(unmerged),
+            StackDecision::Stackable {
+                blocker_key: "AX-408".to_string(),
+                pr_number: 490,
+                head_ref_name: "jowi-dev/ax-408-thing".to_string(),
+            }
+        );
     }
 
     #[test]
