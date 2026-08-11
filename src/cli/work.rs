@@ -359,6 +359,15 @@ pub fn run(
         prepared.wt_name, prepared.timestamp
     ));
 
+    // `prepare_run_lane` already called `start_run` (see its doc comment),
+    // before `log_path` above could be computed — it needs `prepared.wt_name`
+    // /`prepared.timestamp`, which don't exist until `prepare_run_lane`
+    // returns. So the row is updated with its log path here, a beat after
+    // creation, mirroring how the supervisor itself records its own pid via
+    // `RunStore::update_pid` once it learns it.
+    deps.run_store
+        .update_log_path(prepared.run_id, &log_path.to_string_lossy())?;
+
     let ticket = prepared.ticket.clone();
     let branch = prepared.branch.clone();
     let worktree = prepared.worktree.clone();
@@ -1526,6 +1535,10 @@ mod tests {
         let run_row = run_store.run_by_id(runs[0].id).unwrap().unwrap();
         assert_eq!(run_row.pid, None);
         assert_eq!(run_row.status, RunStatus::Running);
+        assert_eq!(
+            run_row.log_path.as_deref(),
+            Some(recorded[0].log_path.to_string_lossy()).as_deref()
+        );
 
         let printed = out_string(&out);
         assert!(printed.contains("started   mylane"));

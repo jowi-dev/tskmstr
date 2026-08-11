@@ -407,6 +407,14 @@ pub fn watch(
         return Ok(WatchOutcome::Detached);
     }
 
+    // Recomputed rather than threaded through from the `!foreground` branch
+    // above: that branch runs in a *different process* than this one when
+    // detached (the re-exec'd `--foreground` child never sees the parent's
+    // locals), and a direct `tm pr watch KEY --foreground` invocation never
+    // runs that branch at all. `watch_log_dir`/the filename convention are
+    // the single source of truth both branches derive from.
+    let log_path = watch_log_dir(deps.home).join(format!("{}.log", key.to_lowercase()));
+
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: key.to_string(),
         lane: "review-watch".to_string(),
@@ -414,7 +422,7 @@ pub fn watch(
         branch: None,
         pid: Some(std::process::id()),
         kind: "review-watch".to_string(),
-        log_path: None,
+        log_path: Some(log_path.to_string_lossy().into_owned()),
     })?;
 
     let started_at_unix = deps.clock.now_unix_secs();
@@ -1390,6 +1398,12 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].kind, "review-watch");
         assert_eq!(runs[0].status, RunStatus::Done);
+        let run = run_store.run_by_id(runs[0].id).unwrap().unwrap();
+        let expected_log_path = watch_log_dir(&home).join("proj-372.log");
+        assert_eq!(
+            run.log_path.as_deref(),
+            Some(expected_log_path.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
