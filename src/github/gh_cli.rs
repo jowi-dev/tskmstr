@@ -58,6 +58,71 @@ pub enum GhError {
     },
 }
 
+impl GhError {
+    /// Whether this is a **permanent** failure — a bug in how *tm* itself
+    /// calls `gh` (an invalid `--json` field, an unknown flag, an unknown
+    /// subcommand) — as opposed to a **transient** environmental condition
+    /// (network error, rate limit, a `5xx`, expired auth, `gh` missing, a
+    /// timeout).
+    ///
+    /// This distinction exists because of a real incident: an earlier
+    /// version of this code requested an invalid `--json` field
+    /// (`"merged"`, see [`PrLifecycle`]'s doc comment) and every call failed
+    /// identically, forever, with `Unknown JSON field: "merged"` on stderr —
+    /// a permanent, code-level defect. But callers that catch a `gh` error
+    /// and fall back rather than fail (e.g.
+    /// [`crate::work::run::resolve_blocker_stacking`], designed to tolerate
+    /// a *transient* network hiccup) had no way to tell that failure apart
+    /// from an ordinary blip, so the permanent bug was silently swallowed as
+    /// a "warning" that went nowhere visible — six autonomous lane runs were
+    /// dispatched against the wrong (unstacked) base as a result, each
+    /// burning real cost. `is_permanent` is what lets those call sites
+    /// refuse to pretend a permanent failure is a transient one.
+    ///
+    /// Detection is narrow and stderr-driven, matching only wording `gh`
+    /// itself uses to say "you asked me something nonsensical" — see
+    /// [`is_permanent_stderr`]. It only ever inspects [`GhError::Command`];
+    /// [`GhError::Spawn`] (couldn't even launch `gh` — e.g. not installed,
+    /// which is an environment problem) and [`GhError::Parse`] (`gh`
+    /// succeeded but its output didn't parse — ambiguous, could be either)
+    /// always classify as transient.
+    ///
+    /// Deliberately biased toward **transient by default**: every case not
+    /// explicitly matched — including every `Command` error whose stderr
+    /// doesn't hit one of the known markers — is transient. A misclassified
+    /// transient error only costs an unnecessary warn-and-fallback; a
+    /// misclassified permanent error would wrongly hard-fail a run over an
+    /// ordinary network blip, which is the failure mode this default avoids.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            GhError::Command { stderr, .. } => is_permanent_stderr(stderr),
+            GhError::Spawn { .. } | GhError::Parse { .. } => false,
+        }
+    }
+}
+
+/// Narrow, case-insensitive check for the specific wording `gh` uses when
+/// *tm* itself called it wrong, rather than when the environment
+/// misbehaved:
+///
+/// - `Unknown JSON field: "..."` — an invalid `--json` field name (the
+///   incident this whole distinction exists for).
+/// - `unknown flag: ...` / `unknown shorthand flag: ...` — a flag `gh`'s
+///   version doesn't recognize.
+/// - `unknown command "..." for "..."` — a subcommand `gh` doesn't
+///   recognize.
+///
+/// Kept intentionally narrow (see [`GhError::is_permanent`]'s doc comment
+/// for why): anything not matching one of these falls through to transient,
+/// which is the safe default.
+fn is_permanent_stderr(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("unknown json field")
+        || lower.contains("unknown flag")
+        || lower.contains("unknown shorthand flag")
+        || lower.contains("unknown command")
+}
+
 /// The lifecycle state of a pull request, as reported by `gh pr view --json
 /// state`.
 ///
@@ -1565,6 +1630,106 @@ impl GhCli for FakeGhCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- GhError::is_permanent ---
+    //
+    // These pin the permanent-vs-transient distinction the resilience fix
+    // depends on: `resolve_blocker_stacking` (src/work/run.rs) and
+    // `run_poll_loop` (src/work/review_watch.rs) both need to tell "tm asked
+    // gh something nonsensical, and always will" apart from "the network/gh
+    // itself hiccuped", so a permanent bug can't masquerade as a retryable
+    // blip ever again.
+
+    #[test]
+    fn is_permanent_true_for_unknown_json_field() {
+        let err = GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: Some(1),
+            stderr: r#"unknown JSON field: "merged""#.to_string(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn is_permanent_true_for_unknown_json_field_case_insensitively() {
+        let err = GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: Some(1),
+            stderr: "Unknown JSON field: \"merged\"".to_string(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn is_permanent_true_for_unknown_flag() {
+        let err = GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "unknown flag: --nonexistent".to_string(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn is_permanent_true_for_unknown_command() {
+        let err = GhError::Command {
+            command: "gh pr frobnicate".to_string(),
+            exit_code: Some(1),
+            stderr: "unknown command \"frobnicate\" for \"gh pr\"".to_string(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn is_permanent_false_for_network_and_auth_failures() {
+        // Every one of these is an environmental condition, not a tm bug —
+        // none should ever be classified as permanent.
+        for stderr in [
+            "not authenticated",
+            "connection reset by peer",
+            "context deadline exceeded",
+            "HTTP 503",
+            "gh: rate limit exceeded",
+        ] {
+            let err = GhError::Command {
+                command: "gh pr view".to_string(),
+                exit_code: Some(1),
+                stderr: stderr.to_string(),
+            };
+            assert!(
+                !err.is_permanent(),
+                "expected {stderr:?} to classify as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn is_permanent_defaults_to_false_when_unsure() {
+        // An error whose stderr matches none of the known permanent markers
+        // must default to transient — a misclassified transient error costs
+        // a warn-and-fallback, while a misclassified permanent error would
+        // wrongly hard-fail a run over an ordinary blip.
+        let err = GhError::Command {
+            command: "gh pr view".to_string(),
+            exit_code: Some(1),
+            stderr: "some completely novel gh failure mode".to_string(),
+        };
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn is_permanent_false_for_spawn_and_parse_errors() {
+        let spawn = GhError::Spawn {
+            command: "gh".to_string(),
+            message: "No such file or directory".to_string(),
+        };
+        let parse = GhError::Parse {
+            command: "gh pr view".to_string(),
+            message: "invalid JSON".to_string(),
+        };
+        assert!(!spawn.is_permanent());
+        assert!(!parse.is_permanent());
+    }
 
     #[test]
     fn current_user_login_parses_trimmed_login() {
