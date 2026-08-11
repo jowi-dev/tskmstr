@@ -78,7 +78,7 @@ tm auth status
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
-| `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`) |
+| `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of lane runs, polling the local run db |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
@@ -176,6 +176,27 @@ would leave a pid-less row that `tm runs reap` could immediately re-mark
 failed once its (inherited, already-old) `started_at` looks stale.
 `tm runs resume` still works on a terminal run without reopening it first —
 it just warns on stderr and points here, without blocking.
+
+`--to blocked` is a repair target rather than a "make it actionable again"
+one: use it when a run's `done`/`failed`/`interrupted` status is simply
+wrong and the run is actually `blocked` (e.g. a run a bug mislabeled — see
+below), not when you want to resume work on it.
+
+#### Precedence when a run finishes itself
+
+A headless lane run's in-session agent can finish its own run mid-session
+with a deliberate status, e.g. `tm runs finish 18 --status blocked --blocker
+"waiting on PROJ-408"`, before `claude -p` exits. When `tm work run`'s
+supervisor then observes that exit, its own inferred status only wins over
+that deliberate one when it's an unambiguous crash signal — a non-zero exit,
+or an explicit `is_error: true` in the result JSON — which always marks the
+run `Failed` regardless of what the session already set. An exit-0
+`Done`/`Interrupted` classification, by contrast, defers to any status the
+session already recorded: it fills in the telemetry only the supervisor
+can see (turns, cost, session id, transcript, PR URL) without touching
+`status`. This matters because a run finished twice used to always let the
+second (supervisor's) write win outright, silently overwriting a
+deliberate `blocked` status back to `done`.
 
 ### Log files
 

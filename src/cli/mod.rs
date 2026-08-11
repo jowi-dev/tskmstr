@@ -631,11 +631,15 @@ impl From<FinishStatusArg> for crate::runs::RunStatus {
     }
 }
 
-/// Statuses `tm runs reopen --to` accepts as a reopen target: the two
-/// non-terminal states a reopened run can usefully land in. Deliberately
-/// narrower than [`FinishStatusArg`] -- reopening to `blocked`/`review`
-/// would just recreate a different terminal-ish state instead of making the
-/// run actionable again.
+/// Statuses `tm runs reopen --to` accepts as a reopen target. Mostly the two
+/// non-terminal states a reopened run can usefully land in -- reopening to
+/// `review` would just recreate a different terminal-ish state instead of
+/// making the run actionable again, so it's deliberately excluded, same as
+/// the rest of [`FinishStatusArg`]. `Blocked` is the one exception: it's
+/// also included as a *repair* target for rows a bug mislabeled `done` (see
+/// the `run_claude_and_finish`/`finish_run_from_supervisor` fix this exists
+/// alongside) -- moving such a row to `blocked` is restoring its true state,
+/// not recreating a fresh terminal one.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 pub enum ReopenStatusArg {
     /// Queued to run again but not yet started. The default: avoids
@@ -645,6 +649,9 @@ pub enum ReopenStatusArg {
     Queued,
     /// Mark it running immediately.
     Running,
+    /// Waiting on an external dependency or escalation -- for repairing a
+    /// run a bug mislabeled `done` when it was actually blocked.
+    Blocked,
 }
 
 impl From<ReopenStatusArg> for crate::runs::RunStatus {
@@ -652,6 +659,7 @@ impl From<ReopenStatusArg> for crate::runs::RunStatus {
         match value {
             ReopenStatusArg::Queued => crate::runs::RunStatus::Queued,
             ReopenStatusArg::Running => crate::runs::RunStatus::Running,
+            ReopenStatusArg::Blocked => crate::runs::RunStatus::Blocked,
         }
     }
 }
@@ -1540,6 +1548,37 @@ mod tests {
     fn runs_finish_status_running_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "runs", "finish", "3", "--status", "running"]);
         assert!(result.is_err(), "running is not a valid finish status");
+    }
+
+    #[test]
+    fn parses_runs_reopen_with_to_blocked() {
+        // A repair target: a run mislabeled `done` by the supervisor-clobber
+        // bug should be reopenable straight to its true `blocked` status.
+        let cli = Cli::try_parse_from(["tm", "runs", "reopen", "18", "--to", "blocked"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Reopen {
+                        ticket_or_id, to, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(ticket_or_id, "18");
+                assert!(matches!(to, ReopenStatusArg::Blocked));
+                assert_eq!(
+                    crate::runs::RunStatus::from(to),
+                    crate::runs::RunStatus::Blocked
+                );
+            }
+            other => panic!("expected Runs Reopen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_reopen_status_review_is_still_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "runs", "reopen", "18", "--to", "review"]);
+        assert!(result.is_err(), "review is not a valid reopen target");
     }
 
     #[test]

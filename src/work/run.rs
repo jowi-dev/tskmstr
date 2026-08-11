@@ -1662,10 +1662,7 @@ mod tests {
 
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Blocked);
-        assert_eq!(
-            run.blocker.as_deref(),
-            Some("waiting on AX-408 / PR #490")
-        );
+        assert_eq!(run.blocker.as_deref(), Some("waiting on AX-408 / PR #490"));
         // Telemetry only the supervisor can observe is still recorded.
         assert_eq!(run.session_id.as_deref(), Some("sess-1"));
         assert_eq!(run.num_turns, Some(3));
