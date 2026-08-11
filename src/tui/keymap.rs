@@ -123,6 +123,7 @@ pub fn map_key(
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
+        KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
         _ => None,
     }
 }
@@ -1121,6 +1122,41 @@ mod tests {
                     false,
                     false,
                     KeyCode::Char('v')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn capital_l_maps_to_view_logs_action_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                KeyCode::Char('L')
+            ),
+            Some(Msg::ViewLogsAction)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Char('L')
                 ),
                 None
             );

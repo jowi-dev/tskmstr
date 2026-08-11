@@ -279,6 +279,13 @@ fn run_cmds<B: Backend>(
             pending.extend(more_cmds);
             continue;
         }
+        if let Cmd::ViewLogs { key } = cmd {
+            let message = view_logs(terminal, deps.store.as_ref(), &deps.home, &key);
+            let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
         for msg in execute(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -415,6 +422,54 @@ fn attach_audit<B: Backend>(
     match result {
         Ok(()) => format!("detached from {session_name}"),
         Err(err) => format!("attach to {session_name} failed: {err}"),
+    }
+}
+
+/// Run [`Cmd::ViewLogs`]: resolve `key`'s latest run (any `kind`, same
+/// resolution [`Msg::ViewRunAction`]'s overlay uses) via
+/// [`crate::cli::runs::resolve_run`], then its log path via
+/// [`crate::cli::runs::resolve_log_path`], and open it in `less`, suspending
+/// and restoring the board's terminal state around the blocking call exactly
+/// like [`attach_audit`]. Every failure mode (no store, no run, no log path,
+/// missing file, pager launch failure) is reported as a status-line message
+/// rather than an error -- viewing a log is a convenience action, not
+/// something that should be able to crash the board.
+fn view_logs<B: Backend>(
+    terminal: &mut Terminal<B>,
+    store: Option<&crate::runs::RunStore>,
+    home: &std::path::Path,
+    key: &str,
+) -> String {
+    let Some(store) = store else {
+        return "no run store available".to_string();
+    };
+    let run = match crate::cli::runs::resolve_run(store, key, None) {
+        Ok(run) => run,
+        Err(_) => return format!("no runs recorded for {key}"),
+    };
+    let Some(path) = crate::cli::runs::resolve_log_path(&run, home) else {
+        return format!("run {} for {key} has no log path", run.id);
+    };
+    if !path.exists() {
+        return format!("log file {} does not exist", path.display());
+    }
+
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+
+    let result = std::process::Command::new("less")
+        .arg("+G")
+        .arg(&path)
+        .status();
+
+    let _ = enable_raw_mode();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = terminal.clear();
+
+    match result {
+        Ok(status) if status.success() => format!("viewed log for {key}"),
+        Ok(status) => format!("less exited with {status}"),
+        Err(err) => format!("failed to launch pager: {err}"),
     }
 }
 
@@ -716,7 +771,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::ReapRuns
         | Cmd::AttachAudit { .. }
         | Cmd::LaunchLaneRun { .. }
-        | Cmd::LaunchBotWatch { .. }) => {
+        | Cmd::LaunchBotWatch { .. }
+        | Cmd::ViewLogs { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"

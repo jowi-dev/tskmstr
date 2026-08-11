@@ -234,7 +234,7 @@ fn last_event_column(run: &RunSummary) -> String {
 /// Returns [`RunsCliError::NoRunWithId`] for an unmatched numeric id, or
 /// [`RunsCliError::NoRunForTicket`] for a ticket with no recorded runs (of
 /// `kind`, if given).
-fn resolve_run(
+pub(crate) fn resolve_run(
     store: &RunStore,
     ticket_or_id: &str,
     kind: Option<&str>,
@@ -737,7 +737,7 @@ fn fallback_log_path(home: &Path, kind: &str, ticket: &str) -> Option<std::path:
 /// Resolves the log file path for `run`: its own `log_path` column if set,
 /// otherwise [`fallback_log_path`]. `None` means there is truly no way to
 /// find this run's log.
-fn resolve_log_path(run: &Run, home: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_log_path(run: &Run, home: &Path) -> Option<std::path::PathBuf> {
     run.log_path
         .as_deref()
         .map(std::path::PathBuf::from)

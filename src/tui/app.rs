@@ -754,6 +754,14 @@ pub enum Msg {
     /// `docs/plans/board-run-detail.md`'s "Decisions" section. A no-op when
     /// no ticket is selected.
     ViewRunAction,
+    /// The `L` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// open its latest run's log file (see [`Cmd::ViewLogs`]). A no-op when
+    /// no ticket is selected.
+    ViewLogsAction,
+    /// The outcome of [`Cmd::ViewLogs`], already rendered to a
+    /// human-readable status-line message -- mirrors
+    /// [`Msg::AuditActionResult`]'s single-string-variant shape.
+    LogsActionResult(String),
     /// A reap pass completed, having reaped `0` reports as a no-op status
     /// line.
     RunsReaped(usize),
@@ -949,6 +957,14 @@ pub enum Cmd {
         /// Ticket key to arm a watcher for.
         key: String,
     },
+    /// Open the selected ticket's latest run's log file in a pager,
+    /// suspending and restoring the board's terminal state around the
+    /// blocking call -- handled specially by the board's event loop, exactly
+    /// like [`Cmd::AttachAudit`].
+    ViewLogs {
+        /// Ticket key to view the latest run's log for.
+        key: String,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -1130,6 +1146,11 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::ViewRunAction => view_run_action(app),
+        Msg::ViewLogsAction => view_logs_action(app),
+        Msg::LogsActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
         Msg::RunsReaped(count) => {
             if count > 0 {
                 app.status_line = format!("Reaped {count} dead run(s)");
@@ -1369,6 +1390,23 @@ fn view_run_action(mut app: App) -> (App, Vec<Cmd>) {
     app.run_detail = None;
     app.run_detail_scroll = 0;
     (app, vec![Cmd::LoadTicketRunDetail { key }])
+}
+
+/// Handle [`Msg::ViewLogsAction`]: open the selected ticket's latest run's
+/// log file in a pager. A no-op (off [`Screen::Board`], or with no ticket
+/// selected) mirroring [`view_run_action`]'s guard shape; actually resolving
+/// a run/log path and shelling out happens in
+/// [`crate::tui::event::run_cmds`]'s [`Cmd::ViewLogs`] interception, since
+/// that needs the run store and a real terminal, neither of which `update`
+/// has access to (it stays pure, per this module's doc comment).
+fn view_logs_action(app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board {
+        return (app, Vec::new());
+    }
+    let Some(key) = app.selected_ticket().map(|ticket| ticket.key.clone()) else {
+        return (app, Vec::new());
+    };
+    (app, vec![Cmd::ViewLogs { key }])
 }
 
 /// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]/[`Screen::Board`].
@@ -4045,6 +4083,45 @@ mod tests {
         };
         let (app, cmds) = update(app, Msg::ViewRunAction);
         assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::ViewLogsAction / Msg::LogsActionResult ---
+
+    #[test]
+    fn view_logs_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::ViewLogsAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_logs_action_emits_view_logs_for_the_selected_ticket() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (_app, cmds) = update(app, Msg::ViewLogsAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::ViewLogs {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn view_logs_action_off_the_board_screen_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (_app, cmds) = update(app, Msg::ViewLogsAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn logs_action_result_sets_status_line() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::LogsActionResult("no log for PROJ-1".to_string()));
+        assert_eq!(app.status_line, "no log for PROJ-1");
         assert!(cmds.is_empty());
     }
 
