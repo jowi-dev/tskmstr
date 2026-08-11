@@ -760,7 +760,21 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
             tskmstr::cli::runs::show(&store, &ticket, kind.as_deref(), json, &mut stdout)?;
         }
         Some(RunsCmd::Resume { ticket }) => {
-            tskmstr::cli::runs::resume(&store, &ticket, &mut stdout)?;
+            let mut stderr = std::io::stderr();
+            tskmstr::cli::runs::resume(&store, &ticket, &mut stdout, &mut stderr)?;
+        }
+        Some(RunsCmd::Reopen {
+            ticket_or_id,
+            kind,
+            to,
+        }) => {
+            tskmstr::cli::runs::reopen(
+                &store,
+                &ticket_or_id,
+                kind.as_deref(),
+                to.into(),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Register { kind, key }) => {
             let session_env = tskmstr::runs::session::SessionEnv::from_process_env();

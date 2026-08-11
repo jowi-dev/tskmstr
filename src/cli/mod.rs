@@ -548,6 +548,25 @@ pub enum RunsCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         ticket: String,
     },
+    /// Reopens a finished run so it can be worked (or resumed) again.
+    ///
+    /// Only runs whose status is terminal (`done`, `failed`, or
+    /// `interrupted`) can be reopened; anything else is a hard error. Clears
+    /// `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default
+    /// `queued`) -- see [`crate::runs::RunStore::reopen_run`]'s doc comment
+    /// for why `queued` rather than `running` is the safer default.
+    Reopen {
+        /// Jira ticket key or run row id, e.g. `PROJ-123` or `42`.
+        ticket_or_id: String,
+        /// Restrict ticket lookup to the latest run of this kind (e.g.
+        /// `lane`, `audit`, `create`), same disambiguation as `tm runs show
+        /// --kind`. Ignored when `ticket_or_id` is a numeric run id.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Status to reopen into.
+        #[arg(long, value_enum, default_value = "queued")]
+        to: ReopenStatusArg,
+    },
     /// Adopts (or starts) a session run for `kind`/`KEY`, for skills invoked
     /// directly rather than through `tm ticket audit`/`create` (e.g.
     /// `/bugbot-triage`). See `docs/plans/bugbot-watch.md`'s "Adoption"
@@ -575,6 +594,8 @@ pub enum FinishStatusArg {
     Blocked,
     /// Finished and awaiting human review.
     Review,
+    /// Ended abnormally, or its outcome could not be determined.
+    Interrupted,
 }
 
 impl From<FinishStatusArg> for crate::runs::RunStatus {
@@ -584,6 +605,32 @@ impl From<FinishStatusArg> for crate::runs::RunStatus {
             FinishStatusArg::Failed => crate::runs::RunStatus::Failed,
             FinishStatusArg::Blocked => crate::runs::RunStatus::Blocked,
             FinishStatusArg::Review => crate::runs::RunStatus::Review,
+            FinishStatusArg::Interrupted => crate::runs::RunStatus::Interrupted,
+        }
+    }
+}
+
+/// Statuses `tm runs reopen --to` accepts as a reopen target: the two
+/// non-terminal states a reopened run can usefully land in. Deliberately
+/// narrower than [`FinishStatusArg`] -- reopening to `blocked`/`review`
+/// would just recreate a different terminal-ish state instead of making the
+/// run actionable again.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+pub enum ReopenStatusArg {
+    /// Queued to run again but not yet started. The default: avoids
+    /// `tm runs reap` immediately re-killing the row (see
+    /// [`crate::runs::RunStore::reopen_run`]'s doc comment).
+    #[default]
+    Queued,
+    /// Mark it running immediately.
+    Running,
+}
+
+impl From<ReopenStatusArg> for crate::runs::RunStatus {
+    fn from(value: ReopenStatusArg) -> Self {
+        match value {
+            ReopenStatusArg::Queued => crate::runs::RunStatus::Queued,
+            ReopenStatusArg::Running => crate::runs::RunStatus::Running,
         }
     }
 }

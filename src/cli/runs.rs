@@ -11,7 +11,9 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::runs::session::{SessionEnv, register_session};
-use crate::runs::{FinishRun, RunEvent, RunStore, RunStoreError, RunSummary, StartRun};
+use crate::runs::{
+    FinishRun, Run, RunEvent, RunStatus, RunStore, RunStoreError, RunSummary, StartRun,
+};
 
 /// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
 ///
@@ -72,6 +74,10 @@ pub enum RunsCliError {
         /// The run id that has no session id.
         run_id: i64,
     },
+
+    /// `tm runs reopen` was given a numeric id with no matching run row.
+    #[error("no run with id {0}")]
+    NoRunWithId(i64),
 }
 
 /// `tm runs start`: record the start of a lane run, printing only the new
@@ -192,6 +198,35 @@ fn last_event_column(run: &RunSummary) -> String {
         (Some(kind), Some(age_secs)) => format!("{kind} {} ago", format_age(age_secs)),
         _ => "-".to_string(),
     }
+}
+
+/// Resolves `ticket_or_id` to a [`Run`] for `tm runs reopen`: a value that
+/// parses as an `i64` is looked up by row id ([`RunStore::run_by_id`]),
+/// disambiguating multiple runs sharing a ticket the same way `tm runs
+/// watch`'s detail window does; anything else is uppercased and resolved as
+/// a ticket key via [`RunStore::latest_run_for_ticket_kind`] -- the same
+/// ticket/`--kind` resolution `tm runs show` uses -- restricted to `kind`
+/// when given (`kind` is ignored for a numeric id, since a row id is already
+/// unambiguous).
+///
+/// # Errors
+///
+/// Returns [`RunsCliError::NoRunWithId`] for an unmatched numeric id, or
+/// [`RunsCliError::NoRunForTicket`] for a ticket with no recorded runs (of
+/// `kind`, if given).
+fn resolve_run(
+    store: &RunStore,
+    ticket_or_id: &str,
+    kind: Option<&str>,
+) -> Result<Run, RunsCliError> {
+    if let Ok(id) = ticket_or_id.parse::<i64>() {
+        return store.run_by_id(id)?.ok_or(RunsCliError::NoRunWithId(id));
+    }
+
+    let ticket = ticket_or_id.to_uppercase();
+    store
+        .latest_run_for_ticket_kind(&ticket, kind)?
+        .ok_or(RunsCliError::NoRunForTicket { ticket })
 }
 
 /// `tm runs show`: print the latest run for `ticket` and its event timeline.
@@ -581,7 +616,12 @@ fn format_event_line(event: &RunEvent) -> String {
 /// Returns [`RunsCliError::NoRunForTicket`] if `ticket` has no recorded
 /// runs, or [`RunsCliError::NoSessionId`] if its latest run has no session
 /// id.
-pub fn resume(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(), RunsCliError> {
+pub fn resume(
+    store: &RunStore,
+    ticket: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(), RunsCliError> {
     let ticket = ticket.to_uppercase();
     let run =
         store
@@ -595,7 +635,57 @@ pub fn resume(store: &RunStore, ticket: &str, out: &mut dyn Write) -> Result<(),
         run_id: run.id,
     })?;
 
+    // Doesn't block resuming (that would be a regression -- resuming a
+    // finished session to keep chatting is normal usage), just points at
+    // `tm runs reopen` for anyone who actually wants the run row itself
+    // treated as live again (e.g. after the run.rs classification bug that
+    // motivated RunStatus::Interrupted marked an in-flight run terminal).
+    if run.status.is_terminal() {
+        writeln!(
+            err,
+            "warning: run {} for {ticket} is already {} — `claude --resume` will work, \
+             but the run row will still look finished. Run `tm runs reopen {ticket}` first \
+             if you want it to look active again.",
+            run.id,
+            run.status.as_str()
+        )?;
+    }
+
     writeln!(out, "{session_id}")?;
+    Ok(())
+}
+
+/// `tm runs reopen <ticket-or-run-id> [--kind <kind>] [--to <status>]`:
+/// reopen a finished run so it can be worked (or resumed) again.
+///
+/// Resolves `ticket_or_id`/`kind` via [`resolve_run`] (same rules as `tm
+/// runs show`, plus numeric ids), then reopens the resolved row via
+/// [`RunStore::reopen_run`]. Prints `Reopened run {id} ({ticket}): {old} ->
+/// {new}` on success.
+///
+/// # Errors
+///
+/// Returns [`RunsCliError::NoRunWithId`]/[`RunsCliError::NoRunForTicket`] if
+/// nothing resolves, or the wrapped [`RunStoreError::NotTerminal`] if the
+/// resolved run's status isn't terminal.
+pub fn reopen(
+    store: &RunStore,
+    ticket_or_id: &str,
+    kind: Option<&str>,
+    to: RunStatus,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let run = resolve_run(store, ticket_or_id, kind)?;
+    let reopened = store.reopen_run(run.id, to)?;
+
+    writeln!(
+        out,
+        "Reopened run {} ({}): {} -> {}",
+        reopened.id,
+        reopened.ticket,
+        reopened.old_status.as_str(),
+        reopened.new_status.as_str()
+    )?;
     Ok(())
 }
 
@@ -643,7 +733,6 @@ pub fn format_age(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runs::RunStatus;
     use tempfile::tempdir;
 
     fn open_store(dir: &std::path::Path) -> RunStore {
@@ -1833,9 +1922,57 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        resume(&store, "proj-1", &mut out).expect("should succeed");
+        let mut stderr = Vec::new();
+        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "sess-abc\n");
+    }
+
+    #[test]
+    fn resume_warns_on_stderr_when_run_is_terminal() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    session_id: Some("sess-abc".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        let mut stderr = Vec::new();
+        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
+
+        let warning = String::from_utf8(stderr).unwrap();
+        assert!(warning.contains("PROJ-1"));
+        assert!(warning.contains("done"));
+        assert!(warning.contains("tm runs reopen"));
+        // Still resumable -- the warning must not have touched stdout.
+        assert_eq!(String::from_utf8(out).unwrap(), "sess-abc\n");
+    }
+
+    #[test]
+    fn resume_does_not_warn_when_run_is_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .update_session_id(
+                store.start_run(&start_params("PROJ-1")).unwrap(),
+                "sess-live",
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        let mut stderr = Vec::new();
+        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
+
+        assert!(stderr.is_empty());
+        assert_eq!(String::from_utf8(out).unwrap(), "sess-live\n");
     }
 
     #[test]
@@ -1843,8 +1980,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let mut out = Vec::new();
+        let mut stderr = Vec::new();
 
-        let err = resume(&store, "PROJ-404", &mut out).expect_err("should fail");
+        let err = resume(&store, "PROJ-404", &mut out, &mut stderr).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -1869,7 +2007,8 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        let err = resume(&store, "PROJ-1", &mut out).expect_err("should fail");
+        let mut stderr = Vec::new();
+        let err = resume(&store, "PROJ-1", &mut out, &mut stderr).expect_err("should fail");
 
         match &err {
             RunsCliError::NoSessionId { ticket, run_id } => {
@@ -1884,6 +2023,106 @@ mod tests {
                 "latest run {id} for PROJ-1 has no session id; was it finished with --session-id?"
             )
         );
+        assert!(out.is_empty());
+    }
+
+    // --- reopen ---
+
+    fn finished_run(store: &RunStore, ticket: &str, status: RunStatus) -> i64 {
+        let id = store.start_run(&start_params(ticket)).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status,
+                    session_id: Some("sess-abc".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn reopen_by_ticket_moves_it_to_queued_by_default() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = finished_run(&store, "PROJ-1", RunStatus::Done);
+
+        let mut out = Vec::new();
+        reopen(&store, "proj-1", None, RunStatus::Queued, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Reopened run {id} (PROJ-1): done -> queued\n")
+        );
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Queued);
+    }
+
+    #[test]
+    fn reopen_by_numeric_id_ignores_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = finished_run(&store, "PROJ-1", RunStatus::Interrupted);
+
+        let mut out = Vec::new();
+        reopen(
+            &store,
+            &id.to_string(),
+            Some("audit"),
+            RunStatus::Running,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn reopen_errors_on_unknown_numeric_id() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err =
+            reopen(&store, "999", None, RunStatus::Queued, &mut out).expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::NoRunWithId(999)));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn reopen_errors_on_unknown_ticket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        let err =
+            reopen(&store, "PROJ-404", None, RunStatus::Queued, &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::NoRunForTicket { ticket } if ticket == "PROJ-404"
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn reopen_errors_on_non_terminal_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.start_run(&start_params("PROJ-1")).unwrap(); // left running
+
+        let mut out = Vec::new();
+        let err =
+            reopen(&store, "proj-1", None, RunStatus::Queued, &mut out).expect_err("should fail");
+
+        assert!(matches!(
+            err,
+            RunsCliError::Store(RunStoreError::NotTerminal { .. })
+        ));
         assert!(out.is_empty());
     }
 

@@ -1549,7 +1549,10 @@ mod tests {
     #[test]
     fn run_status_interrupted_round_trips_through_as_str_and_parse() {
         assert_eq!(RunStatus::Interrupted.as_str(), "interrupted");
-        assert_eq!(RunStatus::parse("interrupted"), Some(RunStatus::Interrupted));
+        assert_eq!(
+            RunStatus::parse("interrupted"),
+            Some(RunStatus::Interrupted)
+        );
     }
 
     #[test]
