@@ -351,9 +351,17 @@ pub fn run(
     )?;
 
     std::fs::create_dir_all(&paths.state_dir)?;
-    let log_path = paths
-        .state_dir
-        .join(format!("{}-{}.log", prepared.wt_name, prepared.timestamp));
+    // Same path `prepare_run_lane` may already have started writing to
+    // before this run row existed (a blocker-resolution warning or a
+    // permanent gh error) — see `run_log_path`'s doc comment. Computing it
+    // via the same shared function, rather than re-deriving the filename
+    // format independently, is what keeps the two computations from
+    // silently drifting apart.
+    let log_path = crate::work::run::run_log_path(
+        &paths.state_dir,
+        &prepared.wt_name,
+        &prepared.timestamp,
+    );
     let state_path = paths.state_dir.join(format!(
         "{}-{}.supervisor.json",
         prepared.wt_name, prepared.timestamp
@@ -1553,6 +1561,133 @@ mod tests {
         let state: SupervisorState = serde_json::from_str(&raw).unwrap();
         assert_eq!(state.prepared.run_id, run_row.id);
         assert_eq!(state.run_db_path, run_db_path);
+    }
+
+    /// A minimal Jira issue fixture carrying a single `Blocks`-type
+    /// blocker, mirroring `work::run`'s own private `issue`/`blocks_link`
+    /// test helpers (not reusable across modules, so duplicated here).
+    fn blocked_issue(blocker_key: &str) -> crate::jira::types::Issue {
+        use crate::jira::types::{
+            IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
+            StatusCategory,
+        };
+        crate::jira::types::Issue {
+            key: "ABC-123".to_string(),
+            fields: IssueFields {
+                summary: "Depends on a blocker".to_string(),
+                status: Status {
+                    name: "To Do".to_string(),
+                    status_category: StatusCategory {
+                        key: "new".to_string(),
+                    },
+                },
+                description: None,
+                assignee: None,
+                issue_links: vec![IssueLink {
+                    id: format!("link-{blocker_key}"),
+                    link_type: IssueLinkType {
+                        name: "Blocks".to_string(),
+                        inward: "is blocked by".to_string(),
+                        outward: "blocks".to_string(),
+                    },
+                    inward_issue: Some(LinkedIssue {
+                        key: blocker_key.to_string(),
+                        fields: LinkedIssueFields {
+                            summary: "blocker".to_string(),
+                            status: Status {
+                                name: "In Progress".to_string(),
+                                status_category: StatusCategory {
+                                    key: "new".to_string(),
+                                },
+                            },
+                        },
+                    }),
+                    outward_issue: None,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn run_detached_writes_a_pre_run_blocker_warning_to_the_run_log_file() {
+        // The incident this closes: the stacking warning is computed by
+        // `prepare_run_lane`, before this function even knows the log
+        // path, and previously only ever reached `out` — never the log
+        // file `tail -f`/`tm runs logs` actually reads. This exercises the
+        // whole `cli::work::run` → `prepare_run_lane` → `run_log_path` path
+        // the way a real detached `tm work run` invocation would.
+        use crate::jira::fake::FakeJiraClient;
+
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let jira = FakeJiraClient::new().with_issue("ABC-123", blocked_issue("ABC-1"));
+        let gh = FakeGhCli::new().with_pr_list_all(Err(crate::github::gh_cli::GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "not authenticated".to_string(),
+        }));
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: Some(&jira),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        run(&ctx, &deps, "mylane", request, false, &mut out).unwrap();
+
+        let recorded = detach.recorded.lock().unwrap();
+        let log_path = recorded[0].log_path.clone();
+        drop(recorded);
+
+        let log_contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log_contents.contains("warning: could not resolve PRs for blockers of ABC-123"),
+            "expected the blocker warning already in the log file \
+             DetachSpawner::spawn_detached is about to redirect the \
+             supervisor's stdio into, got: {log_contents:?}"
+        );
+
+        // The run row's own recorded log_path must be the exact same file.
+        let runs = run_store.list_runs().unwrap();
+        let run_row = run_store.run_by_id(runs[0].id).unwrap().unwrap();
+        assert_eq!(
+            run_row.log_path.as_deref(),
+            Some(log_path.to_string_lossy()).as_deref()
+        );
     }
 
     #[test]

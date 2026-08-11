@@ -707,6 +707,48 @@ fn repo_name(repo_root: &Path) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
+/// The run's durable log file path: `<state_dir>/<wt_name>-<timestamp>.log`.
+///
+/// Pure and computed from `wt_name`/`timestamp` alone (not `PreparedRun`) so
+/// [`prepare_run_lane`] can log to it *before* a run row exists — the
+/// blocked-ticket branch-off resolution runs before `start_run`, and its
+/// warnings/errors previously only ever reached `out` (this process's
+/// stdout), which is invisible for a detached run once the launching
+/// terminal closes and, worse, isn't the run's log file at all: that log
+/// file's own path is computed independently by
+/// `crate::cli::work::run` *after* `prepare_run_lane` returns, from the same
+/// `wt_name`/`timestamp` pair. Sharing this one function is what makes both
+/// computations agree, so anything appended here by `prepare_run_lane`
+/// before the log file is otherwise touched is exactly the content
+/// `crate::work::detach::DetachSpawner::spawn_detached`'s later
+/// append-mode stdio redirection (and `tail -f`/`tm runs logs`) will see at
+/// the top of the file.
+pub fn run_log_path(state_dir: &Path, wt_name: &str, timestamp: &str) -> PathBuf {
+    state_dir.join(format!("{wt_name}-{timestamp}.log"))
+}
+
+/// Best-effort append of one line to the run's log file (see
+/// [`run_log_path`]), creating it (and `state_dir`, transitively, since the
+/// caller is expected to have already created it) if it doesn't exist yet.
+///
+/// Deliberately swallows the write failure rather than propagating it: this
+/// exists to make a warning/error *more* visible, and a full disk or a
+/// permissions problem on the log file must never be the reason a run itself
+/// fails — `out` (and, for the hard-fail case, the propagated `Err`) is
+/// still the authoritative channel; this is only a durable mirror of it,
+/// the same stance `crate::work::review_watch::log_event` takes for its own
+/// best-effort log line.
+fn append_log_line(log_path: &Path, line: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Run one foreground lane run: provision (if needed), cut this run's
 /// branch, invoke `claude -p`, record the outcome in `run_store`, and print
 /// the summary to `out`. See the module doc comment for the full ported
@@ -810,6 +852,22 @@ pub fn prepare_run_lane(
         return Err(RunLaneError::WorktreePathMismatch(wt_path));
     }
 
+    // The timestamp is computed here — earlier than strictly needed for
+    // step 6's branch name below — specifically so `log_path` (and thus
+    // `run_log_path`'s durable file) exists *before* the blocked-ticket
+    // branch-off resolution below runs. That resolution can warn or
+    // outright fail, and both used to be visible only on `out`: for a
+    // detached run that's this short-lived parent process's stdout, gone
+    // the instant its terminal closes, and it's also not the run's actual
+    // log file (computed independently, from this same wt_name/timestamp
+    // pair, by `crate::cli::work::run` — see `run_log_path`'s doc comment).
+    // `paths.state_dir` is created now too so the log file can be written
+    // immediately, rather than waiting for step 9's own `create_dir_all`.
+    let (year, month, day, hour, min, sec) = deps.clock.now_parts();
+    let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);
+    std::fs::create_dir_all(&paths.state_dir)?;
+    let log_path = run_log_path(&paths.state_dir, &wt_name, &timestamp);
+
     // Blocked-ticket branch-off: resolved once, up front, before step 4's
     // worktree provisioning (which needs a base too, if the worktree is
     // new) and step 6's branch cut both consult it — resolving it inside
@@ -817,13 +875,27 @@ pub fn prepare_run_lane(
     // Skipped entirely when `--from` was given: an explicit base override
     // must never be second-guessed by blocker logic. See
     // resolve_blocker_stacking's doc comment for the full decision table.
+    //
+    // No run row exists yet at this point (that's step 9, below), so there
+    // is no `RunStore::add_event` to write to either a warning or a
+    // permanent failure here — `log_path` above is the only durable channel
+    // available. A permanent gh error is logged before propagating the
+    // `Err`, since prepare_run_lane's caller has no other opportunity to
+    // record it anywhere durable.
     let blocker_resolution = if request.from_base.is_none() {
-        resolve_blocker_stacking(deps.jira, deps.gh, &repo_root, request.ticket.as_deref())?
+        match resolve_blocker_stacking(deps.jira, deps.gh, &repo_root, request.ticket.as_deref()) {
+            Ok(resolution) => resolution,
+            Err(err) => {
+                append_log_line(&log_path, &format!("error: {err}"));
+                return Err(err);
+            }
+        }
     } else {
         BlockerResolution::default()
     };
     for message in &blocker_resolution.messages {
         writeln!(out, "{message}")?;
+        append_log_line(&log_path, message);
     }
 
     // Step 4: provision the worktree if it doesn't exist yet.
@@ -879,8 +951,6 @@ pub fn prepare_run_lane(
     // origin-remote-tracking ref before it's cut.
     let base = resolve_base(deps.git)?;
     let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root);
-    let (year, month, day, hour, min, sec) = deps.clock.now_parts();
-    let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);
     let candidate = match resolve_ticket_slug(deps.jira, request.ticket.as_deref()) {
         Some(slug) => naming::branch_name_with_slug(&owner, &wt_name, &slug),
         None => naming::branch_name(&owner, &wt_name, &timestamp),
@@ -3210,6 +3280,135 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("blocked by AX-410"));
+    }
+
+    #[test]
+    fn prepare_run_lane_writes_a_blocker_warning_to_the_run_log_file() {
+        // The other half of the incident: the stacking warning printed to
+        // `out` never showed up in any of the six lane logs inspected,
+        // because it's computed before the run row (and, for the detached
+        // path, the log file redirection) exists. `prepare_run_lane` must
+        // also append its blocker-resolution messages to the run's durable
+        // log file, at the same path `crate::cli::work::run` later points
+        // `RunStore::update_log_path`/`DetachSpawner::spawn_detached` at —
+        // see `run_log_path`.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "not authenticated".to_string(),
+        }));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let state_dir = tmp.path().join("state");
+        let paths = RunLanePaths {
+            home,
+            state_dir: state_dir.clone(),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-2".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        let log_path = run_log_path(&state_dir, "ax-2", "20260806-090503");
+        let log_contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|err| panic!("expected a log file at {log_path:?}: {err}"));
+        assert!(
+            log_contents.contains("warning: could not resolve PRs for blockers of AX-2"),
+            "expected the blocker warning in the log file, got: {log_contents:?}"
+        );
+
+        // The run row doesn't exist yet at this point (blocker resolution
+        // happens before `start_run`), so this is the only durable place
+        // the warning can land — `out` alone (the previous behavior) isn't
+        // enough, since a detached run's `out` is only the parent
+        // process's stdout, gone the moment its terminal closes.
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("warning: could not resolve PRs for blockers of AX-2"));
+    }
+
+    #[test]
+    fn prepare_run_lane_writes_a_permanent_gh_error_to_the_run_log_before_failing() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: r#"Unknown JSON field: "merged""#.to_string(),
+        }));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            jira: Some(&jira),
+        };
+        let state_dir = tmp.path().join("state");
+        let paths = RunLanePaths {
+            home,
+            state_dir: state_dir.clone(),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-2".to_string()),
+            ..Default::default()
+        };
+
+        let err = prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out)
+            .unwrap_err();
+        assert!(matches!(err, RunLaneError::Gh(ref e) if e.is_permanent()));
+
+        // No run row exists to leak (prepare_run_lane's whole design point,
+        // per its doc comment), but the error must still land somewhere
+        // durable rather than only on this process's stdout/stderr.
+        assert_eq!(run_store.list_runs().unwrap().len(), 0);
+
+        let log_path = run_log_path(&state_dir, "ax-2", "20260806-090503");
+        let log_contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|err| panic!("expected a log file at {log_path:?}: {err}"));
+        assert!(
+            log_contents.contains("Unknown JSON field"),
+            "expected the permanent gh error in the log file, got: {log_contents:?}"
+        );
     }
 
     #[test]
