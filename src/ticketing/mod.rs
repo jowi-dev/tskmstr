@@ -796,38 +796,47 @@ pub fn open_blockers(issue: &Issue) -> Vec<&LinkedIssue> {
 }
 
 /// Result of [`ready_tickets`]: the caller's ready-to-pick-up tickets, in the
-/// same rank order the search returned, plus a count of candidates that were
+/// same rank order the search returned, plus the candidates that were
 /// excluded for having an open blocker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyListing {
     /// Tickets assigned to the current user, in "To Do", with no open
     /// blockers, in rank order.
     pub ready: Vec<Issue>,
+    /// Candidates excluded because [`open_blockers`] found at least one, in
+    /// rank order. `tm ready`'s CLI layer (`crate::cli::ready`) re-examines
+    /// each of these against `crate::blocker_stacking` to tell a genuinely
+    /// stuck ticket apart from a stackable one — this module stays Jira-only
+    /// and doesn't make that call itself.
+    pub blocked: Vec<Issue>,
+}
+
+impl ReadyListing {
     /// Number of candidates excluded because [`open_blockers`] found at
     /// least one. Surfaced by the CLI so a caller doesn't mistake a filtered
     /// list for the complete set of assigned tickets.
-    pub hidden_blocked_count: usize,
+    pub fn hidden_blocked_count(&self) -> usize {
+        self.blocked.len()
+    }
 }
 
 /// `tm ready` (no key): search the current user's "To Do" tickets (via
 /// [`ready_candidates_jql`]) and keep only those with no open blockers.
 ///
-/// Rank order from the search is preserved in [`ReadyListing::ready`].
+/// Rank order from the search is preserved in both [`ReadyListing::ready`]
+/// and [`ReadyListing::blocked`].
 pub fn ready_tickets(jira: &dyn JiraClient) -> Result<ReadyListing, TicketingError> {
     let result = jira.search(&ready_candidates_jql())?;
     let mut ready = Vec::new();
-    let mut hidden_blocked_count = 0;
+    let mut blocked = Vec::new();
     for issue in result.issues {
         if open_blockers(&issue).is_empty() {
             ready.push(issue);
         } else {
-            hidden_blocked_count += 1;
+            blocked.push(issue);
         }
     }
-    Ok(ReadyListing {
-        ready,
-        hidden_blocked_count,
-    })
+    Ok(ReadyListing { ready, blocked })
 }
 
 /// Result of [`check_ready`]: `key`'s current status and its open blockers,
@@ -2781,7 +2790,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["PROJ-1".to_string(), "PROJ-3".to_string()]
         );
-        assert_eq!(listing.hidden_blocked_count, 1);
+        assert_eq!(listing.hidden_blocked_count(), 1);
     }
 
     #[test]
@@ -2791,7 +2800,7 @@ mod tests {
         let listing = ready_tickets(&jira).expect("should succeed");
 
         assert!(listing.ready.is_empty());
-        assert_eq!(listing.hidden_blocked_count, 0);
+        assert_eq!(listing.hidden_blocked_count(), 0);
     }
 
     #[test]
