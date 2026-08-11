@@ -78,6 +78,26 @@ pub enum RunsCliError {
     /// `tm runs reopen` was given a numeric id with no matching run row.
     #[error("no run with id {0}")]
     NoRunWithId(i64),
+
+    /// `tm runs logs` resolved a run with no recorded `log_path` and no
+    /// by-convention fallback for its `kind` (see [`fallback_log_path`]).
+    #[error(
+        "run {id} ({ticket}) has no recorded log path, and its kind has no \
+         by-convention fallback; see `tm runs show {ticket}` for its event timeline"
+    )]
+    NoLogPath {
+        /// The ticket key the run belongs to.
+        ticket: String,
+        /// The run's row id.
+        id: i64,
+    },
+
+    /// `tm runs logs` resolved a log path, but nothing exists there.
+    #[error("log file {path} does not exist")]
+    LogFileMissing {
+        /// The path that was resolved but not found.
+        path: std::path::PathBuf,
+    },
 }
 
 /// `tm runs start`: record the start of a lane run, printing only the new
@@ -686,6 +706,153 @@ pub fn reopen(
         reopened.old_status.as_str(),
         reopened.new_status.as_str()
     )?;
+    Ok(())
+}
+
+/// Default number of trailing lines [`logs`] prints when `--tail` isn't
+/// given and `--follow` isn't set: generous enough to see a whole failed
+/// `tm pr watch` run's worth of poll ticks (the default `poll_secs`/
+/// `max_wait_mins` combination produces well under this many lines) without
+/// dumping an unbounded file to the terminal.
+pub const DEFAULT_LOG_TAIL_LINES: usize = 200;
+
+/// The by-convention log path for a run with no recorded `log_path` column
+/// (every run started before that column existed, including any `kind =
+/// "review-watch"` run from before this fix — exactly what let the owner's
+/// failed bugbot crons go undiagnosed).
+///
+/// Only `review-watch` has a convention derivable from `kind` + `ticket`
+/// alone ([`crate::cli::pr::watch_log_dir`]): a lane run's log filename also
+/// bears a worktree name and timestamp neither of which survive into the
+/// `runs` row anywhere [`logs`] can recover them, so this returns `None` for
+/// every other kind rather than guessing.
+fn fallback_log_path(home: &Path, kind: &str, ticket: &str) -> Option<std::path::PathBuf> {
+    if kind == "review-watch" {
+        Some(crate::cli::pr::watch_log_dir(home).join(format!("{}.log", ticket.to_lowercase())))
+    } else {
+        None
+    }
+}
+
+/// Resolves the log file path for `run`: its own `log_path` column if set,
+/// otherwise [`fallback_log_path`]. `None` means there is truly no way to
+/// find this run's log.
+fn resolve_log_path(run: &Run, home: &Path) -> Option<std::path::PathBuf> {
+    run.log_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| fallback_log_path(home, &run.kind, &run.ticket))
+}
+
+/// Returns the last `n` lines of `content`, in original order. `n == 0`
+/// yields an empty slice, and `content` shorter than `n` lines returns all
+/// of it.
+fn tail_lines(content: &str, n: usize) -> Vec<&str> {
+    // `lines()` drops a trailing empty element from a final `\n`, matching
+    // `wc -l`/`tail`'s idea of "how many lines" a file has.
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(n);
+    all[start..].to_vec()
+}
+
+/// Reads whatever bytes have been appended to `path` since `offset`,
+/// returning them alongside the file's new length (the next call's
+/// `offset`). Used by [`logs`]'s `--follow` loop; pulled out as its own
+/// function so the "what's new since last time" logic is testable without
+/// an actual infinite polling loop.
+fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= offset {
+        return Ok((String::new(), offset));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    Ok((buf, len))
+}
+
+/// `tm runs logs <ticket-or-run-id> [--kind <kind>] [--tail <N>] [--follow]`:
+/// print (or follow) a run's detached-process log file.
+///
+/// Resolves `ticket_or_id`/`kind` via [`resolve_run`] (same rules as `tm
+/// runs reopen`), then the log path via [`resolve_log_path`] — the recorded
+/// `log_path` column, or [`fallback_log_path`] for the many pre-migration
+/// rows (including the failed bugbot runs this whole feature exists for)
+/// that predate it.
+///
+/// Three distinct "nothing to show" outcomes, each worded differently so the
+/// caller knows which one they hit:
+/// - [`RunsCliError::NoLogPath`]: no column value and no fallway for this
+///   run's `kind`.
+/// - [`RunsCliError::LogFileMissing`]: a path was resolved but nothing
+///   exists there on disk.
+/// - An empty (zero-byte) file is not an error: prints an explanatory line
+///   pointing at `tm runs show` (see this module's doc comment) and returns
+///   `Ok`, unless `--follow` is set, in which case it keeps watching for
+///   content to appear.
+///
+/// `--follow`'s live loop is real (`sleeper.sleep`/re-reading the file
+/// forever) and, like [`crate::work::detach::RealDetachSpawner`]'s actual
+/// process spawn, is not itself unit-tested — only the pure pieces it's
+/// built from ([`read_appended`], [`tail_lines`]) are. It never returns on
+/// its own; the caller (a real terminal) is expected to Ctrl-C out, same as
+/// `tail -f`.
+#[allow(clippy::too_many_arguments)]
+pub fn logs(
+    store: &RunStore,
+    home: &Path,
+    ticket_or_id: &str,
+    kind: Option<&str>,
+    tail: usize,
+    follow: bool,
+    sleeper: &dyn crate::work::review_watch::Sleeper,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let run = resolve_run(store, ticket_or_id, kind)?;
+    let path = resolve_log_path(&run, home).ok_or_else(|| RunsCliError::NoLogPath {
+        ticket: run.ticket.clone(),
+        id: run.id,
+    })?;
+
+    if !path.exists() {
+        return Err(RunsCliError::LogFileMissing { path });
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let mut offset = content.len() as u64;
+
+    if content.is_empty() {
+        writeln!(
+            out,
+            "log file {} is empty (no runtime output was captured for run {}); \
+             see `tm runs show {}` for the recorded event timeline.",
+            path.display(),
+            run.id,
+            run.ticket
+        )?;
+        if !follow {
+            return Ok(());
+        }
+    } else {
+        for line in tail_lines(&content, tail) {
+            writeln!(out, "{line}")?;
+        }
+    }
+
+    if follow {
+        loop {
+            sleeper.sleep(2);
+            let (appended, new_offset) = read_appended(&path, offset)?;
+            if !appended.is_empty() {
+                write!(out, "{appended}")?;
+                offset = new_offset;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2125,6 +2292,206 @@ mod tests {
             RunsCliError::Store(RunStoreError::NotTerminal { .. })
         ));
         assert!(out.is_empty());
+    }
+
+    // --- logs ---
+
+    struct NoopSleeper;
+    impl crate::work::review_watch::Sleeper for NoopSleeper {
+        fn sleep(&self, _secs: u64) {}
+    }
+
+    #[test]
+    fn logs_prints_the_tail_of_the_recorded_log_path() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let log_file = dir.path().join("mylane.log");
+        std::fs::write(&log_file, "line1\nline2\nline3\n").unwrap();
+        store
+            .start_run(&StartRun {
+                log_path: Some(log_file.to_string_lossy().into_owned()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            dir.path(),
+            "proj-1",
+            None,
+            2,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "line2\nline3\n");
+    }
+
+    #[test]
+    fn logs_falls_back_to_the_review_watch_convention_when_log_path_is_null() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&StartRun {
+                ticket: "AX-408".to_string(),
+                lane: "review-watch".to_string(),
+                kind: "review-watch".to_string(),
+                log_path: None,
+                ..start_params("AX-408")
+            })
+            .unwrap();
+        let expected_path = crate::cli::pr::watch_log_dir(dir.path()).join("ax-408.log");
+        std::fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+        std::fs::write(&expected_path, "watch_started\n").unwrap();
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            dir.path(),
+            "ax-408",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "watch_started\n");
+    }
+
+    #[test]
+    fn logs_reports_the_empty_case_distinctly_and_points_at_show() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let log_file = dir.path().join("ax-408.log");
+        std::fs::write(&log_file, "").unwrap();
+        let id = store
+            .start_run(&StartRun {
+                ticket: "AX-408".to_string(),
+                log_path: Some(log_file.to_string_lossy().into_owned()),
+                ..start_params("AX-408")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            dir.path(),
+            "ax-408",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("is empty"), "got: {printed:?}");
+        assert!(printed.contains("tm runs show AX-408"), "got: {printed:?}");
+        assert!(printed.contains(&id.to_string()), "got: {printed:?}");
+    }
+
+    #[test]
+    fn logs_errors_distinctly_when_no_log_path_and_no_fallback_for_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                kind: "lane".to_string(),
+                log_path: None,
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        let err = logs(
+            &store,
+            dir.path(),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::NoLogPath { .. }));
+    }
+
+    #[test]
+    fn logs_errors_distinctly_when_the_resolved_file_is_missing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&StartRun {
+                log_path: Some(dir.path().join("gone.log").to_string_lossy().into_owned()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        let err = logs(
+            &store,
+            dir.path(),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::LogFileMissing { .. }));
+    }
+
+    #[test]
+    fn tail_lines_returns_all_when_shorter_than_n() {
+        assert_eq!(tail_lines("a\nb\n", 5), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tail_lines_returns_the_last_n_lines() {
+        assert_eq!(tail_lines("a\nb\nc\nd\n", 2), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn tail_lines_zero_returns_empty() {
+        assert!(tail_lines("a\nb\n", 0).is_empty());
+    }
+
+    #[test]
+    fn read_appended_returns_only_bytes_written_after_the_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(&path, "first\nsecond\n").unwrap();
+
+        let (appended, new_offset) = read_appended(&path, offset).unwrap();
+
+        assert_eq!(appended, "second\n");
+        assert_eq!(new_offset, "first\nsecond\n".len() as u64);
+    }
+
+    #[test]
+    fn read_appended_returns_empty_when_nothing_new() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+
+        let (appended, new_offset) = read_appended(&path, offset).unwrap();
+
+        assert_eq!(appended, "");
+        assert_eq!(new_offset, offset);
     }
 
     // --- register ---

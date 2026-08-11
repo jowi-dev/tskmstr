@@ -580,6 +580,27 @@ pub enum RunsCmd {
     },
     /// Live board of lane runs (polls the local run db).
     Watch,
+    /// Print (or follow) a run's detached-process log file.
+    ///
+    /// Falls back to the by-convention path for `kind = "review-watch"` when
+    /// the run has no recorded `log_path` (every run started before that
+    /// column existed) -- this is what makes a `tm pr watch` cron's log
+    /// viewable even though it predates this feature.
+    Logs {
+        /// Jira ticket key or run row id, e.g. `PROJ-123` or `42`.
+        ticket_or_id: String,
+        /// Restrict ticket lookup to the latest run of this kind (e.g.
+        /// `lane`, `audit`, `review-watch`), same disambiguation as `tm runs
+        /// show --kind`. Ignored when `ticket_or_id` is a numeric run id.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Number of trailing lines to print when not following.
+        #[arg(long, default_value_t = crate::cli::runs::DEFAULT_LOG_TAIL_LINES)]
+        tail: usize,
+        /// Keep printing new lines as they're appended, like `tail -f`.
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 /// Terminal statuses accepted by `tm runs finish` (queued/running are not

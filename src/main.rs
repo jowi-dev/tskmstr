@@ -785,6 +785,27 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
         Some(RunsCmd::Watch) => {
             tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
         }
+        Some(RunsCmd::Logs {
+            ticket_or_id,
+            kind,
+            tail,
+            follow,
+        }) => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("~"));
+            let sleeper = tskmstr::work::review_watch::RealSleeper;
+            tskmstr::cli::runs::logs(
+                &store,
+                &home,
+                &ticket_or_id,
+                kind.as_deref(),
+                tail,
+                follow,
+                &sleeper,
+                &mut stdout,
+            )?;
+        }
     }
     Ok(())
 }

@@ -313,7 +313,7 @@ fn resolve_watch_repo_root(
 
 /// Directory the detached watcher's log file lives in:
 /// `<home>/.local/state/tskmstr/review-watch`.
-fn watch_log_dir(home: &Path) -> PathBuf {
+pub(crate) fn watch_log_dir(home: &Path) -> PathBuf {
     home.join(".local")
         .join("state")
         .join("tskmstr")
