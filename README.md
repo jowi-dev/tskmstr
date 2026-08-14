@@ -62,6 +62,7 @@ tm auth status
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
 | `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
+| `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` | Post a comment to ticket `<KEY>` (inferred from the current branch's PR if omitted); `--pr` also posts it to the current branch's PR |
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
@@ -755,6 +756,37 @@ in `config.toml` points instead). Recording never touches Jira and works
 fully offline; every past verdict is kept (no upsert), and the read mode
 above always shows the most recent one. `--notes` only makes sense alongside
 `--record`, so it requires it.
+
+### Commenting
+
+`tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` posts a comment to a Jira
+ticket. `<KEY>` is verified to exist first, same as `rank`/`link`; if it's
+omitted, it's inferred from the current branch's pull request the same way
+`tm pr create` infers an existing ticket (title, body, then branch name). If
+neither an explicit `<KEY>` nor a resolvable one is available — no pull
+request open for the branch at all, or one exists but carries no ticket key
+anywhere — it's a hard error naming the branch.
+
+The comment body is resolved in this order: `--body`, then piped stdin (when
+stdin isn't a terminal, e.g. `git log -1 --format=%B | tm ticket comment
+PROJ-372`), then `$EDITOR` as a last resort (opened on a scratch file; its
+saved contents become the body). An empty or all-whitespace resolved body is
+rejected as a usage error, same rationale as `tm ticket search`'s empty-text
+check. The body is Markdown throughout; it's converted to Jira's ADF format
+for the Jira comment (the same conversion `tm ticket update`/`create --body`
+use).
+
+`--pr` **means the pull request open for the current branch** — not "the
+pull request associated with the ticket". There is no reverse lookup from a
+Jira issue back to a PR in this codebase (it would mean re-deriving one via
+`gh pr list`), and every other explicit `tm ticket <KEY>` command already
+only ever touches the current branch's PR, so `comment` follows the same
+rule. When set, the same Markdown body is also posted to that PR via `gh pr
+comment`, unconverted — GitHub comments are Markdown natively, unlike Jira's
+ADF requirement. Like every other explicit `tm ticket` subcommand, every
+failure here is a hard error (non-zero exit); there's no advisory/warning
+path, since nothing has already been created or linked by the time a comment
+attempt fails.
 
 ### Searching
 
