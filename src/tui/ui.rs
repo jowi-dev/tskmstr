@@ -125,6 +125,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_lane_picker {
         draw_lane_picker(frame, app);
     }
+
+    if app.show_browser_picker {
+        draw_browser_picker(frame, app);
+    }
 }
 
 /// The status bar's left-hand text: the active assignee filter (when it
@@ -171,12 +175,12 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  f filter  p priority  a audit  w work  b bots  v view run  L logs  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  w work  b bots  v view run  L logs  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
         Screen::Rank => {
-            "j/k move  Enter/Space grab-drop  r refresh  o browser  Esc back  ? help  q quit"
+            "j/k move  Enter/Space grab-drop  r refresh  o browser  O jira  Esc back  ? help  q quit"
         }
         Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
         Screen::Runs => "h/l/j/k: move  enter: detail  r: refresh  q: quit",
@@ -1182,7 +1186,7 @@ fn draw_transition_window(frame: &mut Frame, app: &App) {
 
 /// A centered overlay listing every keybinding.
 fn draw_help_overlay(frame: &mut Frame) {
-    let area = centered_rect(60, 60, frame.area());
+    let area = centered_rect(60, 75, frame.area());
     let lines = vec![
         Line::from("j / Down    move down"),
         Line::from("k / Up      move up"),
@@ -1191,7 +1195,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("Enter       open / apply"),
         Line::from("Esc / q     back (quits from the board)"),
         Line::from("r           refresh tickets (inert mid-grab in priority view)"),
-        Line::from("o           open in browser"),
+        Line::from("o           open in browser (picks Jira/GitHub if a PR exists, board only)"),
+        Line::from("O           open Jira directly, no PR lookup"),
         Line::from("f           filter by assignee (board only)"),
         Line::from("p           priority (stack-rank) view (board only)"),
         Line::from("Enter/Space grab or drop a ticket (priority view only)"),
@@ -1287,6 +1292,43 @@ fn draw_lane_picker(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A centered floating window listing `app.browser_picker_options`'s two
+/// choices (Jira, then the resolved GitHub PR), for [`Msg::OpenBrowserAction`]'s
+/// browser picker. Structurally identical to [`draw_lane_picker`] -- the data
+/// is synchronous (built once by
+/// [`crate::tui::app::browser_options_resolved`], no lazy fetch and so no
+/// loading/error line) and there's no "active" option to mark, only the
+/// highlighted row via the list's own `highlight_style`.
+///
+/// [`Msg::OpenBrowserAction`]: crate::tui::app::Msg::OpenBrowserAction
+fn draw_browser_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = app
+        .browser_picker_options
+        .iter()
+        .map(|option| ListItem::new(format!("  {}", option.label())))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Open in browser")),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    if !app.browser_picker_options.is_empty() {
+        state.select(Some(
+            app.browser_picker_selected
+                .min(app.browser_picker_options.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` percent of its
 /// width/height.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1313,6 +1355,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::jira::types::{Status, StatusCategory, Transition};
+    use crate::tui::app::BrowserPickerOption;
     use crate::tui::app::{Column, TicketSummary, group_into_columns};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1417,7 +1460,8 @@ mod tests {
             "j/k",
             "Enter",
             "r",
-            "o",
+            "o browser",
+            "O jira",
             "f filter",
             "p priority",
             "a audit",
@@ -2126,6 +2170,59 @@ mod tests {
         assert!(modifier.contains(Modifier::REVERSED));
         let modifier = modifier_at(&buffer, "backend");
         assert!(!modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn draws_browser_picker_overlay_with_option_labels() {
+        let app = App {
+            show_browser_picker: true,
+            browser_picker_options: vec![
+                BrowserPickerOption::Jira {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                },
+                BrowserPickerOption::GitHub {
+                    number: 42,
+                    url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+            ],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Open in browser"));
+        assert!(text.contains("Jira (PROJ-1)"));
+        assert!(text.contains("GitHub (#42)"));
+    }
+
+    #[test]
+    fn draws_browser_picker_highlights_the_selected_option() {
+        let app = App {
+            show_browser_picker: true,
+            browser_picker_selected: 1,
+            browser_picker_options: vec![
+                BrowserPickerOption::Jira {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                },
+                BrowserPickerOption::GitHub {
+                    number: 42,
+                    url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+            ],
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let modifier = modifier_at(&buffer, "GitHub (#42)");
+        assert!(modifier.contains(Modifier::REVERSED));
+        let modifier = modifier_at(&buffer, "Jira (PROJ-1)");
+        assert!(!modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn rank_hint_documents_the_o_and_capital_o_split() {
+        let hint = hint_for(Screen::Rank, false);
+        assert!(hint.contains("o browser"));
+        assert!(hint.contains("O jira"));
     }
 
     #[test]
