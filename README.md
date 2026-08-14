@@ -293,6 +293,37 @@ gets a compact one-line rendering in the event timeline itself, e.g. `fable-5
 89.2k out / sonnet-5 30.7k out` (a leading `claude-` is stripped from each
 model name for brevity).
 
+#### Estimated cost for interactive sessions
+
+Lane runs (`tm work run`) get their cost straight from `claude -p`'s
+authoritative `modelUsage.costUSD` — no guessing involved. Interactive
+sessions (`tm ticket audit`, `tm ticket create`) have no equivalent: a Claude
+Code transcript's `assistant` turns carry only token counts, never a dollar
+figure, so `tm` derives an approximate cost from a small per-model price
+table (`src/runs/pricing.rs`) instead. That table is a hand-maintained
+estimate, not a vendor price list, and needs manual updates if pricing
+changes — see its module docs for how the current rates were derived.
+
+Every place a cost like this appears, it is marked so it can never be
+mistaken for an authoritative figure:
+
+- In `tm runs show`'s `cost` header line and `Model usage` section, an
+  estimated cost gets a leading `~` (`cost ~$3.28 / 12 turns`, `Model usage
+  (estimated)`), including any `total` line that sums in at least one
+  estimated entry.
+- In `tm runs show --json`, each model's object in `models` carries
+  `"estimated": true` when its `costUSD` was derived rather than reported,
+  and the top-level `model_usage.source` is `"estimated"` (a third value
+  alongside `"final"` and `"live"`) whenever any model in the authoritative
+  column is.
+
+This estimation happens automatically when an audit/create session's run
+finishes — either explicitly (`tm runs finish --model-usage <JSON>` fills in
+any model missing a `costUSD`) or implicitly (recording an audit verdict
+rolls up whatever `usage` events were recorded during the conversation the
+same way). It never overwrites a `costUSD` that's already present, and never
+estimates a model absent from the price table.
+
 ### Friendly event rendering
 
 `tool`, `checklist`, and `usage` events render as a short human-readable
@@ -341,9 +372,14 @@ Every optional field on `run` is present as `null` rather than omitted, so
 the schema is stable regardless of which fields a given run happens to have
 set. `checklist` and `model_usage` are `null` when the run has none;
 `model_usage.source` is `"final"` when it came from the authoritative
-`runs.model_usage` column, or `"live"` when it fell back to the latest
-`usage` event snapshot (same distinction as the "Model usage" / "Model usage
-(live)" section label). `tool_counts` is the same `(tool, count)` list
+`runs.model_usage` column and every model's cost was reported verbatim,
+`"estimated"` when it came from that same column but at least one model's
+`costUSD` was derived from `src/runs/pricing.rs`'s price table (see "Estimated
+cost for interactive sessions" above), or `"live"` when it fell back to the
+latest `usage` event snapshot (same three-way distinction as the "Model
+usage" / "Model usage (estimated)" / "Model usage (live)" section label). A
+model entry itself carries `"estimated": true` when its own `costUSD` was
+derived rather than reported. `tool_counts` is the same `(tool, count)` list
 `tool_counts()` computes, just as objects instead of tuples.
 
 ```json
@@ -747,7 +783,22 @@ registers nothing and behaves exactly as before. When a finished `audit`-kind
 run for `<KEY>` recorded model usage, a `Last audit usage: <model> <n>k
 out / ...` line follows `Last audit: ...` (omitted otherwise, or on a
 runs-DB error). `tm runs --kind audit` and `tm runs show <KEY> --kind audit`
-surface these runs directly.
+surface these runs directly. `tm ticket create` registers a `create`-kind run
+the same way, immediately after the new ticket exists.
+
+Session registration only writes the marker file (`register_session` in
+`src/runs/session.rs`) that ties a Claude Code session to its run row — it
+does not, by itself, make any usage data show up. That still depends on
+`hooks/tm-usage.sh` (Stop/SubagentStop) and `hooks/tm-session-end.sh`
+(SessionEnd) actually firing during the conversation. `tm work run` deploys
+those hooks automatically into each lane's worktree-local Claude Code
+settings (see [`src/work/hooks.rs`](src/work/hooks.rs)), but an interactive
+`tm ticket audit`/`create` session runs under your normal, global Claude Code
+settings (`~/.claude/settings.json`), which `tm` never touches. Wiring
+`tm-usage.sh` (`Stop`, `SubagentStop`) and `tm-session-end.sh` (`SessionEnd`)
+into your global `settings.json` — additively, alongside whatever hooks are
+already there — is a one-time, manual step; without it, `tm ticket audit`/
+`create` runs register correctly but never accumulate any usage or cost.
 
 `tm ticket audit <KEY> --record <ready|needs-work> [--notes "..."]` persists
 that conversation's verdict, timestamped, to the same local SQLite database

@@ -47,11 +47,17 @@ Verified 2026-08-07 on Claude Code 2.1.220 and the current tree.
   main-loop edits during lane runs. It must NOT learn the session-marker
   fallback below, or it would start denying edits in registered
   interactive sessions.
-- **Cost is tokens-only for sessions.** `costUSD` comes only from
-  `claude -p`'s result JSON; interactive sessions have no result JSON and
-  tskmstr has no rate table (per-agent-usage plan). Session runs carry
-  token counts; `cost_usd` stays NULL. That matches how usage is actually
-  budgeted here (subscription limits are token-denominated).
+- **Cost is tokens-only for sessions** — was true at the time this plan was
+  written: `costUSD` comes only from `claude -p`'s result JSON, interactive
+  sessions have no result JSON, and tskmstr had no rate table
+  (per-agent-usage plan). Superseded 2026-08-14: `src/runs/pricing.rs` adds a
+  manually maintained per-model price table, and `estimate_missing_costs`
+  fills in `cost_usd` for a session run's rolled-up `model_usage` (marking it
+  `estimated`, never blended with an authoritative `costUSD`) at both
+  `tm runs finish --model-usage` and `finish_session`'s implicit finish. The
+  budgeting-is-token-denominated point still holds for lane runs' real cost;
+  the estimate exists so audit/create sessions aren't a total blind spot in
+  `tm runs`/`tm runs show`, not to replace token-based budgeting.
 
 ## Design
 
