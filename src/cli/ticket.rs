@@ -39,6 +39,13 @@ pub enum TicketCliError {
     #[error("ticket title is required; pass --title or answer the prompt")]
     TitleRequired,
 
+    /// `tm ticket comment` resolved to an empty (or all-whitespace) body,
+    /// whether it came from `--body`, piped stdin, or `$EDITOR`. Rejected
+    /// here rather than sent to Jira/GitHub as a meaningless empty comment,
+    /// mirroring [`TicketCliError::TitleRequired`]'s rationale.
+    #[error("comment body must not be empty")]
+    CommentBodyRequired,
+
     /// `tm ticket rank <KEY> (--above|--below) <OTHER>` was given the same
     /// key (after normalization) for both `KEY` and `OTHER`. Rejected here
     /// rather than left to the Jira API, whose behavior ranking an issue
@@ -499,6 +506,9 @@ pub fn comment(
     also_pr: bool,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
+    if body_markdown.trim().is_empty() {
+        return Err(TicketCliError::CommentBodyRequired);
+    }
     let normalized_key = key.map(normalize_key).transpose()?;
     let outcome = comment_ticket(ctx, normalized_key.as_deref(), body_markdown, also_pr)?;
 
@@ -1590,6 +1600,24 @@ mod tests {
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comment_empty_body_is_an_actionable_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        let err = comment(&ctx, Some("PROJ-372"), "   ", false, &mut out)
+            .expect_err("should fail on whitespace-only body");
+        assert!(matches!(err, TicketCliError::CommentBodyRequired));
+        assert!(jira.add_comment_calls().is_empty());
     }
 
     #[test]
