@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod pid;
+pub mod pricing;
 pub mod session;
 
 /// A SQL expression yielding the current UTC time as
@@ -510,9 +511,56 @@ pub struct ModelUsage {
     pub cache_creation_input_tokens: u64,
     /// Cost in USD, present in the authoritative `runs.model_usage` column
     /// (recorded at `tm runs finish --model-usage`) and absent from live
-    /// `usage` event snapshots.
+    /// `usage` event snapshots, UNLESS [`Self::estimated`] is `true` (see
+    /// [`estimate_missing_costs`]).
     #[serde(rename = "costUSD", default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// `true` when [`Self::cost_usd`] was derived from [`crate::runs::pricing`]'s
+    /// per-token price table rather than reported verbatim by `claude -p`.
+    /// Interactive sessions (`tm ticket audit`/`create`) have no
+    /// authoritative cost source at all, so their rolled-up usage is always
+    /// estimated this way — see [`estimate_missing_costs`]. Always `false`
+    /// for a lane run's authoritative `modelUsage`. Omitted from JSON when
+    /// `false`, so existing authoritative snapshots serialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub estimated: bool,
+}
+
+/// `serde`'s `skip_serializing_if` helper for [`ModelUsage::estimated`]:
+/// omit the field entirely rather than always writing `"estimated":false`.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Fills in an ESTIMATED `cost_usd` for every entry in `map` that doesn't
+/// already carry one, using [`pricing::estimate_cost_usd`], and marks each
+/// one [`ModelUsage::estimated`]. Entries that already have a `cost_usd`
+/// (the authoritative case, from `claude -p`'s `modelUsage`) are left
+/// completely untouched — this never overwrites an authoritative figure.
+/// Entries for a model absent from [`pricing::PRICE_TABLE`] are also left
+/// alone (no estimate rather than a wrong one).
+pub fn estimate_missing_costs(map: &mut ModelUsageMap) {
+    for (model, usage) in map.iter_mut() {
+        if usage.cost_usd.is_some() {
+            continue;
+        }
+        if let Some(cost) = pricing::estimate_cost_usd(model, usage) {
+            usage.cost_usd = Some(cost);
+            usage.estimated = true;
+        }
+    }
+}
+
+/// Sums every entry's `cost_usd` in `map` (authoritative or estimated
+/// alike). `None` when no entry carries a cost at all — the caller
+/// shouldn't record a `0.0` total when cost is simply unknown.
+pub fn total_cost_usd(map: &ModelUsageMap) -> Option<f64> {
+    let costs: Vec<f64> = map.values().filter_map(|usage| usage.cost_usd).collect();
+    if costs.is_empty() {
+        None
+    } else {
+        Some(costs.iter().sum())
+    }
 }
 
 /// A model name (e.g. `claude-fable-5`) to its [`ModelUsage`]. A
@@ -4269,6 +4317,7 @@ mod tests {
                 cache_read_input_tokens: 6535803,
                 cache_creation_input_tokens: 203983,
                 cost_usd: None,
+                estimated: false,
             },
         );
 
@@ -4292,6 +4341,7 @@ mod tests {
                 cache_read_input_tokens: 6535803,
                 cache_creation_input_tokens: 203983,
                 cost_usd: Some(12.996),
+                estimated: false,
             },
         );
         map.insert(
@@ -4302,6 +4352,7 @@ mod tests {
                 cache_read_input_tokens: 5400000,
                 cache_creation_input_tokens: 191000,
                 cost_usd: Some(2.81),
+                estimated: false,
             },
         );
 
@@ -4316,6 +4367,123 @@ mod tests {
         assert!(lines[1].starts_with("claude-sonnet-5"));
         assert!(lines[1].contains("$2.81"));
         assert_eq!(lines[2], format!("total{}${:.2}", " ".repeat(12), 15.806));
+    }
+
+    #[test]
+    fn estimate_missing_costs_fills_in_cost_for_priced_model_with_no_cost() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: None,
+                estimated: false,
+            },
+        );
+
+        estimate_missing_costs(&mut map);
+
+        let usage = &map["claude-sonnet-5"];
+        assert_eq!(usage.cost_usd, Some(3.00));
+        assert!(usage.estimated);
+    }
+
+    #[test]
+    fn estimate_missing_costs_never_overwrites_an_authoritative_cost() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: Some(999.0),
+                estimated: false,
+            },
+        );
+
+        estimate_missing_costs(&mut map);
+
+        let usage = &map["claude-sonnet-5"];
+        assert_eq!(
+            usage.cost_usd,
+            Some(999.0),
+            "authoritative cost must survive untouched"
+        );
+        assert!(!usage.estimated);
+    }
+
+    #[test]
+    fn estimate_missing_costs_leaves_unpriced_models_alone() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-unknown-model".to_string(),
+            ModelUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: None,
+                estimated: false,
+            },
+        );
+
+        estimate_missing_costs(&mut map);
+
+        let usage = &map["claude-unknown-model"];
+        assert_eq!(usage.cost_usd, None);
+        assert!(!usage.estimated);
+    }
+
+    #[test]
+    fn total_cost_usd_sums_authoritative_and_estimated_costs_alike() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: Some(1.5),
+                estimated: false,
+            },
+        );
+        map.insert(
+            "claude-opus-5".to_string(),
+            ModelUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: Some(2.5),
+                estimated: true,
+            },
+        );
+
+        assert_eq!(total_cost_usd(&map), Some(4.0));
+    }
+
+    #[test]
+    fn total_cost_usd_is_none_when_no_entry_has_a_cost() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 1,
+                cache_creation_input_tokens: 1,
+                cost_usd: None,
+                estimated: false,
+            },
+        );
+
+        assert_eq!(total_cost_usd(&map), None);
     }
 
     #[test]
