@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -55,6 +56,21 @@ pub enum GhError {
         command: String,
         /// The underlying parse error message.
         message: String,
+    },
+
+    /// The command did not finish within its bounded wait and was killed.
+    ///
+    /// Only ever produced by [`GhCli::pr_list_bounded`] (see its doc comment
+    /// for why that's the one method on this trait with a bound at all) --
+    /// every other method here shells out with an ordinary unbounded
+    /// `.output()` call, matching `tm`'s existing "a CLI command taking
+    /// longer than usual is annoying but not board-freezing" tolerance.
+    #[error("`{command}` did not finish within {seconds}s and was killed")]
+    Timeout {
+        /// The command that timed out, e.g. `gh pr list`.
+        command: String,
+        /// The bound that was exceeded, in seconds.
+        seconds: u64,
     },
 }
 
@@ -96,7 +112,7 @@ impl GhError {
     pub fn is_permanent(&self) -> bool {
         match self {
             GhError::Command { stderr, .. } => is_permanent_stderr(stderr),
-            GhError::Spawn { .. } | GhError::Parse { .. } => false,
+            GhError::Spawn { .. } | GhError::Parse { .. } | GhError::Timeout { .. } => false,
         }
     }
 }
@@ -146,6 +162,90 @@ pub fn permanence_note(err: &GhError) -> &'static str {
     } else {
         ""
     }
+}
+
+/// How often [`spawn_with_timeout`]'s poll loop checks whether the child has
+/// exited. Small enough that the loop's own overhead never meaningfully
+/// stretches the timeout bound it's enforcing, large enough not to spin the
+/// CPU while waiting on a slow `gh` call.
+const POLL_STEP: Duration = Duration::from_millis(25);
+
+/// Run `command` to completion, but kill it and return
+/// `Err(GhError::Timeout)` if it hasn't exited within `timeout`.
+///
+/// `label` is a human-readable name for the command (e.g. `"gh pr list"`),
+/// used only in the error variants' messages -- `command` itself isn't
+/// `Debug`, so it can't be interpolated directly.
+///
+/// stdout/stderr are drained on background threads *while* the poll loop
+/// runs, not read afterward: `gh pr list` on a repository with many open PRs
+/// can produce enough JSON to fill a pipe's OS buffer, and reading it only
+/// after the child exits (the way [`std::process::Command::output`] would
+/// look if reimplemented naively here) would deadlock a child that's blocked
+/// writing to a full pipe while this function is blocked waiting for it to
+/// exit. This mirrors what `Command::output`/`wait_with_output` already do
+/// internally; the only reason this function exists instead of calling
+/// `wait_with_output` on a spawned child is that `wait_with_output` has no
+/// bound and can't be interrupted once called.
+///
+/// Used only by [`GhCli::pr_list_bounded`], but kept generic over `Command`
+/// (rather than hardcoded to build the `gh pr list` invocation itself) so it
+/// can be unit-tested directly against ordinary subprocesses (`sleep`,
+/// `echo`) without needing a real `gh` binary or network -- see this
+/// module's tests.
+fn spawn_with_timeout(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, GhError> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|err| GhError::Spawn {
+        command: label.to_string(),
+        message: err.to_string(),
+    })?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped above");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped above");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|err| GhError::Spawn {
+            command: label.to_string(),
+            message: err.to_string(),
+        })? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GhError::Timeout {
+                command: label.to_string(),
+                seconds: timeout.as_secs(),
+            });
+        }
+        std::thread::sleep(POLL_STEP);
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// The lifecycle state of a pull request, as reported by `gh pr view --json
@@ -286,6 +386,21 @@ pub trait GhCli {
     /// (rather than `gh`'s default of 30) so a repo with more than 30 open
     /// PRs doesn't silently hide the one being searched for.
     fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError>;
+
+    /// Same as [`GhCli::pr_list`], but bounded by `timeout`: if the `gh`
+    /// child process hasn't finished within it, it is killed and
+    /// `Err(GhError::Timeout)` is returned instead of blocking forever.
+    ///
+    /// Exists for exactly one caller: `crate::tui::event::resolve_pr_for_ticket`,
+    /// the board's `o`-key PR lookup. That call runs synchronously inside the
+    /// terminal event loop with no way to cancel a hung child -- a dead
+    /// network or expired `gh` auth would otherwise freeze the whole board
+    /// indefinitely (no redraw, no key input, not even quit). Every other
+    /// caller of PR data (`tm pr watch`, `tm pr status`, `tm ready`) keeps
+    /// calling the unbounded [`GhCli::pr_list`] unchanged: those are batch CLI
+    /// commands where a slow `gh` call is merely annoying, not a frozen UI, so
+    /// there is no reason to newly bound them.
+    fn pr_list_bounded(&self, dir: &Path, timeout: Duration) -> Result<Vec<PrInfo>, GhError>;
 
     /// The login of the currently authenticated `gh` user
     /// (`gh api user -q .login`), used by `tm work run`'s branch-owner
@@ -665,6 +780,30 @@ impl GhCli for ShellGhCli {
                 command: "gh pr list".to_string(),
                 message: err.to_string(),
             })?;
+
+        interpret_pr_list_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_list_bounded(&self, dir: &Path, timeout: Duration) -> Result<Vec<PrInfo>, GhError> {
+        let mut command = Command::new("gh");
+        command
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                PR_VIEW_JSON_FIELDS,
+            ])
+            .current_dir(dir);
+
+        let output = spawn_with_timeout(command, "gh pr list", timeout)?;
 
         interpret_pr_list_output(
             output.status.code(),
@@ -1402,6 +1541,8 @@ pub struct FakeGhCli {
     finding_details_calls: RefCell<Vec<u64>>,
     pr_list_result: RefCell<Result<Vec<PrInfo>, GhError>>,
     pr_list_calls: RefCell<Vec<PathBuf>>,
+    pr_list_bounded_result: RefCell<Option<Result<Vec<PrInfo>, GhError>>>,
+    pr_list_bounded_calls: RefCell<Vec<PathBuf>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
@@ -1439,6 +1580,8 @@ impl Default for FakeGhCli {
             finding_details_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
             pr_list_calls: RefCell::new(Vec::new()),
+            pr_list_bounded_result: RefCell::new(None),
+            pr_list_bounded_calls: RefCell::new(Vec::new()),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
@@ -1587,6 +1730,21 @@ impl FakeGhCli {
         self.pr_list_calls.borrow().clone()
     }
 
+    /// Set the result `pr_list_bounded` will return, e.g.
+    /// `Err(GhError::Timeout { .. })` to simulate the board's `o`-key lookup
+    /// timing out. Unconfigured (the default), `pr_list_bounded` delegates to
+    /// whatever `pr_list_result` is set to, mirroring [`FakeGhCli::pr_list`]'s
+    /// success case for tests that don't care about the timeout path.
+    pub fn with_pr_list_bounded(self, result: Result<Vec<PrInfo>, GhError>) -> Self {
+        *self.pr_list_bounded_result.borrow_mut() = Some(result);
+        self
+    }
+
+    /// The `dir` arguments passed to `pr_list_bounded`, in call order.
+    pub fn pr_list_bounded_calls(&self) -> Vec<PathBuf> {
+        self.pr_list_bounded_calls.borrow().clone()
+    }
+
     /// Set the result `current_user_login` will return.
     pub fn with_current_user_login(self, result: Result<Option<String>, GhError>) -> Self {
         *self.current_user_login_result.borrow_mut() = result;
@@ -1686,6 +1844,16 @@ impl GhCli for FakeGhCli {
     fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError> {
         self.pr_list_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_result.borrow().clone()
+    }
+
+    fn pr_list_bounded(&self, dir: &Path, _timeout: Duration) -> Result<Vec<PrInfo>, GhError> {
+        self.pr_list_bounded_calls
+            .borrow_mut()
+            .push(dir.to_path_buf());
+        match self.pr_list_bounded_result.borrow().clone() {
+            Some(result) => result,
+            None => self.pr_list_result.borrow().clone(),
+        }
     }
 
     fn current_user_login(&self) -> Result<Option<String>, GhError> {
@@ -2613,5 +2781,80 @@ mod tests {
             fake.pr_list_calls(),
             vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")]
         );
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_list_bounded_unconfigured_delegates_to_pr_list() {
+        let prs = vec![PrInfo {
+            number: 1,
+            url: "https://github.com/example/repo/pull/1".to_string(),
+            title: "Fix the thing".to_string(),
+            body: String::new(),
+            head_ref_name: "proj-372-fix".to_string(),
+        }];
+        let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
+        assert_eq!(
+            fake.pr_list_bounded(Path::new("/repo"), Duration::from_secs(8))
+                .unwrap(),
+            prs
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_list_bounded_configured_overrides_pr_list() {
+        let fake = FakeGhCli::new()
+            .with_pr_list(Ok(vec![]))
+            .with_pr_list_bounded(Err(GhError::Timeout {
+                command: "gh pr list".to_string(),
+                seconds: 8,
+            }));
+        let err = fake
+            .pr_list_bounded(Path::new("/repo"), Duration::from_secs(8))
+            .unwrap_err();
+        assert!(matches!(err, GhError::Timeout { .. }));
+        assert_eq!(fake.pr_list_bounded_calls(), vec![PathBuf::from("/repo")]);
+    }
+
+    #[test]
+    fn is_permanent_false_for_timeout() {
+        let err = GhError::Timeout {
+            command: "gh pr list".to_string(),
+            seconds: 8,
+        };
+        assert!(!err.is_permanent());
+    }
+
+    // --- spawn_with_timeout ---
+    //
+    // Tested directly against ordinary subprocesses (not `gh`) so the
+    // kill-on-timeout mechanism itself is covered without needing a real `gh`
+    // binary or network -- see the function's doc comment.
+
+    #[test]
+    fn spawn_with_timeout_returns_output_for_a_fast_command() {
+        let mut command = Command::new("echo");
+        command.arg("hello");
+        let output = spawn_with_timeout(command, "echo", Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
+
+    #[test]
+    fn spawn_with_timeout_kills_and_errors_on_a_hanging_command() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let start = std::time::Instant::now();
+        let err = spawn_with_timeout(command, "sleep", Duration::from_millis(200)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "should time out quickly, not wait for the full sleep"
+        );
+        match err {
+            GhError::Timeout { command, seconds } => {
+                assert_eq!(command, "sleep");
+                assert_eq!(seconds, 0);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 }
