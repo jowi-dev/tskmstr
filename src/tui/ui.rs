@@ -1110,18 +1110,29 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
     };
 
     let text = match app.selected_ticket() {
-        Some(ticket) => vec![
-            Line::from(vec![
-                Span::styled("Status: ", theme::SECTION_HEADER),
-                Span::styled(
-                    ticket.status.clone(),
-                    theme::ticket_status_style(&ticket.status_category),
-                ),
-            ]),
-            Line::from(Span::styled(ticket.url.clone(), theme::DIM)),
-            Line::from(""),
-            Line::from(ticket.description.clone()),
-        ],
+        Some(ticket) => {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Status: ", theme::SECTION_HEADER),
+                    Span::styled(
+                        ticket.status.clone(),
+                        theme::ticket_status_style(&ticket.status_category),
+                    ),
+                ]),
+                Line::from(Span::styled(ticket.url.clone(), theme::DIM)),
+                Line::from(""),
+            ];
+            // `split('\n')`, not `.lines()`: a trailing blank line in the
+            // description (e.g. a trailing hardBreak) should still render as
+            // an empty row rather than being silently dropped.
+            lines.extend(
+                ticket
+                    .description
+                    .split('\n')
+                    .map(|segment| Line::from(segment.to_string())),
+            );
+            lines
+        }
         None => vec![Line::from("No ticket selected")],
     };
 
@@ -1530,6 +1541,29 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("[PROJ-1]"));
         assert!(text.contains("A longer description"));
+    }
+
+    #[test]
+    fn detail_overlay_renders_description_paragraphs_on_separate_rows() {
+        let app = App {
+            columns: group_into_columns(
+                vec![TicketSummary {
+                    description: "first paragraph\n\nsecond paragraph".to_string(),
+                    ..ticket("PROJ-1")
+                }],
+                &[],
+            ),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let (_, first_y) = cell_pos(&buffer, "first paragraph").expect("first paragraph renders");
+        let (_, second_y) =
+            cell_pos(&buffer, "second paragraph").expect("second paragraph renders");
+        assert_ne!(
+            first_y, second_y,
+            "paragraphs must render on different rows, not collapse into one blob"
+        );
     }
 
     #[test]
