@@ -201,6 +201,14 @@ pub trait GhCli {
     /// Edit an existing pull request (`gh pr edit`).
     fn pr_edit(&self, number: u64, req: &PrEditRequest) -> Result<(), GhError>;
 
+    /// Post a comment to a pull request (`gh pr comment <number> --body
+    /// <text>`).
+    ///
+    /// `body` is plain (GitHub-flavored) Markdown, unlike
+    /// [`crate::jira::client::JiraClient::add_comment`]'s ADF body — GitHub
+    /// comments are Markdown natively, so no conversion happens on this path.
+    fn pr_comment(&self, number: u64, body: &str) -> Result<(), GhError>;
+
     /// The name of the currently checked out branch (`git branch --show-current`).
     fn current_branch(&self) -> Result<String, GhError>;
 
@@ -486,6 +494,21 @@ impl GhCli for ShellGhCli {
             })?;
 
         interpret_pr_edit_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_comment(&self, number: u64, body: &str) -> Result<(), GhError> {
+        let output = Command::new("gh")
+            .args(["pr", "comment", &number.to_string(), "--body", body])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr comment".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_comment_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stderr),
         )
@@ -1299,6 +1322,14 @@ fn interpret_pr_edit_output(exit_code: Option<i32>, stderr: &str) -> Result<(), 
     interpret_success_or_command_error("gh pr edit", exit_code, stderr)
 }
 
+/// Interpret the result of a `gh pr comment ...` invocation.
+///
+/// Pure over the exit code and captured stderr, for the same reasons as
+/// [`interpret_pr_create_output`].
+fn interpret_pr_comment_output(exit_code: Option<i32>, stderr: &str) -> Result<(), GhError> {
+    interpret_success_or_command_error("gh pr comment", exit_code, stderr)
+}
+
 /// Shared success/failure interpretation for commands whose output carries
 /// no information beyond "it worked": exit 0 is `Ok(())`, anything else is a
 /// [`GhError::Command`] tagged with `command`.
@@ -1357,8 +1388,10 @@ pub struct FakeGhCli {
     current_branch_result: RefCell<Result<String, GhError>>,
     pr_create_result: RefCell<Result<PrInfo, GhError>>,
     pr_edit_result: RefCell<Result<(), GhError>>,
+    pr_comment_result: RefCell<Result<(), GhError>>,
     pr_create_calls: RefCell<Vec<PrCreateRequest>>,
     pr_edit_calls: RefCell<Vec<(u64, PrEditRequest)>>,
+    pr_comment_calls: RefCell<Vec<(u64, String)>>,
     review_threads_results: RefCell<HashMap<u64, Result<Vec<ReviewThread>, GhError>>>,
     review_threads_calls: RefCell<Vec<u64>>,
     pr_reviews_results: RefCell<HashMap<u64, Result<Vec<PrReview>, GhError>>>,
@@ -1392,8 +1425,10 @@ impl Default for FakeGhCli {
                 head_ref_name: String::new(),
             })),
             pr_edit_result: RefCell::new(Ok(())),
+            pr_comment_result: RefCell::new(Ok(())),
             pr_create_calls: RefCell::new(Vec::new()),
             pr_edit_calls: RefCell::new(Vec::new()),
+            pr_comment_calls: RefCell::new(Vec::new()),
             review_threads_results: RefCell::new(HashMap::new()),
             review_threads_calls: RefCell::new(Vec::new()),
             pr_reviews_results: RefCell::new(HashMap::new()),
@@ -1451,6 +1486,17 @@ impl FakeGhCli {
     /// The `(number, request)` pairs passed to `pr_edit`, in call order.
     pub fn pr_edit_calls(&self) -> Vec<(u64, PrEditRequest)> {
         self.pr_edit_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_comment` will return.
+    pub fn with_pr_comment_result(self, result: Result<(), GhError>) -> Self {
+        *self.pr_comment_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(number, body)` pairs passed to `pr_comment`, in call order.
+    pub fn pr_comment_calls(&self) -> Vec<(u64, String)> {
+        self.pr_comment_calls.borrow().clone()
     }
 
     /// Set the result `pr_review_threads` will return for pull request
@@ -1588,6 +1634,13 @@ impl GhCli for FakeGhCli {
     fn pr_edit(&self, number: u64, req: &PrEditRequest) -> Result<(), GhError> {
         self.pr_edit_calls.borrow_mut().push((number, req.clone()));
         self.pr_edit_result.borrow().clone()
+    }
+
+    fn pr_comment(&self, number: u64, body: &str) -> Result<(), GhError> {
+        self.pr_comment_calls
+            .borrow_mut()
+            .push((number, body.to_string()));
+        self.pr_comment_result.borrow().clone()
     }
 
     fn current_branch(&self) -> Result<String, GhError> {
@@ -1907,6 +1960,30 @@ mod tests {
     }
 
     #[test]
+    fn fake_gh_cli_records_pr_comment_calls() {
+        let fake = FakeGhCli::new();
+
+        fake.pr_comment(42, "Looks good to me.").unwrap();
+
+        assert_eq!(
+            fake.pr_comment_calls(),
+            vec![(42, "Looks good to me.".to_string())]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_pr_comment_seeded_error_is_returned() {
+        let fake = FakeGhCli::new().with_pr_comment_result(Err(GhError::Command {
+            command: "gh pr comment".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+
+        let err = fake.pr_comment(42, "body").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
     fn fake_gh_cli_returns_configured_pr_view_result() {
         let pr = PrInfo {
             number: 1,
@@ -1974,6 +2051,37 @@ mod tests {
     #[test]
     fn pr_edit_signal_termination_is_a_command_error() {
         let err = interpret_pr_edit_output(None, "").unwrap_err();
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pr_comment_success_is_ok() {
+        interpret_pr_comment_output(Some(0), "").unwrap();
+    }
+
+    #[test]
+    fn pr_comment_failure_is_a_command_error() {
+        let err = interpret_pr_comment_output(Some(1), "gh: pull request not found").unwrap_err();
+        match err {
+            GhError::Command {
+                command, stderr, ..
+            } => {
+                assert_eq!(command, "gh pr comment");
+                assert!(stderr.contains("not found"));
+            }
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_comment_signal_termination_is_a_command_error() {
+        let err = interpret_pr_comment_output(None, "").unwrap_err();
         assert!(matches!(
             err,
             GhError::Command {
