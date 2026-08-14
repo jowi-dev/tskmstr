@@ -404,13 +404,36 @@ pub fn finish_session(
         _ => return Ok(None),
     }
 
-    store.finish_run(
-        run_id,
-        &FinishRun {
+    // Interactive sessions have no wrapper process to pass --model-usage the
+    // way a lane run's supervisor does, so this rolls up whatever `usage`
+    // events tm-usage.sh recorded during the conversation (the same
+    // events-fallback `crate::runs::latest_usage` reads for a *running*
+    // run's live display) and estimates a cost from them via
+    // `crate::runs::estimate_missing_costs` — see
+    // `crate::runs::pricing`'s module docs for why this is always an
+    // estimate, never authoritative. `None` (no usage events at all) leaves
+    // `model_usage`/`cost_usd` untouched, same as before this rollup existed.
+    let events = store.events_for_run(run_id)?;
+    let outcome = match crate::runs::latest_usage(&events) {
+        Some(mut usage) => {
+            crate::runs::estimate_missing_costs(&mut usage);
+            FinishRun {
+                status,
+                cost_usd: crate::runs::total_cost_usd(&usage),
+                model_usage: Some(
+                    serde_json::to_string(&usage)
+                        .expect("a parsed ModelUsageMap always re-serializes"),
+                ),
+                ..FinishRun::default()
+            }
+        }
+        None => FinishRun {
             status,
             ..FinishRun::default()
         },
-    )?;
+    };
+
+    store.finish_run(run_id, &outcome)?;
 
     std::fs::remove_file(&path).map_err(|source| SessionError::RemoveMarker {
         path: path.clone(),
@@ -823,6 +846,72 @@ mod tests {
             RunStatus::Done
         );
         assert!(!markers_dir.path().join("sess-1").exists());
+    }
+
+    #[test]
+    fn finish_session_rolls_up_usage_events_into_an_estimated_cost() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        store
+            .add_event(
+                id,
+                "usage",
+                Some(
+                    r#"{"models":{"claude-sonnet-5":{"inputTokens":1000000,"outputTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#,
+                ),
+            )
+            .unwrap();
+
+        finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            run.cost_usd,
+            Some(3.00),
+            "the run's latest usage event should roll up into an estimated cost_usd"
+        );
+        let usage = crate::runs::parse_model_usage(run.model_usage.as_deref().unwrap()).unwrap();
+        assert!(usage["claude-sonnet-5"].estimated);
+    }
+
+    #[test]
+    fn finish_session_leaves_cost_usd_none_when_there_are_no_usage_events() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+
+        finish_session(
+            &store,
+            markers_dir.path(),
+            &env,
+            "audit",
+            "PROJ-1",
+            RunStatus::Done,
+        )
+        .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.cost_usd, None);
+        assert_eq!(run.model_usage, None);
     }
 
     #[test]
