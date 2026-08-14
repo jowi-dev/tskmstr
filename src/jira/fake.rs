@@ -75,6 +75,8 @@ pub struct FakeJiraClient {
     delete_link_calls: RefCell<Vec<String>>,
     update_description_result: RefCell<Result<(), (u16, String)>>,
     update_description_calls: RefCell<Vec<(String, serde_json::Value)>>,
+    add_comment_result: RefCell<Result<(), (u16, String)>>,
+    add_comment_calls: RefCell<Vec<(String, serde_json::Value)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -101,6 +103,8 @@ impl Default for FakeJiraClient {
             delete_link_calls: RefCell::new(Vec::new()),
             update_description_result: RefCell::new(Ok(())),
             update_description_calls: RefCell::new(Vec::new()),
+            add_comment_result: RefCell::new(Ok(())),
+            add_comment_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -312,6 +316,18 @@ impl FakeJiraClient {
     pub fn update_description_calls(&self) -> Vec<(String, serde_json::Value)> {
         self.update_description_calls.borrow().clone()
     }
+
+    /// Seed `add_comment(..)` to return [`JiraError::Api`] with the given
+    /// status and message.
+    pub fn with_add_comment_error(self, status: u16, message: &str) -> Self {
+        *self.add_comment_result.borrow_mut() = Err((status, message.to_string()));
+        self
+    }
+
+    /// The `(key, body)` pairs passed to `add_comment`, in call order.
+    pub fn add_comment_calls(&self) -> Vec<(String, serde_json::Value)> {
+        self.add_comment_calls.borrow().clone()
+    }
 }
 
 impl JiraClient for FakeJiraClient {
@@ -480,6 +496,19 @@ impl JiraClient for FakeJiraClient {
             .borrow_mut()
             .push((key.to_string(), description.clone()));
         match self.update_description_result.borrow().as_ref() {
+            Ok(()) => Ok(()),
+            Err((status, message)) => Err(JiraError::Api {
+                status: *status,
+                message: message.clone(),
+            }),
+        }
+    }
+
+    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
+        self.add_comment_calls
+            .borrow_mut()
+            .push((key.to_string(), body.clone()));
+        match self.add_comment_result.borrow().as_ref() {
             Ok(()) => Ok(()),
             Err((status, message)) => Err(JiraError::Api {
                 status: *status,
@@ -781,6 +810,31 @@ mod tests {
         let err = fake
             .update_description("PROJ-1", &description)
             .expect_err("should fail");
+        match err {
+            JiraError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_comment_records_calls_and_succeeds_by_default() {
+        let fake = FakeJiraClient::new();
+        let body = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+
+        fake.add_comment("PROJ-1", &body).expect("should succeed");
+
+        assert_eq!(fake.add_comment_calls(), vec![("PROJ-1".to_string(), body)]);
+    }
+
+    #[test]
+    fn add_comment_seeded_error_is_returned() {
+        let fake = FakeJiraClient::new().with_add_comment_error(500, "boom");
+        let body = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+
+        let err = fake.add_comment("PROJ-1", &body).expect_err("should fail");
         match err {
             JiraError::Api { status, message } => {
                 assert_eq!(status, 500);
