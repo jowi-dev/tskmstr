@@ -118,6 +118,8 @@ pub fn finish(
     outcome: &FinishRun,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
+    let mut outcome = outcome.clone();
+
     if let Some(model_usage) = &outcome.model_usage {
         let value: serde_json::Value = serde_json::from_str(model_usage)
             .map_err(|e| RunsCliError::InvalidModelUsageJson(e.to_string()))?;
@@ -126,9 +128,27 @@ pub fn finish(
                 "expected a JSON object".to_string(),
             ));
         }
+
+        // Interactive audit/create sessions have no authoritative cost the
+        // way a lane run's claude -p result does (see
+        // crate::runs::pricing's module docs) — a bare `--model-usage` map
+        // with no costUSD (as tm-session-end.sh reports) gets an ESTIMATED
+        // one filled in here, and rolled up into `cost_usd` when the caller
+        // didn't already provide one explicitly. A lane run's map already
+        // carries costUSD for every model, so estimate_missing_costs is a
+        // no-op there.
+        if let Some(mut map) = crate::runs::parse_model_usage(model_usage) {
+            crate::runs::estimate_missing_costs(&mut map);
+            outcome.model_usage = Some(
+                serde_json::to_string(&map).expect("a parsed ModelUsageMap always re-serializes"),
+            );
+            if outcome.cost_usd.is_none() {
+                outcome.cost_usd = crate::runs::total_cost_usd(&map);
+            }
+        }
     }
 
-    store.finish_run(run_id, outcome)?;
+    store.finish_run(run_id, &outcome)?;
     writeln!(out, "Finished run {run_id}: {}", outcome.status.as_str())?;
     Ok(())
 }
@@ -969,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_stores_valid_model_usage_json() {
+    fn finish_stores_valid_model_usage_json_verbatim_for_an_unpriced_model() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
@@ -980,7 +1000,7 @@ mod tests {
             id,
             &FinishRun {
                 status: RunStatus::Done,
-                model_usage: Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string()),
+                model_usage: Some(r#"{"claude-unpriced-model":{"inputTokens":146}}"#.to_string()),
                 ..FinishRun::default()
             },
             &mut out,
@@ -988,10 +1008,77 @@ mod tests {
         .expect("should succeed");
 
         let run = store.run_by_id(id).unwrap().expect("expected a run");
+        let usage = crate::runs::parse_model_usage(run.model_usage.as_deref().unwrap())
+            .expect("stored model_usage should parse");
+        let unpriced = &usage["claude-unpriced-model"];
+        assert_eq!(unpriced.input_tokens, 146);
         assert_eq!(
-            run.model_usage,
-            Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string())
+            unpriced.cost_usd, None,
+            "a model absent from the price table gets no estimate injected"
         );
+        assert!(!unpriced.estimated);
+    }
+
+    #[test]
+    fn finish_estimates_missing_cost_for_a_priced_model_and_marks_it_estimated() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-sonnet-5":{"inputTokens":1000000,"outputTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#
+                        .to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        let usage = crate::runs::parse_model_usage(run.model_usage.as_deref().unwrap())
+            .expect("stored model_usage should parse");
+        let sonnet = &usage["claude-sonnet-5"];
+        assert_eq!(sonnet.cost_usd, Some(3.00));
+        assert!(sonnet.estimated);
+        assert_eq!(
+            run.cost_usd,
+            Some(3.00),
+            "finish should roll the estimated cost up into runs.cost_usd when none was given explicitly"
+        );
+    }
+
+    #[test]
+    fn finish_never_overwrites_an_explicitly_given_cost_usd_with_the_rollup() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let mut out = Vec::new();
+
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                cost_usd: Some(42.0),
+                model_usage: Some(
+                    r#"{"claude-sonnet-5":{"inputTokens":1000000,"outputTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#
+                        .to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.cost_usd, Some(42.0));
     }
 
     #[test]
