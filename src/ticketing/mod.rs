@@ -257,6 +257,23 @@ pub enum TicketingError {
         /// [`format_no_blocks_others`].
         others: String,
     },
+
+    /// `tm ticket comment` was given no explicit `KEY`, and no ticket key
+    /// could be resolved either: either the current branch has no open pull
+    /// request at all, or it does but [`resolve_existing_key`] found no key
+    /// carried by it (title, body, or branch name). Mirrors
+    /// [`TicketingError::NoPrForBranch`]'s shape (it also needs
+    /// [`GhCli::current_branch`] to name the branch), but distinct from it:
+    /// a PR existing with no derivable key is also this error, not
+    /// `NoPrForBranch`, since the missing piece here is a *ticket*, not a
+    /// PR.
+    #[error(
+        "no ticket key given and none could be resolved for branch `{branch}`; pass a key or run `tm ticket <KEY>` first"
+    )]
+    NoTicketOrPrForBranch {
+        /// The branch a ticket key could not be resolved for.
+        branch: String,
+    },
 }
 
 /// Describe `others` for display in [`TicketingError::NoBlocksLinkBetween`]:
@@ -881,6 +898,99 @@ pub fn search_tickets(
     let jql = ticket_search_jql(&config.default_project_key, text);
     let result = jira.search(&jql)?;
     Ok(result.issues)
+}
+
+/// Outcome of successfully [`comment_ticket`]ing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentOutcome {
+    /// The issue key the Jira comment was posted to. Always `Some` on a
+    /// successful [`comment_ticket`] call — a missing key is
+    /// [`TicketingError::NoTicketOrPrForBranch`] instead — but kept as an
+    /// `Option` alongside [`CommentOutcome::pr_number`] for a symmetric
+    /// shape.
+    pub issue_key: Option<String>,
+    /// The pull request number a copy of the comment was also posted to, if
+    /// `also_pr` was requested. `None` when it wasn't.
+    pub pr_number: Option<u64>,
+}
+
+/// `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]`: post a comment to a
+/// Jira ticket, optionally also to the current branch's pull request.
+///
+/// `body_markdown` is GitHub-flavored Markdown; it is converted to ADF (via
+/// [`text_to_adf`]) for the Jira comment, but posted to the pull request
+/// as-is when `also_pr` is set — GitHub comments are Markdown natively, so
+/// no conversion happens on that path (unlike Jira's v3 API, which only
+/// accepts ADF).
+///
+/// `key`, if given, is validated with [`JiraClient::get_issue`] first (like
+/// [`rank_ticket`]/[`link_ticket`]) so a typo'd key gives the familiar
+/// [`JiraError::NotFound`] rather than a raw comment-post 404. If `key` is
+/// omitted, it's resolved from the current branch's pull request the same
+/// way [`resolve_existing_key`] does for `tm pr create` — this is the only
+/// way to derive a key without one being given explicitly. If neither an
+/// explicit key nor a resolvable one is available (no pull request for the
+/// branch at all, or one exists but carries no key), this fails with
+/// [`TicketingError::NoTicketOrPrForBranch`] rather than silently doing
+/// nothing.
+///
+/// `--pr` means the pull request open for the **current branch**, not "the
+/// pull request associated with the ticket" — there is no reverse
+/// issue-to-PR lookup in this codebase (it would require re-deriving one via
+/// `gh pr list`), and every other explicit `tm ticket <KEY>` command already
+/// only ever touches the current branch's PR. When `also_pr` is set and `key`
+/// was given explicitly (so no pull request has been looked up yet), the
+/// current branch's PR is fetched via [`GhCli::pr_view`], failing with
+/// [`TicketingError::NoPrForBranch`] if there is none.
+///
+/// Like every other explicit `tm ticket` subcommand (`transition`, `assign`,
+/// `rank`, `link`, `unlink`, `update`), every failure here is a hard error:
+/// there is no advisory/warning path analogous to
+/// [`apply_status_transition`]'s, since nothing has already been created or
+/// linked by the time a comment attempt fails.
+pub fn comment_ticket(
+    ctx: &TicketingContext,
+    key: Option<&str>,
+    body_markdown: &str,
+    also_pr: bool,
+) -> Result<CommentOutcome, TicketingError> {
+    let (issue_key, pr): (Option<String>, Option<PrInfo>) = match key {
+        Some(key) => {
+            ctx.jira.get_issue(key)?;
+            (Some(key.to_string()), None)
+        }
+        None => match ctx.gh.pr_view()? {
+            Some(pr) => {
+                let issue_key = resolve_existing_key(ctx.jira, &pr)?;
+                (issue_key, Some(pr))
+            }
+            None => (None, None),
+        },
+    };
+
+    let Some(issue_key) = issue_key else {
+        let branch = ctx.gh.current_branch()?;
+        return Err(TicketingError::NoTicketOrPrForBranch { branch });
+    };
+
+    ctx.jira
+        .add_comment(&issue_key, &text_to_adf(body_markdown))?;
+
+    let pr_number = if also_pr {
+        let pr = match pr {
+            Some(pr) => pr,
+            None => current_branch_pr(ctx)?,
+        };
+        ctx.gh.pr_comment(pr.number, body_markdown)?;
+        Some(pr.number)
+    } else {
+        None
+    };
+
+    Ok(CommentOutcome {
+        issue_key: Some(issue_key),
+        pr_number,
+    })
 }
 
 /// Extract the project key prefix from an issue key, e.g. `PROJ` from
@@ -2922,6 +3032,189 @@ mod tests {
                 assert_eq!(message, "boom");
             }
             other => panic!("expected Jira Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_ticket_explicit_key_posts_adf_comment_and_no_pr() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            comment_ticket(&ctx, Some("PROJ-1"), "**bold** note", false).expect("should succeed");
+
+        assert_eq!(outcome.issue_key, Some("PROJ-1".to_string()));
+        assert_eq!(outcome.pr_number, None);
+
+        let calls = jira.add_comment_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "PROJ-1");
+        assert!(
+            calls[0].1.to_string().contains("\"strong\""),
+            "markdown body should be converted to ADF marks: {}",
+            calls[0].1
+        );
+        assert!(gh.pr_comment_calls().is_empty());
+    }
+
+    #[test]
+    fn comment_ticket_explicit_key_not_found_errors_with_key() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-404");
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let err = comment_ticket(&ctx, Some("PROJ-404"), "note", false).expect_err("should fail");
+
+        match err {
+            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected Jira NotFound, got {other:?}"),
+        }
+        assert!(jira.add_comment_calls().is_empty());
+    }
+
+    #[test]
+    fn comment_ticket_explicit_key_also_pr_comments_on_current_branch_pr_with_raw_markdown() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr("Fix the thing"))));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            comment_ticket(&ctx, Some("PROJ-1"), "**bold** note", true).expect("should succeed");
+
+        assert_eq!(outcome.pr_number, Some(42));
+        assert_eq!(
+            gh.pr_comment_calls(),
+            vec![(42, "**bold** note".to_string())]
+        );
+    }
+
+    #[test]
+    fn comment_ticket_explicit_key_also_pr_no_pr_for_branch_is_a_hard_error() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(None))
+            .with_current_branch(Ok("proj-1-fix".to_string()));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let err = comment_ticket(&ctx, Some("PROJ-1"), "note", true).expect_err("should fail");
+
+        match err {
+            TicketingError::NoPrForBranch { branch } => assert_eq!(branch, "proj-1-fix"),
+            other => panic!("expected NoPrForBranch, got {other:?}"),
+        }
+        // The Jira comment was already posted before the PR lookup failed;
+        // this documents that ordering rather than asserting it never
+        // happens.
+        assert_eq!(jira.add_comment_calls().len(), 1);
+    }
+
+    #[test]
+    fn comment_ticket_infers_key_from_current_branch_pr() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut pull_request = pr("[PROJ-372] Fix the thing");
+        pull_request.head_ref_name = "some-other-branch".to_string();
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pull_request)));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = comment_ticket(&ctx, None, "note", false).expect("should succeed");
+
+        assert_eq!(outcome.issue_key, Some("PROJ-372".to_string()));
+        assert_eq!(jira.add_comment_calls()[0].0, "PROJ-372");
+    }
+
+    #[test]
+    fn comment_ticket_infers_key_and_also_comments_on_pr_without_a_second_pr_view_lookup() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut pull_request = pr("[PROJ-372] Fix the thing");
+        pull_request.head_ref_name = "some-other-branch".to_string();
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pull_request)));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = comment_ticket(&ctx, None, "note", true).expect("should succeed");
+
+        assert_eq!(outcome.pr_number, Some(42));
+        assert_eq!(gh.pr_comment_calls(), vec![(42, "note".to_string())]);
+    }
+
+    #[test]
+    fn comment_ticket_no_key_no_pr_for_branch_is_no_ticket_or_pr_for_branch() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(None))
+            .with_current_branch(Ok("proj-372-fix".to_string()));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let err = comment_ticket(&ctx, None, "note", false).expect_err("should fail");
+
+        match err {
+            TicketingError::NoTicketOrPrForBranch { branch } => {
+                assert_eq!(branch, "proj-372-fix")
+            }
+            other => panic!("expected NoTicketOrPrForBranch, got {other:?}"),
+        }
+        assert!(jira.add_comment_calls().is_empty());
+    }
+
+    #[test]
+    fn comment_ticket_no_key_pr_with_no_resolvable_key_is_no_ticket_or_pr_for_branch() {
+        let jira = FakeJiraClient::new();
+        // A PR with no key in title/body and a branch name that doesn't look
+        // like a ticket key: resolve_existing_key finds nothing.
+        let mut pull_request = pr("Fix the thing");
+        pull_request.head_ref_name = "some-branch".to_string();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pull_request)))
+            .with_current_branch(Ok("some-branch".to_string()));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let err = comment_ticket(&ctx, None, "note", false).expect_err("should fail");
+
+        match err {
+            TicketingError::NoTicketOrPrForBranch { branch } => {
+                assert_eq!(branch, "some-branch")
+            }
+            other => panic!("expected NoTicketOrPrForBranch, got {other:?}"),
         }
     }
 }
