@@ -346,7 +346,17 @@ pub fn adf_to_text(value: &Value) -> String {
 /// node types produce no lines.
 fn node_lines(node: &Value) -> Vec<String> {
     match node.get("type").and_then(|v| v.as_str()) {
-        Some("paragraph") | Some("heading") => vec![extract_inline_text(node)],
+        Some("paragraph") | Some("heading") => {
+            // A hardBreak within the node becomes a real `\n` (see
+            // `extract_inline_text`), so split it into one output line per
+            // physical line -- mirroring the `codeBlock` arm below -- since
+            // callers (`list_lines`'s indentation, the `blockquote` arm's
+            // `"> "` prefixing) assume each entry here is exactly one line.
+            extract_inline_text(node)
+                .split('\n')
+                .map(|l| l.to_string())
+                .collect()
+        }
         Some("codeBlock") => {
             let code = extract_inline_text(node);
             if code.is_empty() {
@@ -405,14 +415,15 @@ fn child_content(node: &Value) -> &[Value] {
 }
 
 /// Concatenate a node's direct `text`/`hardBreak` children into a single
-/// string, ignoring marks. Used for `paragraph`, `heading`, and `codeBlock`
-/// nodes.
+/// string, ignoring marks. A `hardBreak` (Jira's shift+Enter) becomes a
+/// literal `\n`, so the result may span multiple physical lines. Used for
+/// `paragraph`, `heading`, and `codeBlock` nodes.
 fn extract_inline_text(node: &Value) -> String {
     child_content(node)
         .iter()
         .filter_map(|n| match n.get("type").and_then(|v| v.as_str()) {
             Some("text") => n.get("text").and_then(|v| v.as_str()).map(str::to_string),
-            Some("hardBreak") => Some(" ".to_string()),
+            Some("hardBreak") => Some("\n".to_string()),
             _ => None,
         })
         .collect()
@@ -767,6 +778,49 @@ mod tests {
         assert!(rendered.contains("2. second"));
         assert!(rendered.contains("echo hi"));
         assert!(rendered.contains("> quoted"));
+    }
+
+    #[test]
+    fn hard_break_in_paragraph_becomes_a_real_newline() {
+        let doc = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        { "type": "text", "text": "first line" },
+                        { "type": "hardBreak" },
+                        { "type": "text", "text": "second line" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(adf_to_text(&doc), "first line\nsecond line");
+    }
+
+    #[test]
+    fn hard_break_inside_blockquote_prefixes_both_resulting_lines() {
+        let doc = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "blockquote",
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                { "type": "text", "text": "first line" },
+                                { "type": "hardBreak" },
+                                { "type": "text", "text": "second line" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(adf_to_text(&doc), "> first line\n> second line");
     }
 
     #[test]
