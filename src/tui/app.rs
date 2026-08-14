@@ -2358,6 +2358,190 @@ mod tests {
         assert!(cmds.is_empty());
     }
 
+    fn pr_info(number: u64, url: &str) -> crate::github::pr::PrInfo {
+        crate::github::pr::PrInfo {
+            number,
+            url: url.to_string(),
+            title: format!("[PROJ-1] PR {number}"),
+            body: String::new(),
+            head_ref_name: "proj-1-fix".to_string(),
+        }
+    }
+
+    #[test]
+    fn open_browser_action_emits_resolve_pr_for_selected_ticket() {
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
+        let (_, cmds) = update(app, Msg::OpenBrowserAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::ResolvePrForTicket {
+                key: "PROJ-2".to_string(),
+                jira_url: "https://example.atlassian.net/browse/PROJ-2".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn open_browser_action_with_no_tickets_emits_nothing() {
+        let app = board_with(vec![], 0);
+        let (_, cmds) = update(app, Msg::OpenBrowserAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn open_browser_action_off_board_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (_, cmds) = update(app, Msg::OpenBrowserAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn browser_options_resolved_with_no_pr_opens_jira_directly() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                pr: None,
+            },
+        );
+        assert!(!app.show_browser_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenUrl(
+                "https://example.atlassian.net/browse/PROJ-1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn browser_options_resolved_with_pr_shows_picker_with_both_options() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                pr: Some(pr_info(42, "https://github.com/example/repo/pull/42")),
+            },
+        );
+        assert!(app.show_browser_picker);
+        assert_eq!(app.browser_picker_selected, 0);
+        assert_eq!(
+            app.browser_picker_options,
+            vec![
+                BrowserPickerOption::Jira {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                },
+                BrowserPickerOption::GitHub {
+                    number: 42,
+                    url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+            ]
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn browser_picker_option_labels() {
+        let jira = BrowserPickerOption::Jira {
+            key: "PROJ-1".to_string(),
+            url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+        };
+        assert_eq!(jira.label(), "Jira (PROJ-1)");
+        let github = BrowserPickerOption::GitHub {
+            number: 42,
+            url: "https://github.com/example/repo/pull/42".to_string(),
+        };
+        assert_eq!(github.label(), "GitHub (#42)");
+    }
+
+    fn app_with_browser_picker(options: Vec<BrowserPickerOption>, selected: usize) -> App {
+        App {
+            show_browser_picker: true,
+            browser_picker_options: options,
+            browser_picker_selected: selected,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn browser_picker_up_and_down_move_within_bounds() {
+        let app = app_with_browser_picker(
+            vec![
+                BrowserPickerOption::Jira {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                },
+                BrowserPickerOption::GitHub {
+                    number: 42,
+                    url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+            ],
+            0,
+        );
+        let (app, _) = update(app, Msg::BrowserPickerDown);
+        assert_eq!(app.browser_picker_selected, 1);
+        let (app, _) = update(app, Msg::BrowserPickerDown);
+        assert_eq!(app.browser_picker_selected, 1);
+        let (app, _) = update(app, Msg::BrowserPickerUp);
+        assert_eq!(app.browser_picker_selected, 0);
+        let (app, _) = update(app, Msg::BrowserPickerUp);
+        assert_eq!(app.browser_picker_selected, 0);
+    }
+
+    #[test]
+    fn browser_picker_select_opens_highlighted_option_and_closes_picker() {
+        let app = app_with_browser_picker(
+            vec![
+                BrowserPickerOption::Jira {
+                    key: "PROJ-1".to_string(),
+                    url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                },
+                BrowserPickerOption::GitHub {
+                    number: 42,
+                    url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+            ],
+            1,
+        );
+        let (app, cmds) = update(app, Msg::BrowserPickerSelect);
+        assert!(!app.show_browser_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenUrl(
+                "https://github.com/example/repo/pull/42".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn browser_picker_select_out_of_range_is_a_noop() {
+        let app = app_with_browser_picker(vec![], 0);
+        let (app, cmds) = update(app, Msg::BrowserPickerSelect);
+        assert!(app.show_browser_picker);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn browser_picker_close_hides_picker_without_a_cmd() {
+        let app = app_with_browser_picker(
+            vec![BrowserPickerOption::Jira {
+                key: "PROJ-1".to_string(),
+                url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+            }],
+            0,
+        );
+        let (app, cmds) = update(app, Msg::BrowserPickerClose);
+        assert!(!app.show_browser_picker);
+        assert!(cmds.is_empty());
+    }
+
     #[test]
     fn toggle_help_flips_show_help() {
         let app = App::new();

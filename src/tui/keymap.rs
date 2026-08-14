@@ -69,6 +69,7 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 ///
 /// [`Msg::OpenBrowserAction`]: crate::tui::app::Msg::OpenBrowserAction
 /// [`Msg::OpenInBrowser`]: crate::tui::app::Msg::OpenInBrowser
+#[allow(clippy::too_many_arguments)]
 pub fn map_key(
     screen: &Screen,
     show_help: bool,
