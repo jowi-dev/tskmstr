@@ -793,6 +793,88 @@ impl Prompter for FakePrompter {
     }
 }
 
+/// Spawn an editor for multi-line prose input, for callers where
+/// [`Prompter::prompt_line`]'s single-line shape doesn't fit — currently
+/// `tm ticket comment`'s body, when neither `--body` nor piped stdin was
+/// given.
+///
+/// A trait (rather than a direct `$EDITOR` shell-out), same rationale as
+/// [`Prompter`]: so the precedence logic that decides *whether* to fall back
+/// to an editor (see `crate::cli::ticket::resolve_comment_body`) can be
+/// tested with a canned [`FakeEditorPrompter`] instead of driving a real
+/// editor process.
+pub trait EditorPrompter {
+    /// Open an editor on a scratch file and return what the user saved.
+    fn edit(&mut self) -> io::Result<String>;
+}
+
+/// [`EditorPrompter`] backed by a real `$EDITOR` process, given a scratch
+/// file to edit.
+///
+/// Falls back to `vi` if `$EDITOR` isn't set. Like [`crate::github::gh_cli::ShellGhCli`]
+/// (see its module doc comment), there is no automated end-to-end test of
+/// this real implementation — spawning an interactive editor process isn't
+/// meaningfully exercisable in a test — so that coverage is deliberately
+/// left to manual verification; [`crate::cli::ticket::resolve_comment_body`]'s
+/// precedence logic (the part that decides whether an editor is invoked at
+/// all) is what's actually under test, via [`FakeEditorPrompter`].
+pub struct RealEditorPrompter;
+
+impl EditorPrompter for RealEditorPrompter {
+    fn edit(&mut self) -> io::Result<String> {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let file = tempfile::NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let status = std::process::Command::new(&editor).arg(&path).status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!("`{editor}` exited with {status}")));
+        }
+
+        std::fs::read_to_string(&path)
+    }
+}
+
+/// [`EditorPrompter`] test double: returns a canned answer and records how
+/// many times `edit` was called, so a test can assert an editor was (or
+/// wasn't) invoked at all.
+#[cfg(test)]
+pub struct FakeEditorPrompter {
+    result: io::Result<String>,
+    /// Number of times `edit` was called.
+    pub calls: usize,
+}
+
+#[cfg(test)]
+impl FakeEditorPrompter {
+    /// An editor that returns `content` when invoked.
+    pub fn with_content(content: impl Into<String>) -> Self {
+        Self {
+            result: Ok(content.into()),
+            calls: 0,
+        }
+    }
+
+    /// An editor that fails with `message` when invoked.
+    pub fn with_error(message: impl Into<String>) -> Self {
+        Self {
+            result: Err(io::Error::other(message.into())),
+            calls: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl EditorPrompter for FakeEditorPrompter {
+    fn edit(&mut self) -> io::Result<String> {
+        self.calls += 1;
+        match &self.result {
+            Ok(content) => Ok(content.clone()),
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

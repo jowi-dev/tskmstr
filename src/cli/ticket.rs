@@ -2,7 +2,7 @@
 //! ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
 //! `tm ticket update`, `tm ticket audit`, and `tm ticket search`.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use regex::Regex;
@@ -520,6 +520,31 @@ pub fn comment(
     }
 
     Ok(())
+}
+
+/// Resolve `tm ticket comment`'s body: `--body` first, then piped stdin
+/// (already read by the caller, `Some` only when stdin isn't a TTY), then
+/// `$EDITOR` (via `editor`) as a last resort.
+///
+/// Deliberately separate from [`comment`]/[`comment_ticket`], and takes
+/// already-resolved `body_flag`/`piped_stdin` values rather than reading
+/// `--body`/stdin itself: the actual TTY check (`std::io::IsTerminal`) and
+/// stdin read are real I/O, done by the caller (`src/main.rs`) before this
+/// function runs, so this precedence decision stays pure and testable with a
+/// [`crate::cli::FakeEditorPrompter`] — spawning a real editor process never
+/// happens inside a function under test.
+pub fn resolve_comment_body(
+    body_flag: Option<String>,
+    piped_stdin: Option<String>,
+    editor: &mut dyn super::EditorPrompter,
+) -> io::Result<String> {
+    if let Some(body) = body_flag {
+        return Ok(body);
+    }
+    if let Some(stdin) = piped_stdin {
+        return Ok(stdin);
+    }
+    editor.edit()
 }
 
 /// `tm ticket search <TEXT>`: search `config`'s default project for open
@@ -1720,6 +1745,51 @@ mod tests {
             other => panic!("expected NoTicketOrPrForBranch, got {other:?}"),
         }
         assert!(out.is_empty(), "nothing should be printed on hard failure");
+    }
+
+    #[test]
+    fn resolve_comment_body_prefers_body_flag_over_everything() {
+        let mut editor = crate::cli::FakeEditorPrompter::with_content("from editor");
+
+        let body = resolve_comment_body(
+            Some("from --body".to_string()),
+            Some("from stdin".to_string()),
+            &mut editor,
+        )
+        .expect("should succeed");
+
+        assert_eq!(body, "from --body");
+        assert_eq!(editor.calls, 0, "editor should never be invoked");
+    }
+
+    #[test]
+    fn resolve_comment_body_falls_back_to_piped_stdin() {
+        let mut editor = crate::cli::FakeEditorPrompter::with_content("from editor");
+
+        let body = resolve_comment_body(None, Some("from stdin".to_string()), &mut editor)
+            .expect("should succeed");
+
+        assert_eq!(body, "from stdin");
+        assert_eq!(editor.calls, 0, "editor should never be invoked");
+    }
+
+    #[test]
+    fn resolve_comment_body_falls_back_to_editor_as_last_resort() {
+        let mut editor = crate::cli::FakeEditorPrompter::with_content("from editor");
+
+        let body = resolve_comment_body(None, None, &mut editor).expect("should succeed");
+
+        assert_eq!(body, "from editor");
+        assert_eq!(editor.calls, 1);
+    }
+
+    #[test]
+    fn resolve_comment_body_propagates_editor_error() {
+        let mut editor = crate::cli::FakeEditorPrompter::with_error("boom");
+
+        let err = resolve_comment_body(None, None, &mut editor).expect_err("should fail");
+
+        assert_eq!(err.to_string(), "boom");
     }
 
     #[test]
