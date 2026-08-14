@@ -202,6 +202,40 @@ pub enum WorkCmd {
         #[arg(long = "state-file")]
         state_file: String,
     },
+    /// Install/maintain tm's hook scripts outside a lane worktree (see
+    /// `tskmstr::work::hooks_install`).
+    Hooks {
+        /// Which hooks action to perform.
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
+}
+
+/// `tm work hooks` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HooksCmd {
+    /// Install tm's telemetry hooks (`Stop`/`SubagentStop` -> `tm-usage.sh`,
+    /// `SessionEnd` -> `tm-session-end.sh`) into a user's own Claude Code
+    /// settings, so interactive `tm ticket audit`/`tm ticket create`
+    /// sessions record usage the same way lane runs already do.
+    ///
+    /// Deliberately narrow: never installs `guard-delegate.sh` (it would
+    /// start denying ordinary edits in every session, not just lane runs)
+    /// or the other lane-only scripts. See
+    /// `tskmstr::work::hooks_install` module docs for the full rationale.
+    Install {
+        /// Install at user level (`~/.claude/settings.json`, or
+        /// `$CLAUDE_CONFIG_DIR/settings.json`). Currently the only
+        /// supported target — required so a future install target can't
+        /// silently reuse this flag's default.
+        #[arg(long)]
+        user: bool,
+        /// Print a summary of what would change; touch nothing. Given the
+        /// blast radius of editing a settings file shared with unrelated
+        /// tools, this is the recommended way to run the command first.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 /// `tm ticket` subcommands.
@@ -2270,5 +2304,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_work_hooks_install_user() {
+        let cli = Cli::try_parse_from(["tm", "work", "hooks", "install", "--user"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Hooks {
+                        cmd: HooksCmd::Install { user, dry_run },
+                    },
+            }) => {
+                assert!(user);
+                assert!(!dry_run);
+            }
+            other => panic!("expected Work Hooks Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_hooks_install_user_dry_run() {
+        let cli = Cli::try_parse_from(["tm", "work", "hooks", "install", "--user", "--dry-run"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Hooks {
+                        cmd: HooksCmd::Install { user, dry_run },
+                    },
+            }) => {
+                assert!(user);
+                assert!(dry_run);
+            }
+            other => panic!("expected Work Hooks Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_hooks_install_without_user_flag() {
+        // `--user` is currently the only supported target, but it's an
+        // opt-in flag (not clap-required) so the runtime error message can
+        // stay friendly and forward-compatible with a future `--lane`.
+        let cli = Cli::try_parse_from(["tm", "work", "hooks", "install"]).expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd:
+                    WorkCmd::Hooks {
+                        cmd: HooksCmd::Install { user, .. },
+                    },
+            }) => assert!(!user),
+            other => panic!("expected Work Hooks Install, got {other:?}"),
+        }
     }
 }

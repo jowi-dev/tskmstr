@@ -285,6 +285,33 @@ fn run_work(
                 return Err("lane run failed".into());
             }
         }
+        WorkCmd::Hooks { cmd } => match cmd {
+            tskmstr::cli::HooksCmd::Install { user, dry_run } => {
+                if !user {
+                    return Err("tm work hooks install currently only supports --user".into());
+                }
+                let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+                let hooks_dir =
+                    tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), &home);
+                let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+                let settings_path = tskmstr::work::hooks_install::user_settings_path(
+                    claude_config_dir.as_deref(),
+                    &home,
+                );
+                let clock = tskmstr::work::run::SystemClock;
+                let (year, month, day, hour, min, sec) =
+                    tskmstr::work::run::Clock::now_parts(&clock);
+                let backup_suffix =
+                    tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
+                let report = tskmstr::work::hooks_install::install_user_hooks(
+                    &hooks_dir,
+                    &settings_path,
+                    &backup_suffix,
+                    dry_run,
+                )?;
+                report.write_summary(&mut stdout)?;
+            }
+        },
     }
     Ok(())
 }
