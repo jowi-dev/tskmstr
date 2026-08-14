@@ -322,16 +322,30 @@ pub fn show(
     if let Some(blocker) = &run.blocker {
         writeln!(out, "blocker {blocker}")?;
     }
+    let authoritative_usage = run
+        .model_usage
+        .as_deref()
+        .and_then(crate::runs::parse_model_usage);
+    let cost_is_estimated = authoritative_usage
+        .as_ref()
+        .is_some_and(crate::runs::model_usage_is_estimated);
+
     if run.cost_usd.is_some() || run.num_turns.is_some() {
         let cost = run
             .cost_usd
-            .map(|c| format!("{c:.2}"))
+            .map(|c| {
+                if cost_is_estimated {
+                    format!("~${c:.2}")
+                } else {
+                    format!("${c:.2}")
+                }
+            })
             .unwrap_or_else(|| "?".to_string());
         let turns = run
             .num_turns
             .map(|t| t.to_string())
             .unwrap_or_else(|| "?".to_string());
-        writeln!(out, "cost ${cost} / {turns} turns")?;
+        writeln!(out, "cost {cost} / {turns} turns")?;
     }
 
     let events = store.events_for_run(run.id)?;
@@ -340,11 +354,8 @@ pub fn show(
         writeln!(out, "{tools_line}")?;
     }
 
-    let authoritative_usage = run
-        .model_usage
-        .as_deref()
-        .and_then(crate::runs::parse_model_usage);
     let (usage, usage_label) = match authoritative_usage {
+        Some(usage) if cost_is_estimated => (Some(usage), "Model usage (estimated)"),
         Some(usage) => (Some(usage), "Model usage"),
         None if run.status == crate::runs::RunStatus::Running => {
             (crate::runs::latest_usage(&events), "Model usage (live)")
@@ -554,6 +565,13 @@ fn show_json(
     // and the live branch owns one from `latest_usage`.
     let model_usage_data: Option<(crate::runs::ModelUsageMap, &'static str)> =
         match authoritative_usage {
+            // A "final" (authoritative) column can still hold an ESTIMATED
+            // cost -- see crate::runs::pricing's module docs -- so this
+            // checks per-model `estimated` rather than assuming the column
+            // always means fully authoritative. Never conflate the two.
+            Some(models) if crate::runs::model_usage_is_estimated(&models) => {
+                Some((models, "estimated"))
+            }
             Some(models) => Some((models, "final")),
             None if run.status == crate::runs::RunStatus::Running => {
                 crate::runs::latest_usage(&events).map(|models| (models, "live"))
@@ -2030,6 +2048,77 @@ mod tests {
             value["model_usage"]["models"]["claude-fable-5"]
                 .get("costUSD")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn show_json_model_usage_source_is_estimated_when_the_authoritative_column_holds_a_derived_cost()
+     {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-sonnet-5":{"inputTokens":1000000,"outputTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#
+                        .to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["model_usage"]["source"], "estimated");
+        assert_eq!(
+            value["model_usage"]["models"]["claude-sonnet-5"]["costUSD"],
+            3.00
+        );
+        assert_eq!(
+            value["model_usage"]["models"]["claude-sonnet-5"]["estimated"],
+            true
+        );
+    }
+
+    #[test]
+    fn show_marks_an_estimated_cost_with_a_tilde_and_labels_the_usage_section() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        finish(
+            &store,
+            id,
+            &FinishRun {
+                status: RunStatus::Done,
+                model_usage: Some(
+                    r#"{"claude-sonnet-5":{"inputTokens":1000000,"outputTokens":0,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#
+                        .to_string(),
+                ),
+                ..FinishRun::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(
+            output.contains("cost ~$3.00"),
+            "estimated cost must be tilde-marked in the header: {output}"
+        );
+        assert!(
+            output.contains("Model usage (estimated)"),
+            "estimated usage section must say so: {output}"
         );
     }
 

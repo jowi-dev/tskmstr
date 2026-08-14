@@ -563,6 +563,15 @@ pub fn total_cost_usd(map: &ModelUsageMap) -> Option<f64> {
     }
 }
 
+/// `true` when any entry in `map` carries an [`ModelUsage::estimated`] cost
+/// rather than one reported verbatim by `claude -p`. Renderers use this to
+/// mark a run's cost as approximate — see `crate::runs::pricing`'s module
+/// docs on why an estimated and an authoritative cost must never be
+/// presented identically.
+pub fn model_usage_is_estimated(map: &ModelUsageMap) -> bool {
+    map.values().any(|usage| usage.estimated)
+}
+
 /// A model name (e.g. `claude-fable-5`) to its [`ModelUsage`]. A
 /// [`std::collections::BTreeMap`] rather than a `HashMap` so
 /// [`format_model_usage`] renders models in a deterministic order.
@@ -811,12 +820,30 @@ fn format_token_count(n: u64) -> String {
     }
 }
 
+/// Formats one model's cost for [`format_model_usage`]: `$12.99` when
+/// [`ModelUsage::estimated`] is `false` (authoritative, from `claude -p`),
+/// `~$12.99` when `true` — the `~` is this codebase's one visual marker for
+/// "derived, not authoritative"; never omit it, or an estimate reads as if
+/// it were real billed cost. See `crate::runs::pricing`'s module docs.
+fn format_cost(cost: f64, estimated: bool) -> String {
+    if estimated {
+        format!("~${cost:.2}")
+    } else {
+        format!("${cost:.2}")
+    }
+}
+
 /// Renders [`latest_usage`]/[`parse_model_usage`]'s output as one line per
 /// model, plus a trailing `total` line when any model carries a `costUSD`
 /// (i.e. the map came from the authoritative `runs.model_usage` column
 /// rather than a live event snapshot). Cache tokens are always shown
 /// alongside input/output — they dominate real cost on a cached-heavy run
 /// and hiding them would misrepresent it.
+///
+/// Any [`ModelUsage::estimated`] cost is rendered with a leading `~` (see
+/// [`format_cost`]), including the `total` line whenever at least one model
+/// contributing to it was estimated — a mix of authoritative and estimated
+/// costs must never be presented as if the total were fully authoritative.
 ///
 /// Returns an empty `Vec` for an empty map.
 pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
@@ -825,6 +852,7 @@ pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
     }
 
     let any_cost = map.values().any(|usage| usage.cost_usd.is_some());
+    let any_estimated = model_usage_is_estimated(map);
     let name_width = map
         .keys()
         .map(|name| name.chars().count())
@@ -832,8 +860,12 @@ pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
         .unwrap_or(0);
     let cost_width = map
         .values()
-        .filter_map(|usage| usage.cost_usd)
-        .map(|cost| format!("${cost:.2}").chars().count())
+        .filter_map(|usage| {
+            usage
+                .cost_usd
+                .map(|cost| format_cost(cost, usage.estimated))
+        })
+        .map(|s| s.chars().count())
         .max()
         .unwrap_or(0);
     let name_w = name_width + 2;
@@ -856,7 +888,7 @@ pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
                 Some(cost) => {
                     total_cost += cost;
                     have_cost = true;
-                    format!("${cost:.2}")
+                    format_cost(cost, usage.estimated)
                 }
                 None => String::new(),
             };
@@ -868,7 +900,8 @@ pub fn format_model_usage(map: &ModelUsageMap) -> Vec<String> {
 
     if have_cost {
         let total_label = "total";
-        lines.push(format!("{total_label:<name_w$}${total_cost:.2}"));
+        let total_str = format_cost(total_cost, any_estimated);
+        lines.push(format!("{total_label:<name_w$}{total_str}"));
     }
 
     lines
@@ -4370,6 +4403,61 @@ mod tests {
     }
 
     #[test]
+    fn format_model_usage_marks_an_estimated_cost_and_total_with_a_tilde() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: Some(3.00),
+                estimated: true,
+            },
+        );
+
+        let lines = format_model_usage(&map);
+        assert_eq!(lines.len(), 2, "one model line plus a total: {lines:?}");
+        assert!(
+            lines[0].contains("~$3.00"),
+            "estimated cost should be tilde-marked: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("~$3.00"),
+            "total derived solely from an estimate should be tilde-marked too: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn format_model_usage_marks_a_mixed_total_when_only_some_models_are_estimated() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                cost_usd: Some(3.00),
+                estimated: false,
+                ..ModelUsage::default()
+            },
+        );
+        map.insert(
+            "claude-opus-5".to_string(),
+            ModelUsage {
+                cost_usd: Some(2.00),
+                estimated: true,
+                ..ModelUsage::default()
+            },
+        );
+
+        let lines = format_model_usage(&map);
+        let total_line = lines.last().unwrap();
+        assert!(
+            total_line.contains("~$5.00"),
+            "a total mixing an estimate must not read as fully authoritative: {total_line}"
+        );
+    }
+
+    #[test]
     fn estimate_missing_costs_fills_in_cost_for_priced_model_with_no_cost() {
         let mut map = ModelUsageMap::new();
         map.insert(
@@ -4484,6 +4572,44 @@ mod tests {
         );
 
         assert_eq!(total_cost_usd(&map), None);
+    }
+
+    #[test]
+    fn model_usage_is_estimated_is_true_when_any_entry_is_estimated() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                cost_usd: Some(1.0),
+                estimated: false,
+                ..ModelUsage::default()
+            },
+        );
+        map.insert(
+            "claude-opus-5".to_string(),
+            ModelUsage {
+                cost_usd: Some(2.0),
+                estimated: true,
+                ..ModelUsage::default()
+            },
+        );
+
+        assert!(model_usage_is_estimated(&map));
+    }
+
+    #[test]
+    fn model_usage_is_estimated_is_false_when_every_entry_is_authoritative() {
+        let mut map = ModelUsageMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            ModelUsage {
+                cost_usd: Some(1.0),
+                estimated: false,
+                ..ModelUsage::default()
+            },
+        );
+
+        assert!(!model_usage_is_estimated(&map));
     }
 
     #[test]
