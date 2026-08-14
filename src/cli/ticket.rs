@@ -16,8 +16,8 @@ use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
-    TransitionOutcome, assign_ticket, associate_ticket, create_ticket, link_ticket, list_links,
-    list_transitions, rank_ticket, search_tickets, transition_ticket, unlink_ticket,
+    TransitionOutcome, assign_ticket, associate_ticket, comment_ticket, create_ticket, link_ticket,
+    list_links, list_transitions, rank_ticket, search_tickets, transition_ticket, unlink_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -481,6 +481,34 @@ pub fn update(
     jira.update_description(&normalized, &description)
         .map_err(TicketingError::Jira)?;
     writeln!(out, "Description updated for {normalized}")?;
+    Ok(())
+}
+
+/// `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]`: post a comment to a
+/// Jira ticket, optionally also to the current branch's pull request.
+///
+/// `key` is normalized via [`normalize_key`] when given; `.transpose()` turns
+/// the `Option<Result<String, _>>` produced by mapping `normalize_key` over
+/// it into the `Result<Option<String>, _>` [`comment_ticket`] expects. Prints
+/// `Commented on <KEY>` and, when `also_pr` posted a comment,
+/// `Commented on PR #<number>` on its own line.
+pub fn comment(
+    ctx: &TicketingContext,
+    key: Option<&str>,
+    body_markdown: &str,
+    also_pr: bool,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let normalized_key = key.map(normalize_key).transpose()?;
+    let outcome = comment_ticket(ctx, normalized_key.as_deref(), body_markdown, also_pr)?;
+
+    if let Some(issue_key) = &outcome.issue_key {
+        writeln!(out, "Commented on {issue_key}")?;
+    }
+    if let Some(pr_number) = outcome.pr_number {
+        writeln!(out, "Commented on PR #{pr_number}")?;
+    }
+
     Ok(())
 }
 
@@ -1562,6 +1590,108 @@ mod tests {
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comment_explicit_key_prints_confirmation() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        comment(&ctx, Some("proj-372"), "note", false, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Commented on PROJ-372\n");
+    }
+
+    #[test]
+    fn comment_also_pr_prints_both_confirmation_lines() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr())));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        comment(&ctx, Some("PROJ-372"), "note", true, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Commented on PROJ-372\nCommented on PR #42\n");
+    }
+
+    #[test]
+    fn comment_no_key_infers_from_current_branch_pr() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut pull_request = pr();
+        pull_request.title = "[PROJ-372] Fix the thing".to_string();
+        pull_request.head_ref_name = "some-other-branch".to_string();
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pull_request)));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        comment(&ctx, None, "note", false, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Commented on PROJ-372\n");
+    }
+
+    #[test]
+    fn comment_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new();
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        let err =
+            comment(&ctx, Some("not-a-key!"), "note", false, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        assert!(jira.add_comment_calls().is_empty());
+    }
+
+    #[test]
+    fn comment_no_key_no_pr_for_branch_is_a_hard_error() {
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(None))
+            .with_current_branch(Ok("proj-372-fix".to_string()));
+        let cfg = config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut out = Vec::new();
+
+        let err = comment(&ctx, None, "note", false, &mut out).expect_err("should fail");
+        match err {
+            TicketCliError::Ticketing(TicketingError::NoTicketOrPrForBranch { branch }) => {
+                assert_eq!(branch, "proj-372-fix")
+            }
+            other => panic!("expected NoTicketOrPrForBranch, got {other:?}"),
+        }
+        assert!(out.is_empty(), "nothing should be printed on hard failure");
     }
 
     #[test]

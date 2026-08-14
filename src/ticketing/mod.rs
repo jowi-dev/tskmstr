@@ -75,6 +75,23 @@
 //! `TEXT` is rejected up front as [`TicketingError::EmptySearchText`], the
 //! same "don't send a meaningless match-everything query" rationale as
 //! [`TicketingError::EmptyAssigneeName`].
+//!
+//! [`comment_ticket`] (`tm ticket comment [<KEY>] [--body <TEXT>] [--pr]`)
+//! posts a comment to a Jira ticket, converting `body_markdown` to ADF via
+//! [`text_to_adf`] the same way [`create_ticket`]/`tm ticket update` do. An
+//! omitted `KEY` is resolved from the current branch's pull request via
+//! [`resolve_existing_key`], the same as `tm pr create`'s key inference;
+//! neither an explicit key nor a resolvable one is
+//! [`TicketingError::NoTicketOrPrForBranch`]. `--pr` means the pull request
+//! open for the *current branch*, not "the pull request associated with the
+//! ticket" — there is no reverse issue-to-PR lookup in this codebase, and
+//! every other explicit `tm ticket <KEY>` command already only ever touches
+//! the current branch's PR; when set, the comment is also posted to that PR
+//! as raw Markdown (GitHub comments are Markdown natively, unlike Jira's ADF
+//! requirement). Like `transition`/`assign`/`rank`/`link`/`unlink`/`update`,
+//! every failure is a hard error — there is no advisory/warning path here,
+//! since nothing has already been created or linked by the time a comment
+//! attempt fails.
 
 use thiserror::Error;
 
