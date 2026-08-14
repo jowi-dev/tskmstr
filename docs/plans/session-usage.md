@@ -183,10 +183,25 @@ Repeat finish after `--record` is safe (ground truth above): status stays
 `done` and `model_usage` lands via COALESCE.
 
 `settings_json()` in `src/work/hooks.rs` gains the `SessionEnd` wiring
-and the script joins `HOOK_SOURCES` (+ parity tests). Deployment beyond
-`tm work` is operational: the axiom repo's checked-in hook copies and its
-`settings.json` must be synced to pick this up for interactive sessions
-(same byte-identical mirroring discipline as before).
+and the script joins `HOOK_SOURCES` (+ parity tests).
+
+**Deployment gap, closed 2026-08-14**: the paragraph above only ever
+covered lane worktrees. Interactive sessions (`tm ticket audit`, `tm
+ticket create`) run in the user's own Claude Code, which reads
+`~/.claude/settings.json`/`$CLAUDE_CONFIG_DIR/settings.json` — nothing
+installed tm's hooks there, so those sessions recorded zero usage events
+and no cost despite the estimation machinery above being fully wired.
+`tm work hooks install --user` (`src/work/hooks_install.rs`) closes this:
+it copies the hook scripts into the stable
+`${XDG_DATA_HOME:-~/.local/share}/tskmstr/hooks/` directory and
+additively/idempotently merges just `Stop`/`SubagentStop` ->
+`tm-usage.sh` and `SessionEnd` -> `tm-session-end.sh` into the settings
+file, backing it up first. It deliberately never installs
+`guard-delegate.sh` (would start denying ordinary edits in every
+session) or the other four lane-only scripts (unneeded overhead). See the
+README's "Interactive-session hooks" section for the user-facing
+walkthrough, including the `--dry-run` recommendation given the blast
+radius of editing a settings file shared with unrelated tools.
 
 ### Surfaces
 

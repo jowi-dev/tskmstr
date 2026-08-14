@@ -89,6 +89,7 @@ tm auth status
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--fg]` | Provision (if needed) and run one autonomous headless Claude Code session for a configured lane, tracked in `tm runs`; detached by default, `--fg` runs synchronously |
+| `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 
 ## `tm runs`
 
@@ -458,6 +459,40 @@ completion it records the PR URL, if any, on the run's `pr_url` field:
 first by asking `gh` directly for the branch's open PR, falling back to
 scraping the first GitHub pull-request URL out of the run's result text —
 no PR is a normal outcome, not an error.
+
+### Interactive-session hooks (`tm work hooks install --user`)
+
+`tm work run`'s lane worktrees get tm's telemetry hooks deployed fresh on
+every run (copy-on-every-run, no install step — see `src/work/hooks.rs`).
+But interactive sessions like `tm ticket audit`/`tm ticket create` run in
+your normal Claude Code, which reads `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`), and nothing installs tm's hooks there
+automatically. Without them, those sessions' token usage and cost are
+invisible to `tm runs`.
+
+`tm work hooks install --user` closes that gap: it copies tm's hook
+scripts into `${XDG_DATA_HOME:-~/.local/share}/tskmstr/hooks/` and
+additively merges just three hook entries into your settings file —
+`Stop`/`SubagentStop` -> `tm-usage.sh` and `SessionEnd` ->
+`tm-session-end.sh`. It never removes, reorders, or rewrites any existing
+entry (your settings file is likely shared with other tools), never
+duplicates an entry on repeat runs, and always writes a timestamped backup
+(`settings.json.bak-<timestamp>`) next to the file before changing it. An
+absent, empty, or unparseable settings file is a hard error rather than
+something this command will overwrite or recreate.
+
+It deliberately does **not** wire in `guard-delegate.sh`: that hook denies
+main-loop file edits while its gate is active, and installing it at user
+level would start blocking your ordinary editing in every Claude Code
+session, not just lane runs. `tm-event.sh`, `tm-checklist.sh`,
+`tm-tasklist.sh`, and `tm-session-state.sh` are excluded too — none of them
+are needed to close the interactive-session cost gap, and each adds
+per-tool-call overhead to every session if wired in.
+
+Given the blast radius of editing a settings file you rely on for
+everything else, run `tm work hooks install --user --dry-run` first — it
+performs every check and prints the same summary, but touches nothing.
+Once the diff looks right, re-run without `--dry-run` to apply it.
 
 ## TUI keybindings
 
