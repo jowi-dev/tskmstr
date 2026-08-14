@@ -43,6 +43,18 @@ use crate::work::tmux::TmuxOps;
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long [`resolve_pr_for_ticket`]'s `gh pr list` lookup (the `o` key's
+/// PR-vs-Jira picker) waits before giving up and falling back to opening
+/// Jira directly, via [`crate::github::gh_cli::GhCli::pr_list_bounded`].
+///
+/// 8s: comfortably above how long an ordinary `gh pr list` call takes against
+/// GitHub's API (a few hundred milliseconds to low seconds), so a healthy
+/// network never spuriously falls back to Jira; short enough that a dead
+/// network or expired `gh` auth -- which otherwise hangs forever, the defect
+/// this whole mechanism exists to fix -- can only ever freeze the board for a
+/// single-digit number of seconds rather than indefinitely.
+const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Run `kind` of a `tm pr watch` poll loop, filtered on by
 /// [`load_bot_watch_status`].
 const REVIEW_WATCH_KIND: &str = "review-watch";
@@ -260,6 +272,11 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// through `update`; a spawn success instead pushes a [`PendingLaunch`] onto
 /// `launches` for [`poll_pending_launches`] to resolve later, once its
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] reports completion.
+/// [`Cmd::ResolvePrForTicket`] is intercepted for yet another reason: it
+/// needs `&mut Terminal` to force a status-line redraw before its blocking
+/// `gh pr list` call, so the "resolving PR for <key>..." message set by
+/// `update`'s `open_browser_action` is actually on screen for the (bounded)
+/// wait rather than only appearing after it -- see [`resolve_pr_for_ticket`].
 ///
 /// Generic over the terminal backend (rather than fixed to
 /// [`CrosstermBackend`]) purely so tests can drive it with
@@ -301,6 +318,27 @@ fn run_cmds<B: Backend>(
             let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
             app = next_app;
             pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::ResolvePrForTicket { key, jira_url } = cmd {
+            // Unlike every other `Cmd`, this one needs `&mut Terminal` for a
+            // reason none of the above do: not to suspend the alternate
+            // screen, but to force a redraw *before* the blocking `gh pr
+            // list` call runs. `update`'s `open_browser_action` already set
+            // `app.status_line` to `resolving PR for <key>...`, but this
+            // loop's ordinary structure only calls `terminal.draw` at the
+            // *top* of `run`'s `while` loop -- after every `Cmd` from the
+            // current keypress has finished executing (see `run`'s doc
+            // comment). Without this explicit draw here, that status-line
+            // message would never reach the screen before the lookup
+            // started, and the board would look just as hung as it did
+            // before this fix, even though the wait is now bounded.
+            let _ = terminal.draw(|frame| draw(frame, &app));
+            for msg in resolve_pr_for_ticket(deps, key, jira_url) {
+                let (next_app, more_cmds) = update(app, msg);
+                app = next_app;
+                pending.extend(more_cmds);
+            }
             continue;
         }
         for msg in execute(deps, cmd) {
@@ -773,14 +811,15 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
-        Cmd::ResolvePrForTicket { key, jira_url } => resolve_pr_for_ticket(deps, key, jira_url),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
-        // alternate screen around the blocking `tmux attach` call), and
+        // alternate screen around the blocking `tmux attach` call);
         // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
-        // Vec<PendingLaunch>` (the in-flight launcher registry) -- neither of
-        // which this function's signature has access to; `run_cmds` always
-        // intercepts all three before calling `execute` (see the module
-        // docs), so they're unreachable here in practice.
+        // Vec<PendingLaunch>` (the in-flight launcher registry);
+        // `Cmd::ResolvePrForTicket` needs `&mut Terminal` too, to force a
+        // redraw before its blocking (bounded) `gh pr list` call runs -- none
+        // of which this function's signature has access to; `run_cmds`
+        // always intercepts all of these before calling `execute` (see the
+        // module docs), so they're unreachable here in practice.
         //
         // The Jira board never enters `Screen::Runs`, so `update` can never
         // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
@@ -791,7 +830,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::AttachAudit { .. }
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
-        | Cmd::ViewLogs { .. }) => {
+        | Cmd::ViewLogs { .. }
+        | Cmd::ResolvePrForTicket { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -1156,11 +1196,63 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
 /// to `pr: None`, letting [`crate::tui::app::browser_options_resolved`] open
 /// Jira directly rather than leaving the user stuck, per [`TuiDeps`]'s
 /// leniency stance.
+///
+/// This is the one place `tui` calls a network-backed command synchronously
+/// on a keypress rather than deferring it to a background poll (contrast
+/// [`load_bot_watch_status`] et al., which only ever read the local runs DB).
+/// That's accepted here, not just tolerated, for the same reason
+/// [`TuiDeps::store`]'s doc comment and [`load_audit_status`]'s
+/// `.unwrap_or_default()` rationale accept their own leniency: a *bounded*
+/// block is a reasonable price for a feature that only fires on an explicit
+/// keypress (never prefetched for every card), and [`run_cmds`] makes sure
+/// the status line reflects that wait rather than leaving the board looking
+/// hung. The bound itself -- [`crate::github::gh_cli::GhCli::pr_list_bounded`]
+/// with [`PR_LOOKUP_TIMEOUT`] -- is what makes "reasonable" actually true:
+/// before it existed, `gh pr list` had no timeout at all, so a dead network
+/// or expired `gh` auth froze the *entire* board (no redraw, no key input,
+/// not even quit) for as long as the hang lasted, which is the defect this
+/// whole mechanism exists to close. On timeout specifically, `note` carries a
+/// status-line explanation (rather than silently landing on Jira looking
+/// like "no PR found") -- see [`crate::tui::app::browser_options_resolved`].
 fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<Msg> {
-    let pr = resolve_repo_root_for_pr_lookup(deps, &key)
-        .and_then(|repo_root| deps.gh.pr_list(&repo_root).ok())
-        .and_then(|prs| crate::github::pr::find_pr_for_ticket(&prs, &key).cloned());
-    vec![Msg::BrowserOptionsResolved { key, jira_url, pr }]
+    let Some(repo_root) = resolve_repo_root_for_pr_lookup(deps, &key) else {
+        return vec![Msg::BrowserOptionsResolved {
+            key,
+            jira_url,
+            pr: None,
+            note: None,
+        }];
+    };
+
+    match deps.gh.pr_list_bounded(&repo_root, PR_LOOKUP_TIMEOUT) {
+        Ok(prs) => {
+            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key).cloned();
+            vec![Msg::BrowserOptionsResolved {
+                key,
+                jira_url,
+                pr,
+                note: None,
+            }]
+        }
+        Err(crate::github::gh_cli::GhError::Timeout { .. }) => {
+            let note = format!(
+                "PR lookup for {key} timed out after {}s; opening Jira",
+                PR_LOOKUP_TIMEOUT.as_secs()
+            );
+            vec![Msg::BrowserOptionsResolved {
+                key,
+                jira_url,
+                pr: None,
+                note: Some(note),
+            }]
+        }
+        Err(_) => vec![Msg::BrowserOptionsResolved {
+            key,
+            jira_url,
+            pr: None,
+            note: None,
+        }],
+    }
 }
 
 /// Resolve the repository `key`'s `gh pr list` lookup should run against, for
@@ -1428,6 +1520,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "jira-url".to_string(),
                 pr: Some(pr(42, "[PROJ-1] Fix the thing", "proj-1-fix")),
+                note: None,
             }]
         );
     }
@@ -1453,6 +1546,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "jira-url".to_string(),
                 pr: None,
+                note: None,
             }]
         );
     }
@@ -1474,6 +1568,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "jira-url".to_string(),
                 pr: None,
+                note: None,
             }]
         );
     }
@@ -1498,8 +1593,46 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "jira-url".to_string(),
                 pr: None,
+                note: None,
             }]
         );
+    }
+
+    #[test]
+    fn resolve_pr_for_ticket_on_timeout_falls_back_to_jira_with_a_status_note() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list_bounded(Err(
+                crate::github::gh_cli::GhError::Timeout {
+                    command: "gh pr list".to_string(),
+                    seconds: PR_LOOKUP_TIMEOUT.as_secs(),
+                },
+            )),
+        );
+        let msgs = resolve_pr_for_ticket(&deps, "PROJ-1".to_string(), "jira-url".to_string());
+        match msgs.as_slice() {
+            [
+                Msg::BrowserOptionsResolved {
+                    key,
+                    jira_url,
+                    pr,
+                    note: Some(note),
+                },
+            ] => {
+                assert_eq!(key, "PROJ-1");
+                assert_eq!(jira_url, "jira-url");
+                assert_eq!(*pr, None);
+                assert_eq!(
+                    note,
+                    "PR lookup for PROJ-1 timed out after 8s; opening Jira"
+                );
+            }
+            other => panic!("expected BrowserOptionsResolved with a timeout note, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1633,6 +1766,72 @@ mod tests {
         assert_eq!(app.columns.len(), 1);
         assert_eq!(app.selected_col, 0);
         assert_eq!(app.selected_row, 0);
+    }
+
+    /// Flatten a [`ratatui::backend::TestBackend`]'s buffer into one string,
+    /// for asserting a message is visible on screen. Mirrors `src/tui/ui.rs`'s
+    /// own private `buffer_text` test helper.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn run_cmds_draws_the_resolving_status_line_before_the_blocking_pr_lookup() {
+        // `open_browser_action` (src/tui/app.rs) is what actually sets this
+        // status line on a real `o` keypress; this test starts from its
+        // output directly to isolate what's under test here: that
+        // `run_cmds` paints that message to the terminal *before* running
+        // `Cmd::ResolvePrForTicket`'s blocking `gh` call, rather than only on
+        // the event loop's next iteration (which -- per this fix's whole
+        // premise -- would happen only *after* the call already finished).
+        let app = App {
+            status_line: "resolving PR for PROJ-1...".to_string(),
+            ..App::new()
+        };
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        // Resolve to a matching PR (rather than the "no PR" default) so
+        // `browser_options_resolved` shows the picker and emits no further
+        // `Cmd` -- specifically not `Cmd::OpenUrl`, which would shell out to
+        // the real `open` command and could actually launch a browser during
+        // this test.
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
+                42,
+                "[PROJ-1] Fix the thing",
+                "proj-1-fix",
+            )])),
+        );
+
+        run_cmds(
+            app,
+            vec![Cmd::ResolvePrForTicket {
+                key: "PROJ-1".to_string(),
+                jira_url: "jira-url".to_string(),
+            }],
+            &deps,
+            &mut terminal,
+            &mut launches,
+        );
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("resolving PR for PROJ-1..."),
+            "expected the resolving status line to have been drawn before the \
+             blocking lookup ran, got:\n{text}"
+        );
     }
 
     fn watch_deps(store: crate::runs::RunStore) -> WatchDeps {

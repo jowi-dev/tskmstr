@@ -757,6 +757,13 @@ pub enum Msg {
         jira_url: String,
         /// The resolved PR, if any.
         pr: Option<crate::github::pr::PrInfo>,
+        /// A status-line note to surface alongside the resolution, if the
+        /// lookup degraded in a way the user should know about (currently:
+        /// the bounded `gh pr list` call timed out -- see
+        /// [`crate::tui::event::resolve_pr_for_ticket`]). `None` for the
+        /// ordinary "found a PR" / "no PR yet" outcomes, which need no
+        /// explanation beyond the picker or the direct Jira open itself.
+        note: Option<String>,
     },
     /// Move the browser picker's highlighted option up.
     BrowserPickerUp,
@@ -1119,9 +1126,12 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, cmds)
         }
         Msg::OpenBrowserAction => open_browser_action(app),
-        Msg::BrowserOptionsResolved { key, jira_url, pr } => {
-            browser_options_resolved(app, key, jira_url, pr)
-        }
+        Msg::BrowserOptionsResolved {
+            key,
+            jira_url,
+            pr,
+            note,
+        } => browser_options_resolved(app, key, jira_url, pr, note),
         Msg::BrowserPickerUp => {
             app.browser_picker_selected = app.browser_picker_selected.saturating_sub(1);
             (app, Vec::new())
@@ -1361,18 +1371,24 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
 /// keeps the PR lookup a single `gh` call made only on this keypress, per the
 /// feature's "on keypress only" requirement -- no board refresh ever
 /// prefetches PR data for every card.
-fn open_browser_action(app: App) -> (App, Vec<Cmd>) {
+///
+/// Sets `status_line` to `resolving PR for <key>...` before returning the
+/// `Cmd` -- the lookup is a blocking `gh pr list` call (bounded, but still
+/// synchronous inside the event loop; see
+/// [`crate::tui::event::resolve_pr_for_ticket`]'s doc comment), and
+/// `crate::tui::event::run_cmds` forces a redraw with this message on screen
+/// before running it, so the board never just looks hung while it waits.
+fn open_browser_action(mut app: App) -> (App, Vec<Cmd>) {
     if app.screen != Screen::Board {
         return (app, Vec::new());
     }
     let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
     };
-    let cmds = vec![Cmd::ResolvePrForTicket {
-        key: ticket.key.clone(),
-        jira_url: ticket.url.clone(),
-    }];
-    (app, cmds)
+    let key = ticket.key.clone();
+    let jira_url = ticket.url.clone();
+    app.status_line = format!("resolving PR for {key}...");
+    (app, vec![Cmd::ResolvePrForTicket { key, jira_url }])
 }
 
 /// Handle [`Msg::BrowserOptionsResolved`]: [`Cmd::ResolvePrForTicket`]'s
@@ -1391,12 +1407,22 @@ fn open_browser_action(app: App) -> (App, Vec<Cmd>) {
 ///   feature, it must never block the Jira board" stance applies here too, so
 ///   every one of those cases collapses to the same "no PR" case rather than
 ///   surfacing an error.
+///
+/// `note`, when `Some`, overwrites `status_line` before the picker/Jira
+/// decision -- currently only set when the lookup timed out (see
+/// [`crate::tui::event::resolve_pr_for_ticket`]), so the user landing on Jira
+/// unexpectedly (rather than the picker) has a visible reason why, instead of
+/// it looking like the ticket simply has no PR.
 fn browser_options_resolved(
     mut app: App,
     key: String,
     jira_url: String,
     pr: Option<crate::github::pr::PrInfo>,
+    note: Option<String>,
 ) -> (App, Vec<Cmd>) {
+    if let Some(note) = note {
+        app.status_line = note;
+    }
     match pr {
         Some(pr) => {
             app.browser_picker_options = vec![
@@ -2382,6 +2408,13 @@ mod tests {
     }
 
     #[test]
+    fn open_browser_action_sets_resolving_status_line() {
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
+        let (app, _) = update(app, Msg::OpenBrowserAction);
+        assert_eq!(app.status_line, "resolving PR for PROJ-2...");
+    }
+
+    #[test]
     fn open_browser_action_with_no_tickets_emits_nothing() {
         let app = board_with(vec![], 0);
         let (_, cmds) = update(app, Msg::OpenBrowserAction);
@@ -2407,9 +2440,35 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
                 pr: None,
+                note: None,
             },
         );
         assert!(!app.show_browser_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenUrl(
+                "https://example.atlassian.net/browse/PROJ-1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn browser_options_resolved_with_timeout_note_opens_jira_and_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                pr: None,
+                note: Some("PR lookup for PROJ-1 timed out; opening Jira".to_string()),
+            },
+        );
+        assert!(!app.show_browser_picker);
+        assert_eq!(
+            app.status_line,
+            "PR lookup for PROJ-1 timed out; opening Jira"
+        );
         assert_eq!(
             cmds,
             vec![Cmd::OpenUrl(
@@ -2427,6 +2486,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 jira_url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
                 pr: Some(pr_info(42, "https://github.com/example/repo/pull/42")),
+                note: None,
             },
         );
         assert!(app.show_browser_picker);
