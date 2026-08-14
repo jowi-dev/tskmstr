@@ -367,6 +367,27 @@ pub enum TicketCmd {
         #[arg(long, requires = "record")]
         notes: Option<String>,
     },
+    /// Post a comment to a Jira ticket, optionally also to the current
+    /// branch's pull request.
+    ///
+    /// Body precedence: `--body`, then piped stdin (when stdin isn't a
+    /// TTY), then `$EDITOR` as a last resort. `--pr` posts the comment to
+    /// the pull request open for the **current branch** — not necessarily
+    /// the one associated with `KEY` — as raw Markdown; the Jira comment is
+    /// always ADF-converted from the same Markdown body.
+    Comment {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive). Omit to
+        /// infer from the current branch's pull request.
+        key: Option<String>,
+        /// Comment body, as GitHub-flavored Markdown. Falls back to piped
+        /// stdin, then `$EDITOR`, if omitted.
+        #[arg(long)]
+        body: Option<String>,
+        /// Also post the comment to the pull request open for the current
+        /// branch.
+        #[arg(long)]
+        pr: bool,
+    },
     /// Search the configured default project for open tickets matching
     /// `TEXT`.
     ///
@@ -1379,6 +1400,64 @@ mod tests {
     fn ticket_update_without_body_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "update", "proj-372"]);
         assert!(result.is_err(), "update requires --body");
+    }
+
+    #[test]
+    fn parses_ticket_comment_with_key_and_body() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "comment",
+            "proj-372",
+            "--body",
+            "looks good",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Comment { key, body, pr }),
+            }) => {
+                assert_eq!(key, Some("proj-372".to_string()));
+                assert_eq!(body, Some("looks good".to_string()));
+                assert!(!pr);
+            }
+            other => panic!("expected TicketCmd::Comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_comment_with_pr_flag() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "comment", "proj-372", "--pr"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Comment { key, body, pr }),
+            }) => {
+                assert_eq!(key, Some("proj-372".to_string()));
+                assert_eq!(body, None);
+                assert!(pr);
+            }
+            other => panic!("expected TicketCmd::Comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_comment_with_no_key() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "comment", "--body", "looks good"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd: Some(TicketCmd::Comment { key, body, pr }),
+            }) => {
+                assert_eq!(key, None);
+                assert_eq!(body, Some("looks good".to_string()));
+                assert!(!pr);
+            }
+            other => panic!("expected TicketCmd::Comment, got {other:?}"),
+        }
     }
 
     #[test]

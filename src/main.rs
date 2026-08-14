@@ -338,6 +338,25 @@ fn default_config_paths() -> ConfigPaths {
 }
 
 /// Build a [`JiraClient`] for the given config and token.
+/// Read all of stdin as `tm ticket comment`'s piped-body source, but only
+/// when stdin isn't a TTY — an interactive terminal has nothing piped in,
+/// and blocking on `read_to_string` there would hang waiting for EOF that
+/// never comes. Returns `Ok(None)` for an interactive terminal (so
+/// [`tskmstr::cli::ticket::resolve_comment_body`] falls through to
+/// `$EDITOR`), `Ok(Some(content))` when something was piped in, regardless
+/// of content (an empty pipe is still "stdin was given"; `comment`'s
+/// empty-body check catches a truly empty result).
+fn read_piped_stdin() -> std::io::Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(Some(buf))
+}
+
 fn jira_client_for(config: &Config, token: &str) -> Box<dyn JiraClient> {
     Box::new(HttpJiraClient::new(JiraClientContext {
         base_url: config.jira_base_url.clone(),
@@ -388,7 +407,7 @@ fn build_ticketing_deps(
 
 /// Dispatch `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`,
 /// `tm ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket
-/// unlink`, `tm ticket update`, and `tm ticket search`.
+/// unlink`, `tm ticket update`, `tm ticket comment`, and `tm ticket search`.
 ///
 /// The forms need different dependencies: associating a key needs the full
 /// [`TicketingContext`] (Jira + `gh` + config) to find the current branch's
@@ -400,10 +419,16 @@ fn build_ticketing_deps(
 /// reads or writes anything about a pull request; `assign` additionally
 /// needs `config` itself (not just to build the Jira client) for
 /// [`Config::default_assignee_account_id`], and `search` needs it for
-/// [`Config::default_project_key`]. `key` and `cmd` are both `Option` at the
-/// clap layer so `tm ticket create`/`tm ticket transition`/`tm ticket
-/// assign`/`tm ticket rank`/`tm ticket link`/`tm ticket unlink`/`tm ticket
-/// update`/`tm ticket search` don't also require a positional key; exactly
+/// [`Config::default_project_key`]. `tm ticket comment` needs the full
+/// [`TicketingContext`] like `tm ticket <KEY>` does (a key can be inferred
+/// from the current branch's PR, and `--pr` posts to it too), plus
+/// [`read_piped_stdin`] and a [`tskmstr::cli::RealEditorPrompter`] to resolve
+/// its body before [`tskmstr::cli::ticket::comment`] ever runs — that
+/// resolution is real I/O, kept out of the testable `comment`/`comment_ticket`
+/// functions themselves. `key` and `cmd` are both `Option` at the clap layer
+/// so `tm ticket create`/`tm ticket transition`/`tm ticket assign`/`tm ticket
+/// rank`/`tm ticket link`/`tm ticket unlink`/`tm ticket update`/`tm ticket
+/// comment`/`tm ticket search` don't also require a positional key; exactly
 /// one of them is expected to be `Some`, which this function enforces since
 /// clap itself doesn't.
 fn run_ticket(
@@ -482,6 +507,21 @@ fn run_ticket(
             let jira = jira_client_for(&config, &token);
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::update(jira.as_ref(), &key, &body, &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Comment { key, body, pr })) => {
+            let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
+            let ctx = TicketingContext {
+                jira: &jira,
+                gh: &gh,
+                config: &config,
+            };
+            let piped_stdin = read_piped_stdin()?;
+            let mut editor = tskmstr::cli::RealEditorPrompter;
+            let body_markdown =
+                tskmstr::cli::ticket::resolve_comment_body(body, piped_stdin, &mut editor)?;
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::comment(&ctx, key.as_deref(), &body_markdown, pr, &mut stdout)?;
             Ok(())
         }
         (
