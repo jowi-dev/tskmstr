@@ -10,6 +10,7 @@ pub mod claude;
 pub mod detach;
 pub mod git;
 pub mod hooks;
+pub mod hooks_install;
 pub mod naming;
 pub mod review_watch;
 pub mod run;
