@@ -1397,6 +1397,111 @@ mod tests {
         }
     }
 
+    fn pr(number: u64, title: &str, branch: &str) -> crate::github::pr::PrInfo {
+        crate::github::pr::PrInfo {
+            number,
+            url: format!("https://github.com/example/repo/pull/{number}"),
+            title: title.to_string(),
+            body: String::new(),
+            head_ref_name: branch.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_pr_for_ticket_finds_pr_via_git_fallback_when_no_runs_store() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
+                42,
+                "[PROJ-1] Fix the thing",
+                "proj-1-fix",
+            )])),
+        );
+        let msgs = resolve_pr_for_ticket(&deps, "PROJ-1".to_string(), "jira-url".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "jira-url".to_string(),
+                pr: Some(pr(42, "[PROJ-1] Fix the thing", "proj-1-fix")),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pr_for_ticket_with_no_matching_pr_resolves_none() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
+                7,
+                "unrelated PR",
+                "some-branch",
+            )])),
+        );
+        let msgs = resolve_pr_for_ticket(&deps, "PROJ-1".to_string(), "jira-url".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "jira-url".to_string(),
+                pr: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pr_for_ticket_degrades_to_none_when_repo_root_fails() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(crate::work::git::FakeGitOps::new().with_repo_root(Err(
+            crate::work::git::GitError::Command {
+                command: "git rev-parse".to_string(),
+                exit_code: Some(128),
+                stderr: "not a git repository".to_string(),
+            },
+        )));
+        let msgs = resolve_pr_for_ticket(&deps, "PROJ-1".to_string(), "jira-url".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "jira-url".to_string(),
+                pr: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pr_for_ticket_degrades_to_none_when_gh_pr_list_fails() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(crate::github::gh_cli::FakeGhCli::new().with_pr_list(Err(
+            crate::github::gh_cli::GhError::Spawn {
+                command: "gh pr list".to_string(),
+                message: "gh not found".to_string(),
+            },
+        )));
+        let msgs = resolve_pr_for_ticket(&deps, "PROJ-1".to_string(), "jira-url".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::BrowserOptionsResolved {
+                key: "PROJ-1".to_string(),
+                jira_url: "jira-url".to_string(),
+                pr: None,
+            }]
+        );
+    }
+
     #[test]
     fn to_ticket_summary_derives_url_and_extracts_description() {
         let summary = to_ticket_summary(issue("PROJ-1", "To Do"), "https://example.atlassian.net");
