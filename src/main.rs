@@ -335,8 +335,10 @@ fn run_board(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
-    let lane_names: Vec<String> = config.work.lanes.keys().cloned().collect();
+    let lanes = config.work.lanes.clone();
+    let lane_names: Vec<String> = lanes.keys().cloned().collect();
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir()?;
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
@@ -350,6 +352,10 @@ fn run_board(
         home,
         launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
         lane_names,
+        gh: Box::new(ShellGhCli::new()),
+        git: Box::new(ShellGitOps::new()),
+        cwd,
+        lanes,
     })?;
     Ok(())
 }

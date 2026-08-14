@@ -457,6 +457,47 @@ pub fn bot_watch_indicator(run: Option<RunStatus>) -> Option<BotWatchIndicator> 
     }
 }
 
+/// One choice in the floating picker [`Msg::OpenBrowserAction`] opens when
+/// the selected ticket has both a Jira issue and an open GitHub pull request.
+/// Built once, in [`browser_options_resolved`], from the ticket's own `url`
+/// plus the [`crate::github::pr::PrInfo`] [`Cmd::ResolvePrForTicket`]
+/// resolved -- never rebuilt by the picker's up/down/select handlers, which
+/// only move `App::browser_picker_selected` or read `url()` off of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserPickerOption {
+    /// Open the ticket's Jira issue.
+    Jira {
+        /// Issue key, shown in the picker as `Jira (<key>)`.
+        key: String,
+        /// Browsable Jira URL.
+        url: String,
+    },
+    /// Open the associated GitHub pull request.
+    GitHub {
+        /// Pull request number, shown in the picker as `GitHub (#<number>)`.
+        number: u64,
+        /// Browsable GitHub URL.
+        url: String,
+    },
+}
+
+impl BrowserPickerOption {
+    /// The label to render for this option in the picker list.
+    pub fn label(&self) -> String {
+        match self {
+            BrowserPickerOption::Jira { key, .. } => format!("Jira ({key})"),
+            BrowserPickerOption::GitHub { number, .. } => format!("GitHub (#{number})"),
+        }
+    }
+
+    /// The URL [`Msg::BrowserPickerSelect`] opens for this option.
+    pub fn url(&self) -> &str {
+        match self {
+            BrowserPickerOption::Jira { url, .. } | BrowserPickerOption::GitHub { url, .. } => url,
+        }
+    }
+}
+
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All seven
 /// columns always render, even when empty.
 pub const RUN_COLUMNS: [crate::runs::RunStatus; 7] = [
@@ -595,6 +636,16 @@ pub struct App {
     /// cleared by [`Msg::BotWatchLaunchResult`]. Rendered as a starting-style
     /// `bots:` badge, the bot-watch counterpart of `pending_lane_launches`.
     pub pending_bot_watch_launches: std::collections::HashSet<String>,
+    /// Whether the browser picker overlay is shown (see
+    /// [`Msg::OpenBrowserAction`]).
+    pub show_browser_picker: bool,
+    /// Index into `browser_picker_options` of the currently highlighted
+    /// option.
+    pub browser_picker_selected: usize,
+    /// The browser picker's option list -- Jira plus the resolved GitHub PR
+    /// -- built by [`browser_options_resolved`] once [`Cmd::ResolvePrForTicket`]
+    /// reports a PR was found. Empty whenever the picker is closed.
+    pub browser_picker_options: Vec<BrowserPickerOption>,
 }
 
 impl App {
@@ -679,8 +730,43 @@ pub enum Msg {
     Back,
     /// Reload the ticket list.
     Refresh,
-    /// Open the selected ticket's URL in a browser.
+    /// Open the selected ticket's URL in a browser directly, with no PR
+    /// lookup. Bound to `O` on every screen, and to `o` on every screen
+    /// *except* [`Screen::Board`] (where `o` instead maps to
+    /// [`Msg::OpenBrowserAction`]) -- see [`crate::tui::keymap::map_key`]'s
+    /// doc comment for the full split.
     OpenInBrowser,
+    /// The `o` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// resolve whether it has an open GitHub PR (via
+    /// [`Cmd::ResolvePrForTicket`]) before deciding whether to show the
+    /// browser picker or open Jira directly, per
+    /// [`browser_options_resolved`]'s precedence. A no-op when no ticket is
+    /// selected, mirroring [`Msg::OpenInBrowser`].
+    OpenBrowserAction,
+    /// [`Cmd::ResolvePrForTicket`] finished: `pr` is `Some` when an open
+    /// GitHub PR was found for `key`, `None` otherwise (no PR yet, or `gh`/the
+    /// repo couldn't be resolved -- degrading to "no PR" rather than an error,
+    /// per [`crate::tui::event::TuiDeps`]'s leniency stance). `jira_url` is
+    /// carried through from the keypress rather than re-read off the ticket,
+    /// so this resolves correctly even if the selection has moved on by the
+    /// time `gh` answers.
+    BrowserOptionsResolved {
+        /// Ticket key the lookup was for.
+        key: String,
+        /// The ticket's Jira URL, captured at keypress time.
+        jira_url: String,
+        /// The resolved PR, if any.
+        pr: Option<crate::github::pr::PrInfo>,
+    },
+    /// Move the browser picker's highlighted option up.
+    BrowserPickerUp,
+    /// Move the browser picker's highlighted option down.
+    BrowserPickerDown,
+    /// Open the browser picker's highlighted option's URL, and close the
+    /// picker.
+    BrowserPickerSelect,
+    /// Close the browser picker without opening anything.
+    BrowserPickerClose,
     /// Toggle the help overlay.
     ToggleHelp,
     /// Quit the application.
@@ -965,6 +1051,18 @@ pub enum Cmd {
         /// Ticket key to view the latest run's log for.
         key: String,
     },
+    /// Resolve whether `key` has an open GitHub pull request, for
+    /// [`Msg::OpenBrowserAction`]'s picker-or-direct-open decision. Reports
+    /// back as [`Msg::BrowserOptionsResolved`]. One `gh` call, made only on
+    /// this keypress -- never prefetched for every card on refresh.
+    ResolvePrForTicket {
+        /// Ticket key to resolve a PR for.
+        key: String,
+        /// The ticket's Jira URL, threaded through to
+        /// [`Msg::BrowserOptionsResolved`] so it can open Jira directly when
+        /// no PR is found without a second lookup.
+        jira_url: String,
+    },
 }
 
 /// Advance `app` in response to `msg`, returning the new state and any
@@ -1019,6 +1117,26 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 None => Vec::new(),
             };
             (app, cmds)
+        }
+        Msg::OpenBrowserAction => open_browser_action(app),
+        Msg::BrowserOptionsResolved { key, jira_url, pr } => {
+            browser_options_resolved(app, key, jira_url, pr)
+        }
+        Msg::BrowserPickerUp => {
+            app.browser_picker_selected = app.browser_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::BrowserPickerDown => {
+            let count = app.browser_picker_options.len();
+            if count > 0 {
+                app.browser_picker_selected = (app.browser_picker_selected + 1).min(count - 1);
+            }
+            (app, Vec::new())
+        }
+        Msg::BrowserPickerSelect => browser_picker_select(app),
+        Msg::BrowserPickerClose => {
+            app.show_browser_picker = false;
+            (app, Vec::new())
         }
         Msg::ToggleHelp => {
             app.show_help = !app.show_help;
@@ -1228,6 +1346,89 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
     }
+}
+
+/// Handle [`Msg::OpenBrowserAction`]: the `o` key's browser-open entry point
+/// on [`Screen::Board`], per the feature's "Target behavior" decisions. A
+/// no-op when no ticket is selected, mirroring [`Msg::OpenInBrowser`]. Only
+/// meaningful on [`Screen::Board`] -- [`crate::tui::keymap::map_key`] only
+/// ever emits this from there, but (like [`view_run_action`]) the check is
+/// kept explicit rather than relying solely on that gating.
+///
+/// Never opens anything directly: it always defers to
+/// [`Cmd::ResolvePrForTicket`], whose result ([`Msg::BrowserOptionsResolved`])
+/// is what actually decides between the picker and a direct Jira open. This
+/// keeps the PR lookup a single `gh` call made only on this keypress, per the
+/// feature's "on keypress only" requirement -- no board refresh ever
+/// prefetches PR data for every card.
+fn open_browser_action(app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let cmds = vec![Cmd::ResolvePrForTicket {
+        key: ticket.key.clone(),
+        jira_url: ticket.url.clone(),
+    }];
+    (app, cmds)
+}
+
+/// Handle [`Msg::BrowserOptionsResolved`]: [`Cmd::ResolvePrForTicket`]'s
+/// result decides between showing the browser picker and opening Jira
+/// directly, mirroring [`lane_run_action`]'s zero/one/many short-circuit
+/// precedent (see `src/tui/app.rs:1298`, "Key existing code" in the feature
+/// brief) -- here the split is binary: found a PR, or didn't.
+///
+/// - `pr` is `Some` -> build the picker's two options (Jira first, then
+///   GitHub) and show it, highlighting the first entry.
+/// - `pr` is `None` -> skip the picker entirely and open `jira_url` directly,
+///   the same "ticket not yet in code review, or no PR resolves to it"
+///   fallback the feature brief specifies. This also covers `gh` being
+///   unavailable, the repo not resolving, or the lookup erroring --
+///   [`crate::tui::event::TuiDeps`]'s "a broken dependency degrades one
+///   feature, it must never block the Jira board" stance applies here too, so
+///   every one of those cases collapses to the same "no PR" case rather than
+///   surfacing an error.
+fn browser_options_resolved(
+    mut app: App,
+    key: String,
+    jira_url: String,
+    pr: Option<crate::github::pr::PrInfo>,
+) -> (App, Vec<Cmd>) {
+    match pr {
+        Some(pr) => {
+            app.browser_picker_options = vec![
+                BrowserPickerOption::Jira { key, url: jira_url },
+                BrowserPickerOption::GitHub {
+                    number: pr.number,
+                    url: pr.url,
+                },
+            ];
+            app.browser_picker_selected = 0;
+            app.show_browser_picker = true;
+            (app, Vec::new())
+        }
+        None => (app, vec![Cmd::OpenUrl(jira_url)]),
+    }
+}
+
+/// Handle [`Msg::BrowserPickerSelect`]: open the browser picker's highlighted
+/// option's URL, and close the picker.
+///
+/// A no-op (picker stays open) when `browser_picker_selected` is out of
+/// range, mirroring [`filter_picker_select`]/[`lane_picker_select`]'s
+/// out-of-range behavior -- which in practice only happens if the option list
+/// were ever empty, since [`browser_options_resolved`] always seeds exactly
+/// two options before showing the picker.
+fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(option) = app.browser_picker_options.get(app.browser_picker_selected) else {
+        return (app, Vec::new());
+    };
+    let url = option.url().to_string();
+    app.show_browser_picker = false;
+    (app, vec![Cmd::OpenUrl(url)])
 }
 
 /// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm

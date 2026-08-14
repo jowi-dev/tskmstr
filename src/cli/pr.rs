@@ -297,7 +297,13 @@ pub enum WatchOutcome {
 /// developer running `tm pr watch KEY` by hand from inside it); it cannot be
 /// correct for a lane-less ticket watched from the board or spawned
 /// elsewhere, which is a known gap, not engineered around here.
-fn resolve_watch_repo_root(
+///
+/// `pub(crate)` rather than private: `crate::tui::event`'s
+/// `resolve_repo_root_for_pr_lookup` reuses this verbatim for the board's `o`
+/// key's PR lookup -- "which repo do I list this ticket's PRs for" is exactly
+/// the same question `tm pr watch` already answers here, so it's answered the
+/// same way rather than inventing a second resolution.
+pub(crate) fn resolve_watch_repo_root(
     lanes: &std::collections::BTreeMap<String, crate::config::LaneConfig>,
     run_store: &RunStore,
     git: &dyn GitOps,

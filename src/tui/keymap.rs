@@ -44,6 +44,10 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// `j`/`k`/arrows/`Enter`/`Esc`/`q` shape applies, routed to `LanePicker*`
 /// instead of `FilterPicker*`.
 ///
+/// While the browser picker is shown (`show_browser_picker`), the same
+/// `j`/`k`/arrows/`Enter`/`Esc`/`q` shape applies again, routed to
+/// `BrowserPicker*` (see [`Msg::OpenBrowserAction`]).
+///
 /// While a ticket is grabbed on [`Screen::Rank`] (`rank_grabbed`), `r` is
 /// inert: refreshing would silently discard the pending, undropped reorder.
 /// `rank_grabbed` is ignored on every other screen.
@@ -52,11 +56,25 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// [`Screen::Board`] (`show_run_detail`), only `j`/`k`/arrows (scroll),
 /// `Esc`/`q` (close the overlay), and `r` (refresh) are bound; every other
 /// key is inert. `show_run_detail` is ignored on every other screen.
+///
+/// `o` and `O` (shift-`o`) both open a browser, but differ in what: on
+/// [`Screen::Board`], lowercase `o` maps to [`Msg::OpenBrowserAction`], which
+/// resolves whether the selected ticket has an open GitHub PR before deciding
+/// whether to show the browser picker or open Jira directly (see that
+/// message's doc comment). On every other screen -- and for uppercase `O` on
+/// *every* screen, including [`Screen::Board`] -- both map to the original
+/// [`Msg::OpenInBrowser`], which always opens Jira immediately with no PR
+/// lookup. `O` is the escape hatch that preserves that always-instant
+/// behavior even where `o` no longer does.
+///
+/// [`Msg::OpenBrowserAction`]: crate::tui::app::Msg::OpenBrowserAction
+/// [`Msg::OpenInBrowser`]: crate::tui::app::Msg::OpenInBrowser
 pub fn map_key(
     screen: &Screen,
     show_help: bool,
     show_filter_picker: bool,
     show_lane_picker: bool,
+    show_browser_picker: bool,
     rank_grabbed: bool,
     show_run_detail: bool,
     key: KeyCode,
@@ -88,6 +106,16 @@ pub fn map_key(
         };
     }
 
+    if show_browser_picker {
+        return match key {
+            KeyCode::Char('j') | KeyCode::Down => Some(Msg::BrowserPickerDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Msg::BrowserPickerUp),
+            KeyCode::Enter => Some(Msg::BrowserPickerSelect),
+            KeyCode::Esc | KeyCode::Char('q') => Some(Msg::BrowserPickerClose),
+            _ => None,
+        };
+    }
+
     if matches!(screen, Screen::Runs | Screen::Board) && show_run_detail {
         return match key {
             KeyCode::Char('j') | KeyCode::Down => Some(Msg::Down),
@@ -115,7 +143,9 @@ pub fn map_key(
         KeyCode::Enter => Some(Msg::Enter),
         KeyCode::Esc | KeyCode::Char('q') => Some(Msg::Back),
         KeyCode::Char('r') => Some(Msg::Refresh),
+        KeyCode::Char('o') if *screen == Screen::Board => Some(Msg::OpenBrowserAction),
         KeyCode::Char('o') => Some(Msg::OpenInBrowser),
+        KeyCode::Char('O') => Some(Msg::OpenInBrowser),
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
@@ -142,7 +172,16 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, false, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    key
+                ),
                 Some(expected)
             );
         }
@@ -159,7 +198,7 @@ mod tests {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             for (key, ref expected) in cases.clone() {
                 assert_eq!(
-                    map_key(&screen, false, false, false, false, false, key),
+                    map_key(&screen, false, false, false, false, false, false, key),
                     Some(expected.clone())
                 );
             }
@@ -170,7 +209,16 @@ mod tests {
     fn enter_maps_to_enter_on_every_screen() {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             assert_eq!(
-                map_key(&screen, false, false, false, false, false, KeyCode::Enter),
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Enter
+                ),
                 Some(Msg::Enter)
             );
         }
@@ -180,12 +228,22 @@ mod tests {
     fn esc_and_q_map_to_back_on_every_screen() {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             assert_eq!(
-                map_key(&screen, false, false, false, false, false, KeyCode::Esc),
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Esc
+                ),
                 Some(Msg::Back)
             );
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -208,6 +266,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -215,10 +274,11 @@ mod tests {
     }
 
     #[test]
-    fn o_maps_to_open_in_browser() {
+    fn o_on_board_maps_to_open_browser_action() {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -226,8 +286,142 @@ mod tests {
                 false,
                 KeyCode::Char('o')
             ),
-            Some(Msg::OpenInBrowser)
+            Some(Msg::OpenBrowserAction)
         );
+    }
+
+    #[test]
+    fn o_off_board_maps_to_open_in_browser() {
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Char('o')
+                ),
+                Some(Msg::OpenInBrowser),
+                "o should still open Jira directly off the board on {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capital_o_maps_to_open_in_browser_on_every_screen() {
+        for screen in [
+            Screen::Board,
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    KeyCode::Char('O')
+                ),
+                Some(Msg::OpenInBrowser),
+                "O should always open Jira directly on {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_picker_navigation_keys_map_to_up_and_down() {
+        let cases = [
+            (KeyCode::Char('j'), Msg::BrowserPickerDown),
+            (KeyCode::Down, Msg::BrowserPickerDown),
+            (KeyCode::Char('k'), Msg::BrowserPickerUp),
+            (KeyCode::Up, Msg::BrowserPickerUp),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                map_key(&Screen::Board, false, false, false, true, false, false, key),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn browser_picker_enter_selects() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                KeyCode::Enter
+            ),
+            Some(Msg::BrowserPickerSelect)
+        );
+    }
+
+    #[test]
+    fn browser_picker_esc_and_q_close_it() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                KeyCode::Esc
+            ),
+            Some(Msg::BrowserPickerClose)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                KeyCode::Char('q')
+            ),
+            Some(Msg::BrowserPickerClose)
+        );
+    }
+
+    #[test]
+    fn browser_picker_open_makes_other_board_keys_inert() {
+        for key in [
+            KeyCode::Char('r'),
+            KeyCode::Char('o'),
+            KeyCode::Char('O'),
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+            KeyCode::Char('?'),
+            KeyCode::Char('f'),
+            KeyCode::Char('w'),
+            KeyCode::Char('z'),
+        ] {
+            assert_eq!(
+                map_key(&Screen::Board, false, false, false, true, false, false, key),
+                None
+            );
+        }
     }
 
     #[test]
@@ -235,6 +429,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -256,6 +451,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('z')
             ),
             None
@@ -263,6 +459,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -284,6 +481,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('z')
             ),
             Some(Msg::ToggleHelp)
@@ -296,6 +494,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::ToggleHelp)
@@ -304,6 +503,7 @@ mod tests {
             map_key(
                 &Screen::Board,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -324,6 +524,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('q')
             ),
             Some(Msg::Quit)
@@ -335,6 +536,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -357,6 +559,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('f')
                 ),
                 None
@@ -374,7 +577,7 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, true, false, false, false, key),
+                map_key(&Screen::Board, false, true, false, false, false, false, key),
                 Some(expected)
             );
         }
@@ -387,6 +590,7 @@ mod tests {
                 &Screen::Board,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -406,6 +610,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::FilterPickerClose)
@@ -415,6 +620,7 @@ mod tests {
                 &Screen::Board,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -429,6 +635,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -451,6 +658,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('p')
                 ),
                 None
@@ -463,6 +671,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -490,6 +699,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('a')
                 ),
                 None
@@ -502,6 +712,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -529,6 +740,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('w')
                 ),
                 None
@@ -541,6 +753,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -568,6 +781,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('b')
                 ),
                 None
@@ -585,7 +799,7 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, true, false, false, key),
+                map_key(&Screen::Board, false, false, true, false, false, false, key),
                 Some(expected)
             );
         }
@@ -599,6 +813,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 KeyCode::Enter
@@ -617,6 +832,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::LanePickerClose)
@@ -627,6 +843,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 KeyCode::Char('q')
@@ -648,7 +865,7 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Board, false, false, true, false, false, key),
+                map_key(&Screen::Board, false, false, true, false, false, false, key),
                 None
             );
         }
@@ -664,6 +881,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Enter
             ),
             Some(Msg::RankGrabToggle)
@@ -671,6 +889,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -693,6 +912,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char(' ')
                 ),
                 None
@@ -710,6 +930,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('j')
             ),
             Some(Msg::Down)
@@ -717,6 +938,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -734,6 +956,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::Back)
@@ -741,6 +964,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -758,6 +982,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -770,6 +995,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('o')
             ),
             Some(Msg::OpenInBrowser)
@@ -777,6 +1003,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -796,6 +1023,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 true,
                 false,
                 KeyCode::Char('r')
@@ -809,6 +1037,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -835,8 +1064,8 @@ mod tests {
             KeyCode::Char(' '),
         ] {
             assert_eq!(
-                map_key(&Screen::Rank, false, false, false, true, false, key),
-                map_key(&Screen::Rank, false, false, false, false, false, key),
+                map_key(&Screen::Rank, false, false, false, false, true, false, key),
+                map_key(&Screen::Rank, false, false, false, false, false, false, key),
                 "key {key:?} should behave the same grabbed or not"
             );
         }
@@ -848,6 +1077,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -872,7 +1102,7 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Board, false, true, false, false, false, key),
+                map_key(&Screen::Board, false, true, false, false, false, false, key),
                 None
             );
         }
@@ -883,6 +1113,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -900,6 +1131,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('l')
             ),
             Some(Msg::Right)
@@ -907,6 +1139,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -924,6 +1157,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('k')
             ),
             Some(Msg::Up)
@@ -931,6 +1165,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -948,6 +1183,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Char('r')
             ),
             Some(Msg::Refresh)
@@ -960,6 +1196,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 KeyCode::Esc
             ),
             Some(Msg::Back)
@@ -967,6 +1204,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -987,6 +1225,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 true,
                 KeyCode::Char('j')
             ),
@@ -995,6 +1234,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1011,18 +1251,29 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 true,
                 KeyCode::Char('k')
             ),
             Some(Msg::Up)
         );
         assert_eq!(
-            map_key(&Screen::Runs, false, false, false, false, true, KeyCode::Up),
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                KeyCode::Up
+            ),
             Some(Msg::Up)
         );
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1039,6 +1290,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 true,
                 KeyCode::Char('q')
             ),
@@ -1047,6 +1299,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1069,7 +1322,7 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Runs, false, false, false, false, true, key),
+                map_key(&Screen::Runs, false, false, false, false, false, true, key),
                 None
             );
         }
@@ -1081,6 +1334,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -1098,6 +1352,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -1121,6 +1376,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     KeyCode::Char('v')
                 ),
                 None
@@ -1133,6 +1389,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -1151,6 +1408,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -1178,7 +1436,7 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, false, false, true, key),
+                map_key(&Screen::Board, false, false, false, false, false, true, key),
                 expected
             );
         }

@@ -107,6 +107,22 @@ pub struct TuiDeps {
     /// [`crate::tui::app::App::with_lane_names`] at construction (see that
     /// method's doc comment).
     pub lane_names: Vec<String>,
+    /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`] to list a
+    /// ticket's repo's open pull requests.
+    pub gh: Box<dyn crate::github::gh_cli::GhCli>,
+    /// `git` operations used by [`resolve_repo_root_for_pr_lookup`]'s
+    /// `resolve_watch_repo_root` fallback (`git rev-parse` the repo root of
+    /// `cwd`) when a ticket has no lane run to resolve a repo from.
+    pub git: Box<dyn crate::work::git::GitOps>,
+    /// The board process's working directory, passed to
+    /// [`resolve_repo_root_for_pr_lookup`] as the `cwd` a lane-less ticket's
+    /// PR lookup falls back to resolving a repo root from.
+    pub cwd: std::path::PathBuf,
+    /// `config.work.lanes`, kept in full (not just names, unlike
+    /// `lane_names`) so [`resolve_repo_root_for_pr_lookup`] can look up a
+    /// lane's `repo` the same way `tm pr watch`'s
+    /// `crate::cli::pr::resolve_watch_repo_root` does.
+    pub lanes: std::collections::BTreeMap<String, crate::config::LaneConfig>,
 }
 
 /// One board-launched child (`tm work run` or `tm pr watch`) that hasn't yet
@@ -209,6 +225,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                     app.show_help,
                     app.show_filter_picker,
                     app.show_lane_picker,
+                    app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
                     key_event.code,
@@ -516,6 +533,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                     app.show_help,
                     app.show_filter_picker,
                     app.show_lane_picker,
+                    app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
                     key_event.code,
@@ -755,6 +773,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
+        Cmd::ResolvePrForTicket { key, jira_url } => resolve_pr_for_ticket(deps, key, jira_url),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
         // alternate screen around the blocking `tmux attach` call), and
         // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
@@ -1130,6 +1149,51 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
     }
 }
 
+/// Run `Cmd::ResolvePrForTicket`: look up `key`'s open GitHub PR (if any),
+/// one `gh pr list` call, and report the result as
+/// [`Msg::BrowserOptionsResolved`]. Never fails outright -- every failure
+/// mode (no runs DB, `git`/`gh` erroring, no PR resolving to `key`) degrades
+/// to `pr: None`, letting [`crate::tui::app::browser_options_resolved`] open
+/// Jira directly rather than leaving the user stuck, per [`TuiDeps`]'s
+/// leniency stance.
+fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<Msg> {
+    let pr = resolve_repo_root_for_pr_lookup(deps, &key)
+        .and_then(|repo_root| deps.gh.pr_list(&repo_root).ok())
+        .and_then(|prs| crate::github::pr::find_pr_for_ticket(&prs, &key).cloned());
+    vec![Msg::BrowserOptionsResolved { key, jira_url, pr }]
+}
+
+/// Resolve the repository `key`'s `gh pr list` lookup should run against, for
+/// [`resolve_pr_for_ticket`].
+///
+/// Reuses [`crate::cli::pr::resolve_watch_repo_root`] -- the same "ticket's
+/// lane repo, falling back to `cwd`'s git repo root" resolution `tm pr watch`
+/// already relies on to answer this exact question (see that function's doc
+/// comment) -- whenever a runs DB is open. `None` on any resolution failure
+/// (a `RunStoreError` or `GitError`), which [`resolve_pr_for_ticket`] folds
+/// into "no PR found" rather than an error.
+///
+/// When `deps.store` is `None` (an unopenable runs DB), there is no way to
+/// look up the ticket's lane run, so this skips straight to
+/// `resolve_watch_repo_root`'s own fallback -- `deps.git.repo_root(deps.cwd)`
+/// -- directly. That fallback is only correct when `deps.cwd` really is the
+/// ticket's repo (the same caveat `resolve_watch_repo_root`'s doc comment
+/// already accepts for the lane-less/no-store case), which holds for the
+/// ordinary case of running `tm board` from inside the repo.
+fn resolve_repo_root_for_pr_lookup(deps: &TuiDeps, key: &str) -> Option<std::path::PathBuf> {
+    match &deps.store {
+        Some(store) => crate::cli::pr::resolve_watch_repo_root(
+            &deps.lanes,
+            store,
+            deps.git.as_ref(),
+            &deps.cwd,
+            key,
+        )
+        .ok(),
+        None => deps.git.repo_root(&deps.cwd).ok(),
+    }
+}
+
 /// Best-effort open `url` in the user's default browser via the `open`
 /// command. Failures are not surfaced as a dedicated message (the fixed `Msg`
 /// set has no `OpenUrlFailed` variant); [`Msg::TicketsFailed`] is reused
@@ -1223,6 +1287,10 @@ mod tests {
             xdg_data_home: None,
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             lane_names: Vec::new(),
+            gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
+            git: Box::new(crate::work::git::FakeGitOps::new()),
+            cwd: std::path::PathBuf::from("/repo"),
+            lanes: std::collections::BTreeMap::new(),
         }
     }
 
