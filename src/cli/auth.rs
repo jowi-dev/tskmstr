@@ -288,6 +288,9 @@ mod tests {
         ) -> Result<(), JiraError> {
             self.0.update_description(key, description)
         }
+        fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
+            self.0.add_comment(key, body)
+        }
     }
 
     fn write_test_config(path: &Path) {

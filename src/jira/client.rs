@@ -235,6 +235,16 @@ pub trait JiraClient {
         key: &str,
         description: &serde_json::Value,
     ) -> Result<(), JiraError>;
+
+    /// Post a comment to an issue (`POST /issue/{key}/comment`), 201 on
+    /// success.
+    ///
+    /// `body` is an ADF document value (see
+    /// [`crate::jira::adf::text_to_adf`]), not plain text — Jira Cloud's v3
+    /// comment endpoint accepts the same ADF shape
+    /// [`JiraClient::update_description`] does. This only ever posts a new
+    /// comment; there is no edit/replace form.
+    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -617,6 +627,18 @@ impl JiraClient for HttpJiraClient {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "fields": { "description": description } }))
+            .send()?;
+        Self::parse_empty(response, key)
+    }
+
+    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/issue/{key}/comment")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "body": body }))
             .send()?;
         Self::parse_empty(response, key)
     }
@@ -1484,6 +1506,52 @@ mod tests {
         let client = HttpJiraClient::new(test_ctx(&server));
         let err = client
             .update_description("PROJ-404", &description)
+            .expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_comment_posts_body() {
+        let server = MockServer::start();
+        let body = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue/PROJ-1/comment")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({ "body": body }));
+            then.status(201);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .add_comment("PROJ-1", &body)
+            .expect("add_comment should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn add_comment_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let body = serde_json::json!({ "type": "doc", "version": 1, "content": [] });
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue/PROJ-404/comment");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .add_comment("PROJ-404", &body)
             .expect_err("should fail");
 
         match err {
