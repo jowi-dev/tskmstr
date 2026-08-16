@@ -1254,7 +1254,7 @@ impl RunStore {
     /// terminal (it isn't reopenable via [`RunStore::reopen_run`]) but which
     /// is exactly the status this method exists to protect. Every other field
     /// (`exit_code`, `session_id`, `cost_usd`, `num_turns`, `pr_url`,
-    /// `transcript`, `model_usage`) is still recorded via the same
+    /// `transcript`, `model_usage`, `findings_count`) is still recorded via the same
     /// COALESCE-a-null-doesn't-clobber semantics as `finish_run`, since the
     /// supervisor is often the only source of that telemetry -- losing it
     /// would be a regression even though the status write is suppressed.
