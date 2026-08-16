@@ -145,6 +145,19 @@ pub enum RunStoreError {
         /// Its current (non-terminal) status string.
         status: String,
     },
+
+    /// [`RunStore::record_retro`] was called with [`RetroVerdict::Defect`]
+    /// but no severity -- severity is mandatory for a defect, since "how bad
+    /// was it" is the whole point of recording one.
+    #[error("--severity is required when recording a defect retro")]
+    RetroSeverityRequired,
+
+    /// [`RunStore::record_retro`] was called with [`RetroVerdict::Clean`] and
+    /// a severity -- severity is only meaningful for a defect, so pairing it
+    /// with a clean verdict is rejected rather than silently ignored (see
+    /// [`RunStore::record_retro`]'s doc comment for the rationale).
+    #[error("severity must not be set for a clean retro verdict")]
+    RetroSeverityNotAllowedForClean,
 }
 
 /// Lifecycle status of a run, stored in `runs.status` as its lowercase name.
@@ -471,6 +484,113 @@ pub struct TicketAudit {
     pub notes: Option<String>,
     /// When the audit was recorded, per [`NOW_SQL`].
     pub audited_at: String,
+}
+
+/// Whether a shipped ticket turned out defective in production; see
+/// [`RunStore::record_retro`].
+///
+/// Distinct from [`FindingsOutcome`]: `FindingsOutcome` records what
+/// automated review bots caught pre-merge, while `RetroVerdict` records what
+/// production revealed post-ship. The two are allowed to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetroVerdict {
+    /// Shipped with no known production defect.
+    Clean,
+    /// Shipped and turned out to be defective in production.
+    Defect,
+}
+
+impl RetroVerdict {
+    /// Returns the lowercase string stored in the database for this verdict.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetroVerdict::Clean => "clean",
+            RetroVerdict::Defect => "defect",
+        }
+    }
+
+    /// Parses a verdict string as stored in the database. Returns `None` for
+    /// unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "clean" => Some(RetroVerdict::Clean),
+            "defect" => Some(RetroVerdict::Defect),
+            _ => None,
+        }
+    }
+}
+
+/// Severity of a [`RetroVerdict::Defect`], meaningful only alongside that
+/// verdict; see [`RunStore::record_retro`] for how the pairing is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetroSeverity {
+    /// Low-impact defect.
+    Minor,
+    /// Significant defect, but not critical.
+    Major,
+    /// Severe defect (e.g. an outage or data issue).
+    Critical,
+}
+
+impl RetroSeverity {
+    /// Returns the lowercase string stored in the database for this severity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetroSeverity::Minor => "minor",
+            RetroSeverity::Major => "major",
+            RetroSeverity::Critical => "critical",
+        }
+    }
+
+    /// Parses a severity string as stored in the database. Returns `None`
+    /// for unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "minor" => Some(RetroSeverity::Minor),
+            "major" => Some(RetroSeverity::Major),
+            "critical" => Some(RetroSeverity::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// A recorded retro verdict for a ticket, from [`RunStore::record_retro`],
+/// [`RunStore::latest_retro_for_ticket`], and
+/// [`RunStore::retro_verdicts_for_tickets`].
+#[derive(Debug, Clone)]
+pub struct TicketRetro {
+    /// Jira ticket key the retro was recorded for.
+    pub ticket_key: String,
+    /// Recorded verdict.
+    pub verdict: RetroVerdict,
+    /// Defect severity; always `None` for [`RetroVerdict::Clean`], always
+    /// `Some` for [`RetroVerdict::Defect`] (see [`RunStore::record_retro`]).
+    pub severity: Option<RetroSeverity>,
+    /// Optional free-text notes attached to the verdict.
+    pub notes: Option<String>,
+    /// When the retro was recorded, per [`NOW_SQL`].
+    pub recorded_at: String,
+}
+
+/// One bucket's cost aggregate from [`RunStore::cost_by_retro_verdict`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetroCostSummary {
+    /// Which verdict this row summarizes.
+    pub verdict: RetroVerdict,
+    /// Number of distinct tickets carrying this verdict (their latest
+    /// recorded retro).
+    pub ticket_count: i64,
+    /// Of `ticket_count`, how many have no recorded run at all -- excluded
+    /// from `total_cost_usd`/`avg_cost_usd` rather than counted as $0.
+    pub tickets_without_run: i64,
+    /// Number of runs across all tickets carrying this verdict.
+    pub run_count: i64,
+    /// Sum of `cost_usd` over those runs that have one recorded; `None` if
+    /// none do.
+    pub total_cost_usd: Option<f64>,
+    /// Average of `cost_usd` over those runs that have one recorded; `None`
+    /// if none do.
+    pub avg_cost_usd: Option<f64>,
 }
 
 /// One `run_events` row.
@@ -1871,6 +1991,235 @@ impl RunStore {
             .optional()
             .map_err(RunStoreError::from)
     }
+
+    /// Records a shipped-ticket retro verdict for `ticket_key`, with
+    /// `recorded_at` set to the database's current time (see [`NOW_SQL`]).
+    ///
+    /// Keeps full history rather than upserting, same choice as
+    /// [`RunStore::record_audit`]: a ticket may be re-recorded (marked clean,
+    /// then later found defective once a bug surfaces), and every call
+    /// inserts a new row so [`RunStore::latest_retro_for_ticket`] can report
+    /// the current verdict while earlier ones remain queryable directly
+    /// against the `ticket_retros` table.
+    ///
+    /// Enforces, in this one place so every caller (CLI or otherwise) gets
+    /// the same guarantee, the pairing between `verdict` and `severity`:
+    /// [`RetroVerdict::Defect`] requires `Some` severity
+    /// ([`RunStoreError::RetroSeverityRequired`] otherwise) and
+    /// [`RetroVerdict::Clean`] rejects any severity
+    /// ([`RunStoreError::RetroSeverityNotAllowedForClean`]) rather than
+    /// silently dropping it -- a caller that thought it was recording a
+    /// severity should be told it didn't, not have it vanish.
+    pub fn record_retro(
+        &self,
+        ticket_key: &str,
+        verdict: RetroVerdict,
+        severity: Option<RetroSeverity>,
+        notes: Option<&str>,
+    ) -> Result<(), RunStoreError> {
+        match (verdict, severity) {
+            (RetroVerdict::Defect, None) => return Err(RunStoreError::RetroSeverityRequired),
+            (RetroVerdict::Clean, Some(_)) => {
+                return Err(RunStoreError::RetroSeverityNotAllowedForClean);
+            }
+            _ => {}
+        }
+
+        self.conn.execute(
+            &format!(
+                "INSERT INTO ticket_retros (ticket_key, verdict, severity, notes, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, {NOW_SQL})"
+            ),
+            params![
+                ticket_key,
+                verdict.as_str(),
+                severity.map(RetroSeverity::as_str),
+                notes
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recently recorded retro for `ticket_key` (newest by
+    /// `recorded_at`, which is lexicographically sortable, breaking ties by
+    /// `id`), or `None` if no retro has ever been recorded for it.
+    ///
+    /// A row whose stored `verdict`/`severity` string doesn't parse (written
+    /// by a newer binary sharing the same DB) is skipped in favor of the
+    /// next most recent row that does, the same forward-compat stance
+    /// [`RunStore::list_runs_filtered`] takes for an unrecognized `status`.
+    pub fn latest_retro_for_ticket(
+        &self,
+        ticket_key: &str,
+    ) -> Result<Option<TicketRetro>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_key, verdict, severity, notes, recorded_at
+             FROM ticket_retros
+             WHERE ticket_key = ?1
+             ORDER BY recorded_at DESC, id DESC",
+        )?;
+        let mut rows = stmt.query(params![ticket_key])?;
+        while let Some(row) = rows.next()? {
+            if let Some(retro) = parse_ticket_retro_row(row)? {
+                return Ok(Some(retro));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Batch form of [`RunStore::latest_retro_for_ticket`]: returns the
+    /// current verdict for each key in `ticket_keys` that has one recorded,
+    /// keyed by ticket key. Keys with no recorded retro are simply absent
+    /// from the result rather than mapped to `None`.
+    ///
+    /// Exists so a caller filtering a Jira result list (the board screen's
+    /// use case) can do it in one query instead of one
+    /// [`RunStore::latest_retro_for_ticket`] call per ticket. Returns an
+    /// empty map without touching the database when `ticket_keys` is empty.
+    pub fn retro_verdicts_for_tickets(
+        &self,
+        ticket_keys: &[String],
+    ) -> Result<std::collections::HashMap<String, TicketRetro>, RunStoreError> {
+        if ticket_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let placeholders = (1..=ticket_keys.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT ticket_key, verdict, severity, notes, recorded_at
+             FROM ticket_retros
+             WHERE ticket_key IN ({placeholders})
+             ORDER BY ticket_key, recorded_at DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(ticket_keys.iter());
+        let mut rows = stmt.query(params)?;
+
+        let mut by_ticket = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            if let Some(retro) = parse_ticket_retro_row(row)? {
+                // Rows arrive ordered newest-first per ticket, so the first
+                // one seen for a given key is its current verdict; later
+                // rows for the same key are older history and are skipped.
+                by_ticket.entry(retro.ticket_key.clone()).or_insert(retro);
+            }
+        }
+        Ok(by_ticket)
+    }
+
+    /// Returns cost aggregates grouped by retro verdict (clean / defect),
+    /// restricted to `kind` when given (same filter as
+    /// [`RunStore::list_runs_filtered`]), for `tm runs --by-retro`.
+    ///
+    /// Always returns exactly two rows, in a fixed order
+    /// ([`RetroVerdict::Clean`], [`RetroVerdict::Defect`]), even when a
+    /// bucket has no matching tickets -- same stable-shape rationale as
+    /// [`RunStore::cost_by_findings_outcome`]. Buckets on each ticket's
+    /// *current* verdict (see [`RunStore::latest_retro_for_ticket`]), then
+    /// joins in every run recorded for that ticket (filtered by `kind`).
+    ///
+    /// A ticket with a recorded verdict but no matching run contributes to
+    /// `ticket_count`/`tickets_without_run` but nothing to
+    /// `run_count`/`total_cost_usd`/`avg_cost_usd` -- it is excluded from
+    /// the cost aggregates entirely rather than counted as a $0 run, exactly
+    /// as [`RunStore::cost_by_findings_outcome`]'s "not measured" bucket is
+    /// never folded into "clean".
+    pub fn cost_by_retro_verdict(
+        &self,
+        kind: Option<&str>,
+    ) -> Result<Vec<RetroCostSummary>, RunStoreError> {
+        let sql = "WITH latest_retro AS (
+                SELECT t1.ticket_key AS ticket_key, t1.verdict AS verdict
+                FROM ticket_retros t1
+                WHERE t1.id = (
+                    SELECT t2.id FROM ticket_retros t2
+                    WHERE t2.ticket_key = t1.ticket_key
+                    ORDER BY t2.recorded_at DESC, t2.id DESC
+                    LIMIT 1
+                )
+            )
+            SELECT
+                latest_retro.verdict AS verdict,
+                COUNT(DISTINCT latest_retro.ticket_key) AS ticket_count,
+                COUNT(DISTINCT CASE WHEN r.id IS NULL THEN latest_retro.ticket_key END)
+                    AS tickets_without_run,
+                COUNT(r.id) AS run_count,
+                SUM(r.cost_usd) AS total_cost_usd,
+                AVG(r.cost_usd) AS avg_cost_usd
+             FROM latest_retro
+             LEFT JOIN runs r
+                ON r.ticket = latest_retro.ticket_key AND (?1 IS NULL OR r.kind = ?1)
+             GROUP BY latest_retro.verdict";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![kind])?;
+        let mut by_verdict = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let verdict_str: String = row.get(0)?;
+            let Some(verdict) = RetroVerdict::parse(&verdict_str) else {
+                continue;
+            };
+            by_verdict.insert(
+                verdict,
+                RetroCostSummary {
+                    verdict,
+                    ticket_count: row.get(1)?,
+                    tickets_without_run: row.get(2)?,
+                    run_count: row.get(3)?,
+                    total_cost_usd: row.get(4)?,
+                    avg_cost_usd: row.get(5)?,
+                },
+            );
+        }
+
+        Ok([RetroVerdict::Clean, RetroVerdict::Defect]
+            .into_iter()
+            .map(|verdict| {
+                by_verdict.remove(&verdict).unwrap_or(RetroCostSummary {
+                    verdict,
+                    ticket_count: 0,
+                    tickets_without_run: 0,
+                    run_count: 0,
+                    total_cost_usd: None,
+                    avg_cost_usd: None,
+                })
+            })
+            .collect())
+    }
+}
+
+/// Parses a `ticket_retros` row (`ticket_key, verdict, severity, notes,
+/// recorded_at`) into a [`TicketRetro`], returning `Ok(None)` rather than an
+/// error for a `verdict`/`severity` string this binary doesn't recognize --
+/// see [`RunStore::latest_retro_for_ticket`]'s forward-compat note.
+fn parse_ticket_retro_row(row: &rusqlite::Row) -> Result<Option<TicketRetro>, rusqlite::Error> {
+    let ticket_key: String = row.get(0)?;
+    let verdict_str: String = row.get(1)?;
+    let severity_str: Option<String> = row.get(2)?;
+    let notes: Option<String> = row.get(3)?;
+    let recorded_at: String = row.get(4)?;
+
+    let Some(verdict) = RetroVerdict::parse(&verdict_str) else {
+        return Ok(None);
+    };
+    let severity = match severity_str {
+        Some(s) => match RetroSeverity::parse(&s) {
+            Some(sev) => Some(sev),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+
+    Ok(Some(TicketRetro {
+        ticket_key,
+        verdict,
+        severity,
+        notes,
+        recorded_at,
+    }))
 }
 
 /// Returns the default path for the run database: `$XDG_DATA_HOME/tskmstr/runs.db`
@@ -5148,5 +5497,382 @@ mod tests {
             .expect("expected an audit");
         assert_eq!(audit.ticket_key, "PROJ-2");
         assert_eq!(audit.verdict, "needs-work");
+    }
+
+    #[test]
+    fn retro_verdict_round_trips_through_as_str_and_parse() {
+        assert_eq!(RetroVerdict::Clean.as_str(), "clean");
+        assert_eq!(RetroVerdict::parse("clean"), Some(RetroVerdict::Clean));
+        assert_eq!(RetroVerdict::Defect.as_str(), "defect");
+        assert_eq!(RetroVerdict::parse("defect"), Some(RetroVerdict::Defect));
+        assert_eq!(RetroVerdict::parse("bogus"), None);
+    }
+
+    #[test]
+    fn retro_severity_round_trips_through_as_str_and_parse() {
+        assert_eq!(RetroSeverity::Minor.as_str(), "minor");
+        assert_eq!(RetroSeverity::parse("minor"), Some(RetroSeverity::Minor));
+        assert_eq!(RetroSeverity::Major.as_str(), "major");
+        assert_eq!(RetroSeverity::parse("major"), Some(RetroSeverity::Major));
+        assert_eq!(RetroSeverity::Critical.as_str(), "critical");
+        assert_eq!(
+            RetroSeverity::parse("critical"),
+            Some(RetroSeverity::Critical)
+        );
+        assert_eq!(RetroSeverity::parse("bogus"), None);
+    }
+
+    #[test]
+    fn latest_retro_for_ticket_returns_none_when_never_recorded() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.latest_retro_for_ticket("PROJ-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn record_retro_round_trips_clean_verdict() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+
+        let retro = store
+            .latest_retro_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a retro");
+        assert_eq!(retro.ticket_key, "PROJ-1");
+        assert_eq!(retro.verdict, RetroVerdict::Clean);
+        assert_eq!(retro.severity, None);
+        assert_eq!(retro.notes, None);
+        let re = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$").unwrap();
+        assert!(
+            re.is_match(&retro.recorded_at),
+            "recorded_at {:?} did not match expected format",
+            retro.recorded_at
+        );
+    }
+
+    #[test]
+    fn record_retro_round_trips_defect_with_severity_and_notes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_retro(
+                "PROJ-1",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Critical),
+                Some("took down prod"),
+            )
+            .unwrap();
+
+        let retro = store
+            .latest_retro_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a retro");
+        assert_eq!(retro.verdict, RetroVerdict::Defect);
+        assert_eq!(retro.severity, Some(RetroSeverity::Critical));
+        assert_eq!(retro.notes.as_deref(), Some("took down prod"));
+    }
+
+    #[test]
+    fn record_retro_rejects_defect_without_severity() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .record_retro("PROJ-1", RetroVerdict::Defect, None, None)
+            .expect_err("should fail");
+        assert!(matches!(err, RunStoreError::RetroSeverityRequired));
+        assert!(store.latest_retro_for_ticket("PROJ-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn record_retro_rejects_clean_with_severity() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .record_retro(
+                "PROJ-1",
+                RetroVerdict::Clean,
+                Some(RetroSeverity::Minor),
+                None,
+            )
+            .expect_err("should fail");
+        assert!(matches!(
+            err,
+            RunStoreError::RetroSeverityNotAllowedForClean
+        ));
+        assert!(store.latest_retro_for_ticket("PROJ-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_retro_for_ticket_prefers_most_recently_recorded() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE ticket_retros SET recorded_at = '2000-01-01T00:00:00.000Z' WHERE ticket_key = 'PROJ-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .record_retro(
+                "PROJ-1",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Major),
+                Some("regressed later"),
+            )
+            .unwrap();
+
+        let retro = store
+            .latest_retro_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a retro");
+        assert_eq!(retro.verdict, RetroVerdict::Defect);
+        assert_eq!(retro.notes.as_deref(), Some("regressed later"));
+    }
+
+    #[test]
+    fn retro_verdicts_for_tickets_returns_current_verdict_per_key() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+        store
+            .record_retro(
+                "PROJ-2",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Minor),
+                None,
+            )
+            .unwrap();
+        // PROJ-3 never recorded -- should be absent from the result.
+
+        let keys = vec![
+            "PROJ-1".to_string(),
+            "PROJ-2".to_string(),
+            "PROJ-3".to_string(),
+        ];
+        let result = store.retro_verdicts_for_tickets(&keys).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["PROJ-1"].verdict, RetroVerdict::Clean);
+        assert_eq!(result["PROJ-2"].verdict, RetroVerdict::Defect);
+        assert!(!result.contains_key("PROJ-3"));
+    }
+
+    #[test]
+    fn retro_verdicts_for_tickets_prefers_most_recent_per_key() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE ticket_retros SET recorded_at = '2000-01-01T00:00:00.000Z' WHERE ticket_key = 'PROJ-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .record_retro(
+                "PROJ-1",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Critical),
+                None,
+            )
+            .unwrap();
+
+        let keys = vec!["PROJ-1".to_string()];
+        let result = store.retro_verdicts_for_tickets(&keys).unwrap();
+
+        assert_eq!(result["PROJ-1"].verdict, RetroVerdict::Defect);
+    }
+
+    #[test]
+    fn retro_verdicts_for_tickets_returns_empty_map_for_empty_input() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let result = store.retro_verdicts_for_tickets(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn cost_by_retro_verdict_returns_both_buckets_even_when_empty() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let summary = store.cost_by_retro_verdict(None).unwrap();
+
+        assert_eq!(summary.len(), 2);
+        for row in &summary {
+            assert_eq!(row.ticket_count, 0);
+            assert_eq!(row.tickets_without_run, 0);
+            assert_eq!(row.run_count, 0);
+            assert_eq!(row.total_cost_usd, None);
+            assert_eq!(row.avg_cost_usd, None);
+        }
+    }
+
+    #[test]
+    fn cost_by_retro_verdict_sums_cost_per_bucket_and_excludes_ticket_with_no_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        // PROJ-1: clean, one run with cost.
+        let run1 = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                run1,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(5.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+
+        // PROJ-2: defect, two runs with cost.
+        let run2 = store.start_run(&start_params("PROJ-2")).unwrap();
+        store
+            .finish_run(
+                run2,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(10.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let run3 = store.start_run(&start_params("PROJ-2")).unwrap();
+        store
+            .finish_run(
+                run3,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(20.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_retro(
+                "PROJ-2",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Major),
+                None,
+            )
+            .unwrap();
+
+        // PROJ-3: defect, but no run at all -- must not count as $0.
+        store
+            .record_retro(
+                "PROJ-3",
+                RetroVerdict::Defect,
+                Some(RetroSeverity::Minor),
+                None,
+            )
+            .unwrap();
+
+        let summary = store.cost_by_retro_verdict(None).unwrap();
+
+        let clean = summary
+            .iter()
+            .find(|s| s.verdict == RetroVerdict::Clean)
+            .unwrap();
+        assert_eq!(clean.ticket_count, 1);
+        assert_eq!(clean.tickets_without_run, 0);
+        assert_eq!(clean.run_count, 1);
+        assert_eq!(clean.total_cost_usd, Some(5.0));
+
+        let defect = summary
+            .iter()
+            .find(|s| s.verdict == RetroVerdict::Defect)
+            .unwrap();
+        assert_eq!(defect.ticket_count, 2);
+        assert_eq!(defect.tickets_without_run, 1);
+        assert_eq!(defect.run_count, 2);
+        assert_eq!(defect.total_cost_usd, Some(30.0));
+        assert_eq!(defect.avg_cost_usd, Some(15.0));
+    }
+
+    #[test]
+    fn cost_by_retro_verdict_respects_kind_filter() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                lane_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(5.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                audit_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(1.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        store
+            .record_retro("PROJ-1", RetroVerdict::Clean, None, None)
+            .unwrap();
+
+        let lane_only = store.cost_by_retro_verdict(Some("lane")).unwrap();
+        let clean = lane_only
+            .iter()
+            .find(|s| s.verdict == RetroVerdict::Clean)
+            .unwrap();
+        assert_eq!(clean.run_count, 1);
+        assert_eq!(clean.total_cost_usd, Some(5.0));
     }
 }
