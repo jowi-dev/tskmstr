@@ -210,10 +210,12 @@ pub enum PollOutcome {
 /// 3. Bots done → [`GhCli::pr_review_threads`] + [`count_bot_findings`] for
 ///    the tally, emitting `bots_done` (detail `{"total": N, "unresolved":
 ///    N}`).
-///    - Zero unresolved → finishes the run `Done`.
+///    - Zero unresolved → finishes the run `Done` with
+///      `findings_count = Some(0)` (measured, clean).
 ///    - Otherwise → [`GhCli::pr_bot_finding_details`] + [`bot_finding_details`]
 ///      to filter to unresolved bot findings, writes the findings file (see
-///      [`findings_file_path`]), finishes the run `Review`, and — when
+///      [`findings_file_path`]), finishes the run `Review` with
+///      `findings_count` set to the unresolved tally, and — when
 ///      `config.on_bots_done == Launch` — invokes
 ///      [`PollDeps::cleanup_launcher`].
 ///
@@ -267,6 +269,7 @@ pub fn poll_once(
             req.run_id,
             &FinishRun {
                 status: RunStatus::Done,
+                findings_count: Some(0),
                 ..FinishRun::default()
             },
         )?;
@@ -290,6 +293,7 @@ pub fn poll_once(
         req.run_id,
         &FinishRun {
             status: RunStatus::Review,
+            findings_count: Some(counts.unresolved as i64),
             ..FinishRun::default()
         },
     )?;
@@ -882,6 +886,11 @@ mod tests {
         ));
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Done);
+        assert_eq!(
+            run.findings_count,
+            Some(0),
+            "a clean poll must record findings_count = 0 (measured, clean), not leave it NULL"
+        );
         let events = fx.store.events_for_run(fx.run_id).unwrap();
         let done = events.iter().find(|e| e.kind == "bots_done").unwrap();
         assert_eq!(
@@ -936,6 +945,11 @@ mod tests {
         ));
         let run = fx.store.run_by_id(fx.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Review);
+        assert_eq!(
+            run.findings_count,
+            Some(1),
+            "findings path must record the unresolved tally on the run"
+        );
         assert!(
             fx.cleanup.calls().is_empty(),
             "notify mode must not launch cleanup"
