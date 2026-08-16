@@ -80,6 +80,17 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN findings_count INTEGER;
     "#,
+    r#"
+    CREATE TABLE ticket_retros (
+      id INTEGER PRIMARY KEY,
+      ticket_key TEXT NOT NULL,
+      verdict TEXT NOT NULL,
+      severity TEXT,
+      notes TEXT,
+      recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_ticket_retros_key ON ticket_retros(ticket_key, recorded_at);
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -1963,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_6() {
+    fn open_migrates_a_fresh_db_to_user_version_7() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -1971,7 +1982,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
