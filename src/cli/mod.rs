@@ -441,11 +441,8 @@ pub enum TicketCmd {
     /// defective in production. Local SQLite only; never touches Jira.
     ///
     /// Exactly one of `--clean`/`--defect` is required; clap rejects giving
-    /// both or neither. `--severity` is required alongside `--defect` and
-    /// rejected alongside `--clean` -- enforced by
-    /// [`crate::runs::RunStore::record_retro`], the one place that pairing
-    /// is checked. `--note` is optional but, if given, must not be empty or
-    /// all-whitespace.
+    /// both or neither. `--note` is optional but, if given, must not be
+    /// empty or all-whitespace.
     // Same `override_usage` fix as `Assign`/`Rank`: clap's default-derived
     // synopsis for a required `ArgGroup` mixed with a plain positional puts
     // the group before `KEY`, which reads as `KEY` coming second -- wrong,
@@ -470,12 +467,13 @@ pub enum TicketCmd {
         /// `--severity`.
         #[arg(long, group = "retro_verdict")]
         defect: bool,
-        /// Defect severity. Only meaningful (and only accepted) alongside
-        /// `--defect`; both directions of that pairing are enforced by
-        /// [`crate::runs::RunStore::record_retro`] rather than by clap --
-        /// `--clean`/`--defect` are `ArgAction::SetTrue` flags, which always
-        /// carry a (possibly false) value, so `requires`/`requires_if` can't
-        /// express "only when `--defect` was actually passed" for them.
+        /// Defect severity. Required with `--defect`; rejected with
+        /// `--clean`.
+        // Enforced by `RunStore::record_retro`, not by clap: `--clean`/
+        // `--defect` are `ArgAction::SetTrue` flags, which always carry a
+        // (possibly false) value, so `requires`/`requires_if` can't express
+        // "only when --defect was actually passed" for them. Plain comment
+        // (not a doc comment) so the rationale doesn't leak into --help.
         #[arg(long, value_enum)]
         severity: Option<RetroSeverityArg>,
         /// Free-text notes to attach to the recorded verdict. Must not be
