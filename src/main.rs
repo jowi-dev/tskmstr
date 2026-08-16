@@ -155,8 +155,9 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Runs {
             kind,
             by_outcome,
+            by_retro,
             cmd,
-        } => run_runs(kind, by_outcome, cmd),
+        } => run_runs(kind, by_outcome, by_retro, cmd),
         Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
     }
 }
@@ -631,6 +632,16 @@ fn run_ticket(
         (None, Some(TicketCmd::Audit { key, record, notes })) => {
             run_ticket_audit(key, record, notes, paths, keychain, env_token)
         }
+        (
+            None,
+            Some(TicketCmd::Retro {
+                key,
+                clean,
+                defect: _,
+                severity,
+                note,
+            }),
+        ) => run_ticket_retro(key, clean, severity, note, paths),
         (None, Some(TicketCmd::Search { text })) => {
             let config = config::load(paths)?;
             let token = resolve_token(keychain, env_token)?;
@@ -723,6 +734,47 @@ fn run_ticket_audit(
             }
         }
     }
+    Ok(())
+}
+
+/// `tm ticket retro <KEY> (--clean|--defect --severity <SEVERITY>) [--note
+/// <TEXT>]`: persist a shipped-ticket retro verdict.
+///
+/// `clap`'s `retro_verdict` `ArgGroup` on [`TicketCmd::Retro`] guarantees
+/// `clean` is `true` xor `--defect` was given, so `clean` alone is enough to
+/// pick the verdict here. Loads config strictly via [`config::load`] purely
+/// to resolve `run_db_path` (same tradeoff [`run_ticket_audit`] documents:
+/// this command never touches Jira, but still needs a valid config file to
+/// run), then opens the runs DB and delegates to
+/// [`tskmstr::cli::ticket::retro`], which does the actual validation and
+/// persistence.
+fn run_ticket_retro(
+    key: String,
+    clean: bool,
+    severity: Option<tskmstr::cli::RetroSeverityArg>,
+    note: Option<String>,
+    paths: &ConfigPaths,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let db_path = run_db_path_from_config(&config);
+    let store = tskmstr::runs::RunStore::open(&db_path)?;
+
+    let verdict = if clean {
+        tskmstr::runs::RetroVerdict::Clean
+    } else {
+        tskmstr::runs::RetroVerdict::Defect
+    };
+    let severity = severity.map(tskmstr::runs::RetroSeverity::from);
+
+    let mut stdout = std::io::stdout();
+    tskmstr::cli::ticket::retro(
+        &store,
+        &key,
+        verdict,
+        severity,
+        note.as_deref(),
+        &mut stdout,
+    )?;
     Ok(())
 }
 
@@ -841,6 +893,7 @@ fn run_ready_check(key: String) -> ExitCode {
 fn run_runs(
     kind: Option<String>,
     by_outcome: bool,
+    by_retro: bool,
     cmd: Option<RunsCmd>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
@@ -849,6 +902,9 @@ fn run_runs(
     match cmd {
         None if by_outcome => {
             tskmstr::cli::runs::list_by_outcome(&store, kind.as_deref(), &mut stdout)?
+        }
+        None if by_retro => {
+            tskmstr::cli::runs::list_by_retro(&store, kind.as_deref(), &mut stdout)?
         }
         None => tskmstr::cli::runs::list(&store, kind.as_deref(), &mut stdout)?,
         Some(RunsCmd::Start {

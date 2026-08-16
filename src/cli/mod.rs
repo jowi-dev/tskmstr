@@ -109,8 +109,16 @@ pub enum Command {
         /// did clean PRs cost vs. ones that came back with findings",
         /// restricted to `--kind` when given. Only meaningful without a
         /// subcommand (plain `tm runs`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "by_retro")]
         by_outcome: bool,
+        /// Instead of listing individual runs, print cost totals grouped by
+        /// shipped-ticket retro verdict (clean / defect) -- "what did the
+        /// runs that shipped defects cost, and what did clean ones cost",
+        /// restricted to `--kind` when given. Only meaningful without a
+        /// subcommand (plain `tm runs`). See `tm ticket retro` for recording
+        /// verdicts.
+        #[arg(long, conflicts_with = "by_outcome")]
+        by_retro: bool,
         /// Which runs action to perform. Omit to list current runs.
         #[command(subcommand)]
         cmd: Option<RunsCmd>,
@@ -429,6 +437,52 @@ pub enum TicketCmd {
         #[arg(long)]
         pr: bool,
     },
+    /// Record a shipped-ticket retro verdict: whether it turned out to be
+    /// defective in production. Local SQLite only; never touches Jira.
+    ///
+    /// Exactly one of `--clean`/`--defect` is required; clap rejects giving
+    /// both or neither. `--severity` is required alongside `--defect` and
+    /// rejected alongside `--clean` -- enforced by
+    /// [`crate::runs::RunStore::record_retro`], the one place that pairing
+    /// is checked. `--note` is optional but, if given, must not be empty or
+    /// all-whitespace.
+    // Same `override_usage` fix as `Assign`/`Rank`: clap's default-derived
+    // synopsis for a required `ArgGroup` mixed with a plain positional puts
+    // the group before `KEY`, which reads as `KEY` coming second -- wrong,
+    // since `KEY` is always the first positional argument. Plain comment
+    // (not a doc comment) so it doesn't leak into `--help`.
+    #[command(
+        group(
+            ArgGroup::new("retro_verdict")
+                .required(true)
+                .args(["clean", "defect"])
+        ),
+        override_usage = "tm ticket retro <KEY> (--clean|--defect --severity <SEVERITY>) [--note <TEXT>]"
+    )]
+    Retro {
+        /// Jira issue key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Record that the ticket shipped clean, with no known production
+        /// defect.
+        #[arg(long, group = "retro_verdict")]
+        clean: bool,
+        /// Record that the ticket shipped a production defect. Requires
+        /// `--severity`.
+        #[arg(long, group = "retro_verdict")]
+        defect: bool,
+        /// Defect severity. Only meaningful (and only accepted) alongside
+        /// `--defect`; both directions of that pairing are enforced by
+        /// [`crate::runs::RunStore::record_retro`] rather than by clap --
+        /// `--clean`/`--defect` are `ArgAction::SetTrue` flags, which always
+        /// carry a (possibly false) value, so `requires`/`requires_if` can't
+        /// express "only when `--defect` was actually passed" for them.
+        #[arg(long, value_enum)]
+        severity: Option<RetroSeverityArg>,
+        /// Free-text notes to attach to the recorded verdict. Must not be
+        /// empty or all-whitespace if given.
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Search the configured default project for open tickets matching
     /// `TEXT`.
     ///
@@ -460,6 +514,27 @@ impl AuditVerdict {
         match self {
             AuditVerdict::Ready => "ready",
             AuditVerdict::NeedsWork => "needs-work",
+        }
+    }
+}
+
+/// Severities accepted by `tm ticket retro --defect --severity`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum RetroSeverityArg {
+    /// Low-impact defect.
+    Minor,
+    /// Significant defect, but not critical.
+    Major,
+    /// Severe defect (e.g. an outage or data issue).
+    Critical,
+}
+
+impl From<RetroSeverityArg> for crate::runs::RetroSeverity {
+    fn from(value: RetroSeverityArg) -> Self {
+        match value {
+            RetroSeverityArg::Minor => crate::runs::RetroSeverity::Minor,
+            RetroSeverityArg::Major => crate::runs::RetroSeverity::Major,
+            RetroSeverityArg::Critical => crate::runs::RetroSeverity::Critical,
         }
     }
 }
@@ -1632,10 +1707,12 @@ mod tests {
             Some(Command::Runs {
                 kind,
                 by_outcome,
+                by_retro,
                 cmd,
             }) => {
                 assert!(kind.is_none());
                 assert!(!by_outcome);
+                assert!(!by_retro);
                 assert!(cmd.is_none());
             }
             other => panic!("expected Runs, got {other:?}"),
@@ -1649,10 +1726,12 @@ mod tests {
             Some(Command::Runs {
                 kind,
                 by_outcome,
+                by_retro,
                 cmd,
             }) => {
                 assert_eq!(kind, Some("audit".to_string()));
                 assert!(!by_outcome);
+                assert!(!by_retro);
                 assert!(cmd.is_none());
             }
             other => panic!("expected Runs, got {other:?}"),
@@ -1666,14 +1745,46 @@ mod tests {
             Some(Command::Runs {
                 kind,
                 by_outcome,
+                by_retro,
                 cmd,
             }) => {
                 assert!(kind.is_none());
                 assert!(by_outcome);
+                assert!(!by_retro);
                 assert!(cmd.is_none());
             }
             other => panic!("expected Runs, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_runs_with_by_retro_flag() {
+        let cli = Cli::try_parse_from(["tm", "runs", "--by-retro"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                kind,
+                by_outcome,
+                by_retro,
+                cmd,
+            }) => {
+                assert!(kind.is_none());
+                assert!(!by_outcome);
+                assert!(by_retro);
+                assert!(cmd.is_none());
+            }
+            other => panic!("expected Runs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_by_outcome_and_by_retro_together() {
+        let err = Cli::try_parse_from(["tm", "runs", "--by-outcome", "--by-retro"])
+            .expect_err("should reject conflicting flags");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "unexpected error kind: {err}"
+        );
     }
 
     #[test]
@@ -2041,6 +2152,153 @@ mod tests {
     fn ticket_audit_without_key_is_a_clap_error() {
         let result = Cli::try_parse_from(["tm", "ticket", "audit"]);
         assert!(result.is_err(), "audit requires a key");
+    }
+
+    #[test]
+    fn parses_ticket_retro_clean() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "retro", "proj-372", "--clean"]).unwrap();
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Retro {
+                        key,
+                        clean,
+                        defect,
+                        severity,
+                        note,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert!(clean);
+                assert!(!defect);
+                assert!(severity.is_none());
+                assert_eq!(note, None);
+            }
+            other => panic!("expected TicketCmd::Retro, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ticket_retro_defect_with_severity_and_note() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "retro",
+            "proj-372",
+            "--defect",
+            "--severity",
+            "critical",
+            "--note",
+            "took down prod",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Ticket {
+                key: None,
+                cmd:
+                    Some(TicketCmd::Retro {
+                        key,
+                        clean,
+                        defect,
+                        severity,
+                        note,
+                    }),
+            }) => {
+                assert_eq!(key, "proj-372".to_string());
+                assert!(!clean);
+                assert!(defect);
+                assert!(matches!(severity, Some(RetroSeverityArg::Critical)));
+                assert_eq!(note, Some("took down prod".to_string()));
+            }
+            other => panic!("expected TicketCmd::Retro, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_retro_without_clean_or_defect_is_a_clap_error() {
+        let result = Cli::try_parse_from(["tm", "ticket", "retro", "proj-372"]);
+        assert!(
+            result.is_err(),
+            "retro requires exactly one of --clean/--defect"
+        );
+    }
+
+    #[test]
+    fn ticket_retro_with_both_clean_and_defect_is_a_clap_error() {
+        let result = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "retro",
+            "proj-372",
+            "--clean",
+            "--defect",
+            "--severity",
+            "minor",
+        ]);
+        assert!(
+            result.is_err(),
+            "--clean and --defect are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn ticket_retro_clean_with_severity_parses_at_the_clap_layer() {
+        // clap can't express "only when --defect was passed" for a
+        // `SetTrue` bool flag (see `severity`'s doc comment); this pairing
+        // is rejected later by `RunStore::record_retro`, not by clap.
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "retro",
+            "proj-372",
+            "--clean",
+            "--severity",
+            "minor",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Ticket {
+                cmd:
+                    Some(TicketCmd::Retro {
+                        clean, severity, ..
+                    }),
+                ..
+            }) => {
+                assert!(clean);
+                assert!(matches!(severity, Some(RetroSeverityArg::Minor)));
+            }
+            other => panic!("expected TicketCmd::Retro, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_retro_defect_without_severity_still_parses_at_the_clap_layer() {
+        // clap only enforces severity -> defect, not the reverse; a
+        // defect without severity is rejected later by
+        // `RunStore::record_retro`, not by clap.
+        let cli = Cli::try_parse_from(["tm", "ticket", "retro", "proj-372", "--defect"]).unwrap();
+        match cli.command {
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Retro { severity, .. }),
+                ..
+            }) => assert!(severity.is_none()),
+            other => panic!("expected TicketCmd::Retro, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_retro_invalid_severity_is_a_clap_error() {
+        let result = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "retro",
+            "proj-372",
+            "--defect",
+            "--severity",
+            "bogus",
+        ]);
+        assert!(result.is_err(), "unknown severity should be a clap error");
     }
 
     #[test]

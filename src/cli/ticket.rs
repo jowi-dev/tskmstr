@@ -780,10 +780,10 @@ pub fn retro(
     note: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
-    if let Some(note) = note {
-        if note.trim().is_empty() {
-            return Err(TicketCliError::RetroNoteEmpty);
-        }
+    if let Some(note) = note
+        && note.trim().is_empty()
+    {
+        return Err(TicketCliError::RetroNoteEmpty);
     }
 
     let normalized = normalize_key(key)?;

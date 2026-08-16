@@ -266,6 +266,78 @@ pub fn list_by_outcome(
     Ok(())
 }
 
+/// `tm runs --by-retro`: print a cost-vs-retro-verdict summary joining
+/// [`crate::runs::RunStore::cost_by_retro_verdict`]'s two buckets (clean /
+/// defect), restricted to `kind` when given.
+///
+/// Always prints both rows, even ones with zero tickets, same
+/// stable-shape/visibility rationale as [`list_by_outcome`]. A `TICKETS W/O
+/// RUN` column reports, per bucket, how many of its tickets have no
+/// recorded run at all -- those tickets are excluded from the cost columns
+/// entirely rather than folded in as a `$0` run, since a shipped ticket with
+/// no run usually means the work was done manually rather than by a lane.
+pub fn list_by_retro(
+    store: &RunStore,
+    kind: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let summary = store.cost_by_retro_verdict(kind)?;
+
+    let rows: Vec<[String; 6]> = summary
+        .iter()
+        .map(|s| {
+            [
+                s.verdict.as_str().to_string(),
+                s.ticket_count.to_string(),
+                s.tickets_without_run.to_string(),
+                s.run_count.to_string(),
+                format_optional_cost(s.total_cost_usd),
+                format_optional_cost(s.avg_cost_usd),
+            ]
+        })
+        .collect();
+
+    let headers = [
+        "VERDICT",
+        "TICKETS",
+        "TICKETS W/O RUN",
+        "RUNS",
+        "TOTAL COST",
+        "AVG COST",
+    ];
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    writeln!(
+        out,
+        "{}",
+        format_retro_row(&headers.map(str::to_string), &widths)
+    )?;
+    for row in &rows {
+        writeln!(out, "{}", format_retro_row(row, &widths))?;
+    }
+
+    Ok(())
+}
+
+/// Same left-padding-except-last-column rule as [`format_row`], for
+/// [`list_by_retro`]'s 6-column table.
+fn format_retro_row(row: &[String; 6], widths: &[usize; 6]) -> String {
+    let mut parts = Vec::with_capacity(row.len());
+    for (i, cell) in row.iter().enumerate() {
+        if i + 1 == row.len() {
+            parts.push(cell.clone());
+        } else {
+            parts.push(format!("{cell:<width$}", width = widths[i]));
+        }
+    }
+    parts.join("  ")
+}
+
 /// Renders an optional cost as `$N.NN`, or `-` when there's no cost data to
 /// report -- distinct from `$0.00`, which would claim a known zero cost.
 fn format_optional_cost(cost_usd: Option<f64>) -> String {
@@ -1458,6 +1530,155 @@ mod tests {
             .find(|l| l.starts_with("clean"))
             .expect("expected a clean row");
         assert!(clean_line.contains('-'), "got: {clean_line:?}");
+    }
+
+    #[test]
+    fn list_by_retro_prints_a_row_per_bucket_including_empty_ones() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        list_by_retro(&store, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("clean"), "got: {output:?}");
+        assert!(output.contains("defect"), "got: {output:?}");
+    }
+
+    #[test]
+    fn list_by_retro_reports_ticket_and_run_costs_and_excludes_ticket_with_no_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let clean_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                clean_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(5.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .unwrap();
+
+        let defect_id = store.start_run(&start_params("PROJ-2")).unwrap();
+        store
+            .finish_run(
+                defect_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(10.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_retro(
+                "PROJ-2",
+                crate::runs::RetroVerdict::Defect,
+                Some(crate::runs::RetroSeverity::Major),
+                None,
+            )
+            .unwrap();
+
+        // PROJ-3 shipped a defect but has no recorded run at all.
+        store
+            .record_retro(
+                "PROJ-3",
+                crate::runs::RetroVerdict::Defect,
+                Some(crate::runs::RetroSeverity::Minor),
+                None,
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        list_by_retro(&store, None, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        let clean_line = output
+            .lines()
+            .find(|l| l.starts_with("clean"))
+            .expect("expected a clean row");
+        assert!(clean_line.contains("5.00"), "got: {clean_line:?}");
+
+        let defect_line = output
+            .lines()
+            .find(|l| l.starts_with("defect"))
+            .expect("expected a defect row");
+        assert!(defect_line.contains("10.00"), "got: {defect_line:?}");
+        assert!(
+            !defect_line.contains("20.00"),
+            "PROJ-3's missing run must not be counted as $0: {defect_line:?}"
+        );
+    }
+
+    #[test]
+    fn list_by_retro_respects_kind_filter() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                lane_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(5.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                audit_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(1.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        store
+            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .unwrap();
+
+        let mut out = Vec::new();
+        list_by_retro(&store, Some("lane"), &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        let clean_line = output
+            .lines()
+            .find(|l| l.starts_with("clean"))
+            .expect("expected a clean row");
+        assert!(clean_line.contains("5.00"), "got: {clean_line:?}");
+        assert!(!clean_line.contains("1.00"), "got: {clean_line:?}");
     }
 
     #[test]
