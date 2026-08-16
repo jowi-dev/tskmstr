@@ -565,6 +565,13 @@ pub enum RunsCmd {
         /// value is a hard error.
         #[arg(long)]
         model_usage: Option<String>,
+        /// Number of unresolved bot review findings tallied for this run
+        /// (see `tm pr watch`'s poll loop). Omit to leave the run's
+        /// `findings_count` untouched; pass `0` to record "measured,
+        /// clean" -- that is distinct from omitting the flag, which leaves
+        /// it `NULL` ("not measured").
+        #[arg(long)]
+        findings_count: Option<i64>,
     },
     /// Appends a telemetry event to a run and bumps its heartbeat.
     Event {

@@ -77,6 +77,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN log_path TEXT;
     "#,
+    r#"
+    ALTER TABLE runs ADD COLUMN findings_count INTEGER;
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -255,6 +258,13 @@ pub struct FinishRun {
     /// name (see [`ModelUsage`]). Verbatim from `claude -p`'s `modelUsage`
     /// map. Validated as JSON by the CLI layer before it reaches here.
     pub model_usage: Option<String>,
+    /// Number of unresolved bot review findings tallied for this run (see
+    /// `crate::github::bot_findings::count_bot_findings`), if measured.
+    /// `None` means "not measured" (the default for every run kind other
+    /// than `review-watch`, and for `review-watch` runs finished before
+    /// this field existed); `Some(0)` means "measured, clean" — that
+    /// distinction must never collapse, so this is never defaulted to `0`.
+    pub findings_count: Option<i64>,
 }
 
 impl Default for FinishRun {
@@ -274,6 +284,7 @@ impl Default for FinishRun {
             pr_url: None,
             transcript: None,
             model_usage: None,
+            findings_count: None,
         }
     }
 }
@@ -393,6 +404,10 @@ pub struct Run {
     /// for any run started before this column existed — `tm runs logs`
     /// falls back to the by-convention path for `kind` in that case.
     pub log_path: Option<String>,
+    /// Number of unresolved bot review findings tallied for this run, if
+    /// measured; see [`FinishRun::findings_count`] for the `None` vs
+    /// `Some(0)` distinction, which this field preserves verbatim.
+    pub findings_count: Option<i64>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1146,8 +1161,9 @@ impl RunStore {
                     blocker = COALESCE(?6, blocker),
                     pr_url = COALESCE(?7, pr_url),
                     transcript = COALESCE(?8, transcript),
-                    model_usage = COALESCE(?9, model_usage)
-                 WHERE id = ?10"
+                    model_usage = COALESCE(?9, model_usage),
+                    findings_count = COALESCE(?10, findings_count)
+                 WHERE id = ?11"
             ),
             params![
                 outcome.status.as_str(),
@@ -1159,6 +1175,7 @@ impl RunStore {
                 outcome.pr_url,
                 outcome.transcript,
                 outcome.model_usage,
+                outcome.findings_count,
                 run_id,
             ],
         )?;
@@ -1235,8 +1252,9 @@ impl RunStore {
                     blocker = COALESCE(?6, blocker),
                     pr_url = COALESCE(?7, pr_url),
                     transcript = COALESCE(?8, transcript),
-                    model_usage = COALESCE(?9, model_usage)
-                 WHERE id = ?10"
+                    model_usage = COALESCE(?9, model_usage),
+                    findings_count = COALESCE(?10, findings_count)
+                 WHERE id = ?11"
             ),
             params![
                 outcome.status.as_str(),
@@ -1248,6 +1266,7 @@ impl RunStore {
                 outcome.pr_url,
                 outcome.transcript,
                 outcome.model_usage,
+                outcome.findings_count,
                 run_id,
             ],
         )?;
@@ -1557,7 +1576,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path,
+                blocker, pr_url, model_usage, log_path, findings_count,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
@@ -1588,7 +1607,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path,
+                blocker, pr_url, model_usage, log_path, findings_count,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
@@ -1610,7 +1629,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path,
+                blocker, pr_url, model_usage, log_path, findings_count,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE id = ?1";
@@ -1624,9 +1643,9 @@ impl RunStore {
     /// Maps one row of the `id, ticket, lane, kind, status, session_id,
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
-    /// model_usage, age_secs` projection (shared by [`RunStore::run_by_id`],
-    /// [`RunStore::latest_run_for_ticket_kind`], and
-    /// [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
+    /// model_usage, log_path, findings_count, age_secs` projection (shared
+    /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
+    /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         let status_str: String = row.get(4)?;
         // Same forward-compat reasoning as list_runs_filtered: an
@@ -1653,7 +1672,8 @@ impl RunStore {
             pr_url: row.get(17)?,
             model_usage: row.get(18)?,
             log_path: row.get(19)?,
-            age_secs: row.get(20)?,
+            findings_count: row.get(20)?,
+            age_secs: row.get(21)?,
         })
     }
 
@@ -1833,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_5() {
+    fn open_migrates_a_fresh_db_to_user_version_6() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -1841,7 +1861,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -2081,6 +2101,7 @@ mod tests {
                     pr_url: Some("https://example.invalid/pr/1".to_string()),
                     transcript: Some("/tmp/transcript.log".to_string()),
                     model_usage: Some(r#"{"claude-fable-5":{"inputTokens":146}}"#.to_string()),
+                    findings_count: None,
                 },
             )
             .unwrap();
@@ -2176,6 +2197,119 @@ mod tests {
             run.model_usage,
             Some(r#"{"claude-fable-5":{"inputTokens":1}}"#.to_string())
         );
+    }
+
+    #[test]
+    fn finish_run_records_findings_count_and_distinguishes_zero_from_unset() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        // Freshly started, never finished: findings_count is NULL ("not
+        // measured"), not 0.
+        let fresh = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(fresh.findings_count, None);
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    findings_count: Some(3),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.findings_count, Some(3));
+    }
+
+    #[test]
+    fn finish_run_leaves_findings_count_untouched_when_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    findings_count: Some(2),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        // A later finish_run call (e.g. `finish_run_from_supervisor`'s
+        // re-finish path) that doesn't set findings_count must not clobber
+        // the recorded value back to NULL.
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    findings_count: None,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.findings_count, Some(2));
+    }
+
+    #[test]
+    fn finish_run_records_zero_findings_as_clean_not_null() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "review-watch".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "review-watch".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    findings_count: Some(0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.findings_count, Some(0));
     }
 
     #[test]
@@ -2864,6 +2998,7 @@ mod tests {
                     pr_url: None,
                     transcript: None,
                     model_usage: None,
+                    findings_count: None,
                 },
             )
             .unwrap();

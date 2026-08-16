@@ -1062,6 +1062,7 @@ pub fn run_claude_and_finish(
             pr_url,
             transcript: Some(prepared.out_json_path.to_string_lossy().into_owned()),
             model_usage: model_usage_json,
+            findings_count: None,
         },
         force_status,
     )?;

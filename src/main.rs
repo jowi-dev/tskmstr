@@ -870,6 +870,7 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
             pr_url,
             transcript,
             model_usage,
+            findings_count,
         }) => {
             let outcome = tskmstr::runs::FinishRun {
                 status: status.into(),
@@ -881,6 +882,7 @@ fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn st
                 pr_url,
                 transcript,
                 model_usage,
+                findings_count,
             };
             tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
         }
