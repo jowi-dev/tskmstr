@@ -65,6 +65,8 @@ tm auth status
 | `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` | Post a comment to ticket `<KEY>` (inferred from the current branch's PR if omitted); `--pr` also posts it to the current branch's PR |
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
+| `tm ticket retro <KEY> --clean` | Record that `<KEY>` shipped clean, with no known production defect (offline; never touches Jira) |
+| `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order, plus any blocked ticket that's stackable |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, or blocked. Exits `0` (ready), `3` (stackable), or `1` (blocked/error) |
@@ -74,6 +76,7 @@ tm auth status
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
+| `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
 | `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>] [--findings-count <N>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown and/or the number of unresolved bot review findings (`0` for measured-clean; omit to leave it unmeasured) |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
@@ -850,6 +853,35 @@ in `config.toml` points instead). Recording never touches Jira and works
 fully offline; every past verdict is kept (no upsert), and the read mode
 above always shows the most recent one. `--notes` only makes sense alongside
 `--record`, so it requires it.
+
+### Recording ship-defect retros
+
+`tm ticket retro <KEY> --clean` or `tm ticket retro <KEY> --defect --severity
+<minor|major|critical> [--note "..."]` records whether a ticket, once shipped,
+turned out to be defective in production. This is a different signal from
+`findings_count` (what review bots caught pre-merge, via `tm runs finish
+--findings-count`): a retro records what production revealed *after* ship,
+and the two are allowed to disagree — a ticket clean in bugbot but defective
+in prod is exactly the case this exists to surface. `--severity` is required
+with `--defect` and rejected with `--clean` (enforced by
+`RunStore::record_retro`, not by clap — see its doc comment for why). Exactly
+one of `--clean`/`--defect` is required; `--note` is optional but, if given,
+must not be empty or all-whitespace.
+
+Retros are stored in the same local SQLite database `tm runs` uses, in a
+`ticket_retros` table modeled on `ticket_audits`: every call inserts a new
+row rather than upserting, so a ticket can be re-recorded (marked clean, then
+later found defective once a bug surfaces) while every past verdict stays
+queryable, and reads always resolve to the most recent one. Recording never
+touches Jira and works fully offline.
+
+`tm runs --by-retro [--kind <KIND>]` joins retro verdicts to run cost: for
+each verdict (clean/defect), it reports the number of tickets carrying that
+verdict, how many of them have no recorded run at all, the number of runs
+across the rest, and total/average cost over those runs. A ticket with a
+verdict but no run (common — not all shipped work goes through a lane)
+contributes to the ticket count but is excluded from the cost columns
+entirely, rather than counted as a `$0` run.
 
 ### Commenting
 
