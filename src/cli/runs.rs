@@ -217,6 +217,77 @@ pub fn list(store: &RunStore, kind: Option<&str>, out: &mut dyn Write) -> Result
     Ok(())
 }
 
+/// `tm runs --by-outcome`: print a cost-vs-outcome summary joining
+/// [`crate::runs::RunStore::cost_by_findings_outcome`]'s three buckets
+/// (not measured / clean / findings), restricted to `kind` when given.
+///
+/// Always prints all three rows, even ones with zero runs, so "not
+/// measured" stays visible rather than silently vanishing from the
+/// comparison -- collapsing it into "clean" is exactly the miscount this
+/// view exists to avoid. A bucket with no `cost_usd` data (no runs, or
+/// runs whose cost was never recorded) renders `-` for its cost columns
+/// rather than `$0.00`, which would misrepresent "unknown" as "free".
+pub fn list_by_outcome(
+    store: &RunStore,
+    kind: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let summary = store.cost_by_findings_outcome(kind)?;
+
+    let rows: Vec<[String; 4]> = summary
+        .iter()
+        .map(|s| {
+            [
+                s.outcome.as_str().to_string(),
+                s.run_count.to_string(),
+                format_optional_cost(s.total_cost_usd),
+                format_optional_cost(s.avg_cost_usd),
+            ]
+        })
+        .collect();
+
+    let headers = ["OUTCOME", "RUNS", "TOTAL COST", "AVG COST"];
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    writeln!(
+        out,
+        "{}",
+        format_outcome_row(&headers.map(str::to_string), &widths)
+    )?;
+    for row in &rows {
+        writeln!(out, "{}", format_outcome_row(row, &widths))?;
+    }
+
+    Ok(())
+}
+
+/// Renders an optional cost as `$N.NN`, or `-` when there's no cost data to
+/// report -- distinct from `$0.00`, which would claim a known zero cost.
+fn format_optional_cost(cost_usd: Option<f64>) -> String {
+    cost_usd
+        .map(|c| format!("${c:.2}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Same left-padding-except-last-column rule as [`format_row`], for
+/// [`list_by_outcome`]'s 4-column table.
+fn format_outcome_row(row: &[String; 4], widths: &[usize; 4]) -> String {
+    let mut parts = Vec::with_capacity(row.len());
+    for (i, cell) in row.iter().enumerate() {
+        if i + 1 == row.len() {
+            parts.push(cell.clone());
+        } else {
+            parts.push(format!("{cell:<width$}", width = widths[i]));
+        }
+    }
+    parts.join("  ")
+}
+
 /// Format `row` as space-padded columns per `widths`, except the last
 /// column, which is left unpadded (no trailing whitespace on each line).
 fn format_row(row: &[String; 6], widths: &[usize; 6]) -> String {
@@ -358,7 +429,11 @@ pub fn show(
             .unwrap_or_else(|| "?".to_string());
         writeln!(out, "cost {cost} / {turns} turns")?;
     }
-    writeln!(out, "findings {}", format_findings_count(run.findings_count))?;
+    writeln!(
+        out,
+        "findings {}",
+        format_findings_count(run.findings_count)
+    )?;
 
     let events = store.events_for_run(run.id)?;
 
@@ -1278,6 +1353,111 @@ mod tests {
         list(&store, None, &mut out).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "No runs recorded.\n");
+    }
+
+    #[test]
+    fn list_by_outcome_prints_a_row_per_bucket_including_empty_ones() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        list_by_outcome(&store, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("not measured"), "got: {output:?}");
+        assert!(output.contains("clean"), "got: {output:?}");
+        assert!(output.contains("findings"), "got: {output:?}");
+    }
+
+    #[test]
+    fn list_by_outcome_reports_run_counts_and_total_cost_per_bucket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let clean_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                clean_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(2.5),
+                    findings_count: Some(0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let dirty_id = store.start_run(&start_params("PROJ-2")).unwrap();
+        store
+            .finish_run(
+                dirty_id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    cost_usd: Some(4.0),
+                    findings_count: Some(2),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let unmeasured_id = store.start_run(&start_params("PROJ-3")).unwrap();
+        store
+            .finish_run(
+                unmeasured_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd: Some(1.0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        list_by_outcome(&store, None, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        let clean_line = output
+            .lines()
+            .find(|l| l.starts_with("clean"))
+            .expect("expected a clean row");
+        assert!(clean_line.contains('1'), "got: {clean_line:?}");
+        assert!(clean_line.contains("2.50"), "got: {clean_line:?}");
+
+        let findings_line = output
+            .lines()
+            .find(|l| l.starts_with("findings"))
+            .expect("expected a findings row");
+        assert!(findings_line.contains('1'), "got: {findings_line:?}");
+        assert!(findings_line.contains("4.00"), "got: {findings_line:?}");
+
+        let not_measured_line = output
+            .lines()
+            .find(|l| l.starts_with("not measured"))
+            .expect("expected a not measured row");
+        assert!(
+            not_measured_line.contains('1'),
+            "got: {not_measured_line:?}"
+        );
+        assert!(
+            not_measured_line.contains("1.00"),
+            "got: {not_measured_line:?}"
+        );
+    }
+
+    #[test]
+    fn list_by_outcome_renders_dash_for_a_bucket_with_no_cost_data() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        list_by_outcome(&store, None, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        let clean_line = output
+            .lines()
+            .find(|l| l.starts_with("clean"))
+            .expect("expected a clean row");
+        assert!(clean_line.contains('-'), "got: {clean_line:?}");
     }
 
     #[test]

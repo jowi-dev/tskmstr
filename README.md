@@ -73,8 +73,9 @@ tm auth status
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
+| `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
-| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown |
+| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>] [--findings-count <N>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown and/or the number of unresolved bot review findings (`0` for measured-clean; omit to leave it unmeasured) |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
 | `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
@@ -404,7 +405,8 @@ derived rather than reported. `tool_counts` is the same `(tool, count)` list
     "cost_usd": 1.5,
     "blocker": null,
     "pr_url": "https://example.invalid/pr/1",
-    "age_secs": 240
+    "age_secs": 240,
+    "findings_count": null
   },
   "checklist": {
     "done": 1,
@@ -433,6 +435,12 @@ derived rather than reported. `tool_counts` is the same `(tool, count)` list
   ]
 }
 ```
+
+`run.findings_count` is the number of unresolved bot review findings tallied
+by `tm pr watch` at the run's end (see `--by-outcome` above): `null` means
+"not measured" (every run kind other than `review-watch`, and any
+`review-watch` run finished before this field existed), `0` means "measured,
+clean". The two are never conflated.
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default

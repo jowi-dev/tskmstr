@@ -340,6 +340,44 @@ pub struct RunSummary {
     pub awaiting_input: bool,
 }
 
+/// A run's bot-findings outcome bucket, as measured by `findings_count`; see
+/// [`RunStore::cost_by_findings_outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FindingsOutcome {
+    /// `findings_count IS NULL` -- never measured.
+    NotMeasured,
+    /// `findings_count = 0` -- measured, no unresolved findings.
+    Clean,
+    /// `findings_count > 0` -- measured, came back with findings.
+    Findings,
+}
+
+impl FindingsOutcome {
+    /// Short label used by `tm runs --by-outcome`'s table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingsOutcome::NotMeasured => "not measured",
+            FindingsOutcome::Clean => "clean",
+            FindingsOutcome::Findings => "findings",
+        }
+    }
+}
+
+/// One bucket's cost aggregate from [`RunStore::cost_by_findings_outcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeCostSummary {
+    /// Which bucket this row summarizes.
+    pub outcome: FindingsOutcome,
+    /// Number of runs in this bucket.
+    pub run_count: i64,
+    /// Sum of `cost_usd` over runs in this bucket that have one recorded;
+    /// `None` if none do.
+    pub total_cost_usd: Option<f64>,
+    /// Average of `cost_usd` over runs in this bucket that have one
+    /// recorded; `None` if none do.
+    pub avg_cost_usd: Option<f64>,
+}
+
 /// Derives whether a run is currently awaiting user input: `status` is
 /// [`RunStatus::Running`] and its most recent event is `await` (emitted by
 /// `hooks/tm-session-state.sh` on `Stop`/`Notification` for a registered
@@ -1489,6 +1527,78 @@ impl RunStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Returns cost aggregates grouped by bot-findings outcome, restricted
+    /// to `kind` when given (same filter as [`RunStore::list_runs_filtered`]),
+    /// for `tm runs --by-outcome`.
+    ///
+    /// Always returns exactly three rows, in a fixed order
+    /// ([`FindingsOutcome::NotMeasured`], [`FindingsOutcome::Clean`],
+    /// [`FindingsOutcome::Findings`]), even when a bucket has no matching
+    /// runs -- a stable shape is easier for a caller to render as a table
+    /// than a variable-length one. `total_cost_usd`/`avg_cost_usd` are
+    /// computed only over runs in the bucket that also have a recorded
+    /// `cost_usd`; both are `None` for an empty bucket.
+    ///
+    /// [`FindingsOutcome::NotMeasured`] (`findings_count IS NULL`) is its
+    /// own bucket, never folded into `Clean` -- a run whose findings were
+    /// never measured must not silently read as "came back clean" in a
+    /// cost comparison.
+    pub fn cost_by_findings_outcome(
+        &self,
+        kind: Option<&str>,
+    ) -> Result<Vec<OutcomeCostSummary>, RunStoreError> {
+        let sql = "SELECT
+                CASE
+                    WHEN findings_count IS NULL THEN 0
+                    WHEN findings_count = 0 THEN 1
+                    ELSE 2
+                END AS bucket,
+                COUNT(*) AS run_count,
+                SUM(cost_usd) AS total_cost_usd,
+                AVG(cost_usd) AS avg_cost_usd
+             FROM runs
+             WHERE ?1 IS NULL OR kind = ?1
+             GROUP BY bucket";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![kind], |row| {
+            let bucket: i64 = row.get(0)?;
+            let outcome = match bucket {
+                0 => FindingsOutcome::NotMeasured,
+                1 => FindingsOutcome::Clean,
+                _ => FindingsOutcome::Findings,
+            };
+            Ok(OutcomeCostSummary {
+                outcome,
+                run_count: row.get(1)?,
+                total_cost_usd: row.get(2)?,
+                avg_cost_usd: row.get(3)?,
+            })
+        })?;
+
+        let mut by_outcome = std::collections::HashMap::new();
+        for row in rows {
+            let row = row?;
+            by_outcome.insert(row.outcome, row);
+        }
+
+        Ok([
+            FindingsOutcome::NotMeasured,
+            FindingsOutcome::Clean,
+            FindingsOutcome::Findings,
+        ]
+        .into_iter()
+        .map(|outcome| {
+            by_outcome.remove(&outcome).unwrap_or(OutcomeCostSummary {
+                outcome,
+                run_count: 0,
+                total_cost_usd: None,
+                avg_cost_usd: None,
+            })
+        })
+        .collect())
     }
 
     /// Marks abandoned runs as failed.
@@ -2864,6 +2974,141 @@ mod tests {
         let ids: Vec<i64> = all.iter().map(|r| r.id).collect();
         assert!(ids.contains(&lane_id));
         assert!(ids.contains(&audit_id));
+    }
+
+    fn start_params(ticket: &str) -> StartRun {
+        StartRun {
+            ticket: ticket.to_string(),
+            lane: "backend".to_string(),
+            worktree: "/tmp/wt".to_string(),
+            branch: None,
+            pid: None,
+            kind: "lane".to_string(),
+            log_path: None,
+        }
+    }
+
+    fn finish_with_cost_and_findings(
+        store: &RunStore,
+        id: i64,
+        cost_usd: Option<f64>,
+        findings_count: Option<i64>,
+    ) {
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    cost_usd,
+                    findings_count,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cost_by_findings_outcome_groups_null_zero_and_positive_separately() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        // Not measured: findings_count NULL.
+        let not_measured = store.start_run(&start_params("PROJ-1")).unwrap();
+        finish_with_cost_and_findings(&store, not_measured, Some(10.0), None);
+
+        // Clean: findings_count 0, two runs.
+        let clean_a = store.start_run(&start_params("PROJ-2")).unwrap();
+        finish_with_cost_and_findings(&store, clean_a, Some(2.0), Some(0));
+        let clean_b = store.start_run(&start_params("PROJ-3")).unwrap();
+        finish_with_cost_and_findings(&store, clean_b, Some(4.0), Some(0));
+
+        // Findings: findings_count > 0.
+        let dirty = store.start_run(&start_params("PROJ-4")).unwrap();
+        finish_with_cost_and_findings(&store, dirty, Some(9.0), Some(3));
+
+        let summary = store.cost_by_findings_outcome(None).unwrap();
+        assert_eq!(summary.len(), 3);
+
+        let not_measured_row = summary
+            .iter()
+            .find(|s| s.outcome == FindingsOutcome::NotMeasured)
+            .unwrap();
+        assert_eq!(not_measured_row.run_count, 1);
+        assert_eq!(not_measured_row.total_cost_usd, Some(10.0));
+
+        let clean_row = summary
+            .iter()
+            .find(|s| s.outcome == FindingsOutcome::Clean)
+            .unwrap();
+        assert_eq!(clean_row.run_count, 2);
+        assert_eq!(clean_row.total_cost_usd, Some(6.0));
+        assert_eq!(clean_row.avg_cost_usd, Some(3.0));
+
+        let findings_row = summary
+            .iter()
+            .find(|s| s.outcome == FindingsOutcome::Findings)
+            .unwrap();
+        assert_eq!(findings_row.run_count, 1);
+        assert_eq!(findings_row.total_cost_usd, Some(9.0));
+    }
+
+    #[test]
+    fn cost_by_findings_outcome_returns_all_three_buckets_even_when_empty() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let summary = store.cost_by_findings_outcome(None).unwrap();
+
+        assert_eq!(summary.len(), 3);
+        for row in &summary {
+            assert_eq!(row.run_count, 0);
+            assert_eq!(row.total_cost_usd, None);
+            assert_eq!(row.avg_cost_usd, None);
+        }
+    }
+
+    #[test]
+    fn cost_by_findings_outcome_respects_kind_filter() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        finish_with_cost_and_findings(&store, lane_id, Some(5.0), Some(0));
+
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-2".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        finish_with_cost_and_findings(&store, audit_id, Some(1.0), Some(2));
+
+        let lane_only = store.cost_by_findings_outcome(Some("lane")).unwrap();
+        let clean_row = lane_only
+            .iter()
+            .find(|s| s.outcome == FindingsOutcome::Clean)
+            .unwrap();
+        assert_eq!(clean_row.run_count, 1);
+        let findings_row = lane_only
+            .iter()
+            .find(|s| s.outcome == FindingsOutcome::Findings)
+            .unwrap();
+        assert_eq!(findings_row.run_count, 0);
     }
 
     #[test]

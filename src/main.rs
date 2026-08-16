@@ -152,7 +152,11 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
-        Command::Runs { kind, cmd } => run_runs(kind, cmd),
+        Command::Runs {
+            kind,
+            by_outcome,
+            cmd,
+        } => run_runs(kind, by_outcome, cmd),
         Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
     }
 }
@@ -834,11 +838,18 @@ fn run_ready_check(key: String) -> ExitCode {
 /// in the strict (error-if-missing) sense: `tm runs` must work on a machine
 /// with no Jira config at all, so config loading here is best-effort (see
 /// [`resolve_run_db_path`]).
-fn run_runs(kind: Option<String>, cmd: Option<RunsCmd>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_runs(
+    kind: Option<String>,
+    by_outcome: bool,
+    cmd: Option<RunsCmd>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
     let mut stdout = std::io::stdout();
 
     match cmd {
+        None if by_outcome => {
+            tskmstr::cli::runs::list_by_outcome(&store, kind.as_deref(), &mut stdout)?
+        }
         None => tskmstr::cli::runs::list(&store, kind.as_deref(), &mut stdout)?,
         Some(RunsCmd::Start {
             ticket,

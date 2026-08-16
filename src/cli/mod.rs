@@ -104,6 +104,13 @@ pub enum Command {
         /// meaningful without a subcommand (plain `tm runs`).
         #[arg(long)]
         kind: Option<String>,
+        /// Instead of listing individual runs, print cost totals grouped by
+        /// bot-findings outcome (not measured / clean / findings) -- "what
+        /// did clean PRs cost vs. ones that came back with findings",
+        /// restricted to `--kind` when given. Only meaningful without a
+        /// subcommand (plain `tm runs`).
+        #[arg(long)]
+        by_outcome: bool,
         /// Which runs action to perform. Omit to list current runs.
         #[command(subcommand)]
         cmd: Option<RunsCmd>,
@@ -1622,8 +1629,13 @@ mod tests {
     fn parses_bare_runs_as_list() {
         let cli = Cli::try_parse_from(["tm", "runs"]).expect("should parse");
         match cli.command {
-            Some(Command::Runs { kind, cmd }) => {
+            Some(Command::Runs {
+                kind,
+                by_outcome,
+                cmd,
+            }) => {
                 assert!(kind.is_none());
+                assert!(!by_outcome);
                 assert!(cmd.is_none());
             }
             other => panic!("expected Runs, got {other:?}"),
@@ -1634,8 +1646,30 @@ mod tests {
     fn parses_runs_with_kind_filter() {
         let cli = Cli::try_parse_from(["tm", "runs", "--kind", "audit"]).expect("should parse");
         match cli.command {
-            Some(Command::Runs { kind, cmd }) => {
+            Some(Command::Runs {
+                kind,
+                by_outcome,
+                cmd,
+            }) => {
                 assert_eq!(kind, Some("audit".to_string()));
+                assert!(!by_outcome);
+                assert!(cmd.is_none());
+            }
+            other => panic!("expected Runs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_with_by_outcome_flag() {
+        let cli = Cli::try_parse_from(["tm", "runs", "--by-outcome"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                kind,
+                by_outcome,
+                cmd,
+            }) => {
+                assert!(kind.is_none());
+                assert!(by_outcome);
                 assert!(cmd.is_none());
             }
             other => panic!("expected Runs, got {other:?}"),
