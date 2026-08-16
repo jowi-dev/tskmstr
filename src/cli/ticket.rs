@@ -46,6 +46,13 @@ pub enum TicketCliError {
     #[error("comment body must not be empty")]
     CommentBodyRequired,
 
+    /// `tm ticket retro <KEY> --note <TEXT>` resolved to an empty (or
+    /// all-whitespace) note. Rejected here rather than stored as a
+    /// meaningless empty note, mirroring
+    /// [`TicketCliError::CommentBodyRequired`]'s rationale.
+    #[error("retro note must not be empty")]
+    RetroNoteEmpty,
+
     /// `tm ticket rank <KEY> (--above|--below) <OTHER>` was given the same
     /// key (after normalization) for both `KEY` and `OTHER`. Rejected here
     /// rather than left to the Jira API, whose behavior ranking an issue
@@ -745,6 +752,53 @@ pub fn audit_record(
         &normalized,
         crate::runs::RunStatus::Done,
     );
+    Ok(())
+}
+
+/// `tm ticket retro <KEY> (--clean|--defect --severity <SEVERITY>) [--note
+/// <TEXT>]`: persist a shipped-ticket retro verdict, timestamped by the runs
+/// DB itself (see [`RunStore::record_retro`]). Never touches Jira, so this
+/// works fully offline, same stance as [`audit_record`].
+///
+/// Which of `--clean`/`--defect` was given, and `--severity`'s presence, are
+/// expected to already be resolved into `verdict`/`severity` by the
+/// caller -- clap's `ArgGroup` on [`super::TicketCmd::Retro`] guarantees
+/// exactly one of `--clean`/`--defect` was passed before this function ever
+/// runs. The `verdict`/`severity` pairing itself (severity required for a
+/// defect, rejected for a clean) is enforced by [`RunStore::record_retro`],
+/// not here -- see its doc comment for why that's the one place this
+/// invariant is checked.
+///
+/// An empty/all-whitespace `note` is rejected as
+/// [`TicketCliError::RetroNoteEmpty`], mirroring [`comment`]'s handling of
+/// an empty body; `note` is otherwise optional.
+pub fn retro(
+    store: &RunStore,
+    key: &str,
+    verdict: crate::runs::RetroVerdict,
+    severity: Option<crate::runs::RetroSeverity>,
+    note: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    if let Some(note) = note {
+        if note.trim().is_empty() {
+            return Err(TicketCliError::RetroNoteEmpty);
+        }
+    }
+
+    let normalized = normalize_key(key)?;
+    store.record_retro(&normalized, verdict, severity, note)?;
+
+    match severity {
+        Some(severity) => writeln!(
+            out,
+            "Recorded retro for {normalized}: {} ({})",
+            verdict.as_str(),
+            severity.as_str()
+        )?,
+        None => writeln!(out, "Recorded retro for {normalized}: {}", verdict.as_str())?,
+    }
+
     Ok(())
 }
 
@@ -2553,6 +2607,125 @@ mod tests {
         match err {
             TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
             other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retro_clean_inserts_a_row_readable_via_latest_retro_for_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        retro(
+            &store,
+            "proj-372",
+            crate::runs::RetroVerdict::Clean,
+            None,
+            None,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Recorded retro for PROJ-372: clean\n");
+
+        let recorded = store
+            .latest_retro_for_ticket("PROJ-372")
+            .unwrap()
+            .expect("expected a retro");
+        assert_eq!(recorded.verdict, crate::runs::RetroVerdict::Clean);
+        assert_eq!(recorded.severity, None);
+    }
+
+    #[test]
+    fn retro_defect_with_severity_and_note_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        retro(
+            &store,
+            "proj-372",
+            crate::runs::RetroVerdict::Defect,
+            Some(crate::runs::RetroSeverity::Major),
+            Some("broke checkout"),
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Recorded retro for PROJ-372: defect (major)\n");
+
+        let recorded = store
+            .latest_retro_for_ticket("PROJ-372")
+            .unwrap()
+            .expect("expected a retro");
+        assert_eq!(recorded.verdict, crate::runs::RetroVerdict::Defect);
+        assert_eq!(recorded.severity, Some(crate::runs::RetroSeverity::Major));
+        assert_eq!(recorded.notes.as_deref(), Some("broke checkout"));
+    }
+
+    #[test]
+    fn retro_invalid_key_is_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = retro(
+            &store,
+            "not-a-key!",
+            crate::runs::RetroVerdict::Clean,
+            None,
+            None,
+            &mut out,
+        )
+        .expect_err("should fail");
+        match err {
+            TicketCliError::InvalidKey { key } => assert_eq!(key, "not-a-key!"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retro_empty_note_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = retro(
+            &store,
+            "PROJ-372",
+            crate::runs::RetroVerdict::Clean,
+            None,
+            Some("   "),
+            &mut out,
+        )
+        .expect_err("should fail");
+        assert!(matches!(err, TicketCliError::RetroNoteEmpty));
+        assert!(
+            store.latest_retro_for_ticket("PROJ-372").unwrap().is_none(),
+            "nothing should be recorded when the note is rejected"
+        );
+    }
+
+    #[test]
+    fn retro_defect_without_severity_propagates_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        let err = retro(
+            &store,
+            "PROJ-372",
+            crate::runs::RetroVerdict::Defect,
+            None,
+            None,
+            &mut out,
+        )
+        .expect_err("should fail");
+        match err {
+            TicketCliError::RunStore(RunStoreError::RetroSeverityRequired) => {}
+            other => panic!("expected RetroSeverityRequired, got {other:?}"),
         }
     }
 
