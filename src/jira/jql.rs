@@ -48,6 +48,30 @@ pub fn ready_candidates_jql() -> String {
     "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC".to_string()
 }
 
+/// The lookback window, in days, for [`shipped_awaiting_retro_jql`]: how far
+/// back "recently shipped" reaches. Named and pinned so changing the retro
+/// board's queue depth is a deliberate, reviewable change rather than a
+/// magic number buried in a query string. 30 days: long enough that a ticket
+/// isn't dropped from the queue before someone gets to it, short enough that
+/// the screen reads as a queue to clear rather than a wall of all-time
+/// shipped history.
+pub const RETRO_WINDOW_DAYS: u32 = 30;
+
+/// The JQL query used by the TUI's retro board (`Screen::Retro`) to list
+/// tickets in `project_key` that shipped (moved to a `Done`-category status)
+/// within the last [`RETRO_WINDOW_DAYS`] days, most recently resolved first.
+///
+/// Bounded to a recent window rather than every `Done` ticket ever shipped,
+/// per [`RETRO_WINDOW_DAYS`]'s doc comment. This query alone doesn't exclude
+/// tickets that already have a recorded retro verdict -- that filtering
+/// happens client-side against `RunStore::retro_verdicts_for_tickets`, the
+/// same JQL-scopes/store-filters split every other board screen uses.
+pub fn shipped_awaiting_retro_jql(project_key: &str) -> String {
+    format!(
+        "project = {project_key} AND statusCategory = Done AND resolutiondate >= -{RETRO_WINDOW_DAYS}d ORDER BY resolutiondate DESC"
+    )
+}
+
 /// Escape `text` for embedding in a double-quoted JQL string literal:
 /// backslashes first (so a later-escaped quote doesn't get re-escaped), then
 /// double quotes. Without this, a search term containing `"` would either
@@ -77,7 +101,8 @@ pub fn ticket_search_jql(project_key: &str, text: &str) -> String {
 mod tests {
     use super::{
         assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-        ready_candidates_jql, ticket_search_jql, unassigned_tickets_jql,
+        ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
+        unassigned_tickets_jql,
     };
 
     #[test]
@@ -149,6 +174,14 @@ mod tests {
         assert_eq!(
             ticket_search_jql("PROJ", "C:\\path\\to\\file"),
             "project = PROJ AND statusCategory != Done AND text ~ \"C:\\\\path\\\\to\\\\file\" ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn shipped_awaiting_retro_jql_scopes_to_project_done_and_window() {
+        assert_eq!(
+            shipped_awaiting_retro_jql("PROJ"),
+            "project = PROJ AND statusCategory = Done AND resolutiondate >= -30d ORDER BY resolutiondate DESC"
         );
     }
 
