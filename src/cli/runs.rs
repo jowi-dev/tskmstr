@@ -231,6 +231,17 @@ fn format_row(row: &[String; 6], widths: &[usize; 6]) -> String {
     parts.join("  ")
 }
 
+/// Renders a run's `findings_count` for [`show`]'s human-oriented output,
+/// keeping "not measured" (`None`), "measured, clean" (`Some(0)`), and a
+/// nonzero tally visually distinct so a NULL never reads as a clean run.
+fn format_findings_count(findings_count: Option<i64>) -> String {
+    match findings_count {
+        None => "not measured".to_string(),
+        Some(0) => "0 (clean)".to_string(),
+        Some(n) => n.to_string(),
+    }
+}
+
 /// Render a [`RunSummary`]'s last-event column: `{kind} {age} ago`, or `-`
 /// when the run has no recorded events.
 fn last_event_column(run: &RunSummary) -> String {
@@ -347,6 +358,7 @@ pub fn show(
             .unwrap_or_else(|| "?".to_string());
         writeln!(out, "cost {cost} / {turns} turns")?;
     }
+    writeln!(out, "findings {}", format_findings_count(run.findings_count))?;
 
     let events = store.events_for_run(run.id)?;
 
@@ -430,6 +442,11 @@ struct RunJson<'a> {
     blocker: Option<&'a str>,
     pr_url: Option<&'a str>,
     age_secs: i64,
+    /// Number of unresolved bot review findings tallied for this run; see
+    /// [`crate::runs::FinishRun::findings_count`] for why `null` and `0`
+    /// carry distinct meanings and neither is ever collapsed into the
+    /// other here.
+    findings_count: Option<i64>,
 }
 
 /// JSON projection of one [`crate::runs::ChecklistItem`] for [`show_json`].
@@ -638,6 +655,7 @@ fn show_json(
             blocker: run.blocker.as_deref(),
             pr_url: run.pr_url.as_deref(),
             age_secs: run.age_secs,
+            findings_count: run.findings_count,
         },
         checklist,
         model_usage,
@@ -1453,6 +1471,77 @@ mod tests {
     }
 
     #[test]
+    fn show_renders_not_measured_when_findings_count_is_null() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(
+            output.contains("findings not measured\n"),
+            "got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn show_renders_zero_findings_as_clean_not_bare_zero() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    findings_count: Some(0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("findings 0 (clean)\n"), "got: {output:?}");
+    }
+
+    #[test]
+    fn show_renders_a_nonzero_findings_count() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    findings_count: Some(4),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        let output = String::from_utf8(out).unwrap();
+
+        assert!(output.contains("findings 4\n"), "got: {output:?}");
+    }
+
+    #[test]
     fn show_renders_friendly_tool_event_detail() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -1914,6 +2003,7 @@ mod tests {
         assert_eq!(value["run"]["num_turns"], 3);
         assert_eq!(value["run"]["pr_url"], "https://example.invalid/pr/1");
         assert_eq!(value["run"]["blocker"], serde_json::Value::Null);
+        assert_eq!(value["run"]["findings_count"], serde_json::Value::Null);
         assert!(value["run"]["started_at"].is_string());
         assert!(value["run"]["age_secs"].is_number());
 
@@ -1928,6 +2018,30 @@ mod tests {
         assert_eq!(events[0]["detail"], r#"{"tool":"Bash"}"#);
         assert_eq!(events[1]["kind"], "stop");
         assert_eq!(events[1]["detail"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn show_json_distinguishes_zero_findings_from_null() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    findings_count: Some(0),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        show(&store, "proj-1", None, true, &mut out).expect("should succeed");
+        let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
+            .expect("output should be valid JSON");
+
+        assert_eq!(value["run"]["findings_count"], 0);
     }
 
     #[test]
