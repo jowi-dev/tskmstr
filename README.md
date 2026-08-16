@@ -531,6 +531,7 @@ to" windows.
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
+| `R` | Open the retro board (board only); see "Retro board" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
@@ -680,6 +681,52 @@ documented first step is `tm runs register --kind bugbot-cleanup <KEY>`,
 which adopts the pre-registered run via `TSKMSTR_SESSION_RUN_ID` so the
 whole conversation's telemetry lands on it, the same way `tm ticket
 audit`/`create` adopt theirs.
+
+### Retro board
+
+Pressing `R` on the board opens a full-screen "Retro" list: every ticket in
+`default_project_key` that shipped (moved to a `Done`-category status)
+within the last 30 days and has no recorded retro verdict yet (see
+"Recording ship-defect retros" below), newest-resolved first. Bounded to a
+recent window rather than every `Done` ticket ever, so the screen reads as
+a queue to clear, not a wall of history. Once a ticket has a verdict —
+recorded here or via `tm ticket retro` — it drops off the list for good.
+
+Each row shows the ticket's key and summary plus its latest `kind = lane`
+run's cost and model mix, when it has one. A ticket with no lane run at all
+(common — not all shipped work goes through a lane) shows `no run`, kept
+visibly distinct from a run that cost `$0.00` — that distinction is the
+whole point, since it separates "shipped manually" from "shipped cheaply".
+
+| Key | Action |
+|---|---|
+| `j` / `k` / arrows | Move the cursor |
+| `d` | Flag a defect: opens a severity picker (`Minor`/`Major`/`Critical`), then an optional one-line note |
+| `c` | Mark the highlighted ticket clean, immediately, no picker |
+| `r` | Refetch the retro list from Jira |
+| `o` | Open the highlighted ticket in the browser |
+| `Esc` / `q` | Return to the board |
+| `?` | Toggle the help overlay |
+
+The note step is a single-line field built up a character at a time
+(`Backspace` deletes, `Enter` submits — blank submits with no note, `Esc`
+cancels the whole defect flow, ticket included). It doesn't shell out to
+`$EDITOR` the way `tm ticket comment`'s prompter does: doing that from
+inside the board would mean suspending raw mode and the alternate screen
+around the child process, the same dance `a`/`L` already do for `tmux
+attach`/`less`, and wiring the `EditorPrompter` trait through the TUI's
+dependencies for one optional field wasn't worth the extra moving parts.
+If you need a longer note, `tm ticket retro <KEY> --defect --severity
+<...> --note "..."` isn't limited to one line.
+
+A successful verdict removes the ticket from the list immediately (no
+refetch) and confirms in the status line (`Recorded clean for PROJ-3`); a
+failed one (e.g. the runs database is unavailable) leaves the ticket in
+place and shows the error instead — the board never freezes or panics on a
+failed Jira/store call here, same stance as everywhere else in the TUI.
+When nothing is awaiting a verdict, the screen says so plainly rather than
+rendering an empty box — that's the steady state this screen is meant to
+reach, not an error.
 
 ## Configuration
 
