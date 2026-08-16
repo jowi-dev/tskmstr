@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use crate::jira::client::RankAnchor;
 use crate::jira::jql::{
     assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-    unassigned_tickets_jql,
+    shipped_awaiting_retro_jql, unassigned_tickets_jql,
 };
 use crate::jira::types::{JiraUser, Transition};
-use crate::runs::RunStatus;
+use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::jira::types::Issue`] plus the configured Jira base URL.
@@ -156,6 +156,9 @@ pub enum Screen {
     Rank,
     /// Live kanban of lane runs, entered via `tm runs watch`.
     Runs,
+    /// Shipped tickets awaiting a retro verdict, entered via `R` from
+    /// [`Screen::Board`]. See [`RetroRow`].
+    Retro,
 }
 
 /// A run as displayed on the [`Screen::Runs`] kanban board, derived from a
@@ -498,6 +501,55 @@ impl BrowserPickerOption {
     }
 }
 
+/// A shipped ticket's latest `kind = "lane"` run, as much of it as
+/// [`Screen::Retro`] shows: cost and model mix. Kept separate from
+/// [`crate::runs::Run`] for the same reason [`RunCard`]/[`RunDetail`] are --
+/// decoupling the pure Elm core from the store module's evolution.
+///
+/// A ticket with `run: None` on its [`RetroRow`] never had a lane run at
+/// all (shipped manually, or through some other path); that's a distinct
+/// case from *this* struct's fields being `None` (a lane run exists but
+/// hasn't recorded a cost or model breakdown yet, e.g. still running) --
+/// [`RetroRow::run`] is what carries the "no run at all" case, not this
+/// type. Rendering must keep those two states visually distinct: a ticket
+/// with no run is not the same as a ticket whose run cost `$0.00`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetroRunInfo {
+    /// The run's reported cost in USD, `None` if not yet recorded (e.g. the
+    /// run is still in progress).
+    pub cost_usd: Option<f64>,
+    /// One-line model-mix summary (see
+    /// [`crate::runs::format_model_usage_compact`]), `None` if the run has
+    /// no per-model usage recorded yet.
+    pub model_summary: Option<String>,
+}
+
+/// One row on [`Screen::Retro`]: a shipped ticket (Jira status category
+/// `Done`) with no recorded retro verdict yet, per
+/// `crate::jira::jql::shipped_awaiting_retro_jql`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetroRow {
+    /// Issue key, e.g. `PROJ-123`.
+    pub key: String,
+    /// One-line issue summary.
+    pub summary: String,
+    /// Browsable Jira URL, for `o`/`O`.
+    pub url: String,
+    /// Its latest `kind = "lane"` run's cost/model info, or `None` if it has
+    /// never had one (e.g. the work shipped manually) -- see
+    /// [`RetroRunInfo`]'s doc comment for why that's a distinct state from
+    /// this struct's fields being unset.
+    pub run: Option<RetroRunInfo>,
+}
+
+/// The severities [`Msg::RetroSeverityPickerUp`]/`Down` cycle through, in
+/// display order.
+pub const RETRO_SEVERITIES: [RetroSeverity; 3] = [
+    RetroSeverity::Minor,
+    RetroSeverity::Major,
+    RetroSeverity::Critical,
+];
+
 /// The fixed column order for [`Screen::Runs`]'s kanban board. All seven
 /// columns always render, even when empty.
 pub const RUN_COLUMNS: [crate::runs::RunStatus; 7] = [
@@ -646,6 +698,33 @@ pub struct App {
     /// -- built by [`browser_options_resolved`] once [`Cmd::ResolvePrForTicket`]
     /// reports a PR was found. Empty whenever the picker is closed.
     pub browser_picker_options: Vec<BrowserPickerOption>,
+    /// [`Screen::Retro`]'s ticket list: shipped tickets awaiting a retro
+    /// verdict, newest-resolved first. Kept entirely separate from
+    /// `columns`/`rank_tickets`, same reasoning as those two.
+    pub retro_tickets: Vec<RetroRow>,
+    /// Index into `retro_tickets` of the currently highlighted row.
+    pub retro_selected: usize,
+    /// Whether the defect-severity picker overlay is shown (see
+    /// [`Msg::RetroDefectStart`]).
+    pub show_retro_severity_picker: bool,
+    /// Index into [`RETRO_SEVERITIES`] of the currently highlighted severity.
+    pub retro_severity_selected: usize,
+    /// Whether the optional note-entry overlay is shown, following severity
+    /// selection in the defect flow.
+    pub show_retro_note_entry: bool,
+    /// The note's in-progress text, built up character by character while
+    /// [`App::show_retro_note_entry`] is set. Submitting with this empty
+    /// records no note at all, rather than an empty string.
+    pub retro_note_draft: String,
+    /// The ticket key a defect flow (severity picker, then note entry) is
+    /// in progress for. Captured at [`Msg::RetroDefectStart`] rather than
+    /// re-read off `retro_selected` at submit time, so the flow still
+    /// targets the right ticket even if -- not that anything currently lets
+    /// it -- the underlying list were to change out from under it.
+    pub retro_action_key: Option<String>,
+    /// The severity chosen by [`Msg::RetroSeverityPickerSelect`], carried
+    /// through the note-entry step to [`Msg::RetroNoteSubmit`].
+    pub retro_pending_severity: Option<RetroSeverity>,
 }
 
 impl App {
@@ -679,6 +758,11 @@ impl App {
     /// Whether a ticket is currently grabbed on [`Screen::Rank`].
     pub fn is_rank_grabbed(&self) -> bool {
         self.rank_grab_origin.is_some()
+    }
+
+    /// The currently highlighted row on [`Screen::Retro`], if any.
+    pub fn retro_selected_ticket(&self) -> Option<&RetroRow> {
+        self.retro_tickets.get(self.retro_selected)
     }
 
     /// The assignee filter picker's options, in display order: `Me`,
@@ -926,6 +1010,56 @@ pub enum Msg {
         /// stderr otherwise (e.g. no open PR, or already watching).
         result: Result<(), String>,
     },
+    /// Open the retro board. Only meaningful on [`Screen::Board`];
+    /// [`crate::tui::keymap::map_key`] only ever emits this from there.
+    OpenRetro,
+    /// The retro board's ticket list finished loading (already filtered
+    /// against recorded retro verdicts, and enriched with run cost/model
+    /// info -- see [`crate::tui::event::fetch_retro_tickets`]).
+    RetroTicketsLoaded(Vec<RetroRow>),
+    /// The retro board's ticket list failed to load.
+    RetroTicketsFailed(String),
+    /// The `d` key was pressed on [`Screen::Retro`] for the highlighted
+    /// ticket: begin the defect flow by opening the severity picker. A
+    /// no-op when nothing is highlighted.
+    RetroDefectStart,
+    /// Move the severity picker's highlighted option up.
+    RetroSeverityPickerUp,
+    /// Move the severity picker's highlighted option down.
+    RetroSeverityPickerDown,
+    /// Confirm the severity picker's highlighted option and move on to the
+    /// (optional) note-entry step.
+    RetroSeverityPickerSelect,
+    /// Cancel the defect flow from the severity picker, discarding it
+    /// entirely -- the ticket stays on the board, no verdict recorded.
+    RetroSeverityPickerClose,
+    /// Append `char` to the in-progress note.
+    RetroNoteChar(char),
+    /// Remove the last character of the in-progress note.
+    RetroNoteBackspace,
+    /// Submit the defect flow: record [`RetroVerdict::Defect`] with the
+    /// chosen severity and whatever note text has been typed (empty ->
+    /// `None`).
+    RetroNoteSubmit,
+    /// Cancel the defect flow from the note-entry step, discarding it
+    /// entirely -- same effect as [`Msg::RetroSeverityPickerClose`], one
+    /// step later.
+    RetroNoteCancel,
+    /// The `c` key was pressed on [`Screen::Retro`] for the highlighted
+    /// ticket: record [`RetroVerdict::Clean`] directly, no picker. A no-op
+    /// when nothing is highlighted.
+    RetroMarkClean,
+    /// [`Cmd::RecordRetro`] succeeded: drop `key` from `retro_tickets` (it
+    /// now has a verdict) and report it in the status line.
+    RetroRecorded {
+        /// Ticket key the verdict was recorded for.
+        key: String,
+        /// The verdict that was recorded.
+        verdict: RetroVerdict,
+    },
+    /// [`Cmd::RecordRetro`] failed: the ticket stays in `retro_tickets`
+    /// (nothing was written), and the error is reported in the status line.
+    RetroFailed(String),
 }
 
 /// I/O the caller should perform as a result of [`update`].
@@ -1069,6 +1203,27 @@ pub enum Cmd {
         /// [`Msg::BrowserOptionsResolved`] so it can open Jira directly when
         /// no PR is found without a second lookup.
         jira_url: String,
+    },
+    /// Fetch shipped tickets matching `jql` (built by
+    /// [`shipped_awaiting_retro_jql`]), filter out any that already have a
+    /// recorded retro verdict, and enrich the rest with their latest
+    /// `kind = "lane"` run's cost/model info, for [`Screen::Retro`].
+    FetchRetroTickets {
+        /// The JQL query to search with.
+        jql: String,
+    },
+    /// Record a retro verdict for `key`.
+    RecordRetro {
+        /// Ticket key to record a verdict for.
+        key: String,
+        /// The verdict.
+        verdict: RetroVerdict,
+        /// Defect severity; must be `Some` for
+        /// [`RetroVerdict::Defect`] and `None` for [`RetroVerdict::Clean`]
+        /// (enforced by [`crate::runs::RunStore::record_retro`]).
+        severity: Option<RetroSeverity>,
+        /// Optional free-text note.
+        notes: Option<String>,
     },
 }
 
@@ -1353,6 +1508,52 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 Ok(()) => format!("watching PR for {key}"),
                 Err(err) => format!("PR watch failed for {key}: {err}"),
             };
+            (app, Vec::new())
+        }
+        Msg::OpenRetro => open_retro(app),
+        Msg::RetroTicketsLoaded(tickets) => {
+            retro_tickets_loaded(&mut app, tickets);
+            (app, Vec::new())
+        }
+        Msg::RetroTicketsFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::RetroDefectStart => retro_defect_start(app),
+        Msg::RetroSeverityPickerUp => {
+            app.retro_severity_selected = app.retro_severity_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::RetroSeverityPickerDown => {
+            app.retro_severity_selected =
+                (app.retro_severity_selected + 1).min(RETRO_SEVERITIES.len() - 1);
+            (app, Vec::new())
+        }
+        Msg::RetroSeverityPickerSelect => retro_severity_picker_select(app),
+        Msg::RetroSeverityPickerClose => {
+            retro_cancel_defect_flow(&mut app);
+            (app, Vec::new())
+        }
+        Msg::RetroNoteChar(c) => {
+            app.retro_note_draft.push(c);
+            (app, Vec::new())
+        }
+        Msg::RetroNoteBackspace => {
+            app.retro_note_draft.pop();
+            (app, Vec::new())
+        }
+        Msg::RetroNoteSubmit => retro_note_submit(app),
+        Msg::RetroNoteCancel => {
+            retro_cancel_defect_flow(&mut app);
+            (app, Vec::new())
+        }
+        Msg::RetroMarkClean => retro_mark_clean(app),
+        Msg::RetroRecorded { key, verdict } => {
+            retro_recorded(&mut app, &key, verdict);
+            (app, Vec::new())
+        }
+        Msg::RetroFailed(err) => {
+            app.status_line = err;
             (app, Vec::new())
         }
     }
@@ -1835,6 +2036,153 @@ fn rank_cancel_grab(app: &mut App) {
     }
 }
 
+/// Handle [`Msg::OpenRetro`]: switch to [`Screen::Retro`] and fetch its
+/// ticket list. Resets every piece of in-progress defect-flow state, mostly
+/// as defense in depth -- normal navigation can't reach `Board` with any of
+/// it still set, since [`retro_recorded`]/[`retro_cancel_defect_flow`] always
+/// clear it first.
+fn open_retro(mut app: App) -> (App, Vec<Cmd>) {
+    app.screen = Screen::Retro;
+    app.retro_selected = 0;
+    app.show_retro_severity_picker = false;
+    app.show_retro_note_entry = false;
+    app.retro_note_draft.clear();
+    app.retro_action_key = None;
+    app.retro_pending_severity = None;
+    app.status_line = "Loading retro board...".to_string();
+    let jql = shipped_awaiting_retro_jql(&app.project_key);
+    (app, vec![Cmd::FetchRetroTickets { jql }])
+}
+
+/// Handle [`Msg::RetroTicketsLoaded`]: replace `retro_tickets` with server
+/// truth, preferring to keep the previously highlighted ticket selected if
+/// it still exists, otherwise clamping into the new bounds.
+fn retro_tickets_loaded(app: &mut App, tickets: Vec<RetroRow>) {
+    let preferred_key = app.retro_selected_ticket().map(|t| t.key.clone());
+    app.retro_tickets = tickets;
+    let found = preferred_key.is_some_and(|key| {
+        match app.retro_tickets.iter().position(|t| t.key == key) {
+            Some(pos) => {
+                app.retro_selected = pos;
+                true
+            }
+            None => false,
+        }
+    });
+    if !found {
+        clamp_retro_selected(app);
+    }
+}
+
+/// Clamp `retro_selected` into the bounds of `retro_tickets`, resetting to
+/// `0` when the list is empty.
+fn clamp_retro_selected(app: &mut App) {
+    match app.retro_tickets.len() {
+        0 => app.retro_selected = 0,
+        len if app.retro_selected >= len => app.retro_selected = len - 1,
+        _ => {}
+    }
+}
+
+/// Handle [`Msg::RetroDefectStart`]: capture the highlighted ticket's key
+/// and open the severity picker, highlighting [`RetroSeverity::Minor`]
+/// first. A no-op when nothing is highlighted.
+fn retro_defect_start(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.retro_selected_ticket() else {
+        return (app, Vec::new());
+    };
+    app.retro_action_key = Some(ticket.key.clone());
+    app.show_retro_severity_picker = true;
+    app.retro_severity_selected = 0;
+    (app, Vec::new())
+}
+
+/// Handle [`Msg::RetroSeverityPickerSelect`]: record the highlighted
+/// severity and move on to the note-entry step. A no-op (picker stays open)
+/// if `retro_action_key` is somehow unset -- defense in depth, since
+/// [`retro_defect_start`] is the only way to set `show_retro_severity_picker`
+/// and always sets it alongside `retro_action_key`.
+fn retro_severity_picker_select(mut app: App) -> (App, Vec<Cmd>) {
+    if app.retro_action_key.is_none() {
+        return (app, Vec::new());
+    }
+    let severity = RETRO_SEVERITIES[app.retro_severity_selected.min(RETRO_SEVERITIES.len() - 1)];
+    app.retro_pending_severity = Some(severity);
+    app.show_retro_severity_picker = false;
+    app.show_retro_note_entry = true;
+    app.retro_note_draft.clear();
+    (app, Vec::new())
+}
+
+/// Discard an in-progress defect flow (from either the severity picker or
+/// the note-entry step): the ticket stays on the board, nothing is recorded.
+fn retro_cancel_defect_flow(app: &mut App) {
+    app.show_retro_severity_picker = false;
+    app.show_retro_note_entry = false;
+    app.retro_note_draft.clear();
+    app.retro_action_key = None;
+    app.retro_pending_severity = None;
+}
+
+/// Handle [`Msg::RetroNoteSubmit`]: record [`RetroVerdict::Defect`] with the
+/// severity chosen earlier in the flow and whatever note text has been
+/// typed (trimmed; empty becomes `None` rather than recording a blank
+/// note). A no-op (clears the flow with nothing recorded) if
+/// `retro_action_key`/`retro_pending_severity` are somehow unset --
+/// [`retro_severity_picker_select`] always sets both before
+/// `show_retro_note_entry` goes up.
+fn retro_note_submit(mut app: App) -> (App, Vec<Cmd>) {
+    let key = app.retro_action_key.take();
+    let severity = app.retro_pending_severity.take();
+    let notes = std::mem::take(&mut app.retro_note_draft);
+    app.show_retro_note_entry = false;
+
+    let (Some(key), Some(severity)) = (key, severity) else {
+        return (app, Vec::new());
+    };
+    let notes = {
+        let trimmed = notes.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    (
+        app,
+        vec![Cmd::RecordRetro {
+            key,
+            verdict: RetroVerdict::Defect,
+            severity: Some(severity),
+            notes,
+        }],
+    )
+}
+
+/// Handle [`Msg::RetroMarkClean`]: record [`RetroVerdict::Clean`] for the
+/// highlighted ticket directly, no picker. A no-op when nothing is
+/// highlighted.
+fn retro_mark_clean(app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.retro_selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    (
+        app,
+        vec![Cmd::RecordRetro {
+            key,
+            verdict: RetroVerdict::Clean,
+            severity: None,
+            notes: None,
+        }],
+    )
+}
+
+/// Handle [`Msg::RetroRecorded`]: drop `key` from `retro_tickets` (it now
+/// has a verdict, so it's no longer awaiting one) and report it in the
+/// status line. Clamps `retro_selected` into the shrunk list's bounds.
+fn retro_recorded(app: &mut App, key: &str, verdict: RetroVerdict) {
+    app.retro_tickets.retain(|t| t.key != key);
+    clamp_retro_selected(app);
+    app.status_line = format!("Recorded {} for {key}", verdict.as_str());
+}
+
 /// Handle [`Msg::OpenFilterPicker`]: show the picker, highlight the currently
 /// active filter, and fetch assignable users if they haven't been cached yet.
 fn open_filter_picker(mut app: App) -> (App, Vec<Cmd>) {
@@ -1920,6 +2268,10 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
             }
             None => (app, Vec::new()),
         },
+        // `d`/`c` are the retro board's actions; `Enter` has nothing to
+        // drill into here, kept as a no-op so `Screen` stays exhaustively
+        // matched.
+        Screen::Retro => (app, Vec::new()),
     }
 }
 
@@ -1958,6 +2310,10 @@ fn back(app: &mut App) {
                 app.quit = true;
             }
         }
+        // `map_key` routes Esc/`q` to `Msg::RetroSeverityPickerClose`/
+        // `Msg::RetroNoteCancel` while either overlay is open, so `Back`
+        // only ever fires here with both closed.
+        Screen::Retro => app.screen = Screen::Board,
     }
 }
 
@@ -1990,6 +2346,9 @@ fn move_up(app: &mut App) {
             } else {
                 app.runs_selected_row = app.runs_selected_row.saturating_sub(1);
             }
+        }
+        Screen::Retro => {
+            app.retro_selected = app.retro_selected.saturating_sub(1);
         }
     }
 }
@@ -2028,6 +2387,11 @@ fn move_down(app: &mut App) {
                 if len > 0 {
                     app.runs_selected_row = (app.runs_selected_row + 1).min(len - 1);
                 }
+            }
+        }
+        Screen::Retro => {
+            if !app.retro_tickets.is_empty() {
+                app.retro_selected = (app.retro_selected + 1).min(app.retro_tickets.len() - 1);
             }
         }
     }
@@ -4875,5 +5239,303 @@ mod tests {
             app.lane_run_status.get("PROJ-1"),
             Some(&RunIndicator::Running)
         );
+    }
+
+    fn retro_row(key: &str) -> RetroRow {
+        RetroRow {
+            key: key.to_string(),
+            summary: format!("Summary for {key}"),
+            url: format!("https://example.atlassian.net/browse/{key}"),
+            run: None,
+        }
+    }
+
+    fn retro_board_with(rows: Vec<RetroRow>, selected: usize) -> App {
+        App {
+            screen: Screen::Retro,
+            retro_tickets: rows,
+            retro_selected: selected,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn open_retro_switches_screen_and_fetches_shipped_jql() {
+        let mut app = App::new();
+        app.project_key = "PROJ".to_string();
+        let (app, cmds) = update(app, Msg::OpenRetro);
+        assert_eq!(app.screen, Screen::Retro);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchRetroTickets {
+                jql: shipped_awaiting_retro_jql("PROJ")
+            }]
+        );
+    }
+
+    #[test]
+    fn open_retro_resets_defect_flow_state() {
+        let mut app = App::new();
+        app.show_retro_severity_picker = true;
+        app.show_retro_note_entry = true;
+        app.retro_note_draft = "leftover".to_string();
+        app.retro_action_key = Some("PROJ-1".to_string());
+        app.retro_pending_severity = Some(RetroSeverity::Major);
+        let (app, _cmds) = update(app, Msg::OpenRetro);
+        assert!(!app.show_retro_severity_picker);
+        assert!(!app.show_retro_note_entry);
+        assert!(app.retro_note_draft.is_empty());
+        assert_eq!(app.retro_action_key, None);
+        assert_eq!(app.retro_pending_severity, None);
+    }
+
+    #[test]
+    fn retro_tickets_loaded_replaces_list_and_clamps_selection() {
+        let app = retro_board_with(vec![retro_row("PROJ-1"), retro_row("PROJ-2")], 1);
+        let (app, cmds) = update(app, Msg::RetroTicketsLoaded(vec![retro_row("PROJ-3")]));
+        assert_eq!(app.retro_tickets, vec![retro_row("PROJ-3")]);
+        assert_eq!(app.retro_selected, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_tickets_loaded_preserves_selection_by_key_when_still_present() {
+        let app = retro_board_with(vec![retro_row("PROJ-1"), retro_row("PROJ-2")], 1);
+        let (app, _) = update(
+            app,
+            Msg::RetroTicketsLoaded(vec![
+                retro_row("PROJ-2"),
+                retro_row("PROJ-1"),
+                retro_row("PROJ-3"),
+            ]),
+        );
+        assert_eq!(app.retro_selected, 0);
+    }
+
+    #[test]
+    fn retro_tickets_failed_sets_status_line() {
+        let app = retro_board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::RetroTicketsFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn move_up_and_down_navigate_the_retro_list() {
+        let app = retro_board_with(vec![retro_row("PROJ-1"), retro_row("PROJ-2")], 0);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.retro_selected, 1);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.retro_selected, 1, "should clamp at the last row");
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.retro_selected, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.retro_selected, 0, "should clamp at the first row");
+    }
+
+    #[test]
+    fn back_on_retro_screen_returns_to_board() {
+        let app = retro_board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::Back);
+        assert_eq!(app.screen, Screen::Board);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_retro_screen_is_a_noop() {
+        let app = retro_board_with(vec![retro_row("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::Enter);
+        assert_eq!(app.screen, Screen::Retro);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_defect_start_captures_key_and_opens_severity_picker() {
+        let app = retro_board_with(vec![retro_row("PROJ-1"), retro_row("PROJ-2")], 1);
+        let (app, cmds) = update(app, Msg::RetroDefectStart);
+        assert_eq!(app.retro_action_key, Some("PROJ-2".to_string()));
+        assert!(app.show_retro_severity_picker);
+        assert_eq!(app.retro_severity_selected, 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_defect_start_with_no_selection_is_a_noop() {
+        let app = retro_board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::RetroDefectStart);
+        assert!(!app.show_retro_severity_picker);
+        assert_eq!(app.retro_action_key, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_severity_picker_navigation_clamps_at_bounds() {
+        let mut app = retro_board_with(vec![retro_row("PROJ-1")], 0);
+        app.show_retro_severity_picker = true;
+        let (app, _) = update(app, Msg::RetroSeverityPickerUp);
+        assert_eq!(app.retro_severity_selected, 0, "should clamp at zero");
+        let (app, _) = update(app, Msg::RetroSeverityPickerDown);
+        let (app, _) = update(app, Msg::RetroSeverityPickerDown);
+        let (app, _) = update(app, Msg::RetroSeverityPickerDown);
+        assert_eq!(
+            app.retro_severity_selected,
+            RETRO_SEVERITIES.len() - 1,
+            "should clamp at the last severity"
+        );
+    }
+
+    #[test]
+    fn retro_severity_picker_select_moves_to_note_entry() {
+        let mut app = retro_board_with(vec![retro_row("PROJ-1")], 0);
+        app.retro_action_key = Some("PROJ-1".to_string());
+        app.show_retro_severity_picker = true;
+        app.retro_severity_selected = 1;
+        let (app, cmds) = update(app, Msg::RetroSeverityPickerSelect);
+        assert!(!app.show_retro_severity_picker);
+        assert!(app.show_retro_note_entry);
+        assert_eq!(app.retro_pending_severity, Some(RetroSeverity::Major));
+        assert!(app.retro_note_draft.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_severity_picker_select_with_no_action_key_is_a_noop() {
+        let mut app = retro_board_with(vec![], 0);
+        app.show_retro_severity_picker = true;
+        let (app, _) = update(app, Msg::RetroSeverityPickerSelect);
+        assert!(app.show_retro_severity_picker, "picker should stay open");
+        assert!(!app.show_retro_note_entry);
+    }
+
+    #[test]
+    fn retro_severity_picker_close_discards_the_flow() {
+        let mut app = retro_board_with(vec![], 0);
+        app.show_retro_severity_picker = true;
+        app.retro_action_key = Some("PROJ-1".to_string());
+        let (app, cmds) = update(app, Msg::RetroSeverityPickerClose);
+        assert!(!app.show_retro_severity_picker);
+        assert_eq!(app.retro_action_key, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_note_char_and_backspace_edit_the_draft() {
+        let app = retro_board_with(vec![], 0);
+        let (app, _) = update(app, Msg::RetroNoteChar('h'));
+        let (app, _) = update(app, Msg::RetroNoteChar('i'));
+        assert_eq!(app.retro_note_draft, "hi");
+        let (app, _) = update(app, Msg::RetroNoteBackspace);
+        assert_eq!(app.retro_note_draft, "h");
+    }
+
+    #[test]
+    fn retro_note_submit_with_text_records_defect_with_note() {
+        let mut app = retro_board_with(vec![], 0);
+        app.retro_action_key = Some("PROJ-1".to_string());
+        app.retro_pending_severity = Some(RetroSeverity::Critical);
+        app.show_retro_note_entry = true;
+        app.retro_note_draft = "  it broke prod  ".to_string();
+        let (app, cmds) = update(app, Msg::RetroNoteSubmit);
+        assert!(!app.show_retro_note_entry);
+        assert_eq!(app.retro_action_key, None);
+        assert_eq!(app.retro_pending_severity, None);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RecordRetro {
+                key: "PROJ-1".to_string(),
+                verdict: RetroVerdict::Defect,
+                severity: Some(RetroSeverity::Critical),
+                notes: Some("it broke prod".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn retro_note_submit_with_blank_text_records_no_note() {
+        let mut app = retro_board_with(vec![], 0);
+        app.retro_action_key = Some("PROJ-1".to_string());
+        app.retro_pending_severity = Some(RetroSeverity::Minor);
+        app.show_retro_note_entry = true;
+        app.retro_note_draft = "   ".to_string();
+        let (_app, cmds) = update(app, Msg::RetroNoteSubmit);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RecordRetro {
+                key: "PROJ-1".to_string(),
+                verdict: RetroVerdict::Defect,
+                severity: Some(RetroSeverity::Minor),
+                notes: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn retro_note_submit_with_missing_flow_state_is_a_noop() {
+        let app = retro_board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::RetroNoteSubmit);
+        assert!(cmds.is_empty());
+        assert!(!app.show_retro_note_entry);
+    }
+
+    #[test]
+    fn retro_note_cancel_discards_the_flow() {
+        let mut app = retro_board_with(vec![], 0);
+        app.show_retro_note_entry = true;
+        app.retro_action_key = Some("PROJ-1".to_string());
+        app.retro_pending_severity = Some(RetroSeverity::Major);
+        app.retro_note_draft = "typed something".to_string();
+        let (app, cmds) = update(app, Msg::RetroNoteCancel);
+        assert!(!app.show_retro_note_entry);
+        assert_eq!(app.retro_action_key, None);
+        assert_eq!(app.retro_pending_severity, None);
+        assert!(app.retro_note_draft.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_mark_clean_emits_record_retro_with_no_severity() {
+        let app = retro_board_with(vec![retro_row("PROJ-1")], 0);
+        let (_app, cmds) = update(app, Msg::RetroMarkClean);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RecordRetro {
+                key: "PROJ-1".to_string(),
+                verdict: RetroVerdict::Clean,
+                severity: None,
+                notes: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn retro_mark_clean_with_no_selection_is_a_noop() {
+        let app = retro_board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::RetroMarkClean);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_recorded_drops_the_ticket_and_sets_status_line() {
+        let app = retro_board_with(vec![retro_row("PROJ-1"), retro_row("PROJ-2")], 1);
+        let (app, cmds) = update(
+            app,
+            Msg::RetroRecorded {
+                key: "PROJ-2".to_string(),
+                verdict: RetroVerdict::Clean,
+            },
+        );
+        assert_eq!(app.retro_tickets, vec![retro_row("PROJ-1")]);
+        assert_eq!(app.retro_selected, 0);
+        assert_eq!(app.status_line, "Recorded clean for PROJ-2");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn retro_failed_sets_status_line_and_keeps_the_ticket() {
+        let app = retro_board_with(vec![retro_row("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::RetroFailed("db locked".to_string()));
+        assert_eq!(app.status_line, "db locked");
+        assert_eq!(app.retro_tickets, vec![retro_row("PROJ-1")]);
+        assert!(cmds.is_empty());
     }
 }

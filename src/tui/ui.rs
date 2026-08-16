@@ -19,10 +19,10 @@ use ratatui::widgets::{
 };
 
 use crate::cli::runs::format_age;
-use crate::runs::RunStatus;
+use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
-    App, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, RUN_COLUMNS, RunCard,
-    RunIndicator, Screen, TicketSummary,
+    App, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, RETRO_SEVERITIES,
+    RUN_COLUMNS, RunCard, RunIndicator, Screen, TicketSummary,
 };
 use crate::tui::theme;
 
@@ -85,6 +85,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Rank => draw_rank_list(frame, app, body),
         Screen::Runs => draw_runs_board(frame, app, body),
+        Screen::Retro => draw_retro_list(frame, app, body),
         _ => draw_board_columns(frame, app, body),
     }
 
@@ -105,6 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_run_detail_window(frame, app);
             }
         }
+        Screen::Retro => {}
     }
 
     draw_status_bar(
@@ -128,6 +130,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.show_browser_picker {
         draw_browser_picker(frame, app);
+    }
+
+    if app.show_retro_severity_picker {
+        draw_retro_severity_picker(frame, app);
+    }
+
+    if app.show_retro_note_entry {
+        draw_retro_note_entry(frame, app);
     }
 }
 
@@ -175,7 +185,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  w work  b bots  v view run  L logs  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  w work  b bots  v view run  L logs  R retro  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -184,6 +194,9 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
         }
         Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
         Screen::Runs => "h/l/j/k: move  enter: detail  r: refresh  q: quit",
+        Screen::Retro => {
+            "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
+        }
     }
 }
 
@@ -587,6 +600,120 @@ fn draw_rank_list(frame: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.rank_selected.min(app.rank_tickets.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// [`Screen::Retro`]: a flat list of shipped tickets awaiting a verdict, one
+/// per row, showing each ticket's key, its latest lane run's cost and model
+/// mix (or `no run` when it never had one -- see
+/// [`crate::tui::app::RetroRunInfo`]'s doc comment for why that's kept
+/// visually distinct from a `$0.00` run), and its summary. An empty list
+/// renders as a plain "caught up" message rather than an empty bordered box,
+/// since an empty retro board is the steady state this screen is meant to
+/// reach, not an error or a loading state.
+fn draw_retro_list(frame: &mut Frame, app: &App, area: Rect) {
+    if app.retro_tickets.is_empty() {
+        let paragraph = Paragraph::new("Nothing awaiting a retro verdict -- you're caught up.")
+            .block(Block::default().borders(Borders::ALL).title("Retro"));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .retro_tickets
+        .iter()
+        .map(|ticket| {
+            let key_span = Span::styled(format!(" {}", ticket.key), theme::CARD_KEY);
+            let run_span = match &ticket.run {
+                None => Span::styled("  no run".to_string(), theme::DIM),
+                Some(run) => {
+                    let cost = run
+                        .cost_usd
+                        .map(|cost| format!("${cost:.2}"))
+                        .unwrap_or_else(|| "pending".to_string());
+                    let model = run.model_summary.as_deref().unwrap_or("no model usage");
+                    Span::raw(format!("  {cost}  {model}"))
+                }
+            };
+            let summary_span = Span::raw(format!("  {}", ticket.summary));
+            ListItem::new(Line::from(vec![key_span, run_span, summary_span]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Retro"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    state.select(Some(app.retro_selected.min(app.retro_tickets.len() - 1)));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The display label for a [`RetroSeverity`], for
+/// [`draw_retro_severity_picker`]'s option list.
+fn retro_severity_label(severity: RetroSeverity) -> &'static str {
+    match severity {
+        RetroSeverity::Minor => "Minor",
+        RetroSeverity::Major => "Major",
+        RetroSeverity::Critical => "Critical",
+    }
+}
+
+/// A centered floating window listing [`RETRO_SEVERITIES`], for the defect
+/// flow's severity step ([`Msg::RetroDefectStart`]). Structurally identical
+/// to [`draw_lane_picker`] -- synchronous, fixed options, no "active" marker.
+///
+/// [`Msg::RetroDefectStart`]: crate::tui::app::Msg::RetroDefectStart
+fn draw_retro_severity_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = RETRO_SEVERITIES
+        .iter()
+        .map(|severity| ListItem::new(format!("  {}", retro_severity_label(*severity))))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Severity")),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    state.select(Some(
+        app.retro_severity_selected.min(RETRO_SEVERITIES.len() - 1),
+    ));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A centered floating window for the defect flow's optional note step
+/// ([`Msg::RetroSeverityPickerSelect`]): a single line of free text built up
+/// character by character (see `Msg::RetroNoteChar`/`Backspace`), `Enter` to
+/// submit (empty is fine -- no note gets recorded), `Esc` to cancel the whole
+/// defect flow.
+///
+/// [`Msg::RetroSeverityPickerSelect`]: crate::tui::app::Msg::RetroSeverityPickerSelect
+fn draw_retro_note_entry(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(app.retro_note_draft.clone()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter to submit (blank = no note), Esc to cancel",
+            theme::DIM,
+        )),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title("Note (optional)")),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 /// How many seconds without a heartbeat before a running card is marked
@@ -1355,8 +1482,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::jira::types::{Status, StatusCategory, Transition};
+    use crate::runs::RetroSeverity;
     use crate::tui::app::BrowserPickerOption;
-    use crate::tui::app::{Column, TicketSummary, group_into_columns};
+    use crate::tui::app::{
+        Column, RETRO_SEVERITIES, RetroRow, RetroRunInfo, TicketSummary, group_into_columns,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1469,6 +1599,7 @@ mod tests {
             "b bots",
             "v view run",
             "L logs",
+            "R retro",
             "?",
             "q",
         ] {
@@ -2360,6 +2491,126 @@ mod tests {
         };
         let text = buffer_text(&render(&app));
         assert!(!text.contains("Filter:"));
+    }
+
+    fn retro_row(key: &str, run: Option<RetroRunInfo>) -> RetroRow {
+        RetroRow {
+            key: key.to_string(),
+            summary: "Fix the thing".to_string(),
+            url: format!("https://example.atlassian.net/browse/{key}"),
+            run,
+        }
+    }
+
+    #[test]
+    fn draws_retro_list_with_run_shows_cost_and_model_mix() {
+        let app = App {
+            screen: Screen::Retro,
+            retro_tickets: vec![retro_row(
+                "PROJ-1",
+                Some(RetroRunInfo {
+                    cost_usd: Some(4.5),
+                    model_summary: Some("fable-5 58.6k out".to_string()),
+                }),
+            )],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("PROJ-1"));
+        assert!(text.contains("$4.50"));
+        assert!(text.contains("fable-5 58.6k out"));
+        assert!(text.contains("Fix the thing"));
+    }
+
+    #[test]
+    fn draws_retro_list_with_no_run_shows_no_run_not_dollar_zero() {
+        let app = App {
+            screen: Screen::Retro,
+            retro_tickets: vec![retro_row("PROJ-1", None)],
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("no run"));
+        assert!(!text.contains("$0.00"));
+    }
+
+    #[test]
+    fn draws_retro_empty_list_shows_a_caught_up_message_not_a_blank_box() {
+        let app = App {
+            screen: Screen::Retro,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Nothing awaiting a retro verdict"));
+    }
+
+    #[test]
+    fn retro_screen_does_not_show_board_columns_behind_it() {
+        let app = App {
+            screen: Screen::Retro,
+            retro_tickets: vec![retro_row("PROJ-1", None)],
+            ..three_column_app()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("To Do (1)"));
+        assert!(!text.contains("In Progress (1)"));
+        assert!(!text.contains("Done (1)"));
+    }
+
+    #[test]
+    fn retro_hint_documents_its_keys() {
+        let hint = hint_for(Screen::Retro, false);
+        for key in [
+            "j/k",
+            "d defect",
+            "c clean",
+            "r refresh",
+            "Esc back",
+            "q quit",
+        ] {
+            assert!(
+                hint.contains(key),
+                "retro hint should mention `{key}`: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn draws_retro_severity_picker_lists_every_severity() {
+        let app = App {
+            screen: Screen::Retro,
+            show_retro_severity_picker: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Severity"));
+        assert!(text.contains("Minor"));
+        assert!(text.contains("Major"));
+        assert!(text.contains("Critical"));
+    }
+
+    #[test]
+    fn retro_severity_label_covers_every_variant() {
+        for severity in RETRO_SEVERITIES {
+            assert!(!retro_severity_label(severity).is_empty());
+        }
+        assert_eq!(retro_severity_label(RetroSeverity::Minor), "Minor");
+        assert_eq!(retro_severity_label(RetroSeverity::Major), "Major");
+        assert_eq!(retro_severity_label(RetroSeverity::Critical), "Critical");
+    }
+
+    #[test]
+    fn draws_retro_note_entry_shows_the_draft_and_instructions() {
+        let app = App {
+            screen: Screen::Retro,
+            show_retro_note_entry: true,
+            retro_note_draft: "it broke prod".to_string(),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Note"));
+        assert!(text.contains("it broke prod"));
+        assert!(text.contains("Enter to submit"));
     }
 
     #[test]

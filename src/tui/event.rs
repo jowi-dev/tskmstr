@@ -35,13 +35,31 @@ use crate::tui::app::{
     lane_run_indicator,
 };
 use crate::tui::app::{jql_for_filter, update};
-use crate::tui::keymap::map_key;
+use crate::tui::keymap::{RetroOverlay, map_key};
 use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
 use crate::work::tmux::TmuxOps;
 
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Which of [`Screen::Retro`]'s overlays `app` currently has open, for
+/// [`map_key`]'s `retro_overlay` parameter. The two `App` fields are mutually
+/// exclusive by construction (see [`App::show_retro_note_entry`]'s doc
+/// comment), so `show_retro_note_entry` is checked first without needing to
+/// assert the other is unset.
+///
+/// [`Screen::Retro`]: crate::tui::app::Screen::Retro
+/// [`App::show_retro_note_entry`]: crate::tui::app::App::show_retro_note_entry
+fn retro_overlay_for(app: &App) -> RetroOverlay {
+    if app.show_retro_note_entry {
+        RetroOverlay::NoteEntry
+    } else if app.show_retro_severity_picker {
+        RetroOverlay::SeverityPicker
+    } else {
+        RetroOverlay::None
+    }
+}
 
 /// How long [`resolve_pr_for_ticket`]'s `gh pr list` lookup (the `o` key's
 /// PR-vs-Jira picker) waits before giving up and falling back to opening
@@ -240,6 +258,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
+                    retro_overlay_for(&app),
                     key_event.code,
                 )
             {
@@ -574,6 +593,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
+                    RetroOverlay::None,
                     key_event.code,
                 )
             {
@@ -811,6 +831,13 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
+        Cmd::FetchRetroTickets { jql } => fetch_retro_tickets(deps, &jql),
+        Cmd::RecordRetro {
+            key,
+            verdict,
+            severity,
+            notes,
+        } => record_retro(deps, &key, verdict, severity, notes.as_deref()),
         // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
         // alternate screen around the blocking `tmux attach` call);
         // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
@@ -1140,6 +1167,87 @@ fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
     }
 }
 
+/// Run `Cmd::FetchRetroTickets`: search for shipped tickets matching `jql`,
+/// drop any that already have a recorded retro verdict (via
+/// [`crate::runs::RunStore::retro_verdicts_for_tickets`]'s batch lookup), and
+/// enrich the rest with their latest `kind = "lane"` run's cost/model info,
+/// for [`crate::tui::app::Screen::Retro`].
+///
+/// Requires `deps.store`: unlike the board's badge polls (which degrade to
+/// an empty map when the runs DB is unavailable, since badges are best-effort
+/// enrichment of a still-useful board), the retro board's entire reason to
+/// exist is filtering by recorded verdicts -- showing an unfiltered list
+/// would be actively misleading, not just less enriched. So a missing store
+/// fails the whole screen with a status-line message instead.
+pub fn fetch_retro_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
+    let tickets = match search_tickets(deps, jql) {
+        Ok(tickets) => tickets,
+        Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
+    };
+    let Some(store) = &deps.store else {
+        return vec![Msg::RetroTicketsFailed(
+            "run database unavailable".to_string(),
+        )];
+    };
+
+    let keys: Vec<String> = tickets.iter().map(|t| t.key.clone()).collect();
+    let verdicts = match store.retro_verdicts_for_tickets(&keys) {
+        Ok(verdicts) => verdicts,
+        Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
+    };
+
+    let mut rows = Vec::new();
+    for ticket in tickets {
+        if verdicts.contains_key(&ticket.key) {
+            continue;
+        }
+        let run = match store.latest_run_for_ticket_kind(&ticket.key, Some("lane")) {
+            Ok(Some(run)) => Some(crate::tui::app::RetroRunInfo {
+                cost_usd: run.cost_usd,
+                model_summary: run
+                    .model_usage
+                    .as_deref()
+                    .and_then(crate::runs::parse_model_usage)
+                    .and_then(|usage| crate::runs::format_model_usage_compact(&usage)),
+            }),
+            Ok(None) => None,
+            Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
+        };
+        rows.push(crate::tui::app::RetroRow {
+            key: ticket.key,
+            summary: ticket.summary,
+            url: ticket.url,
+            run,
+        });
+    }
+    vec![Msg::RetroTicketsLoaded(rows)]
+}
+
+/// Run `Cmd::RecordRetro`: record a retro verdict via
+/// [`crate::runs::RunStore::record_retro`].
+///
+/// `deps.store` being unavailable degrades to [`Msg::RetroFailed`] rather
+/// than a panic -- the same "never freeze or crash the board" stance every
+/// other store-backed command here takes.
+pub fn record_retro(
+    deps: &TuiDeps,
+    key: &str,
+    verdict: crate::runs::RetroVerdict,
+    severity: Option<crate::runs::RetroSeverity>,
+    notes: Option<&str>,
+) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::RetroFailed("run database unavailable".to_string())];
+    };
+    match store.record_retro(key, verdict, severity, notes) {
+        Ok(()) => vec![Msg::RetroRecorded {
+            key: key.to_string(),
+            verdict,
+        }],
+        Err(err) => vec![Msg::RetroFailed(err.to_string())],
+    }
+}
+
 /// Run `Cmd::RankTicket`: move `key` to its new position relative to
 /// `anchor`, reporting a human-readable confirmation on success (e.g.
 /// `Ranked PROJ-3 above PROJ-7`).
@@ -1331,7 +1439,7 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
 mod tests {
     use super::*;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::jql::my_open_tickets_jql;
+    use crate::jira::jql::{my_open_tickets_jql, shipped_awaiting_retro_jql};
     use crate::jira::types::{IssueFields, JiraUser, Status, StatusCategory};
 
     fn issue(key: &str, status: &str) -> Issue {
@@ -1742,6 +1850,231 @@ mod tests {
             [Msg::RankFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
             other => panic!("expected RankFailed, got {other:?}"),
         }
+    }
+
+    // --- Cmd::FetchRetroTickets / fetch_retro_tickets ---
+
+    #[test]
+    fn fetch_retro_tickets_with_no_store_reports_unavailable() {
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "Done")],
+            next_page_token: None,
+        });
+        let mut deps = deps(jira);
+        deps.store = None;
+        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        assert_eq!(
+            msgs,
+            vec![Msg::RetroTicketsFailed(
+                "run database unavailable".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn fetch_retro_tickets_search_failure_reports_failed() {
+        let jira = FakeJiraClient::new().with_search_error(500, "boom");
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps(jira);
+        deps.store = Some(store);
+        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RetroTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            other => panic!("expected RetroTicketsFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_retro_tickets_excludes_tickets_with_a_recorded_verdict() {
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "Done"), issue("PROJ-2", "Done")],
+            next_page_token: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store
+            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .unwrap();
+        let mut deps = deps(jira);
+        deps.store = Some(store);
+
+        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RetroTicketsLoaded(rows)] => {
+                let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+                assert_eq!(keys, vec!["PROJ-2"]);
+            }
+            other => panic!("expected RetroTicketsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_retro_tickets_ticket_with_no_run_has_run_none() {
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "Done")],
+            next_page_token: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps(jira);
+        deps.store = Some(store);
+
+        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RetroTicketsLoaded(rows)] => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].key, "PROJ-1");
+                assert_eq!(rows[0].run, None);
+            }
+            other => panic!("expected RetroTicketsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_retro_tickets_ticket_with_a_lane_run_reports_cost_and_model_mix() {
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "Done")],
+            next_page_token: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                run_id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    cost_usd: Some(4.5),
+                    model_usage: Some(
+                        r#"{"claude-fable-5":{"outputTokens":58564,"costUSD":4.5}}"#.to_string(),
+                    ),
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+        let mut deps = deps(jira);
+        deps.store = Some(store);
+
+        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        match msgs.as_slice() {
+            [Msg::RetroTicketsLoaded(rows)] => {
+                let run = rows[0].run.as_ref().expect("expected a run");
+                assert_eq!(run.cost_usd, Some(4.5));
+                assert_eq!(run.model_summary.as_deref(), Some("fable-5 58.6k out"));
+            }
+            other => panic!("expected RetroTicketsLoaded, got {other:?}"),
+        }
+    }
+
+    // --- Cmd::RecordRetro / record_retro ---
+
+    #[test]
+    fn record_retro_clean_success_emits_retro_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = record_retro(
+            &deps,
+            "PROJ-1",
+            crate::runs::RetroVerdict::Clean,
+            None,
+            None,
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::RetroRecorded {
+                key: "PROJ-1".to_string(),
+                verdict: crate::runs::RetroVerdict::Clean,
+            }]
+        );
+    }
+
+    #[test]
+    fn record_retro_defect_with_severity_and_note_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = record_retro(
+            &deps,
+            "PROJ-1",
+            crate::runs::RetroVerdict::Defect,
+            Some(crate::runs::RetroSeverity::Critical),
+            Some("it broke prod"),
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::RetroRecorded {
+                key: "PROJ-1".to_string(),
+                verdict: crate::runs::RetroVerdict::Defect,
+            }]
+        );
+        let recorded = deps
+            .store
+            .as_ref()
+            .unwrap()
+            .latest_retro_for_ticket("PROJ-1")
+            .unwrap()
+            .expect("expected a recorded retro");
+        assert_eq!(
+            recorded.severity,
+            Some(crate::runs::RetroSeverity::Critical)
+        );
+        assert_eq!(recorded.notes.as_deref(), Some("it broke prod"));
+    }
+
+    #[test]
+    fn record_retro_defect_with_no_severity_reports_the_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+
+        let msgs = record_retro(
+            &deps,
+            "PROJ-1",
+            crate::runs::RetroVerdict::Defect,
+            None,
+            None,
+        );
+        match msgs.as_slice() {
+            [Msg::RetroFailed(message)] => {
+                assert_eq!(
+                    message,
+                    "--severity is required when recording a defect retro"
+                );
+            }
+            other => panic!("expected RetroFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_retro_with_no_store_reports_unavailable() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+        let msgs = record_retro(
+            &deps,
+            "PROJ-1",
+            crate::runs::RetroVerdict::Clean,
+            None,
+            None,
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::RetroFailed("run database unavailable".to_string())]
+        );
     }
 
     #[test]

@@ -5,6 +5,21 @@ use crossterm::event::KeyCode;
 
 use crate::tui::app::{Msg, Screen};
 
+/// Which of [`Screen::Retro`]'s two floating overlays (if any) is currently
+/// shown, bundled into one parameter rather than two separate booleans
+/// (mirroring the mutual exclusivity of the app's `show_retro_severity_picker`
+/// and `show_retro_note_entry` fields -- only one is ever set at a time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetroOverlay {
+    /// Neither overlay is shown; ordinary [`Screen::Retro`] bindings apply.
+    #[default]
+    None,
+    /// The defect-severity picker is shown.
+    SeverityPicker,
+    /// The note-entry overlay is shown.
+    NoteEntry,
+}
+
 /// Key bindings active on [`Screen::Rank`]. `Enter`/`Space` grab or drop the
 /// highlighted ticket; every other binding falls through to the shared
 /// bindings below (navigation, `r`, `o`, `?`, `Esc`/`q`).
@@ -67,6 +82,16 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// lookup. `O` is the escape hatch that preserves that always-instant
 /// behavior even where `o` no longer does.
 ///
+/// While [`Screen::Retro`]'s severity picker is shown
+/// (`retro_overlay == RetroOverlay::SeverityPicker`), the same
+/// `j`/`k`/arrows/`Enter`/`Esc`/`q` shape applies again, routed to
+/// `RetroSeverityPicker*`. While its note-entry overlay is shown
+/// (`retro_overlay == RetroOverlay::NoteEntry`), every printable character
+/// is bound to `Msg::RetroNoteChar` (so typing `q` or `?` inserts a
+/// character rather than quitting or opening help), `Backspace` deletes the
+/// last one, `Enter` submits, and `Esc` cancels -- deliberately not `q`,
+/// since `q` needs to be typeable.
+///
 /// [`Msg::OpenBrowserAction`]: crate::tui::app::Msg::OpenBrowserAction
 /// [`Msg::OpenInBrowser`]: crate::tui::app::Msg::OpenInBrowser
 #[allow(clippy::too_many_arguments)]
@@ -78,6 +103,7 @@ pub fn map_key(
     show_browser_picker: bool,
     rank_grabbed: bool,
     show_run_detail: bool,
+    retro_overlay: RetroOverlay,
     key: KeyCode,
 ) -> Option<Msg> {
     if show_help {
@@ -113,6 +139,26 @@ pub fn map_key(
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::BrowserPickerUp),
             KeyCode::Enter => Some(Msg::BrowserPickerSelect),
             KeyCode::Esc | KeyCode::Char('q') => Some(Msg::BrowserPickerClose),
+            _ => None,
+        };
+    }
+
+    if retro_overlay == RetroOverlay::SeverityPicker {
+        return match key {
+            KeyCode::Char('j') | KeyCode::Down => Some(Msg::RetroSeverityPickerDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(Msg::RetroSeverityPickerUp),
+            KeyCode::Enter => Some(Msg::RetroSeverityPickerSelect),
+            KeyCode::Esc | KeyCode::Char('q') => Some(Msg::RetroSeverityPickerClose),
+            _ => None,
+        };
+    }
+
+    if retro_overlay == RetroOverlay::NoteEntry {
+        return match key {
+            KeyCode::Enter => Some(Msg::RetroNoteSubmit),
+            KeyCode::Esc => Some(Msg::RetroNoteCancel),
+            KeyCode::Backspace => Some(Msg::RetroNoteBackspace),
+            KeyCode::Char(c) => Some(Msg::RetroNoteChar(c)),
             _ => None,
         };
     }
@@ -155,6 +201,9 @@ pub fn map_key(
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
+        KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
+        KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
+        KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
         _ => None,
     }
 }
@@ -181,7 +230,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    key
+                    RetroOverlay::None,
+                    key,
                 ),
                 Some(expected)
             );
@@ -199,7 +249,17 @@ mod tests {
         for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
             for (key, ref expected) in cases.clone() {
                 assert_eq!(
-                    map_key(&screen, false, false, false, false, false, false, key),
+                    map_key(
+                        &screen,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        RetroOverlay::None,
+                        key
+                    ),
                     Some(expected.clone())
                 );
             }
@@ -218,7 +278,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Enter
+                    RetroOverlay::None,
+                    KeyCode::Enter,
                 ),
                 Some(Msg::Enter)
             );
@@ -237,7 +298,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Esc
+                    RetroOverlay::None,
+                    KeyCode::Esc,
                 ),
                 Some(Msg::Back)
             );
@@ -250,7 +312,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('q')
+                    RetroOverlay::None,
+                    KeyCode::Char('q'),
                 ),
                 Some(Msg::Back)
             );
@@ -268,7 +331,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::Refresh)
         );
@@ -285,7 +349,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('o')
+                RetroOverlay::None,
+                KeyCode::Char('o'),
             ),
             Some(Msg::OpenBrowserAction)
         );
@@ -308,7 +373,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('o')
+                    RetroOverlay::None,
+                    KeyCode::Char('o'),
                 ),
                 Some(Msg::OpenInBrowser),
                 "o should still open Jira directly off the board on {screen:?}"
@@ -334,7 +400,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('O')
+                    RetroOverlay::None,
+                    KeyCode::Char('O'),
                 ),
                 Some(Msg::OpenInBrowser),
                 "O should always open Jira directly on {screen:?}"
@@ -352,7 +419,17 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, false, true, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 Some(expected)
             );
         }
@@ -369,7 +446,8 @@ mod tests {
                 true,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::BrowserPickerSelect)
         );
@@ -386,7 +464,8 @@ mod tests {
                 true,
                 false,
                 false,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::BrowserPickerClose)
         );
@@ -399,7 +478,8 @@ mod tests {
                 true,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::BrowserPickerClose)
         );
@@ -419,7 +499,17 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Board, false, false, false, true, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 None
             );
         }
@@ -436,7 +526,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('?')
+                RetroOverlay::None,
+                KeyCode::Char('?'),
             ),
             Some(Msg::ToggleHelp)
         );
@@ -453,7 +544,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('z')
+                RetroOverlay::None,
+                KeyCode::Char('z'),
             ),
             None
         );
@@ -466,7 +558,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Tab
+                RetroOverlay::None,
+                KeyCode::Tab,
             ),
             None
         );
@@ -483,7 +576,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('z')
+                RetroOverlay::None,
+                KeyCode::Char('z'),
             ),
             Some(Msg::ToggleHelp)
         );
@@ -496,7 +590,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::ToggleHelp)
         );
@@ -509,7 +604,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::ToggleHelp)
         );
@@ -526,7 +622,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::Quit)
         );
@@ -543,7 +640,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('f')
+                RetroOverlay::None,
+                KeyCode::Char('f'),
             ),
             Some(Msg::OpenFilterPicker)
         );
@@ -561,7 +659,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('f')
+                    RetroOverlay::None,
+                    KeyCode::Char('f'),
                 ),
                 None
             );
@@ -578,7 +677,17 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, true, false, false, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 Some(expected)
             );
         }
@@ -595,7 +704,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::FilterPickerSelect)
         );
@@ -612,7 +722,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::FilterPickerClose)
         );
@@ -625,7 +736,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::FilterPickerClose)
         );
@@ -642,7 +754,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('p')
+                RetroOverlay::None,
+                KeyCode::Char('p'),
             ),
             Some(Msg::OpenRank)
         );
@@ -660,7 +773,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('p')
+                    RetroOverlay::None,
+                    KeyCode::Char('p'),
                 ),
                 None
             );
@@ -678,7 +792,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('a')
+                RetroOverlay::None,
+                KeyCode::Char('a'),
             ),
             Some(Msg::AuditAction)
         );
@@ -701,7 +816,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('a')
+                    RetroOverlay::None,
+                    KeyCode::Char('a'),
                 ),
                 None
             );
@@ -719,7 +835,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('w')
+                RetroOverlay::None,
+                KeyCode::Char('w'),
             ),
             Some(Msg::LaneRunAction)
         );
@@ -742,7 +859,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('w')
+                    RetroOverlay::None,
+                    KeyCode::Char('w'),
                 ),
                 None
             );
@@ -760,7 +878,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('b')
+                RetroOverlay::None,
+                KeyCode::Char('b'),
             ),
             Some(Msg::BotsAction)
         );
@@ -783,7 +902,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('b')
+                    RetroOverlay::None,
+                    KeyCode::Char('b'),
                 ),
                 None
             );
@@ -800,7 +920,17 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, true, false, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 Some(expected)
             );
         }
@@ -817,7 +947,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::LanePickerSelect)
         );
@@ -834,7 +965,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::LanePickerClose)
         );
@@ -847,7 +979,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::LanePickerClose)
         );
@@ -866,7 +999,17 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Board, false, false, true, false, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 None
             );
         }
@@ -883,7 +1026,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::RankGrabToggle)
         );
@@ -896,7 +1040,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char(' ')
+                RetroOverlay::None,
+                KeyCode::Char(' '),
             ),
             Some(Msg::RankGrabToggle)
         );
@@ -914,7 +1059,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char(' ')
+                    RetroOverlay::None,
+                    KeyCode::Char(' '),
                 ),
                 None
             );
@@ -932,7 +1078,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('j')
+                RetroOverlay::None,
+                KeyCode::Char('j'),
             ),
             Some(Msg::Down)
         );
@@ -945,7 +1092,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('k')
+                RetroOverlay::None,
+                KeyCode::Char('k'),
             ),
             Some(Msg::Up)
         );
@@ -958,7 +1106,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::Back)
         );
@@ -971,7 +1120,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::Back)
         );
@@ -984,7 +1134,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::Refresh)
         );
@@ -997,7 +1148,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('o')
+                RetroOverlay::None,
+                KeyCode::Char('o'),
             ),
             Some(Msg::OpenInBrowser)
         );
@@ -1010,7 +1162,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('?')
+                RetroOverlay::None,
+                KeyCode::Char('?'),
             ),
             Some(Msg::ToggleHelp)
         );
@@ -1027,7 +1180,8 @@ mod tests {
                 false,
                 true,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             None
         );
@@ -1044,7 +1198,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::Refresh)
         );
@@ -1065,8 +1220,28 @@ mod tests {
             KeyCode::Char(' '),
         ] {
             assert_eq!(
-                map_key(&Screen::Rank, false, false, false, false, true, false, key),
-                map_key(&Screen::Rank, false, false, false, false, false, false, key),
+                map_key(
+                    &Screen::Rank,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
+                map_key(
+                    &Screen::Rank,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 "key {key:?} should behave the same grabbed or not"
             );
         }
@@ -1084,7 +1259,8 @@ mod tests {
                     false,
                     true,
                     false,
-                    KeyCode::Char('r')
+                    RetroOverlay::None,
+                    KeyCode::Char('r'),
                 ),
                 Some(Msg::Refresh)
             );
@@ -1103,7 +1279,17 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Board, false, true, false, false, false, false, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    key
+                ),
                 None
             );
         }
@@ -1120,7 +1306,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('h')
+                RetroOverlay::None,
+                KeyCode::Char('h'),
             ),
             Some(Msg::Left)
         );
@@ -1133,7 +1320,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('l')
+                RetroOverlay::None,
+                KeyCode::Char('l'),
             ),
             Some(Msg::Right)
         );
@@ -1146,7 +1334,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('j')
+                RetroOverlay::None,
+                KeyCode::Char('j'),
             ),
             Some(Msg::Down)
         );
@@ -1159,7 +1348,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('k')
+                RetroOverlay::None,
+                KeyCode::Char('k'),
             ),
             Some(Msg::Up)
         );
@@ -1172,7 +1362,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Enter
+                RetroOverlay::None,
+                KeyCode::Enter,
             ),
             Some(Msg::Enter)
         );
@@ -1185,7 +1376,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::Refresh)
         );
@@ -1198,7 +1390,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::Back)
         );
@@ -1211,7 +1404,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::Back)
         );
@@ -1228,7 +1422,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Char('j')
+                RetroOverlay::None,
+                KeyCode::Char('j'),
             ),
             Some(Msg::Down)
         );
@@ -1241,7 +1436,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Down
+                RetroOverlay::None,
+                KeyCode::Down,
             ),
             Some(Msg::Down)
         );
@@ -1254,7 +1450,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Char('k')
+                RetroOverlay::None,
+                KeyCode::Char('k'),
             ),
             Some(Msg::Up)
         );
@@ -1267,7 +1464,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Up
+                RetroOverlay::None,
+                KeyCode::Up,
             ),
             Some(Msg::Up)
         );
@@ -1280,7 +1478,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Esc
+                RetroOverlay::None,
+                KeyCode::Esc,
             ),
             Some(Msg::Back)
         );
@@ -1293,7 +1492,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Char('q')
+                RetroOverlay::None,
+                KeyCode::Char('q'),
             ),
             Some(Msg::Back)
         );
@@ -1306,7 +1506,8 @@ mod tests {
                 false,
                 false,
                 true,
-                KeyCode::Char('r')
+                RetroOverlay::None,
+                KeyCode::Char('r'),
             ),
             Some(Msg::Refresh)
         );
@@ -1323,7 +1524,17 @@ mod tests {
             KeyCode::Char('z'),
         ] {
             assert_eq!(
-                map_key(&Screen::Runs, false, false, false, false, false, true, key),
+                map_key(
+                    &Screen::Runs,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    RetroOverlay::None,
+                    key
+                ),
                 None
             );
         }
@@ -1341,7 +1552,8 @@ mod tests {
                     false,
                     false,
                     true,
-                    KeyCode::Char('r')
+                    RetroOverlay::None,
+                    KeyCode::Char('r'),
                 ),
                 Some(Msg::Refresh)
             );
@@ -1359,7 +1571,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('v')
+                RetroOverlay::None,
+                KeyCode::Char('v'),
             ),
             Some(Msg::ViewRunAction)
         );
@@ -1378,7 +1591,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('v')
+                    RetroOverlay::None,
+                    KeyCode::Char('v'),
                 ),
                 None
             );
@@ -1396,7 +1610,8 @@ mod tests {
                 false,
                 false,
                 false,
-                KeyCode::Char('L')
+                RetroOverlay::None,
+                KeyCode::Char('L'),
             ),
             Some(Msg::ViewLogsAction)
         );
@@ -1415,7 +1630,8 @@ mod tests {
                     false,
                     false,
                     false,
-                    KeyCode::Char('L')
+                    RetroOverlay::None,
+                    KeyCode::Char('L'),
                 ),
                 None
             );
@@ -1437,9 +1653,316 @@ mod tests {
         ];
         for (key, expected) in cases {
             assert_eq!(
-                map_key(&Screen::Board, false, false, false, false, false, true, key),
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    RetroOverlay::None,
+                    key
+                ),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn capital_r_opens_retro_board_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('R')
+            ),
+            Some(Msg::OpenRetro)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+            Screen::Retro,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('R')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn d_and_c_trigger_retro_actions_on_retro_screen_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('d')
+            ),
+            Some(Msg::RetroDefectStart)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('c')
+            ),
+            Some(Msg::RetroMarkClean)
+        );
+        for screen in [
+            Screen::Board,
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            for key in [KeyCode::Char('d'), KeyCode::Char('c')] {
+                assert_eq!(
+                    map_key(
+                        &screen,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        RetroOverlay::None,
+                        key
+                    ),
+                    None,
+                    "{key:?} should be unbound off the retro screen"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retro_screen_still_maps_shared_navigation_and_action_keys() {
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('j')
+            ),
+            Some(Msg::Down)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('r')
+            ),
+            Some(Msg::Refresh)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Esc
+            ),
+            Some(Msg::Back)
+        );
+    }
+
+    #[test]
+    fn retro_severity_picker_navigation_keys_map_to_up_and_down() {
+        let cases = [
+            (KeyCode::Char('j'), Msg::RetroSeverityPickerDown),
+            (KeyCode::Down, Msg::RetroSeverityPickerDown),
+            (KeyCode::Char('k'), Msg::RetroSeverityPickerUp),
+            (KeyCode::Up, Msg::RetroSeverityPickerUp),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                map_key(
+                    &Screen::Retro,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::SeverityPicker,
+                    key
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn retro_severity_picker_enter_selects_and_esc_or_q_close_it() {
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::SeverityPicker,
+                KeyCode::Enter
+            ),
+            Some(Msg::RetroSeverityPickerSelect)
+        );
+        for key in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(
+                map_key(
+                    &Screen::Retro,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::SeverityPicker,
+                    key
+                ),
+                Some(Msg::RetroSeverityPickerClose)
+            );
+        }
+    }
+
+    #[test]
+    fn retro_severity_picker_open_makes_other_keys_inert() {
+        for key in [
+            KeyCode::Char('r'),
+            KeyCode::Char('o'),
+            KeyCode::Char('d'),
+            KeyCode::Char('c'),
+            KeyCode::Char('?'),
+            KeyCode::Char('z'),
+        ] {
+            assert_eq!(
+                map_key(
+                    &Screen::Retro,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::SeverityPicker,
+                    key
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn retro_note_entry_types_printable_characters_including_q_and_question_mark() {
+        for c in ['a', 'q', '?', ' ', 'Z'] {
+            assert_eq!(
+                map_key(
+                    &Screen::Retro,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::NoteEntry,
+                    KeyCode::Char(c)
+                ),
+                Some(Msg::RetroNoteChar(c)),
+                "{c:?} should type into the note, not trigger its usual binding"
+            );
+        }
+    }
+
+    #[test]
+    fn retro_note_entry_backspace_enter_and_esc() {
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::NoteEntry,
+                KeyCode::Backspace
+            ),
+            Some(Msg::RetroNoteBackspace)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::NoteEntry,
+                KeyCode::Enter
+            ),
+            Some(Msg::RetroNoteSubmit)
+        );
+        assert_eq!(
+            map_key(
+                &Screen::Retro,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::NoteEntry,
+                KeyCode::Esc
+            ),
+            Some(Msg::RetroNoteCancel)
+        );
     }
 }
