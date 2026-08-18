@@ -16,3 +16,4 @@ pub mod review_watch;
 pub mod run;
 pub mod runner;
 pub mod tmux;
+pub mod vdiff;

@@ -949,6 +949,142 @@ pub fn prepare_run_lane(
     })
 }
 
+/// Errors that can occur while running [`prepare_review_fix`].
+#[derive(Debug, Error)]
+pub enum ReviewFixError {
+    /// The worktree has uncommitted changes. See [`prepare_review_fix`]'s
+    /// doc comment for why this check is kept even though (unlike
+    /// [`prepare_run_lane`]'s freshly-branched worktree) this branch
+    /// legitimately carries the PR's already-committed history.
+    #[error(
+        "worktree {} has uncommitted changes — resolve or stash them before dispatching a fix pass",
+        .0.display()
+    )]
+    WorktreeDirty(PathBuf),
+
+    /// A `git` shell-out failed.
+    #[error(transparent)]
+    Git(#[from] GitError),
+
+    /// Hook deployment failed.
+    #[error(transparent)]
+    Hooks(#[from] HooksError),
+
+    /// A run-state store operation failed.
+    #[error(transparent)]
+    RunStore(#[from] RunStoreError),
+
+    /// A filesystem/output-write operation failed.
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+
+    /// Serializing the generated hooks `--settings` JSON to disk failed.
+    #[error("failed to serialize settings JSON: {0}")]
+    SettingsJson(#[from] serde_json::Error),
+}
+
+/// Prepare a `tm review fix <KEY>` run (`crate::cli::review::fix`): the
+/// `review-fix` analogue of [`prepare_run_lane`], for dispatching a Claude
+/// fix pass over `vdiff`-captured review comments on a ticket's *existing*
+/// lane-run worktree and branch — see
+/// `docs/plans/board-vdiff-review-loop.md`.
+///
+/// Unlike [`prepare_run_lane`], this never provisions a worktree or cuts a
+/// branch — both are already resolved by the caller (from the ticket's
+/// latest `kind = "lane"` run row) and passed in as `worktree`/`branch`
+/// unchanged. That collapses most of `prepare_run_lane`'s preflight, which
+/// exists specifically to create a *new* branch off a *resolved* base:
+///
+/// - **Base-branch resolution, blocker stacking, worktree provisioning,
+///   branch naming/cutting: dropped entirely.** None of them have anything
+///   to resolve when there is no new branch to cut.
+/// - **Prompt-file resolution: dropped.** The caller (`crate::cli::review::fix`)
+///   builds `prompt` itself from the `vdiff --export-comments` markdown, not
+///   from a lane's configured prompt file.
+/// - **Dirty-worktree check: kept, but re-justified.** `prepare_run_lane`'s
+///   version guards against a *previous run* leaving uncommitted work behind
+///   on what is supposed to be a fresh branch. That framing does not apply
+///   here — this branch legitimately has the PR's commits already on it —
+///   but the underlying hazard is the same: uncommitted local changes (left
+///   by an interrupted previous review-fix run, or picked up by hand while
+///   reviewing in `vdiff`) would get silently folded into this fix pass's
+///   session and attributed to it. So the check stays, just worded for this
+///   case ([`ReviewFixError::WorktreeDirty`]) instead of reused verbatim.
+/// - **Hook deployment, [`RunStore::start_run`], [`build_claude_invocation`]:
+///   kept unchanged**, exactly as in `prepare_run_lane`.
+///
+/// Run rows are started with `kind = "review-fix"`, distinct from `"lane"`
+/// so this run never shadows the ticket's lane run in
+/// [`RunStore::latest_run_for_ticket_kind`] lookups — a second `tm review
+/// fix` on the same ticket must resolve *its own* worktree/branch from the
+/// lane run, not from a previous fix pass.
+///
+/// `pid` follows [`prepare_run_lane`]'s convention: `Some(current pid)` for
+/// a foreground dispatch (this process is the driver and stays alive for
+/// the whole run), `None` for a detached dispatch, whose caller re-execs the
+/// same `tm work __supervise` supervisor [`prepare_run_lane`]'s detached path
+/// uses (see `src/work/detach.rs`) — the supervisor only reads back a
+/// [`PreparedRun`], so it has no idea (and no need to know) whether the run
+/// it's supervising is a lane run or a review-fix run.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_review_fix(
+    git: &dyn GitOps,
+    run_store: &RunStore,
+    clock: &dyn Clock,
+    paths: &RunLanePaths,
+    ticket: &str,
+    lane: &str,
+    worktree: &Path,
+    branch: &str,
+    prompt: String,
+    pid: Option<u32>,
+) -> Result<PreparedRun, ReviewFixError> {
+    if !git.status_is_clean(worktree)? {
+        return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
+    }
+
+    let settings = hooks::deploy_hooks(&paths.hooks_deploy_dir)?;
+    let settings_path = paths.hooks_deploy_dir.join("settings.json");
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+
+    let run_id = run_store.start_run(&StartRun {
+        ticket: ticket.to_string(),
+        lane: lane.to_string(),
+        worktree: worktree.to_string_lossy().into_owned(),
+        branch: Some(branch.to_string()),
+        pid,
+        kind: "review-fix".to_string(),
+        log_path: None,
+    })?;
+
+    let invocation = build_claude_invocation(ClaudeInvocationInputs {
+        prompt,
+        model: None,
+        max_turns: None,
+        permission_mode: None,
+        settings_path: settings_path.clone(),
+        run_id: Some(run_id.to_string()),
+    });
+
+    let (year, month, day, hour, min, sec) = clock.now_parts();
+    let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);
+    std::fs::create_dir_all(&paths.state_dir)?;
+    let wt_name = format!("{}-review-fix", ticket.to_lowercase());
+    let out_json_path = paths.state_dir.join(format!("{wt_name}-{timestamp}.json"));
+
+    Ok(PreparedRun {
+        run_id,
+        lane: lane.to_string(),
+        ticket: Some(ticket.to_string()),
+        wt_name,
+        timestamp,
+        worktree: worktree.to_path_buf(),
+        branch: branch.to_string(),
+        invocation,
+        out_json_path,
+    })
+}
+
 /// Regex matching a GitHub pull-request URL in free-form text, mirroring
 /// `work.ml`'s `grep -oE 'https://github[^ )]*/pull/[0-9]+'` fallback scrape
 /// of the run's result text.
@@ -3437,5 +3573,114 @@ mod tests {
         assert!(matches!(err, RunLaneError::MultipleUnmergedBlockers { .. }));
         assert!(spawner.recorded.lock().unwrap().is_empty());
         assert_eq!(run_store.list_runs().unwrap().len(), 0);
+    }
+
+    fn review_fix_paths(tmp: &TempDir) -> RunLanePaths {
+        RunLanePaths {
+            home: tmp.path().join("home"),
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        }
+    }
+
+    #[test]
+    fn prepare_review_fix_starts_a_review_fix_run_on_the_existing_worktree_and_branch() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let prepared = prepare_review_fix(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            "PROJ-1",
+            "mylane",
+            &worktree,
+            "jowi-dev/proj-1-slug",
+            "fix the review comments".to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.worktree, worktree);
+        assert_eq!(prepared.branch, "jowi-dev/proj-1-slug");
+        assert_eq!(prepared.ticket, Some("PROJ-1".to_string()));
+        assert!(
+            prepared
+                .invocation
+                .args
+                .contains(&"fix the review comments".to_string())
+        );
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.kind, "review-fix");
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(run.lane, "mylane");
+        assert_eq!(run.worktree, worktree.to_string_lossy());
+        assert_eq!(run.branch, Some("jowi-dev/proj-1-slug".to_string()));
+
+        // No worktree provisioning and no branch cut -- this is the whole
+        // point of prepare_review_fix over prepare_run_lane.
+        assert!(git.provision_worktree_calls().is_empty());
+        assert!(git.switch_new_branch_calls().is_empty());
+    }
+
+    #[test]
+    fn prepare_review_fix_refuses_a_dirty_worktree_and_creates_no_run_row() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new().with_status_is_clean(Ok(false));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+
+        let err = prepare_review_fix(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            "PROJ-1",
+            "mylane",
+            &worktree,
+            "jowi-dev/proj-1-slug",
+            "fix the review comments".to_string(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ReviewFixError::WorktreeDirty(path) if path == worktree));
+        assert_eq!(run_store.list_runs().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn prepare_review_fix_records_the_current_pid_when_given_one() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+
+        let prepared = prepare_review_fix(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            "PROJ-1",
+            "mylane",
+            &worktree,
+            "jowi-dev/proj-1-slug",
+            "fix the review comments".to_string(),
+            Some(4242),
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.pid, Some(4242));
     }
 }

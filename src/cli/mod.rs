@@ -15,6 +15,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 pub mod auth;
 pub mod pr;
 pub mod ready;
+pub mod review;
 pub mod runs;
 pub mod ticket;
 pub mod work;
@@ -129,6 +130,36 @@ pub enum Command {
         /// Which work action to perform.
         #[command(subcommand)]
         cmd: WorkCmd,
+    },
+    /// Close the code-review loop over a ticket's `vdiff`-captured review
+    /// comments (see `docs/plans/board-vdiff-review-loop.md`).
+    Review {
+        /// Which review action to perform.
+        #[command(subcommand)]
+        cmd: ReviewCmd,
+    },
+}
+
+/// `tm review` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ReviewCmd {
+    /// Dispatch a Claude fix pass over the review comments `vdiff` captured
+    /// for KEY's lane-run worktree.
+    ///
+    /// Resolves KEY's latest `kind = "lane"` run to find its worktree and
+    /// branch, exports the comments `vdiff.nvim` captured there via `vdiff
+    /// --export-comments`, and — if any were captured — dispatches a
+    /// tracked `review-fix` run in that same worktree, on that same branch.
+    /// No new worktree, no new branch. Exits with a distinct code and
+    /// creates no run row if no comments were captured.
+    Fix {
+        /// Jira issue key of the ticket whose lane-run worktree holds the
+        /// captured review comments, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Run synchronously in the foreground, waiting for `claude` to
+        /// finish before returning, instead of the detached default.
+        #[arg(long)]
+        fg: bool,
     },
 }
 
