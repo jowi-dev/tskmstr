@@ -1,6 +1,27 @@
 # Board vdiff review loop (issue #1)
 
-Status: planned.
+Status: implemented 2026-08-18 (commits `ce24ddd`..`4322e39`, merged as two
+halves). Deviations from the plan below:
+
+- `tm review fix` grew a `--fg` flag, mirroring `tm work run`'s, rather than
+  being detach-only.
+- `prepare_review_fix` keeps `prepare_run_lane`'s dirty-worktree check. The
+  plan left this an open question; the call is that uncommitted changes here
+  come from an interrupted prior run or manual edits made during `vdiff`
+  review, and would otherwise be silently folded into the fix-pass session.
+- The detached path reuses the existing `tm work __supervise` supervisor
+  unchanged — it only ever reads back a `PreparedRun` and has no notion of
+  lane vs. review-fix, so no new entry point was needed.
+- `vdiff --export-comments`'s "No comments." is returned verbatim as
+  `Ok(String)` from the `VdiffOps` seam rather than modeled as an error
+  variant; it's a normal outcome, not a fault. The CLI maps it to exit code 3.
+- The reducers gate on `App::lane_run_status` rather than hitting the run
+  store, since a ticket absent from that map has no lane run at all. `V`
+  additionally refuses while the indicator is `Starting` (no run row yet, so
+  no worktree to resolve); `F` deliberately does not, since `tm review fix`'s
+  own preflight fails fast with its own stderr.
+
+Manual verification below is still open.
 
 Close the code-review loop from the `tm board` TUI without leaving the
 keyboard: open the focused ticket's PR in `vdiff` for review, then dispatch a
