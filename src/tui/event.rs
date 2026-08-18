@@ -155,10 +155,11 @@ pub struct TuiDeps {
     pub lanes: std::collections::BTreeMap<String, crate::config::LaneConfig>,
 }
 
-/// One board-launched child (`tm work run` or `tm pr watch`) that hasn't yet
-/// reported completion, tracked by [`run`]'s event loop between [`run_cmds`]'s
-/// [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`] interception (which creates
-/// the entry) and [`poll_pending_launches`] (which removes it once
+/// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
+/// fix`) that hasn't yet reported completion, tracked by [`run`]'s event loop
+/// between [`run_cmds`]'s [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
+/// [`Cmd::LaunchReviewFix`] interception (which creates the entry) and
+/// [`poll_pending_launches`] (which removes it once
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] resolves).
 struct PendingLaunch {
     /// The ticket key the launch was for, echoed back in the result `Msg`.
@@ -179,6 +180,8 @@ enum PendingLaunchKind {
     LaneRun,
     /// `tm pr watch <key>`; reports [`Msg::BotWatchLaunchResult`].
     BotWatch,
+    /// `tm review fix <key>`; reports [`Msg::ReviewFixLaunchResult`].
+    ReviewFix,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -284,18 +287,22 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// transitions after opening the detail screen).
 ///
 /// [`Cmd::AttachAudit`] is intercepted here rather than passed to `execute`:
-/// see the module docs. [`Cmd::LaunchLaneRun`] is intercepted for the same
-/// kind of reason -- it needs mutable access to `launches`, the in-flight
-/// launcher registry, which `execute`'s signature has no access to. A spawn
-/// failure feeds an immediate [`Msg::LaneRunLaunchResult`] error straight
-/// through `update`; a spawn success instead pushes a [`PendingLaunch`] onto
-/// `launches` for [`poll_pending_launches`] to resolve later, once its
+/// see the module docs. [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
+/// [`Cmd::LaunchReviewFix`] are intercepted for the same kind of reason --
+/// they need mutable access to `launches`, the in-flight launcher registry,
+/// which `execute`'s signature has no access to. A spawn failure feeds an
+/// immediate launch-result `Msg` error straight through `update`; a spawn
+/// success instead pushes a [`PendingLaunch`] onto `launches` for
+/// [`poll_pending_launches`] to resolve later, once its
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] reports completion.
-/// [`Cmd::ResolvePrForTicket`] is intercepted for yet another reason: it
-/// needs `&mut Terminal` to force a status-line redraw before its blocking
-/// `gh pr list` call, so the "resolving PR for <key>..." message set by
-/// `update`'s `open_browser_action` is actually on screen for the (bounded)
-/// wait rather than only appearing after it -- see [`resolve_pr_for_ticket`].
+/// [`Cmd::ViewDiff`] is intercepted like [`Cmd::AttachAudit`] (needs `&mut
+/// Terminal` to suspend/restore around the blocking `vdiff` call -- see
+/// [`view_diff`]). [`Cmd::ResolvePrForTicket`] is intercepted for yet
+/// another reason: it needs `&mut Terminal` to force a status-line redraw
+/// before its blocking `gh pr list` call, so the "resolving PR for
+/// <key>..." message set by `update`'s `open_browser_action` is actually on
+/// screen for the (bounded) wait rather than only appearing after it -- see
+/// [`resolve_pr_for_ticket`].
 ///
 /// Generic over the terminal backend (rather than fixed to
 /// [`CrosstermBackend`]) purely so tests can drive it with
@@ -335,6 +342,27 @@ fn run_cmds<B: Backend>(
         if let Cmd::ViewLogs { key } = cmd {
             let message = view_logs(terminal, deps.store.as_ref(), &deps.home, &key);
             let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::ViewDiff { key } = cmd {
+            let message = view_diff(terminal, deps.store.as_ref(), &key);
+            let (next_app, more_cmds) = update(app, Msg::DiffActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::LaunchReviewFix { key } = cmd {
+            let argv = review_fix_argv(&key);
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps,
+                launches,
+                key,
+                PendingLaunchKind::ReviewFix,
+                &argv,
+            );
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -391,6 +419,15 @@ fn bot_watch_argv(key: &str) -> Vec<String> {
     vec!["pr".to_string(), "watch".to_string(), key.to_string()]
 }
 
+/// The argv [`Cmd::LaunchReviewFix`] spawns through
+/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm review fix <key>`, the
+/// fixed contract agreed in `docs/plans/board-vdiff-review-loop.md`'s
+/// "Decisions" section between this board half and `tm review fix`'s own
+/// (concurrently developed) CLI half.
+fn review_fix_argv(key: &str) -> Vec<String> {
+    vec!["review".to_string(), "fix".to_string(), key.to_string()]
+}
+
 /// Spawn `argv` as a watched child for `key`, registering it in `launches` on
 /// success. A spawn failure never reaches the registry: it feeds the matching
 /// launch-result `Msg` (an `Err`) straight back through `update`, returning
@@ -418,6 +455,7 @@ fn launch_result_msg(kind: PendingLaunchKind, key: String, result: Result<(), St
     match kind {
         PendingLaunchKind::LaneRun => Msg::LaneRunLaunchResult { key, result },
         PendingLaunchKind::BotWatch => Msg::BotWatchLaunchResult { key, result },
+        PendingLaunchKind::ReviewFix => Msg::ReviewFixLaunchResult { key, result },
     }
 }
 
@@ -544,6 +582,89 @@ fn view_logs<B: Backend>(
         Ok(status) if status.success() => format!("viewed log for {key}"),
         Ok(status) => format!("less exited with {status}"),
         Err(err) => format!("failed to launch pager: {err}"),
+    }
+}
+
+/// Resolves the worktree directory [`Cmd::ViewDiff`] should launch `vdiff`
+/// in: `key`'s latest `kind = "lane"` run's `worktree` column, per
+/// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section (`vdiff`
+/// has no `--pr` flag and detects the base branch itself, so the run row's
+/// recorded `worktree` is all that's needed -- no path reconstruction).
+///
+/// Pulled out of [`view_diff`] so this resolution logic -- unlike the actual
+/// `vdiff` launch, which needs a real terminal and a real subprocess --
+/// stays unit-testable (see this module's tests). Checks the worktree still
+/// exists on disk before returning it: a run row can outlive `tm work
+/// remove`, which deletes the worktree but not its run history.
+fn resolve_vdiff_worktree(
+    store: Option<&crate::runs::RunStore>,
+    key: &str,
+) -> Result<std::path::PathBuf, String> {
+    let store = store.ok_or_else(|| "no run store available".to_string())?;
+    let run = crate::cli::runs::resolve_run(store, key, Some("lane"))
+        .map_err(|_| format!("no lane run for {key}"))?;
+    let worktree = std::path::PathBuf::from(&run.worktree);
+    if !worktree.is_dir() {
+        return Err(format!(
+            "worktree {} for {key} no longer exists",
+            run.worktree
+        ));
+    }
+    Ok(worktree)
+}
+
+/// Run [`Cmd::ViewDiff`]: resolve `key`'s lane-run worktree (via
+/// [`resolve_vdiff_worktree`]) and open it in `vdiff`, suspending and
+/// restoring the board's terminal state around the blocking call exactly
+/// like [`view_logs`]/[`attach_audit`] -- `vdiff` is an interactive GUI/TUI
+/// that needs the real TTY, per
+/// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section. No
+/// `--pr`/PR-resolution flags are passed: `vdiff` detects the worktree's base
+/// branch itself.
+///
+/// Every failure mode is a status-line message rather than an error: no run
+/// store, no lane run, a worktree that's since been removed (all three from
+/// [`resolve_vdiff_worktree`]), and -- the one case only reachable past the
+/// suspend/restore dance -- `vdiff` missing from `PATH`, distinguished from
+/// other spawn failures via [`std::io::ErrorKind::NotFound`] so it reads as
+/// "not installed" rather than looking like the board hung.
+///
+/// ## What's unit-tested vs. deferred to manual verification
+///
+/// [`resolve_vdiff_worktree`]'s resolution logic is exercised directly in
+/// this module's tests. The actual `vdiff` launch and its interaction with a
+/// real terminal are not -- matching [`view_logs`]'s and
+/// `crate::tui::launcher::RealLaunchHandle`'s existing carve-outs for this
+/// class of mechanics. Verify manually per
+/// `docs/plans/board-vdiff-review-loop.md`'s "Manual verification" section.
+fn view_diff<B: Backend>(
+    terminal: &mut Terminal<B>,
+    store: Option<&crate::runs::RunStore>,
+    key: &str,
+) -> String {
+    let worktree = match resolve_vdiff_worktree(store, key) {
+        Ok(worktree) => worktree,
+        Err(message) => return message,
+    };
+
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+
+    let result = std::process::Command::new("vdiff")
+        .current_dir(&worktree)
+        .status();
+
+    let _ = enable_raw_mode();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = terminal.clear();
+
+    match result {
+        Ok(status) if status.success() => format!("reviewed {key} in vdiff"),
+        Ok(status) => format!("vdiff exited with {status}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            "vdiff not found on PATH".to_string()
+        }
+        Err(err) => format!("failed to launch vdiff: {err}"),
     }
 }
 
@@ -838,9 +959,10 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
             severity,
             notes,
         } => record_retro(deps, &key, verdict, severity, notes.as_deref()),
-        // `Cmd::AttachAudit` needs `&mut Terminal` (to suspend/restore the
-        // alternate screen around the blocking `tmux attach` call);
-        // `Cmd::LaunchLaneRun`/`Cmd::LaunchBotWatch` need `&mut
+        // `Cmd::AttachAudit`/`Cmd::ViewDiff` need `&mut Terminal` (to
+        // suspend/restore the alternate screen around a blocking call --
+        // `tmux attach`/`vdiff`, respectively); `Cmd::LaunchLaneRun`/
+        // `Cmd::LaunchBotWatch`/`Cmd::LaunchReviewFix` need `&mut
         // Vec<PendingLaunch>` (the in-flight launcher registry);
         // `Cmd::ResolvePrForTicket` needs `&mut Terminal` too, to force a
         // redraw before its blocking (bounded) `gh pr list` call runs -- none
@@ -858,6 +980,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
         | Cmd::ViewLogs { .. }
+        | Cmd::ViewDiff { .. }
+        | Cmd::LaunchReviewFix { .. }
         | Cmd::ResolvePrForTicket { .. }) => {
             debug_assert!(
                 false,
