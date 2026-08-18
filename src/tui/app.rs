@@ -939,6 +939,36 @@ pub enum Msg {
     /// human-readable status-line message -- mirrors
     /// [`Msg::AuditActionResult`]'s single-string-variant shape.
     LogsActionResult(String),
+    /// The `V` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// open its worktree in `vdiff` for review, per
+    /// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section. A
+    /// no-op when no ticket is selected; degrades to a status-line message
+    /// (via [`view_diff_action`]) when the ticket has no lane run, rather
+    /// than emitting [`Cmd::ViewDiff`] with nothing to launch.
+    ViewDiffAction,
+    /// The outcome of [`Cmd::ViewDiff`], already rendered to a
+    /// human-readable status-line message -- mirrors
+    /// [`Msg::LogsActionResult`]'s single-string-variant shape.
+    DiffActionResult(String),
+    /// The `F` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// dispatch a fix pass over the review comments captured for it in
+    /// `vdiff`, per `docs/plans/board-vdiff-review-loop.md`. A no-op when no
+    /// ticket is selected; degrades to a status-line message (via
+    /// [`review_fix_action`]) when the ticket has no lane run, rather than
+    /// spawning `tm review fix` with no worktree to run it in.
+    ReviewFixAction,
+    /// The outcome of [`Cmd::LaunchReviewFix`] for `key`: a watched-child
+    /// spawn through the same [`crate::tui::launcher::LaneLauncher`] seam
+    /// [`Msg::LaneRunLaunchResult`]/[`Msg::BotWatchLaunchResult`] use.
+    /// `Ok(())` means `tm review fix <key>` exited zero (the fix pass is
+    /// dispatched and detached); `Err` carries its stderr, e.g. "no comments
+    /// captured" or "no lane run for `<key>`".
+    ReviewFixLaunchResult {
+        /// Ticket key the fix pass was dispatched for.
+        key: String,
+        /// Outcome of the watched launcher child.
+        result: Result<(), String>,
+    },
     /// A reap pass completed, having reaped `0` reports as a no-op status
     /// line.
     RunsReaped(usize),
@@ -1192,6 +1222,29 @@ pub enum Cmd {
         /// Ticket key to view the latest run's log for.
         key: String,
     },
+    /// Open `key`'s worktree (its latest `kind = "lane"` run's `worktree`)
+    /// in `vdiff`, suspending and restoring the board's terminal state
+    /// around the blocking call -- handled specially by the board's event
+    /// loop, exactly like [`Cmd::ViewLogs`] and [`Cmd::AttachAudit`], since
+    /// `vdiff` is an interactive GUI/TUI that needs the real TTY (see
+    /// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section for why
+    /// this is foreground/suspending rather than the watched-child seam
+    /// [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
+    /// [`Cmd::LaunchReviewFix`] use).
+    ViewDiff {
+        /// Ticket key to open the latest lane run's worktree for.
+        key: String,
+    },
+    /// Dispatch a fix pass over `key`'s captured `vdiff` review comments
+    /// (`tm review fix <key>`, spawned via `std::env::current_exe()` as a
+    /// watched child process through the same
+    /// [`crate::tui::launcher::LaneLauncher`] seam [`Cmd::LaunchLaneRun`]/
+    /// [`Cmd::LaunchBotWatch`] use -- see
+    /// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section).
+    LaunchReviewFix {
+        /// Ticket key to dispatch a fix pass for.
+        key: String,
+    },
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::OpenBrowserAction`]'s picker-or-direct-open decision. Reports
     /// back as [`Msg::BrowserOptionsResolved`]. One `gh` call, made only on
@@ -1432,6 +1485,19 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ViewLogsAction => view_logs_action(app),
         Msg::LogsActionResult(message) => {
             app.status_line = message;
+            (app, Vec::new())
+        }
+        Msg::ViewDiffAction => view_diff_action(app),
+        Msg::DiffActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
+        Msg::ReviewFixAction => review_fix_action(app),
+        Msg::ReviewFixLaunchResult { key, result } => {
+            app.status_line = match result {
+                Ok(()) => format!("fix pass dispatched for {key}"),
+                Err(err) => format!("fix pass for {key} failed: {err}"),
+            };
             (app, Vec::new())
         }
         Msg::RunsReaped(count) => {
@@ -1835,6 +1901,76 @@ fn view_logs_action(app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     (app, vec![Cmd::ViewLogs { key }])
+}
+
+/// Handle [`Msg::ViewDiffAction`]: open the selected board ticket's worktree
+/// in `vdiff`, per `docs/plans/board-vdiff-review-loop.md`'s "Decisions"
+/// section.
+///
+/// A no-op (off [`Screen::Board`], or with no ticket selected) mirroring
+/// [`view_logs_action`]'s guard shape. Gating is otherwise state-driven, not
+/// column/status-driven (matching `a`/`w`, which have no per-status gating
+/// either): a ticket with no entry in `lane_run_status` has no lane run at
+/// all -- [`lane_run_indicator`] maps every possible run row to `Some`, so a
+/// missing entry can only mean "no run row exists" -- and thus no worktree
+/// for `vdiff` to open, so this sets a status-line message instead of
+/// emitting [`Cmd::ViewDiff`]. A ticket whose lane run is still
+/// [`RunIndicator::Starting`] (launcher child in flight, no run row yet)
+/// gets the same treatment: there is no worktree path to resolve until the
+/// run row exists. Every other indicator has a real run row -- and thus a
+/// `worktree` column to resolve -- so [`Cmd::ViewDiff`]'s own resolution
+/// (see [`crate::tui::event::resolve_vdiff_worktree`]) is left to catch the
+/// rarer case of a worktree that was since removed (`tm work remove`).
+fn view_diff_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    match app.lane_run_status.get(&key) {
+        None => {
+            app.status_line = format!("no lane run for {key} -- press w first");
+            (app, Vec::new())
+        }
+        Some(RunIndicator::Starting) => {
+            app.status_line = format!("lane run for {key} is still starting");
+            (app, Vec::new())
+        }
+        Some(_) => (app, vec![Cmd::ViewDiff { key }]),
+    }
+}
+
+/// Handle [`Msg::ReviewFixAction`]: dispatch a fix pass over `key`'s
+/// captured `vdiff` review comments, per
+/// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section.
+///
+/// A no-op (off [`Screen::Board`], or with no ticket selected), and the same
+/// "no lane run at all" gate [`view_diff_action`] uses -- for the identical
+/// reason: `tm review fix` needs the ticket's existing worktree and branch,
+/// which only exist once a lane run has provisioned them. Unlike
+/// `view_diff_action`, a `RunIndicator::Starting` ticket is *not* blocked
+/// here: the fix pass is a watched-child launch (like `w`/`b`), so it is
+/// fine to queue it up even before the lane run's own preflight finishes --
+/// `tm review fix`'s own preflight (see the module doc comment on
+/// `docs/plans/board-vdiff-review-loop.md`) will simply fail fast with a
+/// clear stderr message if the worktree still doesn't exist by the time it
+/// runs, which [`Msg::ReviewFixLaunchResult`] surfaces in the status line.
+fn review_fix_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    if !app.lane_run_status.contains_key(&key) {
+        app.status_line = format!("no lane run for {key} -- press w first");
+        return (app, Vec::new());
+    }
+    app.status_line = format!("dispatching fix pass for {key}");
+    (app, vec![Cmd::LaunchReviewFix { key }])
 }
 
 /// Handle [`Msg::Tick`]: a no-op off [`Screen::Runs`]/[`Screen::Board`].
@@ -4931,6 +5067,160 @@ mod tests {
         let app = board_with(vec![], 0);
         let (app, cmds) = update(app, Msg::LogsActionResult("no log for PROJ-1".to_string()));
         assert_eq!(app.status_line, "no log for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::ViewDiffAction / Msg::DiffActionResult ---
+
+    #[test]
+    fn view_diff_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::ViewDiffAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_diff_action_off_the_board_screen_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (_app, cmds) = update(app, Msg::ViewDiffAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_diff_action_with_no_lane_run_sets_status_message_and_no_launch() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::ViewDiffAction);
+        assert_eq!(app.status_line, "no lane run for PROJ-1 -- press w first");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_diff_action_with_starting_lane_run_sets_status_message_and_no_launch() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Starting);
+        let (app, cmds) = update(app, Msg::ViewDiffAction);
+        assert_eq!(app.status_line, "lane run for PROJ-1 is still starting");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_diff_action_with_a_lane_run_emits_view_diff() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Done);
+        let (_app, cmds) = update(app, Msg::ViewDiffAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::ViewDiff {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_action_result_sets_status_line() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::DiffActionResult("reviewed PROJ-1 in vdiff".to_string()),
+        );
+        assert_eq!(app.status_line, "reviewed PROJ-1 in vdiff");
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::ReviewFixAction / Msg::ReviewFixLaunchResult ---
+
+    #[test]
+    fn review_fix_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::ReviewFixAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn review_fix_action_off_the_board_screen_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (_app, cmds) = update(app, Msg::ReviewFixAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn review_fix_action_with_no_lane_run_sets_status_message_and_no_launch() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::ReviewFixAction);
+        assert_eq!(app.status_line, "no lane run for PROJ-1 -- press w first");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn review_fix_action_with_a_lane_run_emits_launch_review_fix() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Done);
+        let (app, cmds) = update(app, Msg::ReviewFixAction);
+        assert_eq!(app.status_line, "dispatching fix pass for PROJ-1");
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchReviewFix {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn review_fix_action_with_a_starting_lane_run_still_launches() {
+        // Unlike `Msg::ViewDiffAction`, `Starting` doesn't block `F`: it's a
+        // watched-child launch, so it's fine to queue it before the lane
+        // run's own preflight finishes -- `tm review fix` fails fast with
+        // its own stderr if the worktree still doesn't exist by the time it
+        // runs.
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.lane_run_status
+            .insert("PROJ-1".to_string(), RunIndicator::Starting);
+        let (_app, cmds) = update(app, Msg::ReviewFixAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchReviewFix {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn review_fix_launch_result_ok_sets_status_line() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::ReviewFixLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Ok(()),
+            },
+        );
+        assert_eq!(app.status_line, "fix pass dispatched for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn review_fix_launch_result_err_sets_status_line_with_stderr() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::ReviewFixLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Err("no comments captured".to_string()),
+            },
+        );
+        assert_eq!(
+            app.status_line,
+            "fix pass for PROJ-1 failed: no comments captured"
+        );
         assert!(cmds.is_empty());
     }
 

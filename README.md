@@ -531,6 +531,8 @@ to" windows.
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
+| `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
+| `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
@@ -681,6 +683,42 @@ documented first step is `tm runs register --kind bugbot-cleanup <KEY>`,
 which adopts the pre-registered run via `TSKMSTR_SESSION_RUN_ID` so the
 whole conversation's telemetry lands on it, the same way `tm ticket
 audit`/`create` adopt theirs.
+
+### Board-launched vdiff review loop
+
+`vdiff` (https://github.com/jowi-dev/vdiff) is a visual PR reviewer with an
+embedded nvim; its `vdiff.nvim` plugin captures per-hunk review comments into
+`<git-dir>/vdiff/comments.json` as you review. `V` and `F` close that review
+loop from the board without leaving the keyboard: `V` opens the review, `F`
+dispatches a fix pass over whatever comments you left.
+
+Pressing `V` on a board ticket resolves its latest `kind = "lane"` run and
+opens `vdiff` with `current_dir` set to that run's `worktree` — the same
+worktree `tm work run` provisioned, on its existing branch. `vdiff` detects
+the PR's base branch itself, so no `--pr` flag or other resolution is
+needed. Unlike `a`/`w`/`b`, this is a foreground, terminal-suspending
+launch (mirroring `L`'s log viewer): the board leaves the alternate screen
+and hands the terminal to `vdiff` directly, since it's an interactive
+GUI/TUI that needs the real TTY, and returns to an intact board once you
+quit it. A ticket with no lane run, a lane run whose worktree has since
+been removed (`tm work remove`), or a `vdiff` not found on `PATH` all set a
+status-line message rather than launching anything or appearing to hang.
+
+Reviewing PRs with no local worktree (someone else's PR, not run from this
+board) is out of scope for now — `vdiff` has no `--pr` flag yet.
+
+Pressing `F` dispatches `tm review fix <KEY>` as a detached, watched-child
+launch, the same shape as `w`/`b`: `tm review fix` resolves the ticket's
+lane run, renders its captured `vdiff` comments via
+`vdiff --export-comments`, and dispatches a tracked run in the ticket's
+existing worktree and branch — no new worktree, no new branch. Its run rows
+use `kind = "review-fix"`, so they never shadow the lane run and show up
+separately in `tm runs`; there is no board badge for them yet, so track
+progress via `tm runs` or the run-detail overlay (`v`). A ticket with no
+lane run sets a status-line message immediately; one with a lane run but no
+captured comments launches the child, which resolves quickly (like every
+watched-child launch) and reports "no comments captured" (or similar) in the
+status line without leaving a `review-fix` run behind.
 
 ### Retro board
 

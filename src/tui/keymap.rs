@@ -201,6 +201,8 @@ pub fn map_key(
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
+        KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
+        KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
         KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
@@ -1665,6 +1667,84 @@ mod tests {
                     key
                 ),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn capital_v_maps_to_view_diff_action_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('V'),
+            ),
+            Some(Msg::ViewDiffAction)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('V'),
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn capital_f_maps_to_review_fix_action_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('F'),
+            ),
+            Some(Msg::ReviewFixAction)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('F'),
+                ),
+                None
             );
         }
     }
