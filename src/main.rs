@@ -7,7 +7,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tskmstr::cli::{AuthCmd, Cli, Command, PrCmd, RealPrompter, RunsCmd, TicketCmd, WorkCmd};
+use tskmstr::cli::{
+    AuthCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
+};
 use tskmstr::config::{self, Config, ConfigPaths};
 use tskmstr::github::gh_cli::ShellGhCli;
 use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
@@ -42,6 +44,19 @@ fn main() -> ExitCode {
     // via `dispatch`/`run_ready`.
     if let Command::Ready { key: Some(key) } = command {
         return run_ready_check(key);
+    }
+
+    // `tm review fix <KEY>` is special-cased the same way: it needs a
+    // three-way exit code (0 dispatched, 1 error or a failed `--fg` run, 3
+    // no comments captured) rather than dispatch's uniform 0/1 — see
+    // `REVIEW_FIX_EXIT_NO_COMMENTS`'s doc comment. `ReviewCmd::Fix` is
+    // `tm review`'s only subcommand today, so every `Command::Review` ends
+    // up here.
+    if let Command::Review {
+        cmd: ReviewCmd::Fix { key, fg },
+    } = command
+    {
+        return run_review_fix(key, fg);
     }
 
     match dispatch(command) {
@@ -159,6 +174,19 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             cmd,
         } => run_runs(kind, by_outcome, by_retro, cmd),
         Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
+        Command::Review { cmd } => run_review(cmd),
+    }
+}
+
+/// `tm review fix <KEY>` is always special-cased in `main` as
+/// [`run_review_fix`] instead (see the comment above that early-return),
+/// since `ReviewCmd::Fix` is `tm review`'s only subcommand and always needs
+/// the non-uniform exit code `run_review_fix` provides. This arm exists only
+/// so `dispatch`'s match stays exhaustive over [`Command`]; it is never
+/// actually reached.
+fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        ReviewCmd::Fix { .. } => unreachable!("tm review fix is handled by run_review_fix"),
     }
 }
 
@@ -877,6 +905,83 @@ fn run_ready_check(key: String) -> ExitCode {
     match tskmstr::cli::ready::check(&ctx, &key, &mut stdout) {
         Ok(tskmstr::cli::ready::ReadyOutcome::Ready) => ExitCode::SUCCESS,
         Ok(tskmstr::cli::ready::ReadyOutcome::Stackable) => ExitCode::from(READY_EXIT_STACKABLE),
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Exit code for `tm review fix <KEY>` reporting that `vdiff` captured no
+/// review comments for the ticket's worktree (see
+/// [`tskmstr::cli::review::FixOutcome::NoComments`]) — distinct from `0`
+/// (dispatched) and `1` (any error, or a `--fg` run that finished failed) so
+/// an autonomous agent can branch on "nothing to fix yet" without parsing
+/// stdout. Exit codes are scoped per-command, so reusing
+/// [`READY_EXIT_STACKABLE`]'s value here (rather than picking a fresh one)
+/// is fine — the two commands share nothing that would make the overlap
+/// confusing.
+const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
+
+/// `tm review fix <KEY> [--fg]`: build real dependencies and run
+/// [`tskmstr::cli::review::fix`], mapping its
+/// [`tskmstr::cli::review::FixOutcome`] to an exit code (`0` dispatched/
+/// completed successfully, `3` no comments captured, `1` any other error or
+/// a `--fg` run that finished failed) — see
+/// [`REVIEW_FIX_EXIT_NO_COMMENTS`]'s doc comment for why this needs its own
+/// three-way scheme rather than `dispatch`'s uniform 0/1.
+fn run_review_fix(key: String, fg: bool) -> ExitCode {
+    let run_db_path = resolve_run_db_path();
+    let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+
+    let git = ShellGitOps::new();
+    let gh = ShellGhCli::new();
+    let spawner = tskmstr::work::runner::StdProcessSpawner;
+    let vdiff = tskmstr::work::vdiff::ShellVdiffOps::new();
+    let detach = tskmstr::work::detach::RealDetachSpawner;
+    let clock = tskmstr::work::run::SystemClock;
+
+    let run_paths = tskmstr::work::run::RunLanePaths {
+        home: home.clone(),
+        state_dir: home.join(".local/state/tskmstr/work"),
+        hooks_deploy_dir: home.join(".local/share/tskmstr/hooks"),
+    };
+    let deps = tskmstr::cli::review::ReviewFixDeps {
+        git: &git,
+        gh: &gh,
+        spawner: &spawner,
+        run_store: &run_store,
+        clock: &clock,
+        vdiff: &vdiff,
+        detach: &detach,
+        current_exe: &current_exe,
+        run_db_path: &run_db_path,
+    };
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::cli::review::fix(&deps, &run_paths, &key, fg, &mut stdout) {
+        Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true }) => ExitCode::SUCCESS,
+        Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: false }) => ExitCode::FAILURE,
+        Ok(tskmstr::cli::review::FixOutcome::NoComments) => {
+            eprintln!("No comments captured for {key}'s worktree — nothing to fix yet.");
+            ExitCode::from(REVIEW_FIX_EXIT_NO_COMMENTS)
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
