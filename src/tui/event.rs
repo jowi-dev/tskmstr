@@ -1264,20 +1264,46 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
 /// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
 /// error) becomes.
-fn search_tickets(deps: &TuiDeps, jql: &str) -> Result<Vec<TicketSummary>, JiraError> {
+fn search_tickets(deps: &TuiDeps, jql: &str) -> Result<TicketPage, JiraError> {
     let result = deps.jira.search(jql)?;
-    Ok(result
-        .issues
-        .into_iter()
-        .map(|issue| to_ticket_summary(issue, &deps.base_url))
-        .collect())
+    Ok(TicketPage {
+        truncated: result.next_page_token.is_some(),
+        tickets: result
+            .issues
+            .into_iter()
+            .map(|issue| to_ticket_summary(issue, &deps.base_url))
+            .collect(),
+    })
+}
+
+/// What [`search_tickets`] found: the mapped tickets, plus whether
+/// [`crate::jira::client::JiraClient::search`] stopped on its page budget
+/// with more matches unfetched.
+struct TicketPage {
+    tickets: Vec<TicketSummary>,
+    truncated: bool,
+}
+
+impl TicketPage {
+    /// The truncation warning to append after the screen's loaded message,
+    /// or nothing when the results are complete.
+    fn truncation_msg(&self) -> Option<Msg> {
+        self.truncated.then_some(Msg::SearchTruncated {
+            shown: self.tickets.len(),
+        })
+    }
 }
 
 /// Run `Cmd::FetchTickets`: search for tickets matching `jql` and map them to
 /// [`crate::tui::app::TicketSummary`]s.
 fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
     match search_tickets(deps, jql) {
-        Ok(tickets) => vec![Msg::TicketsLoaded(tickets)],
+        Ok(page) => {
+            let truncation = page.truncation_msg();
+            let mut msgs = vec![Msg::TicketsLoaded(page.tickets)];
+            msgs.extend(truncation);
+            msgs
+        }
         Err(err) => vec![Msg::TicketsFailed(err.to_string())],
     }
 }
@@ -1286,7 +1312,12 @@ fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
 /// list for [`crate::tui::app::Screen::Rank`].
 fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
     match search_tickets(deps, jql) {
-        Ok(tickets) => vec![Msg::RankTicketsLoaded(tickets)],
+        Ok(page) => {
+            let truncation = page.truncation_msg();
+            let mut msgs = vec![Msg::RankTicketsLoaded(page.tickets)];
+            msgs.extend(truncation);
+            msgs
+        }
         Err(err) => vec![Msg::RankTicketsFailed(err.to_string())],
     }
 }
@@ -1304,8 +1335,13 @@ fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
 /// would be actively misleading, not just less enriched. So a missing store
 /// fails the whole screen with a status-line message instead.
 pub fn fetch_retro_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
+    // No truncation warning here, unlike the board and rank screens: this
+    // list is filtered down again below (tickets with a recorded verdict drop
+    // out), so a "showing first N" count taken from the fetch wouldn't match
+    // what ends up on screen. The 30-day window keeps it well inside one
+    // search's page budget anyway.
     let tickets = match search_tickets(deps, jql) {
-        Ok(tickets) => tickets,
+        Ok(page) => page.tickets,
         Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
     };
     let Some(store) = &deps.store else {
@@ -1647,6 +1683,24 @@ mod tests {
         let jira = FakeJiraClient::new();
         let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
         assert_eq!(msgs, vec![Msg::TicketsLoaded(vec![])]);
+    }
+
+    #[test]
+    fn fetch_tickets_appends_search_truncated_when_a_page_was_left_unfollowed() {
+        use crate::jira::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do"), issue("PROJ-2", "To Do")],
+            next_page_token: Some("more".to_string()),
+        });
+        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
+        match msgs.as_slice() {
+            [Msg::TicketsLoaded(tickets), Msg::SearchTruncated { shown }] => {
+                assert_eq!(tickets.len(), 2);
+                assert_eq!(*shown, 2);
+            }
+            other => panic!("expected TicketsLoaded then SearchTruncated, got {other:?}"),
+        }
     }
 
     #[test]

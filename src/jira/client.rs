@@ -127,6 +127,20 @@ impl RankAnchor {
     }
 }
 
+/// Issues requested per page by [`JiraClient::search`]. 100 is the largest
+/// page `POST /rest/api/3/search/jql` reliably honors; asking for more just
+/// gets silently clamped.
+pub const SEARCH_PAGE_SIZE: usize = 100;
+
+/// How many pages [`JiraClient::search`] will follow before giving up.
+///
+/// A bound rather than an unlimited loop: a broad board filter on a large
+/// project could otherwise fan out into dozens of round-trips on every
+/// refresh. [`SEARCH_PAGE_SIZE`] * this is the effective ceiling on any one
+/// search, and the unfollowed `nextPageToken` is returned so callers can tell
+/// the results were truncated rather than complete.
+pub const MAX_SEARCH_PAGES: usize = 5;
+
 /// Behavior tskmstr needs from the Jira Cloud REST API.
 pub trait JiraClient {
     /// Fetch the authenticated user (`GET /myself`). Used to verify auth is
@@ -159,11 +173,11 @@ pub trait JiraClient {
 
     /// Run a JQL search (`POST /search/jql`).
     ///
-    /// Only the first page of results is fetched; `nextPageToken` is
-    /// deserialized but not automatically followed. This is sufficient for
-    /// tskmstr's current use (a user's own open tickets rarely exceed one
-    /// page) but callers listing large result sets will need to page
-    /// manually in a future revision.
+    /// Pages are followed automatically via `nextPageToken`, up to
+    /// [`MAX_SEARCH_PAGES`] pages of [`SEARCH_PAGE_SIZE`] issues each. The
+    /// returned [`SearchResult`] holds every issue collected across those
+    /// pages; its `next_page_token` is `Some` only when the page budget ran
+    /// out first, i.e. the results are truncated and more matches exist.
     ///
     /// Note: the response shape for `/rest/api/3/search/jql` follows Atlassian's
     /// documented contract (`issues` plus an optional `nextPageToken`), but has
@@ -439,20 +453,40 @@ impl JiraClient for HttpJiraClient {
     }
 
     fn search(&self, jql: &str) -> Result<SearchResult, JiraError> {
-        let body = serde_json::json!({
-            "jql": jql,
-            "fields": ["summary", "status", "assignee", "description", "issuelinks"],
-            "maxResults": 50,
-        });
-        let response = self
-            .http
-            .post(self.url("/search/jql"))
-            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()?;
-        Self::parse(response, "")
+        let mut issues = Vec::new();
+        let mut token: Option<String> = None;
+
+        for _ in 0..MAX_SEARCH_PAGES {
+            let mut body = serde_json::json!({
+                "jql": jql,
+                "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                "maxResults": SEARCH_PAGE_SIZE,
+            });
+            if let Some(token) = &token {
+                body["nextPageToken"] = serde_json::Value::String(token.clone());
+            }
+            let response = self
+                .http
+                .post(self.url("/search/jql"))
+                .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()?;
+            let page: SearchResult = Self::parse(response, "")?;
+            issues.extend(page.issues);
+            token = page.next_page_token;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        // `token` is `Some` only if we stopped on the page budget rather than
+        // running out of pages -- see `MAX_SEARCH_PAGES`.
+        Ok(SearchResult {
+            issues,
+            next_page_token: token,
+        })
     }
 
     fn get_project(&self, key: &str) -> Result<(), JiraError> {
@@ -655,6 +689,19 @@ mod tests {
             email: "ada@example.com".to_string(),
             token: "test-token".to_string(),
         }
+    }
+
+    /// A minimal `issues[]` entry for search responses, keyed by `key`.
+    fn issue_json(key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "key": key,
+            "fields": {
+                "summary": key,
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "description": null,
+                "assignee": null
+            }
+        })
     }
 
     #[test]
@@ -942,23 +989,11 @@ mod tests {
                 .json_body(serde_json::json!({
                     "jql": "assignee = currentUser()",
                     "fields": ["summary", "status", "assignee", "description", "issuelinks"],
-                    "maxResults": 50
+                    "maxResults": SEARCH_PAGE_SIZE
                 }));
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(serde_json::json!({
-                    "issues": [
-                        {
-                            "key": "PROJ-1",
-                            "fields": {
-                                "summary": "First",
-                                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
-                                "description": null,
-                                "assignee": null
-                            }
-                        }
-                    ]
-                }));
+                .json_body(serde_json::json!({ "issues": [issue_json("PROJ-1")] }));
         });
 
         let client = HttpJiraClient::new(test_ctx(&server));
@@ -969,6 +1004,80 @@ mod tests {
         mock.assert();
         assert_eq!(result.issues.len(), 1);
         assert_eq!(result.next_page_token, None);
+    }
+
+    #[test]
+    fn search_follows_next_page_token_until_exhausted() {
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql")
+                .json_body(serde_json::json!({
+                    "jql": "project = PROJ",
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                    "maxResults": SEARCH_PAGE_SIZE
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "issues": [issue_json("PROJ-1")],
+                    "nextPageToken": "page-2"
+                }));
+        });
+        let second = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql")
+                .json_body(serde_json::json!({
+                    "jql": "project = PROJ",
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                    "maxResults": SEARCH_PAGE_SIZE,
+                    "nextPageToken": "page-2"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "issues": [issue_json("PROJ-2")] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let result = client
+            .search("project = PROJ")
+            .expect("search should succeed");
+
+        first.assert();
+        second.assert();
+        let keys: Vec<&str> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["PROJ-1", "PROJ-2"]);
+        assert_eq!(result.next_page_token, None);
+    }
+
+    #[test]
+    fn search_stops_at_max_pages_and_reports_the_unfollowed_token() {
+        let server = MockServer::start();
+        // Every page claims another page follows, so only MAX_SEARCH_PAGES
+        // bounds the loop.
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "issues": [issue_json("PROJ-1")],
+                    "nextPageToken": "more"
+                }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let result = client
+            .search("project = PROJ")
+            .expect("search should succeed");
+
+        assert_eq!(mock.hits(), MAX_SEARCH_PAGES);
+        assert_eq!(result.issues.len(), MAX_SEARCH_PAGES);
+        assert_eq!(
+            result.next_page_token,
+            Some("more".to_string()),
+            "the token we stopped on is retained so callers can tell results were truncated"
+        );
     }
 
     #[test]

@@ -1137,10 +1137,10 @@ all rather than an error.
 
 - **macOS-only keychain.** Token storage shells out to `security`. On any
   other platform, set `JIRA_API_TOKEN` in the environment instead.
-- **Single-page ticket search.** The board only fetches the first page of
-  `POST /search/jql` results; `nextPageToken` pagination isn't
-  implemented, so boards with a very large number of open tickets will be
-  truncated.
+- **Ticket search caps at 500 results.** `POST /search/jql` is paged
+  through via `nextPageToken`, but only up to 5 pages of 100 issues. Past
+  that the board and rank screens show the first 500 and warn "showing
+  first N tickets -- more matched; narrow the filter" in the status line.
 - **PR title edits are last-write-wins.** `tm` doesn't read back the
   title before prefixing it, so a concurrent edit to the PR title can be
   clobbered.

@@ -882,6 +882,15 @@ pub enum Msg {
     TicketsLoaded(Vec<TicketSummary>),
     /// The ticket list failed to load.
     TicketsFailed(String),
+    /// A ticket search hit [`crate::jira::client::MAX_SEARCH_PAGES`] with
+    /// more matches still unfetched, so the screen is showing a truncated
+    /// list. Emitted alongside (after) the load message rather than folded
+    /// into it: truncation is a warning about the results, not a different
+    /// kind of result, and every loaded-list handler stays untouched.
+    SearchTruncated {
+        /// How many tickets were actually fetched and are on screen.
+        shown: usize,
+    },
     /// Transitions for the selected ticket finished loading.
     TransitionsLoaded(Vec<Transition>),
     /// Transitions for the selected ticket failed to load.
@@ -1372,6 +1381,11 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::TicketsFailed(err) => {
             app.status_line = err;
+            (app, Vec::new())
+        }
+        Msg::SearchTruncated { shown } => {
+            app.status_line =
+                format!("showing first {shown} tickets -- more matched; narrow the filter");
             (app, Vec::new())
         }
         Msg::Enter => enter(app),
@@ -2854,6 +2868,23 @@ mod tests {
         let app = App::new();
         let (app, cmds) = update(app, Msg::TicketsFailed("boom".to_string()));
         assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn search_truncated_warns_in_the_status_line_with_the_count_shown() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::SearchTruncated { shown: 500 });
+        assert!(
+            app.status_line.contains("500"),
+            "status line should name how many tickets are shown, got {:?}",
+            app.status_line
+        );
+        assert!(
+            app.status_line.contains("narrow"),
+            "status line should tell the user what to do about it, got {:?}",
+            app.status_line
+        );
         assert!(cmds.is_empty());
     }
 
