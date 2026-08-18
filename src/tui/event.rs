@@ -2962,6 +2962,181 @@ mod tests {
         assert!(launches.is_empty());
     }
 
+    // --- Cmd::LaunchReviewFix routing (run_cmds intercepts it too) ---
+
+    #[test]
+    fn run_cmds_launch_review_fix_spawns_review_fix_argv() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher = Box::new(RecordingLauncher(calls.clone()));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        run_cmds(
+            App::new(),
+            vec![Cmd::LaunchReviewFix {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            calls.borrow().clone(),
+            vec![vec![
+                "review".to_string(),
+                "fix".to_string(),
+                "PROJ-1".to_string(),
+            ]]
+        );
+        assert_eq!(launches.len(), 1);
+    }
+
+    #[test]
+    fn run_cmds_launch_review_fix_success_registers_pending_launch() {
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchReviewFix {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].key, "PROJ-1");
+        assert_eq!(app.status_line, "");
+    }
+
+    #[test]
+    fn run_cmds_launch_review_fix_spawn_failure_feeds_immediate_launch_result() {
+        let mut d = deps(FakeJiraClient::new());
+        d.launcher = Box::new(
+            crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("current_exe failed"),
+        );
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchReviewFix {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert!(launches.is_empty());
+        assert_eq!(
+            app.status_line,
+            "fix pass for PROJ-1 failed: current_exe failed"
+        );
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_a_review_fix_entry_as_review_fix_result() {
+        let launcher = crate::tui::launcher::FakeLaneLauncher::new()
+            .with_finish_sequence(vec![Some(Err("no comments captured".to_string()))]);
+        let handle = launcher.spawn(&review_fix_argv("PROJ-1")).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::ReviewFix,
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::ReviewFixLaunchResult {
+                key: "PROJ-1".to_string(),
+                result: Err("no comments captured".to_string()),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    // --- resolve_vdiff_worktree (Cmd::ViewDiff's testable resolution logic) ---
+
+    #[test]
+    fn resolve_vdiff_worktree_with_no_store_reports_unavailable() {
+        let result = resolve_vdiff_worktree(None, "PROJ-1");
+        assert_eq!(result, Err("no run store available".to_string()));
+    }
+
+    #[test]
+    fn resolve_vdiff_worktree_with_no_lane_run_reports_no_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        assert_eq!(result, Err("no lane run for PROJ-1".to_string()));
+    }
+
+    #[test]
+    fn resolve_vdiff_worktree_ignores_a_non_lane_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: worktree.path().to_string_lossy().to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        assert_eq!(result, Err("no lane run for PROJ-1".to_string()));
+    }
+
+    #[test]
+    fn resolve_vdiff_worktree_with_a_missing_worktree_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let gone = dir.path().join("gone-worktree");
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: gone.to_string_lossy().to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        assert_eq!(
+            result,
+            Err(format!(
+                "worktree {} for PROJ-1 no longer exists",
+                gone.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_vdiff_worktree_with_an_existing_worktree_resolves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: worktree.path().to_string_lossy().to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        assert_eq!(result, Ok(worktree.path().to_path_buf()));
+    }
+
     // --- Cmd::LaunchCleanup / launch_cleanup_cmd ---
 
     #[test]
