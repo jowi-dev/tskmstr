@@ -152,12 +152,22 @@ pub enum ReviewCmd {
     /// tracked `review-fix` run in that same worktree, on that same branch.
     /// No new worktree, no new branch. Exits with a distinct code and
     /// creates no run row if no comments were captured.
+    ///
+    /// Interactive by default: the fix pass runs in a `fix` window of the
+    /// ticket's `tm-<key>` tmux session (a second pass becomes `fix-2`), so
+    /// it can be attached to and steered. `--headless` runs the one-shot
+    /// `claude -p` pass under a detached supervisor instead, and `--fg` runs
+    /// that pass synchronously.
     Fix {
         /// Jira issue key of the ticket whose lane-run worktree holds the
         /// captured review comments, e.g. `PROJ-372` (case-insensitive).
         key: String,
+        /// Run the one-shot `claude -p` fix pass under a detached
+        /// supervisor, instead of the interactive tmux-hosted default.
+        #[arg(long)]
+        headless: bool,
         /// Run synchronously in the foreground, waiting for `claude` to
-        /// finish before returning, instead of the detached default.
+        /// finish before returning. Implies `--headless`.
         #[arg(long)]
         fg: bool,
     },
@@ -199,14 +209,19 @@ pub enum WorkCmd {
         /// Directory to start/attach a session for. Defaults to `cwd`.
         dir: Option<String>,
     },
-    /// Run one autonomous headless Claude Code session for a configured
-    /// lane, tracked in the run-state store.
+    /// Run one Claude Code session for a configured lane, tracked in the
+    /// run-state store.
     ///
-    /// Detached by default: provisioning/preflight run in the foreground
-    /// (so errors surface immediately), then a supervisor process is
-    /// spawned to run `claude` and record the outcome, and this invocation
-    /// returns the terminal right away. `--fg` instead runs synchronously,
-    /// waiting for `claude` to finish before returning.
+    /// Interactive by default: provisioning/preflight run in the foreground
+    /// (so errors surface immediately), then `claude` is launched in a
+    /// `work` window of the ticket's `tm-<key>` tmux session — attach to
+    /// steer it mid-run — and this invocation returns the terminal right
+    /// away.
+    ///
+    /// `--headless` instead runs the autonomous one-shot `claude -p` under
+    /// a detached supervisor, for CI, cron, and unattended batches. `--fg`
+    /// runs that same headless pass synchronously, so this command's exit
+    /// code reports the run's outcome.
     Run {
         /// Configured lane name (must match a `[work.lanes.<name>]` entry).
         lane: String,
@@ -230,8 +245,13 @@ pub enum WorkCmd {
         /// `prompt_file`/the `~/.claude/prompts/<lane>.md` default.
         #[arg(long)]
         prompt: Option<String>,
+        /// Run the autonomous one-shot `claude -p` pass under a detached
+        /// supervisor, instead of the interactive tmux-hosted default.
+        #[arg(long)]
+        headless: bool,
         /// Run synchronously in the foreground, waiting for `claude` to
-        /// finish before returning, instead of the detached default.
+        /// finish before returning. Implies `--headless`: an interactive
+        /// session has no outcome to report back synchronously.
         #[arg(long)]
         fg: bool,
     },
@@ -2455,6 +2475,7 @@ mod tests {
                         max_turns,
                         permission_mode,
                         prompt,
+                        headless,
                         fg,
                     },
             }) => {
@@ -2465,6 +2486,7 @@ mod tests {
                 assert_eq!(max_turns, None);
                 assert_eq!(permission_mode, None);
                 assert_eq!(prompt, None);
+                assert!(!headless);
                 assert!(!fg);
             }
             other => panic!("expected Work Run, got {other:?}"),
@@ -2551,6 +2573,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_work_run_with_headless() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "--headless"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { headless, fg, .. },
+            }) => {
+                assert!(headless);
+                assert!(!fg, "--headless alone does not wait for the run");
+            }
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_fix_with_headless() {
+        let cli = Cli::try_parse_from(["tm", "review", "fix", "PROJ-1", "--headless"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Review {
+                cmd: ReviewCmd::Fix { key, headless, fg },
+            }) => {
+                assert_eq!(key, "PROJ-1");
+                assert!(headless);
+                assert!(!fg);
+            }
+            other => panic!("expected Review Fix, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_work_run_with_fg() {
         let cli =
             Cli::try_parse_from(["tm", "work", "run", "my-lane", "--fg"]).expect("should parse");
@@ -2594,6 +2647,7 @@ mod tests {
                         max_turns,
                         permission_mode,
                         prompt,
+                        headless,
                         fg,
                     },
             }) => {
@@ -2605,6 +2659,10 @@ mod tests {
                 assert_eq!(permission_mode, Some("plan".to_string()));
                 assert_eq!(prompt, Some("/tmp/custom.md".to_string()));
                 assert!(fg);
+                assert!(
+                    !headless,
+                    "--fg alone selects the headless path without the flag                      being passed — see Dispatch::from_flags"
+                );
             }
             other => panic!("expected Work Run, got {other:?}"),
         }
