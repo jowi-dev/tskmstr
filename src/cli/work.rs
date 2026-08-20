@@ -413,6 +413,18 @@ pub fn run(
         Dispatch::Headless => {}
     }
 
+    // The ticket's viewer window is resolved from one `list_windows`
+    // snapshot *before* provisioning, for the same reason the interactive
+    // path does it there: `prepare_run_lane` cuts a branch and starts a run
+    // row, so a refusal afterwards would leave both behind. A headless run
+    // is subject to the same double-launch refusal as an interactive one —
+    // "this action is already live for this ticket" is true either way, and
+    // whether the live window hosts `claude` or merely tails its log makes
+    // no difference to that.
+    let session_key = request.ticket.clone().unwrap_or_else(|| lane.to_string());
+    let windows = ctx.tmux.list_windows()?;
+    let viewer_target = resolve_action_window(&windows, &session_key, WORK_WINDOW_NAME)?;
+
     // Detached: provisioning/preflight/start_run happen here, in the
     // foreground, with pid = None (the supervisor records its own pid on
     // startup — see prepare_run_lane's doc comment on why).
@@ -446,6 +458,7 @@ pub fn run(
     let ticket = prepared.ticket.clone();
     let branch = prepared.branch.clone();
     let worktree = prepared.worktree.clone();
+    let run_id = prepared.run_id;
 
     let state = crate::work::detach::SupervisorState {
         prepared,
@@ -464,6 +477,17 @@ pub fn run(
     )?;
     writeln!(out, "worktree  {}", worktree.display())?;
     writeln!(out, "log       {}", log_path.display())?;
+    // After `spawn_detached`, deliberately: the log file the viewer follows
+    // is created by the spawn itself, and the viewer is a courtesy over a
+    // run that is already going — so its failure is reported, not returned.
+    crate::work::viewer::launch_and_report_viewer(
+        ctx.tmux,
+        &viewer_target,
+        &worktree.to_string_lossy(),
+        deps.current_exe,
+        run_id,
+        out,
+    )?;
     writeln!(out, "watch:    tm runs watch")?;
     writeln!(out, "follow:   tail -f {}", log_path.display())?;
     if let Some(ticket) = &ticket {
@@ -2059,6 +2083,169 @@ mod tests {
 
         let printed = out_string(&out);
         assert!(printed.contains("resume:   tm runs resume ABC-123"));
+    }
+
+    /// Issue #2 phase 4: a headless run gets a window in the ticket's session
+    /// too, but a *viewer* — `tm runs logs <id> --follow` — never the run's
+    /// own process. See `crate::work::viewer`'s module docs.
+    #[test]
+    fn run_headless_gets_a_viewer_window_that_does_not_own_the_run() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap();
+
+        // The supervisor is still what runs `claude`; the window is extra.
+        assert_eq!(detach.recorded.lock().unwrap().len(), 1);
+
+        let run_row = run_store
+            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap();
+        let (window_name, env, command) = tmux
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                TmuxCall::NewSessionWithCommand {
+                    name,
+                    window_name,
+                    env,
+                    command,
+                    ..
+                } => {
+                    assert_eq!(name, "tm-proj-1");
+                    Some((window_name.clone(), env.clone(), command.clone()))
+                }
+                _ => None,
+            })
+            .expect("a viewer window was launched");
+
+        assert_eq!(window_name, "work");
+        assert_eq!(
+            command,
+            format!("'/usr/local/bin/tm' runs logs {} --follow", run_row.id),
+            "the window must follow the log, not host claude"
+        );
+        assert!(
+            !command.contains("claude"),
+            "binding the supervisor's claude to a tmux window would make \
+             kill-session destructive: {command}"
+        );
+        assert!(
+            env.is_empty(),
+            "a viewer owns no run and adopts no row: {env:?}"
+        );
+
+        let printed = out_string(&out);
+        assert!(
+            printed.contains("window    tm-proj-1:work (log viewer)"),
+            "{printed}"
+        );
+        // The log line stays: the file, not the window, is the archive.
+        assert!(printed.contains("log       "), "{printed}");
+    }
+
+    /// A headless run's viewer is a courtesy over a run that is already
+    /// going. Refusing to launch one when the action is already live still
+    /// has to happen *before* provisioning, exactly like the interactive
+    /// path, or the refusal leaves a worktree and a run row behind.
+    #[test]
+    fn run_headless_refuses_a_second_live_work_window_before_provisioning() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "work".to_string(),
+            dead: false,
+        }]));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let err = run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorkCliError::Interactive(InteractiveLaunchError::AlreadyRunning { .. })
+        ));
+        assert!(run_store.list_runs().unwrap().is_empty());
+        assert!(detach.recorded.lock().unwrap().is_empty());
     }
 
     #[test]
