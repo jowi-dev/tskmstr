@@ -223,6 +223,31 @@ pub fn window_creation_sequence(
     sequence
 }
 
+/// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) holds a live
+/// window named `window_name` in session `session`.
+///
+/// The double-launch guard for tmux-hosted actions: a ticket's session
+/// outlives any single action, so "is this action already running?" is a
+/// question about a window, not a session. A window whose pane has died
+/// (`remain-on-exit`) does not count as running — relaunching over that
+/// aftermath is the intended behavior.
+pub fn has_live_window(windows: &[TmuxWindow], session: &str, window_name: &str) -> bool {
+    windows
+        .iter()
+        .any(|window| window.session == session && window.name == window_name && !window.dead)
+}
+
+/// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) mentions session
+/// `session` at all — the create-session-vs-append-window fork.
+///
+/// Equivalent to [`TmuxOps::has_session`] against the same snapshot, since a
+/// session always has at least one window, and cheaper: the same snapshot
+/// already answered [`has_live_window`], so the two decisions can't disagree
+/// about a session that appeared or vanished in between.
+pub fn session_present(windows: &[TmuxWindow], session: &str) -> bool {
+    windows.iter().any(|window| window.session == session)
+}
+
 fn has_session_args(name: &str) -> Vec<String> {
     vec![
         "has-session".to_string(),
@@ -1099,6 +1124,47 @@ mod tests {
                 "server".to_string(),
             ]
         );
+    }
+
+    // --- window-set queries over a list_windows snapshot ---
+
+    fn windows() -> Vec<TmuxWindow> {
+        vec![
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "audit".to_string(),
+                dead: false,
+            },
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "fix".to_string(),
+                dead: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn has_live_window_finds_a_live_window_by_session_and_name() {
+        assert!(has_live_window(&windows(), "tm-proj-1", "audit"));
+    }
+
+    #[test]
+    fn has_live_window_ignores_a_dead_window_of_that_name() {
+        assert!(!has_live_window(&windows(), "tm-proj-1", "fix"));
+    }
+
+    #[test]
+    fn has_live_window_ignores_a_same_named_window_in_another_session() {
+        assert!(!has_live_window(&windows(), "tm-proj-2", "audit"));
+    }
+
+    #[test]
+    fn session_present_is_true_for_any_window_including_a_dead_one() {
+        // A session always has at least one window, so a window bearing its
+        // name is exactly "the session exists" — a dead pane doesn't remove
+        // the session.
+        assert!(session_present(&windows(), "tm-proj-1"));
+        assert!(!session_present(&windows(), "tm-proj-2"));
     }
 
     // --- FakeTmuxOps sequencing for session-with-windows creation ---
