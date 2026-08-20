@@ -872,12 +872,12 @@ mod tests {
     #[test]
     fn new_session_with_command_args_with_no_env_appends_bare_command() {
         assert_eq!(
-            new_session_with_command_args("tm-audit-proj-1", "/repo/axiom", "audit", &[], "claude"),
+            new_session_with_command_args("tm-proj-1", "/repo/axiom", "audit", &[], "claude"),
             vec![
                 "new-session",
                 "-d",
                 "-s",
-                "tm-audit-proj-1",
+                "tm-proj-1",
                 "-c",
                 "/repo/axiom",
                 "-n",
@@ -895,7 +895,7 @@ mod tests {
         ];
         assert_eq!(
             new_session_with_command_args(
-                "tm-audit-proj-1",
+                "tm-proj-1",
                 "/repo/axiom",
                 "audit",
                 &env,
@@ -905,7 +905,7 @@ mod tests {
                 "new-session",
                 "-d",
                 "-s",
-                "tm-audit-proj-1",
+                "tm-proj-1",
                 "-c",
                 "/repo/axiom",
                 "-n",
@@ -1359,7 +1359,7 @@ mod tests {
         let fake = FakeTmuxOps::new();
         let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string())];
         fake.new_session_with_command(
-            "tm-audit-proj-1",
+            "tm-proj-1",
             "/repo/axiom",
             "audit",
             &env,
@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(
             fake.calls(),
             vec![TmuxCall::NewSessionWithCommand {
-                name: "tm-audit-proj-1".to_string(),
+                name: "tm-proj-1".to_string(),
                 dir: "/repo/axiom".to_string(),
                 window_name: "audit".to_string(),
                 env,
