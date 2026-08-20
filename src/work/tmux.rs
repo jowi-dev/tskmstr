@@ -141,6 +141,30 @@ pub trait TmuxOps {
     /// <dir>`).
     fn new_window(&self, name: &str, window_name: &str, dir: &str) -> Result<(), TmuxError>;
 
+    /// Append a window named `window_name` to session `name`, rooted at
+    /// `dir`, running `command` as its pane command instead of the default
+    /// shell (`tmux new-window -a -t <name>:{end} -n <window_name> -c <dir>
+    /// [-e KEY=VAL ...] <command>`).
+    ///
+    /// The window-with-a-command counterpart of
+    /// [`TmuxOps::new_session_with_command`], for the second and later
+    /// actions taken against a ticket whose session already exists; `env` and
+    /// `command` carry the same contract (one `-e KEY=VAL` per entry;
+    /// `command` is a single string tmux hands to `$SHELL -c`, so the caller
+    /// escapes it).
+    ///
+    /// Appended at `{end}`, not after the session's current window, so window
+    /// order is the ticket's action history — tmux's default insertion point
+    /// follows whichever window happens to be selected.
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError>;
+
     /// Select window `window` in session `name`
     /// (`tmux select-window -t <name>:<window>`).
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError>;
@@ -250,6 +274,35 @@ fn new_window_args(name: &str, window_name: &str, dir: &str) -> Vec<String> {
         "-c".to_string(),
         dir.to_string(),
     ]
+}
+
+/// Builds the argv for [`TmuxOps::new_window_with_command`]. Targets
+/// `<name>:{end}` with `-a` so the window lands after the session's last
+/// window (see that method's docs), then one `-e KEY=VAL` pair per `env`
+/// entry, then `command` as the final positional argument.
+fn new_window_with_command_args(
+    name: &str,
+    window_name: &str,
+    dir: &str,
+    env: &[(String, String)],
+    command: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "new-window".to_string(),
+        "-a".to_string(),
+        "-t".to_string(),
+        format!("{name}:{{end}}"),
+        "-n".to_string(),
+        window_name.to_string(),
+        "-c".to_string(),
+        dir.to_string(),
+    ];
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(command.to_string());
+    args
 }
 
 fn select_window_args(name: &str, window: &str) -> Vec<String> {
@@ -416,6 +469,21 @@ impl TmuxOps for ShellTmuxOps {
         require_success("tmux new-window", &output)
     }
 
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        let output = run(
+            "tmux new-window",
+            &new_window_with_command_args(name, window_name, dir, env, command),
+        )?;
+        require_success("tmux new-window", &output)
+    }
+
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError> {
         let output = run("tmux select-window", &select_window_args(name, window))?;
         require_success("tmux select-window", &output)
@@ -527,6 +595,19 @@ pub enum TmuxCall {
         /// Window working directory.
         dir: String,
     },
+    /// `new_window_with_command(name, window_name, dir, env, command)`.
+    NewWindowWithCommand {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window_name: String,
+        /// Window working directory.
+        dir: String,
+        /// Per-window environment pairs.
+        env: Vec<(String, String)>,
+        /// Pane command.
+        command: String,
+    },
     /// `select_window(name, window)`.
     SelectWindow {
         /// Session name.
@@ -623,6 +704,26 @@ impl TmuxOps for FakeTmuxOps {
             window_name: window_name.to_string(),
             dir: dir.to_string(),
         });
+        Ok(())
+    }
+
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        self.calls
+            .borrow_mut()
+            .push(TmuxCall::NewWindowWithCommand {
+                name: name.to_string(),
+                window_name: window_name.to_string(),
+                dir: dir.to_string(),
+                env: env.to_vec(),
+                command: command.to_string(),
+            });
         Ok(())
     }
 
@@ -737,6 +838,52 @@ mod tests {
                 "OTHER=value",
                 "claude '/ticket-audit PROJ-1'"
             ]
+        );
+    }
+
+    #[test]
+    fn new_window_with_command_args_append_at_the_end_with_env_and_command() {
+        let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "42".to_string())];
+        assert_eq!(
+            new_window_with_command_args(
+                "tm-proj-1",
+                "audit",
+                "/repo/axiom",
+                &env,
+                "claude '/ticket-audit PROJ-1'"
+            ),
+            vec![
+                "new-window",
+                "-a",
+                "-t",
+                "tm-proj-1:{end}",
+                "-n",
+                "audit",
+                "-c",
+                "/repo/axiom",
+                "-e",
+                "TSKMSTR_SESSION_RUN_ID=42",
+                "claude '/ticket-audit PROJ-1'"
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_records_new_window_with_command_call() {
+        let fake = FakeTmuxOps::new();
+        let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string())];
+        fake.new_window_with_command("tm-proj-1", "audit", "/repo/axiom", &env, "claude")
+            .unwrap();
+
+        assert_eq!(
+            fake.calls(),
+            vec![TmuxCall::NewWindowWithCommand {
+                name: "tm-proj-1".to_string(),
+                window_name: "audit".to_string(),
+                dir: "/repo/axiom".to_string(),
+                env,
+                command: "claude".to_string(),
+            }]
         );
     }
 
