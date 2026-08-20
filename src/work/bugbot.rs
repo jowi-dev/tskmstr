@@ -35,8 +35,10 @@ use crate::work::tmux::{TmuxError, TmuxOps};
 const DEFAULT_PROMPT_TEMPLATE: &str = "/bugbot-triage {key} {findings_file}";
 
 /// Name of the tmux window a launched cleanup session's `claude` process
-/// runs in.
-const CLEANUP_WINDOW_NAME: &str = "bugbot-cleanup";
+/// runs in. Public for the same reason
+/// [`crate::work::audit::AUDIT_WINDOW_NAME`] is: it is the board's liveness
+/// signal for cleanup sessions.
+pub const CLEANUP_WINDOW_NAME: &str = "bugbot-cleanup";
 
 /// `kind`/`lane` value [`launch_cleanup`] stores for the pre-registered run
 /// row.

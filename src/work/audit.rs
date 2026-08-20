@@ -48,8 +48,9 @@ const DEFAULT_PROMPT_TEMPLATE: &str = "/ticket-audit {key}";
 pub const SESSION_RUN_ID_ENV: &str = "TSKMSTR_SESSION_RUN_ID";
 
 /// Name of the tmux window a launched audit session's `claude` process runs
-/// in.
-const AUDIT_WINDOW_NAME: &str = "audit";
+/// in. Public because it is also the board's liveness signal for audits (see
+/// [`crate::work::tmux::TmuxOps::list_windows`]).
+pub const AUDIT_WINDOW_NAME: &str = "audit";
 
 /// Errors returned by [`launch_audit`].
 #[derive(Debug, Error)]
