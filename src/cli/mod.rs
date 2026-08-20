@@ -203,6 +203,20 @@ pub enum WorkCmd {
     /// Recreate tmux sessions for every existing worktree that doesn't
     /// already have one running (e.g. after a reboot).
     Restore,
+    /// Rebuild a ticket's `tm-<key>` tmux session and its windows from the
+    /// ticket's recorded runs — after a reboot, a `tmux kill-server`, or an
+    /// accidental `kill-session`.
+    ///
+    /// Only runs still in flight come back: a headless one reattaches its
+    /// log viewer and keeps going, an interactive one comes back as a shell
+    /// in its worktree with a printed `claude --resume` line (its `claude`
+    /// died with the pane). Finished runs are history — `tm runs show`/`tm
+    /// runs logs` are where that lives. Never attaches, and running it
+    /// against a healthy session does nothing.
+    Session {
+        /// Jira ticket key, e.g. `PROJ-123`.
+        key: String,
+    },
     /// Attach to (or create) the tmux session for a directory, defaulting
     /// to the current working directory.
     Start {

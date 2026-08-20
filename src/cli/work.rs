@@ -139,6 +139,14 @@ pub enum WorkCliError {
     /// ticket's session.
     #[error(transparent)]
     Interactive(#[from] InteractiveLaunchError),
+
+    /// `tm work session <KEY>` was given a ticket with no recorded runs.
+    /// Reconstruction rebuilds a session *from* the run rows, so with none
+    /// there is nothing to rebuild — and a bare `tm-<key>` session with a
+    /// single shell rooted nowhere in particular would be a worse answer
+    /// than saying so.
+    #[error("no runs recorded for {0} — nothing to rebuild a session from")]
+    NoRunsForTicket(String),
 }
 
 /// How a run is hosted and whether the invoking process waits for it — the
@@ -577,6 +585,75 @@ pub fn supervise(
         out,
     )?;
     Ok(!outcome.is_error)
+}
+
+/// `tm work session <KEY>`: rebuild `key`'s `tm-<key>` tmux session and its
+/// window set from the ticket's run rows — the after-a-reboot,
+/// after-a-`kill-session`, after-a-`tmux kill-server` operation.
+///
+/// [`crate::work::session::plan_session`] owns every decision about *what*
+/// comes back (only in-flight runs; a viewer for a headless one, a shell plus
+/// a printed `claude --resume` line for an interactive one) and why; this
+/// function is the I/O around it: one `list_windows` snapshot, the run rows,
+/// then the tmux calls and a summary.
+///
+/// Never attaches, matching [`restore`]: reconstruction is something you may
+/// want to do for several tickets in a row, and it must be safe to run from a
+/// script.
+///
+/// # Errors
+///
+/// [`WorkCliError::NoRunsForTicket`] when the ticket has no runs at all, and
+/// [`WorkCliError::Tmux`] when a `tmux` call fails. Unlike a viewer launched
+/// alongside a live run (see [`crate::work::viewer`]), a tmux failure *is*
+/// fatal here — rebuilding the session is the entire point of the command, so
+/// there is nothing left to succeed at.
+pub fn session(
+    ctx: &WorkContext<'_>,
+    store: &RunStore,
+    current_exe: &Path,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let ticket = key.to_uppercase();
+    let runs = store.runs_for_ticket(&ticket)?;
+    if runs.is_empty() {
+        return Err(WorkCliError::NoRunsForTicket(ticket));
+    }
+
+    let windows = ctx.tmux.list_windows()?;
+    let viewer = |run_id: i64| crate::work::viewer::viewer_command(current_exe, run_id);
+    let plan = crate::work::session::plan_session(&ticket, &runs, &windows, &viewer);
+
+    if plan.windows.is_empty() {
+        writeln!(
+            out,
+            "{} already has every window its runs call for; nothing to rebuild",
+            plan.session_name
+        )?;
+        return Ok(());
+    }
+
+    crate::work::session::reconstruct_session(ctx.tmux, &plan)?;
+
+    for window in &plan.windows {
+        let role = match (&window.command, window.run_id) {
+            (Some(_), _) => "log viewer",
+            (None, Some(_)) => "shell (its claude session died with the pane)",
+            (None, None) => "shell",
+        };
+        writeln!(
+            out,
+            "window    {}:{} — {role}",
+            plan.session_name, window.name
+        )?;
+        if let Some(session_id) = &window.resume_session_id {
+            writeln!(out, "resume:   claude --resume {session_id}")?;
+        }
+    }
+    writeln!(out, "attach:   tmux attach -t {}", plan.session_name)?;
+
+    Ok(())
 }
 
 /// `tm work start [<dir>]`: attach to (or create) the tmux session for
@@ -1576,6 +1653,187 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, WorkCliError::DirectoryNotFound(_)));
+    }
+
+    // --- session (reconstruction) ---
+
+    #[test]
+    fn session_rebuilds_a_viewer_for_a_live_headless_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: Some(4242),
+                kind: "lane".to_string(),
+                log_path: Some("/state/proj-1.log".to_string()),
+            })
+            .unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "proj-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::ListWindows,
+                TmuxCall::NewSessionWithCommand {
+                    name: "tm-proj-1".to_string(),
+                    dir: "/wt/proj-1".to_string(),
+                    window_name: "work".to_string(),
+                    env: Vec::new(),
+                    command: format!("'/usr/local/bin/tm' runs logs {run_id} --follow"),
+                },
+                TmuxCall::NewWindow {
+                    name: "tm-proj-1".to_string(),
+                    window_name: "shell".to_string(),
+                    dir: "/wt/proj-1".to_string(),
+                },
+                TmuxCall::SelectWindow {
+                    name: "tm-proj-1".to_string(),
+                    window: "work".to_string(),
+                },
+            ]
+        );
+
+        let printed = out_string(&out);
+        assert!(printed.contains("tm-proj-1:work"), "{printed}");
+        assert!(printed.contains("attach:"), "{printed}");
+    }
+
+    /// A live interactive run lost its `claude` with the pane. Its window
+    /// comes back as a shell, and the `claude --resume` line is *printed* —
+    /// see `crate::work::session`'s module docs on why it is not run.
+    #[test]
+    fn session_prints_a_resume_line_for_a_live_interactive_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-abc").unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+
+        assert!(
+            tmux.calls().iter().any(|call| matches!(
+                call,
+                TmuxCall::NewSession {
+                    primary_window,
+                    ..
+                } if primary_window == "work"
+            )),
+            "expected a plain shell window, got {:?}",
+            tmux.calls()
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("claude --resume sess-abc"), "{printed}");
+    }
+
+    #[test]
+    fn session_reports_nothing_to_do_for_a_healthy_session() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "work".to_string(),
+                dead: false,
+            },
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "shell".to_string(),
+                dead: false,
+            },
+        ]));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: Some(1),
+                kind: "lane".to_string(),
+                log_path: Some("/state/a.log".to_string()),
+            })
+            .unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![TmuxCall::ListWindows],
+            "reconstruction of a healthy session must touch nothing"
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("already"), "{printed}");
+    }
+
+    #[test]
+    fn session_errors_when_the_ticket_has_no_runs_to_rebuild_from() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        let err = session(&ctx, &store, &current_exe, "PROJ-404", &mut out).unwrap_err();
+
+        assert!(matches!(err, WorkCliError::NoRunsForTicket(_)));
     }
 
     // --- run (detached) / supervise ---
