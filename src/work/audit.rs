@@ -32,7 +32,9 @@ use thiserror::Error;
 use crate::config::AuditConfig;
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::naming::{expand_tilde, ticket_session_name};
-use crate::work::tmux::{TmuxError, TmuxOps, has_live_window, session_present};
+use crate::work::tmux::{
+    TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
+};
 
 /// Default prompt template used when [`AuditConfig::prompt`] is unset. See
 /// [`audit_prompt`].
@@ -51,6 +53,11 @@ pub const SESSION_RUN_ID_ENV: &str = "TSKMSTR_SESSION_RUN_ID";
 /// in. Public because it is also the board's liveness signal for audits (see
 /// [`crate::work::tmux::TmuxOps::list_windows`]).
 pub const AUDIT_WINDOW_NAME: &str = "audit";
+
+/// Name of the plain-shell window every ticket session is provisioned with,
+/// for `claude --resume`, manual git work, and running tests without leaving
+/// the ticket's session.
+pub const SHELL_WINDOW_NAME: &str = "shell";
 
 /// Errors returned by [`launch_audit`].
 #[derive(Debug, Error)]
@@ -95,6 +102,10 @@ pub struct LaunchOutcome {
     pub run_id: i64,
     /// Name of the tmux session the caller can attach to.
     pub session_name: String,
+    /// Name of the window `claude` runs in: [`AUDIT_WINDOW_NAME`], or a
+    /// [`unique_window_name`] suffixed variant when a previous audit's dead
+    /// window still holds that name.
+    pub window_name: String,
 }
 
 /// Substitutes `{key}` in `template` (or [`DEFAULT_PROMPT_TEMPLATE`] when
@@ -152,9 +163,11 @@ pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
 ///    `pid = None`; see the module docs) and starts `claude <prompt>` (with
 ///    `--model` when `audit_cfg.model` is set — see [`claude_command`]) in
 ///    that window, with `SESSION_RUN_ID_ENV` set to the new run's id so the
-///    in-session `tm ticket audit` can adopt it. The session is created if
-///    this is the ticket's first tmux-hosted action, and the window appended
-///    to it otherwise.
+///    in-session `tm ticket audit` can adopt it. The session (plus its
+///    [`SHELL_WINDOW_NAME`] window) is created if this is the ticket's first
+///    tmux-hosted action, and the window appended to it otherwise; the window
+///    takes a [`unique_window_name`] suffix if a dead predecessor still holds
+///    the plain name.
 ///
 /// `home` resolves a leading `~` in `audit_cfg.dir` via
 /// [`crate::work::naming::expand_tilde`], matching every other `~`-expanding
@@ -186,7 +199,8 @@ pub fn launch_audit(
             window_name: AUDIT_WINDOW_NAME.to_string(),
         });
     }
-    let session_exists = session_present(&windows, &session_name);
+    let existing_windows = session_window_names(&windows, &session_name);
+    let window_name = unique_window_name(AUDIT_WINDOW_NAME, &existing_windows);
 
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
@@ -202,15 +216,21 @@ pub fn launch_audit(
     let command = claude_command(audit_cfg.model.as_deref(), &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
-    if session_exists {
-        tmux.new_window_with_command(&session_name, AUDIT_WINDOW_NAME, &dir_str, &env, &command)?;
+    if existing_windows.is_empty() {
+        tmux.new_session_with_command(&session_name, &dir_str, &window_name, &env, &command)?;
+        // The ticket's session is being created, so provision its shell
+        // window too, then hand focus back to the action window `new_window`
+        // just stole it from.
+        tmux.new_window(&session_name, SHELL_WINDOW_NAME, &dir_str)?;
+        tmux.select_window(&session_name, &window_name)?;
     } else {
-        tmux.new_session_with_command(&session_name, &dir_str, AUDIT_WINDOW_NAME, &env, &command)?;
+        tmux.new_window_with_command(&session_name, &window_name, &dir_str, &env, &command)?;
     }
 
     Ok(LaunchOutcome {
         run_id,
         session_name,
+        window_name,
     })
 }
 
@@ -281,6 +301,7 @@ mod tests {
         assert_eq!(run.pid, None);
         assert_eq!(run.worktree, "/Users/jowi/Projects/axiom");
 
+        assert_eq!(outcome.window_name, "audit");
         assert_eq!(
             tmux.calls(),
             vec![
@@ -291,6 +312,15 @@ mod tests {
                     window_name: "audit".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
                     command: "claude '/ticket-audit PROJ-1'".to_string(),
+                },
+                TmuxCall::NewWindow {
+                    name: "tm-proj-1".to_string(),
+                    window_name: SHELL_WINDOW_NAME.to_string(),
+                    dir: "/Users/jowi/Projects/axiom".to_string(),
+                },
+                TmuxCall::SelectWindow {
+                    name: "tm-proj-1".to_string(),
+                    window: "audit".to_string(),
                 },
             ]
         );
@@ -359,13 +389,14 @@ mod tests {
         // refuse, and don't try to create a duplicate session.
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = tmux_with_windows(&[("tm-proj-1", "shell", false)]);
+        let tmux = tmux_with_windows(&[("tm-proj-1", SHELL_WINDOW_NAME, false)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
         let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
             .expect("launch should succeed");
 
+        assert_eq!(outcome.window_name, "audit");
         assert_eq!(
             tmux.calls(),
             vec![
@@ -379,6 +410,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn launch_audit_suffixes_the_window_when_a_dead_one_holds_the_name() {
+        // Windows are append-only and nothing renames them, so a relaunch
+        // over dead aftermath takes the next free name.
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = tmux_with_windows(&[("tm-proj-1", "audit", true)]);
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = configured("/repo/axiom");
+
+        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+            .expect("launch should succeed");
+
+        assert_eq!(outcome.window_name, "audit-2");
     }
 
     #[test]

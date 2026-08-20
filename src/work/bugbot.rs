@@ -26,9 +26,12 @@ use thiserror::Error;
 
 use crate::config::ReviewWatchConfig;
 use crate::runs::{RunStore, RunStoreError, StartRun};
+use crate::work::audit::SHELL_WINDOW_NAME;
 use crate::work::naming::{expand_tilde, ticket_session_name};
 use crate::work::review_watch::{CleanupLauncher, findings_file_path};
-use crate::work::tmux::{TmuxError, TmuxOps, has_live_window, session_present};
+use crate::work::tmux::{
+    TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
+};
 
 /// Default prompt template used when [`ReviewWatchConfig::prompt`] is unset.
 /// See [`cleanup_prompt`].
@@ -89,6 +92,10 @@ pub struct LaunchOutcome {
     pub run_id: i64,
     /// Name of the tmux session the caller can attach to.
     pub session_name: String,
+    /// Name of the window `claude` runs in: [`CLEANUP_WINDOW_NAME`], or a
+    /// suffixed variant when a dead predecessor still holds that name (see
+    /// [`crate::work::tmux::unique_window_name`]).
+    pub window_name: String,
 }
 
 /// Substitutes `{key}` and `{findings_file}` in `template` (or
@@ -174,7 +181,8 @@ pub fn launch_cleanup(
             window_name: CLEANUP_WINDOW_NAME.to_string(),
         });
     }
-    let session_exists = session_present(&windows, &session_name);
+    let existing_windows = session_window_names(&windows, &session_name);
+    let window_name = unique_window_name(CLEANUP_WINDOW_NAME, &existing_windows);
 
     let run_id = deps.store.start_run(&StartRun {
         ticket: req.key.to_string(),
@@ -194,27 +202,29 @@ pub fn launch_cleanup(
         run_id.to_string(),
     )];
 
-    if session_exists {
-        deps.tmux.new_window_with_command(
-            &session_name,
-            CLEANUP_WINDOW_NAME,
-            &dir_str,
-            &env,
-            &command,
-        )?;
-    } else {
+    if existing_windows.is_empty() {
         deps.tmux.new_session_with_command(
             &session_name,
             &dir_str,
-            CLEANUP_WINDOW_NAME,
+            &window_name,
             &env,
             &command,
         )?;
+        // Creating the ticket's session, so provision its shell window too
+        // and hand focus back to the action window, exactly as
+        // `launch_audit` does.
+        deps.tmux
+            .new_window(&session_name, SHELL_WINDOW_NAME, &dir_str)?;
+        deps.tmux.select_window(&session_name, &window_name)?;
+    } else {
+        deps.tmux
+            .new_window_with_command(&session_name, &window_name, &dir_str, &env, &command)?;
     }
 
     Ok(LaunchOutcome {
         run_id,
         session_name,
+        window_name,
     })
 }
 
@@ -334,6 +344,7 @@ mod tests {
         assert_eq!(run.pid, None);
         assert_eq!(run.worktree, "/Users/jowi/Projects/axiom");
 
+        assert_eq!(outcome.window_name, CLEANUP_WINDOW_NAME);
         let findings_file = findings_file_path(&home, None, "PROJ-1");
         assert_eq!(
             tmux.calls(),
@@ -351,6 +362,15 @@ mod tests {
                         "claude '/bugbot-triage PROJ-1 {}'",
                         findings_file.to_string_lossy()
                     ),
+                },
+                TmuxCall::NewWindow {
+                    name: "tm-proj-1".to_string(),
+                    window_name: SHELL_WINDOW_NAME.to_string(),
+                    dir: "/Users/jowi/Projects/axiom".to_string(),
+                },
+                TmuxCall::SelectWindow {
+                    name: "tm-proj-1".to_string(),
+                    window: CLEANUP_WINDOW_NAME.to_string(),
                 },
             ]
         );
@@ -566,8 +586,8 @@ mod tests {
 
         assert_eq!(
             tmux.calls().len(),
-            2,
-            "should have snapshotted the windows then started the tmux session"
+            4,
+            "should have snapshotted the windows, then created the session, its shell window, and reselected the action window"
         );
         let run = store
             .list_runs()

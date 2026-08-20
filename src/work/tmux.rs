@@ -276,15 +276,21 @@ pub fn has_live_window(windows: &[TmuxWindow], session: &str, window_name: &str)
     })
 }
 
-/// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) mentions session
-/// `session` at all — the create-session-vs-append-window fork.
+/// Every window name in session `session`, in [`TmuxOps::list_windows`]
+/// order — the input [`unique_window_name`] resolves a new action window's
+/// name against, and, because a session always has at least one window, also
+/// the create-session-vs-append-window fork: empty means the session does not
+/// exist.
 ///
-/// Equivalent to [`TmuxOps::has_session`] against the same snapshot, since a
-/// session always has at least one window, and cheaper: the same snapshot
-/// already answered [`has_live_window`], so the two decisions can't disagree
-/// about a session that appeared or vanished in between.
-pub fn session_present(windows: &[TmuxWindow], session: &str) -> bool {
-    windows.iter().any(|window| window.session == session)
+/// Deriving both from one snapshot (rather than a separate
+/// [`TmuxOps::has_session`] probe) keeps them from disagreeing about a
+/// session that appeared or vanished between two calls.
+pub fn session_window_names(windows: &[TmuxWindow], session: &str) -> Vec<String> {
+    windows
+        .iter()
+        .filter(|window| window.session == session)
+        .map(|window| window.name.clone())
+        .collect()
 }
 
 fn has_session_args(name: &str) -> Vec<String> {
@@ -1264,12 +1270,14 @@ mod tests {
     }
 
     #[test]
-    fn session_present_is_true_for_any_window_including_a_dead_one() {
-        // A session always has at least one window, so a window bearing its
-        // name is exactly "the session exists" — a dead pane doesn't remove
-        // the session.
-        assert!(session_present(&windows(), "tm-proj-1"));
-        assert!(!session_present(&windows(), "tm-proj-2"));
+    fn session_window_names_lists_that_sessions_windows_including_dead_ones() {
+        // A dead pane doesn't free the window's name, and doesn't remove the
+        // session either — an empty list is exactly "no such session".
+        assert_eq!(
+            session_window_names(&windows(), "tm-proj-1"),
+            vec!["audit".to_string(), "fix".to_string()]
+        );
+        assert!(session_window_names(&windows(), "tm-proj-2").is_empty());
     }
 
     // --- FakeTmuxOps sequencing for session-with-windows creation ---
