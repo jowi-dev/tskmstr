@@ -581,13 +581,30 @@ non-`Me` filter is active, the status line shows `Filter: <name>` and each
 ticket card also shows its assignee (`Assignee: <name>` or `Assignee:
 Unassigned`).
 
+### One tmux session per ticket
+
+Every action tskmstr takes against a ticket runs in a window of that
+ticket's own detached tmux session, named `tm-<lowercased key>` — the audit
+in a window named `audit`, the bugbot-cleanup session in `bugbot`, plus a
+plain `shell` window rooted where the session was created, for
+`claude --resume`, manual git work, and running tests. So `tmux attach -t
+tm-proj-123` shows one ticket's whole history, live windows included.
+
+Windows are append-only: nothing renames or reorders them, so window order
+is the action history. A repeat action whose window name is still taken
+(by a previous run's dead window) gets a numeric suffix — `audit`,
+`audit-2`, `audit-3`. Badges and the refuse-to-double-launch guard key off
+*live window names*, not session existence: once one session outlives every
+individual action, the session merely existing means "this ticket has been
+touched".
+
 ### Board-launched audit sessions
 
 Pressing `a` on a board ticket launches a ticket-audit Claude session for
-it in a detached tmux session named `tm-audit-<key>` — several can run
-concurrently. Pressing `a` again on the same ticket attaches the terminal
-to that session (the board suspends, tmux takes over; detach with `C-b d`
-to land back on the board). Launching requires:
+it in the `audit` window of its `tm-<key>` session — several tickets can
+run concurrently. Pressing `a` again on the same ticket attaches the
+terminal to that session (the board suspends, tmux takes over; detach with
+`C-b d` to land back on the board). Launching requires:
 
 ```toml
 [work.audit]
@@ -609,11 +626,11 @@ the pinned model, not anything tskmstr configures. Setting it emits an
 explicit `claude --model`, which overrides that pin. Since an audit is
 where digging quality matters most, it is worth setting deliberately.
 
-Each card with a session (or a live audit run) shows a badge: `audit:
-starting` (session up, run not registered yet), `audit: running`, `audit:
+Each card with a live `audit` window (or a live audit run) shows a badge:
+`audit: starting` (window up, run not registered yet), `audit: running`, `audit:
 waiting` (bold yellow — Claude stopped or asked a question and is waiting
 for you; attach and answer), and `audit: done` / `audit: failed` while
-the session is still up. Waiting-state telemetry comes from the `Stop` /
+the window is still up. Waiting-state telemetry comes from the `Stop` /
 `Notification` / `UserPromptSubmit` hooks emitting `await`/`resume`
 events; `tm runs watch` renders the same state as a `waiting` marker on
 running audit/create cards. The board polls the run store and tmux for
@@ -675,8 +692,8 @@ unresolved findings. Zero unresolved findings always goes straight to
 
 When there are findings, the watcher writes them to
 `${XDG_DATA_HOME:-~/.local/share}/tskmstr/findings/<key>.json` before
-finishing, and the cleanup session (a detached tmux session named
-`tm-bugbot-<key>`, launched the same way `tm-audit-<key>` is) runs
+finishing, and the cleanup session (the `bugbot` window of the ticket's
+`tm-<key>` session, launched the same way the `audit` window is) runs
 `prompt` with both `{key}` and `{findings_file}` substituted. Unlike the
 audit session, nothing in this repo calls `tm ticket audit` for you
 inside the cleanup conversation — the axiom-side `/bugbot-triage` skill's

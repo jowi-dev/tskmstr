@@ -82,6 +82,24 @@ pub fn session_name_from_dir(dir: &str) -> String {
     base.replace('.', "-")
 }
 
+/// The deterministic tmux session name for ticket `key`: `tm-<lowercased
+/// key>`.
+///
+/// One session per ticket, holding one window per action taken against it
+/// (`audit`, `work`, `bugbot`, `fix`, `shell`, …), so `tmux attach -t
+/// tm-proj-123` shows a ticket's whole history and finishing with it is one
+/// `kill-session`. Deterministic so the board can map a ticket to its session
+/// by name alone, with no lookup through the run store — this replaced the
+/// per-action `tm-audit-<key>` / `tm-bugbot-<key>` sessions, which split one
+/// ticket across several unrelated tmux sessions.
+///
+/// Lowercased only — never otherwise transformed — so uppercasing the suffix
+/// recovers the original (always-uppercase) Jira key exactly; the board's
+/// liveness mapping depends on that round trip.
+pub fn ticket_session_name(key: &str) -> String {
+    format!("tm-{}", key.to_lowercase())
+}
+
 /// Format a broken-down local time as `work.ml`'s `timestamp` does:
 ///
 /// ```ocaml
@@ -370,6 +388,24 @@ mod tests {
         assert_eq!(
             session_name_from_dir("/Users/jowi/Worktrees/axiom/already-dashed"),
             "already-dashed"
+        );
+    }
+
+    #[test]
+    fn ticket_session_name_lowercases_the_key() {
+        assert_eq!(ticket_session_name("PROJ-123"), "tm-proj-123");
+    }
+
+    #[test]
+    fn ticket_session_name_round_trips_back_to_the_key() {
+        // The board's window-name liveness mapping strips `tm-` and
+        // uppercases; that only recovers the key because lowercasing is the
+        // sole transformation here.
+        let key = "PROJ-123";
+        let session = ticket_session_name(key);
+        assert_eq!(
+            session.strip_prefix("tm-").unwrap().to_uppercase(),
+            key.to_string()
         );
     }
 

@@ -14,6 +14,14 @@
 //! into the ordered list of window names a new session should be built
 //! with.
 //!
+//! A ticket session ([`crate::work::naming::ticket_session_name`]) is built
+//! differently: it starts with the window of whichever action created it and
+//! grows one appended window per later action, named for that action.
+//! [`unique_window_name`], [`window_action`], [`session_window_names`] and
+//! [`has_live_window`] are the pure rules over that scheme — repeat actions
+//! take a `-2`/`-3` suffix, and a live window (not a live session) is what
+//! "this action is running" means.
+//!
 //! Every `tmux` argv below mirrors `work.ml`'s exactly:
 //!
 //! ```ocaml
@@ -82,6 +90,23 @@ pub struct TmuxSession {
     pub path: String,
 }
 
+/// One row of `tmux list-windows -a` output: which session a window belongs
+/// to, its name, and whether its pane has died.
+///
+/// The window *name* is the liveness signal for tmux-hosted actions (see
+/// [`TmuxOps::list_windows`]), so `dead` matters: a window whose pane exited
+/// can linger when `remain-on-exit` is set, and a lingering window is not a
+/// running action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxWindow {
+    /// `#{session_name}`.
+    pub session: String,
+    /// `#{window_name}`.
+    pub name: String,
+    /// `#{pane_dead}`: the window's pane has exited but the window survives.
+    pub dead: bool,
+}
+
 /// Behavior tskmstr needs from `tmux` to provision and manage lane/worktree
 /// sessions.
 pub trait TmuxOps {
@@ -124,6 +149,30 @@ pub trait TmuxOps {
     /// <dir>`).
     fn new_window(&self, name: &str, window_name: &str, dir: &str) -> Result<(), TmuxError>;
 
+    /// Append a window named `window_name` to session `name`, rooted at
+    /// `dir`, running `command` as its pane command instead of the default
+    /// shell (`tmux new-window -a -t <name>:{end} -n <window_name> -c <dir>
+    /// [-e KEY=VAL ...] <command>`).
+    ///
+    /// The window-with-a-command counterpart of
+    /// [`TmuxOps::new_session_with_command`], for the second and later
+    /// actions taken against a ticket whose session already exists; `env` and
+    /// `command` carry the same contract (one `-e KEY=VAL` per entry;
+    /// `command` is a single string tmux hands to `$SHELL -c`, so the caller
+    /// escapes it).
+    ///
+    /// Appended at `{end}`, not after the session's current window, so window
+    /// order is the ticket's action history — tmux's default insertion point
+    /// follows whichever window happens to be selected.
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError>;
+
     /// Select window `window` in session `name`
     /// (`tmux select-window -t <name>:<window>`).
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError>;
@@ -144,6 +193,21 @@ pub trait TmuxOps {
     /// error, matching `Unix.open_process_in`'s behavior of never
     /// inspecting the child's exit status.
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError>;
+
+    /// List every window of every running session
+    /// (`tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}'`).
+    ///
+    /// This is the liveness signal for tmux-hosted actions. Session
+    /// existence cannot serve that role: one session holds a ticket's whole
+    /// action history (`tm-<key>`, see [`crate::work::audit`]), so its
+    /// existence only means "this ticket has been touched" — it is the
+    /// presence of a live window *named after the action* that means the
+    /// action is running.
+    ///
+    /// Tolerant in the same way [`TmuxOps::list_sessions`] is: no `tmux`
+    /// server running yields `Ok(vec![])`, and malformed rows are dropped
+    /// rather than erroring.
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError>;
 }
 
 /// Given a lane/session's configured extra windows and primary window name,
@@ -165,6 +229,76 @@ pub fn window_creation_sequence(
     sequence.push(primary);
     sequence.extend(tmux_windows.iter().cloned());
     sequence
+}
+
+/// The action a window name denotes: `name` with a trailing `-<n>` repeat
+/// suffix (as produced by [`unique_window_name`]) stripped off.
+///
+/// Only an all-digit suffix is a repeat marker, so multi-word action names
+/// like `bugbot-cleanup` survive intact.
+pub fn window_action(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((base, suffix))
+            if !base.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => name,
+    }
+}
+
+/// The window name a new action window should take: `desired` if no window in
+/// `existing` already holds it, otherwise `desired-2`, `desired-3`, … up to
+/// the first free suffix.
+///
+/// Names, not indices, identify a ticket's action windows: `base-index` is
+/// user-configurable, tmux renumbers indices when a window is killed, and
+/// repeat actions (two fix passes) are expected. This is the whole naming
+/// rule, kept pure so it is testable against a plain list of names — the
+/// caller supplies `existing` from a [`TmuxOps::list_windows`] snapshot of
+/// the ticket's session.
+pub fn unique_window_name(desired: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|name| name == desired) {
+        return desired.to_string();
+    }
+    (2..)
+        .map(|n| format!("{desired}-{n}"))
+        .find(|candidate| !existing.iter().any(|name| name == candidate))
+        .expect("an unbounded counter always reaches a free name")
+}
+
+/// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) holds a live
+/// window for action `window_name` in session `session` — including a repeat
+/// window like `fix-2`, whose action is still `fix` (see [`window_action`]).
+///
+/// The double-launch guard for tmux-hosted actions: a ticket's session
+/// outlives any single action, so "is this action already running?" is a
+/// question about a window, not a session. A window whose pane has died
+/// (`remain-on-exit`) does not count as running — relaunching over that
+/// aftermath is the intended behavior.
+pub fn has_live_window(windows: &[TmuxWindow], session: &str, window_name: &str) -> bool {
+    windows.iter().any(|window| {
+        window.session == session && window_action(&window.name) == window_name && !window.dead
+    })
+}
+
+/// Every window name in session `session`, in [`TmuxOps::list_windows`]
+/// order — the input [`unique_window_name`] resolves a new action window's
+/// name against, and, because a session always has at least one window, also
+/// the create-session-vs-append-window fork: empty means the session does not
+/// exist.
+///
+/// Deriving both from one snapshot (rather than a separate
+/// [`TmuxOps::has_session`] probe) keeps them from disagreeing about a
+/// session that appeared or vanished between two calls.
+pub fn session_window_names(windows: &[TmuxWindow], session: &str) -> Vec<String> {
+    windows
+        .iter()
+        .filter(|window| window.session == session)
+        .map(|window| window.name.clone())
+        .collect()
 }
 
 fn has_session_args(name: &str) -> Vec<String> {
@@ -220,6 +354,35 @@ fn new_window_args(name: &str, window_name: &str, dir: &str) -> Vec<String> {
     ]
 }
 
+/// Builds the argv for [`TmuxOps::new_window_with_command`]. Targets
+/// `<name>:{end}` with `-a` so the window lands after the session's last
+/// window (see that method's docs), then one `-e KEY=VAL` pair per `env`
+/// entry, then `command` as the final positional argument.
+fn new_window_with_command_args(
+    name: &str,
+    window_name: &str,
+    dir: &str,
+    env: &[(String, String)],
+    command: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "new-window".to_string(),
+        "-a".to_string(),
+        "-t".to_string(),
+        format!("{name}:{{end}}"),
+        "-n".to_string(),
+        window_name.to_string(),
+        "-c".to_string(),
+        dir.to_string(),
+    ];
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(command.to_string());
+    args
+}
+
 fn select_window_args(name: &str, window: &str) -> Vec<String> {
     vec![
         "select-window".to_string(),
@@ -250,6 +413,46 @@ fn list_sessions_args() -> Vec<String> {
         "-F".to_string(),
         "#{session_name}|#{session_path}".to_string(),
     ]
+}
+
+fn list_windows_args() -> Vec<String> {
+    vec![
+        "list-windows".to_string(),
+        "-a".to_string(),
+        "-F".to_string(),
+        "#{session_name}:#{window_name}:#{pane_dead}".to_string(),
+    ]
+}
+
+/// Parse `tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}'`
+/// output with the same tolerance [`parse_list_sessions_output`] has: drop
+/// anything that isn't a well-formed row.
+///
+/// The session name is taken up to the *first* `:` and `pane_dead` from after
+/// the *last* one, leaving everything between them as the window name — tmux
+/// forbids `:` in session names but not in window names, and only the outer
+/// two fields have fixed shapes.
+fn parse_list_windows_output(stdout: &str) -> Vec<TmuxWindow> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (head, dead) = line.rsplit_once(':')?;
+            let (session, name) = head.split_once(':')?;
+            if session.is_empty() || name.is_empty() {
+                return None;
+            }
+            let dead = match dead {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            Some(TmuxWindow {
+                session: session.to_string(),
+                name: name.to_string(),
+                dead,
+            })
+        })
+        .collect()
 }
 
 /// Parse `tmux list-sessions -F '#{session_name}|#{session_path}'` output,
@@ -344,6 +547,21 @@ impl TmuxOps for ShellTmuxOps {
         require_success("tmux new-window", &output)
     }
 
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        let output = run(
+            "tmux new-window",
+            &new_window_with_command_args(name, window_name, dir, env, command),
+        )?;
+        require_success("tmux new-window", &output)
+    }
+
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError> {
         let output = run("tmux select-window", &select_window_args(name, window))?;
         require_success("tmux select-window", &output)
@@ -386,6 +604,16 @@ impl TmuxOps for ShellTmuxOps {
             &output.stdout,
         )))
     }
+
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
+        // Same no-server tolerance as `list_sessions`: `tmux list-windows -a`
+        // exits non-zero with no server running, which is "no windows", not a
+        // fault worth failing a badge refresh over.
+        let output = run("tmux list-windows", &list_windows_args())?;
+        Ok(parse_list_windows_output(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
 }
 
 /// A [`TmuxOps`] test double: returns canned results and records every call
@@ -399,6 +627,7 @@ impl TmuxOps for ShellTmuxOps {
 pub struct FakeTmuxOps {
     has_session_result: std::cell::RefCell<Result<bool, TmuxError>>,
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
+    list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -444,6 +673,19 @@ pub enum TmuxCall {
         /// Window working directory.
         dir: String,
     },
+    /// `new_window_with_command(name, window_name, dir, env, command)`.
+    NewWindowWithCommand {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window_name: String,
+        /// Window working directory.
+        dir: String,
+        /// Per-window environment pairs.
+        env: Vec<(String, String)>,
+        /// Pane command.
+        command: String,
+    },
     /// `select_window(name, window)`.
     SelectWindow {
         /// Session name.
@@ -457,15 +699,18 @@ pub enum TmuxCall {
     KillSession(String),
     /// `list_sessions()`.
     ListSessions,
+    /// `list_windows()`.
+    ListWindows,
 }
 
 impl FakeTmuxOps {
     /// Create a fake where `has_session` returns `Ok(false)` and
-    /// `list_sessions` returns `Ok(vec![])` unless overridden.
+    /// `list_sessions`/`list_windows` return `Ok(vec![])` unless overridden.
     pub fn new() -> Self {
         Self {
             has_session_result: std::cell::RefCell::new(Ok(false)),
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
+            list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -479,6 +724,12 @@ impl FakeTmuxOps {
     /// Set the result `list_sessions` will return.
     pub fn with_list_sessions(self, result: Result<Vec<TmuxSession>, TmuxError>) -> Self {
         *self.list_sessions_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `list_windows` will return.
+    pub fn with_list_windows(self, result: Result<Vec<TmuxWindow>, TmuxError>) -> Self {
+        *self.list_windows_result.borrow_mut() = result;
         self
     }
 
@@ -534,6 +785,26 @@ impl TmuxOps for FakeTmuxOps {
         Ok(())
     }
 
+    fn new_window_with_command(
+        &self,
+        name: &str,
+        window_name: &str,
+        dir: &str,
+        env: &[(String, String)],
+        command: &str,
+    ) -> Result<(), TmuxError> {
+        self.calls
+            .borrow_mut()
+            .push(TmuxCall::NewWindowWithCommand {
+                name: name.to_string(),
+                window_name: window_name.to_string(),
+                dir: dir.to_string(),
+                env: env.to_vec(),
+                command: command.to_string(),
+            });
+        Ok(())
+    }
+
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::SelectWindow {
             name: name.to_string(),
@@ -559,6 +830,11 @@ impl TmuxOps for FakeTmuxOps {
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::ListSessions);
         self.list_sessions_result.borrow().clone()
+    }
+
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::ListWindows);
+        self.list_windows_result.borrow().clone()
     }
 }
 
@@ -644,6 +920,52 @@ mod tests {
     }
 
     #[test]
+    fn new_window_with_command_args_append_at_the_end_with_env_and_command() {
+        let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "42".to_string())];
+        assert_eq!(
+            new_window_with_command_args(
+                "tm-proj-1",
+                "audit",
+                "/repo/axiom",
+                &env,
+                "claude '/ticket-audit PROJ-1'"
+            ),
+            vec![
+                "new-window",
+                "-a",
+                "-t",
+                "tm-proj-1:{end}",
+                "-n",
+                "audit",
+                "-c",
+                "/repo/axiom",
+                "-e",
+                "TSKMSTR_SESSION_RUN_ID=42",
+                "claude '/ticket-audit PROJ-1'"
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_records_new_window_with_command_call() {
+        let fake = FakeTmuxOps::new();
+        let env = vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string())];
+        fake.new_window_with_command("tm-proj-1", "audit", "/repo/axiom", &env, "claude")
+            .unwrap();
+
+        assert_eq!(
+            fake.calls(),
+            vec![TmuxCall::NewWindowWithCommand {
+                name: "tm-proj-1".to_string(),
+                window_name: "audit".to_string(),
+                dir: "/repo/axiom".to_string(),
+                env,
+                command: "claude".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn new_window_args_match_work_ml() {
         assert_eq!(
             new_window_args("axiom-lane", "fish", "/repo/lane"),
@@ -689,6 +1011,94 @@ mod tests {
             list_sessions_args(),
             vec!["list-sessions", "-F", "#{session_name}|#{session_path}"]
         );
+    }
+
+    #[test]
+    fn list_windows_args_cover_every_session_with_liveness() {
+        assert_eq!(
+            list_windows_args(),
+            vec![
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_name}:#{pane_dead}"
+            ]
+        );
+    }
+
+    // --- list-windows output parsing ---
+
+    #[test]
+    fn parses_window_lines_with_liveness() {
+        let stdout = "tm-proj-1:audit:0\ntm-proj-1:fix:1\naxiom-lane:code:0\n";
+        assert_eq!(
+            parse_list_windows_output(stdout),
+            vec![
+                TmuxWindow {
+                    session: "tm-proj-1".to_string(),
+                    name: "audit".to_string(),
+                    dead: false,
+                },
+                TmuxWindow {
+                    session: "tm-proj-1".to_string(),
+                    name: "fix".to_string(),
+                    dead: true,
+                },
+                TmuxWindow {
+                    session: "axiom-lane".to_string(),
+                    name: "code".to_string(),
+                    dead: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_window_output_yields_no_windows() {
+        assert_eq!(parse_list_windows_output(""), Vec::new());
+    }
+
+    #[test]
+    fn malformed_window_lines_are_dropped_not_erroring() {
+        // Same tolerance as `parse_list_sessions_output`: a line without the
+        // two delimiters, an empty field, or a `pane_dead` that isn't tmux's
+        // `0`/`1` flag is skipped rather than failing the whole listing.
+        let stdout = "no-delimiters\ntm-proj-1:audit:0\n:empty-session:0\ntm-x:win:maybe\n";
+        assert_eq!(
+            parse_list_windows_output(stdout),
+            vec![TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "audit".to_string(),
+                dead: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn window_names_containing_a_colon_keep_their_colon() {
+        // tmux does not forbid `:` in a window name, and only the first and
+        // last fields of the format string are fixed, so the middle field is
+        // whatever remains.
+        assert_eq!(
+            parse_list_windows_output("tm-proj-1:fix:pass:2:0\n"),
+            vec![TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "fix:pass:2".to_string(),
+                dead: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn fake_list_windows_result_is_configurable() {
+        let windows = vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "audit".to_string(),
+            dead: false,
+        }];
+        let fake = FakeTmuxOps::new().with_list_windows(Ok(windows.clone()));
+        assert_eq!(fake.list_windows().unwrap(), windows);
+        assert_eq!(fake.calls(), vec![TmuxCall::ListWindows]);
     }
 
     // --- list-sessions output parsing ---
@@ -767,6 +1177,115 @@ mod tests {
                 "server".to_string(),
             ]
         );
+    }
+
+    // --- unique_window_name / window_action ---
+
+    #[test]
+    fn unique_window_name_keeps_the_desired_name_when_unused() {
+        assert_eq!(unique_window_name("fix", &["audit".to_string()]), "fix");
+    }
+
+    #[test]
+    fn unique_window_name_suffixes_the_second_pass() {
+        assert_eq!(
+            unique_window_name("fix", &["audit".to_string(), "fix".to_string()]),
+            "fix-2"
+        );
+    }
+
+    #[test]
+    fn unique_window_name_counts_up_past_every_taken_suffix() {
+        let existing = vec![
+            "fix".to_string(),
+            "fix-2".to_string(),
+            "fix-3".to_string(),
+            "work".to_string(),
+        ];
+        assert_eq!(unique_window_name("fix", &existing), "fix-4");
+    }
+
+    #[test]
+    fn unique_window_name_fills_a_gap_left_by_a_killed_window() {
+        // Windows are append-only, but a killed one frees its name; reusing
+        // the lowest free suffix keeps names short and is what tmux's own
+        // window list would suggest.
+        let existing = vec!["fix".to_string(), "fix-3".to_string()];
+        assert_eq!(unique_window_name("fix", &existing), "fix-2");
+    }
+
+    #[test]
+    fn unique_window_name_does_not_confuse_a_different_action() {
+        assert_eq!(unique_window_name("fix", &["prefix".to_string()]), "fix");
+    }
+
+    #[test]
+    fn window_action_strips_a_repeat_suffix() {
+        assert_eq!(window_action("fix-2"), "fix");
+        assert_eq!(window_action("fix"), "fix");
+    }
+
+    #[test]
+    fn window_action_leaves_non_numeric_suffixes_alone() {
+        // `bugbot-cleanup` is one action's name, not `bugbot` repeat
+        // `cleanup`.
+        assert_eq!(window_action("bugbot-cleanup"), "bugbot-cleanup");
+        assert_eq!(window_action("fix-"), "fix-");
+    }
+
+    // --- window-set queries over a list_windows snapshot ---
+
+    fn windows() -> Vec<TmuxWindow> {
+        vec![
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "audit".to_string(),
+                dead: false,
+            },
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "fix".to_string(),
+                dead: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn has_live_window_finds_a_live_window_by_session_and_name() {
+        assert!(has_live_window(&windows(), "tm-proj-1", "audit"));
+    }
+
+    #[test]
+    fn has_live_window_matches_a_repeat_windows_action() {
+        // A second `fix` pass runs in `fix-2`; the action is still `fix`, so
+        // the double-launch guard must see it.
+        let windows = vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "fix-2".to_string(),
+            dead: false,
+        }];
+        assert!(has_live_window(&windows, "tm-proj-1", "fix"));
+    }
+
+    #[test]
+    fn has_live_window_ignores_a_dead_window_of_that_name() {
+        assert!(!has_live_window(&windows(), "tm-proj-1", "fix"));
+    }
+
+    #[test]
+    fn has_live_window_ignores_a_same_named_window_in_another_session() {
+        assert!(!has_live_window(&windows(), "tm-proj-2", "audit"));
+    }
+
+    #[test]
+    fn session_window_names_lists_that_sessions_windows_including_dead_ones() {
+        // A dead pane doesn't free the window's name, and doesn't remove the
+        // session either — an empty list is exactly "no such session".
+        assert_eq!(
+            session_window_names(&windows(), "tm-proj-1"),
+            vec!["audit".to_string(), "fix".to_string()]
+        );
+        assert!(session_window_names(&windows(), "tm-proj-2").is_empty());
     }
 
     // --- FakeTmuxOps sequencing for session-with-windows creation ---
