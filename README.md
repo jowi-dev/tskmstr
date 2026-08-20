@@ -92,9 +92,9 @@ tm auth status
 | `tm work list` | List every current tmux session with a worktree/session kind column |
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
-| `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--fg]` | Provision (if needed) and run one autonomous headless Claude Code session for a configured lane, tracked in `tm runs`; detached by default, `--fg` runs synchronously |
+| `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
-| `tm review fix <KEY> [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; detached by default, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 
 ## `tm runs`
 
@@ -207,12 +207,17 @@ deliberate `blocked` status back to `done`.
 
 ### Log files
 
-Every detached run (`tm pr watch <KEY>` and `tm work run <lane> ... `, both
-detached by default) redirects its stdout/stderr to a log file, recorded on
-the run row as `log_path`:
+Every detached run (`tm pr watch <KEY>`, and `tm work run <lane> ...
+--headless`) redirects its stdout/stderr to a log file, recorded on the run
+row as `log_path`:
 
 - `tm pr watch` (`kind = review-watch`): `<home>/.local/state/tskmstr/review-watch/<lowercased key>.log`
-- `tm work run` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
+- `tm work run --headless` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
+
+Interactive runs (`tm work run` and `tm review fix` without `--headless`)
+have no log file: their output is the tmux window's scrollback, and their
+prompt is kept at `<state_dir>/<worktree name>-<timestamp>.prompt.md`. `tm
+runs show` remains the durable record of what happened.
 
 For `tm work run`, that file can already have content in it by the time the
 detached process's stdio is redirected there: the blocked-ticket
@@ -454,7 +459,7 @@ branch name.
 ## `tm work`
 
 `tm work` provisions per-lane git worktrees and tmux sessions, and can run
-one autonomous headless `claude -p` session per lane, tracked in `tm runs`
+one Claude Code session per lane, tracked in `tm runs`
 (ported from a personal `j work` runner; see
 `docs/plans/runner-port.md`/`docs/decisions/0002-runner-absorption.md`).
 Each lane is configured under `[work.lanes.<name>]` in `config.toml`
@@ -462,11 +467,26 @@ Each lane is configured under `[work.lanes.<name>]` in `config.toml`
 `permission_mode` fall back to the `[work]`-level defaults, then to
 built-in defaults). `tm work run <lane>` provisions the lane's worktree if
 missing, cuts a fresh timestamped branch off the resolved base for this
-run, and invokes `claude -p` with the lane's prompt (`~/.claude/prompts/
-<lane>.md` by convention). Detached by default — provisioning/preflight run
-in the foreground so errors surface immediately, then a supervisor process
-runs `claude` and records the outcome while the initiating invocation
-returns the terminal right away; `--fg` instead runs synchronously. On
+run, and invokes `claude` with the lane's prompt (`~/.claude/prompts/
+<lane>.md` by convention).
+
+Interactive by default: provisioning/preflight run in the foreground so
+errors surface immediately, then `claude` is launched in a `work` window of
+the ticket's `tm-<key>` tmux session and the invocation returns the terminal
+right away. `tmux attach -t tm-<key>` to watch or steer the run mid-flight.
+The run row is finished by the session's own `SessionEnd` hook, so the
+prompt opens by telling the session to run `tm runs register --kind lane
+<KEY>` — that is what lets it adopt the run row `tm work run` pre-registered
+for it. A second `work` run is refused while one is still live in the
+session, before anything is provisioned.
+
+`--headless` keeps the previous behavior for CI, cron, and unattended
+batches: a one-shot `claude -p` under a `setsid`'d supervisor that runs
+`claude`, records the outcome, and is bounded by `--max-turns`. `--fg` runs
+that same headless pass synchronously and reports the run's outcome in the
+command's exit code — it implies `--headless`, since an interactive session
+has no outcome to report back. `--max-turns` applies only to the headless
+pass; an interactive session has no turn budget. On
 completion it records the PR URL, if any, on the run's `pr_url` field:
 first by asking `gh` directly for the branch's open PR, falling back to
 scraping the first GitHub pull-request URL out of the run's result text —
@@ -725,11 +745,13 @@ status-line message rather than launching anything or appearing to hang.
 Reviewing PRs with no local worktree (someone else's PR, not run from this
 board) is out of scope for now — `vdiff` has no `--pr` flag yet.
 
-Pressing `F` dispatches `tm review fix <KEY>` as a detached, watched-child
-launch, the same shape as `w`/`b`: `tm review fix` resolves the ticket's
-lane run, renders its captured `vdiff` comments via
-`vdiff --export-comments`, and dispatches a tracked run in the ticket's
-existing worktree and branch — no new worktree, no new branch. Its run rows
+Pressing `F` dispatches `tm review fix <KEY>` as a watched-child launch, the
+same shape as `w`/`b`: `tm review fix` resolves the ticket's lane run,
+renders its captured `vdiff` comments via `vdiff --export-comments`, and
+dispatches a tracked run in the ticket's existing worktree and branch — no
+new worktree, no new branch. The pass itself runs interactively in a `fix`
+window of the ticket's `tm-<key>` session (`fix-2` for a second pass), so
+`tmux attach -t tm-<key>` shows it alongside the ticket's other actions. Its run rows
 use `kind = "review-fix"`, so they never shadow the lane run and show up
 separately in `tm runs`; there is no board badge for them yet, so track
 progress via `tm runs` or the run-detail overlay (`v`). A ticket with no

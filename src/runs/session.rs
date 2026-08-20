@@ -246,7 +246,8 @@ fn adopt_run(
 /// - `Ok(None)` — no-op: `env.session_id` is absent, or `env.lane_run_id` is
 ///   present (a lane run already owns telemetry).
 /// - `Ok(Some(id))` — adopted `env.session_run_id`'s pre-registered run: it
-///   exists, is [`RunStatus::Running`], and matches `kind`/`ticket`. The
+///   exists, is [`RunStatus::Running`], and matches `kind` and `ticket`
+///   (the latter case-insensitively). The
 ///   marker is written pointing at it, and its `session_id`/`pid` are
 ///   stamped (see the module docs' "Adoption of board-launched sessions").
 /// - `Ok(Some(id))` — reused the existing run at the session's marker,
@@ -280,7 +281,15 @@ pub fn register_session(
         && let Some(run) = store.run_by_id(candidate_id)?
         && run.status == RunStatus::Running
         && run.kind == kind
-        && run.ticket == ticket
+        // Case-insensitive: the pre-registering caller records the ticket in
+        // whatever case it received (`tm work run mylane proj-1`, or the
+        // bare lane name), while `tm runs register` — how an interactive
+        // session adopts — uppercases its key. Ticket keys are
+        // case-insensitive across the rest of this CLI, and a case-only
+        // mismatch here is indistinguishable from success: the session
+        // starts a second run and the pre-registered one is left stuck at
+        // `running`.
+        && run.ticket.eq_ignore_ascii_case(ticket)
     {
         return adopt_run(store, dir, session_id, candidate_id, env.claude_pid).map(Some);
     }
@@ -561,6 +570,43 @@ mod tests {
         let marker = markers_dir.path().join("sess-1");
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents, pre_id.to_string());
+    }
+
+    /// A lane run's row carries its ticket exactly as the user typed it on
+    /// the command line (`tm work run mylane proj-1`), or the lane name when
+    /// no ticket was given — while `tm runs register`, the command an
+    /// interactive session adopts through, uppercases its key. Ticket keys
+    /// are case-insensitive everywhere else in this CLI, and a case-only
+    /// difference here would silently cost the session its pre-registered
+    /// row: it would start a *second* run and leave the first stuck at
+    /// `running`.
+    #[test]
+    fn register_session_adopts_across_a_ticket_case_difference() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+
+        let pre_id = store
+            .start_run(&StartRun {
+                ticket: "proj-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/Worktrees/axiom/proj-1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        let id = register_session(&store, markers_dir.path(), &env, "lane", "PROJ-1")
+            .unwrap()
+            .expect("expected the adopted run id");
+
+        assert_eq!(id, pre_id);
+        assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
     }
 
     #[test]

@@ -8,9 +8,12 @@
 //! `docs/plans/runner-port.md`'s destination note, later from a TUI —
 //! neither layer needs to duplicate this sequencing.
 //!
-//! Unlike `tm work new`/`start`, this never touches tmux: `work.ml`'s
-//! `run_lane` doesn't create or attach any tmux session in either its `--fg`
-//! or detached branch — sessions are `new`/`start`'s job, not `run`'s.
+//! This module itself never touches tmux, in any mode. Issue #2 phase 3
+//! makes an interactive run tmux-hosted, but the window is
+//! `crate::work::interactive`'s job and the CLI layer's to sequence —
+//! everything here stays a pure resolve-provision-prepare pipeline over
+//! injected seams. What this module contributes to a tmux-hosted run is the
+//! `PreparedRun`, including a `RunMode::Interactive` invocation.
 //!
 //! # The ported `--fg` sequence
 //!
@@ -82,9 +85,10 @@ use crate::config::WorkConfig;
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::jira::client::JiraClient;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
-use crate::work::claude::{ClaudeInvocationInputs, build_claude_invocation};
+use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
 use crate::work::hooks::{self, HooksError};
+use crate::work::interactive::interactive_prompt;
 use crate::work::naming::{self, expand_tilde};
 use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest, parse_run_outcome};
 
@@ -299,6 +303,16 @@ pub struct RunLaneRequest {
     /// `--prompt`: prompt file path override, taking precedence over the
     /// lane's `prompt_file` and the `~/.claude/prompts/<lane>.md` default.
     pub prompt_override: Option<String>,
+    /// How this run hosts `claude`: [`RunMode::Interactive`] for a
+    /// tmux-hosted session (`tm work run`'s default), [`RunMode::Headless`]
+    /// for `--headless`'s supervisor-driven `claude -p`.
+    ///
+    /// Defaults to [`RunMode::Headless`] — the shape that predates issue #2
+    /// phase 3 and the only one that needs no tmux server — even though the
+    /// CLI's own default is interactive. The CLI always sets this
+    /// explicitly; the conservative default is for programmatic callers that
+    /// have not thought about window hosting.
+    pub mode: RunMode,
 }
 
 /// Everything [`run_claude_and_finish`] needs to spawn `claude`, wait, parse
@@ -897,7 +911,7 @@ pub fn prepare_run_lane(
     // `RunStore::update_pid` on startup — see this function's doc comment).
     let ticket_field = request.ticket.clone().unwrap_or_else(|| lane.to_string());
     let run_id = deps.run_store.start_run(&StartRun {
-        ticket: ticket_field,
+        ticket: ticket_field.clone(),
         lane: lane.to_string(),
         worktree: wt_path.to_string_lossy().into_owned(),
         branch: Some(branch.clone()),
@@ -924,6 +938,16 @@ pub fn prepare_run_lane(
         .or_else(|| lane_config.permission_mode.clone())
         .or_else(|| config.default_permission_mode.clone());
 
+    // An interactive session has to adopt the row `start_run` just created,
+    // and only something running *inside* the session can do that (see
+    // `interactive::registration_preamble`), so the instruction rides in
+    // front of the prompt. The ticket it must register against is the run
+    // row's own `ticket` column, lane name included.
+    let prompt = match request.mode {
+        RunMode::Headless => prompt,
+        RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
+    };
+
     let invocation = build_claude_invocation(ClaudeInvocationInputs {
         prompt,
         model,
@@ -931,6 +955,7 @@ pub fn prepare_run_lane(
         permission_mode,
         settings_path: settings_path.clone(),
         run_id: Some(run_id.to_string()),
+        mode: request.mode,
     });
 
     std::fs::create_dir_all(&paths.state_dir)?;
@@ -1038,6 +1063,7 @@ pub fn prepare_review_fix(
     branch: &str,
     prompt: String,
     pid: Option<u32>,
+    mode: RunMode,
 ) -> Result<PreparedRun, ReviewFixError> {
     if !git.status_is_clean(worktree)? {
         return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
@@ -1057,6 +1083,13 @@ pub fn prepare_review_fix(
         log_path: None,
     })?;
 
+    // See `prepare_run_lane`'s equivalent: an interactive session adopts its
+    // pre-registered row by running `tm runs register` itself.
+    let prompt = match mode {
+        RunMode::Headless => prompt,
+        RunMode::Interactive => interactive_prompt("review-fix", ticket, &prompt),
+    };
+
     let invocation = build_claude_invocation(ClaudeInvocationInputs {
         prompt,
         model: None,
@@ -1064,6 +1097,7 @@ pub fn prepare_review_fix(
         permission_mode: None,
         settings_path: settings_path.clone(),
         run_id: Some(run_id.to_string()),
+        mode,
     });
 
     let (year, month, day, hour, min, sec) = clock.now_parts();
@@ -2807,6 +2841,112 @@ mod tests {
     }
 
     #[test]
+    fn prepare_run_lane_interactive_builds_a_tmux_hostable_invocation() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            mode: RunMode::Interactive,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(
+            prepared.invocation.env_set,
+            vec![(
+                "TSKMSTR_SESSION_RUN_ID".to_string(),
+                prepared.run_id.to_string()
+            )],
+            "an interactive run is finished by its SessionEnd hook, which \
+             TSKMSTR_RUN_ID would gate off"
+        );
+        // The prompt is positional, and it opens by telling the session to
+        // adopt the row `start_run` just created — the only way a session can
+        // reach `register_session`, which needs an in-session env var.
+        let prompt = &prepared.invocation.args[0];
+        assert!(prompt.contains("tm runs register --kind lane PROJ-1"));
+        assert!(prompt.contains("Work ticket: PROJ-1."));
+        assert!(!prepared.invocation.args.iter().any(|arg| arg == "-p"));
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.pid, None, "no supervisor process to attribute a pid to");
+    }
+
+    #[test]
+    fn prepare_run_lane_interactive_registers_a_ticketless_run_under_its_lane_name() {
+        // With no ticket the run row's `ticket` column holds the lane name,
+        // and that is what the session has to register against for adoption
+        // to match.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            jira: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            mode: RunMode::Interactive,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert!(
+            prepared.invocation.args[0].contains("tm runs register --kind lane mylane"),
+            "got: {}",
+            prepared.invocation.args[0]
+        );
+    }
+
+    #[test]
     fn prepare_run_lane_with_a_pid_records_it_on_the_run_row() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
@@ -3604,6 +3744,7 @@ mod tests {
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
             None,
+            RunMode::Headless,
         )
         .unwrap();
 
@@ -3650,11 +3791,48 @@ mod tests {
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
             None,
+            RunMode::Headless,
         )
         .unwrap_err();
 
         assert!(matches!(err, ReviewFixError::WorktreeDirty(path) if path == worktree));
         assert_eq!(run_store.list_runs().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn prepare_review_fix_interactive_builds_a_tmux_hostable_invocation() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+
+        let prepared = prepare_review_fix(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            "PROJ-1",
+            "mylane",
+            &worktree,
+            "jowi-dev/proj-1-slug",
+            "fix the review comments".to_string(),
+            None,
+            RunMode::Interactive,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.invocation.env_set,
+            vec![(
+                "TSKMSTR_SESSION_RUN_ID".to_string(),
+                prepared.run_id.to_string()
+            )]
+        );
+        let prompt = &prepared.invocation.args[0];
+        assert!(prompt.contains("tm runs register --kind review-fix PROJ-1"));
+        assert!(prompt.ends_with("fix the review comments"));
     }
 
     #[test]
@@ -3677,6 +3855,7 @@ mod tests {
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
             Some(4242),
+            RunMode::Headless,
         )
         .unwrap();
 

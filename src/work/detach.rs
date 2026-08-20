@@ -1,4 +1,4 @@
-//! Detachment mechanics for `tm work run` (no `--fg`), per
+//! Detachment mechanics for `tm work run --headless`, per
 //! `docs/plans/runner-port.md` step 10 — the step the plan's Risks section
 //! flags as the hardest, because Rust doesn't get detachment for free the
 //! way `work.ml` did.
@@ -19,7 +19,7 @@
 //! `tm work run` returns the terminal, to eventually call `RunStore::finish_run`
 //! when `claude` exits. The plan's chosen answer, implemented here:
 //!
-//! 1. `tm work run <lane>` (no `--fg`) does all provisioning, preflight, and
+//! 1. `tm work run <lane> --headless` does all provisioning, preflight, and
 //!    `RunStore::start_run` in the *foreground* — errors surface to the
 //!    user immediately, and no run row is created until it's known the run
 //!    is actually going to happen (see
@@ -101,8 +101,8 @@
 //! ## Manual test plan
 //!
 //! 1. Configure a lane pointing at a small/fast throwaway repo.
-//! 2. Run `tm work run <lane> --max-turns 1` from an interactive shell
-//!    (no `--fg`).
+//! 2. Run `tm work run <lane> --headless --max-turns 1` from an interactive
+//!    shell.
 //! 3. Confirm the terminal returns immediately with the `started`/`log`/
 //!    `follow`/`watch` summary (see [`crate::cli::work::run`]).
 //! 4. Close the terminal (or `kill` the shell) before `claude` finishes.

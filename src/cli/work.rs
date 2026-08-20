@@ -51,8 +51,12 @@ use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
 use crate::jira::client::JiraClient;
 use crate::runs::{RunStore, RunStoreError};
+use crate::work::claude::RunMode;
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
+use crate::work::interactive::{
+    InteractiveLaunchError, WORK_WINDOW_NAME, launch_interactive_run, resolve_action_window,
+};
 use crate::work::naming::{self, expand_tilde};
 use crate::work::run::{Clock, RunLaneError, RunLaneRequest};
 use crate::work::runner::ProcessSpawner;
@@ -129,6 +133,59 @@ pub enum WorkCliError {
         .0.display()
     )]
     WorktreePathMismatch(PathBuf),
+
+    /// Launching the interactive run's tmux window failed — including the
+    /// refusal to double-launch an action that is already live in the
+    /// ticket's session.
+    #[error(transparent)]
+    Interactive(#[from] InteractiveLaunchError),
+}
+
+/// How a run is hosted and whether the invoking process waits for it — the
+/// three-way resolution of `tm work run`/`tm review fix`'s `--headless` and
+/// `--fg` flags (see [`Dispatch::from_flags`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dispatch {
+    /// The default since issue #2 phase 3: `claude` runs interactively in a
+    /// window of the ticket's `tm-<key>` session, so the run can be attached
+    /// to and steered. Returns as soon as the window is launched.
+    #[default]
+    Interactive,
+    /// `--headless`: the `setsid`'d supervisor drives a one-shot `claude -p`
+    /// (see `src/work/detach.rs`) and this invocation returns immediately.
+    Headless,
+    /// `--fg`: the one-shot `claude -p` runs synchronously in *this* process,
+    /// so the command's exit code reports the run's outcome.
+    HeadlessForeground,
+}
+
+impl Dispatch {
+    /// Resolve `--headless` and `--fg` into one dispatch mode.
+    ///
+    /// **`--fg` implies headless.** `--fg`'s contract has always been "run
+    /// synchronously and let my exit code report the outcome", and an
+    /// interactive session cannot honor it: there is no result JSON to parse,
+    /// no bounded turn count, and a human may still be typing at it. Rather
+    /// than redefine `--fg` to mean "launch the window and attach" — which
+    /// would silently change what existing scripts get, and duplicates the
+    /// board attach work of phase 5 — it keeps meaning exactly what it means
+    /// today, which makes it a *selector* for the headless path. `--headless
+    /// --fg` is the same thing said twice, so the two flags do not conflict.
+    pub fn from_flags(headless: bool, fg: bool) -> Self {
+        match (headless, fg) {
+            (_, true) => Dispatch::HeadlessForeground,
+            (true, false) => Dispatch::Headless,
+            (false, false) => Dispatch::Interactive,
+        }
+    }
+
+    /// The [`RunMode`] this dispatch builds its `claude` invocation for.
+    pub fn run_mode(self) -> RunMode {
+        match self {
+            Dispatch::Interactive => RunMode::Interactive,
+            Dispatch::Headless | Dispatch::HeadlessForeground => RunMode::Headless,
+        }
+    }
 }
 
 /// Dependencies `tm work` subcommands need, gathered so callers don't have
@@ -298,29 +355,32 @@ pub struct RunDeps<'a> {
 /// that module's doc comment) so it stays callable from a future TUI
 /// without going through this CLI layer at all.
 ///
-/// `fg = true` runs synchronously in this process
-/// ([`crate::work::run::run_lane_fg`]) and returns once `claude` has
-/// finished. `fg = false` (the default) does provisioning/preflight/
-/// `start_run` in this process — so a bad lane, missing prompt, or dirty
-/// worktree still errors out immediately with no run row left behind — then
-/// re-execs `deps.current_exe` as a detached supervisor (see
-/// `crate::work::detach`) to run `claude` and finish the tracked run, and
-/// returns without waiting for it.
+/// [`Dispatch::Interactive`] (the default) hosts `claude` in a window of the
+/// ticket's `tm-<key>` session and returns as soon as the window is launched;
+/// see [`run_interactive`]. [`Dispatch::HeadlessForeground`] runs
+/// synchronously in this process ([`crate::work::run::run_lane_fg`]) and
+/// returns once `claude` has finished. [`Dispatch::Headless`] does
+/// provisioning/preflight/`start_run` in this process — so a bad lane,
+/// missing prompt, or dirty worktree still errors out immediately with no run
+/// row left behind — then re-execs `deps.current_exe` as a detached
+/// supervisor (see `crate::work::detach`) to run `claude` and finish the
+/// tracked run, and returns without waiting for it.
 ///
-/// Returns `Ok(true)` when the run completed successfully (`fg`) or was
-/// successfully handed off to a supervisor (detached); `Ok(false)` only when
-/// an `fg` run completed but was recorded as failed (a non-zero `claude`
-/// exit or `is_error: true`) — mirroring `work.ml`'s `if is_err then exit 1
-/// else exit 0`, which is not itself an error condition worth an `Err`. The
-/// detached path has no equivalent "did it fail" signal at hand-off time —
+/// Returns `Ok(true)` when the run completed successfully
+/// ([`Dispatch::HeadlessForeground`]) or was successfully handed off (to a
+/// supervisor, or to a tmux window); `Ok(false)` only when a foreground run
+/// completed but was recorded as failed (a non-zero `claude` exit or
+/// `is_error: true`) — mirroring `work.ml`'s `if is_err then exit 1 else exit
+/// 0`, which is not itself an error condition worth an `Err`. Neither
+/// hand-off path has an equivalent "did it fail" signal at hand-off time —
 /// `tm runs watch`/`tm runs show` are how that outcome is observed later —
-/// so it always returns `Ok(true)`.
+/// so both always return `Ok(true)`.
 pub fn run(
     ctx: &WorkContext<'_>,
     deps: &RunDeps<'_>,
     lane: &str,
     request: RunLaneRequest,
-    fg: bool,
+    dispatch: Dispatch,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let paths = crate::work::run::RunLanePaths {
@@ -336,11 +396,21 @@ pub fn run(
         clock: deps.clock,
         jira: deps.jira,
     };
+    let request = RunLaneRequest {
+        mode: dispatch.run_mode(),
+        ..request
+    };
 
-    if fg {
-        let outcome =
-            crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
-        return Ok(!outcome.is_error);
+    match dispatch {
+        Dispatch::Interactive => {
+            return run_interactive(ctx, &run_deps, &paths, lane, request, out);
+        }
+        Dispatch::HeadlessForeground => {
+            let outcome =
+                crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
+            return Ok(!outcome.is_error);
+        }
+        Dispatch::Headless => {}
     }
 
     // Detached: provisioning/preflight/start_run happen here, in the
@@ -399,6 +469,59 @@ pub fn run(
     if let Some(ticket) = &ticket {
         writeln!(out, "resume:   tm runs resume {ticket}")?;
     }
+
+    Ok(true)
+}
+
+/// The interactive half of [`run`]: host this lane run's `claude` in a
+/// window of the ticket's `tm-<key>` session.
+///
+/// Ordering matters. The window is resolved (and a double-launch refused)
+/// from one `tmux list_windows` snapshot *before*
+/// [`crate::work::run::prepare_run_lane`] runs, because preparing is what
+/// provisions the worktree, cuts the branch, and starts the run row — doing
+/// it first and refusing afterwards would leave all three behind. See
+/// [`crate::work::interactive`]'s module docs.
+///
+/// The run row is started with `pid = None`: there is no supervisor process
+/// to attribute a pid to, and the session stamps its own `CLAUDE_PID` when
+/// it adopts the row. Window existence, not a live pid, is what says a
+/// tmux-hosted run is still going.
+fn run_interactive(
+    ctx: &WorkContext<'_>,
+    run_deps: &crate::work::run::RunLaneDeps<'_>,
+    paths: &crate::work::run::RunLanePaths,
+    lane: &str,
+    request: RunLaneRequest,
+    out: &mut dyn Write,
+) -> Result<bool, WorkCliError> {
+    let session_key = request.ticket.clone().unwrap_or_else(|| lane.to_string());
+    let windows = ctx.tmux.list_windows()?;
+    let target = resolve_action_window(&windows, &session_key, WORK_WINDOW_NAME)?;
+
+    let prepared =
+        crate::work::run::prepare_run_lane(run_deps, ctx.config, paths, lane, request, None, out)?;
+
+    let prompt_path = paths.state_dir.join(format!(
+        "{}-{}.prompt.md",
+        prepared.wt_name, prepared.timestamp
+    ));
+    launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path)?;
+
+    writeln!(
+        out,
+        "started   {lane} {} on {}",
+        prepared.ticket.as_deref().unwrap_or("-"),
+        prepared.branch
+    )?;
+    writeln!(out, "worktree  {}", prepared.worktree.display())?;
+    writeln!(
+        out,
+        "window    {}:{}",
+        target.session_name, target.window_name
+    )?;
+    writeln!(out, "attach:   tmux attach -t {}", target.session_name)?;
+    writeln!(out, "watch:    tm runs watch")?;
 
     Ok(true)
 }
@@ -632,7 +755,7 @@ mod tests {
     use super::*;
     use crate::config::LaneConfig;
     use crate::work::git::FakeGitOps;
-    use crate::work::tmux::{FakeTmuxOps, TmuxCall};
+    use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
@@ -1468,6 +1591,205 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_from_flags_resolves_the_three_hosting_modes() {
+        assert_eq!(Dispatch::from_flags(false, false), Dispatch::Interactive);
+        assert_eq!(Dispatch::from_flags(true, false), Dispatch::Headless);
+        // --fg selects the headless path: an interactive session has no
+        // outcome it could report back synchronously.
+        assert_eq!(
+            Dispatch::from_flags(false, true),
+            Dispatch::HeadlessForeground
+        );
+        assert_eq!(
+            Dispatch::from_flags(true, true),
+            Dispatch::HeadlessForeground,
+            "--headless --fg is the same request said twice, not a conflict"
+        );
+    }
+
+    #[test]
+    fn dispatch_maps_to_the_invocation_shape_it_needs() {
+        assert_eq!(Dispatch::Interactive.run_mode(), RunMode::Interactive);
+        assert_eq!(Dispatch::Headless.run_mode(), RunMode::Headless);
+        assert_eq!(Dispatch::HeadlessForeground.run_mode(), RunMode::Headless);
+    }
+
+    #[test]
+    fn run_interactive_hosts_claude_in_the_tickets_tmux_session() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let succeeded = run(
+            &ctx,
+            &deps,
+            "mylane",
+            request,
+            Dispatch::Interactive,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(succeeded);
+        // Neither of the headless mechanisms is involved: no supervisor is
+        // re-exec'd and no `claude` process is spawned by this process.
+        assert!(detach.recorded.lock().unwrap().is_empty());
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+
+        let (window_name, env, command) = tmux
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                TmuxCall::NewSessionWithCommand {
+                    name,
+                    window_name,
+                    env,
+                    command,
+                    ..
+                } => {
+                    assert_eq!(name, "tm-proj-1");
+                    Some((window_name.clone(), env.clone(), command.clone()))
+                }
+                _ => None,
+            })
+            .expect("a work window was launched");
+        assert_eq!(window_name, "work");
+
+        let run_row = run_store
+            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            env,
+            vec![("TSKMSTR_SESSION_RUN_ID".to_string(), run_row.id.to_string())],
+            "the SessionEnd hook is the only thing that will finish this run, \
+             and TSKMSTR_RUN_ID would gate it off"
+        );
+        assert_eq!(run_row.pid, None);
+
+        // The prompt reaches `claude` through a file, not through the
+        // command string tmux hands to `$SHELL -c`.
+        assert!(command.contains("$(cat "));
+        assert!(!command.contains("Do the lane thing"));
+        let prompt_path = tmp
+            .path()
+            .join("home/.local/state/tskmstr/work/proj-1-20260806-090503.prompt.md");
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        assert!(prompt.contains("tm runs register --kind lane PROJ-1"));
+        assert!(prompt.contains("Do the lane thing."));
+
+        let printed = out_string(&out);
+        assert!(printed.contains("window    tm-proj-1:work"));
+        assert!(printed.contains("attach:   tmux attach -t tm-proj-1"));
+    }
+
+    #[test]
+    fn run_interactive_refuses_a_second_live_work_window_before_provisioning() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "work".to_string(),
+            dead: false,
+        }]));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let err = run(
+            &ctx,
+            &deps,
+            "mylane",
+            request,
+            Dispatch::Interactive,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, WorkCliError::Interactive(_)));
+        // The refusal comes before anything is provisioned: no run row, no
+        // branch cut, no worktree.
+        assert!(run_store.list_runs().unwrap().is_empty());
+        assert!(git.switch_new_branch_calls().is_empty());
+        assert!(git.provision_worktree_calls().is_empty());
+    }
+
+    #[test]
     fn run_detached_spawns_a_supervisor_and_returns_without_running_claude() {
         let (tmp, home, repo_root, _prompt_path) = run_setup();
         let mut lanes = BTreeMap::new();
@@ -1513,7 +1835,7 @@ mod tests {
             &deps,
             "mylane",
             RunLaneRequest::default(),
-            false,
+            Dispatch::Headless,
             &mut out,
         )
         .unwrap();
@@ -1664,7 +1986,7 @@ mod tests {
             ..Default::default()
         };
 
-        run(&ctx, &deps, "mylane", request, false, &mut out).unwrap();
+        run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap();
 
         let recorded = detach.recorded.lock().unwrap();
         let log_path = recorded[0].log_path.clone();
@@ -1733,7 +2055,7 @@ mod tests {
             ..Default::default()
         };
 
-        run(&ctx, &deps, "mylane", request, false, &mut out).unwrap();
+        run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap();
 
         let printed = out_string(&out);
         assert!(printed.contains("resume:   tm runs resume ABC-123"));
@@ -1786,7 +2108,7 @@ mod tests {
             &deps,
             "mylane",
             RunLaneRequest::default(),
-            false,
+            Dispatch::Headless,
             &mut out,
         )
         .unwrap_err();

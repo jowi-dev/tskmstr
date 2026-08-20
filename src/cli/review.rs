@@ -21,13 +21,18 @@
 //!    [`crate::work::run::prepare_review_fix`], which starts a tracked
 //!    `kind = "review-fix"` run on the *existing* worktree/branch — no new
 //!    worktree, no new branch.
-//! 5. Dispatch: `--fg` runs [`crate::work::run::run_claude_and_finish`]
-//!    synchronously, mirroring [`crate::cli::work::run`]'s `fg` branch;
-//!    otherwise this writes a [`crate::work::detach::SupervisorState`] and
-//!    spawns the same `tm work __supervise` supervisor `tm work run`'s
-//!    detached path uses — the supervisor only reads back a
-//!    [`crate::work::run::PreparedRun`], so it has no notion of "lane" vs.
-//!    "review-fix" runs at all.
+//! 5. Dispatch, per [`Dispatch`] — the same three-way resolution
+//!    [`crate::cli::work::run`] uses, and for the same reasons:
+//!    - [`Dispatch::Interactive`] (the default) hosts the pass in a `fix`
+//!      window of the ticket's `tm-<key>` session, so it can be attached to
+//!      and steered. A repeat pass becomes `fix-2`.
+//!    - [`Dispatch::HeadlessForeground`] (`--fg`) runs
+//!      [`crate::work::run::run_claude_and_finish`] synchronously.
+//!    - [`Dispatch::Headless`] writes a
+//!      [`crate::work::detach::SupervisorState`] and spawns the same `tm work
+//!      __supervise` supervisor `tm work run`'s headless path uses — the
+//!      supervisor only reads back a [`crate::work::run::PreparedRun`], so it
+//!      has no notion of "lane" vs. "review-fix" runs at all.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,14 +43,19 @@ use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::GitOps;
+use crate::work::interactive::{
+    FIX_WINDOW_NAME, InteractiveLaunchError, launch_interactive_run, resolve_action_window,
+};
 use crate::work::run::{
     Clock, PreparedRun, RunLaneError, RunLanePaths, prepare_review_fix, run_claude_and_finish,
     run_log_path,
 };
 use crate::work::runner::ProcessSpawner;
+use crate::work::tmux::{TmuxError, TmuxOps};
 use crate::work::vdiff::{VdiffError, VdiffOps};
 
 use super::runs::{RunsCliError, resolve_run};
+use super::work::Dispatch;
 
 /// The literal text `vdiff --export-comments` prints (with exit `0`) when
 /// the worktree's comment store is empty or absent. See [`VdiffOps::export_comments`]'s
@@ -104,6 +114,16 @@ pub enum ReviewCliError {
     /// Serializing the detached supervisor's state file failed.
     #[error("failed to serialize run state: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A `tmux` shell-out failed while resolving the interactive fix pass's
+    /// window.
+    #[error(transparent)]
+    Tmux(#[from] TmuxError),
+
+    /// Launching the interactive fix pass's tmux window failed — including
+    /// the refusal to dispatch a second concurrent fix pass.
+    #[error(transparent)]
+    Interactive(#[from] InteractiveLaunchError),
 }
 
 /// The result of one `tm review fix` dispatch attempt.
@@ -112,13 +132,13 @@ pub enum FixOutcome {
     /// `vdiff --export-comments` reported an empty/absent comment store; no
     /// run was dispatched and no run row was created.
     NoComments,
-    /// A run was dispatched (detached) or completed (`--fg`). `succeeded`
-    /// mirrors [`crate::cli::work::run`]'s `Ok(bool)` convention: always
-    /// `true` for a detached dispatch (there's nothing to report failed
-    /// yet), `false` for an `--fg` run that finished but was recorded as
-    /// failed.
+    /// A run was dispatched (interactively or to a supervisor) or completed
+    /// (`--fg`). `succeeded` mirrors [`crate::cli::work::run`]'s `Ok(bool)`
+    /// convention: always `true` for a dispatch (there's nothing to report
+    /// failed yet), `false` for an `--fg` run that finished but was recorded
+    /// as failed.
     Dispatched {
-        /// Whether the run succeeded (always `true` when detached).
+        /// Whether the run succeeded (always `true` when not `--fg`).
         succeeded: bool,
     },
 }
@@ -141,15 +161,18 @@ pub struct ReviewFixDeps<'a> {
     pub clock: &'a dyn Clock,
     /// `vdiff --export-comments` seam (real or fake).
     pub vdiff: &'a dyn VdiffOps,
-    /// Detached-supervisor process spawning (real or fake). Only used when
-    /// `fix`'s `fg` argument is `false`.
+    /// Detached-supervisor process spawning (real or fake). Only used for
+    /// [`Dispatch::Headless`].
     pub detach: &'a dyn DetachSpawner,
     /// This process's own executable path, re-exec'd as the detached
-    /// supervisor. Only used when `fg` is `false`.
+    /// supervisor. Only used for [`Dispatch::Headless`].
     pub current_exe: &'a Path,
     /// The run-state database path, threaded through to the detached
-    /// supervisor's state file. Only used when `fg` is `false`.
+    /// supervisor's state file. Only used for [`Dispatch::Headless`].
     pub run_db_path: &'a Path,
+    /// tmux operations (real or fake), for hosting an interactive fix pass
+    /// in the ticket's session. Only used for [`Dispatch::Interactive`].
+    pub tmux: &'a dyn TmuxOps,
 }
 
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
@@ -169,8 +192,8 @@ fn build_fix_prompt(export: &str) -> String {
     )
 }
 
-/// `tm review fix <KEY> [--fg]`: see the module doc comment for the full
-/// sequence.
+/// `tm review fix <KEY> [--headless] [--fg]`: see the module doc comment for
+/// the full sequence.
 ///
 /// # Errors
 ///
@@ -179,12 +202,14 @@ fn build_fix_prompt(export: &str) -> String {
 /// [`ReviewCliError::Vdiff`] if `vdiff --export-comments` itself failed
 /// (not `PATH`, spawn failure, or a nonzero exit — an empty store is
 /// [`FixOutcome::NoComments`], not an error); [`ReviewCliError::Prepare`] if
-/// [`prepare_review_fix`]'s preflight failed.
+/// [`prepare_review_fix`]'s preflight failed;
+/// [`ReviewCliError::Interactive`] if a fix pass is already live in the
+/// ticket's session.
 pub fn fix(
     deps: &ReviewFixDeps<'_>,
     paths: &RunLanePaths,
     key: &str,
-    fg: bool,
+    dispatch: Dispatch,
     out: &mut dyn Write,
 ) -> Result<FixOutcome, ReviewCliError> {
     let run = resolve_run(deps.run_store, key, Some("lane"))?;
@@ -202,7 +227,25 @@ pub fn fix(
     }
 
     let prompt = build_fix_prompt(&export);
-    let pid = if fg { Some(std::process::id()) } else { None };
+    let pid = match dispatch {
+        Dispatch::HeadlessForeground => Some(std::process::id()),
+        Dispatch::Headless | Dispatch::Interactive => None,
+    };
+
+    // Resolved before `prepare_review_fix` starts a run row, so a refusal to
+    // run a second concurrent fix pass leaves nothing behind — see
+    // `crate::work::interactive`'s module docs.
+    let target = match dispatch {
+        Dispatch::Interactive => {
+            let windows = deps.tmux.list_windows()?;
+            Some(resolve_action_window(
+                &windows,
+                &run.ticket,
+                FIX_WINDOW_NAME,
+            )?)
+        }
+        _ => None,
+    };
 
     let prepared: PreparedRun = prepare_review_fix(
         deps.git,
@@ -215,9 +258,29 @@ pub fn fix(
         &branch,
         prompt,
         pid,
+        dispatch.run_mode(),
     )?;
 
-    if fg {
+    if let Some(target) = target {
+        let prompt_path = paths.state_dir.join(format!(
+            "{}-{}.prompt.md",
+            prepared.wt_name, prepared.timestamp
+        ));
+        launch_interactive_run(deps.tmux, &target, &prepared, &prompt_path)?;
+
+        writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
+        writeln!(out, "worktree  {}", worktree.display())?;
+        writeln!(
+            out,
+            "window    {}:{}",
+            target.session_name, target.window_name
+        )?;
+        writeln!(out, "attach:   tmux attach -t {}", target.session_name)?;
+        writeln!(out, "watch:    tm runs watch")?;
+        return Ok(FixOutcome::Dispatched { succeeded: true });
+    }
+
+    if dispatch == Dispatch::HeadlessForeground {
         let outcome = run_claude_and_finish(deps.spawner, deps.gh, deps.run_store, &prepared, out)?;
         return Ok(FixOutcome::Dispatched {
             succeeded: !outcome.is_error,
@@ -263,6 +326,7 @@ mod tests {
     use crate::work::git::FakeGitOps;
     use crate::work::run::FakeClock;
     use crate::work::runner::FakeProcessSpawner;
+    use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use crate::work::vdiff::FakeVdiffOps;
     use tempfile::TempDir;
 
@@ -309,6 +373,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Ok("## file.rs\n\ncomment".to_string()));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -321,11 +386,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap_err();
+        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Runs(_)));
     }
@@ -351,6 +417,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Ok("## file.rs\n\ncomment".to_string()));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -363,11 +430,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap_err();
+        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
 
         assert!(matches!(err, ReviewCliError::MissingBranch { ticket } if ticket == "PROJ-1"));
     }
@@ -383,6 +451,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Ok("No comments.".to_string()));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -395,11 +464,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap();
+        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
 
         assert_eq!(outcome, FixOutcome::NoComments);
         assert_eq!(run_store.list_runs().unwrap().len(), 1); // only the seeded lane run
@@ -417,6 +487,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Err(VdiffError::NotFound));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -429,11 +500,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap_err();
+        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Vdiff(VdiffError::NotFound)));
         assert_eq!(run_store.list_runs().unwrap().len(), 1);
@@ -452,6 +524,7 @@ mod tests {
             "## src/foo.rs\n\nsrc/foo.rs:10-12 nit: rename this".to_string(),
         ));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -464,11 +537,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap();
+        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
 
         assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
         // No claude process was spawned in this (short-lived, foreground)
@@ -498,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn fix_foreground_runs_claude_synchronously_and_finishes_the_run() {
+    fn fix_interactive_hosts_the_pass_in_the_tickets_tmux_session() {
         let (tmp, run_store, worktree) = setup();
         seed_lane_run(&run_store, &worktree);
 
@@ -510,6 +584,13 @@ mod tests {
             "## src/foo.rs\n\nsrc/foo.rs:10-12 nit: rename this".to_string(),
         ));
         let detach = FakeDetachSpawner::new(4242);
+        // A dead `fix` window from the previous pass, so this one has to
+        // suffix past it.
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "fix".to_string(),
+            dead: true,
+        }]));
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -522,11 +603,125 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", true, &mut out).unwrap();
+        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Interactive, &mut out).unwrap();
+
+        assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
+        assert!(detach.recorded.lock().unwrap().is_empty());
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+
+        let review_fix_run = run_store
+            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .unwrap()
+            .unwrap();
+
+        let (window_name, env) = tmux
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                TmuxCall::NewWindowWithCommand {
+                    window_name, env, ..
+                } => Some((window_name.clone(), env.clone())),
+                _ => None,
+            })
+            .expect("a fix window was appended to the ticket's session");
+        assert_eq!(window_name, "fix-2");
+        assert_eq!(
+            env,
+            vec![(
+                "TSKMSTR_SESSION_RUN_ID".to_string(),
+                review_fix_run.id.to_string()
+            )]
+        );
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("window    tm-proj-1:fix-2"));
+    }
+
+    #[test]
+    fn fix_interactive_refuses_while_a_fix_pass_is_live_and_creates_no_run_row() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let vdiff = FakeVdiffOps::with_export(Ok("## src/foo.rs\n\ncomment".to_string()));
+        let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "fix".to_string(),
+            dead: false,
+        }]));
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+        };
+        let paths = paths(&tmp);
+        let mut out = Vec::new();
+
+        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Interactive, &mut out).unwrap_err();
+
+        assert!(matches!(err, ReviewCliError::Interactive(_)));
+        // Only the seeded lane run: two concurrent fix passes on one
+        // worktree would fight over the same files.
+        assert_eq!(run_store.list_runs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fix_foreground_runs_claude_synchronously_and_finishes_the_run() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let vdiff = FakeVdiffOps::with_export(Ok(
+            "## src/foo.rs\n\nsrc/foo.rs:10-12 nit: rename this".to_string(),
+        ));
+        let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+        };
+        let paths = paths(&tmp);
+        let mut out = Vec::new();
+
+        let outcome = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::HeadlessForeground,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
         assert!(detach.recorded.lock().unwrap().is_empty());
@@ -559,6 +754,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Ok("## src/foo.rs\n\ncomment".to_string()));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -571,11 +767,19 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", true, &mut out).unwrap();
+        let outcome = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::HeadlessForeground,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome, FixOutcome::Dispatched { succeeded: false });
     }
@@ -591,6 +795,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 18, 10, 0, 0));
         let vdiff = FakeVdiffOps::with_export(Ok("## src/foo.rs\n\ncomment".to_string()));
         let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = ReviewFixDeps {
@@ -603,11 +808,12 @@ mod tests {
             detach: &detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
+            tmux: &tmux,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", false, &mut out).unwrap_err();
+        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Prepare(_)));
         assert!(detach.recorded.lock().unwrap().is_empty());

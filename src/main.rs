@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
 };
@@ -53,10 +54,10 @@ fn main() -> ExitCode {
     // `tm review`'s only subcommand today, so every `Command::Review` ends
     // up here.
     if let Command::Review {
-        cmd: ReviewCmd::Fix { key, fg },
+        cmd: ReviewCmd::Fix { key, headless, fg },
     } = command
     {
-        return run_review_fix(key, fg);
+        return run_review_fix(key, Dispatch::from_flags(headless, fg));
     }
 
     match dispatch(command) {
@@ -261,6 +262,7 @@ fn run_work(
             max_turns,
             permission_mode,
             prompt,
+            headless,
             fg,
         } => {
             let gh = ShellGhCli::new();
@@ -295,9 +297,17 @@ fn run_work(
                 max_turns,
                 permission_mode,
                 prompt_override: prompt,
+                // `run` sets `mode` from the resolved dispatch below.
+                ..Default::default()
             };
-            let succeeded =
-                tskmstr::cli::work::run(&ctx, &run_deps, &lane, request, fg, &mut stdout)?;
+            let succeeded = tskmstr::cli::work::run(
+                &ctx,
+                &run_deps,
+                &lane,
+                request,
+                Dispatch::from_flags(headless, fg),
+                &mut stdout,
+            )?;
             if !succeeded {
                 return Err("lane run failed".into());
             }
@@ -930,7 +940,7 @@ const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
 /// a `--fg` run that finished failed) — see
 /// [`REVIEW_FIX_EXIT_NO_COMMENTS`]'s doc comment for why this needs its own
 /// three-way scheme rather than `dispatch`'s uniform 0/1.
-fn run_review_fix(key: String, fg: bool) -> ExitCode {
+fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
     let run_db_path = resolve_run_db_path();
     let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
         Ok(store) => store,
@@ -954,6 +964,7 @@ fn run_review_fix(key: String, fg: bool) -> ExitCode {
     let gh = ShellGhCli::new();
     let spawner = tskmstr::work::runner::StdProcessSpawner;
     let vdiff = tskmstr::work::vdiff::ShellVdiffOps::new();
+    let tmux = ShellTmuxOps::new();
     let detach = tskmstr::work::detach::RealDetachSpawner;
     let clock = tskmstr::work::run::SystemClock;
 
@@ -972,10 +983,11 @@ fn run_review_fix(key: String, fg: bool) -> ExitCode {
         detach: &detach,
         current_exe: &current_exe,
         run_db_path: &run_db_path,
+        tmux: &tmux,
     };
     let mut stdout = std::io::stdout();
 
-    match tskmstr::cli::review::fix(&deps, &run_paths, &key, fg, &mut stdout) {
+    match tskmstr::cli::review::fix(&deps, &run_paths, &key, dispatch, &mut stdout) {
         Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true }) => ExitCode::SUCCESS,
         Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: false }) => ExitCode::FAILURE,
         Ok(tskmstr::cli::review::FixOutcome::NoComments) => {
