@@ -256,7 +256,7 @@ pub enum WorkCmd {
         fg: bool,
     },
     /// Hidden: the detached run supervisor's own re-exec target. Not a
-    /// user-facing command — `tm work run` (without `--fg`) spawns this
+    /// user-facing command — `tm work run --headless` spawns this
     /// itself (see `src/work/detach.rs`) after provisioning and starting
     /// the tracked run in the foreground; it deserializes `--state-file`'s
     /// `PreparedRun` JSON, spawns `claude`, waits, and finishes the run.

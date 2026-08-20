@@ -8,9 +8,12 @@
 //! `docs/plans/runner-port.md`'s destination note, later from a TUI —
 //! neither layer needs to duplicate this sequencing.
 //!
-//! Unlike `tm work new`/`start`, this never touches tmux: `work.ml`'s
-//! `run_lane` doesn't create or attach any tmux session in either its `--fg`
-//! or detached branch — sessions are `new`/`start`'s job, not `run`'s.
+//! This module itself never touches tmux, in any mode. Issue #2 phase 3
+//! makes an interactive run tmux-hosted, but the window is
+//! `crate::work::interactive`'s job and the CLI layer's to sequence —
+//! everything here stays a pure resolve-provision-prepare pipeline over
+//! injected seams. What this module contributes to a tmux-hosted run is the
+//! `PreparedRun`, including a `RunMode::Interactive` invocation.
 //!
 //! # The ported `--fg` sequence
 //!
