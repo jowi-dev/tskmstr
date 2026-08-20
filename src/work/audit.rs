@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::config::AuditConfig;
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::naming::expand_tilde;
-use crate::work::tmux::{TmuxError, TmuxOps};
+use crate::work::tmux::{TmuxError, TmuxOps, has_live_window, session_present};
 
 /// Default prompt template used when [`AuditConfig::prompt`] is unset. See
 /// [`audit_prompt`].
@@ -61,13 +61,20 @@ pub enum AuditLaunchError {
     #[error("audit launching is not configured; set [work.audit].dir")]
     NotConfigured,
 
-    /// A tmux session for this ticket is already live; launching again
-    /// would double-run the audit. The caller should attach to
-    /// `session_name` instead.
-    #[error("an audit session is already running: {session_name}")]
+    /// This ticket's audit window is already live; launching again would
+    /// double-run the audit. The caller should attach to `session_name`
+    /// instead.
+    ///
+    /// Window-scoped, not session-scoped: the session collects a window per
+    /// action taken against the ticket, so only a live window *named after
+    /// this action* means the action is running (see
+    /// [`crate::work::tmux::has_live_window`]).
+    #[error("an audit session is already running: {session_name}:{window_name}")]
     AlreadyRunning {
-        /// Name of the already-live tmux session.
+        /// Name of the tmux session holding the live window.
         session_name: String,
+        /// Name of the already-live window.
+        window_name: String,
     },
 
     /// The run-state database could not be written to.
@@ -144,15 +151,18 @@ pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
 ///
 /// 1. Errors with [`AuditLaunchError::NotConfigured`] if `audit_cfg.dir` is
 ///    unset.
-/// 2. Errors with [`AuditLaunchError::AlreadyRunning`] if a tmux session
-///    named [`audit_session_name`] already exists — no run row is created in
-///    this case, so a launch attempt against an already-live session never
-///    creates an orphaned pre-registration.
+/// 2. Errors with [`AuditLaunchError::AlreadyRunning`] if a live window
+///    named [`AUDIT_WINDOW_NAME`] already exists in [`audit_session_name`]'s
+///    session — no run row is created in this case, so a launch attempt
+///    against an already-live audit never creates an orphaned
+///    pre-registration.
 /// 3. Otherwise pre-registers a run (`kind = "audit"`, `lane = "audit"`,
-///    `pid = None`; see the module docs) and starts the tmux session running
-///    `claude <prompt>` (with `--model` when `audit_cfg.model` is set — see
-///    [`claude_command`]), and `SESSION_RUN_ID_ENV` set to the new run's id so
-///    the in-session `tm ticket audit` can adopt it.
+///    `pid = None`; see the module docs) and starts `claude <prompt>` (with
+///    `--model` when `audit_cfg.model` is set — see [`claude_command`]) in
+///    that window, with `SESSION_RUN_ID_ENV` set to the new run's id so the
+///    in-session `tm ticket audit` can adopt it. The session is created if
+///    this is the ticket's first tmux-hosted action, and the window appended
+///    to it otherwise.
 ///
 /// `home` resolves a leading `~` in `audit_cfg.dir` via
 /// [`crate::work::naming::expand_tilde`], matching every other `~`-expanding
@@ -173,9 +183,18 @@ pub fn launch_audit(
     let dir_str = dir.to_string_lossy().into_owned();
 
     let session_name = audit_session_name(key);
-    if tmux.has_session(&session_name)? {
-        return Err(AuditLaunchError::AlreadyRunning { session_name });
+    // One `list_windows` snapshot answers both questions — "is an audit
+    // already running?" and "does the session exist yet?" — so the two
+    // decisions cannot disagree about a session that appeared or vanished
+    // between two probes.
+    let windows = tmux.list_windows()?;
+    if has_live_window(&windows, &session_name, AUDIT_WINDOW_NAME) {
+        return Err(AuditLaunchError::AlreadyRunning {
+            session_name,
+            window_name: AUDIT_WINDOW_NAME.to_string(),
+        });
     }
+    let session_exists = session_present(&windows, &session_name);
 
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
@@ -191,7 +210,11 @@ pub fn launch_audit(
     let command = claude_command(audit_cfg.model.as_deref(), &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
-    tmux.new_session_with_command(&session_name, &dir_str, AUDIT_WINDOW_NAME, &env, &command)?;
+    if session_exists {
+        tmux.new_window_with_command(&session_name, AUDIT_WINDOW_NAME, &dir_str, &env, &command)?;
+    } else {
+        tmux.new_session_with_command(&session_name, &dir_str, AUDIT_WINDOW_NAME, &env, &command)?;
+    }
 
     Ok(LaunchOutcome {
         run_id,
@@ -203,7 +226,7 @@ pub fn launch_audit(
 mod tests {
     use super::*;
     use crate::runs::RunStatus;
-    use crate::work::tmux::{FakeTmuxOps, TmuxCall};
+    use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -223,7 +246,8 @@ mod tests {
     /// recorded, for the tests that only care about how `claude` was invoked.
     fn launched_command(tmux: &FakeTmuxOps) -> Option<String> {
         tmux.calls().iter().find_map(|call| match call {
-            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
+            TmuxCall::NewSessionWithCommand { command, .. }
+            | TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
             _ => None,
         })
     }
@@ -273,7 +297,7 @@ mod tests {
         assert_eq!(
             tmux.calls(),
             vec![
-                TmuxCall::HasSession("tm-audit-proj-1".to_string()),
+                TmuxCall::ListWindows,
                 TmuxCall::NewSessionWithCommand {
                     name: "tm-audit-proj-1".to_string(),
                     dir: "/Users/jowi/Projects/axiom".to_string(),
@@ -301,11 +325,24 @@ mod tests {
         assert!(tmux.calls().is_empty());
     }
 
+    /// A [`FakeTmuxOps`] whose `list_windows` snapshot is `windows`, each
+    /// entry given as `(session, window, dead)`.
+    fn tmux_with_windows(windows: &[(&str, &str, bool)]) -> FakeTmuxOps {
+        FakeTmuxOps::new().with_list_windows(Ok(windows
+            .iter()
+            .map(|(session, name, dead)| TmuxWindow {
+                session: (*session).to_string(),
+                name: (*name).to_string(),
+                dead: *dead,
+            })
+            .collect()))
+    }
+
     #[test]
-    fn launch_audit_errors_and_creates_no_run_when_already_running() {
+    fn launch_audit_errors_and_creates_no_run_when_the_audit_window_is_live() {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let tmux = tmux_with_windows(&[("tm-audit-proj-1", "audit", false)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("~/Projects/axiom");
 
@@ -313,14 +350,67 @@ mod tests {
             .expect_err("should refuse to double-launch");
 
         match err {
-            AuditLaunchError::AlreadyRunning { session_name } => {
+            AuditLaunchError::AlreadyRunning {
+                session_name,
+                window_name,
+            } => {
                 assert_eq!(session_name, "tm-audit-proj-1");
+                assert_eq!(window_name, "audit");
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
         assert!(
             store.list_runs().unwrap().is_empty(),
-            "must not pre-register a run for a session that already exists"
+            "must not pre-register a run for an action that is already running"
+        );
+    }
+
+    #[test]
+    fn launch_audit_appends_a_window_when_the_ticket_session_already_exists() {
+        // The session exists but holds no live `audit` window, so this is a
+        // first audit against an already-touched ticket: append, don't
+        // refuse, and don't try to create a duplicate session.
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = tmux_with_windows(&[("tm-audit-proj-1", "shell", false)]);
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = configured("/repo/axiom");
+
+        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+            .expect("launch should succeed");
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::ListWindows,
+                TmuxCall::NewWindowWithCommand {
+                    name: "tm-audit-proj-1".to_string(),
+                    window_name: "audit".to_string(),
+                    dir: "/repo/axiom".to_string(),
+                    env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
+                    command: "claude '/ticket-audit PROJ-1'".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_audit_relaunches_over_a_dead_audit_window() {
+        // A window whose pane exited is aftermath, not a running audit.
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = tmux_with_windows(&[("tm-audit-proj-1", "audit", true)]);
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = configured("/repo/axiom");
+
+        launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1").expect("launch should succeed");
+
+        assert!(
+            tmux.calls()
+                .iter()
+                .any(|call| matches!(call, TmuxCall::NewWindowWithCommand { .. })),
+            "expected a window append, got {:?}",
+            tmux.calls()
         );
     }
 

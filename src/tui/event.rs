@@ -1232,8 +1232,11 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         key,
     ) {
         Ok(_) => format!("launched audit for {key} -- press a to attach"),
-        Err(crate::work::audit::AuditLaunchError::AlreadyRunning { session_name }) => {
-            format!("audit already running ({session_name}) -- press a to attach")
+        Err(crate::work::audit::AuditLaunchError::AlreadyRunning {
+            session_name,
+            window_name,
+        }) => {
+            format!("audit already running ({session_name}:{window_name}) -- press a to attach")
         }
         Err(err) => err.to_string(),
     };
@@ -1263,8 +1266,13 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 
     let message = match crate::work::bugbot::launch_cleanup(&launch_deps, &request) {
         Ok(_) => format!("launched bugbot cleanup for {key} -- press b to attach"),
-        Err(crate::work::bugbot::CleanupLaunchError::AlreadyRunning { session_name }) => {
-            format!("bugbot cleanup already running ({session_name}) -- press b to attach")
+        Err(crate::work::bugbot::CleanupLaunchError::AlreadyRunning {
+            session_name,
+            window_name,
+        }) => {
+            format!(
+                "bugbot cleanup already running ({session_name}:{window_name}) -- press b to attach"
+            )
         }
         Err(err) => err.to_string(),
     };
@@ -2859,13 +2867,19 @@ mod tests {
             prompt: None,
             model: None,
         };
-        deps.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_has_session(Ok(true)));
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![window(
+                "tm-audit-proj-1",
+                AUDIT_WINDOW_NAME,
+                false,
+            )])),
+        );
 
         let msgs = launch_audit_cmd(&deps, "PROJ-1");
         assert_eq!(
             msgs,
             vec![Msg::AuditActionResult(
-                "audit already running (tm-audit-proj-1) -- press a to attach".to_string()
+                "audit already running (tm-audit-proj-1:audit) -- press a to attach".to_string()
             )]
         );
     }
@@ -3293,13 +3307,19 @@ mod tests {
             dir: Some("/repo/axiom".to_string()),
             ..crate::config::ReviewWatchConfig::default()
         };
-        deps.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_has_session(Ok(true)));
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![window(
+                "tm-bugbot-proj-1",
+                CLEANUP_WINDOW_NAME,
+                false,
+            )])),
+        );
 
         let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
         assert_eq!(
             msgs,
             vec![Msg::BotsActionResult(
-                "bugbot cleanup already running (tm-bugbot-proj-1) -- press b to attach"
+                "bugbot cleanup already running (tm-bugbot-proj-1:bugbot-cleanup) -- press b to attach"
                     .to_string()
             )]
         );
