@@ -282,11 +282,11 @@ pub struct RunModelUsage {
 /// A ticket's board-launched audit session state, per
 /// `docs/plans/board-audits.md`'s "Board integration" design. Derived, never
 /// stored: [`audit_indicator`] computes it fresh each poll from a live
-/// `tm-audit-<key>` tmux session and the ticket's latest `kind = "audit"`
-/// run.
+/// `audit` window in the ticket's `tm-<key>` tmux session and the ticket's
+/// latest `kind = "audit"` run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditIndicator {
-    /// A `tm-audit-<key>` tmux session exists but no run has reached
+    /// A live `audit` window exists but no run has reached
     /// [`RunStatus::Running`] yet (or none was ever registered for it).
     Starting,
     /// The latest audit run is [`RunStatus::Running`], not currently
@@ -309,35 +309,42 @@ pub enum AuditIndicator {
 }
 
 /// A ticket's full audit badge state on the board: its [`AuditIndicator`]
-/// plus whether a live `tm-audit-<key>` tmux session exists.
+/// plus whether the action's tmux window is live.
+///
+/// `has_session` predates the one-session-per-ticket consolidation and keeps
+/// its name; what it now reports is a live *window* for the action (`audit`,
+/// or `bugbot` for `cleanup_status`) inside the ticket's shared `tm-<key>`
+/// session, which is what liveness means once a session outlives every
+/// individual action (see [`crate::work::tmux::TmuxOps::list_windows`]).
 ///
 /// Kept separate from `AuditIndicator` (rather than deriving `has_session`
 /// back out of it) because attach-vs-launch (see [`Msg::AuditAction`]) must
-/// key off session existence alone: `Running`/`Waiting` can, in principle, be
-/// reported for an audit run with no live session on this machine (e.g. one
+/// key off that liveness alone: `Running`/`Waiting` can, in principle, be
+/// reported for an audit run with no live window on this machine (e.g. one
 /// launched and later killed on another host sharing the same runs DB), and
-/// attaching is only ever possible when the session itself is live.
+/// attaching is only ever possible when the window itself is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditStatusEntry {
     /// The badge to render on the ticket's card.
     pub indicator: AuditIndicator,
-    /// Whether a live `tm-audit-<key>` tmux session exists for this ticket.
+    /// Whether the ticket has a live window for this action (see the struct
+    /// docs on the retained name).
     pub has_session: bool,
 }
 
 /// Pure precedence rule for deriving a ticket's [`AuditIndicator`] from
-/// whether its `tm-audit-<key>` tmux session (`has_session`) is live and its
-/// latest `kind = "audit"` run's `(status, awaiting_input)`, if any exists.
-/// `None` when neither a session nor a run at [`RunStatus::Done`]/
-/// [`RunStatus::Failed`] with a live session applies -- no badge.
+/// whether its `audit` window (`has_session`) is live and its latest
+/// `kind = "audit"` run's `(status, awaiting_input)`, if any exists.
+/// `None` when neither a live window nor a run at [`RunStatus::Done`]/
+/// [`RunStatus::Failed`] with a live window applies -- no badge.
 ///
 /// Precedence, per `docs/plans/board-audits.md`'s "Board integration"
 /// design:
 /// 1. Running + awaiting input -> [`AuditIndicator::Waiting`].
 /// 2. Running, not awaiting -> [`AuditIndicator::Running`].
-/// 3. No run recorded at all, but the session exists -> [`AuditIndicator::Starting`].
-/// 4. A finished (`Done`/`Failed`/`Interrupted`) run *and* the session still
-///    exists -> the matching terminal indicator (attachable aftermath).
+/// 3. No run recorded at all, but the window is live -> [`AuditIndicator::Starting`].
+/// 4. A finished (`Done`/`Failed`/`Interrupted`) run *and* a still-live
+///    window -> the matching terminal indicator (attachable aftermath).
 /// 5. Otherwise: no badge.
 pub fn audit_indicator(
     has_session: bool,
@@ -681,7 +688,7 @@ pub struct App {
     /// cadence, and derived by the *same* [`audit_indicator`] rule as
     /// `audit_status` (a cleanup session is a tmux-hosted interactive session
     /// too -- see `docs/plans/bugbot-watch.md`'s "Board integration"), just
-    /// over `kind = "bugbot-cleanup"` runs and `tm-bugbot-<key>` sessions.
+    /// over `kind = "bugbot-cleanup"` runs and `bugbot` windows.
     pub cleanup_status: HashMap<String, AuditStatusEntry>,
     /// Ticket keys with a `tm pr watch` launcher child currently in flight (no
     /// `review-watch` run row recorded yet). Populated by [`Msg::BotsAction`],
@@ -982,8 +989,8 @@ pub enum Msg {
     /// line.
     RunsReaped(usize),
     /// The `a` key was pressed on [`Screen::Board`] for the selected ticket:
-    /// attach to its live `tm-audit-<key>` session if one exists, otherwise
-    /// launch a new one. See [`audit_action`].
+    /// attach to its `tm-<key>` session if its `audit` window is live,
+    /// otherwise launch a new one. See [`audit_action`].
     AuditAction,
     /// [`Cmd::LoadAuditStatus`] finished loading, replacing
     /// `app.audit_status` wholesale.
@@ -991,7 +998,7 @@ pub enum Msg {
     /// The outcome of [`Cmd::LaunchAudit`] or [`Cmd::AttachAudit`], already
     /// rendered to a human-readable status-line message (e.g. `launched
     /// audit for PROJ-1 -- press a to attach`, or `detached from
-    /// tm-audit-proj-1`). Kept as a single string variant (mirroring
+    /// tm-proj-1`). Kept as a single string variant (mirroring
     /// [`Msg::RankApplied`]/[`Msg::TicketsFailed`]'s reuse pattern) rather
     /// than a dedicated success/failure pair, since every outcome is purely
     /// a status-line update from `update`'s point of view.
@@ -1166,9 +1173,8 @@ pub enum Cmd {
     },
     /// Reap abandoned runs in the run store.
     ReapRuns,
-    /// Reload [`Screen::Board`]'s per-ticket audit status (live
-    /// `tm-audit-<key>` tmux sessions plus the latest `kind = "audit"` run
-    /// per ticket).
+    /// Reload [`Screen::Board`]'s per-ticket audit status (live `audit`
+    /// tmux windows plus the latest `kind = "audit"` run per ticket).
     LoadAuditStatus,
     /// Launch a ticket-audit session for `key` (see
     /// [`crate::work::audit::launch_audit`]).
@@ -1176,7 +1182,7 @@ pub enum Cmd {
         /// Ticket key to launch an audit session for.
         key: String,
     },
-    /// Attach the terminal to `session_name` (a live `tm-audit-<key>`
+    /// Attach the terminal to `session_name` (the ticket's `tm-<key>`
     /// session), suspending and restoring the board's terminal state around
     /// the blocking `tmux attach-session` call. Handled specially by the
     /// board's event loop, unlike every other `Cmd` here -- see
@@ -1203,7 +1209,7 @@ pub enum Cmd {
     /// [`bot_watch_indicator`]).
     LoadBotWatchStatus,
     /// Reload [`Screen::Board`]'s per-ticket bugbot-cleanup session status
-    /// (live `tm-bugbot-<key>` tmux sessions plus the latest
+    /// (live `bugbot` tmux windows plus the latest
     /// `kind = "bugbot-cleanup"` run per ticket, mapped through the same
     /// [`audit_indicator`] rule audit sessions use).
     LoadCleanupStatus,
@@ -1745,10 +1751,10 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 ///
 /// A no-op when no ticket is selected. Otherwise, in order:
 ///
-/// 1. A live `tm-bugbot-<key>` tmux session exists -> attach to it
+/// 1. A live `bugbot` window exists -> attach to the ticket's session
 ///    ([`Cmd::AttachAudit`], which takes a session name rather than anything
 ///    audit-specific).
-/// 2. No live session but the latest watcher run is
+/// 2. No live window but the latest watcher run is
 ///    [`BotWatchIndicator::Ready`] (the bots reviewed and left unresolved
 ///    findings) -> [`Cmd::LaunchCleanup`].
 /// 3. The latest watcher run is [`BotWatchIndicator::Watching`], or a
@@ -1771,7 +1777,7 @@ fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
         return (
             app,
             vec![Cmd::AttachAudit {
-                session_name: crate::work::bugbot::cleanup_session_name(&key),
+                session_name: crate::work::naming::ticket_session_name(&key),
             }],
         );
     }
@@ -1858,8 +1864,8 @@ fn lane_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 }
 
 /// Handle [`Msg::AuditAction`]: for the selected board ticket, attach to its
-/// live `tm-audit-<key>` session if [`App::audit_status`] reports one,
-/// otherwise launch a new one. A no-op when no ticket is selected.
+/// `tm-<key>` session if [`App::audit_status`] reports a live `audit`
+/// window, otherwise launch a new one. A no-op when no ticket is selected.
 fn audit_action(app: App) -> (App, Vec<Cmd>) {
     let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
@@ -1871,7 +1877,7 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
         .is_some_and(|entry| entry.has_session);
     let cmd = if has_session {
         Cmd::AttachAudit {
-            session_name: crate::work::audit::audit_session_name(&key),
+            session_name: crate::work::naming::ticket_session_name(&key),
         }
     } else {
         Cmd::LaunchAudit { key }
@@ -4772,7 +4778,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::AttachAudit {
-                session_name: "tm-bugbot-proj-1".to_string()
+                session_name: "tm-proj-1".to_string()
             }]
         );
     }
@@ -4976,7 +4982,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::AttachAudit {
-                session_name: "tm-audit-proj-1".to_string()
+                session_name: "tm-proj-1".to_string()
             }]
         );
     }
