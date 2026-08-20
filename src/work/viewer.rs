@@ -118,12 +118,150 @@ pub fn launch_viewer_window(
     }
 }
 
+/// [`launch_viewer_window`], with its outcome reported to `out` as part of a
+/// launch summary instead of propagated.
+///
+/// A viewer is a convenience over a run that is *already going*: the
+/// supervisor was spawned before this is called, and it owns the run's
+/// lifecycle from there (see [`crate::work::detach`]). Turning a `tmux`
+/// failure — no server, no binary, a session killed a moment ago — into a
+/// command failure would report a broken run to the user and, worse, invite
+/// them to re-run it. So the error is *printed*, naming what was lost, and
+/// the command still succeeds.
+///
+/// Only a write to `out` can fail here.
+pub fn launch_and_report_viewer(
+    tmux: &dyn TmuxOps,
+    target: &ActionWindow,
+    dir: &str,
+    tm_program: &Path,
+    run_id: i64,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    match launch_viewer_window(tmux, target, dir, tm_program, run_id) {
+        Ok(()) => {
+            writeln!(
+                out,
+                "window    {}:{} (log viewer)",
+                target.session_name, target.window_name
+            )?;
+            writeln!(out, "attach:   tmux attach -t {}", target.session_name)
+        }
+        Err(err) => writeln!(
+            out,
+            "window    none — no log viewer ({err}); the run itself is unaffected"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::work::interactive::{WORK_WINDOW_NAME, resolve_action_window};
-    use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
+    use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxSession, TmuxWindow};
     use std::path::PathBuf;
+
+    /// A [`TmuxOps`] whose every mutating call fails, for the
+    /// no-tmux-server/no-binary case [`launch_and_report_viewer`] must
+    /// survive.
+    struct BrokenTmuxOps;
+
+    impl BrokenTmuxOps {
+        fn error() -> TmuxError {
+            TmuxError::Spawn {
+                command: "tmux new-session".to_string(),
+                message: "No such file or directory".to_string(),
+            }
+        }
+    }
+
+    impl TmuxOps for BrokenTmuxOps {
+        fn has_session(&self, _name: &str) -> Result<bool, TmuxError> {
+            Ok(false)
+        }
+        fn new_session(&self, _: &str, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn new_session_with_command(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[(String, String)],
+            _: &str,
+        ) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn new_window(&self, _: &str, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn new_window_with_command(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[(String, String)],
+            _: &str,
+        ) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn select_window(&self, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn attach(&self, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn kill_session(&self, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
+            Ok(Vec::new())
+        }
+        fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn launch_and_report_viewer_reports_the_window_and_how_to_attach() {
+        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let tmux = FakeTmuxOps::new();
+        let mut out = Vec::new();
+
+        launch_and_report_viewer(&tmux, &target, "/wt", Path::new("/bin/tm"), 9, &mut out).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("window    tm-proj-1:work (log viewer)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("attach:   tmux attach -t tm-proj-1"),
+            "{text}"
+        );
+    }
+
+    /// The whole reason this wrapper exists: the supervisor is already
+    /// running by now, so a tmux failure must not become a command failure.
+    #[test]
+    fn launch_and_report_viewer_reports_a_tmux_failure_without_failing() {
+        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let mut out = Vec::new();
+
+        launch_and_report_viewer(
+            &BrokenTmuxOps,
+            &target,
+            "/wt",
+            Path::new("/bin/tm"),
+            9,
+            &mut out,
+        )
+        .expect("a tmux failure must not fail the command");
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("no log viewer"), "{text}");
+        assert!(text.contains("the run itself is unaffected"), "{text}");
+    }
 
     #[test]
     fn viewer_command_follows_the_runs_log_by_id() {
