@@ -1,10 +1,10 @@
-# One tmux session per ticket (issue #2), phases 1-3
+# One tmux session per ticket (issue #2), phases 1-5
 
-Status: phases 1 and 2 implemented 2026-08-20 (commits `df7c576`..`f547a63`);
-phase 3 implemented 2026-08-20 (commits `1876a3f`..HEAD). Phases 4-5 of
-issue #2 (viewer windows and `tm work session`, board attach/cleanup
-unification) are **not** started; this document covers only what landed and
-where it deviates from the issue's design.
+Status: **complete**. Phases 1 and 2 implemented 2026-08-20 (commits
+`df7c576`..`f547a63`); phase 3 implemented 2026-08-20 (commits
+`1876a3f`..`467b62e`); phases 4 and 5 implemented 2026-08-20 (commits
+`a1e98ed`..HEAD). This document covers what landed and where it deviates
+from the issue's design.
 
 Consolidate every action taken against a ticket into a single long-lived tmux
 session, `tm-<lowercased key>`, with one named window appended per action, and
@@ -95,7 +95,7 @@ is the action history regardless of which window happened to be selected.
   action's window is live". Renaming it reaches into `app.rs`, `ui.rs`,
   `event.rs` and a large block of render tests for no behavior change; the
   field's doc comment states the current meaning instead. A rename belongs
-  with phase 5's board work.
+  with phase 5's board work. **Done in phase 5**: it is now `window_live`.
 - **A dead window's name is not reused.** `unique_window_name` suffixes past
   it rather than reusing the name, keeping "one window per action attempt"
   literally true. It *does* reuse a suffix freed by a killed window, since a
@@ -224,10 +224,153 @@ re-checks it at the tmux seam.
   the CLI. Both still exit quickly (launch, then return), which is what the
   watched-child launcher expects.
 
-## Out of scope (phases 4-5, untouched)
+## Phase 4 — viewer windows and session reconstruction
 
-- Viewer windows for headless runs; `tm work session <KEY>` reconstruction.
-- Board attach keybinding changes and `tm work clean` unification.
+`src/work/viewer.rs` and `src/work/session.rs` are the two new modules;
+`tm work session <KEY>` is the new command.
+
+- **Viewer windows.** A `--headless` run now also gets a window in the
+  ticket's session, running `tm runs logs <id> --follow`. `viewer_command`
+  builds it; `launch_viewer_window` creates-or-appends with the same
+  session-vs-window fork `launch_interactive_run` uses;
+  `launch_and_report_viewer` wraps both and prints the outcome. Both headless
+  call sites (`cli::work::run`, `cli::review::fix`) resolve their window from
+  a `list_windows` snapshot *before* provisioning, then launch the viewer
+  *after* `spawn_detached`.
+- **Reconstruction.** `RunStore::runs_for_ticket` (the one query here that
+  returns rows oldest-first, because window order is the action history)
+  feeds `session::plan_session`, a pure function over the rows plus a
+  `list_windows` snapshot. `reconstruct_session` executes the plan;
+  `cli::work::session` is the I/O around them.
+
+### Decisions and deviations
+
+- **The viewer follows a run *id*, not `<KEY> --kind <kind>`.** The issue
+  sketches the latter, but that resolves to "the latest run of that kind",
+  which need not be the run the window was opened for: start a second `fix`
+  pass while an older viewer is still open and the old window silently
+  re-targets the new run's log. The launcher always knows the row id it just
+  created, and `tm runs logs` takes a numeric id in the same position.
+- **The viewer names the launching binary by `current_exe()`, not `tm`.** A
+  `cargo run` build, or a nix store path not on `$PATH`, must still be able
+  to launch a viewer that works.
+- **A viewer launch failure is printed, never returned.** By the time the
+  viewer can be created the supervisor is already running, so failing the
+  command would report a broken run for a run that is fine — and invite the
+  user to start it again. On a machine with no tmux server or no `tmux`
+  binary (CI, cron), `tm work run --headless` must keep working exactly as
+  before. The output line is `window    none — no log viewer (<err>); the run
+  itself is unaffected`. This is the one place in the feature where a `tmux`
+  error is swallowed, and it is deliberate; reconstruction, by contrast,
+  *is* the tmux operation, so there it stays fatal.
+- **Headless runs are now subject to the double-launch refusal too.** This is
+  a side effect of needing a window name, and it is the right behavior: "a
+  work run for this ticket is already live" is equally true whether the live
+  window hosts `claude` or tails its log. The refusal still happens before
+  provisioning, so it leaves no worktree, branch, or run row — there are
+  tests for exactly that on both paths. Note this is a *behavior change* to
+  `--headless`: previously two concurrent headless runs for one ticket were
+  possible. With no tmux server the window list is empty, so CI and cron are
+  unaffected.
+- **`--fg` gets no window at all.** It has no log file to follow and its
+  output is already going to the caller's terminal.
+- **Only in-flight runs are reconstructed.** This is the phase-4 question
+  the issue leaves open, and the reasoning is in `work::session`'s module
+  docs. A headless run in flight reattaches its viewer and keeps going. An
+  interactive run in flight has lost its `claude` with the pane, so its
+  window comes back as a **plain shell rooted in the run's worktree**, and
+  the command *prints* `claude --resume <session-id>` rather than running it
+  — resuming starts billing and starts editing, and if the process did
+  somehow survive elsewhere, resuming would drive one session twice.
+- **A finished run gets no window, interactive or headless.** Reconstruction
+  restores working state; history lives in the run table and the log files.
+  A ticket with five finished runs would otherwise come back as five dead
+  panes whose only content is a log `tm runs logs` and the board's `L`
+  already open on demand — and a finished *interactive* run has no log at
+  all (its durable artifact is its prompt file), so its window would be an
+  empty shell claiming to be an action. This also keeps the command honest
+  about what tmux is for: after reconstruction the window list is no longer
+  the full action history, and cannot be — the DB is.
+- **Reconstruction is idempotent and never attaches.** Every planned window
+  is skipped if a live window for that action already exists (via
+  `has_live_window`, so a live `fix-2` counts as `fix` being present), so
+  running it against a healthy session is a no-op that touches tmux zero
+  times beyond the snapshot. Not attaching matches `tm work restore`, and
+  makes it scriptable across several tickets.
+- **A ticket with no runs is an error, not an empty session.** There is
+  nothing to rebuild *from*, and a bare `tm-<key>` holding one shell rooted
+  nowhere in particular would be a worse answer than saying so
+  (`WorkCliError::NoRunsForTicket`).
+- **The rebuilt `shell` window is rooted at the *newest* run's worktree.** An
+  audit run is rooted in `[work.audit].dir` (pre-worktree) and a lane run in
+  the worktree, so newest-wins gives the most useful root available. This
+  finally closes the phase-2 deviation about `shell`'s root for the
+  reconstruction path.
+- **Unknown run kinds fall back to the kind as the window name.**
+  `action_window_for_kind` maps the four action kinds explicitly (`lane` →
+  `work`, `review-fix` → `fix`, `bugbot-cleanup` → `bugbot`, `audit` →
+  `audit`); anything else — a future kind, or `review-watch` — uses the kind
+  verbatim rather than being dropped, so a new kind shows up in a rebuilt
+  session immediately under a name that is at worst unlovely.
+
+## Phase 5 — board integration and cleanup unification
+
+- **`s` on the board attaches to the selected ticket's session.** It reuses
+  `attach_session`'s suspend/restore dance unchanged. `Cmd::AttachAudit` was
+  renamed `Cmd::AttachSession` and `attach_audit` to `attach_session`, since
+  all three attaching keys (`a`, `b`, `s`) go through it and none of it was
+  ever audit-specific. `Msg::SessionAttachResult` is now the result `Msg` for
+  all three; `Msg::AuditActionResult` stays for *launch* outcomes, which are
+  audit-specific. Documented in the README keybindings table and the board's
+  key-hint footer.
+- **`tm work clean <KEY>`** is one `kill-session` plus one worktree removal.
+- **`AuditStatusEntry::has_session` → `window_live`.** Renamed; see below.
+
+### Decisions and deviations
+
+- **`s` was chosen because it is free and mnemonic.** `V`, `F`, `v`, `w`,
+  `b`, `a`, `L`, `R`, `O`, `o`, `f`, `p`, `r`, `q`, `h`/`j`/`k`/`l` are all
+  taken on the board; `s` for "session" was unbound on every screen.
+- **`s` attaches unconditionally and never launches.** `a`'s
+  attach-or-launch precedence is right for an action; `s` means "show me this
+  ticket's session", and starting an action as a side effect of asking to
+  look would be a surprise.
+- **`s` consults no liveness map, by design.** `audit_status`/
+  `cleanup_status` answer "is this *action's window* live", which is a
+  different question from "does the session exist" — a session holding only
+  a `work` window, or only `shell`, is perfectly attachable. Answering the
+  session question properly would mean another polled board map; instead
+  `tmux attach-session` answers it and its failure becomes the status line.
+  Cheaper, and it cannot go stale between poll and keypress. The cost is
+  that pressing `s` on an untouched ticket briefly suspends the board to
+  show an attach failure; that is in the manual-verification list.
+- **`tm work clean` finds its worktree through the run rows, with a guard.**
+  The rows know where the worktree actually is, so nothing is re-derived from
+  a lane name. But not every run's `worktree` *is* a worktree — an `audit`
+  run records `[work.audit].dir`, the user's own checkout. Two conditions
+  must both hold: the run's `lane` names a configured lane (giving a repo
+  root for `git worktree remove`), and the path passes
+  `naming::worktree_path_has_expected_parent`, the same guard `tm work
+  new`/`remove` use. Condition two is what makes a checkout un-removable: it
+  is not under the worktree root at all. There is a dedicated test for it,
+  because this is the one operation in the feature that destroys data.
+- **`tm work clean` is idempotent and tolerant.** A missing session, a
+  worktree already gone, and a ticket with no qualifying worktree are all
+  reported and exit zero. Cleanup that fails the second time you run it is
+  worse than useless.
+- **`tm work clean` is a new command, not a rename of `tm work remove`.**
+  They key off different things — `remove` takes a lane/worktree name and is
+  the lane-level operation, `clean` takes a ticket key and is the
+  ticket-level one. `remove` is untouched.
+- **The `has_session` rename was worth doing.** Phase 2 deferred it as
+  "reaches into `app.rs`, `ui.rs`, `event.rs` and a large block of render
+  tests for no behavior change", which was true but is the wrong trade: the
+  field had come to mean the opposite of what it said. Session existence is
+  now explicitly *not* a liveness signal (that is the whole point of phase
+  1), so a field named `has_session` that actually reports "this action's
+  window is live" invites exactly the wrong inference at every call site. It
+  is a pure mechanical rename with the tests green throughout, and the struct
+  docs now record what the old name was and why it went.
 
 ## Manual verification (open)
 
@@ -275,7 +418,9 @@ Nothing below can be unit-tested: it needs a real tmux server, a real
    both in `tm-proj-1`.
 8. **`--headless` is untouched.** `tm work run <lane> PROJ-2 --headless`:
    still returns immediately with a `log` line, still writes to that log,
-   still finishes via the supervisor, still creates no tmux window. Run
+   and still finishes via the supervisor. (As of phase 3 it created no tmux
+   window; phase 4 gives it a *viewer* window — see that phase's own steps.)
+   Run
    `docs`-adjacent step 4-7 of `src/work/detach.rs`'s own manual test plan
    (close the terminal mid-run) to confirm the supervisor still survives.
 9. **`--fg` still reports outcomes.** `tm work run <lane> --fg --max-turns 1`
@@ -283,3 +428,64 @@ Nothing below can be unit-tested: it needs a real tmux server, a real
 10. **From the board.** `w` and `F` on a ticket produce windows in that
     ticket's session, and the launcher's status line still reports quickly
     rather than appearing to hang.
+
+### Phase 4 manual verification
+
+1. **Viewer window.** `tm work run <lane> PROJ-1 --headless`, then `tmux
+   attach -t tm-proj-1`: a `work` window tailing the run's log, and `tmux
+   list-panes -F '#{pane_start_command}'` shows `runs logs <id> --follow`,
+   not `claude`.
+2. **The viewer owns nothing.** With that run mid-flight, kill the `work`
+   window (`C-b &`). Confirm the run still finishes — `tm runs show PROJ-1`
+   reaches `done` — and the log file kept growing after the window died.
+   Then repeat with `tmux kill-session -t tm-proj-1`: same outcome. This is
+   the property the whole viewer design exists to protect.
+3. **No tmux, no problem.** With no tmux server running at all (`tmux
+   kill-server`), `tm work run <lane> PROJ-2 --headless` must still start the
+   run and print a `window    none — no log viewer (...)` line, exiting zero.
+4. **Headless double-launch refusal.** With a live headless `work` window,
+   `tm work run <lane> PROJ-1 --headless` again must refuse, and `git
+   worktree list` plus `tm runs show PROJ-1` must show nothing new.
+5. **Reconstruction after a server death.** Start a headless run, then `tmux
+   kill-server`. Run `tm work session PROJ-1`: the `work` viewer and `shell`
+   come back, the viewer is following the *same* run's log (check the id),
+   and the run still finishes on its own.
+6. **Reconstruction of a live interactive run.** Start an interactive `tm
+   work run`, `tmux kill-server`, then `tm work session PROJ-1`: the `work`
+   window is a plain shell in the run's worktree, and the command printed a
+   `resume:   claude --resume <id>` line. Confirm running that line by hand
+   picks the conversation back up. Nothing should have resumed by itself.
+7. **Reconstruction skips finished runs.** On a ticket with several finished
+   runs and nothing in flight, `tm work session PROJ-1` creates a session
+   with only a `shell` window.
+8. **Idempotence.** Run `tm work session PROJ-1` twice in a row: the second
+   prints "already has every window its runs call for" and changes nothing
+   (`tmux list-windows` identical).
+9. **`--fg` is unchanged.** `tm work run <lane> --fg --max-turns 1` creates
+   no tmux window at all.
+
+### Phase 5 manual verification
+
+1. **Board attach.** `s` on a ticket with a live session: the board
+   suspends, tmux takes over, `C-b d` returns to a cleanly redrawn board with
+   `detached from tm-<key>` on the status line.
+2. **`s` where `a` would launch.** On a ticket whose session holds a `work`
+   window but no `audit` one, `s` must attach; `a` on the same ticket must
+   launch an audit. This is the distinction the two keys exist for.
+3. **`s` on an untouched ticket.** No session exists: confirm the status line
+   reports the `tmux attach-session` failure and the board is fully usable
+   afterwards (raw mode, alternate screen, redraw) — the accepted cost of not
+   polling a session-existence map.
+4. **Cleanup, the happy path.** After finishing a ticket with an audit, a
+   work run, and a fix pass: `tm work clean PROJ-1` kills one session and
+   removes one worktree. `tmux list-sessions` and `git worktree list` are
+   both clean, in one command.
+5. **Cleanup safety.** On a ticket whose *only* run is an audit, `tm work
+   clean PROJ-1` must kill the session and report "No lane-run worktree
+   recorded" — and `[work.audit].dir` must still exist. Verify the directory
+   afterwards; this is the destructive-operation guard.
+6. **Cleanup idempotence.** Run `tm work clean PROJ-1` twice: the second
+   reports no session and an already-gone worktree, exiting zero.
+7. **Badges still work after the rename.** `a` and `b` badges must light,
+   clear, and attach exactly as before — the `window_live` rename is
+   mechanical, but it touches every badge call site.
