@@ -217,6 +217,18 @@ pub enum WorkCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         key: String,
     },
+    /// Finish with a ticket: kill its `tm-<key>` tmux session and remove its
+    /// lane-run worktree.
+    ///
+    /// One `kill-session` plus one worktree removal, because the ticket's
+    /// whole action history lives in that one session. The worktree comes
+    /// from the ticket's run rows, and only a path sitting one level below
+    /// the configured worktree root is ever removed — an `audit` run's
+    /// `[work.audit].dir` is your own checkout and is never touched.
+    Clean {
+        /// Jira ticket key, e.g. `PROJ-123`.
+        key: String,
+    },
     /// Attach to (or create) the tmux session for a directory, defaulting
     /// to the current working directory.
     Start {

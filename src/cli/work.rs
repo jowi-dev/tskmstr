@@ -656,6 +656,97 @@ pub fn session(
     Ok(())
 }
 
+/// `tm work clean <KEY>`: finish with a ticket in one command — kill its
+/// `tm-<key>` session and remove its lane-run worktree.
+///
+/// This is the payoff of issue #2's consolidation. Before it, being done with
+/// a ticket meant killing `tm-audit-<key>`, killing `tm-bugbot-<key>`,
+/// running `tm work remove <lane-ish name>` if you could remember what the
+/// worktree was called, and leaving any orphaned supervisor untracked. Now
+/// the session *is* the ticket, so cleanup is one `kill-session` plus one
+/// worktree removal.
+///
+/// # Which worktree, and the guard on it
+///
+/// The worktree comes from the ticket's run rows, newest first — the rows
+/// know where the worktree actually is, so nothing has to be re-derived from
+/// a lane name. But not every run's `worktree` is a worktree: an `audit`
+/// run's is `[work.audit].dir`, the user's own checkout. Two conditions must
+/// therefore both hold before anything is removed:
+///
+/// 1. The run's `lane` names a configured lane, giving a repo root to run
+///    `git worktree remove` against.
+/// 2. The recorded path sits exactly one level below
+///    `<worktree_root>/<repo>`, per
+///    [`naming::worktree_path_has_expected_parent`] — the same guard
+///    [`worktree_path_for`] applies to `new`/`remove`.
+///
+/// Condition 2 is what makes an audit run's checkout un-removable: it is not
+/// under the worktree root at all. A ticket whose runs offer no qualifying
+/// path is reported, not an error — the session cleanup still happened, and
+/// there may genuinely be no worktree (an audit-only ticket).
+///
+/// Never fails on a worktree that is already gone: cleanup is idempotent, so
+/// running it twice, or after removing the directory by hand, is fine.
+pub fn clean(
+    ctx: &WorkContext<'_>,
+    store: &RunStore,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let ticket = key.to_uppercase();
+    let session_name = naming::ticket_session_name(&ticket);
+
+    if ctx.tmux.has_session(&session_name)? {
+        writeln!(out, "Killing tmux session: {session_name}")?;
+        ctx.tmux.kill_session(&session_name)?;
+    } else {
+        writeln!(out, "No tmux session {session_name} to kill")?;
+    }
+
+    let runs = store.runs_for_ticket(&ticket)?;
+    let Some((repo_root, wt_path)) = removable_worktree(ctx, &runs) else {
+        writeln!(
+            out,
+            "No lane-run worktree recorded for {ticket} — nothing to remove"
+        )?;
+        return Ok(());
+    };
+
+    if !wt_path.exists() {
+        writeln!(out, "Worktree already gone: {}", wt_path.display())?;
+        return Ok(());
+    }
+
+    writeln!(out, "Removing worktree: {}", wt_path.display())?;
+    ctx.git.remove_worktree(&repo_root, &wt_path)?;
+    writeln!(out, "Done.")?;
+    Ok(())
+}
+
+/// The `(repo_root, worktree)` pair [`clean`] may remove: the newest run in
+/// `runs` (which arrive oldest-first) whose lane is configured and whose
+/// recorded worktree passes
+/// [`naming::worktree_path_has_expected_parent`]. `None` when no run
+/// qualifies — see [`clean`]'s doc comment for why both conditions are
+/// required.
+fn removable_worktree(
+    ctx: &WorkContext<'_>,
+    runs: &[crate::runs::Run],
+) -> Option<(PathBuf, PathBuf)> {
+    let root = resolve_worktree_root(ctx);
+    let root_str = root.to_string_lossy();
+
+    runs.iter().rev().find_map(|run| {
+        let lane = ctx.config.lanes.get(&run.lane)?;
+        let repo_root = PathBuf::from(&lane.repo);
+        let repo = repo_name(&repo_root).ok()?;
+        let wt_path = PathBuf::from(&run.worktree);
+        naming::worktree_path_has_expected_parent(&root_str, &repo, &wt_path)
+            .then_some((repo_root, wt_path))
+    })
+}
+
 /// `tm work start [<dir>]`: attach to (or create) the tmux session for
 /// `dir`, defaulting to `cwd` when `dir` is `None`. Joe's main tmux entry
 /// point; see the module docs.
@@ -1834,6 +1925,185 @@ mod tests {
         let err = session(&ctx, &store, &current_exe, "PROJ-404", &mut out).unwrap_err();
 
         assert!(matches!(err, WorkCliError::NoRunsForTicket(_)));
+    }
+
+    // --- clean (per-ticket cleanup unification) ---
+
+    /// Config with one lane whose repo is `repo`, and a worktree root at
+    /// `<tmp>/Worktrees`, so `<tmp>/Worktrees/<repo name>/<lane>` is the only
+    /// path shape `clean` will accept as removable.
+    fn clean_config(tmp: &TempDir, repo: &Path) -> WorkConfig {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo.to_string_lossy()),
+        );
+        WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        }
+    }
+
+    #[test]
+    fn clean_kills_the_ticket_session_and_removes_its_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("Worktrees/repo/proj-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "proj-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::HasSession("tm-proj-1".to_string()),
+                TmuxCall::KillSession("tm-proj-1".to_string()),
+            ],
+            "one kill-session, not one per action"
+        );
+        assert_eq!(
+            git.remove_worktree_calls(),
+            vec![(repo.clone(), worktree.clone())],
+            "one worktree removal"
+        );
+    }
+
+    /// The safety property that matters most: an audit run's `worktree` is
+    /// `[work.audit].dir` — the user's actual checkout. `clean` must never
+    /// hand that to `git worktree remove`.
+    #[test]
+    fn clean_never_removes_a_path_outside_the_worktree_root() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        // An audit run, rooted in the real repo rather than a worktree.
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: repo.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert!(
+            git.remove_worktree_calls().is_empty(),
+            "an audit run points at the user's checkout, not a worktree"
+        );
+        // The session cleanup still happened.
+        assert!(
+            tmux.calls()
+                .contains(&TmuxCall::KillSession("tm-proj-1".to_string()))
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("No lane-run worktree"), "{printed}");
+    }
+
+    #[test]
+    fn clean_skips_a_session_that_is_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![TmuxCall::HasSession("tm-proj-1".to_string())]
+        );
+    }
+
+    /// A worktree already gone from disk (removed by hand, or by an earlier
+    /// `tm work clean`) is not an error — cleanup is idempotent.
+    #[test]
+    fn clean_reports_an_already_removed_worktree_without_erroring() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("Worktrees/repo/proj-1");
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert!(git.remove_worktree_calls().is_empty());
+        let printed = out_string(&out);
+        assert!(printed.contains("already gone"), "{printed}");
     }
 
     // --- run (detached) / supervise ---
