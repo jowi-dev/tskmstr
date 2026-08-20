@@ -14,6 +14,14 @@
 //! into the ordered list of window names a new session should be built
 //! with.
 //!
+//! A ticket session ([`crate::work::naming::ticket_session_name`]) is built
+//! differently: it starts with the window of whichever action created it and
+//! grows one appended window per later action, named for that action.
+//! [`unique_window_name`], [`window_action`], [`session_window_names`] and
+//! [`has_live_window`] are the pure rules over that scheme — repeat actions
+//! take a `-2`/`-3` suffix, and a live window (not a live session) is what
+//! "this action is running" means.
+//!
 //! Every `tmux` argv below mirrors `work.ml`'s exactly:
 //!
 //! ```ocaml
