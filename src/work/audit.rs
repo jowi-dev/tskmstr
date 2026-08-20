@@ -124,7 +124,10 @@ pub fn audit_prompt(template: Option<&str>, key: &str) -> String {
 /// codebase's `Command`/argv-based shelling-out (which never touches a
 /// shell's string-splicing rules at all), this one positional string must
 /// itself be valid shell syntax.
-fn shell_quote(s: &str) -> String {
+///
+/// Shared with [`crate::work::interactive`], which builds the same kind of
+/// command string for tmux-hosted work and fix runs.
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
