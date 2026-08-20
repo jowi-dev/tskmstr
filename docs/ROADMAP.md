@@ -94,6 +94,11 @@ Operational step remaining: the axiom repo's hook copies and its
 waiting-state telemetry flows in real sessions (superset of the stream
 2/3 sync chore).
 
+Superseded 2026-08-20 by issue #2 (`docs/plans/one-session-per-ticket.md`):
+the audit no longer owns a `tm-audit-<key>` session, but an `audit` window
+in the ticket's shared `tm-<key>` session, and badge liveness reads live
+window names rather than session existence.
+
 ## 5. Board-launched lane runs — done
 
 Stated 2026-08-07. The board's lifecycle story so far covers grooming
@@ -197,6 +202,11 @@ the axiom-side `/bugbot-triage` skill needs its documented first step,
 `tm runs register --kind bugbot-cleanup {key}`, and reads the findings
 file itself; no new hook syncing is expected beyond streams 2/4's, since
 the await/resume/session-end hooks are reused unchanged.
+
+Superseded 2026-08-20 by issue #2 (`docs/plans/one-session-per-ticket.md`):
+the cleanup session is now a `bugbot` window in the ticket's shared
+`tm-<key>` session rather than its own `tm-bugbot-<key>` session. The run
+`kind` is still `bugbot-cleanup`; the window is named for the action.
 
 Streams 5-7 together make the board the control surface for the whole
 ticket lifecycle: groom (audit) → execute (lane run) → observe (run

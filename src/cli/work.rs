@@ -139,6 +139,14 @@ pub enum WorkCliError {
     /// ticket's session.
     #[error(transparent)]
     Interactive(#[from] InteractiveLaunchError),
+
+    /// `tm work session <KEY>` was given a ticket with no recorded runs.
+    /// Reconstruction rebuilds a session *from* the run rows, so with none
+    /// there is nothing to rebuild — and a bare `tm-<key>` session with a
+    /// single shell rooted nowhere in particular would be a worse answer
+    /// than saying so.
+    #[error("no runs recorded for {0} — nothing to rebuild a session from")]
+    NoRunsForTicket(String),
 }
 
 /// How a run is hosted and whether the invoking process waits for it — the
@@ -413,6 +421,18 @@ pub fn run(
         Dispatch::Headless => {}
     }
 
+    // The ticket's viewer window is resolved from one `list_windows`
+    // snapshot *before* provisioning, for the same reason the interactive
+    // path does it there: `prepare_run_lane` cuts a branch and starts a run
+    // row, so a refusal afterwards would leave both behind. A headless run
+    // is subject to the same double-launch refusal as an interactive one —
+    // "this action is already live for this ticket" is true either way, and
+    // whether the live window hosts `claude` or merely tails its log makes
+    // no difference to that.
+    let session_key = request.ticket.clone().unwrap_or_else(|| lane.to_string());
+    let windows = ctx.tmux.list_windows()?;
+    let viewer_target = resolve_action_window(&windows, &session_key, WORK_WINDOW_NAME)?;
+
     // Detached: provisioning/preflight/start_run happen here, in the
     // foreground, with pid = None (the supervisor records its own pid on
     // startup — see prepare_run_lane's doc comment on why).
@@ -446,6 +466,7 @@ pub fn run(
     let ticket = prepared.ticket.clone();
     let branch = prepared.branch.clone();
     let worktree = prepared.worktree.clone();
+    let run_id = prepared.run_id;
 
     let state = crate::work::detach::SupervisorState {
         prepared,
@@ -464,6 +485,17 @@ pub fn run(
     )?;
     writeln!(out, "worktree  {}", worktree.display())?;
     writeln!(out, "log       {}", log_path.display())?;
+    // After `spawn_detached`, deliberately: the log file the viewer follows
+    // is created by the spawn itself, and the viewer is a courtesy over a
+    // run that is already going — so its failure is reported, not returned.
+    crate::work::viewer::launch_and_report_viewer(
+        ctx.tmux,
+        &viewer_target,
+        &worktree.to_string_lossy(),
+        deps.current_exe,
+        run_id,
+        out,
+    )?;
     writeln!(out, "watch:    tm runs watch")?;
     writeln!(out, "follow:   tail -f {}", log_path.display())?;
     if let Some(ticket) = &ticket {
@@ -553,6 +585,166 @@ pub fn supervise(
         out,
     )?;
     Ok(!outcome.is_error)
+}
+
+/// `tm work session <KEY>`: rebuild `key`'s `tm-<key>` tmux session and its
+/// window set from the ticket's run rows — the after-a-reboot,
+/// after-a-`kill-session`, after-a-`tmux kill-server` operation.
+///
+/// [`crate::work::session::plan_session`] owns every decision about *what*
+/// comes back (only in-flight runs; a viewer for a headless one, a shell plus
+/// a printed `claude --resume` line for an interactive one) and why; this
+/// function is the I/O around it: one `list_windows` snapshot, the run rows,
+/// then the tmux calls and a summary.
+///
+/// Never attaches, matching [`restore`]: reconstruction is something you may
+/// want to do for several tickets in a row, and it must be safe to run from a
+/// script.
+///
+/// # Errors
+///
+/// [`WorkCliError::NoRunsForTicket`] when the ticket has no runs at all, and
+/// [`WorkCliError::Tmux`] when a `tmux` call fails. Unlike a viewer launched
+/// alongside a live run (see [`crate::work::viewer`]), a tmux failure *is*
+/// fatal here — rebuilding the session is the entire point of the command, so
+/// there is nothing left to succeed at.
+pub fn session(
+    ctx: &WorkContext<'_>,
+    store: &RunStore,
+    current_exe: &Path,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let ticket = key.to_uppercase();
+    let runs = store.runs_for_ticket(&ticket)?;
+    if runs.is_empty() {
+        return Err(WorkCliError::NoRunsForTicket(ticket));
+    }
+
+    let windows = ctx.tmux.list_windows()?;
+    let viewer = |run_id: i64| crate::work::viewer::viewer_command(current_exe, run_id);
+    let plan = crate::work::session::plan_session(&ticket, &runs, &windows, &viewer);
+
+    if plan.windows.is_empty() {
+        writeln!(
+            out,
+            "{} already has every window its runs call for; nothing to rebuild",
+            plan.session_name
+        )?;
+        return Ok(());
+    }
+
+    crate::work::session::reconstruct_session(ctx.tmux, &plan)?;
+
+    for window in &plan.windows {
+        let role = match (&window.command, window.run_id) {
+            (Some(_), _) => "log viewer",
+            (None, Some(_)) => "shell (its claude session died with the pane)",
+            (None, None) => "shell",
+        };
+        writeln!(
+            out,
+            "window    {}:{} — {role}",
+            plan.session_name, window.name
+        )?;
+        if let Some(session_id) = &window.resume_session_id {
+            writeln!(out, "resume:   claude --resume {session_id}")?;
+        }
+    }
+    writeln!(out, "attach:   tmux attach -t {}", plan.session_name)?;
+
+    Ok(())
+}
+
+/// `tm work clean <KEY>`: finish with a ticket in one command — kill its
+/// `tm-<key>` session and remove its lane-run worktree.
+///
+/// This is the payoff of issue #2's consolidation. Before it, being done with
+/// a ticket meant killing `tm-audit-<key>`, killing `tm-bugbot-<key>`,
+/// running `tm work remove <lane-ish name>` if you could remember what the
+/// worktree was called, and leaving any orphaned supervisor untracked. Now
+/// the session *is* the ticket, so cleanup is one `kill-session` plus one
+/// worktree removal.
+///
+/// # Which worktree, and the guard on it
+///
+/// The worktree comes from the ticket's run rows, newest first — the rows
+/// know where the worktree actually is, so nothing has to be re-derived from
+/// a lane name. But not every run's `worktree` is a worktree: an `audit`
+/// run's is `[work.audit].dir`, the user's own checkout. Two conditions must
+/// therefore both hold before anything is removed:
+///
+/// 1. The run's `lane` names a configured lane, giving a repo root to run
+///    `git worktree remove` against.
+/// 2. The recorded path sits exactly one level below
+///    `<worktree_root>/<repo>`, per
+///    [`naming::worktree_path_has_expected_parent`] — the same guard
+///    [`worktree_path_for`] applies to `new`/`remove`.
+///
+/// Condition 2 is what makes an audit run's checkout un-removable: it is not
+/// under the worktree root at all. A ticket whose runs offer no qualifying
+/// path is reported, not an error — the session cleanup still happened, and
+/// there may genuinely be no worktree (an audit-only ticket).
+///
+/// Never fails on a worktree that is already gone: cleanup is idempotent, so
+/// running it twice, or after removing the directory by hand, is fine.
+pub fn clean(
+    ctx: &WorkContext<'_>,
+    store: &RunStore,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), WorkCliError> {
+    let ticket = key.to_uppercase();
+    let session_name = naming::ticket_session_name(&ticket);
+
+    if ctx.tmux.has_session(&session_name)? {
+        writeln!(out, "Killing tmux session: {session_name}")?;
+        ctx.tmux.kill_session(&session_name)?;
+    } else {
+        writeln!(out, "No tmux session {session_name} to kill")?;
+    }
+
+    let runs = store.runs_for_ticket(&ticket)?;
+    let Some((repo_root, wt_path)) = removable_worktree(ctx, &runs) else {
+        writeln!(
+            out,
+            "No lane-run worktree recorded for {ticket} — nothing to remove"
+        )?;
+        return Ok(());
+    };
+
+    if !wt_path.exists() {
+        writeln!(out, "Worktree already gone: {}", wt_path.display())?;
+        return Ok(());
+    }
+
+    writeln!(out, "Removing worktree: {}", wt_path.display())?;
+    ctx.git.remove_worktree(&repo_root, &wt_path)?;
+    writeln!(out, "Done.")?;
+    Ok(())
+}
+
+/// The `(repo_root, worktree)` pair [`clean`] may remove: the newest run in
+/// `runs` (which arrive oldest-first) whose lane is configured and whose
+/// recorded worktree passes
+/// [`naming::worktree_path_has_expected_parent`]. `None` when no run
+/// qualifies — see [`clean`]'s doc comment for why both conditions are
+/// required.
+fn removable_worktree(
+    ctx: &WorkContext<'_>,
+    runs: &[crate::runs::Run],
+) -> Option<(PathBuf, PathBuf)> {
+    let root = resolve_worktree_root(ctx);
+    let root_str = root.to_string_lossy();
+
+    runs.iter().rev().find_map(|run| {
+        let lane = ctx.config.lanes.get(&run.lane)?;
+        let repo_root = PathBuf::from(&lane.repo);
+        let repo = repo_name(&repo_root).ok()?;
+        let wt_path = PathBuf::from(&run.worktree);
+        naming::worktree_path_has_expected_parent(&root_str, &repo, &wt_path)
+            .then_some((repo_root, wt_path))
+    })
 }
 
 /// `tm work start [<dir>]`: attach to (or create) the tmux session for
@@ -1554,6 +1746,366 @@ mod tests {
         assert!(matches!(err, WorkCliError::DirectoryNotFound(_)));
     }
 
+    // --- session (reconstruction) ---
+
+    #[test]
+    fn session_rebuilds_a_viewer_for_a_live_headless_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: Some(4242),
+                kind: "lane".to_string(),
+                log_path: Some("/state/proj-1.log".to_string()),
+            })
+            .unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "proj-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::ListWindows,
+                TmuxCall::NewSessionWithCommand {
+                    name: "tm-proj-1".to_string(),
+                    dir: "/wt/proj-1".to_string(),
+                    window_name: "work".to_string(),
+                    env: Vec::new(),
+                    command: format!("'/usr/local/bin/tm' runs logs {run_id} --follow"),
+                },
+                TmuxCall::NewWindow {
+                    name: "tm-proj-1".to_string(),
+                    window_name: "shell".to_string(),
+                    dir: "/wt/proj-1".to_string(),
+                },
+                TmuxCall::SelectWindow {
+                    name: "tm-proj-1".to_string(),
+                    window: "work".to_string(),
+                },
+            ]
+        );
+
+        let printed = out_string(&out);
+        assert!(printed.contains("tm-proj-1:work"), "{printed}");
+        assert!(printed.contains("attach:"), "{printed}");
+    }
+
+    /// A live interactive run lost its `claude` with the pane. Its window
+    /// comes back as a shell, and the `claude --resume` line is *printed* —
+    /// see `crate::work::session`'s module docs on why it is not run.
+    #[test]
+    fn session_prints_a_resume_line_for_a_live_interactive_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-abc").unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+
+        assert!(
+            tmux.calls().iter().any(|call| matches!(
+                call,
+                TmuxCall::NewSession {
+                    primary_window,
+                    ..
+                } if primary_window == "work"
+            )),
+            "expected a plain shell window, got {:?}",
+            tmux.calls()
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("claude --resume sess-abc"), "{printed}");
+    }
+
+    #[test]
+    fn session_reports_nothing_to_do_for_a_healthy_session() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "work".to_string(),
+                dead: false,
+            },
+            TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "shell".to_string(),
+                dead: false,
+            },
+        ]));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: Some(1),
+                kind: "lane".to_string(),
+                log_path: Some("/state/a.log".to_string()),
+            })
+            .unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![TmuxCall::ListWindows],
+            "reconstruction of a healthy session must touch nothing"
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("already"), "{printed}");
+    }
+
+    #[test]
+    fn session_errors_when_the_ticket_has_no_runs_to_rebuild_from() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let mut out = Vec::new();
+
+        let err = session(&ctx, &store, &current_exe, "PROJ-404", &mut out).unwrap_err();
+
+        assert!(matches!(err, WorkCliError::NoRunsForTicket(_)));
+    }
+
+    // --- clean (per-ticket cleanup unification) ---
+
+    /// Config with one lane whose repo is `repo`, and a worktree root at
+    /// `<tmp>/Worktrees`, so `<tmp>/Worktrees/<repo name>/<lane>` is the only
+    /// path shape `clean` will accept as removable.
+    fn clean_config(tmp: &TempDir, repo: &Path) -> WorkConfig {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo.to_string_lossy()),
+        );
+        WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        }
+    }
+
+    #[test]
+    fn clean_kills_the_ticket_session_and_removes_its_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("Worktrees/repo/proj-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "proj-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::HasSession("tm-proj-1".to_string()),
+                TmuxCall::KillSession("tm-proj-1".to_string()),
+            ],
+            "one kill-session, not one per action"
+        );
+        assert_eq!(
+            git.remove_worktree_calls(),
+            vec![(repo.clone(), worktree.clone())],
+            "one worktree removal"
+        );
+    }
+
+    /// The safety property that matters most: an audit run's `worktree` is
+    /// `[work.audit].dir` — the user's actual checkout. `clean` must never
+    /// hand that to `git worktree remove`.
+    #[test]
+    fn clean_never_removes_a_path_outside_the_worktree_root() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        // An audit run, rooted in the real repo rather than a worktree.
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: repo.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert!(
+            git.remove_worktree_calls().is_empty(),
+            "an audit run points at the user's checkout, not a worktree"
+        );
+        // The session cleanup still happened.
+        assert!(
+            tmux.calls()
+                .contains(&TmuxCall::KillSession("tm-proj-1".to_string()))
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("No lane-run worktree"), "{printed}");
+    }
+
+    #[test]
+    fn clean_skips_a_session_that_is_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert_eq!(
+            tmux.calls(),
+            vec![TmuxCall::HasSession("tm-proj-1".to_string())]
+        );
+    }
+
+    /// A worktree already gone from disk (removed by hand, or by an earlier
+    /// `tm work clean`) is not an error — cleanup is idempotent.
+    #[test]
+    fn clean_reports_an_already_removed_worktree_without_erroring() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("Worktrees/repo/proj-1");
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(false));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+
+        assert!(git.remove_worktree_calls().is_empty());
+        let printed = out_string(&out);
+        assert!(printed.contains("already gone"), "{printed}");
+    }
+
     // --- run (detached) / supervise ---
 
     use crate::github::gh_cli::FakeGhCli;
@@ -2059,6 +2611,169 @@ mod tests {
 
         let printed = out_string(&out);
         assert!(printed.contains("resume:   tm runs resume ABC-123"));
+    }
+
+    /// Issue #2 phase 4: a headless run gets a window in the ticket's session
+    /// too, but a *viewer* — `tm runs logs <id> --follow` — never the run's
+    /// own process. See `crate::work::viewer`'s module docs.
+    #[test]
+    fn run_headless_gets_a_viewer_window_that_does_not_own_the_run() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap();
+
+        // The supervisor is still what runs `claude`; the window is extra.
+        assert_eq!(detach.recorded.lock().unwrap().len(), 1);
+
+        let run_row = run_store
+            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap();
+        let (window_name, env, command) = tmux
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                TmuxCall::NewSessionWithCommand {
+                    name,
+                    window_name,
+                    env,
+                    command,
+                    ..
+                } => {
+                    assert_eq!(name, "tm-proj-1");
+                    Some((window_name.clone(), env.clone(), command.clone()))
+                }
+                _ => None,
+            })
+            .expect("a viewer window was launched");
+
+        assert_eq!(window_name, "work");
+        assert_eq!(
+            command,
+            format!("'/usr/local/bin/tm' runs logs {} --follow", run_row.id),
+            "the window must follow the log, not host claude"
+        );
+        assert!(
+            !command.contains("claude"),
+            "binding the supervisor's claude to a tmux window would make \
+             kill-session destructive: {command}"
+        );
+        assert!(
+            env.is_empty(),
+            "a viewer owns no run and adopts no row: {env:?}"
+        );
+
+        let printed = out_string(&out);
+        assert!(
+            printed.contains("window    tm-proj-1:work (log viewer)"),
+            "{printed}"
+        );
+        // The log line stays: the file, not the window, is the archive.
+        assert!(printed.contains("log       "), "{printed}");
+    }
+
+    /// A headless run's viewer is a courtesy over a run that is already
+    /// going. Refusing to launch one when the action is already live still
+    /// has to happen *before* provisioning, exactly like the interactive
+    /// path, or the refusal leaves a worktree and a run row behind.
+    #[test]
+    fn run_headless_refuses_a_second_live_work_window_before_provisioning() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "work".to_string(),
+            dead: false,
+        }]));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            jira: None,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let err = run(&ctx, &deps, "mylane", request, Dispatch::Headless, &mut out).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WorkCliError::Interactive(InteractiveLaunchError::AlreadyRunning { .. })
+        ));
+        assert!(run_store.list_runs().unwrap().is_empty());
+        assert!(detach.recorded.lock().unwrap().is_empty());
     }
 
     #[test]

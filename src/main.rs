@@ -250,6 +250,15 @@ fn run_work(
         WorkCmd::Restore => {
             tskmstr::cli::work::restore(&ctx, &mut stdout)?;
         }
+        WorkCmd::Session { key } => {
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            let current_exe = std::env::current_exe()?;
+            tskmstr::cli::work::session(&ctx, &run_store, &current_exe, &key, &mut stdout)?;
+        }
+        WorkCmd::Clean { key } => {
+            let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+            tskmstr::cli::work::clean(&ctx, &run_store, &key, &mut stdout)?;
+        }
         WorkCmd::Start { dir } => {
             let dir_path = dir.map(PathBuf::from);
             tskmstr::cli::work::start(&ctx, dir_path.as_deref(), &cwd, &mut stdout)?;

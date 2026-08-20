@@ -235,8 +235,14 @@ pub fn fix(
     // Resolved before `prepare_review_fix` starts a run row, so a refusal to
     // run a second concurrent fix pass leaves nothing behind — see
     // `crate::work::interactive`'s module docs.
+    //
+    // Both tmux-windowed dispatches resolve a window here, and the refusal
+    // applies to both: whether the live `fix` window hosts `claude` or only
+    // tails its log, a fix pass for this ticket is in flight either way.
+    // `--fg` gets no window at all — it has no log file to follow, and its
+    // output is going to this very terminal.
     let target = match dispatch {
-        Dispatch::Interactive => {
+        Dispatch::Interactive | Dispatch::Headless => {
             let windows = deps.tmux.list_windows()?;
             Some(resolve_action_window(
                 &windows,
@@ -244,7 +250,7 @@ pub fn fix(
                 FIX_WINDOW_NAME,
             )?)
         }
-        _ => None,
+        Dispatch::HeadlessForeground => None,
     };
 
     let prepared: PreparedRun = prepare_review_fix(
@@ -261,12 +267,15 @@ pub fn fix(
         dispatch.run_mode(),
     )?;
 
-    if let Some(target) = target {
+    if dispatch == Dispatch::Interactive {
+        let target = target
+            .as_ref()
+            .expect("an interactive dispatch always resolves a window");
         let prompt_path = paths.state_dir.join(format!(
             "{}-{}.prompt.md",
             prepared.wt_name, prepared.timestamp
         ));
-        launch_interactive_run(deps.tmux, &target, &prepared, &prompt_path)?;
+        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path)?;
 
         writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
         writeln!(out, "worktree  {}", worktree.display())?;
@@ -312,6 +321,19 @@ pub fn fix(
     writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
     writeln!(out, "worktree  {}", worktree.display())?;
     writeln!(out, "log       {}", log_path.display())?;
+    // After the spawn, deliberately: the spawn is what creates the log file
+    // the viewer follows. A tmux failure here is reported, never returned —
+    // the supervisor is already driving the pass (see `crate::work::viewer`).
+    if let Some(target) = &target {
+        crate::work::viewer::launch_and_report_viewer(
+            deps.tmux,
+            target,
+            &worktree.to_string_lossy(),
+            deps.current_exe,
+            prepared.run_id,
+            out,
+        )?;
+    }
     writeln!(out, "watch:    tm runs watch")?;
 
     Ok(FixOutcome::Dispatched { succeeded: true })
@@ -569,6 +591,80 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("started   review-fix PROJ-1 on jowi-dev/proj-1-slug"));
+    }
+
+    /// Issue #2 phase 4: like `tm work run --headless`, a headless fix pass
+    /// gets a *viewer* window over its log, never the supervisor's `claude`.
+    #[test]
+    fn fix_detached_gets_a_viewer_window_over_its_log() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let vdiff = FakeVdiffOps::with_export(Ok(
+            "## src/foo.rs\n\nsrc/foo.rs:10-12 nit: rename this".to_string(),
+        ));
+        let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+        };
+        let paths = paths(&tmp);
+        let mut out = Vec::new();
+
+        fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
+
+        let review_fix_run = run_store
+            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .unwrap()
+            .unwrap();
+        let (window_name, env, command) = tmux
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                TmuxCall::NewSessionWithCommand {
+                    name,
+                    window_name,
+                    env,
+                    command,
+                    ..
+                } => {
+                    assert_eq!(name, "tm-proj-1");
+                    Some((window_name.clone(), env.clone(), command.clone()))
+                }
+                _ => None,
+            })
+            .expect("a viewer window was launched");
+
+        assert_eq!(window_name, "fix");
+        assert_eq!(
+            command,
+            format!(
+                "'/usr/local/bin/tm' runs logs {} --follow",
+                review_fix_run.id
+            )
+        );
+        assert!(env.is_empty(), "a viewer owns no run: {env:?}");
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("window    tm-proj-1:fix (log viewer)"),
+            "{printed}"
+        );
     }
 
     #[test]

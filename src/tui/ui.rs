@@ -185,7 +185,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  w work  b bots  v view run  L logs  V vdiff  F fix  R retro  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  s session  w work  b bots  v view run  L logs  V vdiff  F fix  R retro  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1595,6 +1595,7 @@ mod tests {
             "f filter",
             "p priority",
             "a audit",
+            "s session",
             "w work",
             "b bots",
             "v view run",
@@ -1896,7 +1897,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Waiting,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -1957,7 +1958,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         app.lane_run_status
@@ -2001,7 +2002,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -2097,7 +2098,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -2130,7 +2131,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Done,
-                has_session: true,
+                window_live: true,
             },
         );
         app.lane_run_status
@@ -2141,7 +2142,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Waiting,
-                has_session: true,
+                window_live: true,
             },
         );
         let text = buffer_text(&render_with_size(&app, 80, 24));
