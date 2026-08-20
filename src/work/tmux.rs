@@ -223,8 +223,47 @@ pub fn window_creation_sequence(
     sequence
 }
 
+/// The action a window name denotes: `name` with a trailing `-<n>` repeat
+/// suffix (as produced by [`unique_window_name`]) stripped off.
+///
+/// Only an all-digit suffix is a repeat marker, so multi-word action names
+/// like `bugbot-cleanup` survive intact.
+pub fn window_action(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((base, suffix))
+            if !base.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => name,
+    }
+}
+
+/// The window name a new action window should take: `desired` if no window in
+/// `existing` already holds it, otherwise `desired-2`, `desired-3`, … up to
+/// the first free suffix.
+///
+/// Names, not indices, identify a ticket's action windows: `base-index` is
+/// user-configurable, tmux renumbers indices when a window is killed, and
+/// repeat actions (two fix passes) are expected. This is the whole naming
+/// rule, kept pure so it is testable against a plain list of names — the
+/// caller supplies `existing` from a [`TmuxOps::list_windows`] snapshot of
+/// the ticket's session.
+pub fn unique_window_name(desired: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|name| name == desired) {
+        return desired.to_string();
+    }
+    (2..)
+        .map(|n| format!("{desired}-{n}"))
+        .find(|candidate| !existing.iter().any(|name| name == candidate))
+        .expect("an unbounded counter always reaches a free name")
+}
+
 /// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) holds a live
-/// window named `window_name` in session `session`.
+/// window for action `window_name` in session `session` — including a repeat
+/// window like `fix-2`, whose action is still `fix` (see [`window_action`]).
 ///
 /// The double-launch guard for tmux-hosted actions: a ticket's session
 /// outlives any single action, so "is this action already running?" is a
@@ -232,9 +271,9 @@ pub fn window_creation_sequence(
 /// (`remain-on-exit`) does not count as running — relaunching over that
 /// aftermath is the intended behavior.
 pub fn has_live_window(windows: &[TmuxWindow], session: &str, window_name: &str) -> bool {
-    windows
-        .iter()
-        .any(|window| window.session == session && window.name == window_name && !window.dead)
+    windows.iter().any(|window| {
+        window.session == session && window_action(&window.name) == window_name && !window.dead
+    })
 }
 
 /// Whether `windows` (a [`TmuxOps::list_windows`] snapshot) mentions session
@@ -1126,6 +1165,60 @@ mod tests {
         );
     }
 
+    // --- unique_window_name / window_action ---
+
+    #[test]
+    fn unique_window_name_keeps_the_desired_name_when_unused() {
+        assert_eq!(unique_window_name("fix", &["audit".to_string()]), "fix");
+    }
+
+    #[test]
+    fn unique_window_name_suffixes_the_second_pass() {
+        assert_eq!(
+            unique_window_name("fix", &["audit".to_string(), "fix".to_string()]),
+            "fix-2"
+        );
+    }
+
+    #[test]
+    fn unique_window_name_counts_up_past_every_taken_suffix() {
+        let existing = vec![
+            "fix".to_string(),
+            "fix-2".to_string(),
+            "fix-3".to_string(),
+            "work".to_string(),
+        ];
+        assert_eq!(unique_window_name("fix", &existing), "fix-4");
+    }
+
+    #[test]
+    fn unique_window_name_fills_a_gap_left_by_a_killed_window() {
+        // Windows are append-only, but a killed one frees its name; reusing
+        // the lowest free suffix keeps names short and is what tmux's own
+        // window list would suggest.
+        let existing = vec!["fix".to_string(), "fix-3".to_string()];
+        assert_eq!(unique_window_name("fix", &existing), "fix-2");
+    }
+
+    #[test]
+    fn unique_window_name_does_not_confuse_a_different_action() {
+        assert_eq!(unique_window_name("fix", &["prefix".to_string()]), "fix");
+    }
+
+    #[test]
+    fn window_action_strips_a_repeat_suffix() {
+        assert_eq!(window_action("fix-2"), "fix");
+        assert_eq!(window_action("fix"), "fix");
+    }
+
+    #[test]
+    fn window_action_leaves_non_numeric_suffixes_alone() {
+        // `bugbot-cleanup` is one action's name, not `bugbot` repeat
+        // `cleanup`.
+        assert_eq!(window_action("bugbot-cleanup"), "bugbot-cleanup");
+        assert_eq!(window_action("fix-"), "fix-");
+    }
+
     // --- window-set queries over a list_windows snapshot ---
 
     fn windows() -> Vec<TmuxWindow> {
@@ -1146,6 +1239,18 @@ mod tests {
     #[test]
     fn has_live_window_finds_a_live_window_by_session_and_name() {
         assert!(has_live_window(&windows(), "tm-proj-1", "audit"));
+    }
+
+    #[test]
+    fn has_live_window_matches_a_repeat_windows_action() {
+        // A second `fix` pass runs in `fix-2`; the action is still `fix`, so
+        // the double-launch guard must see it.
+        let windows = vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "fix-2".to_string(),
+            dead: false,
+        }];
+        assert!(has_live_window(&windows, "tm-proj-1", "fix"));
     }
 
     #[test]
