@@ -18,3 +18,4 @@ pub mod run;
 pub mod runner;
 pub mod tmux;
 pub mod vdiff;
+pub mod viewer;
