@@ -74,7 +74,7 @@ tm auth status
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
-| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`) |
+| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
@@ -91,6 +91,8 @@ tm auth status
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
 | `tm work list` | List every current tmux session with a worktree/session kind column |
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
+| `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
+| `tm work clean <KEY>` | Finish with `<KEY>`: one `kill-session` on `tm-<key>` plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
@@ -618,6 +620,59 @@ is the action history. A repeat action whose window name is still taken
 *live window names*, not session existence: once one session outlives every
 individual action, the session merely existing means "this ticket has been
 touched".
+
+Press `s` on the board to attach to the selected ticket's session.
+
+#### Interactive windows own their process; headless ones only watch
+
+An interactive action (`tm work run`, `tm review fix`, an audit, a
+bugbot-cleanup) *is* the `claude` process in its window: attach and you can
+steer it. A `--headless` run is different — its `claude` belongs to a
+`setsid`'d supervisor that deliberately lives outside tmux, because it is
+the only thing that will record the run's outcome when `claude` exits.
+Binding it to a window would make `tmux kill-session` (or a reboot) silently
+kill a run mid-flight.
+
+So a headless run gets a window too, but a **viewer**: it runs
+`tm runs logs <id> --follow` and owns nothing. Kill it, or kill the whole
+session, and the run carries on. If tmux is unavailable the viewer is simply
+skipped, reported as a `window none` line — the run is unaffected either way.
+
+This mixed ownership is deliberate, not an inconsistency waiting to be
+tidied up.
+
+#### Rebuilding a session: `tm work session <KEY>`
+
+The session is convenience; the run rows and log files are the record. tmux
+scrollback is capped by `history-limit` and dies with the server, so it is
+never what happened — the log file is.
+
+After a reboot, a `tmux kill-server`, or an accidental
+`tmux kill-session -t tm-proj-123`, `tm work session PROJ-123` rebuilds the
+session from the ticket's runs:
+
+- A **headless run still in flight** gets its viewer window back and keeps
+  going, none the wiser — its supervisor survived whatever killed tmux.
+- An **interactive run still in flight** has lost its `claude` with the
+  pane. Its window comes back as a shell in the run's worktree, and the
+  command prints the `claude --resume <session-id>` line for it. Resuming is
+  never automatic: it would start billing and start editing unasked.
+- A **finished run** gets no window, of either kind. Reconstruction restores
+  working state, not history; `tm runs show`/`tm runs logs` (and the board's
+  `L`) are where a finished run lives. A finished interactive run has no log
+  at all — its durable artifact is its prompt file.
+
+It never attaches, and running it against a healthy session does nothing, so
+it is safe to run at any time or from a script.
+
+#### Finishing with a ticket: `tm work clean <KEY>`
+
+Because the session is the ticket, cleanup is one `kill-session` plus one
+worktree removal. The worktree comes from the ticket's run rows, and only a
+path sitting one level below the configured worktree root is ever removed —
+an `audit` run records `[work.audit].dir`, your own checkout, and that can
+never be handed to `git worktree remove`. A worktree that is already gone is
+reported, not an error.
 
 ### Board-launched audit sessions
 
