@@ -82,6 +82,23 @@ pub struct TmuxSession {
     pub path: String,
 }
 
+/// One row of `tmux list-windows -a` output: which session a window belongs
+/// to, its name, and whether its pane has died.
+///
+/// The window *name* is the liveness signal for tmux-hosted actions (see
+/// [`TmuxOps::list_windows`]), so `dead` matters: a window whose pane exited
+/// can linger when `remain-on-exit` is set, and a lingering window is not a
+/// running action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxWindow {
+    /// `#{session_name}`.
+    pub session: String,
+    /// `#{window_name}`.
+    pub name: String,
+    /// `#{pane_dead}`: the window's pane has exited but the window survives.
+    pub dead: bool,
+}
+
 /// Behavior tskmstr needs from `tmux` to provision and manage lane/worktree
 /// sessions.
 pub trait TmuxOps {
@@ -144,6 +161,21 @@ pub trait TmuxOps {
     /// error, matching `Unix.open_process_in`'s behavior of never
     /// inspecting the child's exit status.
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError>;
+
+    /// List every window of every running session
+    /// (`tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}'`).
+    ///
+    /// This is the liveness signal for tmux-hosted actions. Session
+    /// existence cannot serve that role: one session holds a ticket's whole
+    /// action history (`tm-<key>`, see [`crate::work::audit`]), so its
+    /// existence only means "this ticket has been touched" — it is the
+    /// presence of a live window *named after the action* that means the
+    /// action is running.
+    ///
+    /// Tolerant in the same way [`TmuxOps::list_sessions`] is: no `tmux`
+    /// server running yields `Ok(vec![])`, and malformed rows are dropped
+    /// rather than erroring.
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError>;
 }
 
 /// Given a lane/session's configured extra windows and primary window name,
@@ -250,6 +282,46 @@ fn list_sessions_args() -> Vec<String> {
         "-F".to_string(),
         "#{session_name}|#{session_path}".to_string(),
     ]
+}
+
+fn list_windows_args() -> Vec<String> {
+    vec![
+        "list-windows".to_string(),
+        "-a".to_string(),
+        "-F".to_string(),
+        "#{session_name}:#{window_name}:#{pane_dead}".to_string(),
+    ]
+}
+
+/// Parse `tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}'`
+/// output with the same tolerance [`parse_list_sessions_output`] has: drop
+/// anything that isn't a well-formed row.
+///
+/// The session name is taken up to the *first* `:` and `pane_dead` from after
+/// the *last* one, leaving everything between them as the window name — tmux
+/// forbids `:` in session names but not in window names, and only the outer
+/// two fields have fixed shapes.
+fn parse_list_windows_output(stdout: &str) -> Vec<TmuxWindow> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (head, dead) = line.rsplit_once(':')?;
+            let (session, name) = head.split_once(':')?;
+            if session.is_empty() || name.is_empty() {
+                return None;
+            }
+            let dead = match dead {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            Some(TmuxWindow {
+                session: session.to_string(),
+                name: name.to_string(),
+                dead,
+            })
+        })
+        .collect()
 }
 
 /// Parse `tmux list-sessions -F '#{session_name}|#{session_path}'` output,
@@ -386,6 +458,16 @@ impl TmuxOps for ShellTmuxOps {
             &output.stdout,
         )))
     }
+
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
+        // Same no-server tolerance as `list_sessions`: `tmux list-windows -a`
+        // exits non-zero with no server running, which is "no windows", not a
+        // fault worth failing a badge refresh over.
+        let output = run("tmux list-windows", &list_windows_args())?;
+        Ok(parse_list_windows_output(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
 }
 
 /// A [`TmuxOps`] test double: returns canned results and records every call
@@ -399,6 +481,7 @@ impl TmuxOps for ShellTmuxOps {
 pub struct FakeTmuxOps {
     has_session_result: std::cell::RefCell<Result<bool, TmuxError>>,
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
+    list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -457,15 +540,18 @@ pub enum TmuxCall {
     KillSession(String),
     /// `list_sessions()`.
     ListSessions,
+    /// `list_windows()`.
+    ListWindows,
 }
 
 impl FakeTmuxOps {
     /// Create a fake where `has_session` returns `Ok(false)` and
-    /// `list_sessions` returns `Ok(vec![])` unless overridden.
+    /// `list_sessions`/`list_windows` return `Ok(vec![])` unless overridden.
     pub fn new() -> Self {
         Self {
             has_session_result: std::cell::RefCell::new(Ok(false)),
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
+            list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -479,6 +565,12 @@ impl FakeTmuxOps {
     /// Set the result `list_sessions` will return.
     pub fn with_list_sessions(self, result: Result<Vec<TmuxSession>, TmuxError>) -> Self {
         *self.list_sessions_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `list_windows` will return.
+    pub fn with_list_windows(self, result: Result<Vec<TmuxWindow>, TmuxError>) -> Self {
+        *self.list_windows_result.borrow_mut() = result;
         self
     }
 
@@ -559,6 +651,11 @@ impl TmuxOps for FakeTmuxOps {
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::ListSessions);
         self.list_sessions_result.borrow().clone()
+    }
+
+    fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::ListWindows);
+        self.list_windows_result.borrow().clone()
     }
 }
 
@@ -689,6 +786,94 @@ mod tests {
             list_sessions_args(),
             vec!["list-sessions", "-F", "#{session_name}|#{session_path}"]
         );
+    }
+
+    #[test]
+    fn list_windows_args_cover_every_session_with_liveness() {
+        assert_eq!(
+            list_windows_args(),
+            vec![
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_name}:#{pane_dead}"
+            ]
+        );
+    }
+
+    // --- list-windows output parsing ---
+
+    #[test]
+    fn parses_window_lines_with_liveness() {
+        let stdout = "tm-proj-1:audit:0\ntm-proj-1:fix:1\naxiom-lane:code:0\n";
+        assert_eq!(
+            parse_list_windows_output(stdout),
+            vec![
+                TmuxWindow {
+                    session: "tm-proj-1".to_string(),
+                    name: "audit".to_string(),
+                    dead: false,
+                },
+                TmuxWindow {
+                    session: "tm-proj-1".to_string(),
+                    name: "fix".to_string(),
+                    dead: true,
+                },
+                TmuxWindow {
+                    session: "axiom-lane".to_string(),
+                    name: "code".to_string(),
+                    dead: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_window_output_yields_no_windows() {
+        assert_eq!(parse_list_windows_output(""), Vec::new());
+    }
+
+    #[test]
+    fn malformed_window_lines_are_dropped_not_erroring() {
+        // Same tolerance as `parse_list_sessions_output`: a line without the
+        // two delimiters, an empty field, or a `pane_dead` that isn't tmux's
+        // `0`/`1` flag is skipped rather than failing the whole listing.
+        let stdout = "no-delimiters\ntm-proj-1:audit:0\n:empty-session:0\ntm-x:win:maybe\n";
+        assert_eq!(
+            parse_list_windows_output(stdout),
+            vec![TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "audit".to_string(),
+                dead: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn window_names_containing_a_colon_keep_their_colon() {
+        // tmux does not forbid `:` in a window name, and only the first and
+        // last fields of the format string are fixed, so the middle field is
+        // whatever remains.
+        assert_eq!(
+            parse_list_windows_output("tm-proj-1:fix:pass:2:0\n"),
+            vec![TmuxWindow {
+                session: "tm-proj-1".to_string(),
+                name: "fix:pass:2".to_string(),
+                dead: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn fake_list_windows_result_is_configurable() {
+        let windows = vec![TmuxWindow {
+            session: "tm-proj-1".to_string(),
+            name: "audit".to_string(),
+            dead: false,
+        }];
+        let fake = FakeTmuxOps::new().with_list_windows(Ok(windows.clone()));
+        assert_eq!(fake.list_windows().unwrap(), windows);
+        assert_eq!(fake.calls(), vec![TmuxCall::ListWindows]);
     }
 
     // --- list-sessions output parsing ---
