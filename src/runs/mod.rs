@@ -1806,6 +1806,29 @@ impl RunStore {
         self.latest_run_for_ticket_kind(ticket, None)
     }
 
+    /// Every run recorded for `ticket`, of every kind, **oldest first** (by
+    /// `started_at`, breaking ties by `id`).
+    ///
+    /// Chronological, unlike every other query here, because its consumer is
+    /// [`crate::work::session::plan_session`]: a ticket's tmux windows are
+    /// append-only and their order *is* its action history, so the rows have
+    /// to arrive in the order the actions happened.
+    pub fn runs_for_ticket(&self, ticket: &str) -> Result<Vec<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage, log_path, findings_count,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             WHERE ticket = ?1
+             ORDER BY started_at ASC, id ASC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![ticket], Self::row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<Run>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Like [`RunStore::latest_run_for_ticket`], restricted to runs whose
     /// `kind` column equals `kind` when `Some`; `None` matches every kind
     /// (identical to [`RunStore::latest_run_for_ticket`]).
@@ -4119,6 +4142,63 @@ mod tests {
             .unwrap()
             .expect("expected a run");
         assert_eq!(run.id, second_id);
+    }
+
+    #[test]
+    fn runs_for_ticket_returns_every_kind_oldest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let audit_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/tmp/wt-audit".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let lane_id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-lane".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .start_run(&StartRun {
+                ticket: "PROJ-2".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-other".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let runs = store.runs_for_ticket("PROJ-1").unwrap();
+
+        assert_eq!(
+            runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            vec![audit_id, lane_id],
+            "window order is the action history, so rows must arrive in the \
+             order the actions happened"
+        );
+    }
+
+    #[test]
+    fn runs_for_ticket_is_empty_for_an_untouched_ticket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.runs_for_ticket("PROJ-404").unwrap().is_empty());
     }
 
     #[test]
