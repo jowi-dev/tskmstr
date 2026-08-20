@@ -197,6 +197,7 @@ pub fn map_key(
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
+        KeyCode::Char('s') if *screen == Screen::Board => Some(Msg::SessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
@@ -820,6 +821,49 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     KeyCode::Char('a'),
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn s_triggers_session_action_on_board() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('s'),
+            ),
+            Some(Msg::SessionAction)
+        );
+    }
+
+    #[test]
+    fn s_is_unbound_off_the_board_screen() {
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('s'),
                 ),
                 None
             );

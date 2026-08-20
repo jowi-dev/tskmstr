@@ -549,6 +549,7 @@ to" windows.
 | `f` | Open the assignee filter picker (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
+| `s` | Attach to the selected ticket's `tm-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |

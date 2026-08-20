@@ -993,10 +993,16 @@ pub enum Msg {
     /// attach to its `tm-<key>` session if its `audit` window is live,
     /// otherwise launch a new one. See [`audit_action`].
     AuditAction,
+    /// The `s` key was pressed on [`Screen::Board`]: attach to the selected
+    /// ticket's `tm-<key>` session, whatever is in it. See [`session_action`].
+    SessionAction,
+    /// The outcome of [`Cmd::AttachSession`] when it came from
+    /// [`Msg::SessionAction`], as a ready-to-display status line.
+    SessionAttachResult(String),
     /// [`Cmd::LoadAuditStatus`] finished loading, replacing
     /// `app.audit_status` wholesale.
     AuditStatusLoaded(HashMap<String, AuditStatusEntry>),
-    /// The outcome of [`Cmd::LaunchAudit`] or [`Cmd::AttachAudit`], already
+    /// The outcome of [`Cmd::LaunchAudit`] or [`Cmd::AttachSession`], already
     /// rendered to a human-readable status-line message (e.g. `launched
     /// audit for PROJ-1 -- press a to attach`, or `detached from
     /// tm-proj-1`). Kept as a single string variant (mirroring
@@ -1188,7 +1194,7 @@ pub enum Cmd {
     /// the blocking `tmux attach-session` call. Handled specially by the
     /// board's event loop, unlike every other `Cmd` here -- see
     /// `crate::tui::event`'s module docs.
-    AttachAudit {
+    AttachSession {
         /// Name of the tmux session to attach to.
         session_name: String,
     },
@@ -1233,7 +1239,7 @@ pub enum Cmd {
     /// Open the selected ticket's latest run's log file in a pager,
     /// suspending and restoring the board's terminal state around the
     /// blocking call -- handled specially by the board's event loop, exactly
-    /// like [`Cmd::AttachAudit`].
+    /// like [`Cmd::AttachSession`].
     ViewLogs {
         /// Ticket key to view the latest run's log for.
         key: String,
@@ -1241,7 +1247,7 @@ pub enum Cmd {
     /// Open `key`'s worktree (its latest `kind = "lane"` run's `worktree`)
     /// in `vdiff`, suspending and restoring the board's terminal state
     /// around the blocking call -- handled specially by the board's event
-    /// loop, exactly like [`Cmd::ViewLogs`] and [`Cmd::AttachAudit`], since
+    /// loop, exactly like [`Cmd::ViewLogs`] and [`Cmd::AttachSession`], since
     /// `vdiff` is an interactive GUI/TUI that needs the real TTY (see
     /// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section for why
     /// this is foreground/suspending rather than the watched-child seam
@@ -1528,6 +1534,11 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::AuditAction => audit_action(app),
+        Msg::SessionAction => session_action(app),
+        Msg::SessionAttachResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
         Msg::AuditStatusLoaded(status) => {
             app.audit_status = status;
             (app, Vec::new())
@@ -1753,7 +1764,7 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 /// A no-op when no ticket is selected. Otherwise, in order:
 ///
 /// 1. A live `bugbot` window exists -> attach to the ticket's session
-///    ([`Cmd::AttachAudit`], which takes a session name rather than anything
+///    ([`Cmd::AttachSession`], which takes a session name rather than anything
 ///    audit-specific).
 /// 2. No live window but the latest watcher run is
 ///    [`BotWatchIndicator::Ready`] (the bots reviewed and left unresolved
@@ -1777,7 +1788,7 @@ fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
     if window_live {
         return (
             app,
-            vec![Cmd::AttachAudit {
+            vec![Cmd::AttachSession {
                 session_name: crate::work::naming::ticket_session_name(&key),
             }],
         );
@@ -1877,13 +1888,39 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
         .get(&key)
         .is_some_and(|entry| entry.window_live);
     let cmd = if window_live {
-        Cmd::AttachAudit {
+        Cmd::AttachSession {
             session_name: crate::work::naming::ticket_session_name(&key),
         }
     } else {
         Cmd::LaunchAudit { key }
     };
     (app, vec![cmd])
+}
+
+/// Handle [`Msg::SessionAction`]: attach to the selected board ticket's
+/// `tm-<key>` session. A no-op when no ticket is selected.
+///
+/// Deliberately unconditional, unlike [`audit_action`]'s attach-or-launch.
+/// Two reasons:
+///
+/// - **There is nothing to launch.** A ticket's session is created by
+///   whichever action happens to run first; `s` means "show me this ticket's
+///   session", not "start something". Launching an action as a side effect of
+///   asking to look would be a surprise.
+/// - **No new liveness map is needed.** `audit_status`/`cleanup_status`
+///   report whether a *specific action's window* is live, which is not the
+///   same question as "does the session exist" — a session holding only a
+///   `work` window, or only a `shell`, is perfectly attachable. Answering the
+///   session question properly would mean another polled map on the board;
+///   instead `tmux attach-session` answers it, and its failure becomes the
+///   status line (see [`crate::tui::event`]'s `attach_session`). Cheaper, and
+///   it cannot go stale between poll and keypress.
+fn session_action(app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let session_name = crate::work::naming::ticket_session_name(&ticket.key);
+    (app, vec![Cmd::AttachSession { session_name }])
 }
 
 /// Handle [`Msg::ViewRunAction`]: open the run detail overlay on
@@ -4778,10 +4815,61 @@ mod tests {
         let (_app, cmds) = update(app, Msg::BotsAction);
         assert_eq!(
             cmds,
-            vec![Cmd::AttachAudit {
+            vec![Cmd::AttachSession {
                 session_name: "tm-proj-1".to_string()
             }]
         );
+    }
+
+    /// Issue #2 phase 5: `s` attaches to the selected ticket's session
+    /// unconditionally — it is the whole ticket's session, not any one
+    /// action's, so there is nothing to launch and no liveness to consult.
+    #[test]
+    fn session_action_attaches_to_the_selected_tickets_session() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+
+        let (_app, cmds) = update(app, Msg::SessionAction);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-1".to_string()
+            }]
+        );
+    }
+
+    /// No audit/cleanup status is consulted: a ticket whose session holds
+    /// only a `work` window (or only a `shell`) is still attachable, and a
+    /// session that does not exist reports its own failure from `tmux
+    /// attach-session` rather than needing a board-side liveness map.
+    #[test]
+    fn session_action_does_not_depend_on_any_action_badge() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.audit_status.clear();
+        app.cleanup_status.clear();
+
+        let (_app, cmds) = update(app, Msg::SessionAction);
+
+        assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn session_action_is_a_no_op_with_no_ticket_selected() {
+        let app = App::new();
+
+        let (_app, cmds) = update(app, Msg::SessionAction);
+
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn session_attach_result_reports_on_the_status_line() {
+        let app = App::new();
+
+        let (app, cmds) = update(app, Msg::SessionAttachResult("detached from x".to_string()));
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "detached from x");
     }
 
     #[test]
@@ -4982,7 +5070,7 @@ mod tests {
         let (_app, cmds) = update(app, Msg::AuditAction);
         assert_eq!(
             cmds,
-            vec![Cmd::AttachAudit {
+            vec![Cmd::AttachSession {
                 session_name: "tm-proj-1".to_string()
             }]
         );

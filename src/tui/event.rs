@@ -6,12 +6,12 @@
 //! with [`crate::jira::fake::FakeJiraClient`] instead of a live Jira and a
 //! real terminal.
 //!
-//! [`Cmd::AttachAudit`] is the one exception to that split: attaching needs
+//! [`Cmd::AttachSession`] is the one exception to that split: attaching needs
 //! `&mut Terminal` to suspend and restore the alternate screen around the
 //! blocking `tmux attach-session` call, which `execute`'s signature has no
 //! access to (and shouldn't grow one just for this). [`run_cmds`] intercepts
 //! it before it ever reaches `execute`, handles the suspend/restore itself
-//! (see [`attach_audit`]), and feeds the result back through `update` as an
+//! (see [`attach_session`]), and feeds the result back through `update` as an
 //! ordinary [`Msg`] -- every other `Cmd` still flows through `execute`
 //! unchanged.
 
@@ -288,7 +288,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// `update` (which may itself produce further `Cmd`s, e.g. loading
 /// transitions after opening the detail screen).
 ///
-/// [`Cmd::AttachAudit`] is intercepted here rather than passed to `execute`:
+/// [`Cmd::AttachSession`] is intercepted here rather than passed to `execute`:
 /// see the module docs. [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
 /// [`Cmd::LaunchReviewFix`] are intercepted for the same kind of reason --
 /// they need mutable access to `launches`, the in-flight launcher registry,
@@ -297,7 +297,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// success instead pushes a [`PendingLaunch`] onto `launches` for
 /// [`poll_pending_launches`] to resolve later, once its
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] reports completion.
-/// [`Cmd::ViewDiff`] is intercepted like [`Cmd::AttachAudit`] (needs `&mut
+/// [`Cmd::ViewDiff`] is intercepted like [`Cmd::AttachSession`] (needs `&mut
 /// Terminal` to suspend/restore around the blocking `vdiff` call -- see
 /// [`view_diff`]). [`Cmd::ResolvePrForTicket`] is intercepted for yet
 /// another reason: it needs `&mut Terminal` to force a status-line redraw
@@ -318,9 +318,13 @@ fn run_cmds<B: Backend>(
 ) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
-        if let Cmd::AttachAudit { session_name } = cmd {
-            let message = attach_audit(terminal, deps.tmux.as_ref(), &session_name);
-            let (next_app, more_cmds) = update(app, Msg::AuditActionResult(message));
+        if let Cmd::AttachSession { session_name } = cmd {
+            // One result `Msg` for all three keys that attach (`a`, `b`, `s`):
+            // the Cmd is "attach to this ticket's session" in every case, and
+            // only its status line differs. `Msg::AuditActionResult` stays for
+            // *launch* outcomes, which are audit-specific.
+            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -486,6 +490,13 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 /// alternate screen and raw mode and clear the terminal so the board redraws
 /// cleanly. Returns a status-line message describing the outcome.
 ///
+/// Shared by all three keys that attach: `a` (a live `audit` window), `b` (a
+/// live `bugbot` window), and `s` (the ticket's session as such, issue #2
+/// phase 5). They differ only in how they decide *which* session, which is
+/// [`crate::tui::app`]'s job; the suspend/restore dance is identical, and is
+/// the part that must not be reimplemented per key — getting the ordering
+/// wrong strands the user's shell.
+///
 /// Ordering rationale: restore runs [`run`]'s setup operations in their
 /// original order (`enable_raw_mode` then `EnterAlternateScreen`), and
 /// suspend is its exact reverse (`LeaveAlternateScreen` then
@@ -519,7 +530,13 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    exiting with an error still leaves this terminal fully usable (raw
 ///    mode re-enabled, alternate screen re-entered, board redrawn) rather
 ///    than stranding the shell.
-fn attach_audit<B: Backend>(
+/// 5. Press `s` on a ticket whose session holds a `work` window but no
+///    `audit` one: it must still attach, where `a` would launch an audit.
+/// 6. Press `s` on a ticket that has never been touched: no session exists,
+///    so the status line reports the `tmux attach-session` failure and the
+///    board must be fully usable afterwards (this is the same restore path
+///    as step 4, reached without ever having attached).
+fn attach_session<B: Backend>(
     terminal: &mut Terminal<B>,
     tmux: &dyn TmuxOps,
     session_name: &str,
@@ -544,7 +561,7 @@ fn attach_audit<B: Backend>(
 /// [`crate::cli::runs::resolve_run`], then its log path via
 /// [`crate::cli::runs::resolve_log_path`], and open it in `less`, suspending
 /// and restoring the board's terminal state around the blocking call exactly
-/// like [`attach_audit`]. Every failure mode (no store, no run, no log path,
+/// like [`attach_session`]. Every failure mode (no store, no run, no log path,
 /// missing file, pager launch failure) is reported as a status-line message
 /// rather than an error -- viewing a log is a convenience action, not
 /// something that should be able to crash the board.
@@ -618,7 +635,7 @@ fn resolve_vdiff_worktree(
 /// Run [`Cmd::ViewDiff`]: resolve `key`'s lane-run worktree (via
 /// [`resolve_vdiff_worktree`]) and open it in `vdiff`, suspending and
 /// restoring the board's terminal state around the blocking call exactly
-/// like [`view_logs`]/[`attach_audit`] -- `vdiff` is an interactive GUI/TUI
+/// like [`view_logs`]/[`attach_session`] -- `vdiff` is an interactive GUI/TUI
 /// that needs the real TTY, per
 /// `docs/plans/board-vdiff-review-loop.md`'s "Decisions" section. No
 /// `--pr`/PR-resolution flags are passed: `vdiff` detects the worktree's base
@@ -961,7 +978,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
             severity,
             notes,
         } => record_retro(deps, &key, verdict, severity, notes.as_deref()),
-        // `Cmd::AttachAudit`/`Cmd::ViewDiff` need `&mut Terminal` (to
+        // `Cmd::AttachSession`/`Cmd::ViewDiff` need `&mut Terminal` (to
         // suspend/restore the alternate screen around a blocking call --
         // `tmux attach`/`vdiff`, respectively); `Cmd::LaunchLaneRun`/
         // `Cmd::LaunchBotWatch`/`Cmd::LaunchReviewFix` need `&mut
@@ -978,7 +995,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         other @ (Cmd::LoadRuns
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
-        | Cmd::AttachAudit { .. }
+        | Cmd::AttachSession { .. }
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
         | Cmd::ViewLogs { .. }
@@ -1647,7 +1664,7 @@ mod tests {
     }
 
     /// A minimal in-memory terminal for tests that need to call [`run_cmds`]
-    /// (which requires `&mut Terminal` for [`Cmd::AttachAudit`]'s
+    /// (which requires `&mut Terminal` for [`Cmd::AttachSession`]'s
     /// suspend/restore, even though most tests never exercise that path).
     fn test_terminal() -> Terminal<ratatui::backend::TestBackend> {
         Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal should build")
@@ -2885,16 +2902,36 @@ mod tests {
         );
     }
 
-    // --- Cmd::AttachAudit routing (run_cmds intercepts it before `execute`) ---
+    // --- Cmd::AttachSession routing (run_cmds intercepts it before `execute`) ---
 
     #[test]
-    fn run_cmds_intercepts_attach_audit_and_reports_status_line() {
+    fn run_cmds_intercepts_audit_attach_and_reports_status_line() {
         let d = deps(FakeJiraClient::new());
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
         let app = run_cmds(
             App::new(),
-            vec![Cmd::AttachAudit {
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(app.status_line, "detached from tm-proj-1");
+    }
+
+    /// Phase 5's board attach reuses `attach_session`'s suspend/restore dance
+    /// exactly, so it routes through `run_cmds` the same way and reports the
+    /// same shape of status line.
+    #[test]
+    fn run_cmds_intercepts_attach_session_and_reports_status_line() {
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AttachSession {
                 session_name: "tm-proj-1".to_string(),
             }],
             &d,
