@@ -1896,7 +1896,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Waiting,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -1957,7 +1957,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         app.lane_run_status
@@ -2001,7 +2001,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -2097,7 +2097,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Running,
-                has_session: true,
+                window_live: true,
             },
         );
         let buffer = render_with_size(&app, 80, 24);
@@ -2130,7 +2130,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Done,
-                has_session: true,
+                window_live: true,
             },
         );
         app.lane_run_status
@@ -2141,7 +2141,7 @@ mod tests {
             "PROJ-1".to_string(),
             AuditStatusEntry {
                 indicator: AuditIndicator::Waiting,
-                has_session: true,
+                window_live: true,
             },
         );
         let text = buffer_text(&render_with_size(&app, 80, 24));

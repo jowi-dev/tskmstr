@@ -1033,14 +1033,14 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let mut status = HashMap::new();
     for key in keys {
-        let has_session = sessions.contains(key);
+        let window_live = sessions.contains(key);
         let run = latest_by_ticket.get(key).copied();
-        if let Some(indicator) = audit_indicator(has_session, run) {
+        if let Some(indicator) = audit_indicator(window_live, run) {
             status.insert(
                 key.clone(),
                 AuditStatusEntry {
                     indicator,
-                    has_session,
+                    window_live,
                 },
             );
         }
@@ -1162,14 +1162,14 @@ fn load_cleanup_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let mut status = HashMap::new();
     for key in keys {
-        let has_session = sessions.contains(key);
+        let window_live = sessions.contains(key);
         let run = latest_by_ticket.get(key).copied();
-        if let Some(indicator) = audit_indicator(has_session, run) {
+        if let Some(indicator) = audit_indicator(window_live, run) {
             status.insert(
                 key.clone(),
                 AuditStatusEntry {
                     indicator,
-                    has_session,
+                    window_live,
                 },
             );
         }
@@ -2684,7 +2684,7 @@ mod tests {
             [Msg::AuditStatusLoaded(status)] => {
                 let entry = status.get("PROJ-1").expect("PROJ-1 should have an entry");
                 assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Running);
-                assert!(entry.has_session);
+                assert!(entry.window_live);
             }
             other => panic!("expected AuditStatusLoaded, got {other:?}"),
         }
@@ -2712,7 +2712,7 @@ mod tests {
             [Msg::AuditStatusLoaded(status)] => {
                 let entry = status.get("PROJ-2").expect("PROJ-2 should have an entry");
                 assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Starting);
-                assert!(entry.has_session);
+                assert!(entry.window_live);
             }
             other => panic!("expected AuditStatusLoaded, got {other:?}"),
         }
@@ -3669,7 +3669,7 @@ mod tests {
             [Msg::CleanupStatusLoaded(status)] => {
                 let entry = status.get("PROJ-1").expect("PROJ-1 should have an entry");
                 assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Running);
-                assert!(entry.has_session);
+                assert!(entry.window_live);
             }
             other => panic!("expected CleanupStatusLoaded, got {other:?}"),
         }
@@ -3697,7 +3697,7 @@ mod tests {
             [Msg::CleanupStatusLoaded(status)] => {
                 let entry = status.get("PROJ-2").expect("PROJ-2 should have an entry");
                 assert_eq!(entry.indicator, crate::tui::app::AuditIndicator::Starting);
-                assert!(entry.has_session);
+                assert!(entry.window_live);
             }
             other => panic!("expected CleanupStatusLoaded, got {other:?}"),
         }
