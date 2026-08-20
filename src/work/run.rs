@@ -82,7 +82,7 @@ use crate::config::WorkConfig;
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::jira::client::JiraClient;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
-use crate::work::claude::{ClaudeInvocationInputs, build_claude_invocation};
+use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
 use crate::work::hooks::{self, HooksError};
 use crate::work::naming::{self, expand_tilde};
@@ -931,6 +931,7 @@ pub fn prepare_run_lane(
         permission_mode,
         settings_path: settings_path.clone(),
         run_id: Some(run_id.to_string()),
+        mode: RunMode::Headless,
     });
 
     std::fs::create_dir_all(&paths.state_dir)?;
@@ -1064,6 +1065,7 @@ pub fn prepare_review_fix(
         permission_mode: None,
         settings_path: settings_path.clone(),
         run_id: Some(run_id.to_string()),
+        mode: RunMode::Headless,
     });
 
     let (year, month, day, hour, min, sec) = clock.now_parts();

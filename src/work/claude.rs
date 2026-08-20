@@ -1,4 +1,4 @@
-//! Pure `claude -p` invocation builder for the lane runner, ported from
+//! Pure `claude` invocation builder for the lane runner, ported from
 //! devtools' `~/devtools/work.ml`'s `run_lane`. This module owns only the
 //! translation from already-resolved run inputs into the exact argv/env
 //! `claude` needs — no process spawning, no environment reads, no clock
@@ -37,6 +37,18 @@
 //! default. This module ports that: absent `model`/`max_turns`/
 //! `permission_mode` resolve to the same defaults (`"fable"`, `"200"`,
 //! `"acceptEdits"`) rather than being left out of argv.
+//!
+//! # Two run modes
+//!
+//! Everything above describes [`RunMode::Headless`], the only shape that
+//! existed while `work.ml` was the reference. Issue #2 phase 3 makes work
+//! and fix runs *interactive* tmux-hosted sessions by default
+//! ([`RunMode::Interactive`]): the prompt goes positionally rather than via
+//! `-p`, `--output-format`/`--max-turns` are dropped (nothing parses the
+//! output and there is no turn budget to enforce on a session a human is
+//! steering), and — the part with no visible symptom when it is wrong — the
+//! run id travels as `TSKMSTR_SESSION_RUN_ID` rather than
+//! `TSKMSTR_RUN_ID`. See [`RunMode`].
 
 use std::path::PathBuf;
 
@@ -60,19 +72,70 @@ const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 /// run actually being tracked, not unconditional.
 const TSKMSTR_RUN_ID_VAR: &str = "TSKMSTR_RUN_ID";
 
-/// Already-resolved inputs for one lane run's `claude -p` invocation.
-/// Everything here is data the caller has already produced (prompt text
-/// read from the prompt file and ticket-suffixed, the deployed hooks
-/// settings path, etc.) — this struct carries no unresolved file paths that
-/// still need reading and no clock/env reads of its own.
+/// Environment variable naming the pre-registered run row an *interactive*
+/// session should adopt, read by
+/// [`crate::runs::session::register_session`]. The same variable
+/// [`crate::work::audit::SESSION_RUN_ID_ENV`] has always used for
+/// tmux-hosted audit sessions.
+const TSKMSTR_SESSION_RUN_ID_VAR: &str = "TSKMSTR_SESSION_RUN_ID";
+
+/// How a run hosts its `claude` process — the fork every difference between
+/// the two invocation shapes hangs off.
+///
+/// # The run-id environment variable is the load-bearing difference
+///
+/// `TSKMSTR_RUN_ID` is this codebase's flag for "a supervisor owns this
+/// run's lifecycle". Three separate places read it that way:
+/// `hooks/tm-session-end.sh` exits 0 immediately when it is set, and
+/// [`crate::runs::session::register_session`] and
+/// `crate::runs::session::finish_session` both short-circuit to a no-op on
+/// it.
+///
+/// [`RunMode::Headless`] *has* that supervisor (`tm work __supervise`, see
+/// `src/work/detach.rs`), which calls `RunStore::finish_run` itself, so
+/// gating the session-level machinery off is correct there.
+///
+/// [`RunMode::Interactive`] has no supervisor at all. The SessionEnd hook is
+/// the only thing that will ever finish the run, so it must not be gated
+/// off: the run id travels as `TSKMSTR_SESSION_RUN_ID` instead, which
+/// `register_session` treats as "adopt this pre-registered row" (the same
+/// mechanism [`crate::work::audit::launch_audit`] has always used).
+///
+/// Swapping the two variables produces **no visible symptom**: `claude`
+/// runs, the work gets done, and the run row simply sits at `running` until
+/// `tm runs reap` eventually marks it failed. That is why
+/// `run_mode_decides_which_run_id_env_var_claude_receives` pins the full env
+/// set of both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// One-shot `claude -p`, spawned by a `setsid`'d supervisor (or,
+    /// with `--fg`, synchronously by the invoking process). Machine-readable
+    /// `--output-format json`, bounded by `--max-turns`, finished by the
+    /// supervisor.
+    Headless,
+    /// A steerable `claude` session hosted in a tmux window: the prompt is
+    /// positional (as in [`crate::work::audit::claude_command`]), there is
+    /// no `--max-turns` budget to enforce and no result JSON to parse, and
+    /// the run row is adopted and finished by the session's own hooks.
+    Interactive,
+}
+
+/// Already-resolved inputs for one run's `claude` invocation. Everything
+/// here is data the caller has already produced (prompt text read from the
+/// prompt file and ticket-suffixed, the deployed hooks settings path, etc.)
+/// — this struct carries no unresolved file paths that still need reading and
+/// no clock/env reads of its own.
 pub struct ClaudeInvocationInputs {
-    /// Final prompt text for the `-p` flag. Already includes the
+    /// Final prompt text: the `-p` value when headless, `claude`'s
+    /// positional argument when interactive. Already includes the
     /// `"\n\nWork ticket: <ticket>."` suffix if a ticket was given —
     /// ticket-suffixing is `run_lane`'s job, not this module's.
     pub prompt: String,
     /// Driver model override. `None` resolves to [`DEFAULT_MODEL`].
     pub model: Option<String>,
     /// `--max-turns` override. `None` resolves to [`DEFAULT_MAX_TURNS`].
+    /// Ignored entirely under [`RunMode::Interactive`], which passes no
+    /// turn budget at all.
     pub max_turns: Option<String>,
     /// `--permission-mode` override. `None` resolves to
     /// [`DEFAULT_PERMISSION_MODE`].
@@ -83,10 +146,15 @@ pub struct ClaudeInvocationInputs {
     /// code path that runs `claude` without `--settings`.
     pub settings_path: PathBuf,
     /// The run id returned by `tm runs start`, if this run is tracked.
-    /// `None` (or, defensively, `Some("")`) means untracked: no
-    /// `TSKMSTR_RUN_ID` is set, matching the wrapper script's `if [ -n
+    /// `None` (or, defensively, `Some("")`) means untracked: no run-id
+    /// variable is set at all, matching the wrapper script's `if [ -n
     /// "$RUN_ID" ]` guard.
     pub run_id: Option<String>,
+    /// Whether this run is a headless `claude -p` lane run or an interactive
+    /// tmux-hosted session. Decides the argv shape *and* which run-id
+    /// environment variable carries `run_id` — see [`RunMode`], which is
+    /// where the consequences of getting that wrong are spelled out.
+    pub mode: RunMode,
 }
 
 /// A fully resolved `claude -p` invocation: the program, its argv, and the
@@ -122,38 +190,68 @@ pub struct ClaudeInvocation {
     pub env_remove: Vec<String>,
 }
 
-/// Build the [`ClaudeInvocation`] for one lane run from already-resolved
+/// Build the [`ClaudeInvocation`] for one run from already-resolved
 /// [`ClaudeInvocationInputs`], applying the same model/max-turns/
 /// permission-mode defaults `work.ml`'s `run_lane` applies when a lane/run
 /// option is absent.
+///
+/// [`ClaudeInvocationInputs::mode`] forks both halves of the result:
+///
+/// | | [`RunMode::Headless`] | [`RunMode::Interactive`] |
+/// |---|---|---|
+/// | prompt | `-p <prompt>` | positional, `args[0]` |
+/// | `--output-format json` | yes (parsed by [`crate::work::runner::parse_run_outcome`]) | no — nothing parses an interactive session's stdout |
+/// | `--max-turns` | yes | no — meaningless for a steerable session |
+/// | run id travels as | `TSKMSTR_RUN_ID` | `TSKMSTR_SESSION_RUN_ID` |
+///
+/// `--model`, `--settings` and `--permission-mode` are common to both.
+/// `--settings` especially: it is what deploys the SessionEnd hook that
+/// finishes an interactive run, so an interactive invocation needs it at
+/// least as much as a headless one does.
+///
+/// Read [`RunMode`] before touching the env-set fork.
 pub fn build_claude_invocation(inputs: ClaudeInvocationInputs) -> ClaudeInvocation {
     let model = inputs.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let max_turns = inputs
-        .max_turns
-        .unwrap_or_else(|| DEFAULT_MAX_TURNS.to_string());
     let permission_mode = inputs
         .permission_mode
         .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string());
 
-    let args = vec![
-        "-p".to_string(),
-        inputs.prompt,
-        "--model".to_string(),
-        model,
-        "--settings".to_string(),
-        inputs.settings_path.to_string_lossy().into_owned(),
-        "--permission-mode".to_string(),
-        permission_mode,
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--max-turns".to_string(),
-        max_turns,
-    ];
+    let mut args = Vec::new();
+    match inputs.mode {
+        RunMode::Headless => {
+            args.push("-p".to_string());
+            args.push(inputs.prompt);
+        }
+        // Positional prompt, mirroring `audit::claude_command`'s
+        // `claude <prompt>`. Kept at `args[0]` so
+        // `interactive::tmux_command_line` can swap it for a
+        // `"$(cat <prompt file>)"` read without re-deriving the argv.
+        RunMode::Interactive => args.push(inputs.prompt),
+    }
+    args.push("--model".to_string());
+    args.push(model);
+    args.push("--settings".to_string());
+    args.push(inputs.settings_path.to_string_lossy().into_owned());
+    args.push("--permission-mode".to_string());
+    args.push(permission_mode);
+    if inputs.mode == RunMode::Headless {
+        let max_turns = inputs
+            .max_turns
+            .unwrap_or_else(|| DEFAULT_MAX_TURNS.to_string());
+        args.push("--output-format".to_string());
+        args.push("json".to_string());
+        args.push("--max-turns".to_string());
+        args.push(max_turns);
+    }
 
     let mut env_set = Vec::new();
     let run_id = inputs.run_id.filter(|id| !id.is_empty());
     if let Some(run_id) = run_id {
-        env_set.push((TSKMSTR_RUN_ID_VAR.to_string(), run_id));
+        let var = match inputs.mode {
+            RunMode::Headless => TSKMSTR_RUN_ID_VAR,
+            RunMode::Interactive => TSKMSTR_SESSION_RUN_ID_VAR,
+        };
+        env_set.push((var.to_string(), run_id));
     }
 
     ClaudeInvocation {
@@ -180,6 +278,7 @@ mod tests {
             permission_mode: Some("plan".to_string()),
             settings_path: PathBuf::from("/Users/jowi/.local/share/tskmstr/hooks/settings.json"),
             run_id: Some("run-123".to_string()),
+            mode: RunMode::Headless,
         }
     }
 
@@ -312,6 +411,75 @@ mod tests {
         let invocation = build_claude_invocation(inputs);
 
         assert!(invocation.env_set.is_empty());
+    }
+
+    /// **The phase-3 acceptance test.** The two run modes carry *different*
+    /// run-id environment variables, and swapping them has no visible
+    /// symptom at all — it just leaves every interactive run stuck at
+    /// `running` until `tm runs reap`.
+    ///
+    /// `TSKMSTR_RUN_ID` means "a supervisor owns this run's lifecycle":
+    /// `hooks/tm-session-end.sh` exits 0 the moment it is set, and
+    /// [`crate::runs::session::register_session`]/`finish_session` both
+    /// short-circuit on it. Only the headless path has such a supervisor
+    /// (`tm work __supervise`, see `src/work/detach.rs`). An interactive
+    /// tmux-hosted run has none: its run row is finished by the SessionEnd
+    /// hook, which must therefore *not* be short-circuited, and its
+    /// pre-registered row is adopted via `TSKMSTR_SESSION_RUN_ID`.
+    ///
+    /// This asserts the full env set of both modes, so setting the wrong
+    /// variable — or setting both — fails here.
+    #[test]
+    fn run_mode_decides_which_run_id_env_var_claude_receives() {
+        let headless = build_claude_invocation(ClaudeInvocationInputs {
+            mode: RunMode::Headless,
+            ..base_inputs()
+        });
+        let interactive = build_claude_invocation(ClaudeInvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        assert_eq!(
+            headless.env_set,
+            vec![("TSKMSTR_RUN_ID".to_string(), "run-123".to_string())],
+            "the headless supervisor owns finish, so it — and only it — sets TSKMSTR_RUN_ID"
+        );
+        assert_eq!(
+            interactive.env_set,
+            vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "run-123".to_string())],
+            "an interactive run has no supervisor: TSKMSTR_RUN_ID would gate off the \
+             SessionEnd hook that is the only thing that finishes it"
+        );
+    }
+
+    #[test]
+    fn interactive_mode_passes_the_prompt_positionally_and_drops_max_turns() {
+        let invocation = build_claude_invocation(ClaudeInvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "do the thing",
+                "--model",
+                "sonnet",
+                "--settings",
+                "/Users/jowi/.local/share/tskmstr/hooks/settings.json",
+                "--permission-mode",
+                "plan",
+            ]
+        );
+        assert!(
+            !invocation.args.iter().any(|arg| arg == "-p"),
+            "`-p` is one-shot print mode; an interactive session takes its prompt positionally"
+        );
+        assert!(
+            !invocation.args.iter().any(|arg| arg == "--max-turns"),
+            "--max-turns is meaningless for a steerable interactive session"
+        );
     }
 
     #[test]
