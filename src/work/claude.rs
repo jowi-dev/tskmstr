@@ -106,12 +106,19 @@ const TSKMSTR_SESSION_RUN_ID_VAR: &str = "TSKMSTR_SESSION_RUN_ID";
 /// `tm runs reap` eventually marks it failed. That is why
 /// `run_mode_decides_which_run_id_env_var_claude_receives` pins the full env
 /// set of both modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunMode {
     /// One-shot `claude -p`, spawned by a `setsid`'d supervisor (or,
     /// with `--fg`, synchronously by the invoking process). Machine-readable
     /// `--output-format json`, bounded by `--max-turns`, finished by the
     /// supervisor.
+    ///
+    /// The default, despite the CLI defaulting to
+    /// [`RunMode::Interactive`]: this is the self-contained shape, needing
+    /// no tmux server and no in-session adoption, so it is the safer thing
+    /// for a programmatic caller that has not thought about window hosting
+    /// to fall into. The CLI always states its choice explicitly.
+    #[default]
     Headless,
     /// A steerable `claude` session hosted in a tmux window: the prompt is
     /// positional (as in [`crate::work::audit::claude_command`]), there is

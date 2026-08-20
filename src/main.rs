@@ -295,6 +295,7 @@ fn run_work(
                 max_turns,
                 permission_mode,
                 prompt_override: prompt,
+                mode: tskmstr::work::claude::RunMode::Headless,
             };
             let succeeded =
                 tskmstr::cli::work::run(&ctx, &run_deps, &lane, request, fg, &mut stdout)?;

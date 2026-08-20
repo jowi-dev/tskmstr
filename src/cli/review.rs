@@ -36,6 +36,7 @@ use thiserror::Error;
 
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
+use crate::work::claude::RunMode;
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::GitOps;
 use crate::work::run::{
@@ -215,6 +216,7 @@ pub fn fix(
         &branch,
         prompt,
         pid,
+        RunMode::Headless,
     )?;
 
     if fg {
