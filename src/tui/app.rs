@@ -25,8 +25,8 @@ pub struct TicketSummary {
     pub status: String,
     /// Browsable URL for the issue (`{base_url}/browse/{key}`).
     pub url: String,
-    /// Plain-text description, extracted from the issue's ADF description
-    /// via [`crate::jira::adf::adf_to_text`].
+    /// Plain-text description, as the provider renders it via
+    /// [`crate::ticketing::provider::TicketProvider::description_text`].
     pub description: String,
     /// Status category key (`new`, `indeterminate`, `done`, or anything else
     /// Jira reports), used to order board columns.
