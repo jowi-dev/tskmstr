@@ -6,8 +6,9 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::config::{self, Config, ConfigError, ConfigPaths, GlobalConfigSeed};
-use crate::jira::client::{JiraClient, JiraError};
+use crate::jira::client::JiraError;
 use crate::keychain::{KeychainError, KeychainStore};
+use crate::ticketing::provider::TicketProvider;
 
 use super::Prompter;
 
@@ -52,9 +53,9 @@ pub struct AuthContext<'a> {
     /// The `JIRA_API_TOKEN` environment variable, if set; takes precedence
     /// over the keychain.
     pub env_token: Option<String>,
-    /// Builds a [`JiraClient`] for a given config and token. Injected so
+    /// Builds a [`TicketProvider`] for a given config and token. Injected so
     /// tests can supply a fake client without a real Jira instance.
-    pub jira_client_factory: &'a dyn Fn(&Config, &str) -> Box<dyn JiraClient>,
+    pub jira_client_factory: &'a dyn Fn(&Config, &str) -> Box<dyn TicketProvider>,
 }
 
 /// `tm auth login`: bootstrap config if needed, validate a Jira API token
@@ -201,9 +202,11 @@ fn resolve_token_source(ctx: &AuthContext) -> Result<Option<(String, &'static st
 mod tests {
     use super::*;
     use crate::cli::FakePrompter;
+    use crate::jira::client::JiraClient;
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::types::Myself;
     use crate::keychain::InMemoryKeychain;
+    use crate::ticketing::provider::JiraProvider;
     use tempfile::tempdir;
 
     fn myself() -> Myself {
@@ -214,9 +217,11 @@ mod tests {
         }
     }
 
-    fn factory_returning(jira: FakeJiraClient) -> impl Fn(&Config, &str) -> Box<dyn JiraClient> {
+    fn factory_returning(
+        jira: FakeJiraClient,
+    ) -> impl Fn(&Config, &str) -> Box<dyn TicketProvider> {
         let jira = std::rc::Rc::new(jira);
-        move |_cfg, _token| Box::new(FakeJiraClientHandle(jira.clone()))
+        move |_cfg, _token| Box::new(JiraProvider::new(FakeJiraClientHandle(jira.clone())))
     }
 
     /// A cheaply cloneable handle wrapping a shared [`FakeJiraClient`] so it
@@ -226,70 +231,70 @@ mod tests {
 
     impl JiraClient for FakeJiraClientHandle {
         fn myself(&self) -> Result<Myself, JiraError> {
-            self.0.myself()
+            JiraClient::myself(&*self.0)
         }
         fn get_issue(&self, key: &str) -> Result<crate::jira::types::Issue, JiraError> {
-            self.0.get_issue(key)
+            JiraClient::get_issue(&*self.0, key)
         }
         fn create_issue(
             &self,
             req: &crate::jira::types::CreateIssueRequest,
         ) -> Result<crate::jira::types::Issue, JiraError> {
-            self.0.create_issue(req)
+            JiraClient::create_issue(&*self.0, req)
         }
         fn add_remote_link(
             &self,
             key: &str,
             link: &crate::jira::types::RemoteLinkRequest,
         ) -> Result<(), JiraError> {
-            self.0.add_remote_link(key, link)
+            JiraClient::add_remote_link(&*self.0, key, link)
         }
         fn transitions(&self, key: &str) -> Result<Vec<crate::jira::types::Transition>, JiraError> {
-            self.0.transitions(key)
+            JiraClient::transitions(&*self.0, key)
         }
         fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
-            self.0.transition(key, transition_id)
+            JiraClient::transition(&*self.0, key, transition_id)
         }
         fn search(&self, jql: &str) -> Result<crate::jira::types::SearchResult, JiraError> {
-            self.0.search(jql)
+            JiraClient::search(&*self.0, jql)
         }
         fn get_project(&self, key: &str) -> Result<(), JiraError> {
-            self.0.get_project(key)
+            JiraClient::get_project(&*self.0, key)
         }
         fn assignable_users(
             &self,
             project: &str,
         ) -> Result<Vec<crate::jira::types::JiraUser>, JiraError> {
-            self.0.assignable_users(project)
+            JiraClient::assignable_users(&*self.0, project)
         }
         fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
-            self.0.assign(key, account_id)
+            JiraClient::assign(&*self.0, key, account_id)
         }
         fn rank(
             &self,
             keys: &[String],
             anchor: crate::jira::client::RankAnchor,
         ) -> Result<(), JiraError> {
-            self.0.rank(keys, anchor)
+            JiraClient::rank(&*self.0, keys, anchor)
         }
         fn create_link(
             &self,
             req: &crate::jira::types::CreateLinkRequest,
         ) -> Result<(), JiraError> {
-            self.0.create_link(req)
+            JiraClient::create_link(&*self.0, req)
         }
         fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
-            self.0.delete_link(link_id)
+            JiraClient::delete_link(&*self.0, link_id)
         }
         fn update_description(
             &self,
             key: &str,
             description: &serde_json::Value,
         ) -> Result<(), JiraError> {
-            self.0.update_description(key, description)
+            JiraClient::update_description(&*self.0, key, description)
         }
         fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
-            self.0.add_comment(key, body)
+            JiraClient::add_comment(&*self.0, key, body)
         }
     }
 

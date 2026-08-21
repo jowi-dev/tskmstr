@@ -10,10 +10,11 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::jira::adf::{adf_to_text, text_to_adf};
-use crate::jira::client::{JiraClient, RankAnchor};
+use crate::jira::client::RankAnchor;
 use crate::jira::types::CreateLinkRequest;
 use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
+use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
     TransitionOutcome, assign_ticket, associate_ticket, comment_ticket, create_ticket, link_ticket,
@@ -222,7 +223,7 @@ pub fn run(ctx: &TicketingContext, key: &str, out: &mut dyn Write) -> Result<(),
 /// is needed — this command has nothing to do with a pull request, `gh`, or
 /// `git`.
 pub fn transition(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     status: Option<&str>,
     out: &mut dyn Write,
@@ -236,7 +237,7 @@ pub fn transition(
 
 /// Apply `target` to `key` via [`transition_ticket`] and print the outcome.
 fn transition_to_status(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     target: &str,
     out: &mut dyn Write,
@@ -255,7 +256,7 @@ fn transition_to_status(
 /// Print `key`'s current status and available transitions via
 /// [`list_transitions`].
 fn print_available_transitions(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
@@ -286,7 +287,7 @@ fn print_available_transitions(
 /// error propagated via [`TicketCliError::Ticketing`]: an ambiguous or
 /// unknown name, or any Jira API failure.
 pub fn assign(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     config: &Config,
     key: &str,
     name: Option<&str>,
@@ -331,7 +332,7 @@ pub fn assign(
 /// [`transition`] and [`assign`], every other failure is a hard error
 /// propagated via [`TicketCliError::Ticketing`].
 pub fn rank(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     above: Option<&str>,
     below: Option<&str>,
@@ -375,7 +376,7 @@ pub fn rank(
 /// `--blocked-by OTHER` means `key` is the blocked issue (`blocker_key:
 /// other, blocked_key: key`).
 pub fn link(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     blocks: Option<&str>,
     blocked_by: Option<&str>,
@@ -419,7 +420,7 @@ pub fn link(
 /// Print `key`'s existing issue links via [`list_links`], for the `tm
 /// ticket link <KEY>` (no flag) discovery view.
 fn print_links(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
@@ -458,7 +459,7 @@ fn print_links(
 /// [`TicketCliError::Ticketing`]. Prints one `Unlinked: ...` line per
 /// removed link, in the order [`unlink_ticket`] reports them.
 pub fn unlink(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     other: &str,
     out: &mut dyn Write,
@@ -485,7 +486,7 @@ pub fn unlink(
 /// API failure (including a 404 for an unknown `key`) is a hard error
 /// propagated via [`TicketCliError::Ticketing`] rather than a warning.
 pub fn update(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     body: &str,
     out: &mut dyn Write,
@@ -566,7 +567,7 @@ pub fn resolve_comment_body(
 /// [`TicketingError::EmptySearchText`] via [`TicketCliError::Ticketing`];
 /// any other Jira/config failure is likewise a hard error.
 pub fn search(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     config: &Config,
     text: &str,
     out: &mut dyn Write,
@@ -623,7 +624,7 @@ pub enum AuditStoreStatus<'a> {
 /// swallowed (`register_session`'s error contract requires callers to do
 /// this) — a broken runs DB or marker directory never blocks this read.
 pub fn audit_read(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     store: &AuditStoreStatus,
     key: &str,
     session_env: &SessionEnv,

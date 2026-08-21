@@ -28,8 +28,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
 use crate::jira::adf::adf_to_text;
-use crate::jira::client::{JiraClient, JiraError, RankAnchor};
+use crate::jira::client::{JiraError, RankAnchor};
 use crate::jira::types::Issue;
+use crate::ticketing::provider::TicketProvider;
 use crate::tui::app::{
     App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, bot_watch_indicator,
     lane_run_indicator,
@@ -97,7 +98,7 @@ pub enum TuiError {
 /// and attach to board-launched ticket-audit sessions.
 pub struct TuiDeps {
     /// Client used to fetch tickets, transitions, and apply transitions.
-    pub jira: Box<dyn JiraClient>,
+    pub jira: Box<dyn TicketProvider>,
     /// Base URL of the Jira instance, used to build `{base_url}/browse/{key}`
     /// links for [`Cmd::OpenUrl`].
     pub base_url: String,
@@ -1314,7 +1315,7 @@ fn search_tickets(deps: &TuiDeps, jql: &str) -> Result<TicketPage, JiraError> {
 }
 
 /// What [`search_tickets`] found: the mapped tickets, plus whether
-/// [`crate::jira::client::JiraClient::search`] stopped on its page budget
+/// [`crate::ticketing::provider::TicketProvider::search`] stopped on its page budget
 /// with more matches unfetched.
 struct TicketPage {
     tickets: Vec<TicketSummary>,
@@ -1638,6 +1639,7 @@ mod tests {
     use crate::jira::fake::FakeJiraClient;
     use crate::jira::jql::{my_open_tickets_jql, shipped_awaiting_retro_jql};
     use crate::jira::types::{IssueFields, JiraUser, Status, StatusCategory};
+    use crate::ticketing::provider::JiraProvider;
 
     fn issue(key: &str, status: &str) -> Issue {
         Issue {
@@ -1672,7 +1674,7 @@ mod tests {
 
     fn deps(jira: FakeJiraClient) -> TuiDeps {
         TuiDeps {
-            jira: Box::new(jira),
+            jira: Box::new(JiraProvider::new(jira)),
             base_url: "https://example.atlassian.net".to_string(),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),

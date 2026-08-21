@@ -83,8 +83,8 @@ use thiserror::Error;
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::WorkConfig;
 use crate::github::gh_cli::{GhCli, GhError};
-use crate::jira::client::JiraClient;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
+use crate::ticketing::provider::TicketProvider;
 use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
 use crate::work::hooks::{self, HooksError};
@@ -263,7 +263,7 @@ pub struct RunLaneDeps<'a> {
     /// [`resolve_ticket_slug`]). Never treated as a hard requirement: `tm
     /// work run` has always worked without Jira, and this feature must not
     /// change that.
-    pub jira: Option<&'a dyn JiraClient>,
+    pub jira: Option<&'a dyn TicketProvider>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -431,7 +431,7 @@ pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> Str
 /// perfectly good branch name on its own — this is a "nice to have when
 /// available" enhancement, not a dependency `tm work run` should ever block
 /// on or complain about losing.
-fn resolve_ticket_slug(jira: Option<&dyn JiraClient>, ticket: Option<&str>) -> Option<String> {
+fn resolve_ticket_slug(jira: Option<&dyn TicketProvider>, ticket: Option<&str>) -> Option<String> {
     let jira = jira?;
     let ticket = ticket?;
     let issue = jira.get_issue(ticket).ok()?;
@@ -480,7 +480,7 @@ impl BlockerResolution {
 /// `tm ready`'s report of the same ticket so the two can never disagree — see
 /// that module's doc comment for the incident this split fixes and the full
 /// rule. This function's job is only to fetch the inputs
-/// ([`JiraClient::get_issue`], [`GhCli::pr_list_all`]) and act on the
+/// ([`TicketProvider::get_issue`], [`GhCli::pr_list_all`]) and act on the
 /// resulting [`StackDecision`]:
 /// - [`StackDecision::Ready`] → `stacked_base: None` (normal base).
 /// - [`StackDecision::Stackable`] → `stacked_base:
@@ -524,7 +524,7 @@ impl BlockerResolution {
 /// call — one `gh` invocation per run, not one per blocker (see
 /// [`crate::blocker_stacking::find_blocker_pr`]'s doc comment).
 pub fn resolve_blocker_stacking(
-    jira: Option<&dyn JiraClient>,
+    jira: Option<&dyn TicketProvider>,
     gh: &dyn GhCli,
     repo_root: &Path,
     ticket: Option<&str>,

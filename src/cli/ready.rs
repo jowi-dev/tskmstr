@@ -29,16 +29,16 @@ use crate::blocker_stacking::{self, StackDecision};
 use crate::github::bot_findings::count_bot_findings;
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::github::pr::{PrInfo, find_issue_key};
-use crate::jira::client::JiraClient;
 use crate::jira::types::Issue;
+use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::{TicketingError, open_blockers, ready_tickets};
 
 /// Dependencies `tm ready`'s bot-findings annotation needs, alongside the
-/// Jira client, bundled to keep `list`/`check`'s arity within this project's
+/// ticket provider, bundled to keep `list`/`check`'s arity within this project's
 /// convention (see `TicketingContext`).
 pub struct ReadyContext<'a> {
-    /// Jira client used for the readiness query/check itself.
-    pub jira: &'a dyn JiraClient,
+    /// Ticket provider used for the readiness query/check itself.
+    pub jira: &'a dyn TicketProvider,
     /// `gh` client used for the best-effort bot-findings annotation.
     pub gh: &'a dyn GhCli,
     /// Bot logins configured as [`crate::config::Config::review_bots`].
