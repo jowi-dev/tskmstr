@@ -27,15 +27,14 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
-use crate::jira::adf::adf_to_text;
 use crate::jira::client::{JiraError, RankAnchor};
 use crate::jira::types::Issue;
-use crate::ticketing::provider::TicketProvider;
+use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::tui::app::{
     App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, bot_watch_indicator,
     lane_run_indicator,
 };
-use crate::tui::app::{jql_for_filter, update};
+use crate::tui::app::{query_for_filter, update};
 use crate::tui::keymap::{RetroOverlay, map_key};
 use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
@@ -235,11 +234,11 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         ..App::new()
     }
     .with_lane_names(deps.lane_names.clone());
-    let jql = jql_for_filter(&app.filter, &app.project_key);
+    let query = query_for_filter(&app.filter, &app.project_key);
     app = run_cmds(
         app,
         vec![
-            Cmd::FetchTickets { jql },
+            Cmd::FetchTickets { query },
             Cmd::LoadAuditStatus,
             Cmd::LoadLaneRunStatus,
             Cmd::LoadBotWatchStatus,
@@ -958,12 +957,12 @@ fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
 /// process); everything else in `tui` stays pure and terminal-free.
 fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
-        Cmd::FetchTickets { jql } => fetch_tickets(deps, &jql),
+        Cmd::FetchTickets { query } => fetch_tickets(deps, &query),
         Cmd::FetchAssignableUsers { project } => fetch_assignable_users(deps, &project),
         Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
         Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
         Cmd::OpenUrl(url) => open_url(&url),
-        Cmd::FetchRankTickets { jql } => fetch_rank_tickets(deps, &jql),
+        Cmd::FetchRankTickets { query } => fetch_rank_tickets(deps, &query),
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
@@ -972,7 +971,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
-        Cmd::FetchRetroTickets { jql } => fetch_retro_tickets(deps, &jql),
+        Cmd::FetchRetroTickets { query } => fetch_retro_tickets(deps, &query),
         Cmd::RecordRetro {
             key,
             verdict,
@@ -1298,18 +1297,18 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     vec![Msg::BotsActionResult(message)]
 }
 
-/// Search for tickets matching `jql` and map them to
+/// Search for tickets matching `query` and map them to
 /// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
 /// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
 /// error) becomes.
-fn search_tickets(deps: &TuiDeps, jql: &str) -> Result<TicketPage, JiraError> {
-    let result = deps.jira.search(jql)?;
+fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, JiraError> {
+    let result = deps.jira.search(query)?;
     Ok(TicketPage {
         truncated: result.next_page_token.is_some(),
         tickets: result
             .issues
             .into_iter()
-            .map(|issue| to_ticket_summary(issue, &deps.base_url))
+            .map(|issue| to_ticket_summary(deps.jira.as_ref(), issue, &deps.base_url))
             .collect(),
     })
 }
@@ -1332,10 +1331,10 @@ impl TicketPage {
     }
 }
 
-/// Run `Cmd::FetchTickets`: search for tickets matching `jql` and map them to
-/// [`crate::tui::app::TicketSummary`]s.
-fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
-    match search_tickets(deps, jql) {
+/// Run `Cmd::FetchTickets`: search for tickets matching `query` and map them
+/// to [`crate::tui::app::TicketSummary`]s.
+fn fetch_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
+    match search_tickets(deps, query) {
         Ok(page) => {
             let truncation = page.truncation_msg();
             let mut msgs = vec![Msg::TicketsLoaded(page.tickets)];
@@ -1348,8 +1347,8 @@ fn fetch_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
 
 /// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
 /// list for [`crate::tui::app::Screen::Rank`].
-fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
-    match search_tickets(deps, jql) {
+fn fetch_rank_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
+    match search_tickets(deps, query) {
         Ok(page) => {
             let truncation = page.truncation_msg();
             let mut msgs = vec![Msg::RankTicketsLoaded(page.tickets)];
@@ -1360,7 +1359,7 @@ fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
     }
 }
 
-/// Run `Cmd::FetchRetroTickets`: search for shipped tickets matching `jql`,
+/// Run `Cmd::FetchRetroTickets`: search for shipped tickets matching `query`,
 /// drop any that already have a recorded retro verdict (via
 /// [`crate::runs::RunStore::retro_verdicts_for_tickets`]'s batch lookup), and
 /// enrich the rest with their latest `kind = "lane"` run's cost/model info,
@@ -1372,13 +1371,13 @@ fn fetch_rank_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
 /// exist is filtering by recorded verdicts -- showing an unfiltered list
 /// would be actively misleading, not just less enriched. So a missing store
 /// fails the whole screen with a status-line message instead.
-pub fn fetch_retro_tickets(deps: &TuiDeps, jql: &str) -> Vec<Msg> {
+pub fn fetch_retro_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
     // No truncation warning here, unlike the board and rank screens: this
     // list is filtered down again below (tickets with a recorded verdict drop
     // out), so a "showing first N" count taken from the fetch wouldn't match
     // what ends up on screen. The 30-day window keeps it well inside one
     // search's page budget anyway.
-    let tickets = match search_tickets(deps, jql) {
+    let tickets = match search_tickets(deps, query) {
         Ok(page) => page.tickets,
         Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
     };
@@ -1608,15 +1607,14 @@ fn open_url(url: &str) -> Vec<Msg> {
 }
 
 /// Convert a Jira [`Issue`] into a [`crate::tui::app::TicketSummary`],
-/// deriving `url` from `base_url` and `description` from the issue's ADF
-/// description via [`adf_to_text`].
-fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSummary {
-    let description = issue
-        .fields
-        .description
-        .as_ref()
-        .map(adf_to_text)
-        .unwrap_or_default();
+/// deriving `url` from `base_url` and `description` from
+/// [`TicketProvider::description_text`].
+fn to_ticket_summary(
+    jira: &dyn TicketProvider,
+    issue: Issue,
+    base_url: &str,
+) -> crate::tui::app::TicketSummary {
+    let description = jira.description_text(&issue);
     let assignee = issue
         .fields
         .assignee
@@ -1637,7 +1635,6 @@ fn to_ticket_summary(issue: Issue, base_url: &str) -> crate::tui::app::TicketSum
 mod tests {
     use super::*;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::jql::{my_open_tickets_jql, shipped_awaiting_retro_jql};
     use crate::jira::types::{IssueFields, JiraUser, Status, StatusCategory};
     use crate::ticketing::provider::JiraProvider;
 
@@ -1701,7 +1698,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
-        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
+        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets)] => {
                 assert_eq!(tickets.len(), 1);
@@ -1720,7 +1717,7 @@ mod tests {
     #[test]
     fn fetch_tickets_with_empty_search_result_loads_empty_list() {
         let jira = FakeJiraClient::new();
-        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
+        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
         assert_eq!(msgs, vec![Msg::TicketsLoaded(vec![])]);
     }
 
@@ -1732,7 +1729,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do"), issue("PROJ-2", "To Do")],
             next_page_token: Some("more".to_string()),
         });
-        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
+        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets), Msg::SearchTruncated { shown }] => {
                 assert_eq!(tickets.len(), 2);
@@ -1745,7 +1742,7 @@ mod tests {
     #[test]
     fn fetch_tickets_failure_emits_tickets_failed() {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
-        let msgs = fetch_tickets(&deps(jira), &my_open_tickets_jql());
+        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
             other => panic!("expected TicketsFailed, got {other:?}"),
@@ -1962,7 +1959,11 @@ mod tests {
 
     #[test]
     fn to_ticket_summary_derives_url_and_extracts_description() {
-        let summary = to_ticket_summary(issue("PROJ-1", "To Do"), "https://example.atlassian.net");
+        let summary = to_ticket_summary(
+            &FakeJiraClient::new(),
+            issue("PROJ-1", "To Do"),
+            "https://example.atlassian.net",
+        );
         assert_eq!(summary.key, "PROJ-1");
         assert_eq!(summary.status, "To Do");
         assert_eq!(summary.url, "https://example.atlassian.net/browse/PROJ-1");
@@ -1973,13 +1974,21 @@ mod tests {
     fn to_ticket_summary_with_no_description_is_empty_string() {
         let mut issue = issue("PROJ-1", "To Do");
         issue.fields.description = None;
-        let summary = to_ticket_summary(issue, "https://example.atlassian.net");
+        let summary = to_ticket_summary(
+            &FakeJiraClient::new(),
+            issue,
+            "https://example.atlassian.net",
+        );
         assert_eq!(summary.description, "");
     }
 
     #[test]
     fn to_ticket_summary_with_no_assignee_is_none() {
-        let summary = to_ticket_summary(issue("PROJ-1", "To Do"), "https://example.atlassian.net");
+        let summary = to_ticket_summary(
+            &FakeJiraClient::new(),
+            issue("PROJ-1", "To Do"),
+            "https://example.atlassian.net",
+        );
         assert_eq!(summary.assignee, None);
     }
 
@@ -1992,20 +2001,28 @@ mod tests {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
-        let summary = to_ticket_summary(issue, "https://example.atlassian.net");
+        let summary = to_ticket_summary(
+            &FakeJiraClient::new(),
+            issue,
+            "https://example.atlassian.net",
+        );
         assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
     }
 
     #[test]
     fn fetch_rank_tickets_maps_issues_to_ticket_summaries() {
-        use crate::jira::jql::ranked_tickets_jql;
         use crate::jira::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
-        let msgs = fetch_rank_tickets(&deps(jira), &ranked_tickets_jql("PROJ"));
+        let msgs = fetch_rank_tickets(
+            &deps(jira),
+            &TicketQuery::Ranked {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RankTicketsLoaded(tickets)] => {
                 assert_eq!(tickets.len(), 1);
@@ -2017,10 +2034,13 @@ mod tests {
 
     #[test]
     fn fetch_rank_tickets_failure_emits_rank_tickets_failed() {
-        use crate::jira::jql::ranked_tickets_jql;
-
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
-        let msgs = fetch_rank_tickets(&deps(jira), &ranked_tickets_jql("PROJ"));
+        let msgs = fetch_rank_tickets(
+            &deps(jira),
+            &TicketQuery::Ranked {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RankTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
             other => panic!("expected RankTicketsFailed, got {other:?}"),
@@ -2081,7 +2101,12 @@ mod tests {
         });
         let mut deps = deps(jira);
         deps.store = None;
-        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        let msgs = fetch_retro_tickets(
+            &deps,
+            &TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string(),
+            },
+        );
         assert_eq!(
             msgs,
             vec![Msg::RetroTicketsFailed(
@@ -2097,7 +2122,12 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         let mut deps = deps(jira);
         deps.store = Some(store);
-        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        let msgs = fetch_retro_tickets(
+            &deps,
+            &TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RetroTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
             other => panic!("expected RetroTicketsFailed, got {other:?}"),
@@ -2120,7 +2150,12 @@ mod tests {
         let mut deps = deps(jira);
         deps.store = Some(store);
 
-        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        let msgs = fetch_retro_tickets(
+            &deps,
+            &TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RetroTicketsLoaded(rows)] => {
                 let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
@@ -2143,7 +2178,12 @@ mod tests {
         let mut deps = deps(jira);
         deps.store = Some(store);
 
-        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        let msgs = fetch_retro_tickets(
+            &deps,
+            &TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RetroTicketsLoaded(rows)] => {
                 assert_eq!(rows.len(), 1);
@@ -2181,7 +2221,12 @@ mod tests {
         let mut deps = deps(jira);
         deps.store = Some(store);
 
-        let msgs = fetch_retro_tickets(&deps, &shipped_awaiting_retro_jql("PROJ"));
+        let msgs = fetch_retro_tickets(
+            &deps,
+            &TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string(),
+            },
+        );
         match msgs.as_slice() {
             [Msg::RetroTicketsLoaded(rows)] => {
                 let run = rows[0].run.as_ref().expect("expected a run");
@@ -2307,7 +2352,7 @@ mod tests {
         let app = run_cmds(
             App::new(),
             vec![Cmd::FetchTickets {
-                jql: my_open_tickets_jql(),
+                query: TicketQuery::MyOpen,
             }],
             &deps(jira),
             &mut terminal,
