@@ -5,7 +5,7 @@
 //! Jira issue key and the pull request open for the current branch, it makes
 //! the PR title carry the key and posts a Jira remote link pointing at the
 //! PR. It does not itself talk to the network; all I/O goes through the
-//! [`JiraClient`] and [`GhCli`] trait objects on [`TicketingContext`].
+//! [`TicketProvider`] and [`GhCli`] trait objects on [`TicketingContext`].
 //!
 //! Three functions move a ticket to a configured workflow status after
 //! creating or linking it, since Jira's create-issue API can't set status
@@ -45,7 +45,7 @@
 //!
 //! [`rank_ticket`] (`tm ticket rank <KEY> (--above|--below) <OTHER>`) moves a
 //! ticket in Jira's native backlog rank (the `Rank` field, via
-//! [`JiraClient::rank`]) relative to another issue. Like transition and
+//! [`TicketProvider::rank`]) relative to another issue. Like transition and
 //! assign, it's explicit: any Jira API failure is a hard error. It verifies
 //! `KEY` exists first so a typo there gets a friendly [`JiraError::NotFound`];
 //! a typo'd anchor key surfaces from the rank call itself as
@@ -53,7 +53,7 @@
 //!
 //! [`link_ticket`] (`tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>`)
 //! creates a `Blocks`-type Jira issue link between two tickets, via
-//! [`JiraClient::create_link`]. Like rank, it verifies `KEY` exists first so
+//! [`TicketProvider::create_link`]. Like rank, it verifies `KEY` exists first so
 //! a typo there gets a friendly [`JiraError::NotFound`]; a typo'd `OTHER`
 //! surfaces from the create-link call itself as [`JiraError::LinkNotFound`].
 //! [`list_links`] (`tm ticket link <KEY>` with neither flag) is a read-only
@@ -63,7 +63,7 @@
 //! [`unlink_ticket`] (`tm ticket unlink <KEY> <OTHER>`) is the inverse of
 //! [`link_ticket`]: it removes the `Blocks`-type link(s) between two
 //! tickets, regardless of which one is the inward/outward side, via
-//! [`JiraClient::delete_link`]. No matching `Blocks` link between the pair is
+//! [`TicketProvider::delete_link`]. No matching `Blocks` link between the pair is
 //! a hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
 //! non-`Blocks` link found between them instead.
 //!
@@ -95,22 +95,25 @@
 
 use thiserror::Error;
 
+pub mod provider;
+
 use crate::config::Config;
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::adf::text_to_adf;
-use crate::jira::client::{JiraClient, JiraError, RankAnchor};
+use crate::jira::client::{JiraError, RankAnchor};
 use crate::jira::jql::{ready_candidates_jql, ticket_search_jql};
 use crate::jira::types::{
     CreateIssueRequest, CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue,
     RemoteLinkRequest,
 };
+use crate::ticketing::provider::TicketProvider;
 
 /// Dependencies shared by the ticketing orchestration functions that deal
 /// with a pull request.
 pub struct TicketingContext<'a> {
-    /// Jira client used to verify issues and post remote links.
-    pub jira: &'a dyn JiraClient,
+    /// Ticket provider used to verify issues and post remote links.
+    pub jira: &'a dyn TicketProvider,
     /// `gh` CLI wrapper used to look up and edit the current branch's PR.
     pub gh: &'a dyn GhCli,
     /// Resolved configuration (Jira base URL, default project, etc).
@@ -123,8 +126,8 @@ pub struct TicketingContext<'a> {
 /// nothing to do with a pull request, so it has no [`GhCli`] dependency and
 /// works the same whether or not the current branch has one.
 pub struct CreateTicketContext<'a> {
-    /// Jira client used to create the issue and apply its status transition.
-    pub jira: &'a dyn JiraClient,
+    /// Ticket provider used to create the issue and apply its status transition.
+    pub jira: &'a dyn TicketProvider,
     /// Resolved configuration (Jira base URL, default project, etc).
     pub config: &'a Config,
 }
@@ -377,7 +380,7 @@ pub fn auto_create_and_associate(
 /// skipped entirely and `status_transition` comes back `None` — there is
 /// nothing to do and nothing to report.
 ///
-/// Reuses the [`JiraClient::get_issue`] call `associate_ticket` already made
+/// Reuses the [`TicketProvider::get_issue`] call `associate_ticket` already made
 /// on this path rather than issuing a second one, since that call's response
 /// already carries the issue's current status.
 pub fn associate_existing_ticket_for_pr_create(
@@ -459,7 +462,7 @@ pub fn create_ticket(
 /// matching transition, or the transition API call itself failing — is
 /// reported as a [`StatusTransition::Warning`], since the ticket has
 /// already been created (and, where applicable, linked) by this point.
-fn apply_status_transition(jira: &dyn JiraClient, key: &str, target: &str) -> StatusTransition {
+fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
     let transitions = match jira.transitions(key) {
         Ok(transitions) => transitions,
         Err(err) => {
@@ -554,7 +557,7 @@ pub enum TransitionOutcome {
 /// [`associate_existing_ticket_for_pr_create`]'s skip-if-already-there
 /// check).
 pub fn transition_ticket(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     target: &str,
 ) -> Result<TransitionOutcome, TicketingError> {
@@ -592,7 +595,7 @@ pub struct TransitionListing {
 /// available workflow transitions, for a caller to choose a target status
 /// with [`transition_ticket`].
 pub fn list_transitions(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
 ) -> Result<TransitionListing, TicketingError> {
     let issue = jira.get_issue(key)?;
@@ -649,7 +652,7 @@ pub enum AssignOutcome {
 /// [`Config::default_assignee_account_id`] (set by `tm auth login`) over an
 /// extra `myself()` call.
 pub fn assign_ticket(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     config: &Config,
     key: &str,
     target: &AssignTarget,
@@ -690,7 +693,7 @@ pub fn assign_ticket(
 /// `tm ticket rank <KEY> (--above|--below) <OTHER>`: move `key` to a new
 /// position in the backlog rank, relative to `anchor`.
 ///
-/// Verifies `key` exists first (via [`JiraClient::get_issue`]) so a typo'd
+/// Verifies `key` exists first (via [`TicketProvider::get_issue`]) so a typo'd
 /// primary key gives the same friendly [`JiraError::NotFound`] every other
 /// `tm ticket` subcommand does, rather than surfacing as a raw
 /// [`JiraError::RankNotFound`] from the agile API. A typo'd anchor key (in
@@ -698,7 +701,7 @@ pub fn assign_ticket(
 /// itself as [`JiraError::RankNotFound`], since Jira's rank endpoint reports
 /// that case directly and a second lookup would be redundant.
 pub fn rank_ticket(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     anchor: RankAnchor,
 ) -> Result<(), TicketingError> {
@@ -719,7 +722,7 @@ pub fn rank_ticket(
 /// typo'd `OTHER` is not checked ahead of time; it surfaces from the
 /// `create_link` call itself as [`JiraError::LinkNotFound`].
 pub fn link_ticket(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     req: &CreateLinkRequest,
 ) -> Result<(), TicketingError> {
@@ -744,13 +747,13 @@ pub struct UnlinkOutcome {
 /// Fetches `key` and scans its `issuelinks` for entries where
 /// [`IssueLinkType::name`](crate::jira::types::IssueLinkType) is `Blocks` and
 /// the other side (`inward_issue` or `outward_issue`) is `other`; each match
-/// is deleted by its link id via [`JiraClient::delete_link`]. No match is a
+/// is deleted by its link id via [`TicketProvider::delete_link`]. No match is a
 /// hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
 /// non-`Blocks` links found between the pair so a caller who mistyped the
 /// relationship type learns what does exist instead of a bare "not found". A
 /// `Blocks` link to a different issue entirely is left untouched.
 pub fn unlink_ticket(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     key: &str,
     other: &str,
 ) -> Result<UnlinkOutcome, TicketingError> {
@@ -802,7 +805,7 @@ pub struct LinkListing {
 /// `tm ticket link <KEY>` (no flag): list `key`'s existing issue links, of
 /// any link type, for discovery. Unlike [`link_ticket`], this never creates
 /// anything.
-pub fn list_links(jira: &dyn JiraClient, key: &str) -> Result<LinkListing, TicketingError> {
+pub fn list_links(jira: &dyn TicketProvider, key: &str) -> Result<LinkListing, TicketingError> {
     let issue = jira.get_issue(key)?;
     Ok(LinkListing {
         links: issue.fields.issue_links,
@@ -859,7 +862,7 @@ impl ReadyListing {
 ///
 /// Rank order from the search is preserved in both [`ReadyListing::ready`]
 /// and [`ReadyListing::blocked`].
-pub fn ready_tickets(jira: &dyn JiraClient) -> Result<ReadyListing, TicketingError> {
+pub fn ready_tickets(jira: &dyn TicketProvider) -> Result<ReadyListing, TicketingError> {
     let result = jira.search(&ready_candidates_jql())?;
     let mut ready = Vec::new();
     let mut blocked = Vec::new();
@@ -886,7 +889,7 @@ pub struct ReadyCheck {
 
 /// `tm ready <KEY>`: fetch `key` (any assignee, any status) and report
 /// whether it has any open blockers.
-pub fn check_ready(jira: &dyn JiraClient, key: &str) -> Result<ReadyCheck, TicketingError> {
+pub fn check_ready(jira: &dyn TicketProvider, key: &str) -> Result<ReadyCheck, TicketingError> {
     let issue = jira.get_issue(key)?;
     let status_name = issue.fields.status.name.clone();
     let open_blockers = open_blockers(&issue).into_iter().cloned().collect();
@@ -905,7 +908,7 @@ pub fn check_ready(jira: &dyn JiraClient, key: &str) -> Result<ReadyCheck, Ticke
 /// check: an empty search is never a meaningful request, and Jira's `text ~
 /// ""` behavior for it isn't worth relying on.
 pub fn search_tickets(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     config: &Config,
     text: &str,
 ) -> Result<Vec<Issue>, TicketingError> {
@@ -940,7 +943,7 @@ pub struct CommentOutcome {
 /// no conversion happens on that path (unlike Jira's v3 API, which only
 /// accepts ADF).
 ///
-/// `key`, if given, is validated with [`JiraClient::get_issue`] first (like
+/// `key`, if given, is validated with [`TicketProvider::get_issue`] first (like
 /// [`rank_ticket`]/[`link_ticket`]) so a typo'd key gives the familiar
 /// [`JiraError::NotFound`] rather than a raw comment-post 404. If `key` is
 /// omitted, it's resolved from the current branch's pull request the same
@@ -1110,14 +1113,14 @@ fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) 
 ///   contacting Jira: the user (or a prior `tm ticket`/`tm pr create` run)
 ///   wrote them deliberately.
 /// - A [`KeySource::Branch`] key is inferred from a naming convention, not
-///   authored, so it is validated with [`JiraClient::get_issue`] first.
+///   authored, so it is validated with [`TicketProvider::get_issue`] first.
 ///   [`JiraError::NotFound`] is treated as "no key after all" (`Ok(None)`);
 ///   any other Jira error propagates, since it means the check itself
 ///   couldn't be completed.
 ///
 /// Returns `Ok(None)` when no key is found by any means.
 pub fn resolve_existing_key(
-    jira: &dyn JiraClient,
+    jira: &dyn TicketProvider,
     pr: &PrInfo,
 ) -> Result<Option<String>, TicketingError> {
     match find_issue_key_with_source(pr) {

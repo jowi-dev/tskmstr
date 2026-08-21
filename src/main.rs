@@ -13,8 +13,9 @@ use tskmstr::cli::{
 };
 use tskmstr::config::{self, Config, ConfigPaths};
 use tskmstr::github::gh_cli::ShellGhCli;
-use tskmstr::jira::client::{HttpJiraClient, JiraClient, JiraClientContext};
+use tskmstr::jira::client::{HttpJiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
+use tskmstr::ticketing::provider::{JiraProvider, TicketProvider};
 use tskmstr::ticketing::{CreateTicketContext, TicketingContext};
 use tskmstr::tui::event::{TuiDeps, run};
 use tskmstr::work::git::ShellGitOps;
@@ -284,7 +285,7 @@ fn run_work(
             // Best-effort Jira client for the branch-name slug: absent
             // config or an unresolvable token silently means no client,
             // never a hard error — see this function's doc comment.
-            let jira: Option<Box<dyn JiraClient>> = full_config.as_ref().and_then(|cfg| {
+            let jira: Option<Box<dyn TicketProvider>> = full_config.as_ref().and_then(|cfg| {
                 resolve_token(keychain, env_token.clone())
                     .ok()
                     .map(|token| jira_client_for(cfg, &token))
@@ -422,7 +423,7 @@ fn default_config_paths() -> ConfigPaths {
     config::default_paths(&home, repo_root.as_deref())
 }
 
-/// Build a [`JiraClient`] for the given config and token.
+/// Build a [`TicketProvider`] for the given config and token.
 /// Read all of stdin as `tm ticket comment`'s piped-body source, but only
 /// when stdin isn't a TTY — an interactive terminal has nothing piped in,
 /// and blocking on `read_to_string` there would hang waiting for EOF that
@@ -442,12 +443,12 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
     Ok(Some(buf))
 }
 
-fn jira_client_for(config: &Config, token: &str) -> Box<dyn JiraClient> {
-    Box::new(HttpJiraClient::new(JiraClientContext {
+fn jira_client_for(config: &Config, token: &str) -> Box<dyn TicketProvider> {
+    Box::new(JiraProvider::new(HttpJiraClient::new(JiraClientContext {
         base_url: config.jira_base_url.clone(),
         email: config.jira_email.clone(),
         token: token.to_string(),
-    }))
+    })))
 }
 
 fn run_auth(
@@ -478,14 +479,14 @@ fn build_ticketing_deps(
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
-) -> Result<(Config, HttpJiraClient, ShellGhCli), Box<dyn std::error::Error>> {
+) -> Result<(Config, JiraProvider, ShellGhCli), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let token = resolve_token(keychain, env_token)?;
-    let jira = HttpJiraClient::new(JiraClientContext {
+    let jira = JiraProvider::new(HttpJiraClient::new(JiraClientContext {
         base_url: config.jira_base_url.clone(),
         email: config.jira_email.clone(),
         token,
-    });
+    }));
     let gh = ShellGhCli::new();
     Ok((config, jira, gh))
 }

@@ -49,8 +49,8 @@ use thiserror::Error;
 
 use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
-use crate::jira::client::JiraClient;
 use crate::runs::{RunStore, RunStoreError};
+use crate::ticketing::provider::TicketProvider;
 use crate::work::claude::RunMode;
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
@@ -354,7 +354,7 @@ pub struct RunDeps<'a> {
     /// configured/authenticated. Absence — like any lookup failure through
     /// it — silently falls back to the timestamp-based branch name; it is
     /// never a hard error for `tm work run` to have no Jira access.
-    pub jira: Option<&'a dyn JiraClient>,
+    pub jira: Option<&'a dyn TicketProvider>,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
