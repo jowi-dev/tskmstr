@@ -70,15 +70,17 @@
 //! [`search_tickets`] (`tm ticket search <TEXT>`) is a read-only discovery
 //! query, unrelated to a pull request: it searches
 //! [`Config::default_project_key`] for non-`Done` tickets matching `TEXT`
-//! (via [`ticket_search_jql`]), for a caller to sweep for potential
+//! (via [`TicketQuery::Search`]), for a caller to sweep for potential
 //! blockers/duplicates before creating a new ticket. An empty/all-whitespace
 //! `TEXT` is rejected up front as [`TicketingError::EmptySearchText`], the
 //! same "don't send a meaningless match-everything query" rationale as
 //! [`TicketingError::EmptyAssigneeName`].
 //!
 //! [`comment_ticket`] (`tm ticket comment [<KEY>] [--body <TEXT>] [--pr]`)
-//! posts a comment to a Jira ticket, converting `body_markdown` to ADF via
-//! [`text_to_adf`] the same way [`create_ticket`]/`tm ticket update` do. An
+//! posts a comment to a Jira ticket, handing `body_markdown` to
+//! [`TicketProvider::add_comment`] as plain Markdown text -- the provider
+//! (Jira today) converts it to whatever wire format it needs internally, the
+//! same way [`create_ticket`]/`tm ticket update` do. An
 //! omitted `KEY` is resolved from the current branch's pull request via
 //! [`resolve_existing_key`], the same as `tm pr create`'s key inference;
 //! neither an explicit key nor a resolvable one is
@@ -100,14 +102,11 @@ pub mod provider;
 use crate::config::Config;
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
-use crate::jira::adf::text_to_adf;
 use crate::jira::client::{JiraError, RankAnchor};
-use crate::jira::jql::{ready_candidates_jql, ticket_search_jql};
 use crate::jira::types::{
-    CreateIssueRequest, CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue,
-    RemoteLinkRequest,
+    CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue, RemoteLinkRequest,
 };
-use crate::ticketing::provider::TicketProvider;
+use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
 
 /// Dependencies shared by the ticketing orchestration functions that deal
 /// with a pull request.
@@ -344,17 +343,16 @@ fn current_branch_pr(ctx: &TicketingContext) -> Result<PrInfo, TicketingError> {
 /// Used when [`resolve_existing_key`] finds no key already associated with
 /// `pr`. The new issue's summary is `pr.title` as-is (a PR reaching this
 /// point has no key anywhere in title/body/branch, so there is no prefix to
-/// strip); its description is `pr.body` followed by the PR URL, converted to
-/// ADF.
+/// strip); its description is `pr.body` followed by the PR URL, handed to
+/// [`TicketProvider::create_issue`] as plain Markdown.
 pub fn auto_create_and_associate(
     ctx: &TicketingContext,
     pr: &PrInfo,
 ) -> Result<AssociateOutcome, TicketingError> {
-    let description = text_to_adf(&format!("{}\n\n{}", pr.body, pr.url));
-    let req = CreateIssueRequest {
+    let req = NewTicket {
         project_key: ctx.config.default_project_key.clone(),
         summary: pr.title.clone(),
-        description,
+        description: format!("{}\n\n{}", pr.body, pr.url),
         issue_type_name: "Task".to_string(),
         assignee_account_id: ctx.config.default_assignee_account_id.clone(),
     };
@@ -418,9 +416,10 @@ pub struct CreateTicketOutcome {
 /// assigned to the configured default assignee, with no pull request
 /// involved.
 ///
-/// `body`, if given, is parsed as GitHub-flavored Markdown into the issue's
-/// ADF description; when absent, the issue is created with an empty
-/// description. `status_target`, if given, is where the new ticket is moved
+/// `body`, if given, is handed to [`TicketProvider::create_issue`] as plain
+/// Markdown, which the provider (Jira today) converts into its own
+/// description format internally; when absent, the issue is created with an
+/// empty description. `status_target`, if given, is where the new ticket is moved
 /// via [`apply_status_transition`] — the same case-insensitive matching used
 /// by the `tm pr create` paths. Resolving whether that target comes from `tm
 /// ticket create`'s `--status` flag, `--no-transition`, or falls back to
@@ -433,11 +432,10 @@ pub fn create_ticket(
     body: Option<&str>,
     status_target: Option<&str>,
 ) -> Result<CreateTicketOutcome, TicketingError> {
-    let description = text_to_adf(body.unwrap_or_default());
-    let req = CreateIssueRequest {
+    let req = NewTicket {
         project_key: ctx.config.default_project_key.clone(),
         summary: title.to_string(),
-        description,
+        description: body.unwrap_or_default().to_string(),
         issue_type_name: "Task".to_string(),
         assignee_account_id: ctx.config.default_assignee_account_id.clone(),
     };
@@ -858,12 +856,12 @@ impl ReadyListing {
 }
 
 /// `tm ready` (no key): search the current user's "To Do" tickets (via
-/// [`ready_candidates_jql`]) and keep only those with no open blockers.
+/// [`TicketQuery::ReadyCandidates`]) and keep only those with no open blockers.
 ///
 /// Rank order from the search is preserved in both [`ReadyListing::ready`]
 /// and [`ReadyListing::blocked`].
 pub fn ready_tickets(jira: &dyn TicketProvider) -> Result<ReadyListing, TicketingError> {
-    let result = jira.search(&ready_candidates_jql())?;
+    let result = jira.search(&TicketQuery::ReadyCandidates)?;
     let mut ready = Vec::new();
     let mut blocked = Vec::new();
     for issue in result.issues {
@@ -901,7 +899,7 @@ pub fn check_ready(jira: &dyn TicketProvider, key: &str) -> Result<ReadyCheck, T
 
 /// `tm ticket search <TEXT>`: search [`Config::default_project_key`] for
 /// open tickets whose text matches `text`, most recently updated first (via
-/// [`ticket_search_jql`]).
+/// [`TicketQuery::Search`]).
 ///
 /// Fails with [`TicketingError::EmptySearchText`] if `text` is empty or
 /// all-whitespace, mirroring [`assign_ticket`]'s [`TicketingError::EmptyAssigneeName`]
@@ -915,8 +913,11 @@ pub fn search_tickets(
     if text.trim().is_empty() {
         return Err(TicketingError::EmptySearchText);
     }
-    let jql = ticket_search_jql(&config.default_project_key, text);
-    let result = jira.search(&jql)?;
+    let query = TicketQuery::Search {
+        project_key: config.default_project_key.clone(),
+        text: text.to_string(),
+    };
+    let result = jira.search(&query)?;
     Ok(result.issues)
 }
 
@@ -937,8 +938,9 @@ pub struct CommentOutcome {
 /// `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]`: post a comment to a
 /// Jira ticket, optionally also to the current branch's pull request.
 ///
-/// `body_markdown` is GitHub-flavored Markdown; it is converted to ADF (via
-/// [`text_to_adf`]) for the Jira comment, but posted to the pull request
+/// `body_markdown` is GitHub-flavored Markdown, handed to
+/// [`TicketProvider::add_comment`] as-is; the provider (Jira today) converts
+/// it internally for the Jira comment, but it's posted to the pull request
 /// as-is when `also_pr` is set — GitHub comments are Markdown natively, so
 /// no conversion happens on that path (unlike Jira's v3 API, which only
 /// accepts ADF).
@@ -993,8 +995,7 @@ pub fn comment_ticket(
         return Err(TicketingError::NoTicketOrPrForBranch { branch });
     };
 
-    ctx.jira
-        .add_comment(&issue_key, &text_to_adf(body_markdown))?;
+    ctx.jira.add_comment(&issue_key, body_markdown)?;
 
     let pr_number = if also_pr {
         let pr = match pr {

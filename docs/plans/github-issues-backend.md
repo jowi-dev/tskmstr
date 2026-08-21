@@ -1,7 +1,7 @@
 # GitHub Issues as a ticket backend (issue #3), phases 1-7
 
-Status: **phase 1 complete** (commit `1446509`). Phases 2-7 are specified
-below per the issue but not started.
+Status: **phases 1-2 complete** (commits `1446509`, `721a331`). Phases 3-7
+are specified below per the issue but not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -76,11 +76,65 @@ uses. This is the same shape as the issue's own suggested escape hatch ("a
 on the existing type instead of a new wrapper struct, since that's what let
 the ~150 tests keep compiling completely unmodified.
 
-## Phase 2 — `TicketQuery` + description abstraction (not started)
+## Phase 2 — `TicketQuery` + description abstraction (complete, commit `721a331`)
 
-Move JQL construction (`src/tui/app.rs`'s raw JQL strings, `src/jira/jql.rs`)
-and ADF conversion (`src/jira/adf.rs`) behind the provider, via a
-`TicketQuery` enum each provider renders to its own query shape.
+Added `TicketQuery` to `src/ticketing/provider.rs`: `MyOpen`, `Unassigned`,
+`Everyone`, `Assignee`, `Ranked`, `Search`, `ShippedAwaitingRetro`, plus
+`ReadyCandidates` (see below). `TicketProvider::search` takes a `&TicketQuery`
+instead of a JQL string; a private `render_jql` in `provider.rs` renders it
+via `src/jira/jql.rs`'s existing builders, which stay exactly where they were
+and unchanged. Both `JiraProvider::search` and `FakeJiraClient`'s
+`TicketProvider` impl call `render_jql`, so no caller outside `src/jira/`
+builds a JQL string anymore -- `src/tui/app.rs`'s `jql_for_filter` became
+`query_for_filter`, returning a `TicketQuery`; `Cmd::FetchTickets`/
+`FetchRankTickets`/`FetchRetroTickets` carry a `TicketQuery` instead of a
+`jql: String`; `src/ticketing/mod.rs`'s `search_tickets`/`ready_tickets`
+build `TicketQuery::Search`/`TicketQuery::ReadyCandidates` instead of calling
+`ticket_search_jql`/`ready_candidates_jql` directly.
+
+`TicketProvider::create_issue` now takes a new `NewTicket` struct (mirroring
+`CreateIssueRequest` but with `description: String`, plain Markdown) instead
+of Jira's `CreateIssueRequest`; `update_description` and `add_comment` take
+`&str` (Markdown) instead of `&serde_json::Value` (ADF). `JiraProvider` and
+`FakeJiraClient`'s `TicketProvider` impl both convert via
+`crate::jira::adf::text_to_adf` before delegating to the wrapped
+`JiraClient`, so `FakeJiraClient`'s recorded calls (`create_issue_calls()`,
+`update_description_calls()`, `add_comment_calls()`) still carry ADF and
+every test asserting on that content needed no changes. A new
+`TicketProvider::description_text(&Issue) -> String` method covers the read
+direction (`src/cli/ticket.rs`'s `audit_read`, `src/tui/event.rs`'s
+`to_ticket_summary`), rendering via `crate::jira::adf::adf_to_text`
+internally instead of callers calling it themselves. `src/jira/adf.rs`
+itself is unchanged.
+
+Full test suite (1818 tests, up from 1810 at phase 1's tip -- phase 2 added
+provider-level tests for `render_jql` and the ADF/Markdown conversions),
+clippy, and fmt all pass.
+
+### The one real design decision this phase forced
+
+The issue names seven `TicketQuery` variants, but `src/jira/jql.rs` has an
+eighth builder, `ready_candidates_jql` (used by `tm ready`'s no-key search:
+the current user's "To Do" tickets in rank order), that doesn't map onto any
+of the seven. It's not `Ranked` (that's project-wide with no assignee
+filter) and not `MyOpen` (that's every open status, not just "To Do"). Since
+leaving it as a bare JQL-string call site would have broken the phase's own
+goal ("no caller outside `src/jira/` builds a JQL string"), this adds an
+eighth variant, `TicketQuery::ReadyCandidates`, not in the issue's list.
+
+### What phase 2 revealed about phases 3-7
+
+`CreateIssueRequest` (`src/jira/types.rs`) stays exactly as the issue
+described it -- Jira's wire-shaped request, still used unchanged by
+`JiraClient::create_issue` and every existing Jira-level test. The new
+`NewTicket` struct in `provider.rs` is a separate, smaller type that only the
+`TicketProvider` layer sees; `JiraProvider` builds a `CreateIssueRequest` out
+of one, rather than `CreateIssueRequest` itself growing a Markdown
+`description` field. A future `GithubProvider` (phase 5/6) will need its own
+analogous "new issue" translation, since GitHub has no `issue_type_name`
+concept and `NewTicket` currently carries one straight through -- phase 6
+should decide whether that field becomes optional/ignored for GitHub or
+whether `NewTicket` itself needs to shed Jira-specific fields at that point.
 
 ## Phase 3 — config: `[backend]` provider selection (not started)
 

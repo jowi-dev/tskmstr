@@ -3,35 +3,151 @@
 //!
 //! [`TicketProvider`] is the interface every ticketing orchestration
 //! function in [`crate::ticketing`], every `tm ticket`/`tm ready`/`tm pr`
-//! command, and the board TUI depend on. It carries the same fourteen
-//! operations [`JiraClient`] exposes, unchanged in shape — a ticket key is
-//! still a plain `&str`, a description is still an ADF `serde_json::Value`,
-//! and every error is still a [`JiraError`]. A non-Jira backend (a future
-//! `GithubProvider`) implements this trait directly rather than going
-//! through [`JiraClient`] at all; the Jira-specific vocabulary baked into
-//! this phase's method signatures (JQL strings, ADF values) is exactly what
-//! a later phase abstracts further, not something this trait tries to hide
-//! today.
+//! command, and the board TUI depend on. A ticket key is still a plain
+//! `&str` and every error is still a [`JiraError`] (abstracting that further
+//! is a later phase's job), but queries and descriptions are already
+//! backend-agnostic: [`TicketProvider::search`] takes a [`TicketQuery`]
+//! rather than a JQL string, and [`TicketProvider::create_issue`],
+//! [`TicketProvider::update_description`], and
+//! [`TicketProvider::add_comment`] take plain Markdown text rather than an
+//! ADF `serde_json::Value`. No caller outside [`crate::jira`] builds a JQL
+//! string or an ADF document — [`JiraProvider`] is where that translation
+//! happens, via [`crate::jira::jql`]'s builders and
+//! [`crate::jira::adf::text_to_adf`]/[`crate::jira::adf::adf_to_text`]. A
+//! non-Jira backend (a future `GithubProvider`) implements this trait
+//! directly rather than going through [`JiraClient`] at all, rendering
+//! [`TicketQuery`] to `gh issue list`/`gh search issues` arguments and
+//! passing Markdown through untouched (GitHub issue bodies are already
+//! Markdown).
 //!
 //! [`JiraProvider`] is a thin wrapper around a boxed [`JiraClient`] that
-//! forwards every call unchanged; it's how production code (`main.rs`, the
-//! board TUI's real dependencies) turns a live
-//! [`crate::jira::client::HttpJiraClient`] into a `Box<dyn TicketProvider>`.
-//! [`crate::jira::fake::FakeJiraClient`] implements [`TicketProvider`]
-//! directly (see the `impl` below) rather than going through
-//! [`JiraProvider`] — it's a plain, non-owning delegation to the
-//! [`JiraClient`] impl it already has, so every existing test that
-//! constructs a `FakeJiraClient` and later inspects its recorded calls
+//! forwards every call, translating queries and descriptions on the way;
+//! it's how production code (`main.rs`, the board TUI's real dependencies)
+//! turns a live [`crate::jira::client::HttpJiraClient`] into a
+//! `Box<dyn TicketProvider>`. [`crate::jira::fake::FakeJiraClient`]
+//! implements [`TicketProvider`] directly (see the `impl` below) rather than
+//! going through [`JiraProvider`] — it's a plain, non-owning delegation to
+//! the [`JiraClient`] impl it already has (translating queries and
+//! descriptions the same way [`JiraProvider`] does), so every existing test
+//! that constructs a `FakeJiraClient` and later inspects its recorded calls
 //! (`fake.transition_calls()`, `fake.add_comment_calls()`, etc.) keeps doing
 //! so by reference, with no ownership transfer and no test rewritten to
 //! route through a wrapper value it can no longer see into.
 
+use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::fake::FakeJiraClient;
+use crate::jira::jql::{
+    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
+    ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
+};
 use crate::jira::types::{
     CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
     SearchResult, Transition,
 };
+
+/// A backend-agnostic ticket search, rendered by each [`TicketProvider`] into
+/// its own query shape ([`JiraProvider`] renders these to JQL via
+/// [`crate::jira::jql`]'s builders; a future `GithubProvider` would render to
+/// `gh issue list`/`gh search issues` arguments instead). No caller outside
+/// [`crate::jira`] builds a JQL string directly — every board screen and
+/// ticketing orchestration function builds one of these variants and hands
+/// it to [`TicketProvider::search`].
+///
+/// Every variant but [`TicketQuery::MyOpen`] and [`TicketQuery::ReadyCandidates`]
+/// carries the project key to scope to, mirroring the corresponding
+/// `src/jira/jql.rs` builder's `project_key` parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketQuery {
+    /// The current user's open tickets, unscoped by project. See
+    /// [`my_open_tickets_jql`].
+    MyOpen,
+    /// Every open ticket in `project_key` with no assignee. See
+    /// [`unassigned_tickets_jql`].
+    Unassigned {
+        /// Project to scope the search to.
+        project_key: String,
+    },
+    /// Every open ticket in `project_key`, regardless of assignee. See
+    /// [`everyone_tickets_jql`].
+    Everyone {
+        /// Project to scope the search to.
+        project_key: String,
+    },
+    /// Every open ticket in `project_key` assigned to `account_id`. See
+    /// [`assignee_tickets_jql`].
+    Assignee {
+        /// Project to scope the search to.
+        project_key: String,
+        /// Assignee to scope the search to.
+        account_id: String,
+    },
+    /// Every open ticket in `project_key`, in native backlog rank order. See
+    /// [`ranked_tickets_jql`].
+    Ranked {
+        /// Project to scope the search to.
+        project_key: String,
+    },
+    /// Every open ticket in `project_key` whose text matches `text`. See
+    /// [`ticket_search_jql`].
+    Search {
+        /// Project to scope the search to.
+        project_key: String,
+        /// Free text to match against.
+        text: String,
+    },
+    /// Tickets in `project_key` that shipped within the retro lookback
+    /// window. See [`shipped_awaiting_retro_jql`].
+    ShippedAwaitingRetro {
+        /// Project to scope the search to.
+        project_key: String,
+    },
+    /// The current user's "To Do" candidates for `tm ready`, unscoped by
+    /// project, in rank order. See [`ready_candidates_jql`]. Not named in
+    /// GitHub issue #3's variant list; added because [`ready_candidates_jql`]
+    /// has no other variant it maps onto (see the phase 2 report).
+    ReadyCandidates,
+}
+
+/// Render `query` into the JQL string [`JiraProvider::search`] (and
+/// [`FakeJiraClient`]'s [`TicketProvider`] impl, so tests configured against
+/// a fixed JQL string keep working unchanged) send to Jira.
+fn render_jql(query: &TicketQuery) -> String {
+    match query {
+        TicketQuery::MyOpen => my_open_tickets_jql(),
+        TicketQuery::Unassigned { project_key } => unassigned_tickets_jql(project_key),
+        TicketQuery::Everyone { project_key } => everyone_tickets_jql(project_key),
+        TicketQuery::Assignee {
+            project_key,
+            account_id,
+        } => assignee_tickets_jql(project_key, account_id),
+        TicketQuery::Ranked { project_key } => ranked_tickets_jql(project_key),
+        TicketQuery::Search { project_key, text } => ticket_search_jql(project_key, text),
+        TicketQuery::ShippedAwaitingRetro { project_key } => {
+            shipped_awaiting_retro_jql(project_key)
+        }
+        TicketQuery::ReadyCandidates => ready_candidates_jql(),
+    }
+}
+
+/// A new ticket to create, provider-agnostic: `description` is plain
+/// Markdown text. [`JiraProvider`] converts it to ADF internally via
+/// [`text_to_adf`] before building the Jira-shaped [`CreateIssueRequest`]; a
+/// future `GithubProvider` would pass it through untouched, since GitHub
+/// issue bodies are already Markdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTicket {
+    /// Project key the issue is created under.
+    pub project_key: String,
+    /// One-line issue summary.
+    pub summary: String,
+    /// Issue description, as Markdown text.
+    pub description: String,
+    /// Issue type name, e.g. `Task`.
+    pub issue_type_name: String,
+    /// Account ID to assign the new issue to, if any.
+    pub assignee_account_id: Option<String>,
+}
 
 /// Backend-agnostic ticket operations. See the module doc comment for how
 /// this relates to [`JiraClient`] and [`JiraProvider`].
@@ -44,7 +160,7 @@ pub trait TicketProvider {
     fn get_issue(&self, key: &str) -> Result<Issue, JiraError>;
 
     /// Create a new ticket.
-    fn create_issue(&self, req: &CreateIssueRequest) -> Result<Issue, JiraError>;
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError>;
 
     /// Attach a remote link (e.g. a GitHub PR) to a ticket.
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError>;
@@ -55,8 +171,8 @@ pub trait TicketProvider {
     /// Apply a workflow transition to a ticket.
     fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError>;
 
-    /// Run a search query (a JQL string against Jira today).
-    fn search(&self, jql: &str) -> Result<SearchResult, JiraError>;
+    /// Run a search query.
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError>;
 
     /// Check that a project exists and is visible to the authenticated
     /// user.
@@ -79,15 +195,17 @@ pub trait TicketProvider {
     /// Remove an issue link by its id.
     fn delete_link(&self, link_id: &str) -> Result<(), JiraError>;
 
-    /// Replace a ticket's description (an ADF document value).
-    fn update_description(
-        &self,
-        key: &str,
-        description: &serde_json::Value,
-    ) -> Result<(), JiraError>;
+    /// Replace a ticket's description with `description`, plain Markdown
+    /// text.
+    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError>;
 
-    /// Post a comment to a ticket (an ADF document value).
-    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError>;
+    /// Post a comment to a ticket. `body` is plain Markdown text.
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError>;
+
+    /// Render `issue`'s description as plain text, translating from
+    /// whatever format the backend stores it in (ADF, for Jira). `""` when
+    /// there's no description.
+    fn description_text(&self, issue: &Issue) -> String;
 }
 
 /// [`TicketProvider`] backed by a boxed [`JiraClient`].
@@ -113,8 +231,14 @@ impl TicketProvider for JiraProvider {
         self.0.get_issue(key)
     }
 
-    fn create_issue(&self, req: &CreateIssueRequest) -> Result<Issue, JiraError> {
-        self.0.create_issue(req)
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError> {
+        self.0.create_issue(&CreateIssueRequest {
+            project_key: req.project_key.clone(),
+            summary: req.summary.clone(),
+            description: text_to_adf(&req.description),
+            issue_type_name: req.issue_type_name.clone(),
+            assignee_account_id: req.assignee_account_id.clone(),
+        })
     }
 
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError> {
@@ -129,8 +253,8 @@ impl TicketProvider for JiraProvider {
         self.0.transition(key, transition_id)
     }
 
-    fn search(&self, jql: &str) -> Result<SearchResult, JiraError> {
-        self.0.search(jql)
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError> {
+        self.0.search(&render_jql(query))
     }
 
     fn get_project(&self, key: &str) -> Result<(), JiraError> {
@@ -157,16 +281,21 @@ impl TicketProvider for JiraProvider {
         self.0.delete_link(link_id)
     }
 
-    fn update_description(
-        &self,
-        key: &str,
-        description: &serde_json::Value,
-    ) -> Result<(), JiraError> {
-        self.0.update_description(key, description)
+    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError> {
+        self.0.update_description(key, &text_to_adf(description))
     }
 
-    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
-        self.0.add_comment(key, body)
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError> {
+        self.0.add_comment(key, &text_to_adf(body))
+    }
+
+    fn description_text(&self, issue: &Issue) -> String {
+        issue
+            .fields
+            .description
+            .as_ref()
+            .map(adf_to_text)
+            .unwrap_or_default()
     }
 }
 
@@ -185,8 +314,17 @@ impl TicketProvider for FakeJiraClient {
         JiraClient::get_issue(self, key)
     }
 
-    fn create_issue(&self, req: &CreateIssueRequest) -> Result<Issue, JiraError> {
-        JiraClient::create_issue(self, req)
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError> {
+        JiraClient::create_issue(
+            self,
+            &CreateIssueRequest {
+                project_key: req.project_key.clone(),
+                summary: req.summary.clone(),
+                description: text_to_adf(&req.description),
+                issue_type_name: req.issue_type_name.clone(),
+                assignee_account_id: req.assignee_account_id.clone(),
+            },
+        )
     }
 
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError> {
@@ -201,8 +339,8 @@ impl TicketProvider for FakeJiraClient {
         JiraClient::transition(self, key, transition_id)
     }
 
-    fn search(&self, jql: &str) -> Result<SearchResult, JiraError> {
-        JiraClient::search(self, jql)
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError> {
+        JiraClient::search(self, &render_jql(query))
     }
 
     fn get_project(&self, key: &str) -> Result<(), JiraError> {
@@ -229,16 +367,21 @@ impl TicketProvider for FakeJiraClient {
         JiraClient::delete_link(self, link_id)
     }
 
-    fn update_description(
-        &self,
-        key: &str,
-        description: &serde_json::Value,
-    ) -> Result<(), JiraError> {
-        JiraClient::update_description(self, key, description)
+    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError> {
+        JiraClient::update_description(self, key, &text_to_adf(description))
     }
 
-    fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
-        JiraClient::add_comment(self, key, body)
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError> {
+        JiraClient::add_comment(self, key, &text_to_adf(body))
+    }
+
+    fn description_text(&self, issue: &Issue) -> String {
+        issue
+            .fields
+            .description
+            .as_ref()
+            .map(adf_to_text)
+            .unwrap_or_default()
     }
 }
 
@@ -291,5 +434,148 @@ mod tests {
         provider
             .transition("PROJ-1", "31")
             .expect("FakeJiraClient::transition succeeds by default");
+    }
+
+    #[test]
+    fn render_jql_covers_every_variant() {
+        assert_eq!(
+            render_jql(&TicketQuery::MyOpen),
+            crate::jira::jql::my_open_tickets_jql()
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Unassigned {
+                project_key: "PROJ".to_string()
+            }),
+            crate::jira::jql::unassigned_tickets_jql("PROJ")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Everyone {
+                project_key: "PROJ".to_string()
+            }),
+            crate::jira::jql::everyone_tickets_jql("PROJ")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Assignee {
+                project_key: "PROJ".to_string(),
+                account_id: "acct-1".to_string()
+            }),
+            crate::jira::jql::assignee_tickets_jql("PROJ", "acct-1")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Ranked {
+                project_key: "PROJ".to_string()
+            }),
+            crate::jira::jql::ranked_tickets_jql("PROJ")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Search {
+                project_key: "PROJ".to_string(),
+                text: "login bug".to_string()
+            }),
+            crate::jira::jql::ticket_search_jql("PROJ", "login bug")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::ShippedAwaitingRetro {
+                project_key: "PROJ".to_string()
+            }),
+            crate::jira::jql::shipped_awaiting_retro_jql("PROJ")
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::ReadyCandidates),
+            crate::jira::jql::ready_candidates_jql()
+        );
+    }
+
+    #[test]
+    fn jira_provider_search_forwards_rendered_jql_to_the_wrapped_client() {
+        let provider = JiraProvider::new(FakeJiraClient::new());
+
+        let result = provider
+            .search(&TicketQuery::MyOpen)
+            .expect("FakeJiraClient::search succeeds by default");
+
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn create_issue_converts_markdown_description_to_adf() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let provider = JiraProvider::new(fake);
+
+        provider
+            .create_issue(&NewTicket {
+                project_key: "PROJ".to_string(),
+                summary: "Fix the thing".to_string(),
+                description: "**bold** text".to_string(),
+                issue_type_name: "Task".to_string(),
+                assignee_account_id: None,
+            })
+            .expect("should succeed");
+    }
+
+    #[test]
+    fn fake_ticket_provider_create_issue_records_adf_description() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+
+        TicketProvider::create_issue(
+            &fake,
+            &NewTicket {
+                project_key: "PROJ".to_string(),
+                summary: "Fix the thing".to_string(),
+                description: "**bold** text".to_string(),
+                issue_type_name: "Task".to_string(),
+                assignee_account_id: None,
+            },
+        )
+        .expect("should succeed");
+
+        let calls = fake.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].description.to_string().contains("\"strong\""));
+    }
+
+    #[test]
+    fn fake_ticket_provider_update_description_records_adf() {
+        let fake = FakeJiraClient::new();
+
+        TicketProvider::update_description(&fake, "PROJ-1", "**bold** text")
+            .expect("should succeed");
+
+        let calls = fake.update_description_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.to_string().contains("\"strong\""));
+    }
+
+    #[test]
+    fn fake_ticket_provider_add_comment_records_adf() {
+        let fake = FakeJiraClient::new();
+
+        TicketProvider::add_comment(&fake, "PROJ-1", "**bold** text").expect("should succeed");
+
+        let calls = fake.add_comment_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.to_string().contains("\"strong\""));
+    }
+
+    #[test]
+    fn fake_ticket_provider_description_text_renders_plain_text() {
+        let fake = FakeJiraClient::new();
+        let mut with_description = issue("PROJ-1");
+        with_description.fields.description = Some(text_to_adf("plain text"));
+
+        assert_eq!(
+            TicketProvider::description_text(&fake, &with_description),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn fake_ticket_provider_description_text_empty_when_no_description() {
+        let fake = FakeJiraClient::new();
+
+        assert_eq!(
+            TicketProvider::description_text(&fake, &issue("PROJ-1")),
+            ""
+        );
     }
 }

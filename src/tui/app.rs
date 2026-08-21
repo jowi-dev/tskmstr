@@ -9,12 +9,9 @@
 use std::collections::HashMap;
 
 use crate::jira::client::RankAnchor;
-use crate::jira::jql::{
-    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-    shipped_awaiting_retro_jql, unassigned_tickets_jql,
-};
 use crate::jira::types::{JiraUser, Transition};
 use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
+use crate::ticketing::provider::TicketQuery;
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::jira::types::Issue`] plus the configured Jira base URL.
@@ -28,8 +25,8 @@ pub struct TicketSummary {
     pub status: String,
     /// Browsable URL for the issue (`{base_url}/browse/{key}`).
     pub url: String,
-    /// Plain-text description, extracted from the issue's ADF description
-    /// via [`crate::jira::adf::adf_to_text`].
+    /// Plain-text description, as the provider renders it via
+    /// [`crate::ticketing::provider::TicketProvider::description_text`].
     pub description: String,
     /// Status category key (`new`, `indeterminate`, `done`, or anything else
     /// Jira reports), used to order board columns.
@@ -65,15 +62,22 @@ impl AssigneeFilter {
     }
 }
 
-/// Build the JQL query for `filter`, scoping project-wide filters to
+/// Build the [`TicketQuery`] for `filter`, scoping project-wide filters to
 /// `project_key`. [`AssigneeFilter::Me`] ignores `project_key` entirely,
 /// preserving the board's original, unscoped query.
-pub fn jql_for_filter(filter: &AssigneeFilter, project_key: &str) -> String {
+pub fn query_for_filter(filter: &AssigneeFilter, project_key: &str) -> TicketQuery {
     match filter {
-        AssigneeFilter::Me => my_open_tickets_jql(),
-        AssigneeFilter::Unassigned => unassigned_tickets_jql(project_key),
-        AssigneeFilter::Everyone => everyone_tickets_jql(project_key),
-        AssigneeFilter::User(user) => assignee_tickets_jql(project_key, &user.account_id),
+        AssigneeFilter::Me => TicketQuery::MyOpen,
+        AssigneeFilter::Unassigned => TicketQuery::Unassigned {
+            project_key: project_key.to_string(),
+        },
+        AssigneeFilter::Everyone => TicketQuery::Everyone {
+            project_key: project_key.to_string(),
+        },
+        AssigneeFilter::User(user) => TicketQuery::Assignee {
+            project_key: project_key.to_string(),
+            account_id: user.account_id.clone(),
+        },
     }
 }
 
@@ -534,7 +538,7 @@ pub struct RetroRunInfo {
 
 /// One row on [`Screen::Retro`]: a shipped ticket (Jira status category
 /// `Done`) with no recorded retro verdict yet, per
-/// `crate::jira::jql::shipped_awaiting_retro_jql`.
+/// [`crate::ticketing::provider::TicketQuery::ShippedAwaitingRetro`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetroRow {
     /// Issue key, e.g. `PROJ-123`.
@@ -1122,11 +1126,11 @@ pub enum Msg {
 /// resulting `Msg` back through `update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// Fetch tickets matching `jql`, built by [`jql_for_filter`] from the
+    /// Fetch tickets matching `query`, built by [`query_for_filter`] from the
     /// board's active [`AssigneeFilter`].
     FetchTickets {
-        /// The JQL query to search with.
-        jql: String,
+        /// The query to search with.
+        query: TicketQuery,
     },
     /// Fetch assignable users for `project`, for the filter picker.
     FetchAssignableUsers {
@@ -1150,8 +1154,8 @@ pub enum Cmd {
     /// Fetch every open ticket in the project, in Jira backlog rank order,
     /// for [`Screen::Rank`].
     FetchRankTickets {
-        /// The JQL query to search with (built by [`ranked_tickets_jql`]).
-        jql: String,
+        /// The query to search with, always [`TicketQuery::Ranked`].
+        query: TicketQuery,
     },
     /// Re-rank `key` relative to `anchor`.
     RankTicket {
@@ -1279,13 +1283,13 @@ pub enum Cmd {
         /// no PR is found without a second lookup.
         jira_url: String,
     },
-    /// Fetch shipped tickets matching `jql` (built by
-    /// [`shipped_awaiting_retro_jql`]), filter out any that already have a
-    /// recorded retro verdict, and enrich the rest with their latest
+    /// Fetch shipped tickets matching `query` (always
+    /// [`TicketQuery::ShippedAwaitingRetro`]), filter out any that already
+    /// have a recorded retro verdict, and enrich the rest with their latest
     /// `kind = "lane"` run's cost/model info, for [`Screen::Retro`].
     FetchRetroTickets {
-        /// The JQL query to search with.
-        jql: String,
+        /// The query to search with.
+        query: TicketQuery,
     },
     /// Record a retro verdict for `key`.
     RecordRetro {
@@ -1336,11 +1340,13 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 }
                 (app, cmds)
             } else if app.screen == Screen::Rank {
-                let jql = ranked_tickets_jql(&app.project_key);
-                (app, vec![Cmd::FetchRankTickets { jql }])
+                let query = TicketQuery::Ranked {
+                    project_key: app.project_key.clone(),
+                };
+                (app, vec![Cmd::FetchRankTickets { query }])
             } else {
-                let jql = jql_for_filter(&app.filter, &app.project_key);
-                (app, vec![Cmd::FetchTickets { jql }])
+                let query = query_for_filter(&app.filter, &app.project_key);
+                (app, vec![Cmd::FetchTickets { query }])
             }
         }
         Msg::OpenInBrowser => {
@@ -1482,8 +1488,10 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::RankFailed(err) => {
             app.status_line = err;
-            let jql = ranked_tickets_jql(&app.project_key);
-            (app, vec![Cmd::FetchRankTickets { jql }])
+            let query = TicketQuery::Ranked {
+                project_key: app.project_key.clone(),
+            };
+            (app, vec![Cmd::FetchRankTickets { query }])
         }
         Msg::Tick => tick(app),
         Msg::RunsLoaded(cards) => {
@@ -2137,8 +2145,10 @@ fn open_rank(mut app: App) -> (App, Vec<Cmd>) {
     app.rank_grab_origin = None;
     app.rank_snapshot = None;
     app.status_line = "Loading priority list...".to_string();
-    let jql = ranked_tickets_jql(&app.project_key);
-    (app, vec![Cmd::FetchRankTickets { jql }])
+    let query = TicketQuery::Ranked {
+        project_key: app.project_key.clone(),
+    };
+    (app, vec![Cmd::FetchRankTickets { query }])
 }
 
 /// Handle [`Msg::RankTicketsLoaded`]: replace `rank_tickets` with server
@@ -2244,8 +2254,10 @@ fn open_retro(mut app: App) -> (App, Vec<Cmd>) {
     app.retro_action_key = None;
     app.retro_pending_severity = None;
     app.status_line = "Loading retro board...".to_string();
-    let jql = shipped_awaiting_retro_jql(&app.project_key);
-    (app, vec![Cmd::FetchRetroTickets { jql }])
+    let query = TicketQuery::ShippedAwaitingRetro {
+        project_key: app.project_key.clone(),
+    };
+    (app, vec![Cmd::FetchRetroTickets { query }])
 }
 
 /// Handle [`Msg::RetroTicketsLoaded`]: replace `retro_tickets` with server
@@ -2412,8 +2424,8 @@ fn filter_picker_select(mut app: App) -> (App, Vec<Cmd>) {
     app.filter = filter;
     app.show_filter_picker = false;
     app.status_line = "Refreshing...".to_string();
-    let jql = jql_for_filter(&app.filter, &app.project_key);
-    (app, vec![Cmd::FetchTickets { jql }])
+    let query = query_for_filter(&app.filter, &app.project_key);
+    (app, vec![Cmd::FetchTickets { query }])
 }
 
 /// Handle [`Msg::Enter`]: activate whatever is selected on the current
@@ -2864,7 +2876,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: my_open_tickets_jql()
+                query: TicketQuery::MyOpen
             }]
         );
     }
@@ -3692,7 +3704,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: unassigned_tickets_jql("PROJ")
+                query: TicketQuery::Unassigned {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }
@@ -3710,7 +3724,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: everyone_tickets_jql("PROJ")
+                query: TicketQuery::Everyone {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }
@@ -3732,7 +3748,10 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: assignee_tickets_jql("PROJ", "acct-1")
+                query: TicketQuery::Assignee {
+                    project_key: "PROJ".to_string(),
+                    account_id: "acct-1".to_string()
+                }
             }]
         );
     }
@@ -3751,7 +3770,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: my_open_tickets_jql()
+                query: TicketQuery::MyOpen
             }]
         );
     }
@@ -3867,7 +3886,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchRankTickets {
-                jql: ranked_tickets_jql("PROJ")
+                query: TicketQuery::Ranked {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }
@@ -3880,7 +3901,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchRankTickets {
-                jql: ranked_tickets_jql("PROJ")
+                query: TicketQuery::Ranked {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }
@@ -3894,7 +3917,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
-                jql: my_open_tickets_jql()
+                query: TicketQuery::MyOpen
             }]
         );
     }
@@ -4200,7 +4223,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchRankTickets {
-                jql: ranked_tickets_jql("PROJ")
+                query: TicketQuery::Ranked {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }
@@ -5684,7 +5709,9 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::FetchRetroTickets {
-                jql: shipped_awaiting_retro_jql("PROJ")
+                query: TicketQuery::ShippedAwaitingRetro {
+                    project_key: "PROJ".to_string()
+                }
             }]
         );
     }

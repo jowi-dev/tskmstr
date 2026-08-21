@@ -9,7 +9,6 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::RankAnchor;
 use crate::jira::types::CreateLinkRequest;
 use crate::runs::session::{SessionEnv, finish_session, register_session};
@@ -478,8 +477,9 @@ pub fn unlink(
 }
 
 /// `tm ticket update <KEY> --body <BODY>`: replace `key`'s description with
-/// `body`, converted from GitHub-flavored Markdown to ADF via
-/// [`text_to_adf`] (the same conversion `tm ticket create --body` uses).
+/// `body`, GitHub-flavored Markdown handed to
+/// [`TicketProvider::update_description`] as-is (the same provider
+/// conversion `tm ticket create --body` goes through).
 ///
 /// This replaces the whole description; there is no partial-update form.
 /// Like [`transition`]/[`assign`], this is an explicit request, so any Jira
@@ -492,8 +492,7 @@ pub fn update(
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
-    let description = text_to_adf(body);
-    jira.update_description(&normalized, &description)
+    jira.update_description(&normalized, body)
         .map_err(TicketingError::Jira)?;
     writeln!(out, "Description updated for {normalized}")?;
     Ok(())
@@ -615,7 +614,8 @@ pub enum AuditStoreStatus<'a> {
 /// `Last audit usage: ...` (only when the store is open and a finished
 /// `audit`-kind run for this ticket recorded parseable `model_usage`; see
 /// `docs/plans/session-usage.md`'s "Surfaces" section), a blank line, then
-/// the description rendered via [`adf_to_text`] (or `(no description)`).
+/// the description rendered via [`TicketProvider::description_text`] (or
+/// `(no description)`).
 ///
 /// Session registration (see `docs/plans/session-usage.md`): when `store`
 /// is [`AuditStoreStatus::Open`], registers an `audit`-kind session run for
@@ -708,12 +708,7 @@ pub fn audit_read(
     }
 
     writeln!(out)?;
-    let description = issue
-        .fields
-        .description
-        .as_ref()
-        .map(adf_to_text)
-        .filter(|text| !text.is_empty());
+    let description = Some(jira.description_text(&issue)).filter(|text| !text.is_empty());
     match description {
         Some(text) => writeln!(out, "{text}")?,
         None => writeln!(out, "(no description)")?,
