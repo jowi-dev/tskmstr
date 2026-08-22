@@ -1481,8 +1481,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jira::types::{Status, StatusCategory, Transition};
     use crate::runs::RetroSeverity;
+    use crate::ticketing::types::{Status, StatusCategory, Transition};
     use crate::tui::app::BrowserPickerOption;
     use crate::tui::app::{
         Column, RETRO_SEVERITIES, RetroRow, RetroRunInfo, TicketSummary, group_into_columns,
@@ -2234,8 +2234,8 @@ mod tests {
         let _ = render_with_size(&app, 4, 24);
     }
 
-    fn jira_user(account_id: &str, display_name: &str) -> crate::jira::types::JiraUser {
-        crate::jira::types::JiraUser {
+    fn jira_user(account_id: &str, display_name: &str) -> crate::ticketing::types::JiraUser {
+        crate::ticketing::types::JiraUser {
             account_id: account_id.to_string(),
             display_name: display_name.to_string(),
         }

@@ -32,7 +32,7 @@
 //! but is the opposite of advisory: since the command is an explicit request
 //! to change status, a mismatch or API failure is a hard error
 //! ([`TicketingError::NoMatchingTransition`] or the underlying
-//! [`JiraError`]), not a warning. [`list_transitions`] (`tm ticket
+//! [`ProviderError`]), not a warning. [`list_transitions`] (`tm ticket
 //! transition <KEY>` with no status) reports a ticket's current status and
 //! available transitions without changing anything.
 //!
@@ -47,15 +47,15 @@
 //! ticket in Jira's native backlog rank (the `Rank` field, via
 //! [`TicketProvider::rank`]) relative to another issue. Like transition and
 //! assign, it's explicit: any Jira API failure is a hard error. It verifies
-//! `KEY` exists first so a typo there gets a friendly [`JiraError::NotFound`];
+//! `KEY` exists first so a typo there gets a friendly [`ProviderError::NotFound`];
 //! a typo'd anchor key surfaces from the rank call itself as
-//! [`JiraError::RankNotFound`].
+//! [`ProviderError::RankNotFound`].
 //!
 //! [`link_ticket`] (`tm ticket link <KEY> (--blocks|--blocked-by) <OTHER>`)
 //! creates a `Blocks`-type Jira issue link between two tickets, via
 //! [`TicketProvider::create_link`]. Like rank, it verifies `KEY` exists first so
-//! a typo there gets a friendly [`JiraError::NotFound`]; a typo'd `OTHER`
-//! surfaces from the create-link call itself as [`JiraError::LinkNotFound`].
+//! a typo there gets a friendly [`ProviderError::NotFound`]; a typo'd `OTHER`
+//! surfaces from the create-link call itself as [`ProviderError::LinkNotFound`].
 //! [`list_links`] (`tm ticket link <KEY>` with neither flag) is a read-only
 //! discovery view: it lists all of `KEY`'s existing issue links, of any link
 //! type, not just `Blocks`.
@@ -97,16 +97,19 @@
 
 use thiserror::Error;
 
+pub mod error;
 pub mod provider;
+pub mod types;
 
 use crate::config::Config;
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
-use crate::jira::client::{JiraError, RankAnchor};
-use crate::jira::types::{
+use crate::jira::client::RankAnchor;
+use crate::ticketing::error::ProviderError;
+use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
+use crate::ticketing::types::{
     CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue, RemoteLinkRequest,
 };
-use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
 
 /// Dependencies shared by the ticketing orchestration functions that deal
 /// with a pull request.
@@ -176,9 +179,9 @@ pub enum StatusTransition {
 /// Errors that can occur while associating a ticket with a pull request.
 #[derive(Debug, Error)]
 pub enum TicketingError {
-    /// A Jira API call failed.
+    /// A ticket provider call failed.
     #[error(transparent)]
-    Jira(#[from] JiraError),
+    Provider(#[from] ProviderError),
 
     /// A `gh`/`git` shell-out failed.
     #[error(transparent)]
@@ -312,7 +315,7 @@ fn format_no_blocks_others(others: &str) -> String {
 /// `tm ticket <KEY>`: verify `key` exists in Jira, then associate it with the
 /// pull request open for the current branch.
 ///
-/// Fails with the underlying [`JiraError`] (e.g. [`JiraError::NotFound`]) if
+/// Fails with the underlying [`ProviderError`] (e.g. [`ProviderError::NotFound`]) if
 /// `key` does not exist, and with [`TicketingError::NoPrForBranch`] if the
 /// current branch has no open pull request.
 pub fn associate_ticket(
@@ -494,9 +497,9 @@ fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -
 /// paths) and [`transition_ticket`] (the explicit, hard-error `tm ticket
 /// transition <KEY> <STATUS>` path) so both use identical matching rules.
 fn find_matching_transition<'a>(
-    transitions: &'a [crate::jira::types::Transition],
+    transitions: &'a [crate::ticketing::types::Transition],
     target: &str,
-) -> Option<&'a crate::jira::types::Transition> {
+) -> Option<&'a crate::ticketing::types::Transition> {
     transitions
         .iter()
         .find(|t| t.to.name.eq_ignore_ascii_case(target))
@@ -512,7 +515,7 @@ fn find_matching_transition<'a>(
 /// -> target status, ..."`, or, when the issue has none at all (common for
 /// closed tickets), `"the ticket has no available transitions"` rather than
 /// a dangling, empty list.
-fn format_transitions(transitions: &[crate::jira::types::Transition]) -> String {
+fn format_transitions(transitions: &[crate::ticketing::types::Transition]) -> String {
     if transitions.is_empty() {
         return "the ticket has no available transitions".to_string();
     }
@@ -546,7 +549,7 @@ pub enum TransitionOutcome {
 /// it's attempted), this command is explicit, so failure is a hard error:
 /// [`TicketingError::NoMatchingTransition`] if no transition matches `target`
 /// (by either rule in [`find_matching_transition`]), or the underlying
-/// [`JiraError`] if fetching the issue, fetching its transitions, or
+/// [`ProviderError`] if fetching the issue, fetching its transitions, or
 /// applying the transition fails.
 ///
 /// If the issue's current status already equals `target` case-insensitively,
@@ -586,7 +589,7 @@ pub struct TransitionListing {
     /// The ticket's current status name.
     pub current_status: String,
     /// Transitions available on the ticket right now.
-    pub transitions: Vec<crate::jira::types::Transition>,
+    pub transitions: Vec<crate::ticketing::types::Transition>,
 }
 
 /// `tm ticket transition <KEY>` (no status): list `key`'s current status and
@@ -624,7 +627,7 @@ pub enum AssignOutcome {
     /// Assigned by name; carries the resolved user's displayName.
     AssignedToUser(String),
     /// Assigned to the current user; carries a display label for the CLI to
-    /// print. This is [`crate::jira::types::Myself::display_name`] when
+    /// print. This is [`crate::ticketing::types::Myself::display_name`] when
     /// [`Config::default_assignee_account_id`] wasn't cached and `myself()`
     /// had to be called, or the cached account ID itself when it was
     /// (fetching `myself()` just to get a display name isn't worth the extra
@@ -639,8 +642,8 @@ pub enum AssignOutcome {
 ///
 /// Like [`transition_ticket`], this command is explicit, so every failure
 /// mode is a hard error: an ambiguous or unknown name is
-/// [`TicketingError::NoMatchingAssignee`], and any Jira API failure
-/// propagates as the underlying [`JiraError`].
+/// [`TicketingError::NoMatchingAssignee`], and any ticket provider failure
+/// propagates as the underlying [`ProviderError`].
 ///
 /// [`AssignTarget::Name`] resolves against the assignable users of `key`'s
 /// *own* project (derived from `key`'s prefix via
@@ -692,11 +695,11 @@ pub fn assign_ticket(
 /// position in the backlog rank, relative to `anchor`.
 ///
 /// Verifies `key` exists first (via [`TicketProvider::get_issue`]) so a typo'd
-/// primary key gives the same friendly [`JiraError::NotFound`] every other
+/// primary key gives the same friendly [`ProviderError::NotFound`] every other
 /// `tm ticket` subcommand does, rather than surfacing as a raw
-/// [`JiraError::RankNotFound`] from the agile API. A typo'd anchor key (in
+/// [`ProviderError::RankNotFound`] from the agile API. A typo'd anchor key (in
 /// `anchor`) is not checked ahead of time; it surfaces from the `rank` call
-/// itself as [`JiraError::RankNotFound`], since Jira's rank endpoint reports
+/// itself as [`ProviderError::RankNotFound`], since Jira's rank endpoint reports
 /// that case directly and a second lookup would be redundant.
 pub fn rank_ticket(
     jira: &dyn TicketProvider,
@@ -715,10 +718,10 @@ pub fn rank_ticket(
 /// Verifies `key` (the primary ticket named on the command line, not
 /// necessarily `req.blocker_key`) exists first, for the same reason
 /// [`rank_ticket`] does: a typo there gets the friendly
-/// [`JiraError::NotFound`] every other `tm ticket` subcommand gives, rather
-/// than surfacing as a raw [`JiraError::LinkNotFound`] from the link API. A
+/// [`ProviderError::NotFound`] every other `tm ticket` subcommand gives, rather
+/// than surfacing as a raw [`ProviderError::LinkNotFound`] from the link API. A
 /// typo'd `OTHER` is not checked ahead of time; it surfaces from the
-/// `create_link` call itself as [`JiraError::LinkNotFound`].
+/// `create_link` call itself as [`ProviderError::LinkNotFound`].
 pub fn link_ticket(
     jira: &dyn TicketProvider,
     key: &str,
@@ -743,7 +746,7 @@ pub struct UnlinkOutcome {
 /// `key` and `other`, regardless of direction.
 ///
 /// Fetches `key` and scans its `issuelinks` for entries where
-/// [`IssueLinkType::name`](crate::jira::types::IssueLinkType) is `Blocks` and
+/// [`IssueLinkType::name`](crate::ticketing::types::IssueLinkType) is `Blocks` and
 /// the other side (`inward_issue` or `outward_issue`) is `other`; each match
 /// is deleted by its link id via [`TicketProvider::delete_link`]. No match is a
 /// hard error ([`TicketingError::NoBlocksLinkBetween`]), naming any
@@ -947,7 +950,7 @@ pub struct CommentOutcome {
 ///
 /// `key`, if given, is validated with [`TicketProvider::get_issue`] first (like
 /// [`rank_ticket`]/[`link_ticket`]) so a typo'd key gives the familiar
-/// [`JiraError::NotFound`] rather than a raw comment-post 404. If `key` is
+/// [`ProviderError::NotFound`] rather than a raw comment-post 404. If `key` is
 /// omitted, it's resolved from the current branch's pull request the same
 /// way [`resolve_existing_key`] does for `tm pr create` — this is the only
 /// way to derive a key without one being given explicitly. If neither an
@@ -1115,7 +1118,7 @@ fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) 
 ///   wrote them deliberately.
 /// - A [`KeySource::Branch`] key is inferred from a naming convention, not
 ///   authored, so it is validated with [`TicketProvider::get_issue`] first.
-///   [`JiraError::NotFound`] is treated as "no key after all" (`Ok(None)`);
+///   [`ProviderError::NotFound`] is treated as "no key after all" (`Ok(None)`);
 ///   any other Jira error propagates, since it means the check itself
 ///   couldn't be completed.
 ///
@@ -1128,7 +1131,7 @@ pub fn resolve_existing_key(
         Some((key, KeySource::Title | KeySource::Body)) => Ok(Some(key)),
         Some((key, KeySource::Branch)) => match jira.get_issue(&key) {
             Ok(_) => Ok(Some(key)),
-            Err(JiraError::NotFound { .. }) => Ok(None),
+            Err(ProviderError::NotFound { .. }) => Ok(None),
             Err(other) => Err(other.into()),
         },
         None => Ok(None),
@@ -1179,7 +1182,7 @@ mod tests {
     use super::*;
     use crate::github::gh_cli::FakeGhCli;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{
+    use crate::ticketing::types::{
         Issue, IssueFields, JiraUser, Myself, Status, StatusCategory, Transition,
     };
 
@@ -1285,7 +1288,9 @@ mod tests {
         let err = associate_ticket(&ctx, "PROJ-404").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(gh.pr_edit_calls().is_empty());
@@ -1888,7 +1893,9 @@ mod tests {
         let err = transition_ticket(&jira, "PROJ-404", "In Review").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
     }
@@ -1902,7 +1909,7 @@ mod tests {
         let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "fetch boom");
             }
@@ -1923,7 +1930,7 @@ mod tests {
         let err = transition_ticket(&jira, "PROJ-1", "In Review").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -1955,7 +1962,9 @@ mod tests {
         let err = list_transitions(&jira, "PROJ-404").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
     }
@@ -1969,7 +1978,7 @@ mod tests {
         let err = list_transitions(&jira, "PROJ-1").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "fetch boom");
             }
@@ -2256,7 +2265,7 @@ mod tests {
         .expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2280,7 +2289,7 @@ mod tests {
         .expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2339,7 +2348,10 @@ mod tests {
         let err =
             assign_ticket(&jira, &cfg, "PROJ-372", &AssignTarget::Me).expect_err("should fail");
 
-        assert!(matches!(err, TicketingError::Jira(JiraError::Unauthorized)));
+        assert!(matches!(
+            err,
+            TicketingError::Provider(ProviderError::Unauthorized)
+        ));
     }
 
     #[test]
@@ -2363,7 +2375,7 @@ mod tests {
             .expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2411,7 +2423,7 @@ mod tests {
         let err = resolve_existing_key(&jira, &pull_request).expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, .. }) => assert_eq!(status, 500),
+            TicketingError::Provider(ProviderError::Api { status, .. }) => assert_eq!(status, 500),
             other => panic!("expected Jira Api error, got {other:?}"),
         }
     }
@@ -2456,7 +2468,9 @@ mod tests {
             .expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(
@@ -2475,7 +2489,7 @@ mod tests {
             .expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2507,7 +2521,9 @@ mod tests {
         let err = link_ticket(&jira, "PROJ-404", &req).expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(
@@ -2529,7 +2545,7 @@ mod tests {
         let err = link_ticket(&jira, "PROJ-1", &req).expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2542,14 +2558,14 @@ mod tests {
         let mut with_links = issue("PROJ-1");
         with_links.fields.issue_links = vec![IssueLink {
             id: "10001".to_string(),
-            link_type: crate::jira::types::IssueLinkType {
+            link_type: crate::ticketing::types::IssueLinkType {
                 name: "Blocks".to_string(),
                 inward: "is blocked by".to_string(),
                 outward: "blocks".to_string(),
             },
-            inward_issue: Some(crate::jira::types::LinkedIssue {
+            inward_issue: Some(crate::ticketing::types::LinkedIssue {
                 key: "PROJ-2".to_string(),
-                fields: crate::jira::types::LinkedIssueFields {
+                fields: crate::ticketing::types::LinkedIssueFields {
                     summary: "Blocker ticket".to_string(),
                     status: Status {
                         name: "In Progress".to_string(),
@@ -2579,7 +2595,9 @@ mod tests {
         let err = list_links(&jira, "PROJ-404").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
     }
@@ -2730,7 +2748,9 @@ mod tests {
         let err = unlink_ticket(&jira, "PROJ-404", "PROJ-2").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(jira.delete_link_calls().is_empty());
@@ -2752,7 +2772,7 @@ mod tests {
         let err = unlink_ticket(&jira, "PROJ-1", "PROJ-2").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2763,7 +2783,7 @@ mod tests {
     fn linked_issue(key: &str, status_name: &str, status_category_key: &str) -> LinkedIssue {
         LinkedIssue {
             key: key.to_string(),
-            fields: crate::jira::types::LinkedIssueFields {
+            fields: crate::ticketing::types::LinkedIssueFields {
                 summary: format!("Summary for {key}"),
                 status: Status {
                     name: status_name.to_string(),
@@ -2775,16 +2795,16 @@ mod tests {
         }
     }
 
-    fn blocks_link_type() -> crate::jira::types::IssueLinkType {
-        crate::jira::types::IssueLinkType {
+    fn blocks_link_type() -> crate::ticketing::types::IssueLinkType {
+        crate::ticketing::types::IssueLinkType {
             name: "Blocks".to_string(),
             inward: "is blocked by".to_string(),
             outward: "blocks".to_string(),
         }
     }
 
-    fn relates_link_type() -> crate::jira::types::IssueLinkType {
-        crate::jira::types::IssueLinkType {
+    fn relates_link_type() -> crate::ticketing::types::IssueLinkType {
+        crate::ticketing::types::IssueLinkType {
             name: "Relates".to_string(),
             inward: "relates to".to_string(),
             outward: "relates to".to_string(),
@@ -2887,8 +2907,8 @@ mod tests {
         assert_eq!(blockers[0].key, "PROJ-2");
     }
 
-    fn search_result(issues: Vec<Issue>) -> crate::jira::types::SearchResult {
-        crate::jira::types::SearchResult {
+    fn search_result(issues: Vec<Issue>) -> crate::ticketing::types::SearchResult {
+        crate::ticketing::types::SearchResult {
             issues,
             next_page_token: None,
         }
@@ -2942,7 +2962,7 @@ mod tests {
         let err = ready_tickets(&jira).expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2992,7 +3012,9 @@ mod tests {
         let err = check_ready(&jira, "PROJ-404").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
     }
@@ -3049,7 +3071,7 @@ mod tests {
         let err = search_tickets(&jira, &cfg, "login bug").expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::Api { status, message }) => {
+            TicketingError::Provider(ProviderError::Api { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -3099,7 +3121,9 @@ mod tests {
         let err = comment_ticket(&ctx, Some("PROJ-404"), "note", false).expect_err("should fail");
 
         match err {
-            TicketingError::Jira(JiraError::NotFound { key }) => assert_eq!(key, "PROJ-404"),
+            TicketingError::Provider(ProviderError::NotFound { key }) => {
+                assert_eq!(key, "PROJ-404")
+            }
             other => panic!("expected Jira NotFound, got {other:?}"),
         }
         assert!(jira.add_comment_calls().is_empty());

@@ -2437,12 +2437,12 @@ mod tests {
     /// A minimal Jira issue fixture carrying a single `Blocks`-type
     /// blocker, mirroring `work::run`'s own private `issue`/`blocks_link`
     /// test helpers (not reusable across modules, so duplicated here).
-    fn blocked_issue(blocker_key: &str) -> crate::jira::types::Issue {
-        use crate::jira::types::{
+    fn blocked_issue(blocker_key: &str) -> crate::ticketing::types::Issue {
+        use crate::ticketing::types::{
             IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
             StatusCategory,
         };
-        crate::jira::types::Issue {
+        crate::ticketing::types::Issue {
             key: "ABC-123".to_string(),
             fields: IssueFields {
                 summary: "Depends on a blocker".to_string(),

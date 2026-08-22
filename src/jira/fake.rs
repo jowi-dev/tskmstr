@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
-use crate::jira::types::{
-    CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
-    SearchResult, Transition,
+use crate::jira::types::CreateIssueRequest;
+use crate::ticketing::types::{
+    CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
 
 /// Canned outcome for [`FakeJiraClient::get_issue`] on a given key.
@@ -523,7 +523,7 @@ mod tests {
     use super::*;
 
     fn issue(key: &str) -> Issue {
-        use crate::jira::types::{IssueFields, Status, StatusCategory};
+        use crate::ticketing::types::{IssueFields, Status, StatusCategory};
 
         Issue {
             key: key.to_string(),

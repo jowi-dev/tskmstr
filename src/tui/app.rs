@@ -9,12 +9,12 @@
 use std::collections::HashMap;
 
 use crate::jira::client::RankAnchor;
-use crate::jira::types::{JiraUser, Transition};
 use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
 use crate::ticketing::provider::TicketQuery;
+use crate::ticketing::types::{JiraUser, Transition};
 
 /// A ticket as displayed on the board, derived from a
-/// [`crate::jira::types::Issue`] plus the configured Jira base URL.
+/// [`crate::ticketing::types::Issue`] plus the configured Jira base URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketSummary {
     /// Issue key, e.g. `PROJ-123`.
@@ -3199,7 +3199,7 @@ mod tests {
     }
 
     fn transition(id: &str, name: &str) -> Transition {
-        use crate::jira::types::{Status, StatusCategory};
+        use crate::ticketing::types::{Status, StatusCategory};
 
         Transition {
             id: id.to_string(),

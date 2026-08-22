@@ -4,9 +4,9 @@
 //! `reqwest`-backed implementation used in production. Tests exercise
 //! [`HttpJiraClient`] directly against an `httpmock` server.
 
-use crate::jira::types::{
-    CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
-    SearchResult, Transition,
+use crate::jira::types::CreateIssueRequest;
+use crate::ticketing::types::{
+    CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
 use reqwest::blocking::Client;
 use thiserror::Error;
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn add_remote_link_posts_payload() {
-        use crate::jira::types::RemoteLinkRequest;
+        use crate::ticketing::types::RemoteLinkRequest;
 
         let server = MockServer::start();
         let link = RemoteLinkRequest {
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn add_remote_link_maps_404_to_not_found_with_key() {
-        use crate::jira::types::RemoteLinkRequest;
+        use crate::ticketing::types::RemoteLinkRequest;
 
         let server = MockServer::start();
         let link = RemoteLinkRequest {
@@ -1421,7 +1421,7 @@ mod tests {
 
     #[test]
     fn create_link_posts_blocks_payload() {
-        use crate::jira::types::CreateLinkRequest;
+        use crate::ticketing::types::CreateLinkRequest;
 
         let server = MockServer::start();
         let req = CreateLinkRequest {
@@ -1450,7 +1450,7 @@ mod tests {
 
     #[test]
     fn create_link_maps_404_to_link_not_found_with_both_keys() {
-        use crate::jira::types::CreateLinkRequest;
+        use crate::ticketing::types::CreateLinkRequest;
 
         let server = MockServer::start();
         let req = CreateLinkRequest {
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn create_link_maps_401_to_unauthorized() {
-        use crate::jira::types::CreateLinkRequest;
+        use crate::ticketing::types::CreateLinkRequest;
 
         let server = MockServer::start();
         let req = CreateLinkRequest {

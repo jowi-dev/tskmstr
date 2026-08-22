@@ -6,8 +6,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::config::{self, Config, ConfigError, ConfigPaths, GlobalConfigSeed};
-use crate::jira::client::JiraError;
 use crate::keychain::{KeychainError, KeychainStore};
+use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::TicketProvider;
 
 use super::Prompter;
@@ -26,9 +26,9 @@ pub enum AuthCliError {
     #[error(transparent)]
     Keychain(#[from] KeychainError),
 
-    /// A Jira API call failed.
+    /// A ticket provider call failed.
     #[error(transparent)]
-    Jira(#[from] JiraError),
+    Provider(#[from] ProviderError),
 
     /// A prompt or output write failed.
     #[error("io error: {0}")]
@@ -203,11 +203,11 @@ fn resolve_token_source(ctx: &AuthContext) -> Result<Option<(String, &'static st
 mod tests {
     use super::*;
     use crate::cli::FakePrompter;
-    use crate::jira::client::JiraClient;
+    use crate::jira::client::{JiraClient, JiraError};
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::Myself;
     use crate::keychain::InMemoryKeychain;
     use crate::ticketing::provider::JiraProvider;
+    use crate::ticketing::types::Myself;
     use tempfile::tempdir;
 
     fn myself() -> Myself {
@@ -234,29 +234,32 @@ mod tests {
         fn myself(&self) -> Result<Myself, JiraError> {
             JiraClient::myself(&*self.0)
         }
-        fn get_issue(&self, key: &str) -> Result<crate::jira::types::Issue, JiraError> {
+        fn get_issue(&self, key: &str) -> Result<crate::ticketing::types::Issue, JiraError> {
             JiraClient::get_issue(&*self.0, key)
         }
         fn create_issue(
             &self,
             req: &crate::jira::types::CreateIssueRequest,
-        ) -> Result<crate::jira::types::Issue, JiraError> {
+        ) -> Result<crate::ticketing::types::Issue, JiraError> {
             JiraClient::create_issue(&*self.0, req)
         }
         fn add_remote_link(
             &self,
             key: &str,
-            link: &crate::jira::types::RemoteLinkRequest,
+            link: &crate::ticketing::types::RemoteLinkRequest,
         ) -> Result<(), JiraError> {
             JiraClient::add_remote_link(&*self.0, key, link)
         }
-        fn transitions(&self, key: &str) -> Result<Vec<crate::jira::types::Transition>, JiraError> {
+        fn transitions(
+            &self,
+            key: &str,
+        ) -> Result<Vec<crate::ticketing::types::Transition>, JiraError> {
             JiraClient::transitions(&*self.0, key)
         }
         fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
             JiraClient::transition(&*self.0, key, transition_id)
         }
-        fn search(&self, jql: &str) -> Result<crate::jira::types::SearchResult, JiraError> {
+        fn search(&self, jql: &str) -> Result<crate::ticketing::types::SearchResult, JiraError> {
             JiraClient::search(&*self.0, jql)
         }
         fn get_project(&self, key: &str) -> Result<(), JiraError> {
@@ -265,7 +268,7 @@ mod tests {
         fn assignable_users(
             &self,
             project: &str,
-        ) -> Result<Vec<crate::jira::types::JiraUser>, JiraError> {
+        ) -> Result<Vec<crate::ticketing::types::JiraUser>, JiraError> {
             JiraClient::assignable_users(&*self.0, project)
         }
         fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
@@ -280,7 +283,7 @@ mod tests {
         }
         fn create_link(
             &self,
-            req: &crate::jira::types::CreateLinkRequest,
+            req: &crate::ticketing::types::CreateLinkRequest,
         ) -> Result<(), JiraError> {
             JiraClient::create_link(&*self.0, req)
         }
@@ -437,7 +440,10 @@ mod tests {
         let mut out = Vec::new();
 
         let err = login(&ctx, &mut prompter, &mut out).expect_err("should fail");
-        assert!(matches!(err, AuthCliError::Jira(JiraError::Unauthorized)));
+        assert!(matches!(
+            err,
+            AuthCliError::Provider(ProviderError::Unauthorized)
+        ));
         assert_eq!(keychain.get_token().unwrap(), None);
     }
 
@@ -543,7 +549,10 @@ mod tests {
         let mut out = Vec::new();
 
         let err = status(&ctx, &mut out).expect_err("should fail");
-        assert!(matches!(err, AuthCliError::Jira(JiraError::Unauthorized)));
+        assert!(matches!(
+            err,
+            AuthCliError::Provider(ProviderError::Unauthorized)
+        ));
     }
 
     #[test]
@@ -571,7 +580,7 @@ mod tests {
         let err = status(&ctx, &mut out).expect_err("should fail");
         assert!(matches!(
             err,
-            AuthCliError::Jira(JiraError::NotFound { .. })
+            AuthCliError::Provider(ProviderError::NotFound { .. })
         ));
     }
 }

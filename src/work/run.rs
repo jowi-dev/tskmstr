@@ -1307,11 +1307,11 @@ mod tests {
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{
+    use crate::runs::RunStore;
+    use crate::ticketing::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
         StatusCategory,
     };
-    use crate::runs::RunStore;
     use crate::work::git::FakeGitOps;
     use crate::work::runner::FakeProcessSpawner;
     use std::collections::BTreeMap;
