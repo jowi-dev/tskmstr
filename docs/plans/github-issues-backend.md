@@ -1,8 +1,9 @@
 # GitHub Issues as a ticket backend (issue #3), phases 1-7
 
-Status: **phases 1-3 complete** (commits `1446509`, `721a331`, and phase
-3's commits below). Phases 4-7 are specified below per the issue but not
-started.
+Status: **phases 1-3 complete** and merged to `main` (merge commits
+`f86ff4f`, `5ae20bc`, `c00e95e`; the underlying work is `1446509`, `721a331`,
+and phase 3's commits below). Phases 4-7 are specified below per the issue but
+not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -212,3 +213,37 @@ body, links, local rank table.
 
 `.tskmstr.toml` with `provider = "github"` in this repo, existing issues
 labeled, tskmstr's own work driven off `tm board`.
+
+## Carry-forward decisions for phases 4-7
+
+Open questions phases 1-3 surfaced, recorded here so they get decided rather
+than defaulted:
+
+- **Config shape.** Phase 3 kept `jira_base_url`/`jira_email`/
+  `default_project_key` flat and top-level to avoid breaking a live config, so
+  the config surface is only half adapter-keyed: `[backend] provider` selects
+  the adapter, but Jira's own fields sit outside any adapter table. When phase
+  5 adds `[backend.github].repo`, document `[backend.jira]` as the canonical
+  location for Jira's fields while `merge` keeps reading the flat keys as a
+  silent fallback. That gives every adapter the same shape without a breaking
+  migration.
+- **The trait is still Jira-shaped.** `TicketProvider` returns `JiraError` and
+  passes `crate::jira::types::Issue` through, so a second adapter has to
+  impersonate Jira's types. Owning the error and read-path types gets more
+  expensive every phase, since retrofitting them touches every call site — do
+  it before or alongside phase 5, not after phase 6.
+- **Fat trait vs. capability traits.** One 14-method trait forces
+  `GithubProvider` to answer for operations GitHub has no equivalent of (rank,
+  transitions). If phases 5-6 produce more than two or three
+  `Unsupported`-style stubs, split the trait into narrower capabilities
+  (`TicketRead`/`TicketWrite`/`Rankable`/`Linkable`/`Transitionable`) so the
+  board can hide a keybinding instead of failing on it at runtime. Below that
+  threshold, the fat trait is the cheaper shape and should stay.
+- **`NewTicket.issue_type_name`** is a Jira-only field sitting on the
+  provider-boundary struct. Phase 6 must decide whether it goes optional,
+  gets ignored by non-Jira adapters, or moves into an adapter-specific extras
+  bag.
+- **Test doubles.** Both `JiraProvider` and any future adapter's fake should be
+  exercised by a shared conformance suite rather than each fake getting an
+  ad-hoc direct `TicketProvider` impl (phase 1 took the ad-hoc route for
+  `FakeJiraClient` deliberately, to avoid rewriting ~150 tests).
