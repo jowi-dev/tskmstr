@@ -614,8 +614,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let ctx = CreateTicketContext {
                 jira: jira.as_ref(),
                 config: &config,
@@ -649,16 +648,14 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Transition { key, status })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::transition(jira.as_ref(), &key, status.as_deref(), &mut stdout)?;
             Ok(())
         }
         (None, Some(TicketCmd::Update { key, body })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::update(jira.as_ref(), &key, &body, &mut stdout)?;
             Ok(())
@@ -688,8 +685,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::assign(
                 jira.as_ref(),
@@ -704,8 +700,7 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Rank { key, above, below })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::rank(
                 jira.as_ref(),
@@ -725,8 +720,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::link(
                 jira.as_ref(),
@@ -739,8 +733,7 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Unlink { key, other })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::unlink(jira.as_ref(), &key, &other, &mut stdout)?;
             Ok(())
@@ -760,8 +753,7 @@ fn run_ticket(
         ) => run_ticket_retro(key, clean, severity, note, paths),
         (None, Some(TicketCmd::Search { text })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::search(jira.as_ref(), &config, &text, &mut stdout)?;
             Ok(())
@@ -818,8 +810,7 @@ fn run_ticket_audit(
             )?;
         }
         None => {
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             // `AuditStoreStatus::Open` borrows `store`, so the store itself
             // has to live in this match's success arm rather than being
             // built into a `status` variable up front and dropped early.
@@ -932,8 +923,7 @@ fn run_ready(
         "tm ready <KEY> is handled by run_ready_check"
     );
     let config = config::load(paths)?;
-    let token = resolve_token(keychain, env_token)?;
-    let jira = jira_client_for(&config, &token);
+    let jira = ticket_provider_for(&config, keychain, env_token)?;
     let gh = ShellGhCli::new();
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
@@ -974,14 +964,13 @@ fn run_ready_check(key: String) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let token = match resolve_token(&keychain, env_token) {
-        Ok(token) => token,
+    let jira = match ticket_provider_for(&config, &keychain, env_token) {
+        Ok(jira) => jira,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::FAILURE;
         }
     };
-    let jira = jira_client_for(&config, &token);
     let gh = ShellGhCli::new();
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
