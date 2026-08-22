@@ -893,18 +893,66 @@ are optional.
 `[backend].provider` selects which ticket provider this config uses. It
 defaults to `"jira"` when `[backend]` is absent from both global and repo
 config, so an existing config with no `[backend]` table at all keeps
-working exactly as before. Only `"jira"` is implemented today;
-`"github"` is a recognized name (GitHub issue #3 tracks the
-`GithubProvider` adapter) that fails cleanly with a "not implemented yet"
-error rather than silently falling back to Jira or panicking. Any other
-value is an invalid-provider error naming the value that was set.
+working exactly as before. `"jira"` and `"github"` are both implemented;
+any other value is an invalid-provider error naming the value that was set.
 
-Each adapter validates only its own required fields: under the (default)
-Jira provider, `jira_base_url`, `jira_email`, and `default_project_key`
-are required exactly as before `[backend]` existed; a future adapter would
-validate whatever fields it needs, without the Jira fields becoming
-required for it too. A repo-local `.tskmstr.toml` can override
+Each adapter validates only its own required fields: under the Jira
+provider, `jira_base_url`, `jira_email`, and `default_project_key` are
+required exactly as before `[backend]` existed; under the GitHub provider,
+`[backend.github].repo` (an `"owner/name"` slug) is required instead, and
+none of the Jira fields are. A repo-local `.tskmstr.toml` can override
 `[backend].provider` on its own, same as every other field.
+
+```toml
+[backend]
+provider = "github"
+
+[backend.github]
+repo = "jowi-dev/tskmstr"   # "owner/name"; defaults to the checkout's
+                             # `origin` remote when unset (see below)
+```
+
+`[backend.github].repo` can be omitted: `tm` then runs `git config --get
+remote.origin.url` in the repo-local config file's directory (or the
+current directory, if there's no repo-local config at all) and parses an
+`"owner/name"` slug out of it, recognizing both the SSH
+(`git@github.com:owner/name.git`) and HTTPS
+(`https://github.com/owner/name.git`) forms GitHub hands out. If that
+doesn't resolve to anything (not a git checkout, no `origin` remote, a
+non-GitHub host), `tm` fails with the same missing-field error an explicit
+`repo` omission would produce — it never guesses.
+
+`[backend.jira]` is the canonical location for Jira's own fields —
+`jira_base_url`, `jira_email`, `default_project_key` — mirroring
+`[backend.github]`'s shape:
+
+```toml
+[backend.jira]
+jira_base_url = "https://example.atlassian.net"
+jira_email = "dev@example.com"
+default_project_key = "PROJ"
+```
+
+The legacy flat top-level keys shown at the top of this section keep working
+unchanged as a silent fallback (checked only when the corresponding
+`[backend.jira]` field is absent) — existing configs, including
+`~/.config/tskmstr/config.toml` in the wild, need no migration. When a field
+is set in both places within the same file, `[backend.jira]` wins.
+
+Selecting the GitHub backend changes several things: `tm auth login`/`tm
+auth status` are no-ops (GitHub Issues authenticates via `gh`'s own `gh auth
+login`/`gh auth status`, not a stored Jira token); ticket keys are
+`GH-<issue number>` instead of a Jira project key; status lives in
+`tm:status/{todo,in-progress,in-review,blocked}` labels (no label, or a
+closed issue, both map to their obvious default) rather than a Jira
+workflow; and `tm backend init-labels` creates those four labels in the
+configured repo (idempotently — safe to re-run) so a fresh repo's board has
+somewhere to put issues. Every write-path ticket operation (create, comment,
+update description, links, rank, assign) isn't implemented yet under the
+GitHub backend and fails with a clear "not yet implemented for the github
+backend" error rather than silently no-oping or panicking; the read path
+(`tm board`, `tm ticket search`, `tm ready`) works today. See
+`docs/plans/github-issues-backend.md` for the full design and phase status.
 
 `review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
 review comment threads count as "bot findings" for `tm pr status` and

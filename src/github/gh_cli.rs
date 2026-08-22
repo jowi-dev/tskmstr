@@ -512,6 +512,33 @@ pub trait GhCli {
     /// fetched, the same single-page limitation as
     /// [`GhCli::pr_review_threads`].
     fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError>;
+
+    // --- Phase 5 additions (GithubProvider read path,
+    // docs/plans/github-issues-backend.md) ---
+
+    /// List the logins eligible to be assigned an issue in `repo` (`gh api
+    /// repos/{repo}/assignees`).
+    ///
+    /// GitHub has no `assignable_users`-style endpoint scoped by anything
+    /// narrower than the repo itself, unlike Jira's per-project assignable
+    /// users list — [`super::super::ticketing::github_provider::GithubProvider::assignable_users`]
+    /// ignores its `project` argument for this reason.
+    fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError>;
+
+    /// Idempotently create (or update, if it already exists) a label in
+    /// `repo` (`gh label create <name> -R <repo> --color <color>
+    /// --description <description> --force`).
+    ///
+    /// `--force` is what makes this idempotent: `gh label create` without it
+    /// fails outright if the label already exists, which would make `tm
+    /// backend init-labels` unsafe to re-run.
+    fn label_create(
+        &self,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), GhError>;
 }
 
 /// A summary of one pull request — its number, head branch, lifecycle state,
@@ -1283,6 +1310,56 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
             number,
+        )
+    }
+
+    fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        let path = format!("repos/{repo}/assignees");
+        let output = Command::new("gh")
+            .args(["api", &path])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api repos/{repo}/assignees".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_repo_assignees_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn label_create(
+        &self,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), GhError> {
+        let output = Command::new("gh")
+            .args([
+                "label",
+                "create",
+                name,
+                "-R",
+                repo,
+                "--color",
+                color,
+                "--description",
+                description,
+                "--force",
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh label create".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_success_or_command_error(
+            "gh label create",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
         )
     }
 }
@@ -2299,6 +2376,44 @@ fn interpret_issue_dependencies_output(
     }
 }
 
+/// Raw shape of one entry in `gh api repos/{repo}/assignees` output, for
+/// deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawAssignee {
+    login: String,
+}
+
+/// Interpret the result of a `gh api repos/{repo}/assignees` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_issue_view_output`].
+fn interpret_repo_assignees_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<String>, GhError> {
+    match exit_code {
+        Some(0) => {
+            let assignees: Vec<RawAssignee> =
+                serde_json::from_str(stdout).map_err(|err| GhError::Parse {
+                    command: "gh api repos/{repo}/assignees".to_string(),
+                    message: err.to_string(),
+                })?;
+            Ok(assignees.into_iter().map(|a| a.login).collect())
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh api repos/{repo}/assignees".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api repos/{repo}/assignees".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// A [`GhCli`] test double: returns canned results and records the
 /// `pr_create`/`pr_edit` calls made against it, for use by tests (including
 /// later ticketing-flow tests) that don't want to shell out to a real `gh`.
@@ -2343,6 +2458,10 @@ pub struct FakeGhCli {
     issue_comment_calls: RefCell<Vec<(String, u64, String)>>,
     issue_dependencies_results: RefCell<HashMap<u64, Result<IssueDependencies, GhError>>>,
     issue_dependencies_calls: RefCell<Vec<(String, u64)>>,
+    repo_assignees_result: RefCell<Result<Vec<String>, GhError>>,
+    repo_assignees_calls: RefCell<Vec<String>>,
+    label_create_result: RefCell<Result<(), GhError>>,
+    label_create_calls: RefCell<Vec<(String, String, String, String)>>,
 }
 
 impl Default for FakeGhCli {
@@ -2402,6 +2521,10 @@ impl Default for FakeGhCli {
             issue_comment_calls: RefCell::new(Vec::new()),
             issue_dependencies_results: RefCell::new(HashMap::new()),
             issue_dependencies_calls: RefCell::new(Vec::new()),
+            repo_assignees_result: RefCell::new(Ok(Vec::new())),
+            repo_assignees_calls: RefCell::new(Vec::new()),
+            label_create_result: RefCell::new(Ok(())),
+            label_create_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -2681,6 +2804,29 @@ impl FakeGhCli {
     pub fn issue_dependencies_calls(&self) -> Vec<(String, u64)> {
         self.issue_dependencies_calls.borrow().clone()
     }
+
+    /// Set the result `repo_assignees` will return.
+    pub fn with_repo_assignees(self, result: Result<Vec<String>, GhError>) -> Self {
+        *self.repo_assignees_result.borrow_mut() = result;
+        self
+    }
+
+    /// The repo slugs passed to `repo_assignees`, in call order.
+    pub fn repo_assignees_calls(&self) -> Vec<String> {
+        self.repo_assignees_calls.borrow().clone()
+    }
+
+    /// Set the result `label_create` will return.
+    pub fn with_label_create_result(self, result: Result<(), GhError>) -> Self {
+        *self.label_create_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, name, color, description)` tuples passed to
+    /// `label_create`, in call order.
+    pub fn label_create_calls(&self) -> Vec<(String, String, String, String)> {
+        self.label_create_calls.borrow().clone()
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -2826,6 +2972,29 @@ impl GhCli for FakeGhCli {
             Some(result) => result.clone(),
             None => Ok(IssueDependencies::default()),
         }
+    }
+
+    fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        self.repo_assignees_calls
+            .borrow_mut()
+            .push(repo.to_string());
+        self.repo_assignees_result.borrow().clone()
+    }
+
+    fn label_create(
+        &self,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), GhError> {
+        self.label_create_calls.borrow_mut().push((
+            repo.to_string(),
+            name.to_string(),
+            color.to_string(),
+            description.to_string(),
+        ));
+        self.label_create_result.borrow().clone()
     }
 }
 
@@ -4286,5 +4455,95 @@ mod tests {
             fake.issue_dependencies("jowi-dev/tskmstr", 3).unwrap(),
             deps
         );
+    }
+
+    // --- repo_assignees / label_create (phase 5) ---
+
+    #[test]
+    fn interpret_repo_assignees_output_parses_logins() {
+        let stdout = r#"[{"login":"jowi-dev","id":1},{"login":"octocat","id":2}]"#;
+        let logins = interpret_repo_assignees_output(Some(0), stdout, "").unwrap();
+        assert_eq!(logins, vec!["jowi-dev".to_string(), "octocat".to_string()]);
+    }
+
+    #[test]
+    fn interpret_repo_assignees_output_empty_list() {
+        let logins = interpret_repo_assignees_output(Some(0), "[]", "").unwrap();
+        assert!(logins.is_empty());
+    }
+
+    #[test]
+    fn interpret_repo_assignees_output_command_failure() {
+        let err = interpret_repo_assignees_output(Some(1), "", "not found").unwrap_err();
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interpret_repo_assignees_output_parse_failure() {
+        let err = interpret_repo_assignees_output(Some(0), "not json", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_repo_assignees_defaults_to_empty() {
+        let fake = FakeGhCli::new();
+        assert_eq!(
+            fake.repo_assignees("jowi-dev/tskmstr").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            fake.repo_assignees_calls(),
+            vec!["jowi-dev/tskmstr".to_string()]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_repo_assignees_returns_configured_result() {
+        let fake = FakeGhCli::new()
+            .with_repo_assignees(Ok(vec!["jowi-dev".to_string(), "octocat".to_string()]));
+        assert_eq!(
+            fake.repo_assignees("jowi-dev/tskmstr").unwrap(),
+            vec!["jowi-dev".to_string(), "octocat".to_string()]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_label_create_records_call_and_succeeds_by_default() {
+        let fake = FakeGhCli::new();
+        fake.label_create(
+            "jowi-dev/tskmstr",
+            "tm:status/todo",
+            "ededed",
+            "To Do (tskmstr)",
+        )
+        .unwrap();
+        assert_eq!(
+            fake.label_create_calls(),
+            vec![(
+                "jowi-dev/tskmstr".to_string(),
+                "tm:status/todo".to_string(),
+                "ededed".to_string(),
+                "To Do (tskmstr)".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_label_create_returns_configured_error() {
+        let fake = FakeGhCli::new().with_label_create_result(Err(GhError::Command {
+            command: "gh label create".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+        let err = fake
+            .label_create("jowi-dev/tskmstr", "tm:status/todo", "ededed", "")
+            .unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
     }
 }

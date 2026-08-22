@@ -5,8 +5,9 @@ Status: **phases 1-3 complete** and merged to `main` (merge commits
 and phase 3's commits below). **Phase 4 complete** on branch
 `issue-3-phase-4-gh-issue-ops` (commit `59efbed`), not yet merged. **Phase 5
 prep complete** on branch `issue-3-phase-5-prep-provider-types` (commits
-`877296d`, `b77baaf`), not yet merged. Phases 5-7 are specified below per the
-issue but not started.
+`877296d`, `b77baaf`), not yet merged. **Phase 5 complete** on branch
+`issue-3-phase-5-github-read-path` (commits below), not yet merged. Phases
+6-7 are specified below per the issue but not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -371,12 +372,179 @@ reason. The `"Blocks"`-constant question (previous bullet) and the
 `NewTicket.issue_type_name` and fat-trait-vs-capability-traits questions
 below are the remaining open items before/during phase 5-6 implementation.
 
-## Phase 5 — `GithubProvider`, read path (not started)
+## Phase 5 — `GithubProvider`, read path (complete, branch `issue-3-phase-5-github-read-path`)
 
-The six board methods (`search`, `transitions`, `transition`,
-`assignable_users`, `rank`, `get_issue`) plus `get_issue`, so `tm board`,
-`tm ticket search`, and `tm ready` work against GitHub Issues.
-`tm backend init-labels` ships here.
+Commits, in order: `29b9f3b` (`GhCli::repo_assignees`/`label_create`),
+`9494fe8` (`GithubProvider`), `cf2b544` (`[backend.github]`/`[backend.jira]`
+config), `26424fd` (main.rs wiring + `tm backend init-labels`), `bd8f1f6`
+(routing every `tm ticket`/`tm ready` code path through the configured
+backend, not just the board). Full test suite 1929 tests (up from 1870 at
+phase 5 prep's tip — 59 new tests), clippy, and fmt all pass.
+
+**`GhCli` gained two methods** (`src/github/gh_cli.rs`), following phase 4's
+exact conventions: `repo_assignees(repo)` (`gh api repos/{repo}/assignees`,
+parsed to a `Vec<String>` of logins) and `label_create(repo, name, color,
+description)` (`gh label create ... --force`, idempotent by construction).
+`FakeGhCli` gained matching `with_repo_assignees`/`repo_assignees_calls` and
+`with_label_create_result`/`label_create_calls` builders.
+
+**`GithubProvider`** (`src/ticketing/github_provider.rs`) implements
+`TicketProvider` over `&dyn GhCli` + a configured `repo` slug, borrowing
+rather than owning its `GhCli` for the same reason phase 1's
+`FakeJiraClient` bypassed `JiraProvider` — tests construct a `FakeGhCli`,
+pass a reference into `GithubProvider::new`, and inspect its recorded calls
+by that same reference afterward.
+
+- **Status synthesis** (`synthesize_status_slug`): a closed issue is always
+  `Done`, regardless of any `tm:status/*` label it still carries; an open
+  issue with more than one status label (not a state `tm` itself produces,
+  but not one it can prevent) resolves by fixed priority `blocked` >
+  `in-review` > `in-progress` > `todo`; no label, or an unrecognized label,
+  both mean `todo`.
+- **Transitions** are synthesized, never fetched: a closed issue offers only
+  `Reopen` (→ `todo`); an open issue offers every status but its current one,
+  plus `Done`. Applying one (`transition`) is a `tm:status/*` label swap via
+  `issue_edit`, plus a close/reopen for `Done`/`Reopen` — `issue_edit`
+  already sequences both `gh` calls internally (phase 4's design), so this
+  is one call site, not two.
+- **`search`** renders each of the eight `TicketQuery` variants to an
+  `issue_list` call plus, where `gh issue list`'s filter shape doesn't cover
+  it, client-side work: `Unassigned` filters out issues with any assignee
+  after the fact (no "has no assignee" filter exists); `Ranked` and
+  `ReadyCandidates` sort ascending by issue number (no local rank table this
+  phase — see below); `Search` filters on summary substring,
+  case-insensitively; `ShippedAwaitingRetro` returns every closed issue with
+  no lookback-window filtering, since `IssueInfo` carries no closed-at
+  timestamp to filter by (a real gap, not a placeholder — see below).
+- **Dependencies** (`get_issue`) come from `GhCli::issue_dependencies` and
+  become `LinkedIssue`s under the link type name `"Blocks"`, matching the
+  hardcoded string `src/blocker_stacking.rs` and `open_blockers` already key
+  off of — the "Blocks"-becomes-a-constant carry-forward item from phase 5
+  prep is still open (see below), but this phase's shape doesn't block it: a
+  future constant would replace this one literal, not restructure the
+  method.
+- **`assignable_users`** ignores its `project` argument (GitHub has no
+  concept narrower than the whole repo) and maps `repo_assignees`'s logins
+  to `{ id: login, display_name: login }`, per the issue's design.
+- **Every write-path method is a stub**: `create_issue`, `add_remote_link`,
+  `assign`, `rank`, `create_link`, `delete_link`, `update_description`,
+  `add_comment` all return a distinct `ProviderError::Api { status: 501,
+  message: "<method> is not yet implemented for the github backend ..." }`
+  rather than panicking or silently no-oping — phase 6's job.
+- **`description_text`** reads the GitHub issue body back out of
+  `Issue.fields.description`, which `GithubProvider` populates as
+  `serde_json::Value::String(body)` (no ADF; GitHub bodies are already
+  Markdown) rather than `None` for an empty body.
+
+**Config**: `[backend.github]` gained a `repo` field (`"owner/name"`,
+required — `ConfigError::MissingField` naming `backend.github.repo` if
+absent and undefaulted). It can be omitted: `load` (not `merge`, which stays
+a pure function of its `RawConfig` arguments and never shells out) tries
+`git config --get remote.origin.url` in the repo-local config's directory
+(or the cwd, if there's no repo-local config), parsing both the SSH and
+HTTPS URL shapes GitHub hands out. `merge`'s `Github` arm, previously an
+unconditional `ConfigError::ProviderNotImplemented`, now validates `repo`
+the same way the `Jira` arm validates its three fields. Per the carry-forward
+decision, `[backend.jira]` is now the canonical (documented) location for
+`jira_base_url`/`jira_email`/`default_project_key`, with the legacy flat
+top-level keys read as a silent fallback when the canonical field is absent
+— see ADR-0003's phase 5 addendum.
+
+**`tm backend init-labels`** (`src/cli/backend.rs`, new `Command::Backend`/
+`BackendCmd` clap surface) creates the four `tm:status/*` labels via
+`gh label create ... --force`, one `gh` call per label — `--force` alone
+makes it idempotent, so no check-then-create round trip was needed.
+Running it under the Jira backend is `BackendCliError::NotGithubBackend`
+without calling `gh` at all.
+
+**Wiring**: `main.rs` gained `ticket_provider_for(config, keychain,
+env_token)`, the one place that branches on `config.backend` to build either
+a real Jira client (as before) or a `GithubProvider` over a leaked
+`&'static dyn GhCli` (see that function's doc comment for why leaking a
+zero-sized `ShellGhCli` is fine for a short-lived CLI process).
+`build_ticketing_deps` and every inline `tm ticket`/`tm ready` dependency
+construction in `main.rs` now goes through it instead of calling
+`jira_client_for` directly, so `tm board`, `tm ticket search`, `tm ready`,
+and every other `tm ticket <subcommand>` all honor the configured backend —
+not just the board, which is all the issue's own phase 5 scope named.
+`tm auth login`/`tm auth status` print a one-line "not applicable to the
+github backend, use `gh auth login`/`gh auth status`" message and return
+under the GitHub backend rather than running the Jira-specific flow (which
+would otherwise fail outright with no Jira config to bootstrap); a fuller
+GitHub-aware `tm auth` (e.g. actually shelling out to `gh auth status`) is
+deferred to phase 7, per this phase's own scope note allowing that.
+
+### The one real design decision this phase forced
+
+`GithubProvider` needing to inspect a `FakeGhCli`'s recorded calls after
+running an operation — the same shape phase 1 hit with `FakeJiraClient` and
+`JiraProvider` — has a different fix here, because the two constraints don't
+actually collide the way they did in phase 1. Phase 1's fix (implement the
+trait a second time, directly on the fake) was needed because `JiraProvider`
+was specified to *wrap* `JiraClient`, and ~150 existing tests already
+constructed a `FakeJiraClient` by reference; rewriting them to route through
+an owning wrapper was explicitly ruled out. Neither constraint applies to a
+brand-new type: no `GithubProvider`-based test existed yet to preserve, so
+there was nothing wrong with just giving `GithubProvider` a lifetime
+parameter and a borrowed `&'a dyn GhCli` field from the start — tests pass a
+`&FakeGhCli` straight in and keep their own reference for `.calls()`
+afterward, no second trait impl needed. The cost shows up only in
+production wiring, where `Box<dyn TicketProvider>` demands `'static`: fixed
+by leaking a freshly constructed `ShellGhCli` (a zero-sized unit struct)
+once per `tm` invocation, which is a real trade worth naming but not one
+that costs anything in practice for a process that exits after one command.
+
+### What phase 5 revealed about phases 6-7
+
+- **Fat trait vs. capability traits: the threshold is now crossed.**
+  `GithubProvider` has eight stub methods (`create_issue`,
+  `add_remote_link`, `assign`, `rank`, `create_link`, `delete_link`,
+  `update_description`, `add_comment`) against phase 5 prep's carry-forward
+  note that named "more than two or three" as the signal to split
+  `TicketProvider` into capability traits (`TicketRead`/`TicketWrite`/
+  `Rankable`/`Linkable`/`Transitionable`). Phase 6 implementing several of
+  these will shrink the stub count, but not below the threshold on its own
+  (`rank` has no GitHub equivalent to implement at all — see below) — phase
+  6 should make the split call explicitly rather than let the stub count
+  quietly stay past the line the previous phase drew.
+- **The local rank table didn't land this phase — and that's a real,
+  user-visible gap, not a formality.** `TicketQuery::Ranked` and
+  `ReadyCandidates` both sort by plain ascending issue number; there is no
+  `runs.db` `ticket_rank` table yet, so "unranked issues fall to the end"
+  degenerates to "every issue is unranked, so everything sorts by number."
+  Phase 6 (or a dedicated sub-phase before it) needs to actually add the
+  local rank table the issue's design describes, wire `GithubProvider::rank`
+  to write to it, and wire `search`'s `Ranked`/`ReadyCandidates` branches to
+  read from it instead of issue-number order.
+- **`ShippedAwaitingRetro` has no time-window filtering.** `IssueInfo`
+  carries no closed-at/updated-at timestamp, so `GithubProvider::search`
+  returns every closed issue rather than ones that shipped within the retro
+  lookback window the Jira JQL builder honors. Fixing this needs a new
+  `GhCli` field (GitHub's REST/GraphQL APIs both expose `closedAt`) threaded
+  through `issue_list`'s JSON fields and `IssueInfo`.
+- **The `"Blocks"`-string-becomes-a-constant question, carried forward from
+  phase 5 prep, is still open.** `GithubProvider::get_issue` hardcodes
+  `"Blocks"` the same way `src/blocker_stacking.rs`/`open_blockers` already
+  do, for the same reason phase 5 prep left it alone: no call site threading
+  a provider reference through those two pure functions yet exists, and this
+  phase's job was the read path, not that refactor.
+- **`NewTicket.issue_type_name`** is still unresolved — `create_issue` is a
+  stub this phase, so nothing yet exercises whether it should go optional
+  or be ignored for GitHub. Phase 6 (which has to actually implement
+  `create_issue`) is where this gets decided for real, from working code
+  rather than a signature guess.
+- **`Config`'s Jira fields are unconditionally present (as empty strings)
+  under the GitHub backend**, rather than the whole `Config` struct being
+  reshaped so Jira-only and GitHub-only fields can't coexist meaninglessly.
+  This was a deliberate minimal-blast-radius choice (`jira_base_url` etc.
+  stay `String`, not `Option<String>`, so the ~15 existing call sites that
+  read them don't all need an `.unwrap()`/pattern-match added) rather than a
+  considered design position — every one of those call sites is already
+  Jira-specific and now runs only on the Jira path via `ticket_provider_for`,
+  so the empty strings are never actually read under the GitHub backend, but
+  a future phase splitting `Config` into a common part plus a
+  `backend`-keyed enum of provider-specific fields would be a cleaner shape
+  if a third adapter ever arrives.
 
 ## Phase 6 — `GithubProvider`, write path (not started)
 
@@ -393,32 +561,61 @@ labeled, tskmstr's own work driven off `tm board`.
 Open questions phases 1-3 surfaced, recorded here so they get decided rather
 than defaulted:
 
-- **Config shape.** Phase 3 kept `jira_base_url`/`jira_email`/
-  `default_project_key` flat and top-level to avoid breaking a live config, so
-  the config surface is only half adapter-keyed: `[backend] provider` selects
-  the adapter, but Jira's own fields sit outside any adapter table. When phase
-  5 adds `[backend.github].repo`, document `[backend.jira]` as the canonical
-  location for Jira's fields while `merge` keeps reading the flat keys as a
-  silent fallback. That gives every adapter the same shape without a breaking
-  migration.
-- ~~**The trait is still Jira-shaped.**~~ Resolved by the phase 5 prep work
-  above: `TicketProvider` returns `ProviderError` and the provider-owned
-  types in `src/ticketing/types.rs`, not `JiraError`/`crate::jira::types::*`.
-  The one item that work explicitly deferred rather than folded in: the
-  `"Blocks"`-string-becomes-a-constant question (see that section's last
-  bullet).
-- **Fat trait vs. capability traits.** One 14-method trait forces
-  `GithubProvider` to answer for operations GitHub has no equivalent of (rank,
-  transitions). If phases 5-6 produce more than two or three
-  `Unsupported`-style stubs, split the trait into narrower capabilities
-  (`TicketRead`/`TicketWrite`/`Rankable`/`Linkable`/`Transitionable`) so the
-  board can hide a keybinding instead of failing on it at runtime. Below that
-  threshold, the fat trait is the cheaper shape and should stay.
+- ~~**Config shape.**~~ Resolved by phase 5: `[backend.github].repo` exists
+  (required, defaultable from the checkout's `origin` remote), and
+  `[backend.jira]` is documented as `jira_base_url`/`jira_email`/
+  `default_project_key`'s canonical location, with the legacy flat top-level
+  keys read as a silent fallback (see ADR-0003's phase 5 addendum). Every
+  adapter now has the same `[backend.<name>]` shape; nothing about the flat
+  keys had to break.
+- ~~**The trait is still Jira-shaped.**~~ Resolved by the phase 5 prep work:
+  `TicketProvider` returns `ProviderError` and the provider-owned types in
+  `src/ticketing/types.rs`, not `JiraError`/`crate::jira::types::*`. The
+  `"Blocks"`-string-becomes-a-constant item that work deferred is still open
+  — see below.
+- **Fat trait vs. capability traits — the threshold named here is now
+  crossed.** `GithubProvider` (phase 5) has eight stub methods
+  (`create_issue`, `add_remote_link`, `assign`, `rank`, `create_link`,
+  `delete_link`, `update_description`, `add_comment`), past the "two or
+  three" this bullet named as the signal to split `TicketProvider` into
+  narrower capabilities (`TicketRead`/`TicketWrite`/`Rankable`/`Linkable`/
+  `Transitionable`). Phase 6 implementing several of these will shrink the
+  count but can't clear it entirely — `rank` has no GitHub equivalent to
+  ever implement, only a local table to back it with — so phase 6 should
+  make the split decision explicitly rather than let the count quietly stay
+  past the line this bullet drew.
+- **The local rank table doesn't exist yet.** Phase 5's `search` sorts
+  `Ranked`/`ReadyCandidates` by plain ascending issue number, which is only
+  correct in the degenerate case where nothing is ranked — every issue looks
+  unranked because there's nowhere to record rank at all. Phase 6 needs to
+  actually add the `runs.db` `ticket_rank` table the issue's design
+  describes, wire `GithubProvider::rank` to write to it, and wire `search`
+  to read from it.
+- **`ShippedAwaitingRetro` has no time-window filtering** — `IssueInfo`
+  carries no closed-at timestamp, so phase 5's `search` returns every closed
+  issue. Needs a new `GhCli` field (`closedAt`) threaded through `issue_list`
+  before this query variant means the same thing under both backends.
+- **`"Blocks"`-string-becomes-a-constant** is still open: `GithubProvider`
+  (phase 5) hardcodes it the same way `src/blocker_stacking.rs`/
+  `open_blockers` already do, for the same reason phase 5 prep left it
+  alone — no call site threading a provider reference through those two
+  pure functions exists yet.
 - **`NewTicket.issue_type_name`** is a Jira-only field sitting on the
-  provider-boundary struct. Phase 6 must decide whether it goes optional,
-  gets ignored by non-Jira adapters, or moves into an adapter-specific extras
-  bag.
-- **Test doubles.** Both `JiraProvider` and any future adapter's fake should be
-  exercised by a shared conformance suite rather than each fake getting an
-  ad-hoc direct `TicketProvider` impl (phase 1 took the ad-hoc route for
-  `FakeJiraClient` deliberately, to avoid rewriting ~150 tests).
+  provider-boundary struct. `create_issue` is a stub through phase 5, so
+  nothing yet exercises this; phase 6, which has to actually implement
+  `create_issue`, is where this gets decided from working code rather than
+  a signature guess.
+- **Test doubles.** Both `JiraProvider` and `GithubProvider` still get an
+  ad-hoc, non-shared test-double integration (`FakeJiraClient` implements
+  `TicketProvider` directly; `GithubProvider` borrows a `&dyn GhCli` and
+  tests construct a `FakeGhCli`) rather than a shared conformance suite.
+  Phase 6 should weigh whether the two backends' read-path tests (status
+  synthesis, transition synthesis, key mapping) have enough structural
+  overlap to be worth extracting one, now that a second implementation
+  exists to compare against the first.
+- **`Config`'s Jira fields are always present (as empty strings) under the
+  GitHub backend**, rather than `Config` being reshaped so Jira-only and
+  GitHub-only fields can't coexist meaninglessly — a deliberate
+  minimal-blast-radius choice phase 5 made explicitly rather than solved;
+  see that phase's report for the reasoning and the cleaner shape it
+  suggests if a third adapter ever arrives.

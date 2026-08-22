@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
+pub mod backend;
 pub mod pr;
 pub mod ready;
 pub mod review;
@@ -138,6 +139,25 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ReviewCmd,
     },
+    /// Manage the configured ticket backend (see
+    /// `docs/plans/github-issues-backend.md`).
+    Backend {
+        /// Which backend action to perform.
+        #[command(subcommand)]
+        cmd: BackendCmd,
+    },
+}
+
+/// `tm backend` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum BackendCmd {
+    /// Idempotently create the `tm:status/*` labels this repo's board needs,
+    /// in the configured `[backend.github].repo`.
+    ///
+    /// Only meaningful under the GitHub backend; running it under the Jira
+    /// backend (Jira has no label taxonomy to create) is an error naming the
+    /// configured provider.
+    InitLabels,
 }
 
 /// `tm review` subcommands.

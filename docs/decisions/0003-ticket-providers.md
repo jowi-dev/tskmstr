@@ -80,6 +80,44 @@ arm in `merge` that validates that adapter's own fields (nested under
 constructs the live provider from a loaded `Config`. Nothing else in
 config, the TUI, or any `tm ticket`/`tm ready` command changes.
 
+## Addendum: `GithubProvider` and `[backend.jira]` (phase 5)
+
+Phase 5 (`docs/plans/github-issues-backend.md`) landed the `Github` arm
+decision 4 above deferred and gave decision 5's "not yet" a resolution:
+
+6. **`GithubProvider` is a real `TicketProvider` impl, not a stub.** The
+   `Github` arm of `merge`'s match no longer returns
+   `ConfigError::ProviderNotImplemented` unconditionally — it validates
+   `[backend.github].repo` (required, defaulting to the checkout's `origin`
+   remote when unset) exactly the way the Jira arm validates its own three
+   fields, and `main.rs` builds a `GithubProvider` from the result the same
+   way it already built a `JiraProvider`. `GithubProvider` implements every
+   `TicketProvider` method: the read path (`get_issue`, `search`,
+   `transitions`, `transition`, `assignable_users`, `myself`, `get_project`,
+   `description_text`) is real; the write path (`create_issue`,
+   `add_remote_link`, `assign`, `rank`, `create_link`, `delete_link`,
+   `update_description`, `add_comment`) is eight stubs returning a
+   distinct "not yet implemented for the github backend" `ProviderError`,
+   landing in phase 6.
+7. **`[backend.jira]` is now the canonical location for Jira's fields**,
+   resolving decision 5's deferral: `merge` reads
+   `[backend.jira].jira_base_url`/`jira_email`/`default_project_key` first,
+   falling back to the legacy flat top-level keys only when the canonical
+   field is absent. This is a silent, non-breaking fallback, not a
+   migration — the repo owner's live flat config keeps working bit-for-bit,
+   and either shape (or a mix) works in any file.
+8. **A provider name recognized but not implemented no longer exists.**
+   `ConfigError::ProviderNotImplemented` is unreachable now that both
+   `BackendKind` variants have a `TicketProvider` impl; it's left in
+   `ConfigError` rather than removed, since a hypothetical future adapter
+   (Linear, Shortcut) would need exactly this state again between "the enum
+   variant exists" and "the impl exists."
+
+See that plan doc's phase 5 section for the full read-path design (label
+taxonomy → status synthesis, transition synthesis, dependencies →
+`LinkedIssue`), the `GithubProvider`/`GhCli` split, and what's carried
+forward into phase 6.
+
 ## What still stands from ADR-0001 and ADR-0002
 
 The no-mirroring rule itself is unchanged: **the configured ticket

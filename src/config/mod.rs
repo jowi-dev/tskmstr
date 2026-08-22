@@ -103,6 +103,43 @@ pub struct RawBackendConfig {
     /// value with no adapter implementation yet (currently `"github"`) is
     /// [`ConfigError::ProviderNotImplemented`].
     pub provider: Option<String>,
+    /// `[backend.jira]`: the canonical (but not yet required) location for
+    /// Jira's own fields. See [`RawJiraBackendConfig`] — `merge` reads these
+    /// fields here first, falling back to the legacy flat top-level
+    /// `jira_base_url`/`jira_email`/`default_project_key` on [`RawConfig`]
+    /// when this section (or the specific field within it) is absent, so an
+    /// existing flat config keeps working bit-for-bit.
+    pub jira: Option<RawJiraBackendConfig>,
+    /// `[backend.github]`: settings for the GitHub Issues provider. See
+    /// [`RawGithubBackendConfig`].
+    pub github: Option<RawGithubBackendConfig>,
+}
+
+/// Raw, partially-specified `[backend.jira]` section as parsed directly from
+/// TOML — the canonical location for Jira's fields (see
+/// [`RawBackendConfig::jira`]'s doc comment for why the legacy flat keys on
+/// [`RawConfig`] still work too).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawJiraBackendConfig {
+    /// Base URL of the Jira instance, e.g. `https://example.atlassian.net`.
+    pub jira_base_url: Option<String>,
+    /// Email address used for Jira basic auth.
+    pub jira_email: Option<String>,
+    /// Default Jira project key used when none is specified explicitly.
+    pub default_project_key: Option<String>,
+}
+
+/// Raw, partially-specified `[backend.github]` section as parsed directly
+/// from TOML.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawGithubBackendConfig {
+    /// The `"owner/name"` GitHub repo slug the GitHub provider targets.
+    ///
+    /// When absent, [`load`] (not [`merge`], which stays a pure function of
+    /// its `RawConfig` arguments) falls back to the checked-out repo's
+    /// `origin` remote, per GitHub issue #3's design ("defaults to the
+    /// origin remote"). See [`detect_origin_repo`].
+    pub repo: Option<String>,
 }
 
 /// Which ticket provider a config selects.
@@ -291,11 +328,24 @@ pub struct Config {
     /// provider fails merging outright with [`ConfigError::ProviderNotImplemented`].
     pub backend: BackendKind,
     /// Base URL of the Jira instance, e.g. `https://example.atlassian.net`.
+    /// Empty when `backend` is [`BackendKind::Github`] — this field, and the
+    /// two below it, are Jira-only and only ever populated (and required) by
+    /// [`merge`]'s [`BackendKind::Jira`] arm. See [`Config::github_repo`] for
+    /// the GitHub-only counterpart.
     pub jira_base_url: String,
-    /// Email address used for Jira basic auth.
+    /// Email address used for Jira basic auth. Empty under the GitHub
+    /// backend — see [`Config::jira_base_url`].
     pub jira_email: String,
     /// Default Jira project key used when none is specified explicitly.
+    /// Empty under the GitHub backend — see [`Config::jira_base_url`].
     pub default_project_key: String,
+    /// The `"owner/name"` GitHub repo slug the GitHub provider targets.
+    /// `None` when `backend` is [`BackendKind::Jira`]; always `Some` when
+    /// `backend` is [`BackendKind::Github`], since [`merge`]'s
+    /// [`BackendKind::Github`] arm requires it (explicitly configured, or
+    /// defaulted from the origin remote by [`load`] — see
+    /// [`RawGithubBackendConfig::repo`]).
+    pub github_repo: Option<String>,
     /// Default Jira account ID to assign new tickets to, if configured.
     pub default_assignee_account_id: Option<String>,
     /// Workflow status name to transition an auto-created or pre-existing
@@ -669,30 +719,100 @@ fn write_raw_config(path: &Path, raw: &RawConfig) -> Result<(), ConfigError> {
 /// all required fields are present.
 ///
 /// Fields set in `repo` win over `global`; fields left `None` in `repo` (or
-/// when `repo` is absent entirely) fall back to `global`.
+/// when `repo` is absent entirely) fall back to `global`. Does not attempt
+/// to default `[backend.github].repo` from a git checkout's origin remote —
+/// that's [`load`]'s job via [`merge_with_repo_dir`], since it requires I/O
+/// this pure function deliberately doesn't do. Every existing caller of
+/// `merge` (including every test that constructs a `RawConfig` by hand) gets
+/// exactly the same behavior as before: a `[backend.github]` with no `repo`
+/// set is [`ConfigError::MissingField`], full stop.
 pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, ConfigError> {
+    merge_with_repo_dir(global, repo, None)
+}
+
+/// Resolve a Jira field, preferring the canonical `[backend.jira]` location
+/// over the legacy flat top-level key, within a single (not-yet-merged)
+/// `RawConfig` -- callers then `.or()` the repo-level result over the
+/// global-level result the same way every other field does. See the
+/// carry-forward decision this implements: `[backend.jira]` is documented as
+/// canonical, but the flat keys silently keep working, so a config with only
+/// the flat key set behaves identically to before `[backend.jira]` existed.
+fn resolved_jira_field(
+    raw: &RawConfig,
+    canonical: impl Fn(&RawJiraBackendConfig) -> Option<String>,
+    flat: &Option<String>,
+) -> Option<String> {
+    raw.backend
+        .as_ref()
+        .and_then(|backend| backend.jira.as_ref())
+        .and_then(canonical)
+        .or_else(|| flat.clone())
+}
+
+/// Merge a repo-local override on top of a global config exactly like
+/// [`merge`], except a `[backend.github]` with no `repo` field set (in
+/// either file) is defaulted from `repo_dir`'s git `origin` remote, if one
+/// is given and a remote can be resolved. [`load`] is the only caller that
+/// passes `Some`; [`merge`] itself always passes `None`, so its behavior
+/// (and every existing test's) is unaffected.
+fn merge_with_repo_dir(
+    global: RawConfig,
+    repo: Option<RawConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<Config, ConfigError> {
     let repo = repo.unwrap_or_default();
 
     let backend = merge_backend(global.backend.clone(), repo.backend.clone())?;
 
-    let jira_base_url = repo.jira_base_url.or(global.jira_base_url);
-    let jira_email = repo.jira_email.or(global.jira_email);
-    let default_project_key = repo.default_project_key.or(global.default_project_key);
+    let jira_base_url = resolved_jira_field(
+        &repo,
+        |jira| jira.jira_base_url.clone(),
+        &repo.jira_base_url,
+    )
+    .or_else(|| {
+        resolved_jira_field(
+            &global,
+            |jira| jira.jira_base_url.clone(),
+            &global.jira_base_url,
+        )
+    });
+    let jira_email = resolved_jira_field(&repo, |jira| jira.jira_email.clone(), &repo.jira_email)
+        .or_else(|| {
+            resolved_jira_field(&global, |jira| jira.jira_email.clone(), &global.jira_email)
+        });
+    let default_project_key = resolved_jira_field(
+        &repo,
+        |jira| jira.default_project_key.clone(),
+        &repo.default_project_key,
+    )
+    .or_else(|| {
+        resolved_jira_field(
+            &global,
+            |jira| jira.default_project_key.clone(),
+            &global.default_project_key,
+        )
+    });
     let default_assignee_account_id = repo
         .default_assignee_account_id
-        .or(global.default_assignee_account_id);
-    let status_on_pr = repo.status_on_pr.or(global.status_on_pr);
-    let status_on_create = repo.status_on_create.or(global.status_on_create);
-    let run_db_path = repo.run_db_path.or(global.run_db_path);
+        .clone()
+        .or(global.default_assignee_account_id.clone());
+    let status_on_pr = repo.status_on_pr.clone().or(global.status_on_pr.clone());
+    let status_on_create = repo
+        .status_on_create
+        .clone()
+        .or(global.status_on_create.clone());
+    let run_db_path = repo.run_db_path.clone().or(global.run_db_path.clone());
     let review_bots = repo
         .review_bots
-        .or(global.review_bots)
+        .clone()
+        .or(global.review_bots.clone())
         .unwrap_or_else(|| vec!["cursor[bot]".to_string()]);
     let board_column_order = repo
         .board_column_order
-        .or(global.board_column_order)
+        .clone()
+        .or(global.board_column_order.clone())
         .unwrap_or_default();
-    let work = merge_work(global.work, repo.work)?;
+    let work = merge_work(global.work.clone(), repo.work.clone())?;
 
     let expected_path = default_global_config_path();
 
@@ -710,6 +830,7 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
                 "default_project_key",
                 &expected_path,
             )?,
+            github_repo: None,
             default_assignee_account_id,
             status_on_pr,
             status_on_create,
@@ -718,9 +839,40 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
             board_column_order,
             work,
         }),
-        BackendKind::Github => Err(ConfigError::ProviderNotImplemented {
-            provider: BackendKind::Github.as_str(),
-        }),
+        BackendKind::Github => {
+            let configured_repo = repo
+                .backend
+                .as_ref()
+                .and_then(|b| b.github.as_ref())
+                .and_then(|g| g.repo.clone())
+                .or_else(|| {
+                    global
+                        .backend
+                        .as_ref()
+                        .and_then(|b| b.github.as_ref())
+                        .and_then(|g| g.repo.clone())
+                })
+                .or_else(|| repo_dir.and_then(detect_origin_repo));
+
+            Ok(Config {
+                backend,
+                jira_base_url: String::new(),
+                jira_email: String::new(),
+                default_project_key: String::new(),
+                github_repo: Some(require_field(
+                    configured_repo,
+                    "backend.github.repo",
+                    &expected_path,
+                )?),
+                default_assignee_account_id,
+                status_on_pr,
+                status_on_create,
+                run_db_path,
+                review_bots,
+                board_column_order,
+                work,
+            })
+        }
     }
 }
 
@@ -904,6 +1056,49 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~"))
 }
 
+/// Best-effort default for `[backend.github].repo`: run `git config --get
+/// remote.origin.url` in `dir` and parse an `"owner/name"` slug out of
+/// whatever URL shape it returns. `None` on any failure (not a git repo, no
+/// `origin` remote, `git` not on `PATH`, an unrecognized URL host/shape) --
+/// this is a convenience default, not a required capability, so [`merge`]'s
+/// own [`ConfigError::MissingField`] is the fallback the caller sees when it
+/// doesn't pan out.
+///
+/// Deliberately does not shell out to `gh repo view` (which
+/// [`crate::github::gh_cli::ShellGhCli`]'s private `resolve_repo` already
+/// does, for the `pr_*` methods): that requires `gh` to be authenticated,
+/// which config loading shouldn't depend on just to resolve a default.
+fn detect_origin_repo(dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    parse_repo_slug_from_git_remote_url(url.trim())
+}
+
+/// Parse an `"owner/name"` slug out of a git remote URL, handling the two
+/// shapes GitHub hands out: SSH (`git@github.com:owner/name.git`) and HTTPS
+/// (`https://github.com/owner/name.git`, with or without the `.git` suffix).
+/// `None` for anything else (a non-GitHub host, a malformed URL) rather than
+/// guessing.
+fn parse_repo_slug_from_git_remote_url(url: &str) -> Option<String> {
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// Load and merge configuration from the given paths.
 ///
 /// Reads and parses the global file (required to exist) and, if present, the
@@ -928,7 +1123,18 @@ pub fn load(paths: &ConfigPaths) -> Result<Config, ConfigError> {
         None => None,
     };
 
-    merge(global, repo).map_err(|err| match err {
+    // Prefer the repo-local config file's directory as the git checkout to
+    // default `[backend.github].repo` from, since that's the repo whose
+    // `.tskmstr.toml` is actually selecting the GitHub backend; fall back to
+    // the process's cwd when there's no repo-local config at all (a global
+    // config alone can still select `provider = "github"`).
+    let repo_dir = paths
+        .repo
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok());
+
+    merge_with_repo_dir(global, repo, repo_dir.as_deref()).map_err(|err| match err {
         ConfigError::MissingField { field, .. } => ConfigError::MissingField {
             field,
             expected_path: paths.global.clone(),
@@ -1756,6 +1962,7 @@ mod tests {
         let global = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("jira".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -1768,6 +1975,7 @@ mod tests {
         let global = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("bogus".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -1779,39 +1987,151 @@ mod tests {
     }
 
     #[test]
-    fn merge_backend_github_provider_is_not_implemented() {
+    fn merge_backend_github_provider_without_repo_is_missing_field() {
         let global = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("github".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
         let err = merge(global, None).expect_err("should fail");
         match err {
-            ConfigError::ProviderNotImplemented { provider } => assert_eq!(provider, "github"),
-            other => panic!("expected ProviderNotImplemented, got {other:?}"),
+            ConfigError::MissingField { field, .. } => {
+                assert_eq!(field, "backend.github.repo")
+            }
+            other => panic!("expected MissingField, got {other:?}"),
         }
     }
 
     #[test]
     fn merge_backend_github_provider_does_not_require_jira_fields() {
-        // Even with every Jira field absent, selecting `github` fails
-        // because of the provider, not because of missing Jira fields --
-        // demonstrating those fields are validated only under the Jira
-        // adapter, not unconditionally.
+        // Even with every Jira field absent, selecting `github` (with a
+        // `repo` configured) succeeds -- demonstrating those fields are
+        // validated only under the Jira adapter, not unconditionally.
         let global = RawConfig {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
             backend: Some(RawBackendConfig {
                 provider: Some("github".to_string()),
+                github: Some(RawGithubBackendConfig {
+                    repo: Some("jowi-dev/tskmstr".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, None).expect("should succeed");
+        assert_eq!(cfg.backend, BackendKind::Github);
+        assert_eq!(cfg.github_repo, Some("jowi-dev/tskmstr".to_string()));
+        assert_eq!(cfg.jira_base_url, "");
+    }
+
+    #[test]
+    fn merge_backend_github_provider_with_repo_configured_succeeds() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+                github: Some(RawGithubBackendConfig {
+                    repo: Some("jowi-dev/tskmstr".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, None).expect("should succeed");
+        assert_eq!(cfg.github_repo, Some("jowi-dev/tskmstr".to_string()));
+    }
+
+    #[test]
+    fn merge_backend_github_repo_from_repo_local_overrides_global() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+                github: Some(RawGithubBackendConfig {
+                    repo: Some("global-owner/global-repo".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RawConfig {
+            backend: Some(RawBackendConfig {
+                github: Some(RawGithubBackendConfig {
+                    repo: Some("repo-owner/repo-repo".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("should succeed");
+        assert_eq!(cfg.github_repo, Some("repo-owner/repo-repo".to_string()));
+    }
+
+    #[test]
+    fn merge_with_repo_dir_defaults_github_repo_from_origin_remote() {
+        let dir = tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:jowi-dev/tskmstr.git",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_with_repo_dir(global, None, Some(dir.path())).expect("should succeed");
+        assert_eq!(cfg.github_repo, Some("jowi-dev/tskmstr".to_string()));
+    }
+
+    #[test]
+    fn merge_without_repo_dir_does_not_default_github_repo() {
+        // `merge` itself (as opposed to `merge_with_repo_dir`) never shells
+        // out to git, so a config with no explicit repo still fails cleanly
+        // even if the test happens to run inside a git checkout.
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
         let err = merge(global, None).expect_err("should fail");
-        assert!(
-            matches!(err, ConfigError::ProviderNotImplemented { .. }),
-            "expected ProviderNotImplemented rather than a missing-Jira-field error, got {err:?}"
+        assert!(matches!(err, ConfigError::MissingField { .. }));
+    }
+
+    #[test]
+    fn parse_repo_slug_from_git_remote_url_handles_ssh_and_https() {
+        assert_eq!(
+            parse_repo_slug_from_git_remote_url("git@github.com:jowi-dev/tskmstr.git"),
+            Some("jowi-dev/tskmstr".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug_from_git_remote_url("https://github.com/jowi-dev/tskmstr.git"),
+            Some("jowi-dev/tskmstr".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug_from_git_remote_url("https://github.com/jowi-dev/tskmstr"),
+            Some("jowi-dev/tskmstr".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug_from_git_remote_url("https://gitlab.com/jowi-dev/tskmstr.git"),
+            None
         );
     }
 
@@ -1821,6 +2141,7 @@ mod tests {
             jira_base_url: None,
             backend: Some(RawBackendConfig {
                 provider: Some("jira".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -1839,17 +2160,26 @@ mod tests {
         let global = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("jira".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
         let repo = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("github".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
+        // The repo override does take effect (selecting github over the
+        // global jira setting) -- it just then fails on github's own
+        // required field, `repo`, which this repo-local override doesn't
+        // set either, rather than falling back to jira's validation.
         let err = merge(global, Some(repo)).expect_err("repo override should take effect");
-        assert!(matches!(err, ConfigError::ProviderNotImplemented { .. }));
+        assert!(matches!(
+            err,
+            ConfigError::MissingField { field, .. } if field == "backend.github.repo"
+        ));
     }
 
     #[test]
@@ -1857,6 +2187,7 @@ mod tests {
         let global = RawConfig {
             backend: Some(RawBackendConfig {
                 provider: Some("jira".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -1896,8 +2227,93 @@ mod tests {
             global: global_path,
             repo: Some(repo_path),
         };
-        let err = load(&paths).expect_err("github backend should fail cleanly");
-        assert!(matches!(err, ConfigError::ProviderNotImplemented { .. }));
+        // The tempdir has no `origin` remote to default `repo` from (it
+        // isn't even a git checkout), so this fails on the missing
+        // `backend.github.repo` field rather than an unimplemented-provider
+        // error -- the provider itself is now implemented.
+        let err = load(&paths).expect_err("github backend without a repo should fail cleanly");
+        assert!(matches!(
+            err,
+            ConfigError::MissingField { field, .. } if field == "backend.github.repo"
+        ));
+    }
+
+    #[test]
+    fn load_repo_local_tskmstr_toml_can_select_github_backend_with_explicit_repo() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [backend]
+            provider = "github"
+
+            [backend.github]
+            repo = "jowi-dev/tskmstr"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should succeed");
+        assert_eq!(cfg.backend, BackendKind::Github);
+        assert_eq!(cfg.github_repo, Some("jowi-dev/tskmstr".to_string()));
+    }
+
+    #[test]
+    fn load_repo_local_tskmstr_toml_jira_fields_under_backend_jira_table() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            [backend.jira]
+            jira_base_url = "https://example.atlassian.net"
+            jira_email = "dev@example.com"
+            default_project_key = "PROJ"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should succeed reading canonical [backend.jira] fields");
+        assert_eq!(cfg.jira_base_url, "https://example.atlassian.net");
+        assert_eq!(cfg.jira_email, "dev@example.com");
+        assert_eq!(cfg.default_project_key, "PROJ");
+    }
+
+    #[test]
+    fn backend_jira_table_wins_over_legacy_flat_key_in_the_same_file() {
+        let global = RawConfig {
+            jira_base_url: Some("https://flat.atlassian.net".to_string()),
+            backend: Some(RawBackendConfig {
+                jira: Some(RawJiraBackendConfig {
+                    jira_base_url: Some("https://canonical.atlassian.net".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should succeed");
+        assert_eq!(cfg.jira_base_url, "https://canonical.atlassian.net");
     }
 
     #[test]

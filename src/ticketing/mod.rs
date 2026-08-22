@@ -98,6 +98,7 @@
 use thiserror::Error;
 
 pub mod error;
+pub mod github_provider;
 pub mod provider;
 pub mod types;
 
@@ -1220,6 +1221,7 @@ mod tests {
             jira_base_url: "https://example.atlassian.net".to_string(),
             jira_email: "ada@example.com".to_string(),
             default_project_key: "PROJ".to_string(),
+            github_repo: None,
             default_assignee_account_id: Some("acct-1".to_string()),
             status_on_pr: None,
             status_on_create: None,

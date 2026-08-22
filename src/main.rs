@@ -9,12 +9,13 @@ use clap::Parser;
 
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
-    AuthCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
+    AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
 };
-use tskmstr::config::{self, Config, ConfigPaths};
-use tskmstr::github::gh_cli::ShellGhCli;
+use tskmstr::config::{self, BackendKind, Config, ConfigPaths};
+use tskmstr::github::gh_cli::{GhCli, ShellGhCli};
 use tskmstr::jira::client::{HttpJiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
+use tskmstr::ticketing::github_provider::GithubProvider;
 use tskmstr::ticketing::provider::{JiraProvider, TicketProvider};
 use tskmstr::ticketing::{CreateTicketContext, TicketingContext};
 use tskmstr::tui::event::{TuiDeps, run};
@@ -86,7 +87,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         }
     };
     let ctx = TicketingContext {
-        jira: &jira,
+        jira: jira.as_ref(),
         gh: &gh,
         config: &config,
     };
@@ -177,6 +178,57 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         } => run_runs(kind, by_outcome, by_retro, cmd),
         Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
         Command::Review { cmd } => run_review(cmd),
+        Command::Backend { cmd } => run_backend(cmd, &paths),
+    }
+}
+
+/// Dispatch `tm backend init-labels`.
+///
+/// Needs no Jira token (or keychain access at all): `gh` handles its own
+/// authentication, so this only loads config to learn `backend` and
+/// `github_repo`.
+fn run_backend(cmd: BackendCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    match cmd {
+        BackendCmd::InitLabels => {
+            let gh = ShellGhCli::new();
+            let repo = config.github_repo.clone().unwrap_or_default();
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::backend::init_labels(config.backend, &repo, &gh, &mut stdout)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a [`TicketProvider`] appropriate for `config.backend`: a real Jira
+/// client (resolving a token from the keychain/environment) under
+/// [`BackendKind::Jira`], or a [`GithubProvider`] under [`BackendKind::Github`].
+///
+/// The [`GithubProvider`] case leaks a freshly constructed [`ShellGhCli`] to
+/// get a `&'static dyn GhCli` — [`GithubProvider`] borrows its [`GhCli`]
+/// rather than owning a boxed one (see that type's doc comment for why:
+/// tests need to inspect a `FakeGhCli`'s recorded calls by reference after
+/// the fact), but `Box<dyn TicketProvider>` requires `'static`. `tm` is a
+/// short-lived CLI process, and `ShellGhCli` is a zero-sized unit struct, so
+/// leaking one costs nothing.
+fn ticket_provider_for(
+    config: &Config,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<Box<dyn TicketProvider>, Box<dyn std::error::Error>> {
+    match config.backend {
+        BackendKind::Jira => {
+            let token = resolve_token(keychain, env_token)?;
+            Ok(jira_client_for(config, &token))
+        }
+        BackendKind::Github => {
+            let repo = config
+                .github_repo
+                .clone()
+                .ok_or("github backend selected but no [backend.github].repo is configured")?;
+            let gh: &'static dyn GhCli = Box::leak(Box::new(ShellGhCli::new()));
+            Ok(Box::new(GithubProvider::new(gh, repo)))
+        }
     }
 }
 
@@ -381,8 +433,7 @@ fn run_board(
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
-    let token = resolve_token(keychain, env_token)?;
-    let jira = jira_client_for(&config, &token);
+    let jira = ticket_provider_for(&config, keychain, env_token)?;
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
     let home = std::env::var_os("HOME")
@@ -457,6 +508,25 @@ fn run_auth(
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Under the GitHub backend there's no Jira token to manage at all --
+    // `gh`'s own `gh auth login`/`gh auth status` cover it. `tm auth`'s full
+    // GitHub-aware UX (e.g. reporting `gh auth status` here) is deferred to
+    // phase 7 of docs/plans/github-issues-backend.md; for now this just
+    // avoids running the Jira-specific login/status flow, which would fail
+    // outright with no Jira config to bootstrap. A config that fails to load
+    // at all (e.g. no config file yet) falls through to the existing flow
+    // unchanged, since `tm auth login`'s bootstrap only ever creates a Jira
+    // config and that's still the right default for a fresh install.
+    if let Ok(config) = config::load(paths)
+        && config.backend == BackendKind::Github
+    {
+        println!(
+            "tm auth is not applicable to the github backend; \
+             this repo authenticates via `gh auth login`/`gh auth status` instead."
+        );
+        return Ok(());
+    }
+
     let ctx = tskmstr::cli::auth::AuthContext {
         paths,
         keychain,
@@ -473,20 +543,18 @@ fn run_auth(
     Ok(())
 }
 
-/// Load config and build a real Jira client + `gh` wrapper, shared by
+/// Load config and build a real ticket provider (Jira or GitHub, per
+/// `config.backend` — see [`ticket_provider_for`]) + `gh` wrapper, shared by
 /// `tm ticket` and `tm pr`.
+type TicketingDeps = (Config, Box<dyn TicketProvider>, ShellGhCli);
+
 fn build_ticketing_deps(
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
-) -> Result<(Config, JiraProvider, ShellGhCli), Box<dyn std::error::Error>> {
+) -> Result<TicketingDeps, Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
-    let token = resolve_token(keychain, env_token)?;
-    let jira = JiraProvider::new(HttpJiraClient::new(JiraClientContext {
-        base_url: config.jira_base_url.clone(),
-        email: config.jira_email.clone(),
-        token,
-    }));
+    let jira = ticket_provider_for(&config, keychain, env_token)?;
     let gh = ShellGhCli::new();
     Ok((config, jira, gh))
 }
@@ -528,7 +596,7 @@ fn run_ticket(
         (Some(key), None) => {
             let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
             let ctx = TicketingContext {
-                jira: &jira,
+                jira: jira.as_ref(),
                 gh: &gh,
                 config: &config,
             };
@@ -546,8 +614,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let ctx = CreateTicketContext {
                 jira: jira.as_ref(),
                 config: &config,
@@ -581,16 +648,14 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Transition { key, status })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::transition(jira.as_ref(), &key, status.as_deref(), &mut stdout)?;
             Ok(())
         }
         (None, Some(TicketCmd::Update { key, body })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::update(jira.as_ref(), &key, &body, &mut stdout)?;
             Ok(())
@@ -598,7 +663,7 @@ fn run_ticket(
         (None, Some(TicketCmd::Comment { key, body, pr })) => {
             let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
             let ctx = TicketingContext {
-                jira: &jira,
+                jira: jira.as_ref(),
                 gh: &gh,
                 config: &config,
             };
@@ -620,8 +685,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::assign(
                 jira.as_ref(),
@@ -636,8 +700,7 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Rank { key, above, below })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::rank(
                 jira.as_ref(),
@@ -657,8 +720,7 @@ fn run_ticket(
             }),
         ) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::link(
                 jira.as_ref(),
@@ -671,8 +733,7 @@ fn run_ticket(
         }
         (None, Some(TicketCmd::Unlink { key, other })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::unlink(jira.as_ref(), &key, &other, &mut stdout)?;
             Ok(())
@@ -692,8 +753,7 @@ fn run_ticket(
         ) => run_ticket_retro(key, clean, severity, note, paths),
         (None, Some(TicketCmd::Search { text })) => {
             let config = config::load(paths)?;
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::search(jira.as_ref(), &config, &text, &mut stdout)?;
             Ok(())
@@ -750,8 +810,7 @@ fn run_ticket_audit(
             )?;
         }
         None => {
-            let token = resolve_token(keychain, env_token)?;
-            let jira = jira_client_for(&config, &token);
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
             // `AuditStoreStatus::Open` borrows `store`, so the store itself
             // has to live in this match's success arm rather than being
             // built into a `status` variable up front and dropped early.
@@ -864,8 +923,7 @@ fn run_ready(
         "tm ready <KEY> is handled by run_ready_check"
     );
     let config = config::load(paths)?;
-    let token = resolve_token(keychain, env_token)?;
-    let jira = jira_client_for(&config, &token);
+    let jira = ticket_provider_for(&config, keychain, env_token)?;
     let gh = ShellGhCli::new();
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
@@ -906,14 +964,13 @@ fn run_ready_check(key: String) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let token = match resolve_token(&keychain, env_token) {
-        Ok(token) => token,
+    let jira = match ticket_provider_for(&config, &keychain, env_token) {
+        Ok(jira) => jira,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::FAILURE;
         }
     };
-    let jira = jira_client_for(&config, &token);
     let gh = ShellGhCli::new();
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
@@ -1173,7 +1230,7 @@ fn run_pr(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (config, jira, gh) = build_ticketing_deps(paths, keychain, env_token)?;
     let ctx = TicketingContext {
-        jira: &jira,
+        jira: jira.as_ref(),
         gh: &gh,
         config: &config,
     };
