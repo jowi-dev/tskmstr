@@ -317,12 +317,12 @@ fn compute_new_ranks(
     };
 
     let (low, high) = if before {
-        let predecessor = anchor_index
-            .filter(|&i| i > 0)
-            .map(|i| existing[i - 1].1);
+        let predecessor = anchor_index.filter(|&i| i > 0).map(|i| existing[i - 1].1);
         (predecessor.unwrap_or(anchor_rank - 1000.0), anchor_rank)
     } else {
-        let successor = anchor_index.and_then(|i| existing.get(i + 1)).map(|(_, r)| *r);
+        let successor = anchor_index
+            .and_then(|i| existing.get(i + 1))
+            .map(|(_, r)| *r);
         (anchor_rank, successor.unwrap_or(anchor_rank + 1000.0))
     };
 
@@ -708,7 +708,9 @@ impl TicketProvider for GithubProvider<'_> {
         let add_assignees = if already_assigned {
             Vec::new()
         } else {
-            account_id.map(|id| vec![id.to_string()]).unwrap_or_default()
+            account_id
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default()
         };
 
         if add_assignees.is_empty() && remove_assignees.is_empty() {
@@ -746,7 +748,11 @@ impl TicketProvider for GithubProvider<'_> {
             RankAnchor::After(key) => (key.clone(), false),
         };
         let existing = store.all_ticket_ranks().map_err(store_err)?;
-        let moving: Vec<String> = keys.iter().filter(|key| **key != anchor_key).cloned().collect();
+        let moving: Vec<String> = keys
+            .iter()
+            .filter(|key| **key != anchor_key)
+            .cloned()
+            .collect();
         let assignments = compute_new_ranks(&existing, &moving, &anchor_key, before);
         for (key, rank) in &assignments {
             store.set_ticket_rank(key, *rank).map_err(store_err)?;
@@ -1452,9 +1458,13 @@ mod tests {
         let fake = FakeGhCli::new();
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
-        let err = provider.delete_link("not-a-link-id").expect_err("should fail");
+        let err = provider
+            .delete_link("not-a-link-id")
+            .expect_err("should fail");
 
-        assert!(matches!(err, ProviderError::LinkIdNotFound { link_id } if link_id == "not-a-link-id"));
+        assert!(
+            matches!(err, ProviderError::LinkIdNotFound { link_id } if link_id == "not-a-link-id")
+        );
     }
 
     #[test]
@@ -1465,7 +1475,10 @@ mod tests {
     #[test]
     fn get_issue_link_ids_round_trip_through_delete_link() {
         let fake = FakeGhCli::new()
-            .with_issue_view(3, Ok(issue_info(3, "Blocked ticket", IssueState::Open, &[])))
+            .with_issue_view(
+                3,
+                Ok(issue_info(3, "Blocked ticket", IssueState::Open, &[])),
+            )
             .with_issue_dependencies(
                 3,
                 Ok(IssueDependencies {
@@ -1497,7 +1510,10 @@ mod tests {
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
         let err = provider
-            .rank(&["GH-1".to_string()], RankAnchor::Before("GH-2".to_string()))
+            .rank(
+                &["GH-1".to_string()],
+                RankAnchor::Before("GH-2".to_string()),
+            )
             .expect_err("should fail");
 
         assert!(matches!(err, ProviderError::Api { .. }));
@@ -1511,7 +1527,10 @@ mod tests {
             GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string()).with_rank_store(&store);
 
         provider
-            .rank(&["GH-1".to_string()], RankAnchor::Before("GH-2".to_string()))
+            .rank(
+                &["GH-1".to_string()],
+                RankAnchor::Before("GH-2".to_string()),
+            )
             .unwrap();
 
         let ranks = store.all_ticket_ranks().unwrap();

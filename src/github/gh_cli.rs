@@ -793,7 +793,8 @@ const ISSUE_DEPENDENCIES_QUERY: &str = "query($owner: String!, $name: String!, $
 /// [`GhCli::create_issue_dependency`]/[`GhCli::delete_issue_dependency`]:
 /// the `addBlockedBy`/`removeBlockedBy` mutations take opaque node ids, not
 /// issue numbers, so this is always run before either mutation.
-const ISSUE_NODE_IDS_QUERY: &str = "query($owner: String!, $name: String!, $blockerNumber: Int!, $blockedNumber: Int!) {
+const ISSUE_NODE_IDS_QUERY: &str =
+    "query($owner: String!, $name: String!, $blockerNumber: Int!, $blockedNumber: Int!) {
   repository(owner: $owner, name: $name) {
     blocker: issue(number: $blockerNumber) { id }
     blocked: issue(number: $blockedNumber) { id }
@@ -2603,16 +2604,13 @@ fn interpret_issue_node_ids_output(
                     }
                 })?;
 
-            let repository =
-                response
-                    .data
-                    .and_then(|data| data.repository)
-                    .ok_or_else(|| GhError::Parse {
-                        command: "gh api graphql".to_string(),
-                        message: format!(
-                            "issue #{blocker_number} or #{blocked_number} not found"
-                        ),
-                    })?;
+            let repository = response
+                .data
+                .and_then(|data| data.repository)
+                .ok_or_else(|| GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: format!("issue #{blocker_number} or #{blocked_number} not found"),
+                })?;
 
             let blocker = repository.blocker.ok_or_else(|| GhError::Parse {
                 command: "gh api graphql".to_string(),
@@ -4829,7 +4827,13 @@ mod tests {
     #[test]
     fn interpret_issue_node_ids_output_failure_is_a_command_error() {
         let err = interpret_issue_node_ids_output(Some(1), "", "boom", 1, 2).unwrap_err();
-        assert!(matches!(err, GhError::Command { exit_code: Some(1), .. }));
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: Some(1),
+                ..
+            }
+        ));
     }
 
     #[test]
