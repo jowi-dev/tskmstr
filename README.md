@@ -947,11 +947,14 @@ login`/`gh auth status`, not a stored Jira token); ticket keys are
 closed issue, both map to their obvious default) rather than a Jira
 workflow; and `tm backend init-labels` creates those four labels in the
 configured repo (idempotently — safe to re-run) so a fresh repo's board has
-somewhere to put issues. Every write-path ticket operation (create, comment,
-update description, links, rank, assign) isn't implemented yet under the
-GitHub backend and fails with a clear "not yet implemented for the github
-backend" error rather than silently no-oping or panicking; the read path
-(`tm board`, `tm ticket search`, `tm ready`) works today. See
+somewhere to put issues. `tm ticket`/`tm ready`/the board's mutating keys
+work end to end under the GitHub backend: create, comment, update
+description, and transitions map onto `gh issue create/comment/edit`;
+associating a PR needs no remote link (the `Closes #N` line already renders
+the backlink); links (`Blocks`) use GitHub's native issue-dependencies
+GraphQL mutations; and rank has no GitHub equivalent, so it's tracked in a
+local `ticket_rank` table in `runs.db` (unranked issues sort to the end by
+issue number, same as before anything is ranked). See
 `docs/plans/github-issues-backend.md` for the full design and phase status.
 
 `review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
