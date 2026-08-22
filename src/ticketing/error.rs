@@ -15,6 +15,7 @@
 //! boundary via the [`From<JiraError>`] impl below; nothing downstream of
 //! [`super::provider::TicketProvider`] needs to know [`JiraError`] exists.
 
+use crate::github::gh_cli::GhError;
 use crate::jira::client::JiraError;
 use thiserror::Error;
 
@@ -138,6 +139,25 @@ impl From<JiraError> for ProviderError {
     }
 }
 
+impl From<GhError> for ProviderError {
+    /// Converts a `gh` shell-out error into its provider-level counterpart at
+    /// [`super::github_provider::GithubProvider`]'s boundary. Unlike
+    /// [`JiraError`], [`GhError`] carries no structured "not found" or
+    /// "unauthorized" classification -- it's always either a spawn/timeout
+    /// failure or a `gh` subcommand's raw stderr -- so every variant maps to
+    /// [`ProviderError::Api`] with a synthetic `status` of `0` (there is no
+    /// real HTTP status for a CLI invocation) and the error's `Display` text
+    /// as the message. Call sites that can say more (e.g. "this issue number
+    /// doesn't exist") build a more specific [`ProviderError`] variant
+    /// themselves instead of relying on this conversion.
+    fn from(err: GhError) -> Self {
+        ProviderError::Api {
+            status: 0,
+            message: err.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +238,21 @@ mod tests {
             link_id: "10001".to_string(),
         });
         assert!(matches!(err, ProviderError::LinkIdNotFound { link_id } if link_id == "10001"));
+    }
+
+    #[test]
+    fn converts_gh_error_to_api_with_synthetic_status() {
+        let err = ProviderError::from(GhError::Command {
+            command: "gh issue view".to_string(),
+            exit_code: Some(1),
+            stderr: "issue not found".to_string(),
+        });
+        match err {
+            ProviderError::Api { status, message } => {
+                assert_eq!(status, 0);
+                assert!(message.contains("issue not found"));
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
     }
 }

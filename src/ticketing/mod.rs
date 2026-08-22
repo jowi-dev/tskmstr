@@ -98,6 +98,7 @@
 use thiserror::Error;
 
 pub mod error;
+pub mod github_provider;
 pub mod provider;
 pub mod types;
 
