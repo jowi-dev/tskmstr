@@ -2,8 +2,9 @@
 
 Status: **phases 1-3 complete** and merged to `main` (merge commits
 `f86ff4f`, `5ae20bc`, `c00e95e`; the underlying work is `1446509`, `721a331`,
-and phase 3's commits below). Phases 4-7 are specified below per the issue but
-not started.
+and phase 3's commits below). **Phase 4 complete** on branch
+`issue-3-phase-4-gh-issue-ops` (commit `59efbed`), not yet merged. Phases
+5-7 are specified below per the issue but not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -191,11 +192,106 @@ a third phase (or a fourth adapter) needs to touch on the config side.
 Nothing about phase 4 (`GhCli` issue operations, which doesn't touch
 config at all) changes.
 
-## Phase 4 — `GhCli` issue operations (not started)
+## Phase 4 — `GhCli` issue operations (complete, commit `59efbed`)
 
-`issue_view`, `issue_list`, `issue_create`, `issue_edit`, `issue_comment`,
-plus the dependencies GraphQL query, following the existing `pr_*` methods'
-`Result<T, GhError>` + `is_permanent()` conventions.
+Added six methods to `GhCli` (`src/github/gh_cli.rs`), all `Result<T,
+GhError>` and classified by the existing `is_permanent()` convention
+unchanged:
+
+- `issue_view(repo, number)` — `gh issue view <number> -R <repo> --json
+  number,url,title,body,state,labels,assignees`, parsed into a new
+  `IssueInfo` (labels/assignees flattened from `gh`'s `{name}`/`{login}`
+  object shape to plain strings).
+- `issue_list(repo, filter)` — `gh issue list -R <repo> --state ... --limit
+  ... [--label ...] [--assignee ...] --json ...`. `IssueListFilter` always
+  carries an explicit `limit` (default 200, matching `pr_list`'s bound) —
+  `gh issue list` defaults to 30, same pitfall as `gh pr list`.
+- `issue_create(repo, req)` — `gh issue create -R <repo> --title ... --body
+  ... [--label ...] [--assignee ...]`. `gh issue create` has no `--json`
+  support and prints only the created issue's URL, so the number is parsed
+  out of that URL and a follow-up `issue_view` fetches the full `IssueInfo`
+  — the same two-step shape `pr_create` uses via `pr_view`, adapted because
+  there's no "current issue" analogous to "the PR for the current branch" to
+  re-resolve by.
+- `issue_edit(repo, number, req)` — label/assignee changes via `gh issue
+  edit -R <repo> --add-label/--remove-label/--add-assignee/
+  --remove-assignee` (skipped entirely if `req` carries none, since `gh
+  issue edit` errors on zero flags and a state-only edit is common), plus,
+  if `req.state` is set, a following `gh issue close`/`gh issue reopen -R
+  <repo>` — two separate `gh` subcommands under the hood, matching the
+  design doc's transition model ("a label swap ... plus, for Done/Reopen, a
+  close/reopen").
+- `issue_comment(repo, number, body)` — `gh issue comment <number> -R
+  <repo> --body <text>`, plain Markdown, mirroring `pr_comment`.
+- `issue_dependencies(repo, number)` — `gh api graphql` querying the
+  `Issue.blockedBy`/`Issue.blocking` connections GitHub's native issue
+  dependencies feature exposes (confirmed against the live GraphQL schema
+  via introspection during this phase — see below), fetching up to 100
+  issues per side, the same single-page bound `pr_review_threads` and
+  `pr_bot_finding_details` already use.
+
+`FakeGhCli` gained matching `with_*`/`*_calls()` builders for all six
+methods, following the existing per-method builder pattern exactly (see
+`with_issue_view`/`with_issue_dependencies` for the two places this phase's
+unconfigured-default choice departs from the norm, below).
+
+Full test suite (1862 tests, up from 1829 — 33 new tests: arg construction,
+JSON/GraphQL response parsing, error classification, and `FakeGhCli`
+call-recording, in the same style already used for `pr_*`), clippy, and
+fmt all pass.
+
+### The one real design decision this phase forced
+
+Every new method takes `repo: &str` (an `"owner/name"` slug) instead of the
+`dir: &Path` the `pr_*` methods take. The `pr_*` methods resolve their
+target repository from a git checkout (`gh repo view` run with
+`.current_dir(dir)`), because a PR is only ever meaningful relative to a
+branch actually checked out somewhere. Issue operations have no such
+anchor: `GithubProvider` (phase 5/6) will be driven entirely by
+`[backend].repo` from config, and the board or a lane run may target that
+repo without it being the invoking process's cwd, or checked out locally at
+all. Requiring a checkout just to shell out `gh issue view` would be a real
+new constraint the design doc never asked for. Every new method instead
+passes `-R <repo>` directly; only `issue_dependencies` (which needs owner
+and name as separate GraphQL variables, not a single flag) splits the slug
+first, via a new pure `split_repo_slug` that classifies a malformed slug as
+`GhError::Parse` naming the offending string — a `tm`-side config/caller
+bug, not something `gh` itself would ever say on stderr.
+
+A smaller decision: this phase's issue-dependencies GraphQL query
+(`ISSUE_DEPENDENCIES_QUERY`) was written against the schema confirmed live
+via `gh api graphql` introspection (`Issue.blockedBy`/`Issue.blocking`,
+each an `IssueConnection` taking `first: Int`), rather than assumed from
+the design doc's prose — GitHub's native issue-dependencies feature reached
+general availability only in August 2025, after this design doc's own
+Jira-parity table was written, so its exact field names weren't a safe
+guess.
+
+### What phase 4 revealed about phases 5-7
+
+`GithubProvider`'s methods (phase 5/6) can call every `GhCli` issue method
+with just `[backend].repo` — no git checkout, `dir`, or cwd resolution
+needed anywhere in the read or write path. This confirms the carry-forward
+note's assumption that a repo config field is sufficient; nothing further
+needs deciding on that front.
+
+`FakeGhCli::issue_view`'s unconfigured-number default is `Err`, not the
+`Ok(trivially empty)` default every other unconfigured `Fake*` lookup in
+this file uses — an issue number is always caller-supplied (unlike, say, a
+PR-for-branch lookup where "none" is a normal outcome), so a silent blank
+result would mask a phase 5/6 test's forgotten `with_issue_view` setup
+rather than model a real "not found" case. `issue_dependencies` keeps the
+existing empty-default convention instead, since "no dependencies" *is* a
+normal, common result. Phase 5/6's own test setup should follow this same
+split when deciding what an unconfigured fake should do, rather than
+defaulting to "empty" uniformly.
+
+`IssueEditRequest.state` bundles a close/reopen into the same request shape
+as label/assignee edits, issuing up to two separate `gh` calls internally.
+Phase 6's transition-as-label-swap logic can call `issue_edit` once per
+transition (labels plus, for `Done`/`Reopen`, `state`) rather than
+sequencing `issue_edit` and a separate close/reopen method itself — that
+sequencing already lives inside `GhCli::issue_edit`.
 
 ## Phase 5 — `GithubProvider`, read path (not started)
 
@@ -214,7 +310,7 @@ body, links, local rank table.
 `.tskmstr.toml` with `provider = "github"` in this repo, existing issues
 labeled, tskmstr's own work driven off `tm board`.
 
-## Carry-forward decisions for phases 4-7
+## Carry-forward decisions for phases 5-7
 
 Open questions phases 1-3 surfaced, recorded here so they get decided rather
 than defaulted:
