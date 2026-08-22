@@ -129,6 +129,7 @@ fn bootstrap_config(
         jira_base_url: seed.jira_base_url,
         jira_email: seed.jira_email,
         default_project_key: seed.default_project_key,
+        github_repo: None,
         default_assignee_account_id: None,
         status_on_pr: None,
         status_on_create: None,
