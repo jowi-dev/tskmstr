@@ -445,6 +445,73 @@ pub trait GhCli {
     /// wrong repository — or fail outright with "not a git repository" —
     /// corrupting blocker resolution without any obviously-related error.
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError>;
+
+    // --- Issue operations (phase 4 of the GitHub-Issues-as-a-backend work,
+    // docs/plans/github-issues-backend.md) ---
+    //
+    // Every method below takes `repo: &str`, an `"owner/name"` slug, rather
+    // than a `dir: &Path` the way the `pr_*` methods above do. That's a
+    // deliberate departure: the `pr_*` methods resolve their target
+    // repository from a git checkout (`dir`'s remote, via `gh repo view`),
+    // because a PR only exists relative to a branch that's actually checked
+    // out somewhere. `GithubProvider` (phase 5/6) has no such checkout to
+    // anchor on — it's driven entirely by `[backend].repo` from config
+    // (`docs/plans/github-issues-backend.md`'s "Carry-forward decisions"),
+    // and the board or a lane run may target that repo without it being the
+    // invoking process's cwd, or checked out locally at all. Passing the
+    // slug straight through as `-R owner/name` sidesteps needing a checkout
+    // for every issue read/write, which `dir`-based `gh repo view`
+    // resolution would otherwise require.
+
+    /// Look up issue `number` in `repo` (`gh issue view <number> -R <repo>
+    /// --json ...`).
+    fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError>;
+
+    /// List issues in `repo` matching `filter` (`gh issue list -R <repo>
+    /// --state ... --json ...`).
+    ///
+    /// `filter.limit` is always passed explicitly as `--limit`: `gh issue
+    /// list`, like `gh pr list`, defaults to 30, which would silently hide
+    /// issues in a busy repo.
+    fn issue_list(&self, repo: &str, filter: &IssueListFilter) -> Result<Vec<IssueInfo>, GhError>;
+
+    /// Create an issue in `repo` (`gh issue create -R <repo> --title ...
+    /// --body ...`).
+    ///
+    /// `gh issue create` prints only the created issue's URL on success (no
+    /// `--json` support, same as `gh pr create`); the returned [`IssueInfo`]
+    /// is fetched with a follow-up [`GhCli::issue_view`] call, the same
+    /// two-step pattern [`GhCli::pr_create`] uses via [`GhCli::pr_view`].
+    fn issue_create(&self, repo: &str, req: &IssueCreateRequest) -> Result<IssueInfo, GhError>;
+
+    /// Edit issue `number` in `repo`: label/assignee changes via `gh issue
+    /// edit -R <repo> --add-label/--remove-label/--add-assignee/
+    /// --remove-assignee`, and, if `req.state` is set, a follow-up `gh issue
+    /// close`/`gh issue reopen -R <repo>`.
+    ///
+    /// These are two separate `gh` subcommands under the hood (`gh issue
+    /// edit` has no close/reopen flag), issued in that order when both a
+    /// label/assignee change and a state change are requested. This mirrors
+    /// the design doc's transition model: "a label swap ... plus, for
+    /// Done/Reopen, a close/reopen" is exactly two `gh` calls, not one.
+    fn issue_edit(&self, repo: &str, number: u64, req: &IssueEditRequest) -> Result<(), GhError>;
+
+    /// Post a comment to issue `number` in `repo` (`gh issue comment
+    /// <number> -R <repo> --body <text>`).
+    ///
+    /// `body` is plain (GitHub-flavored) Markdown, same as
+    /// [`GhCli::pr_comment`] — no ADF conversion happens on this path.
+    fn issue_comment(&self, repo: &str, number: u64, body: &str) -> Result<(), GhError>;
+
+    /// Fetch issue `number`'s native GitHub issue dependencies in `repo`:
+    /// the issues it's blocked by, and the issues it blocks.
+    ///
+    /// Like [`GhCli::pr_review_threads`], this data is only exposed via
+    /// GraphQL, not the REST endpoints `gh` otherwise wraps, so this shells
+    /// out to `gh api graphql`. Only the first 100 issues on each side are
+    /// fetched, the same single-page limitation as
+    /// [`GhCli::pr_review_threads`].
+    fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError>;
 }
 
 /// A summary of one pull request — its number, head branch, lifecycle state,
@@ -465,6 +532,159 @@ pub struct PrSummary {
     pub updated_at: String,
 }
 
+/// The open/closed state of a GitHub issue, as reported by `state` in `gh
+/// issue view`/`gh issue list --json` output (`"OPEN"` or `"CLOSED"`).
+///
+/// Unlike [`PrLifecycle`], there is no third `Merged` state — issues only
+/// ever open or close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueState {
+    /// The issue is open.
+    Open,
+    /// The issue is closed.
+    Closed,
+}
+
+/// A GitHub issue, as returned by [`GhCli::issue_view`] or [`GhCli::issue_list`].
+///
+/// `labels` and `assignees` are flattened to plain name/login strings from
+/// `gh`'s richer `{name: ...}`/`{login: ...}` object shape — nothing in `tm`
+/// needs a label's color or an assignee's display name, only the label
+/// namespace strings (`tm:status/*`) and login used to join against
+/// `runs.db`/branch naming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueInfo {
+    /// Issue number.
+    pub number: u64,
+    /// Web URL of the issue.
+    pub url: String,
+    /// Issue title.
+    pub title: String,
+    /// Issue body (description), plain Markdown.
+    pub body: String,
+    /// Open/closed state.
+    pub state: IssueState,
+    /// Label names attached to the issue.
+    pub labels: Vec<String>,
+    /// Logins of the issue's assignees.
+    pub assignees: Vec<String>,
+}
+
+/// Which of an issue's open/closed state to request via `gh issue list
+/// --state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueListState {
+    /// Only open issues.
+    Open,
+    /// Only closed issues.
+    Closed,
+    /// Both open and closed issues.
+    All,
+}
+
+impl IssueListState {
+    /// The `--state` value `gh issue list` expects.
+    fn as_gh_arg(self) -> &'static str {
+        match self {
+            IssueListState::Open => "open",
+            IssueListState::Closed => "closed",
+            IssueListState::All => "all",
+        }
+    }
+}
+
+/// Filter for [`GhCli::issue_list`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueListFilter {
+    /// Which open/closed state to list.
+    pub state: IssueListState,
+    /// Restrict to issues carrying all of these labels. Empty means no
+    /// label filter.
+    pub labels: Vec<String>,
+    /// Restrict to issues assigned to this login (`gh issue list
+    /// --assignee`). `None` means no assignee filter.
+    pub assignee: Option<String>,
+    /// `--limit` passed to `gh issue list`. Always set explicitly (see
+    /// [`GhCli::issue_list`]'s doc comment on why `gh`'s own default of 30
+    /// isn't safe to rely on).
+    pub limit: u32,
+}
+
+impl Default for IssueListFilter {
+    /// Open issues, no label/assignee filter, `--limit 200` — the same
+    /// bound [`GhCli::pr_list`] uses for the equivalent PR listing.
+    fn default() -> Self {
+        Self {
+            state: IssueListState::Open,
+            labels: Vec::new(),
+            assignee: None,
+            limit: 200,
+        }
+    }
+}
+
+/// Request body for creating an issue via [`GhCli::issue_create`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueCreateRequest {
+    /// Issue title.
+    pub title: String,
+    /// Issue body (description), plain Markdown.
+    pub body: String,
+    /// Labels to attach at creation time.
+    pub labels: Vec<String>,
+    /// Logins to assign at creation time.
+    pub assignees: Vec<String>,
+}
+
+/// A close/reopen state change requested as part of [`IssueEditRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStateChange {
+    /// Close the issue (`gh issue close`).
+    Close,
+    /// Reopen the issue (`gh issue reopen`).
+    Reopen,
+}
+
+/// Request body for editing an issue via [`GhCli::issue_edit`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueEditRequest {
+    /// Labels to add.
+    pub add_labels: Vec<String>,
+    /// Labels to remove.
+    pub remove_labels: Vec<String>,
+    /// Logins to add as assignees.
+    pub add_assignees: Vec<String>,
+    /// Logins to remove as assignees.
+    pub remove_assignees: Vec<String>,
+    /// Close or reopen the issue, if it should change.
+    pub state: Option<IssueStateChange>,
+}
+
+/// A minimal reference to another issue, as returned inside
+/// [`IssueDependencies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRef {
+    /// The referenced issue's number.
+    pub number: u64,
+    /// The referenced issue's title.
+    pub title: String,
+    /// The referenced issue's open/closed state.
+    pub state: IssueState,
+    /// Web URL of the referenced issue.
+    pub url: String,
+}
+
+/// The result of [`GhCli::issue_dependencies`]: the issues an issue is
+/// blocked by, and the issues it blocks, via GitHub's native issue
+/// dependencies feature.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueDependencies {
+    /// Issues blocking this one.
+    pub blocked_by: Vec<IssueRef>,
+    /// Issues this one blocks.
+    pub blocking: Vec<IssueRef>,
+}
+
 /// Fields requested from `gh pr view --json`; shared so the flag and the
 /// [`PrInfo`] deserialization stay in lockstep.
 const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName";
@@ -481,6 +701,28 @@ const PR_STATE_JSON_FIELDS: &str = "state";
 /// deserialization stay in lockstep. Same `merged`-field pitfall as
 /// [`PR_STATE_JSON_FIELDS`] applies here.
 const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,state,updatedAt";
+
+/// Fields requested from `gh issue view`/`gh issue list --json`; shared so
+/// the flag and [`RawIssueView`] deserialization stay in lockstep.
+const ISSUE_JSON_FIELDS: &str = "number,url,title,body,state,labels,assignees";
+
+/// GraphQL query fetching an issue's native dependencies: the issues it's
+/// blocked by, and the issues it blocks (see [`GhCli::issue_dependencies`]).
+///
+/// Fetches only the first 100 issues per side, same single-page limitation
+/// as [`REVIEW_THREADS_QUERY`].
+const ISSUE_DEPENDENCIES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      blockedBy(first: 100) {
+        nodes { number title state url }
+      }
+      blocking(first: 100) {
+        nodes { number title state url }
+      }
+    }
+  }
+}";
 
 /// GraphQL query fetching a pull request's review threads: resolution state
 /// plus the author of each thread's first comment.
@@ -558,6 +800,27 @@ impl ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         )
+    }
+}
+
+/// Split an `"owner/name"` repo slug (e.g. `[backend].repo` from config)
+/// into its `(owner, name)` parts, for methods that need to pass them as
+/// separate `gh api graphql` variables rather than a single `-R` flag (see
+/// [`GhCli::issue_dependencies`]).
+///
+/// A malformed slug (missing or extra `/`, either half empty) is a
+/// [`GhError::Parse`] naming the offending string — this is a `tm`-side
+/// configuration/caller bug, not something `gh` itself ever reports, so
+/// there is no real stderr to attribute it to.
+fn split_repo_slug(repo: &str) -> Result<(&str, &str), GhError> {
+    match repo.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+            Ok((owner, name))
+        }
+        _ => Err(GhError::Parse {
+            command: "gh api graphql".to_string(),
+            message: format!("expected an \"owner/name\" repo slug, got {repo:?}"),
+        }),
     }
 }
 
@@ -863,6 +1126,163 @@ impl GhCli for ShellGhCli {
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &number.to_string(),
+                "-R",
+                repo,
+                "--json",
+                ISSUE_JSON_FIELDS,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh issue view".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_issue_view_output(
+            "gh issue view",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn issue_list(&self, repo: &str, filter: &IssueListFilter) -> Result<Vec<IssueInfo>, GhError> {
+        let output = Command::new("gh")
+            .args(issue_list_args(repo, filter))
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh issue list".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_issue_list_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn issue_create(&self, repo: &str, req: &IssueCreateRequest) -> Result<IssueInfo, GhError> {
+        let output = Command::new("gh")
+            .args(issue_create_args(repo, req))
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh issue create".to_string(),
+                message: err.to_string(),
+            })?;
+
+        let number = interpret_issue_create_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?;
+
+        self.issue_view(repo, number)
+    }
+
+    fn issue_edit(&self, repo: &str, number: u64, req: &IssueEditRequest) -> Result<(), GhError> {
+        if let Some(args) = issue_edit_args(repo, number, req) {
+            let output = Command::new("gh")
+                .args(args)
+                .output()
+                .map_err(|err| GhError::Spawn {
+                    command: "gh issue edit".to_string(),
+                    message: err.to_string(),
+                })?;
+
+            interpret_success_or_command_error(
+                "gh issue edit",
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stderr),
+            )?;
+        }
+
+        if let Some(state) = req.state {
+            let subcommand = match state {
+                IssueStateChange::Close => "close",
+                IssueStateChange::Reopen => "reopen",
+            };
+            let output = Command::new("gh")
+                .args(["issue", subcommand, &number.to_string(), "-R", repo])
+                .output()
+                .map_err(|err| GhError::Spawn {
+                    command: format!("gh issue {subcommand}"),
+                    message: err.to_string(),
+                })?;
+
+            interpret_success_or_command_error(
+                &format!("gh issue {subcommand}"),
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stderr),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn issue_comment(&self, repo: &str, number: u64, body: &str) -> Result<(), GhError> {
+        let output = Command::new("gh")
+            .args([
+                "issue",
+                "comment",
+                &number.to_string(),
+                "-R",
+                repo,
+                "--body",
+                body,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh issue comment".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_success_or_command_error(
+            "gh issue comment",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError> {
+        let (owner, name) = split_repo_slug(repo)?;
+
+        let query_arg = format!("query={ISSUE_DEPENDENCIES_QUERY}");
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        let number_arg = format!("number={number}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-F",
+                &owner_arg,
+                "-F",
+                &name_arg,
+                "-F",
+                &number_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_issue_dependencies_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            number,
         )
     }
 }
@@ -1516,6 +1936,369 @@ fn interpret_current_branch_output(
     }
 }
 
+/// Raw shape of one label entry in `gh issue view`/`gh issue list --json
+/// labels` output, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueLabel {
+    name: String,
+}
+
+/// Raw shape of one assignee entry in `gh issue view`/`gh issue list --json
+/// assignees` output, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueAssignee {
+    login: String,
+}
+
+/// Raw shape of `gh issue view`/one entry of `gh issue list --json
+/// {ISSUE_JSON_FIELDS}` output, for deserialization only; [`IssueInfo`] is
+/// the flattened shape callers use.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueView {
+    number: u64,
+    url: String,
+    title: String,
+    body: String,
+    state: String,
+    labels: Vec<RawIssueLabel>,
+    assignees: Vec<RawIssueAssignee>,
+}
+
+impl From<RawIssueView> for IssueInfo {
+    fn from(raw: RawIssueView) -> Self {
+        IssueInfo {
+            number: raw.number,
+            url: raw.url,
+            title: raw.title,
+            body: raw.body,
+            state: if raw.state.eq_ignore_ascii_case("closed") {
+                IssueState::Closed
+            } else {
+                IssueState::Open
+            },
+            labels: raw.labels.into_iter().map(|label| label.name).collect(),
+            assignees: raw
+                .assignees
+                .into_iter()
+                .map(|assignee| assignee.login)
+                .collect(),
+        }
+    }
+}
+
+/// Interpret the result of a `gh issue view <number> -R <repo> --json
+/// {ISSUE_JSON_FIELDS}` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. Unlike
+/// [`GhCli::pr_view`], there is no "not found" tolerance here: a missing
+/// issue number is always an error, since (unlike a branch's PR) an issue
+/// number is always supplied explicitly by the caller and "not found" is
+/// exactly as much a caller mistake as any other non-zero exit.
+fn interpret_issue_view_output(
+    command: &str,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<IssueInfo, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<RawIssueView>(stdout)
+            .map(IssueInfo::from)
+            .map_err(|err| GhError::Parse {
+                command: command.to_string(),
+                message: err.to_string(),
+            }),
+        Some(code) => Err(GhError::Command {
+            command: command.to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: command.to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Build the argument list for `gh issue list -R <repo> --state ... --limit
+/// ... [--label ...] [--assignee ...] --json {ISSUE_JSON_FIELDS}`.
+fn issue_list_args(repo: &str, filter: &IssueListFilter) -> Vec<String> {
+    let mut args = vec![
+        "issue".to_string(),
+        "list".to_string(),
+        "-R".to_string(),
+        repo.to_string(),
+        "--state".to_string(),
+        filter.state.as_gh_arg().to_string(),
+        "--limit".to_string(),
+        filter.limit.to_string(),
+        "--json".to_string(),
+        ISSUE_JSON_FIELDS.to_string(),
+    ];
+    if !filter.labels.is_empty() {
+        args.push("--label".to_string());
+        args.push(filter.labels.join(","));
+    }
+    if let Some(assignee) = &filter.assignee {
+        args.push("--assignee".to_string());
+        args.push(assignee.clone());
+    }
+    args
+}
+
+/// Interpret the result of a `gh issue list ...` invocation.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_issue_list_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<IssueInfo>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<RawIssueView>>(stdout)
+            .map(|entries| entries.into_iter().map(IssueInfo::from).collect())
+            .map_err(|err| GhError::Parse {
+                command: "gh issue list".to_string(),
+                message: err.to_string(),
+            }),
+        Some(code) => Err(GhError::Command {
+            command: "gh issue list".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh issue list".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Build the argument list for `gh issue create -R <repo> --title ... --body
+/// ... [--label ...] [--assignee ...]`.
+fn issue_create_args(repo: &str, req: &IssueCreateRequest) -> Vec<String> {
+    let mut args = vec![
+        "issue".to_string(),
+        "create".to_string(),
+        "-R".to_string(),
+        repo.to_string(),
+        "--title".to_string(),
+        req.title.clone(),
+        "--body".to_string(),
+        req.body.clone(),
+    ];
+    if !req.labels.is_empty() {
+        args.push("--label".to_string());
+        args.push(req.labels.join(","));
+    }
+    if !req.assignees.is_empty() {
+        args.push("--assignee".to_string());
+        args.push(req.assignees.join(","));
+    }
+    args
+}
+
+/// Extract an issue number from a `gh issue create`-printed URL
+/// (`https://github.com/<owner>/<repo>/issues/<number>`).
+///
+/// Pure so it can be unit tested without shelling out. Returns `None` if the
+/// last path segment isn't a valid number (a URL shape `gh` isn't expected
+/// to ever actually produce, but this avoids a panic if it somehow did).
+fn parse_issue_number_from_url(url: &str) -> Option<u64> {
+    url.trim().rsplit('/').next()?.parse().ok()
+}
+
+/// Interpret the result of a `gh issue create ...` invocation, returning the
+/// created issue's number.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. Unlike [`GhCli::pr_create`]
+/// (which re-resolves the PR via `pr_view` against the current branch),
+/// there is no "current issue" to look up by ambient state, so the number is
+/// parsed directly out of the URL `gh issue create` prints to stdout on
+/// success (see [`parse_issue_number_from_url`]).
+fn interpret_issue_create_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<u64, GhError> {
+    match exit_code {
+        Some(0) => parse_issue_number_from_url(stdout).ok_or_else(|| GhError::Parse {
+            command: "gh issue create".to_string(),
+            message: format!("could not parse an issue number out of {stdout:?}"),
+        }),
+        Some(code) => Err(GhError::Command {
+            command: "gh issue create".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh issue create".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Build the argument list for `gh issue edit <number> -R <repo>
+/// [--add-label ...] [--remove-label ...] [--add-assignee ...]
+/// [--remove-assignee ...]`, or `None` if `req` carries no label/assignee
+/// change at all (in which case [`GhCli::issue_edit`] skips this `gh` call
+/// entirely — `gh issue edit` errors if given no flags, and a
+/// state-change-only edit is a legitimate, common request. e.g. `Done`).
+fn issue_edit_args(repo: &str, number: u64, req: &IssueEditRequest) -> Option<Vec<String>> {
+    if req.add_labels.is_empty()
+        && req.remove_labels.is_empty()
+        && req.add_assignees.is_empty()
+        && req.remove_assignees.is_empty()
+    {
+        return None;
+    }
+
+    let mut args = vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+        "-R".to_string(),
+        repo.to_string(),
+    ];
+    if !req.add_labels.is_empty() {
+        args.push("--add-label".to_string());
+        args.push(req.add_labels.join(","));
+    }
+    if !req.remove_labels.is_empty() {
+        args.push("--remove-label".to_string());
+        args.push(req.remove_labels.join(","));
+    }
+    if !req.add_assignees.is_empty() {
+        args.push("--add-assignee".to_string());
+        args.push(req.add_assignees.join(","));
+    }
+    if !req.remove_assignees.is_empty() {
+        args.push("--remove-assignee".to_string());
+        args.push(req.remove_assignees.join(","));
+    }
+    Some(args)
+}
+
+/// Raw shape of one issue node (`{number, title, state, url}`) inside
+/// [`ISSUE_DEPENDENCIES_QUERY`]'s response, for deserialization only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDependencyIssueNode {
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+}
+
+impl From<RawDependencyIssueNode> for IssueRef {
+    fn from(raw: RawDependencyIssueNode) -> Self {
+        IssueRef {
+            number: raw.number,
+            title: raw.title,
+            state: if raw.state.eq_ignore_ascii_case("closed") {
+                IssueState::Closed
+            } else {
+                IssueState::Open
+            },
+            url: raw.url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDependencyConnection {
+    nodes: Vec<RawDependencyIssueNode>,
+}
+
+/// Raw shape of the `gh api graphql` response body for
+/// [`ISSUE_DEPENDENCIES_QUERY`], for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueDependenciesResponse {
+    data: Option<RawIssueDependenciesData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueDependenciesData {
+    repository: Option<RawIssueDependenciesRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueDependenciesRepository {
+    issue: Option<RawIssueDependenciesIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueDependenciesIssue {
+    #[serde(rename = "blockedBy")]
+    blocked_by: RawDependencyConnection,
+    blocking: RawDependencyConnection,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`ISSUE_DEPENDENCIES_QUERY`] for issue `number`.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. A null
+/// `data.repository.issue` (issue not found) is a [`GhError::Parse`] naming
+/// `number`, the same convention as [`interpret_review_threads_output`].
+fn interpret_issue_dependencies_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    number: u64,
+) -> Result<IssueDependencies, GhError> {
+    match exit_code {
+        Some(0) => {
+            let response =
+                serde_json::from_str::<RawIssueDependenciesResponse>(stdout).map_err(|err| {
+                    GhError::Parse {
+                        command: "gh api graphql".to_string(),
+                        message: err.to_string(),
+                    }
+                })?;
+
+            let issue = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.issue)
+                .ok_or_else(|| GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: format!("issue #{number} not found"),
+                })?;
+
+            Ok(IssueDependencies {
+                blocked_by: issue
+                    .blocked_by
+                    .nodes
+                    .into_iter()
+                    .map(IssueRef::from)
+                    .collect(),
+                blocking: issue
+                    .blocking
+                    .nodes
+                    .into_iter()
+                    .map(IssueRef::from)
+                    .collect(),
+            })
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// A [`GhCli`] test double: returns canned results and records the
 /// `pr_create`/`pr_edit` calls made against it, for use by tests (including
 /// later ticketing-flow tests) that don't want to shell out to a real `gh`.
@@ -1548,6 +2331,18 @@ pub struct FakeGhCli {
     pr_url_for_branch_calls: RefCell<Vec<String>>,
     pr_list_all_result: RefCell<Result<Vec<PrSummary>, GhError>>,
     pr_list_all_calls: RefCell<Vec<PathBuf>>,
+    issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
+    issue_view_calls: RefCell<Vec<(String, u64)>>,
+    issue_list_result: RefCell<Result<Vec<IssueInfo>, GhError>>,
+    issue_list_calls: RefCell<Vec<(String, IssueListFilter)>>,
+    issue_create_result: RefCell<Result<IssueInfo, GhError>>,
+    issue_create_calls: RefCell<Vec<(String, IssueCreateRequest)>>,
+    issue_edit_result: RefCell<Result<(), GhError>>,
+    issue_edit_calls: RefCell<Vec<(String, u64, IssueEditRequest)>>,
+    issue_comment_result: RefCell<Result<(), GhError>>,
+    issue_comment_calls: RefCell<Vec<(String, u64, String)>>,
+    issue_dependencies_results: RefCell<HashMap<u64, Result<IssueDependencies, GhError>>>,
+    issue_dependencies_calls: RefCell<Vec<(String, u64)>>,
 }
 
 impl Default for FakeGhCli {
@@ -1587,6 +2382,26 @@ impl Default for FakeGhCli {
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
             pr_list_all_result: RefCell::new(Ok(Vec::new())),
             pr_list_all_calls: RefCell::new(Vec::new()),
+            issue_view_results: RefCell::new(HashMap::new()),
+            issue_view_calls: RefCell::new(Vec::new()),
+            issue_list_result: RefCell::new(Ok(Vec::new())),
+            issue_list_calls: RefCell::new(Vec::new()),
+            issue_create_result: RefCell::new(Ok(IssueInfo {
+                number: 0,
+                url: String::new(),
+                title: String::new(),
+                body: String::new(),
+                state: IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            })),
+            issue_create_calls: RefCell::new(Vec::new()),
+            issue_edit_result: RefCell::new(Ok(())),
+            issue_edit_calls: RefCell::new(Vec::new()),
+            issue_comment_result: RefCell::new(Ok(())),
+            issue_comment_calls: RefCell::new(Vec::new()),
+            issue_dependencies_results: RefCell::new(HashMap::new()),
+            issue_dependencies_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -1777,6 +2592,95 @@ impl FakeGhCli {
     pub fn pr_list_all_calls(&self) -> Vec<PathBuf> {
         self.pr_list_all_calls.borrow().clone()
     }
+
+    /// Set the result `issue_view` will return for issue `number`.
+    ///
+    /// An issue number with no configured result returns
+    /// `Err(GhError::Command { .. })`, unlike this fake's other unconfigured
+    /// lookups (which default to trivially empty) — an issue number is
+    /// always caller-supplied, so silently returning a blank [`IssueInfo`]
+    /// would hide a test's forgotten setup rather than a real "not found"
+    /// case.
+    pub fn with_issue_view(self, number: u64, result: Result<IssueInfo, GhError>) -> Self {
+        self.issue_view_results.borrow_mut().insert(number, result);
+        self
+    }
+
+    /// The `(repo, number)` pairs passed to `issue_view`, in call order.
+    pub fn issue_view_calls(&self) -> Vec<(String, u64)> {
+        self.issue_view_calls.borrow().clone()
+    }
+
+    /// Set the result `issue_list` will return.
+    pub fn with_issue_list(self, result: Result<Vec<IssueInfo>, GhError>) -> Self {
+        *self.issue_list_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, filter)` pairs passed to `issue_list`, in call order.
+    pub fn issue_list_calls(&self) -> Vec<(String, IssueListFilter)> {
+        self.issue_list_calls.borrow().clone()
+    }
+
+    /// Set the result `issue_create` will return.
+    pub fn with_issue_create_result(self, result: Result<IssueInfo, GhError>) -> Self {
+        *self.issue_create_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, request)` pairs passed to `issue_create`, in call order.
+    pub fn issue_create_calls(&self) -> Vec<(String, IssueCreateRequest)> {
+        self.issue_create_calls.borrow().clone()
+    }
+
+    /// Set the result `issue_edit` will return.
+    pub fn with_issue_edit_result(self, result: Result<(), GhError>) -> Self {
+        *self.issue_edit_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, number, request)` triples passed to `issue_edit`, in call
+    /// order.
+    pub fn issue_edit_calls(&self) -> Vec<(String, u64, IssueEditRequest)> {
+        self.issue_edit_calls.borrow().clone()
+    }
+
+    /// Set the result `issue_comment` will return.
+    pub fn with_issue_comment_result(self, result: Result<(), GhError>) -> Self {
+        *self.issue_comment_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, number, body)` triples passed to `issue_comment`, in call
+    /// order.
+    pub fn issue_comment_calls(&self) -> Vec<(String, u64, String)> {
+        self.issue_comment_calls.borrow().clone()
+    }
+
+    /// Set the result `issue_dependencies` will return for issue `number`.
+    ///
+    /// An issue number with no configured result returns
+    /// `Ok(IssueDependencies::default())` (no dependencies either way),
+    /// mirroring [`FakeGhCli::with_review_threads`]'s
+    /// unconfigured-is-trivially-empty convention — unlike
+    /// [`FakeGhCli::with_issue_view`], "no dependencies" is a perfectly
+    /// normal, common result, not a sign of forgotten test setup.
+    pub fn with_issue_dependencies(
+        self,
+        number: u64,
+        result: Result<IssueDependencies, GhError>,
+    ) -> Self {
+        self.issue_dependencies_results
+            .borrow_mut()
+            .insert(number, result);
+        self
+    }
+
+    /// The `(repo, number)` pairs passed to `issue_dependencies`, in call
+    /// order.
+    pub fn issue_dependencies_calls(&self) -> Vec<(String, u64)> {
+        self.issue_dependencies_calls.borrow().clone()
+    }
 }
 
 impl GhCli for FakeGhCli {
@@ -1870,6 +2774,58 @@ impl GhCli for FakeGhCli {
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
         self.pr_list_all_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_all_result.borrow().clone()
+    }
+
+    fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError> {
+        self.issue_view_calls
+            .borrow_mut()
+            .push((repo.to_string(), number));
+        match self.issue_view_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Err(GhError::Command {
+                command: "gh issue view".to_string(),
+                exit_code: Some(1),
+                stderr: format!("no FakeGhCli issue_view result configured for #{number}"),
+            }),
+        }
+    }
+
+    fn issue_list(&self, repo: &str, filter: &IssueListFilter) -> Result<Vec<IssueInfo>, GhError> {
+        self.issue_list_calls
+            .borrow_mut()
+            .push((repo.to_string(), filter.clone()));
+        self.issue_list_result.borrow().clone()
+    }
+
+    fn issue_create(&self, repo: &str, req: &IssueCreateRequest) -> Result<IssueInfo, GhError> {
+        self.issue_create_calls
+            .borrow_mut()
+            .push((repo.to_string(), req.clone()));
+        self.issue_create_result.borrow().clone()
+    }
+
+    fn issue_edit(&self, repo: &str, number: u64, req: &IssueEditRequest) -> Result<(), GhError> {
+        self.issue_edit_calls
+            .borrow_mut()
+            .push((repo.to_string(), number, req.clone()));
+        self.issue_edit_result.borrow().clone()
+    }
+
+    fn issue_comment(&self, repo: &str, number: u64, body: &str) -> Result<(), GhError> {
+        self.issue_comment_calls
+            .borrow_mut()
+            .push((repo.to_string(), number, body.to_string()));
+        self.issue_comment_result.borrow().clone()
+    }
+
+    fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError> {
+        self.issue_dependencies_calls
+            .borrow_mut()
+            .push((repo.to_string(), number));
+        match self.issue_dependencies_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(IssueDependencies::default()),
+        }
     }
 }
 
@@ -2856,5 +3812,479 @@ mod tests {
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    // --- issue_view ---
+
+    #[test]
+    fn issue_view_parses_successful_json() {
+        let stdout = r#"{
+            "number": 3,
+            "url": "https://github.com/jowi-dev/tskmstr/issues/3",
+            "title": "GitHub Issues as a ticket backend",
+            "body": "Goal section",
+            "state": "OPEN",
+            "labels": [{"name": "tm:status/in-progress"}, {"name": "enhancement"}],
+            "assignees": [{"login": "jowi-dev"}]
+        }"#;
+        let issue = interpret_issue_view_output("gh issue view", Some(0), stdout, "").unwrap();
+        assert_eq!(issue.number, 3);
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(
+            issue.labels,
+            vec![
+                "tm:status/in-progress".to_string(),
+                "enhancement".to_string()
+            ]
+        );
+        assert_eq!(issue.assignees, vec!["jowi-dev".to_string()]);
+    }
+
+    #[test]
+    fn issue_view_closed_state_parses() {
+        let stdout = r#"{
+            "number": 1, "url": "u", "title": "t", "body": "b",
+            "state": "CLOSED", "labels": [], "assignees": []
+        }"#;
+        let issue = interpret_issue_view_output("gh issue view", Some(0), stdout, "").unwrap();
+        assert_eq!(issue.state, IssueState::Closed);
+    }
+
+    #[test]
+    fn issue_view_malformed_json_is_a_parse_error() {
+        let err =
+            interpret_issue_view_output("gh issue view", Some(0), "not json", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn issue_view_failure_is_a_command_error() {
+        let err = interpret_issue_view_output("gh issue view", Some(1), "", "gh: issue not found")
+            .unwrap_err();
+        match err {
+            GhError::Command { stderr, .. } => assert!(stderr.contains("not found")),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_view_signal_termination_is_a_command_error() {
+        let err = interpret_issue_view_output("gh issue view", None, "", "").unwrap_err();
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_view_records_calls_and_returns_configured_result() {
+        let issue = IssueInfo {
+            number: 3,
+            url: "https://github.com/jowi-dev/tskmstr/issues/3".to_string(),
+            title: "GitHub Issues as a ticket backend".to_string(),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: vec!["tm:status/todo".to_string()],
+            assignees: Vec::new(),
+        };
+        let fake = FakeGhCli::new().with_issue_view(3, Ok(issue.clone()));
+
+        assert_eq!(fake.issue_view("jowi-dev/tskmstr", 3).unwrap(), issue);
+        assert_eq!(
+            fake.issue_view_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_view_unconfigured_number_is_an_error() {
+        let fake = FakeGhCli::new();
+        let err = fake.issue_view("jowi-dev/tskmstr", 99).unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    // --- issue_list ---
+
+    #[test]
+    fn issue_list_args_include_state_limit_and_json_fields() {
+        let filter = IssueListFilter::default();
+        let args = issue_list_args("jowi-dev/tskmstr", &filter);
+        assert_eq!(
+            args,
+            vec![
+                "issue",
+                "list",
+                "-R",
+                "jowi-dev/tskmstr",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                ISSUE_JSON_FIELDS,
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_list_args_include_labels_and_assignee_when_set() {
+        let filter = IssueListFilter {
+            state: IssueListState::All,
+            labels: vec!["tm:status/todo".to_string(), "bug".to_string()],
+            assignee: Some("jowi-dev".to_string()),
+            limit: 50,
+        };
+        let args = issue_list_args("jowi-dev/tskmstr", &filter);
+        assert!(args.contains(&"--label".to_string()));
+        assert!(args.contains(&"tm:status/todo,bug".to_string()));
+        assert!(args.contains(&"--assignee".to_string()));
+        assert!(args.contains(&"jowi-dev".to_string()));
+        assert!(args.contains(&"all".to_string()));
+    }
+
+    #[test]
+    fn issue_list_parses_successful_json_array() {
+        let stdout = r#"[
+            {"number": 1, "url": "u1", "title": "t1", "body": "", "state": "OPEN", "labels": [], "assignees": []},
+            {"number": 2, "url": "u2", "title": "t2", "body": "", "state": "CLOSED", "labels": [], "assignees": []}
+        ]"#;
+        let issues = interpret_issue_list_output(Some(0), stdout, "").unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].number, 1);
+        assert_eq!(issues[1].state, IssueState::Closed);
+    }
+
+    #[test]
+    fn issue_list_failure_is_a_command_error() {
+        let err = interpret_issue_list_output(Some(1), "", "gh: not authenticated").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_list_records_calls_and_returns_configured_result() {
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![IssueInfo {
+            number: 1,
+            url: String::new(),
+            title: "t".to_string(),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        }]));
+        let filter = IssueListFilter::default();
+
+        let result = fake.issue_list("jowi-dev/tskmstr", &filter).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            fake.issue_list_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), filter)]
+        );
+    }
+
+    // --- issue_create ---
+
+    #[test]
+    fn issue_create_args_omit_label_and_assignee_flags_when_empty() {
+        let req = IssueCreateRequest {
+            title: "Fix the thing".to_string(),
+            body: "Details".to_string(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+        let args = issue_create_args("jowi-dev/tskmstr", &req);
+        assert_eq!(
+            args,
+            vec![
+                "issue",
+                "create",
+                "-R",
+                "jowi-dev/tskmstr",
+                "--title",
+                "Fix the thing",
+                "--body",
+                "Details",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_create_args_include_labels_and_assignees_when_set() {
+        let req = IssueCreateRequest {
+            title: "Fix the thing".to_string(),
+            body: "Details".to_string(),
+            labels: vec!["tm:status/todo".to_string()],
+            assignees: vec!["jowi-dev".to_string()],
+        };
+        let args = issue_create_args("jowi-dev/tskmstr", &req);
+        assert!(args.contains(&"--label".to_string()));
+        assert!(args.contains(&"tm:status/todo".to_string()));
+        assert!(args.contains(&"--assignee".to_string()));
+        assert!(args.contains(&"jowi-dev".to_string()));
+    }
+
+    #[test]
+    fn parse_issue_number_from_url_extracts_trailing_segment() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/jowi-dev/tskmstr/issues/42\n"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_issue_number_from_url_none_for_non_numeric_segment() {
+        assert_eq!(
+            parse_issue_number_from_url("https://github.com/jowi-dev/tskmstr"),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_create_success_returns_parsed_number() {
+        let number = interpret_issue_create_output(
+            Some(0),
+            "https://github.com/jowi-dev/tskmstr/issues/42\n",
+            "",
+        )
+        .unwrap();
+        assert_eq!(number, 42);
+    }
+
+    #[test]
+    fn issue_create_failure_is_a_command_error() {
+        let err = interpret_issue_create_output(Some(1), "", "gh: validation failed").unwrap_err();
+        match err {
+            GhError::Command { stderr, .. } => assert!(stderr.contains("validation failed")),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_create_unparseable_url_is_a_parse_error() {
+        let err = interpret_issue_create_output(Some(0), "not a url", "").unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_create_records_calls_and_returns_configured_result() {
+        let created = IssueInfo {
+            number: 42,
+            url: "https://github.com/jowi-dev/tskmstr/issues/42".to_string(),
+            title: "Fix the thing".to_string(),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created.clone()));
+        let req = IssueCreateRequest {
+            title: "Fix the thing".to_string(),
+            body: "Details".to_string(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+
+        let result = fake.issue_create("jowi-dev/tskmstr", &req).unwrap();
+        assert_eq!(result, created);
+        assert_eq!(
+            fake.issue_create_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), req)]
+        );
+    }
+
+    // --- issue_edit ---
+
+    #[test]
+    fn issue_edit_args_none_when_no_label_or_assignee_change() {
+        let req = IssueEditRequest {
+            state: Some(IssueStateChange::Close),
+            ..Default::default()
+        };
+        assert_eq!(issue_edit_args("jowi-dev/tskmstr", 3, &req), None);
+    }
+
+    #[test]
+    fn issue_edit_args_build_add_and_remove_flags() {
+        let req = IssueEditRequest {
+            add_labels: vec!["tm:status/in-progress".to_string()],
+            remove_labels: vec!["tm:status/todo".to_string()],
+            add_assignees: vec!["jowi-dev".to_string()],
+            remove_assignees: vec!["other-dev".to_string()],
+            state: None,
+        };
+        let args = issue_edit_args("jowi-dev/tskmstr", 3, &req).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "issue",
+                "edit",
+                "3",
+                "-R",
+                "jowi-dev/tskmstr",
+                "--add-label",
+                "tm:status/in-progress",
+                "--remove-label",
+                "tm:status/todo",
+                "--add-assignee",
+                "jowi-dev",
+                "--remove-assignee",
+                "other-dev",
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_edit_records_calls() {
+        let fake = FakeGhCli::new();
+        let req = IssueEditRequest {
+            add_labels: vec!["tm:status/in-progress".to_string()],
+            state: Some(IssueStateChange::Close),
+            ..Default::default()
+        };
+
+        fake.issue_edit("jowi-dev/tskmstr", 3, &req).unwrap();
+
+        assert_eq!(
+            fake.issue_edit_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 3, req)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_edit_seeded_error_is_returned() {
+        let fake = FakeGhCli::new().with_issue_edit_result(Err(GhError::Command {
+            command: "gh issue edit".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+
+        let err = fake
+            .issue_edit("jowi-dev/tskmstr", 3, &IssueEditRequest::default())
+            .unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    // --- issue_comment ---
+
+    #[test]
+    fn fake_gh_cli_records_issue_comment_calls() {
+        let fake = FakeGhCli::new();
+
+        fake.issue_comment("jowi-dev/tskmstr", 3, "Looks good.")
+            .unwrap();
+
+        assert_eq!(
+            fake.issue_comment_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 3, "Looks good.".to_string())]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_comment_seeded_error_is_returned() {
+        let fake = FakeGhCli::new().with_issue_comment_result(Err(GhError::Command {
+            command: "gh issue comment".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+
+        let err = fake
+            .issue_comment("jowi-dev/tskmstr", 3, "body")
+            .unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    // --- issue_dependencies ---
+
+    #[test]
+    fn split_repo_slug_splits_owner_and_name() {
+        assert_eq!(
+            split_repo_slug("jowi-dev/tskmstr").unwrap(),
+            ("jowi-dev", "tskmstr")
+        );
+    }
+
+    #[test]
+    fn split_repo_slug_rejects_malformed_slugs() {
+        assert!(split_repo_slug("no-slash").is_err());
+        assert!(split_repo_slug("/tskmstr").is_err());
+        assert!(split_repo_slug("jowi-dev/").is_err());
+        assert!(split_repo_slug("jowi-dev/tskmstr/extra").is_err());
+    }
+
+    #[test]
+    fn issue_dependencies_parses_blocked_by_and_blocking() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "issue": {
+                        "blockedBy": {
+                            "nodes": [
+                                {"number": 1, "title": "Provider trait", "state": "CLOSED", "url": "u1"}
+                            ]
+                        },
+                        "blocking": {
+                            "nodes": [
+                                {"number": 5, "title": "Dogfood", "state": "OPEN", "url": "u5"}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let deps = interpret_issue_dependencies_output(Some(0), stdout, "", 3).unwrap();
+        assert_eq!(deps.blocked_by.len(), 1);
+        assert_eq!(deps.blocked_by[0].number, 1);
+        assert_eq!(deps.blocked_by[0].state, IssueState::Closed);
+        assert_eq!(deps.blocking.len(), 1);
+        assert_eq!(deps.blocking[0].number, 5);
+    }
+
+    #[test]
+    fn issue_dependencies_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"issue": null}}}"#;
+        let err = interpret_issue_dependencies_output(Some(0), stdout, "", 3).unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains('3')),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_dependencies_failure_is_a_command_error() {
+        let err = interpret_issue_dependencies_output(Some(1), "", "gh: rate limit exceeded", 3)
+            .unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_dependencies_defaults_to_empty() {
+        let fake = FakeGhCli::new();
+        let deps = fake.issue_dependencies("jowi-dev/tskmstr", 3).unwrap();
+        assert_eq!(deps, IssueDependencies::default());
+        assert_eq!(
+            fake.issue_dependencies_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issue_dependencies_returns_configured_result() {
+        let deps = IssueDependencies {
+            blocked_by: vec![IssueRef {
+                number: 1,
+                title: "Provider trait".to_string(),
+                state: IssueState::Closed,
+                url: "u1".to_string(),
+            }],
+            blocking: Vec::new(),
+        };
+        let fake = FakeGhCli::new().with_issue_dependencies(3, Ok(deps.clone()));
+
+        assert_eq!(
+            fake.issue_dependencies("jowi-dev/tskmstr", 3).unwrap(),
+            deps
+        );
     }
 }
