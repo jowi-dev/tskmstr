@@ -5,8 +5,8 @@
 //! function in [`crate::ticketing`], every `tm ticket`/`tm ready`/`tm pr`
 //! command, and the board TUI depend on. A ticket key is still a plain
 //! `&str`, and every error is a backend-agnostic
-//! [`ProviderError`](crate::ticketing::error::ProviderError) rather than a
-//! Jira-specific [`JiraError`] — see [`crate::ticketing::error`] for how
+//! [`crate::ticketing::error::ProviderError`] rather than a Jira-specific
+//! [`crate::jira::client::JiraError`] — see [`crate::ticketing::error`] for how
 //! [`JiraProvider`] converts at the boundary. Queries and descriptions are
 //! also already backend-agnostic: [`TicketProvider::search`] takes a [`TicketQuery`]
 //! rather than a JQL string, and [`TicketProvider::create_issue`],
