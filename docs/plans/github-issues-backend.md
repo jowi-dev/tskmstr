@@ -1,11 +1,12 @@
 # GitHub Issues as a ticket backend (issue #3), phases 1-7
 
-Status: **phases 1-5 (and the phase 5 prep refactor) complete** and merged to
-`main` (merge commits `f86ff4f`, `5ae20bc`, `c00e95e`, and `e0aaf33` for
-phase 5; the underlying work is `1446509`, `721a331`, phase 3's commits
-below, `59efbed`, `877296d`/`b77baaf`, and phase 5's commits below). **Phase
-6 complete** on branch `issue-3-phase-6-github-write-path` (commits below),
-not yet merged. Phase 7 is specified below per the issue but not started.
+Status: **all seven phases complete.** Phases 1-6 (and the phase 5 prep
+refactor) are merged to `main` (merge commits `f86ff4f`, `5ae20bc`,
+`c00e95e`, `e0aaf33`, and `d6c5f4d`; the underlying work is `1446509`,
+`721a331`, phase 3's commits below, `59efbed`, `877296d`/`b77baaf`, phase
+5's commits below, and phase 6's commits below). **Phase 7** (dogfood) is
+complete on branch `issue-3-phase-7-dogfood` (commit below), not yet
+merged.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -723,15 +724,88 @@ phase 5's carry-forward list:
   against the trait. Left for phase 7 or later to decide with the dogfooding
   workload as a forcing function, rather than speculatively here.
 
-## Phase 7 — dogfood (not started)
+## Phase 7 — dogfood (complete, branch `issue-3-phase-7-dogfood`)
 
-`.tskmstr.toml` with `provider = "github"` in this repo, existing issues
-labeled, tskmstr's own work driven off `tm board`.
+Commits: `469d2d0` (`.tskmstr.toml`), plus this section's doc update. No
+source changes were needed — phases 1-6 already made every code path this
+phase exercises live. Full test suite still 1959 tests (unchanged from
+phase 6's tip), clippy, fmt, and `nix build` all pass.
+
+**Config.** `.tskmstr.toml` at the repo root is just:
+
+```toml
+[backend]
+provider = "github"
+```
+
+No `[backend.github].repo` at all — `[backend.github].repo`'s
+defaulting-from-`origin`-remote path (`detect_origin_repo`, added in phase 5)
+was verified live rather than assumed: running `./target/debug/tm ready
+GH-3` from a checkout of this repo with only `provider = "github"` set
+resolved the repo to `jowi-dev/tskmstr` and fetched the real issue
+correctly. No bug found; the explicit-`repo`-in-config fallback the task
+brief flagged as a possible workaround wasn't needed.
+
+**`tm backend init-labels`**, run live against `jowi-dev/tskmstr`: created
+all four `tm:status/*` labels (confirmed via `gh label list`). Re-running it
+immediately after is idempotent — `gh label create --force` means the second
+run reports the same four "Created label ..." lines with no error and no
+duplicate labels (`gh label list` still shows exactly one of each
+afterward).
+
+**Existing issues labeled.** Issue #3 (this phase's own in-flight work) is
+`tm:status/in-progress`. Issues #1 and #2 are `tm:status/todo` — #1 got there
+via `tm ticket transition GH-1 "To Do"` (a no-op reporting "already in To
+Do" the first time it was tried, since an unlabeled open issue already
+synthesizes as `todo`; #2 hit the same no-op path); the label itself was
+then applied to both directly via `gh issue edit --add-label` so the design's
+"existing issues labeled" holds literally rather than relying on the
+implicit no-label-means-todo reading. No issue was closed, retitled, or had
+its body edited.
+
+**Live verification, all via the real `jowi-dev/tskmstr` repo and the real
+`gh` CLI:**
+
+- `tm ticket audit GH-3` printed the live issue's title, status, assignee,
+  and full Markdown body — confirms `get_issue`/`description_text` work
+  live, not just against `FakeGhCli`.
+- `tm ready GH-3` returned "GH-3 is ready (To Do)" before the round-trip
+  below, and "GH-3 is ready (In Progress)" after — confirms the dependency
+  read path (`open_blockers`/`get_issue`'s `Blocks` links) runs live with no
+  crash even though GH-3 has no dependencies to find.
+- `tm ready` (no key) correctly printed "No ready tickets." — every open
+  issue here is unassigned, so the `assignee = @me` filter legitimately
+  empties the list; this is the expected result, not a bug.
+- Transition round-trip on GH-1 (chosen as the lowest-stakes open issue):
+  `tm ticket transition GH-1 "In Progress"` → confirmed via `gh issue view 1
+  --json labels` that `tm:status/in-progress` was applied → `tm ticket
+  transition GH-1 "To Do"` → confirmed `tm:status/todo` replaced it. Original
+  state (no explicit label, reading as `todo`) is restored in spirit (an
+  explicit `tm:status/todo` label now, per the labeling pass above, but the
+  synthesized status is identical either way).
+- `tm ticket transition GH-3` (no target) printed the correct four remaining
+  transitions for an in-progress issue (`To Do`, `In Review`, `Blocked`,
+  `Done`).
+
+**No live-found bugs.** Every read and write path exercised behaved exactly
+as phases 5/6's design predicted; the only thing this phase's live run
+actually tested that hadn't been exercised outside unit tests before was
+`detect_origin_repo`'s git-remote-URL parsing against this repo's own real
+`git@github.com:jowi-dev/tskmstr.git` origin, which worked on the first try.
+
+**tskmstr's own work driven off `tm board`.** Mechanically true as of this
+phase (the board reads/writes real issues in this repo), but not yet
+exercised as a workflow — no board session was run interactively this phase
+beyond the CLI commands above. That's a process change for future sessions
+to adopt, not something this phase could "complete" any further by itself.
 
 ## Carry-forward decisions for phases 5-7
 
 Open questions phases 1-3 surfaced, recorded here so they get decided rather
-than defaulted:
+than defaulted. Phase 7 was dogfooding, not implementation — it exercised
+these paths live but didn't have natural scope to resolve any of the three
+still-open items below; they carry forward past phase 7 as real follow-up
+work, not phase-7 gaps.
 
 - ~~**Config shape.**~~ Resolved by phase 5: `[backend.github].repo` exists
   (required, defaultable from the checkout's `origin` remote), and
