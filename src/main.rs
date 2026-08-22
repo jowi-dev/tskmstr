@@ -211,6 +211,16 @@ fn run_backend(cmd: BackendCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::
 /// the fact), but `Box<dyn TicketProvider>` requires `'static`. `tm` is a
 /// short-lived CLI process, and `ShellGhCli` is a zero-sized unit struct, so
 /// leaking one costs nothing.
+///
+/// It also opens (and leaks, same rationale) a [`tskmstr::runs::RunStore`]
+/// at `config`'s configured run database path, attached via
+/// [`GithubProvider::with_rank_store`] — this is the one place production
+/// wiring backs `TicketProvider::rank`/the `Ranked`/`ReadyCandidates`
+/// queries with the local `ticket_rank` table (phase 6,
+/// `docs/plans/github-issues-backend.md`). A `RunStore` (unlike `ShellGhCli`)
+/// isn't zero-sized, but it's still a single per-invocation allocation for a
+/// short-lived CLI process, the same trade this function already makes for
+/// `GhCli`.
 fn ticket_provider_for(
     config: &Config,
     keychain: &dyn KeychainStore,
@@ -227,7 +237,12 @@ fn ticket_provider_for(
                 .clone()
                 .ok_or("github backend selected but no [backend.github].repo is configured")?;
             let gh: &'static dyn GhCli = Box::leak(Box::new(ShellGhCli::new()));
-            Ok(Box::new(GithubProvider::new(gh, repo)))
+            let run_store: &'static tskmstr::runs::RunStore = Box::leak(Box::new(
+                tskmstr::runs::RunStore::open(&run_db_path_from_config(config))?,
+            ));
+            Ok(Box::new(
+                GithubProvider::new(gh, repo).with_rank_store(run_store),
+            ))
         }
     }
 }

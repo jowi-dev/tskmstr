@@ -1,6 +1,5 @@
-//! [`GithubProvider`]: the GitHub Issues [`TicketProvider`] implementation,
-//! read path only (phase 5 of `docs/plans/github-issues-backend.md`; GitHub
-//! issue #3).
+//! [`GithubProvider`]: the GitHub Issues [`TicketProvider`] implementation
+//! (phases 5-6 of `docs/plans/github-issues-backend.md`; GitHub issue #3).
 //!
 //! Status lives in the reserved `tm:status/*` label namespace rather than a
 //! workflow field GitHub doesn't have: no label (or `tm:status/todo`) means
@@ -20,22 +19,31 @@
 //! this provider is driven entirely by the configured `repo` slug, never a
 //! git checkout.
 //!
-//! Every write-path method ([`TicketProvider::create_issue`],
-//! [`TicketProvider::add_remote_link`], [`TicketProvider::assign`],
-//! [`TicketProvider::rank`], [`TicketProvider::create_link`],
-//! [`TicketProvider::delete_link`], [`TicketProvider::update_description`],
-//! [`TicketProvider::add_comment`]) is a stub returning
-//! [`not_yet_implemented`]'s [`ProviderError::Api`] — phase 6's job. That's
-//! eight stubs out of sixteen trait methods, past the "two or three" the
-//! carry-forward decisions doc named as the threshold for splitting
-//! [`TicketProvider`] into narrower capability traits; phase 6 should weigh
-//! that split rather than adding a ninth.
+//! Phase 6 (`docs/plans/github-issues-backend.md`) implements every
+//! write-path method: [`TicketProvider::create_issue`] (`gh issue create`,
+//! `tm:status/todo` applied at creation), [`TicketProvider::assign`]
+//! (`gh issue edit --add-assignee/--remove-assignee`),
+//! [`TicketProvider::add_comment`]/[`TicketProvider::update_description`]
+//! (`gh issue comment`/`gh issue edit --body`, Markdown pass-through),
+//! [`TicketProvider::create_link`]/[`TicketProvider::delete_link`] (GitHub's
+//! native issue-dependencies GraphQL mutations, via
+//! [`crate::github::gh_cli::GhCli::create_issue_dependency`]/
+//! [`crate::github::gh_cli::GhCli::delete_issue_dependency`]), and
+//! [`TicketProvider::rank`] (the local `ticket_rank` table in `runs.db`, via
+//! an optional borrowed [`RunStore`] — see [`GithubProvider::with_rank_store`]).
+//! [`TicketProvider::add_remote_link`] is the one method that stays a
+//! deliberate no-op: see its doc comment for why GitHub needs no remote link
+//! at all.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::github::gh_cli::{
-    GhCli, IssueDependencies, IssueEditRequest, IssueInfo, IssueListFilter, IssueListState,
-    IssueRef, IssueState, IssueStateChange,
+    GhCli, IssueCreateRequest, IssueDependencies, IssueEditRequest, IssueInfo, IssueListFilter,
+    IssueListState, IssueRef, IssueState, IssueStateChange,
 };
 use crate::jira::client::RankAnchor;
+use crate::runs::RunStore;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
 use crate::ticketing::types::{
@@ -65,18 +73,37 @@ pub struct GithubProvider<'a> {
     gh: &'a dyn GhCli,
     repo: String,
     key_prefix: String,
+    /// Backing store for the local `ticket_rank` table (see the module doc
+    /// comment). `None` in every existing test that doesn't exercise
+    /// `rank`/`Ranked`/`ReadyCandidates` — attach one via
+    /// [`GithubProvider::with_rank_store`]. Production wiring (`main.rs`)
+    /// always attaches one; `JiraProvider` has no equivalent field at all,
+    /// since Jira has its own native rank and never needs this table.
+    rank_store: Option<&'a RunStore>,
 }
 
 impl<'a> GithubProvider<'a> {
     /// Build a provider against `repo` (an `"owner/name"` slug). Keys are
     /// `GH-<number>`; a configurable prefix (per GitHub issue #3's design)
-    /// isn't wired up yet, so `key_prefix` is always `"GH"`.
+    /// isn't wired up yet, so `key_prefix` is always `"GH"`. No rank store is
+    /// attached by default — see [`GithubProvider::with_rank_store`].
     pub fn new(gh: &'a dyn GhCli, repo: String) -> Self {
         Self {
             gh,
             repo,
             key_prefix: "GH".to_string(),
+            rank_store: None,
         }
+    }
+
+    /// Attach the local rank store backing [`TicketProvider::rank`] and the
+    /// `Ranked`/`ReadyCandidates` [`TicketQuery`] variants. Without one,
+    /// `rank` fails with [`ProviderError::Api`] and searches fall back to
+    /// plain issue-number order (as if nothing were ever ranked) — the same
+    /// degenerate behavior phase 5 shipped before this table existed.
+    pub fn with_rank_store(mut self, store: &'a RunStore) -> Self {
+        self.rank_store = Some(store);
+        self
     }
 
     fn issue_key(&self, number: u64) -> String {
@@ -90,7 +117,7 @@ impl<'a> GithubProvider<'a> {
             .ok_or(ProviderError::Unauthorized)
     }
 
-    fn to_issue(&self, key: &str, info: IssueInfo, deps: IssueDependencies) -> Issue {
+    fn to_issue(&self, key: &str, number: u64, info: IssueInfo, deps: IssueDependencies) -> Issue {
         let closed = matches!(info.state, IssueState::Closed);
         let status = status_for_slug(synthesize_status_slug(closed, &info.labels));
         let assignee = info.assignees.first().map(|login| UserRef {
@@ -109,12 +136,18 @@ impl<'a> GithubProvider<'a> {
                 status,
                 description,
                 assignee,
-                issue_links: self.to_issue_links(deps),
+                issue_links: self.to_issue_links(number, deps),
             },
         }
     }
 
-    fn to_issue_links(&self, deps: IssueDependencies) -> Vec<IssueLink> {
+    /// Build this issue's [`IssueLink`]s from its dependencies. `number` is
+    /// *this* issue's own number, needed (alongside each dependency's
+    /// number) so the synthesized link id encodes both ends of the
+    /// relationship -- see [`link_id`]'s doc comment for why a one-sided id
+    /// (just the neighbor's number, phase 5's shape) can't be parsed back
+    /// into the pair [`TicketProvider::delete_link`] needs.
+    fn to_issue_links(&self, number: u64, deps: IssueDependencies) -> Vec<IssueLink> {
         let link_type = || IssueLinkType {
             name: "Blocks".to_string(),
             inward: "is blocked by".to_string(),
@@ -122,18 +155,20 @@ impl<'a> GithubProvider<'a> {
         };
         let mut links = Vec::with_capacity(deps.blocked_by.len() + deps.blocking.len());
         for dep in deps.blocked_by {
-            let number = dep.number;
+            // `dep` blocks this issue.
+            let blocker_number = dep.number;
             links.push(IssueLink {
-                id: format!("gh-dep-blocked-by-{number}"),
+                id: link_id(blocker_number, number),
                 link_type: link_type(),
                 inward_issue: Some(self.to_linked_issue(dep)),
                 outward_issue: None,
             });
         }
         for dep in deps.blocking {
-            let number = dep.number;
+            // This issue blocks `dep`.
+            let blocked_number = dep.number;
             links.push(IssueLink {
-                id: format!("gh-dep-blocking-{number}"),
+                id: link_id(number, blocked_number),
                 link_type: link_type(),
                 inward_issue: None,
                 outward_issue: Some(self.to_linked_issue(dep)),
@@ -175,11 +210,127 @@ impl<'a> GithubProvider<'a> {
         Ok(infos
             .into_iter()
             .map(|info| {
-                let key = self.issue_key(info.number);
-                self.to_issue(&key, info, IssueDependencies::default())
+                let number = info.number;
+                let key = self.issue_key(number);
+                self.to_issue(&key, number, info, IssueDependencies::default())
             })
             .collect())
     }
+
+    /// Sort `issues` for the `Ranked`/`ReadyCandidates` [`TicketQuery`]
+    /// variants: issues with a recorded local rank come first, ascending by
+    /// rank; every other issue follows, ascending by issue number. With no
+    /// rank store attached (or nothing ranked yet), every issue falls into
+    /// the second group, degenerating to the plain issue-number order phase
+    /// 5 shipped before this table existed.
+    fn apply_local_rank_order(&self, mut issues: Vec<Issue>) -> Vec<Issue> {
+        let ranks: HashMap<String, f64> = self
+            .rank_store
+            .and_then(|store| store.all_ticket_ranks().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        issues.sort_by(|a, b| {
+            let ra = ranks.get(&a.key);
+            let rb = ranks.get(&b.key);
+            match (ra, rb) {
+                (Some(x), Some(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => parse_issue_number(&a.key)
+                    .unwrap_or(u64::MAX)
+                    .cmp(&parse_issue_number(&b.key).unwrap_or(u64::MAX)),
+            }
+        });
+        issues
+    }
+}
+
+/// Build a link id encoding both ends of a `Blocks` dependency:
+/// `blocker_number` blocks `blocked_number`. Deliberately symmetric
+/// regardless of which side ([`GhCli::issue_dependencies`]'s `blocked_by` or
+/// `blocking` connection) it was discovered from -- a link is one
+/// relationship between two issues, not two, so both directions produce the
+/// same id for the same pair. [`parse_link_id`] is the inverse.
+///
+/// Phase 5's id (`gh-dep-blocked-by-<neighbor>`/`gh-dep-blocking-<neighbor>`)
+/// only encoded the *neighbor's* number, not the issue being viewed --
+/// enough to render a link, but not enough for
+/// [`TicketProvider::delete_link`] (which receives only the id, with no
+/// other context) to know which two issues to call
+/// [`GhCli::delete_issue_dependency`] on. Encoding both numbers up front
+/// avoids threading a second parameter through `delete_link`'s signature.
+fn link_id(blocker_number: u64, blocked_number: u64) -> String {
+    format!("gh-dep-{blocker_number}-blocks-{blocked_number}")
+}
+
+/// Parse a [`link_id`]-shaped string back into `(blocker_number,
+/// blocked_number)`. `None` for anything else, including phase 5's
+/// now-stale one-sided id shape (a link fetched under phase 5 and deleted
+/// only after upgrading to phase 6 simply won't parse -- an edge case
+/// tolerated by returning [`ProviderError::LinkIdNotFound`], not a panic).
+fn parse_link_id(link_id: &str) -> Option<(u64, u64)> {
+    let rest = link_id.strip_prefix("gh-dep-")?;
+    let (blocker, blocked) = rest.split_once("-blocks-")?;
+    Some((blocker.parse().ok()?, blocked.parse().ok()?))
+}
+
+/// Wrap a [`crate::runs::RunStoreError`] as a [`ProviderError::Api`] with a
+/// synthetic `status` of `0`, the same convention [`From<GhError>`] uses for
+/// a backend with no real HTTP status to report.
+fn store_err(err: crate::runs::RunStoreError) -> ProviderError {
+    ProviderError::Api {
+        status: 0,
+        message: err.to_string(),
+    }
+}
+
+/// Compute new rank values for `moving` (a batch of ticket keys, excluding
+/// `anchor_key` itself), placing them contiguously immediately before
+/// (`before: true`) or after (`before: false`) `anchor_key`, in the order
+/// given, using fractional-index interpolation between `anchor_key`'s rank
+/// and its nearest neighbor on that side in `existing` (sorted ascending by
+/// rank, as [`crate::runs::RunStore::all_ticket_ranks`] returns it).
+///
+/// If `anchor_key` has no rank in `existing`, it is assigned one first (past
+/// the current maximum, i.e. logically "at the end" -- matching the design
+/// doc's "unranked issues fall to the end" for the anchor's own case), and
+/// that assignment is included in the returned list alongside `moving`'s.
+///
+/// Returns `(ticket_key, rank)` pairs to persist via
+/// [`crate::runs::RunStore::set_ticket_rank`]. Pure and independent of any
+/// store so it's unit-testable without SQLite.
+fn compute_new_ranks(
+    existing: &[(String, f64)],
+    moving: &[String],
+    anchor_key: &str,
+    before: bool,
+) -> Vec<(String, f64)> {
+    let anchor_index = existing.iter().position(|(key, _)| key == anchor_key);
+    let (anchor_rank, mut assignments) = match anchor_index.map(|i| existing[i].1) {
+        Some(rank) => (rank, Vec::new()),
+        None => {
+            let rank = existing.last().map_or(1000.0, |(_, r)| r + 1000.0);
+            (rank, vec![(anchor_key.to_string(), rank)])
+        }
+    };
+
+    let (low, high) = if before {
+        let predecessor = anchor_index.filter(|&i| i > 0).map(|i| existing[i - 1].1);
+        (predecessor.unwrap_or(anchor_rank - 1000.0), anchor_rank)
+    } else {
+        let successor = anchor_index
+            .and_then(|i| existing.get(i + 1))
+            .map(|(_, r)| *r);
+        (anchor_rank, successor.unwrap_or(anchor_rank + 1000.0))
+    };
+
+    let slots = moving.len() as f64 + 1.0;
+    for (i, key) in moving.iter().enumerate() {
+        let frac = (i as f64 + 1.0) / slots;
+        assignments.push((key.clone(), low + (high - low) * frac));
+    }
+    assignments
 }
 
 /// Extract the issue number out of a `GH-<number>`-shaped key (or any
@@ -316,15 +467,27 @@ fn transition_edit_request(
     }
 }
 
-/// Build the [`ProviderError`] for a write-path method not implemented until
-/// phase 6.
-fn not_yet_implemented(method: &str) -> ProviderError {
-    ProviderError::Api {
-        status: 501,
-        message: format!(
-            "{method} is not yet implemented for the github backend \
-             (see docs/plans/github-issues-backend.md, phase 6)"
-        ),
+/// Classify a [`GhCli::issue_view`] failure for `key`: a [`GhError::Command`]
+/// (the process ran and `gh` itself reported failure -- typically the issue
+/// or repo doesn't exist or isn't visible) becomes
+/// [`ProviderError::NotFound`], since that's the only way `issue_view` fails
+/// in practice. Anything else ([`GhError::Spawn`]/[`GhError::Parse`]/
+/// [`GhError::Timeout`] -- `gh` not installed, malformed JSON, a hung
+/// process) is a real transient/environmental failure and is passed through
+/// via [`ProviderError::from`] instead of being misreported as "not found".
+///
+/// Phase 5 mapped every `issue_view` error to `NotFound` unconditionally,
+/// swallowing that distinction; this is phase 6's fix, applied to
+/// [`TicketProvider::get_issue`], [`TicketProvider::transitions`], and
+/// [`TicketProvider::transition`], the three callers that look an issue up
+/// by key before doing anything else.
+fn map_issue_view_error(key: &str, err: crate::github::gh_cli::GhError) -> ProviderError {
+    use crate::github::gh_cli::GhError;
+    match err {
+        GhError::Command { .. } => ProviderError::NotFound {
+            key: key.to_string(),
+        },
+        other => ProviderError::from(other),
     }
 }
 
@@ -343,22 +506,52 @@ impl TicketProvider for GithubProvider<'_> {
         let info = self
             .gh
             .issue_view(&self.repo, number)
-            .map_err(|_| ProviderError::NotFound {
-                key: key.to_string(),
-            })?;
+            .map_err(|err| map_issue_view_error(key, err))?;
         let deps = self
             .gh
             .issue_dependencies(&self.repo, number)
             .unwrap_or_default();
-        Ok(self.to_issue(key, info, deps))
+        Ok(self.to_issue(key, number, info, deps))
     }
 
-    fn create_issue(&self, _req: &NewTicket) -> Result<Issue, ProviderError> {
-        Err(not_yet_implemented("create_issue"))
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
+        // `req.issue_type_name` is Jira-only (Jira's issue-type field has no
+        // GitHub equivalent -- an issue is just an issue) and is deliberately
+        // ignored here rather than encoded as a label or rejected: GitHub
+        // callers pass whatever `NewTicket` requires today, and this is where
+        // that Jira-specific field's journey ends, per the carry-forward
+        // decision this phase settles (see the plan doc's phase 6 section).
+        let info = self
+            .gh
+            .issue_create(
+                &self.repo,
+                &IssueCreateRequest {
+                    title: req.summary.clone(),
+                    body: req.description.clone(),
+                    labels: vec!["tm:status/todo".to_string()],
+                    assignees: req.assignee_account_id.clone().into_iter().collect(),
+                },
+            )
+            .map_err(ProviderError::from)?;
+        let number = info.number;
+        let key = self.issue_key(number);
+        Ok(self.to_issue(&key, number, info, IssueDependencies::default()))
     }
 
+    /// A deliberate no-op: under the github backend, associating a ticket
+    /// with a PR needs no remote link at all. `GH-123` in the PR title (see
+    /// `crate::github::pr::with_issue_key_prefix`, already applied by
+    /// [`crate::ticketing::associate`] before this is ever called) plus the
+    /// `Closes #123` line `tm` puts in the PR body is the whole association
+    /// -- GitHub renders the backlink on the issue page for free, with
+    /// nothing for `tm` to post. Returning `Ok(())` unconditionally (rather
+    /// than, say, appending a comment) is the cheapest honest behavior: a
+    /// comment would be a second, redundant statement of a link GitHub
+    /// already displays natively, and Jira's flow itself only calls this once
+    /// per association, so there's no state this no-op could get out of sync
+    /// with.
     fn add_remote_link(&self, _key: &str, _link: &RemoteLinkRequest) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("add_remote_link"))
+        Ok(())
     }
 
     fn transitions(&self, key: &str) -> Result<Vec<Transition>, ProviderError> {
@@ -366,9 +559,7 @@ impl TicketProvider for GithubProvider<'_> {
         let info = self
             .gh
             .issue_view(&self.repo, number)
-            .map_err(|_| ProviderError::NotFound {
-                key: key.to_string(),
-            })?;
+            .map_err(|err| map_issue_view_error(key, err))?;
         let closed = matches!(info.state, IssueState::Closed);
         Ok(synthesize_transitions(closed, &info.labels))
     }
@@ -378,9 +569,7 @@ impl TicketProvider for GithubProvider<'_> {
         let info = self
             .gh
             .issue_view(&self.repo, number)
-            .map_err(|_| ProviderError::NotFound {
-                key: key.to_string(),
-            })?;
+            .map_err(|err| map_issue_view_error(key, err))?;
         let req = transition_edit_request(transition_id, &info.labels).ok_or_else(|| {
             ProviderError::Api {
                 status: 0,
@@ -420,18 +609,11 @@ impl TicketProvider for GithubProvider<'_> {
                 ..Default::default()
             })?,
             TicketQuery::Ranked { .. } => {
-                // No local rank table yet (deferred to phase 6 -- see the
-                // module doc comment and docs/plans/github-issues-backend.md's
-                // phase 5 report); unranked issues sort by issue number
-                // ascending, matching the design doc's "unranked issues
-                // falling to the end by issue number" for the one-sided case
-                // where nothing is ranked at all.
-                let mut issues = self.list_and_map(IssueListFilter {
+                let issues = self.list_and_map(IssueListFilter {
                     state: IssueListState::Open,
                     ..Default::default()
                 })?;
-                issues.sort_by_key(|issue| parse_issue_number(&issue.key).unwrap_or(u64::MAX));
-                issues
+                self.apply_local_rank_order(issues)
             }
             TicketQuery::Search { text, .. } => {
                 let needle = text.to_lowercase();
@@ -455,7 +637,7 @@ impl TicketProvider for GithubProvider<'_> {
             }
             TicketQuery::ReadyCandidates => {
                 let login = self.current_login()?;
-                let mut issues: Vec<Issue> = self
+                let issues: Vec<Issue> = self
                     .list_and_map(IssueListFilter {
                         state: IssueListState::Open,
                         assignee: Some(login),
@@ -464,8 +646,7 @@ impl TicketProvider for GithubProvider<'_> {
                     .into_iter()
                     .filter(|issue| issue.fields.status.status_category.key == "new")
                     .collect();
-                issues.sort_by_key(|issue| parse_issue_number(&issue.key).unwrap_or(u64::MAX));
-                issues
+                self.apply_local_rank_order(issues)
             }
         };
         Ok(SearchResult {
@@ -503,28 +684,128 @@ impl TicketProvider for GithubProvider<'_> {
             .collect())
     }
 
-    fn assign(&self, _key: &str, _account_id: Option<&str>) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("assign"))
+    /// Sets `key`'s sole assignee to `account_id` (`None` unassigns
+    /// everyone). GitHub issues support multiple assignees, but `tm`'s
+    /// `TicketProvider::assign` signature is exclusive-single-assignee
+    /// (matching Jira), so this replaces the whole assignee list rather than
+    /// adding to it: every existing assignee other than `account_id` is
+    /// removed, and `account_id` is added only if not already present
+    /// (avoiding a redundant add-and-remove-the-same-login round trip).
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), ProviderError> {
+        let number = parse_issue_number(key)?;
+        let info = self
+            .gh
+            .issue_view(&self.repo, number)
+            .map_err(|err| map_issue_view_error(key, err))?;
+
+        let already_assigned = account_id.is_some_and(|id| info.assignees.iter().any(|a| a == id));
+        let remove_assignees: Vec<String> = info
+            .assignees
+            .into_iter()
+            .filter(|a| Some(a.as_str()) != account_id)
+            .collect();
+        let add_assignees = if already_assigned {
+            Vec::new()
+        } else {
+            account_id
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default()
+        };
+
+        if add_assignees.is_empty() && remove_assignees.is_empty() {
+            return Ok(());
+        }
+        self.gh
+            .issue_edit(
+                &self.repo,
+                number,
+                &IssueEditRequest {
+                    add_assignees,
+                    remove_assignees,
+                    ..Default::default()
+                },
+            )
+            .map_err(ProviderError::from)
     }
 
-    fn rank(&self, _keys: &[String], _anchor: RankAnchor) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("rank"))
+    /// Moves `keys` to a new position in the local `ticket_rank` table
+    /// relative to `anchor`, via [`compute_new_ranks`]. Requires a rank
+    /// store to be attached (see [`GithubProvider::with_rank_store`]) --
+    /// without one, this is [`ProviderError::Api`] naming the missing store
+    /// rather than silently no-oping, since a rank request that appears to
+    /// succeed but changes nothing would be a worse failure mode than a
+    /// loud error.
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), ProviderError> {
+        let store = self.rank_store.ok_or_else(|| ProviderError::Api {
+            status: 500,
+            message:
+                "rank requires a local rank store, which this github provider instance has none of"
+                    .to_string(),
+        })?;
+        let (anchor_key, before) = match &anchor {
+            RankAnchor::Before(key) => (key.clone(), true),
+            RankAnchor::After(key) => (key.clone(), false),
+        };
+        let existing = store.all_ticket_ranks().map_err(store_err)?;
+        let moving: Vec<String> = keys
+            .iter()
+            .filter(|key| **key != anchor_key)
+            .cloned()
+            .collect();
+        let assignments = compute_new_ranks(&existing, &moving, &anchor_key, before);
+        for (key, rank) in &assignments {
+            store.set_ticket_rank(key, *rank).map_err(store_err)?;
+        }
+        Ok(())
     }
 
-    fn create_link(&self, _req: &CreateLinkRequest) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("create_link"))
+    /// Records that `req.blocker_key` blocks `req.blocked_key` via GitHub's
+    /// native issue dependencies GraphQL mutation
+    /// ([`GhCli::create_issue_dependency`]).
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), ProviderError> {
+        let blocker_number = parse_issue_number(&req.blocker_key)?;
+        let blocked_number = parse_issue_number(&req.blocked_key)?;
+        self.gh
+            .create_issue_dependency(&self.repo, blocker_number, blocked_number)
+            .map_err(ProviderError::from)
     }
 
-    fn delete_link(&self, _link_id: &str) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("delete_link"))
+    /// Removes a `Blocks` link by its [`link_id`]-shaped id. An id that
+    /// doesn't parse (e.g. a stale phase-5-shaped id -- see [`parse_link_id`]'s
+    /// doc comment) is [`ProviderError::LinkIdNotFound`], the same error a
+    /// genuinely unknown id would produce.
+    fn delete_link(&self, link_id: &str) -> Result<(), ProviderError> {
+        let (blocker_number, blocked_number) =
+            parse_link_id(link_id).ok_or_else(|| ProviderError::LinkIdNotFound {
+                link_id: link_id.to_string(),
+            })?;
+        self.gh
+            .delete_issue_dependency(&self.repo, blocker_number, blocked_number)
+            .map_err(ProviderError::from)
     }
 
-    fn update_description(&self, _key: &str, _description: &str) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("update_description"))
+    /// Replaces `key`'s body via `gh issue edit --body` (plain Markdown,
+    /// pass-through -- no ADF conversion on this path).
+    fn update_description(&self, key: &str, description: &str) -> Result<(), ProviderError> {
+        let number = parse_issue_number(key)?;
+        self.gh
+            .issue_edit(
+                &self.repo,
+                number,
+                &IssueEditRequest {
+                    body: Some(description.to_string()),
+                    ..Default::default()
+                },
+            )
+            .map_err(ProviderError::from)
     }
 
-    fn add_comment(&self, _key: &str, _body: &str) -> Result<(), ProviderError> {
-        Err(not_yet_implemented("add_comment"))
+    /// Posts `body` as a comment on `key` (plain Markdown, pass-through).
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), ProviderError> {
+        let number = parse_issue_number(key)?;
+        self.gh
+            .issue_comment(&self.repo, number, body)
+            .map_err(ProviderError::from)
     }
 
     fn description_text(&self, issue: &Issue) -> String {
@@ -1006,65 +1287,321 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_is_not_yet_implemented() {
+    fn create_issue_calls_issue_create_with_todo_label_and_ignores_issue_type_name() {
+        let created = issue_info(9, "New", IssueState::Open, &[]);
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let issue = provider
+            .create_issue(&NewTicket {
+                project_key: "GH".to_string(),
+                summary: "New".to_string(),
+                description: "details".to_string(),
+                issue_type_name: "Task".to_string(),
+                assignee_account_id: Some("jowi-dev".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(issue.key, "GH-9");
+        let calls = fake.issue_create_calls();
+        assert_eq!(calls.len(), 1);
+        let (repo, req) = &calls[0];
+        assert_eq!(repo, "jowi-dev/tskmstr");
+        assert_eq!(req.title, "New");
+        assert_eq!(req.body, "details");
+        assert_eq!(req.labels, vec!["tm:status/todo".to_string()]);
+        assert_eq!(req.assignees, vec!["jowi-dev".to_string()]);
+    }
+
+    #[test]
+    fn create_issue_with_no_assignee_passes_empty_assignees() {
+        let created = issue_info(9, "New", IssueState::Open, &[]);
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider
+            .create_issue(&NewTicket {
+                project_key: "GH".to_string(),
+                summary: "New".to_string(),
+                description: String::new(),
+                issue_type_name: "Task".to_string(),
+                assignee_account_id: None,
+            })
+            .unwrap();
+
+        assert!(fake.issue_create_calls()[0].1.assignees.is_empty());
+    }
+
+    #[test]
+    fn add_remote_link_is_a_no_op_that_succeeds() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider
+            .add_remote_link(
+                "GH-1",
+                &RemoteLinkRequest {
+                    url: "https://github.com/jowi-dev/tskmstr/pull/1".to_string(),
+                    title: "PR #1".to_string(),
+                },
+            )
+            .expect("should succeed as a no-op");
+    }
+
+    #[test]
+    fn assign_sets_new_assignee_and_removes_prior_ones() {
+        let mut info = issue_info(1, "T", IssueState::Open, &[]);
+        info.assignees = vec!["someone-else".to_string()];
+        let fake = FakeGhCli::new().with_issue_view(1, Ok(info));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.assign("GH-1", Some("jowi-dev")).unwrap();
+
+        let calls = fake.issue_edit_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2.add_assignees, vec!["jowi-dev".to_string()]);
+        assert_eq!(
+            calls[0].2.remove_assignees,
+            vec!["someone-else".to_string()]
+        );
+    }
+
+    #[test]
+    fn assign_none_unassigns_everyone() {
+        let mut info = issue_info(1, "T", IssueState::Open, &[]);
+        info.assignees = vec!["jowi-dev".to_string()];
+        let fake = FakeGhCli::new().with_issue_view(1, Ok(info));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.assign("GH-1", None).unwrap();
+
+        let calls = fake.issue_edit_calls();
+        assert_eq!(calls[0].2.add_assignees, Vec::<String>::new());
+        assert_eq!(calls[0].2.remove_assignees, vec!["jowi-dev".to_string()]);
+    }
+
+    #[test]
+    fn assign_already_assigned_is_a_no_op_that_makes_no_call() {
+        let mut info = issue_info(1, "T", IssueState::Open, &[]);
+        info.assignees = vec!["jowi-dev".to_string()];
+        let fake = FakeGhCli::new().with_issue_view(1, Ok(info));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.assign("GH-1", Some("jowi-dev")).unwrap();
+
+        assert!(fake.issue_edit_calls().is_empty());
+    }
+
+    #[test]
+    fn update_description_edits_the_body() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.update_description("GH-1", "**new** body").unwrap();
+
+        let calls = fake.issue_edit_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2.body.as_deref(), Some("**new** body"));
+    }
+
+    #[test]
+    fn add_comment_posts_markdown_as_is() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.add_comment("GH-1", "**bold** comment").unwrap();
+
+        assert_eq!(
+            fake.issue_comment_calls(),
+            vec![(
+                "jowi-dev/tskmstr".to_string(),
+                1,
+                "**bold** comment".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn create_link_calls_create_issue_dependency_with_both_numbers() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider
+            .create_link(&CreateLinkRequest {
+                blocker_key: "GH-1".to_string(),
+                blocked_key: "GH-2".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            fake.create_issue_dependency_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn delete_link_parses_the_id_and_calls_delete_issue_dependency() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.delete_link(&link_id(1, 2)).unwrap();
+
+        assert_eq!(
+            fake.delete_issue_dependency_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn delete_link_unparseable_id_is_link_id_not_found() {
         let fake = FakeGhCli::new();
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
         let err = provider
-            .create_issue(&NewTicket {
-                project_key: "GH".to_string(),
-                summary: "New".to_string(),
-                description: "".to_string(),
-                issue_type_name: "Task".to_string(),
-                assignee_account_id: None,
-            })
+            .delete_link("not-a-link-id")
             .expect_err("should fail");
 
-        assert!(matches!(err, ProviderError::Api { status: 501, .. }));
+        assert!(
+            matches!(err, ProviderError::LinkIdNotFound { link_id } if link_id == "not-a-link-id")
+        );
     }
 
     #[test]
-    fn every_write_path_stub_returns_a_distinct_not_implemented_error() {
+    fn link_id_round_trips_through_parse_link_id() {
+        assert_eq!(parse_link_id(&link_id(1, 2)), Some((1, 2)));
+    }
+
+    #[test]
+    fn get_issue_link_ids_round_trip_through_delete_link() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(
+                3,
+                Ok(issue_info(3, "Blocked ticket", IssueState::Open, &[])),
+            )
+            .with_issue_dependencies(
+                3,
+                Ok(IssueDependencies {
+                    blocked_by: vec![IssueRef {
+                        number: 2,
+                        title: "Blocker".to_string(),
+                        state: IssueState::Open,
+                        url: String::new(),
+                    }],
+                    blocking: Vec::new(),
+                }),
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let issue = provider.get_issue("GH-3").unwrap();
+        let link = &issue.fields.issue_links[0];
+
+        provider.delete_link(&link.id).unwrap();
+
+        // The blocker (GH-2) blocks the issue being viewed (GH-3).
+        assert_eq!(
+            fake.delete_issue_dependency_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 2, 3)]
+        );
+    }
+
+    #[test]
+    fn rank_without_a_store_is_an_error() {
         let fake = FakeGhCli::new();
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
-        assert!(matches!(
-            provider.add_remote_link(
-                "GH-1",
-                &RemoteLinkRequest {
-                    url: "u".to_string(),
-                    title: "t".to_string()
-                }
-            ),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.assign("GH-1", None),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.rank(&[], RankAnchor::Before("GH-2".to_string())),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.create_link(&CreateLinkRequest {
-                blocker_key: "GH-1".to_string(),
-                blocked_key: "GH-2".to_string()
-            }),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.delete_link("gh-dep-1"),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.update_description("GH-1", "text"),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
-        assert!(matches!(
-            provider.add_comment("GH-1", "text"),
-            Err(ProviderError::Api { status: 501, .. })
-        ));
+        let err = provider
+            .rank(
+                &["GH-1".to_string()],
+                RankAnchor::Before("GH-2".to_string()),
+            )
+            .expect_err("should fail");
+
+        assert!(matches!(err, ProviderError::Api { .. }));
+    }
+
+    #[test]
+    fn rank_before_an_unranked_anchor_places_both_at_the_end() {
+        let store = crate::runs::RunStore::open(std::path::Path::new(":memory:")).unwrap();
+        let fake = FakeGhCli::new();
+        let provider =
+            GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string()).with_rank_store(&store);
+
+        provider
+            .rank(
+                &["GH-1".to_string()],
+                RankAnchor::Before("GH-2".to_string()),
+            )
+            .unwrap();
+
+        let ranks = store.all_ticket_ranks().unwrap();
+        let by_key: HashMap<String, f64> = ranks.into_iter().collect();
+        assert!(by_key["GH-1"] < by_key["GH-2"]);
+    }
+
+    #[test]
+    fn rank_after_places_moving_keys_between_anchor_and_successor() {
+        let store = crate::runs::RunStore::open(std::path::Path::new(":memory:")).unwrap();
+        store.set_ticket_rank("GH-1", 100.0).unwrap();
+        store.set_ticket_rank("GH-5", 300.0).unwrap();
+        let fake = FakeGhCli::new();
+        let provider =
+            GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string()).with_rank_store(&store);
+
+        provider
+            .rank(
+                &["GH-2".to_string(), "GH-3".to_string()],
+                RankAnchor::After("GH-1".to_string()),
+            )
+            .unwrap();
+
+        let by_key: HashMap<String, f64> = store.all_ticket_ranks().unwrap().into_iter().collect();
+        assert!(by_key["GH-1"] < by_key["GH-2"]);
+        assert!(by_key["GH-2"] < by_key["GH-3"]);
+        assert!(by_key["GH-3"] < by_key["GH-5"]);
+    }
+
+    #[test]
+    fn compute_new_ranks_before_with_no_existing_entries() {
+        let assignments = compute_new_ranks(&[], &["GH-1".to_string()], "GH-2", true);
+        // GH-2 (the anchor) gets assigned first, then GH-1 goes before it.
+        let by_key: HashMap<String, f64> = assignments.into_iter().collect();
+        assert!(by_key["GH-1"] < by_key["GH-2"]);
+    }
+
+    #[test]
+    fn compute_new_ranks_preserves_moving_key_order() {
+        let existing = vec![("GH-1".to_string(), 0.0), ("GH-9".to_string(), 1000.0)];
+        let assignments = compute_new_ranks(
+            &existing,
+            &["GH-2".to_string(), "GH-3".to_string(), "GH-4".to_string()],
+            "GH-9",
+            true,
+        );
+        let ranks: Vec<f64> = assignments.iter().map(|(_, r)| *r).collect();
+        assert!(ranks.windows(2).all(|w| w[0] < w[1]));
+        assert!(ranks.iter().all(|r| *r > 0.0 && *r < 1000.0));
+    }
+
+    #[test]
+    fn search_ranked_uses_local_rank_when_available() {
+        let store = crate::runs::RunStore::open(std::path::Path::new(":memory:")).unwrap();
+        store.set_ticket_rank("GH-5", 100.0).unwrap();
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![
+            issue_info(1, "One", IssueState::Open, &[]),
+            issue_info(5, "Five", IssueState::Open, &[]),
+        ]));
+        let provider =
+            GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string()).with_rank_store(&store);
+
+        let result = provider
+            .search(&TicketQuery::Ranked {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap();
+
+        // GH-5 has an explicit rank, so it sorts before GH-1 despite the
+        // higher issue number.
+        let keys: Vec<&str> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["GH-5", "GH-1"]);
     }
 
     #[test]

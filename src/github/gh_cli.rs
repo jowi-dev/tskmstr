@@ -513,6 +513,38 @@ pub trait GhCli {
     /// [`GhCli::pr_review_threads`].
     fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError>;
 
+    // --- Phase 6 additions (GithubProvider write path,
+    // docs/plans/github-issues-backend.md) ---
+
+    /// Record that `blocker_number` blocks `blocked_number` in `repo`, via
+    /// GitHub's native issue dependencies GraphQL mutation.
+    ///
+    /// Two `gh api graphql` round trips: first resolving both issues'
+    /// GraphQL node ids (the `addBlockedBy`/`removeBlockedBy` mutations take
+    /// opaque node ids, not issue numbers), then running the mutation
+    /// itself. Confirmed live against the schema via `gh api graphql`
+    /// introspection during phase 6 (the feature GA'd August 2025, after
+    /// [`GhCli::issue_dependencies`]'s own query-side introspection in phase
+    /// 4) — `addBlockedBy(input: { issueId, blockingIssueId })` is the
+    /// mutation, where `issueId` is the *blocked* issue and
+    /// `blockingIssueId` is the *blocker*.
+    fn create_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError>;
+
+    /// Remove the dependency recorded by [`GhCli::create_issue_dependency`],
+    /// via the `removeBlockedBy` mutation (same node-id resolution, same two
+    /// round trips).
+    fn delete_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError>;
+
     // --- Phase 5 additions (GithubProvider read path,
     // docs/plans/github-issues-backend.md) ---
 
@@ -685,6 +717,12 @@ pub struct IssueEditRequest {
     pub remove_assignees: Vec<String>,
     /// Close or reopen the issue, if it should change.
     pub state: Option<IssueStateChange>,
+    /// Replace the issue body, if it should change (`gh issue edit --body`).
+    /// Added in phase 6 (`docs/plans/github-issues-backend.md`) for
+    /// [`super::super::ticketing::github_provider::GithubProvider::update_description`] —
+    /// phase 4 only wired the label/assignee/state flags, since nothing
+    /// needed to replace a body until the write path existed.
+    pub body: Option<String>,
 }
 
 /// A minimal reference to another issue, as returned inside
@@ -748,6 +786,36 @@ const ISSUE_DEPENDENCIES_QUERY: &str = "query($owner: String!, $name: String!, $
         nodes { number title state url }
       }
     }
+  }
+}";
+
+/// GraphQL query resolving two issues' GraphQL node ids by number, for
+/// [`GhCli::create_issue_dependency`]/[`GhCli::delete_issue_dependency`]:
+/// the `addBlockedBy`/`removeBlockedBy` mutations take opaque node ids, not
+/// issue numbers, so this is always run before either mutation.
+const ISSUE_NODE_IDS_QUERY: &str =
+    "query($owner: String!, $name: String!, $blockerNumber: Int!, $blockedNumber: Int!) {
+  repository(owner: $owner, name: $name) {
+    blocker: issue(number: $blockerNumber) { id }
+    blocked: issue(number: $blockedNumber) { id }
+  }
+}";
+
+/// GraphQL mutation recording that `blockingIssueId` blocks `issueId`, via
+/// GitHub's native issue dependencies feature. Confirmed live via `gh api
+/// graphql` introspection during phase 6 — `AddBlockedByInput` takes exactly
+/// `issueId`/`blockingIssueId`, both required.
+const ADD_BLOCKED_BY_MUTATION: &str = "mutation($issueId: ID!, $blockingIssueId: ID!) {
+  addBlockedBy(input: {issueId: $issueId, blockingIssueId: $blockingIssueId}) {
+    issue { id }
+  }
+}";
+
+/// GraphQL mutation removing the dependency [`ADD_BLOCKED_BY_MUTATION`]
+/// records. Same input shape, confirmed live the same way.
+const REMOVE_BLOCKED_BY_MUTATION: &str = "mutation($issueId: ID!, $blockingIssueId: ID!) {
+  removeBlockedBy(input: {issueId: $issueId, blockingIssueId: $blockingIssueId}) {
+    issue { id }
   }
 }";
 
@@ -825,6 +893,88 @@ impl ShellGhCli {
         interpret_repo_view_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    /// Resolve `blocker_number`/`blocked_number`'s GraphQL node ids in
+    /// `repo` (`gh api graphql` running [`ISSUE_NODE_IDS_QUERY`]), shared by
+    /// [`GhCli::create_issue_dependency`]/[`GhCli::delete_issue_dependency`]:
+    /// the `addBlockedBy`/`removeBlockedBy` mutations take node ids, not
+    /// issue numbers.
+    fn resolve_issue_node_ids(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(String, String), GhError> {
+        let (owner, name) = split_repo_slug(repo)?;
+        let query_arg = format!("query={ISSUE_NODE_IDS_QUERY}");
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        let blocker_arg = format!("blockerNumber={blocker_number}");
+        let blocked_arg = format!("blockedNumber={blocked_number}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-F",
+                &owner_arg,
+                "-F",
+                &name_arg,
+                "-F",
+                &blocker_arg,
+                "-F",
+                &blocked_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_issue_node_ids_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            blocker_number,
+            blocked_number,
+        )
+    }
+
+    /// Run `mutation` (either [`ADD_BLOCKED_BY_MUTATION`] or
+    /// [`REMOVE_BLOCKED_BY_MUTATION`]) with the given node ids.
+    fn run_blocked_by_mutation(
+        &self,
+        mutation: &str,
+        issue_id: &str,
+        blocking_issue_id: &str,
+    ) -> Result<(), GhError> {
+        let mutation_arg = format!("query={mutation}");
+        let issue_id_arg = format!("issueId={issue_id}");
+        let blocking_issue_id_arg = format!("blockingIssueId={blocking_issue_id}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &mutation_arg,
+                "-F",
+                &issue_id_arg,
+                "-F",
+                &blocking_issue_id_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_success_or_command_error(
+            "gh api graphql",
+            output.status.code(),
             &String::from_utf8_lossy(&output.stderr),
         )
     }
@@ -1311,6 +1461,28 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stderr),
             number,
         )
+    }
+
+    fn create_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError> {
+        let (blocker_id, blocked_id) =
+            self.resolve_issue_node_ids(repo, blocker_number, blocked_number)?;
+        self.run_blocked_by_mutation(ADD_BLOCKED_BY_MUTATION, &blocked_id, &blocker_id)
+    }
+
+    fn delete_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError> {
+        let (blocker_id, blocked_id) =
+            self.resolve_issue_node_ids(repo, blocker_number, blocked_number)?;
+        self.run_blocked_by_mutation(REMOVE_BLOCKED_BY_MUTATION, &blocked_id, &blocker_id)
     }
 
     fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
@@ -2222,15 +2394,17 @@ fn interpret_issue_create_output(
 
 /// Build the argument list for `gh issue edit <number> -R <repo>
 /// [--add-label ...] [--remove-label ...] [--add-assignee ...]
-/// [--remove-assignee ...]`, or `None` if `req` carries no label/assignee
-/// change at all (in which case [`GhCli::issue_edit`] skips this `gh` call
-/// entirely — `gh issue edit` errors if given no flags, and a
-/// state-change-only edit is a legitimate, common request. e.g. `Done`).
+/// [--remove-assignee ...] [--body ...]`, or `None` if `req` carries no
+/// label/assignee/body change at all (in which case [`GhCli::issue_edit`]
+/// skips this `gh` call entirely — `gh issue edit` errors if given no flags,
+/// and a state-change-only edit is a legitimate, common request, e.g.
+/// `Done`).
 fn issue_edit_args(repo: &str, number: u64, req: &IssueEditRequest) -> Option<Vec<String>> {
     if req.add_labels.is_empty()
         && req.remove_labels.is_empty()
         && req.add_assignees.is_empty()
         && req.remove_assignees.is_empty()
+        && req.body.is_none()
     {
         return None;
     }
@@ -2257,6 +2431,10 @@ fn issue_edit_args(repo: &str, number: u64, req: &IssueEditRequest) -> Option<Ve
     if !req.remove_assignees.is_empty() {
         args.push("--remove-assignee".to_string());
         args.push(req.remove_assignees.join(","));
+    }
+    if let Some(body) = &req.body {
+        args.push("--body".to_string());
+        args.push(body.clone());
     }
     Some(args)
 }
@@ -2376,6 +2554,88 @@ fn interpret_issue_dependencies_output(
     }
 }
 
+/// Raw shape of one aliased `issue(number: ...) { id }` field in
+/// [`ISSUE_NODE_IDS_QUERY`]'s response, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeId {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdsRepository {
+    blocker: Option<RawIssueNodeId>,
+    blocked: Option<RawIssueNodeId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdsData {
+    repository: Option<RawIssueNodeIdsRepository>,
+}
+
+/// Raw shape of the `gh api graphql` response body for
+/// [`ISSUE_NODE_IDS_QUERY`], for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdsResponse {
+    data: Option<RawIssueNodeIdsData>,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`ISSUE_NODE_IDS_QUERY`] for `blocker_number`/`blocked_number`, returning
+/// `(blocker_node_id, blocked_node_id)`.
+///
+/// Pure over the exit code and captured stdout/stderr, for the same
+/// testability reasons as [`interpret_pr_view_output`]. Either issue missing
+/// is a [`GhError::Parse`] naming both numbers, the same convention as
+/// [`interpret_issue_dependencies_output`].
+fn interpret_issue_node_ids_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    blocker_number: u64,
+    blocked_number: u64,
+) -> Result<(String, String), GhError> {
+    match exit_code {
+        Some(0) => {
+            let response =
+                serde_json::from_str::<RawIssueNodeIdsResponse>(stdout).map_err(|err| {
+                    GhError::Parse {
+                        command: "gh api graphql".to_string(),
+                        message: err.to_string(),
+                    }
+                })?;
+
+            let repository = response
+                .data
+                .and_then(|data| data.repository)
+                .ok_or_else(|| GhError::Parse {
+                    command: "gh api graphql".to_string(),
+                    message: format!("issue #{blocker_number} or #{blocked_number} not found"),
+                })?;
+
+            let blocker = repository.blocker.ok_or_else(|| GhError::Parse {
+                command: "gh api graphql".to_string(),
+                message: format!("issue #{blocker_number} not found"),
+            })?;
+            let blocked = repository.blocked.ok_or_else(|| GhError::Parse {
+                command: "gh api graphql".to_string(),
+                message: format!("issue #{blocked_number} not found"),
+            })?;
+
+            Ok((blocker.id, blocked.id))
+        }
+        Some(code) => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(code),
+            stderr: stderr.trim().to_string(),
+        }),
+        None => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: None,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Raw shape of one entry in `gh api repos/{repo}/assignees` output, for
 /// deserialization only.
 #[derive(Debug, Deserialize)]
@@ -2458,6 +2718,10 @@ pub struct FakeGhCli {
     issue_comment_calls: RefCell<Vec<(String, u64, String)>>,
     issue_dependencies_results: RefCell<HashMap<u64, Result<IssueDependencies, GhError>>>,
     issue_dependencies_calls: RefCell<Vec<(String, u64)>>,
+    create_issue_dependency_result: RefCell<Result<(), GhError>>,
+    create_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
+    delete_issue_dependency_result: RefCell<Result<(), GhError>>,
+    delete_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
     repo_assignees_result: RefCell<Result<Vec<String>, GhError>>,
     repo_assignees_calls: RefCell<Vec<String>>,
     label_create_result: RefCell<Result<(), GhError>>,
@@ -2521,6 +2785,10 @@ impl Default for FakeGhCli {
             issue_comment_calls: RefCell::new(Vec::new()),
             issue_dependencies_results: RefCell::new(HashMap::new()),
             issue_dependencies_calls: RefCell::new(Vec::new()),
+            create_issue_dependency_result: RefCell::new(Ok(())),
+            create_issue_dependency_calls: RefCell::new(Vec::new()),
+            delete_issue_dependency_result: RefCell::new(Ok(())),
+            delete_issue_dependency_calls: RefCell::new(Vec::new()),
             repo_assignees_result: RefCell::new(Ok(Vec::new())),
             repo_assignees_calls: RefCell::new(Vec::new()),
             label_create_result: RefCell::new(Ok(())),
@@ -2805,6 +3073,30 @@ impl FakeGhCli {
         self.issue_dependencies_calls.borrow().clone()
     }
 
+    /// Set the result `create_issue_dependency` will return.
+    pub fn with_create_issue_dependency_result(self, result: Result<(), GhError>) -> Self {
+        *self.create_issue_dependency_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, blocker_number, blocked_number)` triples passed to
+    /// `create_issue_dependency`, in call order.
+    pub fn create_issue_dependency_calls(&self) -> Vec<(String, u64, u64)> {
+        self.create_issue_dependency_calls.borrow().clone()
+    }
+
+    /// Set the result `delete_issue_dependency` will return.
+    pub fn with_delete_issue_dependency_result(self, result: Result<(), GhError>) -> Self {
+        *self.delete_issue_dependency_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, blocker_number, blocked_number)` triples passed to
+    /// `delete_issue_dependency`, in call order.
+    pub fn delete_issue_dependency_calls(&self) -> Vec<(String, u64, u64)> {
+        self.delete_issue_dependency_calls.borrow().clone()
+    }
+
     /// Set the result `repo_assignees` will return.
     pub fn with_repo_assignees(self, result: Result<Vec<String>, GhError>) -> Self {
         *self.repo_assignees_result.borrow_mut() = result;
@@ -2972,6 +3264,34 @@ impl GhCli for FakeGhCli {
             Some(result) => result.clone(),
             None => Ok(IssueDependencies::default()),
         }
+    }
+
+    fn create_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError> {
+        self.create_issue_dependency_calls.borrow_mut().push((
+            repo.to_string(),
+            blocker_number,
+            blocked_number,
+        ));
+        self.create_issue_dependency_result.borrow().clone()
+    }
+
+    fn delete_issue_dependency(
+        &self,
+        repo: &str,
+        blocker_number: u64,
+        blocked_number: u64,
+    ) -> Result<(), GhError> {
+        self.delete_issue_dependency_calls.borrow_mut().push((
+            repo.to_string(),
+            blocker_number,
+            blocked_number,
+        ));
+        self.delete_issue_dependency_result.borrow().clone()
     }
 
     fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
@@ -4275,6 +4595,27 @@ mod tests {
     }
 
     #[test]
+    fn issue_edit_args_body_only_change_builds_body_flag() {
+        let req = IssueEditRequest {
+            body: Some("new body".to_string()),
+            ..Default::default()
+        };
+        let args = issue_edit_args("jowi-dev/tskmstr", 3, &req).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "issue",
+                "edit",
+                "3",
+                "-R",
+                "jowi-dev/tskmstr",
+                "--body",
+                "new body",
+            ]
+        );
+    }
+
+    #[test]
     fn issue_edit_args_build_add_and_remove_flags() {
         let req = IssueEditRequest {
             add_labels: vec!["tm:status/in-progress".to_string()],
@@ -4282,6 +4623,7 @@ mod tests {
             add_assignees: vec!["jowi-dev".to_string()],
             remove_assignees: vec!["other-dev".to_string()],
             state: None,
+            body: None,
         };
         let args = issue_edit_args("jowi-dev/tskmstr", 3, &req).unwrap();
         assert_eq!(
@@ -4455,6 +4797,82 @@ mod tests {
             fake.issue_dependencies("jowi-dev/tskmstr", 3).unwrap(),
             deps
         );
+    }
+
+    // --- issue dependency mutations (phase 6) ---
+
+    #[test]
+    fn interpret_issue_node_ids_output_parses_both_ids() {
+        let stdout = r#"{"data":{"repository":{"blocker":{"id":"I_1"},"blocked":{"id":"I_2"}}}}"#;
+        let (blocker_id, blocked_id) =
+            interpret_issue_node_ids_output(Some(0), stdout, "", 1, 2).unwrap();
+        assert_eq!(blocker_id, "I_1");
+        assert_eq!(blocked_id, "I_2");
+    }
+
+    #[test]
+    fn interpret_issue_node_ids_output_missing_blocker_is_a_parse_error() {
+        let stdout = r#"{"data":{"repository":{"blocker":null,"blocked":{"id":"I_2"}}}}"#;
+        let err = interpret_issue_node_ids_output(Some(0), stdout, "", 1, 2).unwrap_err();
+        assert!(matches!(err, GhError::Parse { message, .. } if message.contains('1')));
+    }
+
+    #[test]
+    fn interpret_issue_node_ids_output_missing_repository_is_a_parse_error() {
+        let stdout = r#"{"data":{"repository":null}}"#;
+        let err = interpret_issue_node_ids_output(Some(0), stdout, "", 1, 2).unwrap_err();
+        assert!(matches!(err, GhError::Parse { .. }));
+    }
+
+    #[test]
+    fn interpret_issue_node_ids_output_failure_is_a_command_error() {
+        let err = interpret_issue_node_ids_output(Some(1), "", "boom", 1, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            GhError::Command {
+                exit_code: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fake_gh_cli_create_issue_dependency_records_calls() {
+        let fake = FakeGhCli::new();
+
+        fake.create_issue_dependency("jowi-dev/tskmstr", 1, 2)
+            .unwrap();
+
+        assert_eq!(
+            fake.create_issue_dependency_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_delete_issue_dependency_records_calls() {
+        let fake = FakeGhCli::new();
+
+        fake.delete_issue_dependency("jowi-dev/tskmstr", 1, 2)
+            .unwrap();
+
+        assert_eq!(
+            fake.delete_issue_dependency_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_create_issue_dependency_seeded_error_is_returned() {
+        let fake = FakeGhCli::new().with_create_issue_dependency_result(Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+
+        let err = fake.create_issue_dependency("jowi-dev/tskmstr", 1, 2);
+
+        assert!(err.is_err());
     }
 
     // --- repo_assignees / label_create (phase 5) ---
