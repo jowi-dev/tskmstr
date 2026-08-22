@@ -957,6 +957,13 @@ local `ticket_rank` table in `runs.db` (unranked issues sort to the end by
 issue number, same as before anything is ranked). See
 `docs/plans/github-issues-backend.md` for the full design and phase status.
 
+This repo dogfoods the GitHub backend on itself: its own `.tskmstr.toml`
+sets `provider = "github"` with no `[backend.github]` section at all, so
+`tm` running inside a checkout of this repo resolves `repo` from the
+checkout's own `origin` remote (`jowi-dev/tskmstr`) rather than a hardcoded
+slug. `tm board`/`tm ready`/`tm ticket *` run against this repo's own
+issues.
+
 `review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
 review comment threads count as "bot findings" for `tm pr status` and
 `tm ready`. Defaults to `["cursor[bot]"]` when unset in both global and
