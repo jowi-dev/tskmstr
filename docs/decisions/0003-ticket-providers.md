@@ -37,6 +37,49 @@ backend-agnostic seam to plug a second implementation into.
    GitHub code, no config changes. Behavior is identical before and after;
    the existing test suite is the spec, and it passes unchanged throughout.
 
+## Addendum: the config-side adapter contract (phase 3)
+
+Phase 1's decision left one thing unsettled: what does *selecting* a
+provider look like in config, and where does a third theoretical adapter
+(Linear, Shortcut, a plain-file backend, whatever) plug in on that side?
+The answer, added in phase 3 without revisiting decisions 1-3 above:
+
+4. **One discriminant enum, one dispatch site.** `src/config/mod.rs`'s
+   `BackendKind` (`Jira` | `Github`) is parsed from an optional `[backend]`
+   `provider` string, defaulting to `Jira` when `[backend]` is absent so
+   every config written before this phase keeps working unchanged. Exactly
+   one `match` on `BackendKind` exists in the whole codebase, in `merge`:
+   each arm validates and assembles that adapter's own required fields
+   (Jira's arm requires `jira_base_url`/`jira_email`/`default_project_key`,
+   as it always has) and nothing outside that arm needs to know what the
+   adapter requires. A provider string that doesn't parse into a
+   `BackendKind` at all is `ConfigError::InvalidProvider`; a recognized
+   variant with no `TicketProvider` impl yet (`Github`, until issue #3's
+   later phases land one) is `ConfigError::ProviderNotImplemented` —
+   config loading fails cleanly either way rather than panicking or
+   silently defaulting to Jira.
+
+5. **Jira's fields stay flat and top-level, not nested under
+   `[backend.jira]`.** The issue's own sketch put a future adapter's
+   settings in `[backend.<name>]` sub-tables, which is the right shape for
+   `Github` (and any later adapter) once one exists — but Jira's
+   `jira_base_url`/`jira_email`/`default_project_key` already exist as
+   flat top-level keys in every config in the wild, including the repo
+   owner's live one. Moving them into a nested table to match the new
+   adapters' shape would be a breaking migration for zero behavioral
+   gain, so phase 3 deliberately left them where they are: "each adapter
+   owns its own config shape" is satisfied by the Jira arm of the `merge`
+   match validating exactly the fields Jira needs, wherever in the TOML
+   they happen to live, not by every adapter's fields sharing one nesting
+   convention.
+
+Adding a real third adapter later means: a new `BackendKind` variant, a new
+arm in `merge` that validates that adapter's own fields (nested under
+`[backend.<name>]` if it has no legacy flat fields to preserve), a new
+`TicketProvider` impl, and registering it at whichever single site
+constructs the live provider from a loaded `Config`. Nothing else in
+config, the TUI, or any `tm ticket`/`tm ready` command changes.
+
 ## What still stands from ADR-0001 and ADR-0002
 
 The no-mirroring rule itself is unchanged: **the configured ticket

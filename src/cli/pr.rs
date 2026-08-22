@@ -502,6 +502,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
+            backend: crate::config::BackendKind::Jira,
             jira_base_url: "https://example.atlassian.net".to_string(),
             jira_email: "dev@example.com".to_string(),
             default_project_key: "PROJ".to_string(),

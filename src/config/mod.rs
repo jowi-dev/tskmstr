@@ -5,6 +5,19 @@
 //! repository root. Fields present in the repo file take precedence over the
 //! global file. The merged result must supply all required fields or
 //! [`ConfigError::MissingField`] is returned.
+//!
+//! An optional `[backend]` table selects which ticket provider a config
+//! uses (see [`BackendKind`]); it defaults to Jira when absent, so an
+//! existing config with no `[backend]` table keeps working unchanged.
+//! [`merge`] validates the selected provider's own required fields — for
+//! Jira, the top-level `jira_base_url`/`jira_email`/`default_project_key`
+//! fields, unconditionally required before `[backend]` existed and now
+//! required only when Jira is the selected provider. A provider name that
+//! doesn't parse into a [`BackendKind`] at all is
+//! [`ConfigError::InvalidProvider`]; a recognized name with no adapter
+//! implementation yet (currently `"github"`, see GitHub issue #3) is
+//! [`ConfigError::ProviderNotImplemented`] — [`load`]/[`merge`] never
+//! panics or silently falls back to Jira for either case.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +84,67 @@ pub struct RawConfig {
     /// When unset in both global and repo config, `tm work` has no lanes to
     /// run and no defaults beyond its own hardcoded fallbacks.
     pub work: Option<RawWorkConfig>,
+    /// `[backend]` settings: which ticket provider this config selects. See
+    /// [`RawBackendConfig`].
+    ///
+    /// When unset in both global and repo config, defaults to
+    /// [`BackendKind::Jira`], and the top-level `jira_base_url`/`jira_email`/
+    /// `default_project_key` fields above are required exactly as before
+    /// `[backend]` existed.
+    pub backend: Option<RawBackendConfig>,
+}
+
+/// Raw, partially-specified `[backend]` section as parsed directly from
+/// TOML.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawBackendConfig {
+    /// Which ticket provider to use: `"jira"` (default) or `"github"`. An
+    /// unrecognized value is [`ConfigError::InvalidProvider`]; a recognized
+    /// value with no adapter implementation yet (currently `"github"`) is
+    /// [`ConfigError::ProviderNotImplemented`].
+    pub provider: Option<String>,
+}
+
+/// Which ticket provider a config selects.
+///
+/// This is the one enum a new adapter extends: add a variant here, add its
+/// config validation as a new arm of the `match` in [`merge`], add its
+/// [`crate::ticketing::provider::TicketProvider`] implementation, and wire
+/// it into whichever construction site builds the live provider (currently
+/// `main.rs`, unconditionally Jira until a later phase branches on this
+/// enum). Nothing else — no board code, no `tm ticket`/`tm ready` command,
+/// no other `match` on provider kind — needs to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    /// Jira, via [`crate::ticketing::provider::JiraProvider`]. The only
+    /// adapter implemented so far, and the default when `[backend]` is
+    /// absent.
+    #[default]
+    Jira,
+    /// GitHub Issues. Recognized as a valid `provider` value (per GitHub
+    /// issue #3's design) but not yet implemented — selecting it is
+    /// [`ConfigError::ProviderNotImplemented`], not [`ConfigError::InvalidProvider`].
+    Github,
+}
+
+impl BackendKind {
+    /// The lowercase string stored in config for this provider.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Jira => "jira",
+            BackendKind::Github => "github",
+        }
+    }
+
+    /// Parses a config `provider` string. Returns `None` for unrecognized
+    /// values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "jira" => Some(BackendKind::Jira),
+            "github" => Some(BackendKind::Github),
+            _ => None,
+        }
+    }
 }
 
 /// Raw, partially-specified `[work]` section as parsed directly from TOML.
@@ -209,6 +283,13 @@ pub struct RawLaneConfig {
 /// application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Which ticket provider this config selects. See [`BackendKind`];
+    /// defaults to [`BackendKind::Jira`] when `[backend]` is absent from
+    /// both global and repo config. Since only the Jira adapter is
+    /// implemented so far, this is always [`BackendKind::Jira`] on any
+    /// [`Config`] that successfully merged — selecting a not-yet-implemented
+    /// provider fails merging outright with [`ConfigError::ProviderNotImplemented`].
+    pub backend: BackendKind,
     /// Base URL of the Jira instance, e.g. `https://example.atlassian.net`.
     pub jira_base_url: String,
     /// Email address used for Jira basic auth.
@@ -458,6 +539,24 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// `[backend].provider` was set to a value that isn't a recognized
+    /// provider name at all (contrast [`ConfigError::ProviderNotImplemented`],
+    /// for a recognized name with no adapter yet).
+    #[error("invalid [backend] provider `{value}`; expected \"jira\" or \"github\"")]
+    InvalidProvider {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[backend].provider` named a recognized provider that has no
+    /// [`crate::ticketing::provider::TicketProvider`] adapter implemented
+    /// yet.
+    #[error("backend provider `{provider}` is not implemented yet")]
+    ProviderNotImplemented {
+        /// The recognized-but-unimplemented provider name.
+        provider: &'static str,
+    },
+
     /// A parent directory for a config file could not be created.
     #[error("failed to create config directory {path}: {source}")]
     CreateDir {
@@ -526,6 +625,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         review_bots: None,
         board_column_order: None,
         work: None,
+        backend: None,
     }
 }
 
@@ -573,6 +673,8 @@ fn write_raw_config(path: &Path, raw: &RawConfig) -> Result<(), ConfigError> {
 pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, ConfigError> {
     let repo = repo.unwrap_or_default();
 
+    let backend = merge_backend(global.backend.clone(), repo.backend.clone())?;
+
     let jira_base_url = repo.jira_base_url.or(global.jira_base_url);
     let jira_email = repo.jira_email.or(global.jira_email);
     let default_project_key = repo.default_project_key.or(global.default_project_key);
@@ -594,22 +696,54 @@ pub fn merge(global: RawConfig, repo: Option<RawConfig>) -> Result<Config, Confi
 
     let expected_path = default_global_config_path();
 
-    Ok(Config {
-        jira_base_url: require_field(jira_base_url, "jira_base_url", &expected_path)?,
-        jira_email: require_field(jira_email, "jira_email", &expected_path)?,
-        default_project_key: require_field(
-            default_project_key,
-            "default_project_key",
-            &expected_path,
-        )?,
-        default_assignee_account_id,
-        status_on_pr,
-        status_on_create,
-        run_db_path,
-        review_bots,
-        board_column_order,
-        work,
-    })
+    // The one match on provider kind: each arm validates and assembles the
+    // fields that adapter needs. Adding a new adapter means adding a
+    // variant to `BackendKind` and a new arm here (and nowhere else in this
+    // module, or in the rest of tskmstr) — see `BackendKind`'s doc comment.
+    match backend {
+        BackendKind::Jira => Ok(Config {
+            backend,
+            jira_base_url: require_field(jira_base_url, "jira_base_url", &expected_path)?,
+            jira_email: require_field(jira_email, "jira_email", &expected_path)?,
+            default_project_key: require_field(
+                default_project_key,
+                "default_project_key",
+                &expected_path,
+            )?,
+            default_assignee_account_id,
+            status_on_pr,
+            status_on_create,
+            run_db_path,
+            review_bots,
+            board_column_order,
+            work,
+        }),
+        BackendKind::Github => Err(ConfigError::ProviderNotImplemented {
+            provider: BackendKind::Github.as_str(),
+        }),
+    }
+}
+
+/// Merge a repo-local `[backend]` section on top of a global one, field by
+/// field, then parse the resulting `provider` string (if any) into a
+/// [`BackendKind`].
+///
+/// Absence in both global and repo config defaults to [`BackendKind::Jira`],
+/// so an existing config with no `[backend]` table at all keeps working
+/// unchanged. Does not check whether the resulting provider has an adapter
+/// implemented yet — that's [`merge`]'s job, since it's the one place that
+/// dispatches on provider kind.
+fn merge_backend(
+    global: Option<RawBackendConfig>,
+    repo: Option<RawBackendConfig>,
+) -> Result<BackendKind, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    match repo.provider.or(global.provider) {
+        Some(value) => BackendKind::parse(&value).ok_or(ConfigError::InvalidProvider { value }),
+        None => Ok(BackendKind::default()),
+    }
 }
 
 /// Merge a repo-local `[work]` section on top of a global one, field by
@@ -850,6 +984,7 @@ mod tests {
             review_bots: Some(vec!["cursor[bot]".into()]),
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
             work: None,
+            backend: None,
         }
     }
 
@@ -875,6 +1010,7 @@ mod tests {
             review_bots: None,
             board_column_order: None,
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -900,6 +1036,7 @@ mod tests {
             review_bots: None,
             board_column_order: None,
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -928,6 +1065,7 @@ mod tests {
             review_bots: None,
             board_column_order: None,
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -956,6 +1094,7 @@ mod tests {
             review_bots: None,
             board_column_order: None,
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -984,6 +1123,7 @@ mod tests {
             review_bots: Some(vec!["repo-bot[bot]".into()]),
             board_column_order: None,
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
@@ -1012,6 +1152,7 @@ mod tests {
             review_bots: None,
             board_column_order: Some(vec!["Code Review".into()]),
             work: None,
+            backend: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
@@ -1600,6 +1741,177 @@ mod tests {
 
         let err = set_assignee_account_id(&path, "acct-123").expect_err("should fail");
         assert!(matches!(err, ConfigError::ReadGlobal { .. }));
+    }
+
+    // --- `[backend]` section ---
+
+    #[test]
+    fn merge_backend_absent_from_both_defaults_to_jira() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.backend, BackendKind::Jira);
+    }
+
+    #[test]
+    fn merge_backend_provider_jira_explicit_succeeds() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("jira".to_string()),
+            }),
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.backend, BackendKind::Jira);
+    }
+
+    #[test]
+    fn merge_backend_invalid_provider_errors() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("bogus".to_string()),
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::InvalidProvider { value } => assert_eq!(value, "bogus"),
+            other => panic!("expected InvalidProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_backend_github_provider_is_not_implemented() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::ProviderNotImplemented { provider } => assert_eq!(provider, "github"),
+            other => panic!("expected ProviderNotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_backend_github_provider_does_not_require_jira_fields() {
+        // Even with every Jira field absent, selecting `github` fails
+        // because of the provider, not because of missing Jira fields --
+        // demonstrating those fields are validated only under the Jira
+        // adapter, not unconditionally.
+        let global = RawConfig {
+            jira_base_url: None,
+            jira_email: None,
+            default_project_key: None,
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+            }),
+            ..Default::default()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::ProviderNotImplemented { .. }),
+            "expected ProviderNotImplemented rather than a missing-Jira-field error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_backend_jira_provider_still_requires_jira_fields() {
+        let global = RawConfig {
+            jira_base_url: None,
+            backend: Some(RawBackendConfig {
+                provider: Some("jira".to_string()),
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        assert!(matches!(
+            err,
+            ConfigError::MissingField {
+                field: "jira_base_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn merge_backend_repo_overrides_global_provider() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("jira".to_string()),
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("github".to_string()),
+            }),
+            ..Default::default()
+        };
+        let err = merge(global, Some(repo)).expect_err("repo override should take effect");
+        assert!(matches!(err, ConfigError::ProviderNotImplemented { .. }));
+    }
+
+    #[test]
+    fn merge_backend_repo_provider_absent_falls_back_to_global() {
+        let global = RawConfig {
+            backend: Some(RawBackendConfig {
+                provider: Some("jira".to_string()),
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            default_project_key: Some("REPO".to_string()),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("should merge");
+        assert_eq!(cfg.backend, BackendKind::Jira);
+    }
+
+    #[test]
+    fn load_repo_local_tskmstr_toml_can_select_backend_provider() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [backend]
+            provider = "github"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let err = load(&paths).expect_err("github backend should fail cleanly");
+        assert!(matches!(err, ConfigError::ProviderNotImplemented { .. }));
+    }
+
+    #[test]
+    fn backend_kind_parse_and_as_str_round_trip() {
+        assert_eq!(BackendKind::parse("jira"), Some(BackendKind::Jira));
+        assert_eq!(BackendKind::parse("github"), Some(BackendKind::Github));
+        assert_eq!(BackendKind::parse("nonsense"), None);
+        assert_eq!(BackendKind::Jira.as_str(), "jira");
+        assert_eq!(BackendKind::Github.as_str(), "github");
+    }
+
+    #[test]
+    fn backend_kind_default_is_jira() {
+        assert_eq!(BackendKind::default(), BackendKind::Jira);
     }
 
     // --- `[work]` section ---

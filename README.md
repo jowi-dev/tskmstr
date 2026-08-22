@@ -875,14 +875,36 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_create = "In Progress"    # optional, see below
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 # board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
+
+# [backend]                           # optional, see below; "jira" is the default
+# provider = "jira"
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
 its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
-between the two files or `tm` refuses to run; `default_assignee_account_id`,
-`status_on_pr`, `status_on_create`, `review_bots`, and `board_column_order`
+between the two files whenever the Jira backend is selected, or `tm`
+refuses to run; `default_assignee_account_id`, `status_on_pr`,
+`status_on_create`, `review_bots`, `board_column_order`, and `[backend]`
 are optional.
+
+### `[backend]`: choosing a ticket provider
+
+`[backend].provider` selects which ticket provider this config uses. It
+defaults to `"jira"` when `[backend]` is absent from both global and repo
+config, so an existing config with no `[backend]` table at all keeps
+working exactly as before. Only `"jira"` is implemented today;
+`"github"` is a recognized name (GitHub issue #3 tracks the
+`GithubProvider` adapter) that fails cleanly with a "not implemented yet"
+error rather than silently falling back to Jira or panicking. Any other
+value is an invalid-provider error naming the value that was set.
+
+Each adapter validates only its own required fields: under the (default)
+Jira provider, `jira_base_url`, `jira_email`, and `default_project_key`
+are required exactly as before `[backend]` existed; a future adapter would
+validate whatever fields it needs, without the Jira fields becoming
+required for it too. A repo-local `.tskmstr.toml` can override
+`[backend].provider` on its own, same as every other field.
 
 `review_bots` lists the GitHub bot logins (e.g. `cursor[bot]`) whose PR
 review comment threads count as "bot findings" for `tm pr status` and

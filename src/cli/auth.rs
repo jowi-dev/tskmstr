@@ -125,6 +125,7 @@ fn bootstrap_config(
     writeln!(out, "Wrote config to {}", path.display())?;
 
     Ok(Config {
+        backend: config::BackendKind::Jira,
         jira_base_url: seed.jira_base_url,
         jira_email: seed.jira_email,
         default_project_key: seed.default_project_key,

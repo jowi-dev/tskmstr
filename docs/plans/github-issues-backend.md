@@ -1,7 +1,8 @@
 # GitHub Issues as a ticket backend (issue #3), phases 1-7
 
-Status: **phases 1-2 complete** (commits `1446509`, `721a331`). Phases 3-7
-are specified below per the issue but not started.
+Status: **phases 1-3 complete** (commits `1446509`, `721a331`, and phase
+3's commits below). Phases 4-7 are specified below per the issue but not
+started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -136,10 +137,58 @@ concept and `NewTicket` currently carries one straight through -- phase 6
 should decide whether that field becomes optional/ignored for GitHub or
 whether `NewTicket` itself needs to shed Jira-specific fields at that point.
 
-## Phase 3 — config: `[backend]` provider selection (not started)
+## Phase 3 — config: `[backend]` provider selection (complete, commit `87774a7`)
 
-Add the `[backend]` table (`provider = "jira" | "github"`, `repo`), make the
-Jira config fields conditionally required, add `ConfigError::InvalidProvider`.
+Added `[backend]` (`provider = "jira" | "github"`, defaulting to `jira`)
+to `src/config/mod.rs`. A new `BackendKind` enum (`Jira`, `Github`) is
+parsed from the `provider` string by `merge_backend`, then dispatched by
+exactly one `match` inside `merge`: the `Jira` arm requires
+`jira_base_url`/`jira_email`/`default_project_key` exactly as before
+`[backend]` existed (`ConfigError::MissingField` on absence, unchanged);
+the `Github` arm returns a new `ConfigError::ProviderNotImplemented`
+unconditionally, since no `GithubProvider` exists yet. A provider string
+that doesn't parse into `BackendKind` at all (anything but `"jira"`/
+`"github"`) is a new `ConfigError::InvalidProvider`. `Config` gained a
+`backend: BackendKind` field, always `Jira` on any `Config` that
+successfully merged (selecting `github` fails merging outright, so a
+`Config` carrying `Github` can never exist yet).
+
+An existing config with no `[backend]` table needs zero changes: absence
+in both global and repo config defaults to `Jira` via `BackendKind`'s
+`#[derive(Default)]`, so behavior for every pre-phase-3 config is
+identical before and after. `tm auth login`'s bootstrap
+(`cli::auth::bootstrap_config`) still writes the pre-phase-3 flat shape
+(no `[backend]` table at all) and still works, for the same reason. Full
+test suite (1829 tests, up from 1818 -- 12 new tests added, one incidental
+net change from an existing test's assertion style caught by `cargo fmt`),
+clippy, and fmt all pass.
+
+### The one real design decision this phase forced
+
+The issue's own `[backend]` sketch put `repo` (a GitHub-only setting)
+flat alongside `provider`, and implied Jira's fields might eventually
+move into a matching `[backend.jira]` table. Phase 3 deliberately does
+neither: `repo` isn't added at all yet, since nothing consumes it before
+`GithubProvider` exists (phase 5/6's job, once there's a config-shape
+decision an implementation can actually validate against) and adding an
+unused field now would be speculative. And Jira's `jira_base_url`/
+`jira_email`/`default_project_key` stay exactly where they've always
+been -- flat, top-level, outside `[backend]` entirely -- rather than
+moving under `[backend.jira]`, because the repo owner's live
+`~/.config/tskmstr/config.toml` already has them at top level and moving
+them would be a breaking migration for zero behavioral gain. See
+ADR-0003's addendum for the full reasoning; `docs/decisions/0003-ticket-providers.md`
+is amended rather than superseded.
+
+### What phase 3 revealed about phases 4-7
+
+Phase 5/6, when they add `GithubProvider`, will need to decide `[backend.github]`'s
+shape from scratch (at minimum a `repo` field, defaulting to the origin
+remote per the issue) and add a new arm to `merge`'s `BackendKind` match
+that validates it -- that match is the one and only place in the codebase
+a third phase (or a fourth adapter) needs to touch on the config side.
+Nothing about phase 4 (`GhCli` issue operations, which doesn't touch
+config at all) changes.
 
 ## Phase 4 — `GhCli` issue operations (not started)
 
