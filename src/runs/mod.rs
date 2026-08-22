@@ -3,7 +3,18 @@
 //! `tskmstr` does not spawn or supervise processes (see
 //! `docs/decisions/0001-run-state.md`). This module only persists what a
 //! runner and its hooks report: run rows and their events. Ticket data
-//! stays in Jira; this store never mirrors it.
+//! stays in the configured ticket provider; this store never mirrors it.
+//!
+//! The one deliberate exception is the `ticket_rank` table (phase 6 of
+//! `docs/plans/github-issues-backend.md`, GitHub issue #3): GitHub Issues
+//! has no backlog-rank concept to mirror, so under the GitHub backend this
+//! store is the *authoritative* source for rank, not a cache of something
+//! else — the same non-mirroring status audit/retro verdicts already have.
+//! [`RunStore::set_ticket_rank`]/[`RunStore::ticket_rank`]/[`RunStore::all_ticket_ranks`]
+//! back [`crate::ticketing::provider::TicketProvider::rank`] and the
+//! `Ranked`/`ReadyCandidates` [`crate::ticketing::provider::TicketQuery`]
+//! variants for [`crate::ticketing::github_provider::GithubProvider`] only —
+//! Jira has its own native rank field and never touches this table.
 //!
 //! All timestamps are written by SQLite itself (see [`NOW_SQL`]) rather
 //! than a Rust time crate, so every row's `started_at`/`ended_at`/etc. and
@@ -90,6 +101,12 @@ const MIGRATIONS: &[&str] = &[
       recorded_at TEXT NOT NULL
     );
     CREATE INDEX idx_ticket_retros_key ON ticket_retros(ticket_key, recorded_at);
+    "#,
+    r#"
+    CREATE TABLE ticket_rank (
+      ticket_key TEXT PRIMARY KEY,
+      rank REAL NOT NULL
+    );
     "#,
 ];
 
@@ -2133,6 +2150,49 @@ impl RunStore {
         Ok(by_ticket)
     }
 
+    /// Sets (inserting or overwriting) `ticket_key`'s rank in the local
+    /// `ticket_rank` table. Unlike [`RunStore::record_audit`]/
+    /// [`RunStore::record_retro`], this upserts rather than appending
+    /// history: rank is a single current position, not an event log.
+    ///
+    /// See the module doc comment for why this table exists and is
+    /// authoritative rather than a mirror.
+    pub fn set_ticket_rank(&self, ticket_key: &str, rank: f64) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            "INSERT INTO ticket_rank (ticket_key, rank) VALUES (?1, ?2)
+             ON CONFLICT(ticket_key) DO UPDATE SET rank = excluded.rank",
+            params![ticket_key, rank],
+        )?;
+        Ok(())
+    }
+
+    /// Returns `ticket_key`'s current rank, or `None` if it has never been
+    /// ranked.
+    pub fn ticket_rank(&self, ticket_key: &str) -> Result<Option<f64>, RunStoreError> {
+        self.conn
+            .query_row(
+                "SELECT rank FROM ticket_rank WHERE ticket_key = ?1",
+                params![ticket_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Returns every ranked ticket's `(ticket_key, rank)` pair, ordered
+    /// ascending by rank. Tickets with no recorded rank are simply absent —
+    /// callers (`GithubProvider::search`'s `Ranked`/`ReadyCandidates`
+    /// handling) sort those to the end by issue number themselves, per the
+    /// design doc.
+    pub fn all_ticket_ranks(&self) -> Result<Vec<(String, f64)>, RunStoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ticket_key, rank FROM ticket_rank ORDER BY rank ASC")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<(String, f64)>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns cost aggregates grouped by retro verdict (clean / defect),
     /// restricted to `kind` when given (same filter as
     /// [`RunStore::list_runs_filtered`]), for `tm runs --by-retro`.
@@ -2346,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_7() {
+    fn open_migrates_a_fresh_db_to_user_version_8() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -2354,7 +2414,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -4626,6 +4686,62 @@ mod tests {
             .expect("expected an audit");
         assert_eq!(audit.verdict, "needs-work");
         assert_eq!(audit.notes, None);
+    }
+
+    #[test]
+    fn ticket_rank_returns_none_when_never_ranked() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.ticket_rank("GH-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_ticket_rank_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.set_ticket_rank("GH-1", 500.0).unwrap();
+
+        assert_eq!(store.ticket_rank("GH-1").unwrap(), Some(500.0));
+    }
+
+    #[test]
+    fn set_ticket_rank_overwrites_existing_rank() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.set_ticket_rank("GH-1", 500.0).unwrap();
+        store.set_ticket_rank("GH-1", 250.0).unwrap();
+
+        assert_eq!(store.ticket_rank("GH-1").unwrap(), Some(250.0));
+    }
+
+    #[test]
+    fn all_ticket_ranks_orders_ascending_and_omits_unranked() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.set_ticket_rank("GH-3", 300.0).unwrap();
+        store.set_ticket_rank("GH-1", 100.0).unwrap();
+        store.set_ticket_rank("GH-2", 200.0).unwrap();
+
+        assert_eq!(
+            store.all_ticket_ranks().unwrap(),
+            vec![
+                ("GH-1".to_string(), 100.0),
+                ("GH-2".to_string(), 200.0),
+                ("GH-3".to_string(), 300.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_ticket_ranks_empty_when_nothing_ranked() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.all_ticket_ranks().unwrap().is_empty());
     }
 
     #[test]
