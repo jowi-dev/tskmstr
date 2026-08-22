@@ -4,9 +4,11 @@
 //! [`TicketProvider`] is the interface every ticketing orchestration
 //! function in [`crate::ticketing`], every `tm ticket`/`tm ready`/`tm pr`
 //! command, and the board TUI depend on. A ticket key is still a plain
-//! `&str` and every error is still a [`JiraError`] (abstracting that further
-//! is a later phase's job), but queries and descriptions are already
-//! backend-agnostic: [`TicketProvider::search`] takes a [`TicketQuery`]
+//! `&str`, and every error is a backend-agnostic
+//! [`crate::ticketing::error::ProviderError`] rather than a Jira-specific
+//! [`crate::jira::client::JiraError`] — see [`crate::ticketing::error`] for how
+//! [`JiraProvider`] converts at the boundary. Queries and descriptions are
+//! also already backend-agnostic: [`TicketProvider::search`] takes a [`TicketQuery`]
 //! rather than a JQL string, and [`TicketProvider::create_issue`],
 //! [`TicketProvider::update_description`], and
 //! [`TicketProvider::add_comment`] take plain Markdown text rather than an
@@ -35,15 +37,16 @@
 //! route through a wrapper value it can no longer see into.
 
 use crate::jira::adf::{adf_to_text, text_to_adf};
-use crate::jira::client::{JiraClient, JiraError, RankAnchor};
+use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::fake::FakeJiraClient;
 use crate::jira::jql::{
     assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
     ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
 };
-use crate::jira::types::{
-    CreateIssueRequest, CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest,
-    SearchResult, Transition,
+use crate::jira::types::CreateIssueRequest;
+use crate::ticketing::error::ProviderError;
+use crate::ticketing::types::{
+    CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
 };
 
 /// A backend-agnostic ticket search, rendered by each [`TicketProvider`] into
@@ -154,53 +157,53 @@ pub struct NewTicket {
 pub trait TicketProvider {
     /// Fetch the authenticated user. Used to verify auth is configured
     /// correctly.
-    fn myself(&self) -> Result<Myself, JiraError>;
+    fn myself(&self) -> Result<Myself, ProviderError>;
 
     /// Fetch a single ticket by key.
-    fn get_issue(&self, key: &str) -> Result<Issue, JiraError>;
+    fn get_issue(&self, key: &str) -> Result<Issue, ProviderError>;
 
     /// Create a new ticket.
-    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError>;
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError>;
 
     /// Attach a remote link (e.g. a GitHub PR) to a ticket.
-    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError>;
+    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError>;
 
     /// List the workflow transitions available on a ticket.
-    fn transitions(&self, key: &str) -> Result<Vec<Transition>, JiraError>;
+    fn transitions(&self, key: &str) -> Result<Vec<Transition>, ProviderError>;
 
     /// Apply a workflow transition to a ticket.
-    fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError>;
+    fn transition(&self, key: &str, transition_id: &str) -> Result<(), ProviderError>;
 
     /// Run a search query.
-    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError>;
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError>;
 
     /// Check that a project exists and is visible to the authenticated
     /// user.
-    fn get_project(&self, key: &str) -> Result<(), JiraError>;
+    fn get_project(&self, key: &str) -> Result<(), ProviderError>;
 
     /// List users eligible to be assigned a ticket in `project`.
-    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError>;
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, ProviderError>;
 
     /// Set (or clear) a ticket's assignee.
-    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError>;
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), ProviderError>;
 
     /// Move `keys` to a new position in the backlog rank, relative to
     /// `anchor`.
-    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError>;
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), ProviderError>;
 
     /// Create a `Blocks` issue link such that `req.blocker_key` blocks
     /// `req.blocked_key`.
-    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError>;
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), ProviderError>;
 
     /// Remove an issue link by its id.
-    fn delete_link(&self, link_id: &str) -> Result<(), JiraError>;
+    fn delete_link(&self, link_id: &str) -> Result<(), ProviderError>;
 
     /// Replace a ticket's description with `description`, plain Markdown
     /// text.
-    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError>;
+    fn update_description(&self, key: &str, description: &str) -> Result<(), ProviderError>;
 
     /// Post a comment to a ticket. `body` is plain Markdown text.
-    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError>;
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), ProviderError>;
 
     /// Render `issue`'s description as plain text, translating from
     /// whatever format the backend stores it in (ADF, for Jira). `""` when
@@ -223,70 +226,70 @@ impl JiraProvider {
 }
 
 impl TicketProvider for JiraProvider {
-    fn myself(&self) -> Result<Myself, JiraError> {
-        self.0.myself()
+    fn myself(&self) -> Result<Myself, ProviderError> {
+        Ok(self.0.myself()?)
     }
 
-    fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
-        self.0.get_issue(key)
+    fn get_issue(&self, key: &str) -> Result<Issue, ProviderError> {
+        Ok(self.0.get_issue(key)?)
     }
 
-    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError> {
-        self.0.create_issue(&CreateIssueRequest {
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
+        Ok(self.0.create_issue(&CreateIssueRequest {
             project_key: req.project_key.clone(),
             summary: req.summary.clone(),
             description: text_to_adf(&req.description),
             issue_type_name: req.issue_type_name.clone(),
             assignee_account_id: req.assignee_account_id.clone(),
-        })
+        })?)
     }
 
-    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError> {
-        self.0.add_remote_link(key, link)
+    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError> {
+        Ok(self.0.add_remote_link(key, link)?)
     }
 
-    fn transitions(&self, key: &str) -> Result<Vec<Transition>, JiraError> {
-        self.0.transitions(key)
+    fn transitions(&self, key: &str) -> Result<Vec<Transition>, ProviderError> {
+        Ok(self.0.transitions(key)?)
     }
 
-    fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
-        self.0.transition(key, transition_id)
+    fn transition(&self, key: &str, transition_id: &str) -> Result<(), ProviderError> {
+        Ok(self.0.transition(key, transition_id)?)
     }
 
-    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError> {
-        self.0.search(&render_jql(query))
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
+        Ok(self.0.search(&render_jql(query))?)
     }
 
-    fn get_project(&self, key: &str) -> Result<(), JiraError> {
-        self.0.get_project(key)
+    fn get_project(&self, key: &str) -> Result<(), ProviderError> {
+        Ok(self.0.get_project(key)?)
     }
 
-    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError> {
-        self.0.assignable_users(project)
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, ProviderError> {
+        Ok(self.0.assignable_users(project)?)
     }
 
-    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
-        self.0.assign(key, account_id)
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), ProviderError> {
+        Ok(self.0.assign(key, account_id)?)
     }
 
-    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError> {
-        self.0.rank(keys, anchor)
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), ProviderError> {
+        Ok(self.0.rank(keys, anchor)?)
     }
 
-    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError> {
-        self.0.create_link(req)
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), ProviderError> {
+        Ok(self.0.create_link(req)?)
     }
 
-    fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
-        self.0.delete_link(link_id)
+    fn delete_link(&self, link_id: &str) -> Result<(), ProviderError> {
+        Ok(self.0.delete_link(link_id)?)
     }
 
-    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError> {
-        self.0.update_description(key, &text_to_adf(description))
+    fn update_description(&self, key: &str, description: &str) -> Result<(), ProviderError> {
+        Ok(self.0.update_description(key, &text_to_adf(description))?)
     }
 
-    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError> {
-        self.0.add_comment(key, &text_to_adf(body))
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), ProviderError> {
+        Ok(self.0.add_comment(key, &text_to_adf(body))?)
     }
 
     fn description_text(&self, issue: &Issue) -> String {
@@ -306,16 +309,16 @@ impl TicketProvider for JiraProvider {
 /// `FakeJiraClient`, pass a reference into a context struct, and then
 /// inspect its recorded calls by that same reference afterward.
 impl TicketProvider for FakeJiraClient {
-    fn myself(&self) -> Result<Myself, JiraError> {
-        JiraClient::myself(self)
+    fn myself(&self) -> Result<Myself, ProviderError> {
+        Ok(JiraClient::myself(self)?)
     }
 
-    fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
-        JiraClient::get_issue(self, key)
+    fn get_issue(&self, key: &str) -> Result<Issue, ProviderError> {
+        Ok(JiraClient::get_issue(self, key)?)
     }
 
-    fn create_issue(&self, req: &NewTicket) -> Result<Issue, JiraError> {
-        JiraClient::create_issue(
+    fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
+        Ok(JiraClient::create_issue(
             self,
             &CreateIssueRequest {
                 project_key: req.project_key.clone(),
@@ -324,55 +327,59 @@ impl TicketProvider for FakeJiraClient {
                 issue_type_name: req.issue_type_name.clone(),
                 assignee_account_id: req.assignee_account_id.clone(),
             },
-        )
+        )?)
     }
 
-    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), JiraError> {
-        JiraClient::add_remote_link(self, key, link)
+    fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError> {
+        Ok(JiraClient::add_remote_link(self, key, link)?)
     }
 
-    fn transitions(&self, key: &str) -> Result<Vec<Transition>, JiraError> {
-        JiraClient::transitions(self, key)
+    fn transitions(&self, key: &str) -> Result<Vec<Transition>, ProviderError> {
+        Ok(JiraClient::transitions(self, key)?)
     }
 
-    fn transition(&self, key: &str, transition_id: &str) -> Result<(), JiraError> {
-        JiraClient::transition(self, key, transition_id)
+    fn transition(&self, key: &str, transition_id: &str) -> Result<(), ProviderError> {
+        Ok(JiraClient::transition(self, key, transition_id)?)
     }
 
-    fn search(&self, query: &TicketQuery) -> Result<SearchResult, JiraError> {
-        JiraClient::search(self, &render_jql(query))
+    fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
+        Ok(JiraClient::search(self, &render_jql(query))?)
     }
 
-    fn get_project(&self, key: &str) -> Result<(), JiraError> {
-        JiraClient::get_project(self, key)
+    fn get_project(&self, key: &str) -> Result<(), ProviderError> {
+        Ok(JiraClient::get_project(self, key)?)
     }
 
-    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, JiraError> {
-        JiraClient::assignable_users(self, project)
+    fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, ProviderError> {
+        Ok(JiraClient::assignable_users(self, project)?)
     }
 
-    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), JiraError> {
-        JiraClient::assign(self, key, account_id)
+    fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), ProviderError> {
+        Ok(JiraClient::assign(self, key, account_id)?)
     }
 
-    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), JiraError> {
-        JiraClient::rank(self, keys, anchor)
+    fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), ProviderError> {
+        Ok(JiraClient::rank(self, keys, anchor)?)
     }
 
-    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), JiraError> {
-        JiraClient::create_link(self, req)
+    fn create_link(&self, req: &CreateLinkRequest) -> Result<(), ProviderError> {
+        Ok(JiraClient::create_link(self, req)?)
     }
 
-    fn delete_link(&self, link_id: &str) -> Result<(), JiraError> {
-        JiraClient::delete_link(self, link_id)
+    fn delete_link(&self, link_id: &str) -> Result<(), ProviderError> {
+        Ok(JiraClient::delete_link(self, link_id)?)
     }
 
-    fn update_description(&self, key: &str, description: &str) -> Result<(), JiraError> {
-        JiraClient::update_description(self, key, &text_to_adf(description))
+    fn update_description(&self, key: &str, description: &str) -> Result<(), ProviderError> {
+        Ok(JiraClient::update_description(
+            self,
+            key,
+            &text_to_adf(description),
+        )?)
     }
 
-    fn add_comment(&self, key: &str, body: &str) -> Result<(), JiraError> {
-        JiraClient::add_comment(self, key, &text_to_adf(body))
+    fn add_comment(&self, key: &str, body: &str) -> Result<(), ProviderError> {
+        Ok(JiraClient::add_comment(self, key, &text_to_adf(body))?)
     }
 
     fn description_text(&self, issue: &Issue) -> String {
@@ -388,7 +395,7 @@ impl TicketProvider for FakeJiraClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jira::types::{IssueFields, Status, StatusCategory};
+    use crate::ticketing::types::{IssueFields, Status, StatusCategory};
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -419,12 +426,12 @@ mod tests {
     }
 
     #[test]
-    fn jira_provider_forwards_errors_unchanged() {
+    fn jira_provider_converts_errors_to_provider_error() {
         let provider = JiraProvider::new(FakeJiraClient::new().with_issue_not_found("PROJ-1"));
 
         let err = provider.get_issue("PROJ-1").expect_err("should fail");
 
-        assert!(matches!(err, JiraError::NotFound { key } if key == "PROJ-1"));
+        assert!(matches!(err, ProviderError::NotFound { key } if key == "PROJ-1"));
     }
 
     #[test]

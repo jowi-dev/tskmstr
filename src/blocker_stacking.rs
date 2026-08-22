@@ -51,7 +51,7 @@
 //!   rather than guessing which one.
 
 use crate::github::gh_cli::{PrLifecycle, PrSummary};
-use crate::jira::types::{Issue, LinkedIssue};
+use crate::ticketing::types::{Issue, LinkedIssue};
 
 /// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
 ///
@@ -221,7 +221,7 @@ pub fn decide(unmerged: Vec<UnmergedBlocker>) -> StackDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jira::types::{
+    use crate::ticketing::types::{
         IssueFields, IssueLink, IssueLinkType, LinkedIssueFields, Status, StatusCategory,
     };
 

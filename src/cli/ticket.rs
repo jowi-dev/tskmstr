@@ -10,10 +10,10 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::jira::client::RankAnchor;
-use crate::jira::types::CreateLinkRequest;
 use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
+use crate::ticketing::types::CreateLinkRequest;
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
     TransitionOutcome, assign_ticket, associate_ticket, comment_ticket, create_ticket, link_ticket,
@@ -493,7 +493,7 @@ pub fn update(
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
     jira.update_description(&normalized, body)
-        .map_err(TicketingError::Jira)?;
+        .map_err(TicketingError::Provider)?;
     writeln!(out, "Description updated for {normalized}")?;
     Ok(())
 }
@@ -637,7 +637,9 @@ pub fn audit_read(
         let _ = register_session(store, sessions_dir, session_env, "audit", &normalized);
     }
 
-    let issue = jira.get_issue(&normalized).map_err(TicketingError::Jira)?;
+    let issue = jira
+        .get_issue(&normalized)
+        .map_err(TicketingError::Provider)?;
 
     writeln!(out, "{}  {}", normalized, issue.fields.summary)?;
     writeln!(out, "Status: {}", issue.fields.status.name)?;
@@ -821,10 +823,10 @@ mod tests {
     use crate::config::Config;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::pr::PrInfo;
-    use crate::jira::client::JiraError;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
     use crate::runs::{FinishRun, RunStatus, StartRun};
+    use crate::ticketing::error::ProviderError;
+    use crate::ticketing::types::{Issue, IssueFields, Status, StatusCategory, Transition};
 
     fn issue(key: &str) -> Issue {
         Issue {
@@ -956,7 +958,9 @@ mod tests {
 
         let err = run(&ctx, "proj-999", &mut out).expect_err("should fail");
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-999")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
@@ -1434,7 +1438,9 @@ mod tests {
             .expect_err("should fail hard");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-404")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
@@ -1476,8 +1482,8 @@ mod tests {
         );
     }
 
-    fn jira_user(account_id: &str, display_name: &str) -> crate::jira::types::JiraUser {
-        crate::jira::types::JiraUser {
+    fn jira_user(account_id: &str, display_name: &str) -> crate::ticketing::types::JiraUser {
+        crate::ticketing::types::JiraUser {
             account_id: account_id.to_string(),
             display_name: display_name.to_string(),
         }
@@ -1559,7 +1565,7 @@ mod tests {
 
     #[test]
     fn assign_me_falls_back_to_myself_display_name() {
-        let jira = FakeJiraClient::new().with_myself(crate::jira::types::Myself {
+        let jira = FakeJiraClient::new().with_myself(crate::ticketing::types::Myself {
             account_id: "acct-me".to_string(),
             display_name: "Ada Lovelace".to_string(),
             email_address: None,
@@ -1655,7 +1661,10 @@ mod tests {
 
         let err = update(&jira, "PROJ-372", "body", &mut out).expect_err("should fail");
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::Api {
+                status,
+                message,
+            })) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -1671,7 +1680,10 @@ mod tests {
 
         let err = update(&jira, "PROJ-404", "body", &mut out).expect_err("should fail");
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, .. })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::Api {
+                status,
+                ..
+            })) => {
                 assert_eq!(status, 404)
             }
             other => panic!("expected Jira Api error, got {other:?}"),
@@ -1845,10 +1857,11 @@ mod tests {
 
     #[test]
     fn search_happy_path_prints_key_status_and_summary_per_line() {
-        let jira = FakeJiraClient::new().with_search_result(crate::jira::types::SearchResult {
-            issues: vec![issue("PROJ-1"), issue("PROJ-2")],
-            next_page_token: None,
-        });
+        let jira =
+            FakeJiraClient::new().with_search_result(crate::ticketing::types::SearchResult {
+                issues: vec![issue("PROJ-1"), issue("PROJ-2")],
+                next_page_token: None,
+            });
         let cfg = config();
         let mut out = Vec::new();
 
@@ -1863,10 +1876,11 @@ mod tests {
 
     #[test]
     fn search_with_no_matches_prints_friendly_message() {
-        let jira = FakeJiraClient::new().with_search_result(crate::jira::types::SearchResult {
-            issues: vec![],
-            next_page_token: None,
-        });
+        let jira =
+            FakeJiraClient::new().with_search_result(crate::ticketing::types::SearchResult {
+                issues: vec![],
+                next_page_token: None,
+            });
         let cfg = config();
         let mut out = Vec::new();
 
@@ -1899,7 +1913,10 @@ mod tests {
         let err = search(&jira, &cfg, "login bug", &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, .. })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::Api {
+                status,
+                ..
+            })) => {
                 assert_eq!(status, 500)
             }
             other => panic!("expected Jira Api error, got {other:?}"),
@@ -1993,7 +2010,9 @@ mod tests {
         let err = rank(&jira, "proj-404", Some("PROJ-1"), None, &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-404")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
@@ -2011,7 +2030,10 @@ mod tests {
         let err = rank(&jira, "proj-372", Some("PROJ-1"), None, &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::Api {
+                status,
+                message,
+            })) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2030,7 +2052,7 @@ mod tests {
         assert_eq!(output, "Linked: PROJ-372 blocks PROJ-1\n");
         assert_eq!(
             jira.create_link_calls(),
-            vec![crate::jira::types::CreateLinkRequest {
+            vec![crate::ticketing::types::CreateLinkRequest {
                 blocker_key: "PROJ-372".to_string(),
                 blocked_key: "PROJ-1".to_string(),
             }]
@@ -2048,7 +2070,7 @@ mod tests {
         assert_eq!(output, "Linked: PROJ-372 is blocked by PROJ-1\n");
         assert_eq!(
             jira.create_link_calls(),
-            vec![crate::jira::types::CreateLinkRequest {
+            vec![crate::ticketing::types::CreateLinkRequest {
                 blocker_key: "PROJ-1".to_string(),
                 blocked_key: "PROJ-372".to_string(),
             }]
@@ -2105,7 +2127,9 @@ mod tests {
         let err = link(&jira, "proj-404", Some("PROJ-1"), None, &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-404")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
@@ -2123,7 +2147,10 @@ mod tests {
         let err = link(&jira, "proj-372", Some("PROJ-1"), None, &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::Api { status, message })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::Api {
+                status,
+                message,
+            })) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "boom");
             }
@@ -2135,16 +2162,16 @@ mod tests {
     fn link_list_mode_renders_inward_and_outward_links() {
         let mut with_links = issue("PROJ-372");
         with_links.fields.issue_links = vec![
-            crate::jira::types::IssueLink {
+            crate::ticketing::types::IssueLink {
                 id: "10001".to_string(),
-                link_type: crate::jira::types::IssueLinkType {
+                link_type: crate::ticketing::types::IssueLinkType {
                     name: "Blocks".to_string(),
                     inward: "is blocked by".to_string(),
                     outward: "blocks".to_string(),
                 },
-                inward_issue: Some(crate::jira::types::LinkedIssue {
+                inward_issue: Some(crate::ticketing::types::LinkedIssue {
                     key: "PROJ-2".to_string(),
-                    fields: crate::jira::types::LinkedIssueFields {
+                    fields: crate::ticketing::types::LinkedIssueFields {
                         summary: "Fix the thing".to_string(),
                         status: Status {
                             name: "In Progress".to_string(),
@@ -2156,17 +2183,17 @@ mod tests {
                 }),
                 outward_issue: None,
             },
-            crate::jira::types::IssueLink {
+            crate::ticketing::types::IssueLink {
                 id: "10001".to_string(),
-                link_type: crate::jira::types::IssueLinkType {
+                link_type: crate::ticketing::types::IssueLinkType {
                     name: "Blocks".to_string(),
                     inward: "is blocked by".to_string(),
                     outward: "blocks".to_string(),
                 },
                 inward_issue: None,
-                outward_issue: Some(crate::jira::types::LinkedIssue {
+                outward_issue: Some(crate::ticketing::types::LinkedIssue {
                     key: "PROJ-3".to_string(),
-                    fields: crate::jira::types::LinkedIssueFields {
+                    fields: crate::ticketing::types::LinkedIssueFields {
                         summary: "Ship the widget".to_string(),
                         status: Status {
                             name: "To Do".to_string(),
@@ -2204,9 +2231,9 @@ mod tests {
     #[test]
     fn link_list_mode_skips_entry_with_neither_side_present() {
         let mut with_links = issue("PROJ-372");
-        with_links.fields.issue_links = vec![crate::jira::types::IssueLink {
+        with_links.fields.issue_links = vec![crate::ticketing::types::IssueLink {
             id: "10001".to_string(),
-            link_type: crate::jira::types::IssueLinkType {
+            link_type: crate::ticketing::types::IssueLinkType {
                 name: "Blocks".to_string(),
                 inward: "is blocked by".to_string(),
                 outward: "blocks".to_string(),
@@ -2227,17 +2254,17 @@ mod tests {
         id: &str,
         inward: Option<&str>,
         outward: Option<&str>,
-    ) -> crate::jira::types::IssueLink {
-        crate::jira::types::IssueLink {
+    ) -> crate::ticketing::types::IssueLink {
+        crate::ticketing::types::IssueLink {
             id: id.to_string(),
-            link_type: crate::jira::types::IssueLinkType {
+            link_type: crate::ticketing::types::IssueLinkType {
                 name: "Blocks".to_string(),
                 inward: "is blocked by".to_string(),
                 outward: "blocks".to_string(),
             },
-            inward_issue: inward.map(|key| crate::jira::types::LinkedIssue {
+            inward_issue: inward.map(|key| crate::ticketing::types::LinkedIssue {
                 key: key.to_string(),
-                fields: crate::jira::types::LinkedIssueFields {
+                fields: crate::ticketing::types::LinkedIssueFields {
                     summary: "Summary".to_string(),
                     status: Status {
                         name: "To Do".to_string(),
@@ -2247,9 +2274,9 @@ mod tests {
                     },
                 },
             }),
-            outward_issue: outward.map(|key| crate::jira::types::LinkedIssue {
+            outward_issue: outward.map(|key| crate::ticketing::types::LinkedIssue {
                 key: key.to_string(),
-                fields: crate::jira::types::LinkedIssueFields {
+                fields: crate::ticketing::types::LinkedIssueFields {
                     summary: "Summary".to_string(),
                     status: Status {
                         name: "To Do".to_string(),
@@ -2382,7 +2409,9 @@ mod tests {
         let err = unlink(&jira, "proj-404", "proj-1", &mut out).expect_err("should fail");
 
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-404")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),
@@ -2397,7 +2426,7 @@ mod tests {
     #[test]
     fn audit_read_prints_all_sections_and_never_audited() {
         let mut with_links = issue("PROJ-372");
-        with_links.fields.assignee = Some(crate::jira::types::UserRef {
+        with_links.fields.assignee = Some(crate::ticketing::types::UserRef {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
@@ -2550,7 +2579,9 @@ mod tests {
         )
         .expect_err("should fail");
         match err {
-            TicketCliError::Ticketing(TicketingError::Jira(JiraError::NotFound { key })) => {
+            TicketCliError::Ticketing(TicketingError::Provider(ProviderError::NotFound {
+                key,
+            })) => {
                 assert_eq!(key, "PROJ-404")
             }
             other => panic!("expected Jira NotFound, got {other:?}"),

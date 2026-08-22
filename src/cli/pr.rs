@@ -470,7 +470,7 @@ mod tests {
     use crate::github::gh_cli::{FakeGhCli, GhError};
     use crate::github::pr::PrInfo;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{Issue, IssueFields, Status, StatusCategory, Transition};
+    use crate::ticketing::types::{Issue, IssueFields, Status, StatusCategory, Transition};
 
     fn issue(key: &str) -> Issue {
         Issue {

@@ -29,8 +29,8 @@ use crate::blocker_stacking::{self, StackDecision};
 use crate::github::bot_findings::count_bot_findings;
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::github::pr::{PrInfo, find_issue_key};
-use crate::jira::types::Issue;
 use crate::ticketing::provider::TicketProvider;
+use crate::ticketing::types::Issue;
 use crate::ticketing::{TicketingError, open_blockers, ready_tickets};
 
 /// Dependencies `tm ready`'s bot-findings annotation needs, alongside the
@@ -310,7 +310,7 @@ pub fn check(
     let issue = ctx
         .jira
         .get_issue(&normalized)
-        .map_err(TicketingError::Jira)?;
+        .map_err(TicketingError::Provider)?;
     let status_name = issue.fields.status.name.clone();
 
     if blocker_stacking::direct_blockers(&issue).is_empty() {
@@ -552,7 +552,7 @@ mod tests {
     use crate::github::bot_findings::ReviewThread;
     use crate::github::gh_cli::{FakeGhCli, GhError};
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{
+    use crate::ticketing::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, SearchResult,
         Status, StatusCategory,
     };
@@ -1046,8 +1046,8 @@ mod tests {
             check(&ready_ctx(&jira, &gh, &bots), "proj-404", &mut out).expect_err("should fail");
 
         match err {
-            ReadyCliError::Ticketing(TicketingError::Jira(
-                crate::jira::client::JiraError::NotFound { key },
+            ReadyCliError::Ticketing(TicketingError::Provider(
+                crate::ticketing::error::ProviderError::NotFound { key },
             )) => {
                 assert_eq!(key, "PROJ-404")
             }

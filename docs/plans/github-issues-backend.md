@@ -3,8 +3,10 @@
 Status: **phases 1-3 complete** and merged to `main` (merge commits
 `f86ff4f`, `5ae20bc`, `c00e95e`; the underlying work is `1446509`, `721a331`,
 and phase 3's commits below). **Phase 4 complete** on branch
-`issue-3-phase-4-gh-issue-ops` (commit `59efbed`), not yet merged. Phases
-5-7 are specified below per the issue but not started.
+`issue-3-phase-4-gh-issue-ops` (commit `59efbed`), not yet merged. **Phase 5
+prep complete** on branch `issue-3-phase-5-prep-provider-types` (commits
+`877296d`, `b77baaf`), not yet merged. Phases 5-7 are specified below per the
+issue but not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -293,6 +295,82 @@ transition (labels plus, for `Done`/`Reopen`, `state`) rather than
 sequencing `issue_edit` and a separate close/reopen method itself — that
 sequencing already lives inside `GhCli::issue_edit`.
 
+## Phase 5 prep — provider-owned types (complete, commits `877296d`, `b77baaf`)
+
+Resolved the first carry-forward bullet ("the trait is still Jira-shaped")
+before `GithubProvider` exists, per that bullet's own instruction. Pure
+refactor, zero behavior change: 1870 tests (up from 1862 at phase 4's tip —
+8 new tests for the error conversion below), clippy, and fmt all pass.
+
+- **`ProviderError`** (`src/ticketing/error.rs`) replaces `JiraError` as
+  every `TicketProvider` method's error type. It's a one-to-one mirror of
+  every `JiraError` variant — same names, same fields — so every existing
+  `match`/`matches!` on a classification (`NotFound`, `ProjectNotFound`,
+  `Unauthorized`, `Api { status, message }`, `RankNotFound`,
+  `RankPartialFailure`, `LinkNotFound`, `LinkIdNotFound`) kept working after
+  a mechanical rename to the `ProviderError` path. The one field that
+  changed shape: `Http` carries a formatted `String` instead of a live
+  `reqwest::Error`, so a non-HTTP adapter (a `gh` shell-out) never needs to
+  fabricate one. `JiraProvider` and `FakeJiraClient`'s `TicketProvider` impl
+  convert via `From<JiraError> for ProviderError` at the boundary (each
+  method body became `Ok(self.0.method(...)?)`, letting `?` invoke the
+  conversion). `TicketingError::Jira` and `AuthCliError::Jira` were renamed
+  to `...::Provider` to carry `ProviderError` instead.
+- **Read-path types moved, not wrapped.** `Issue`, `IssueFields`,
+  `IssueLink`, `IssueLinkType`, `LinkedIssue`, `LinkedIssueFields`, `Status`,
+  `StatusCategory`, `UserRef`, `JiraUser`, `Myself`, `Transition`,
+  `SearchResult`, `RemoteLinkRequest`, and `CreateLinkRequest` moved
+  bodily from `src/jira/types.rs` to `src/ticketing/types.rs`, together with
+  their deserialization tests — no re-export shim, no field renaming. Every
+  `use crate::jira::types::X` outside `src/jira/` became
+  `use crate::ticketing::types::X`, a mechanical import-path swap;
+  `FakeJiraClient`-based tests needed no rewriting beyond that (the phase 1
+  lesson this was deliberately designed around) plus five error-message
+  string assertions that changed wording ("Jira API error" → "ticket
+  provider API error"). `RemoteLinkRequest::to_payload`/
+  `CreateLinkRequest::to_payload` — genuinely Jira-specific wire mapping
+  (ADF-adjacent JSON shaping, the inward/outward link direction quirk) —
+  stayed behind as inherent impls in `src/jira/types.rs`, legal because
+  inherent impls only require the type to live in the current crate, not
+  the current module. `CreateIssueRequest` stayed in `src/jira/types.rs`
+  outright: phase 2 already replaced it at the `TicketProvider` boundary
+  with the backend-neutral `NewTicket`, so it never leaked through the
+  trait and had nothing to move.
+- **What still names a Jira type, on purpose.** `JiraProvider::create_issue`
+  (`src/ticketing/provider.rs`) builds a `crate::jira::types::CreateIssueRequest`
+  to call the wrapped `JiraClient` — inherent to being the Jira→provider
+  boundary, not a leak. `src/ticketing/error.rs` names
+  `crate::jira::client::JiraError` for the same reason: it's the boundary
+  conversion's input type. `src/cli/auth.rs`'s test-only
+  `FakeJiraClientHandle` implements the raw `JiraClient` trait directly (a
+  `tm auth login`/`status` test-plumbing detail predating this refactor), so
+  it necessarily names `JiraError` and the Jira wire types too. None of
+  these are reachable from `GithubProvider`'s side of the trait.
+- **`"Blocks"` stayed hardcoded — deferred, not folded in.** The issue's
+  design flags `open_blockers` (`src/ticketing/mod.rs`) and
+  `direct_blockers` (`src/blocker_stacking.rs`) hardcoding the literal
+  `"Blocks"` as something that becomes a provider-supplied constant. Left
+  alone here: both are pure functions taking `&Issue` with no
+  `TicketProvider` reference in scope, called from `src/cli/ready.rs` and
+  `src/work/run.rs` — threading a provider-supplied constant through would
+  mean a real signature change to every call site, not a mechanical
+  import-path swap, and risks scope creep into behavior this phase
+  promised to leave untouched. Phase 5/6 should decide it alongside
+  `GithubProvider`'s own link-type story (native GitHub issue dependencies
+  have no `"Blocks"`-named type at all — see the issue's dependencies
+  section), since that's when the right shape for the constant (a
+  `TicketProvider` method? a module-level default some adapters override?)
+  becomes answerable from real usage instead of guessed at.
+
+### What phase 5 prep revealed about phases 5-7
+
+`GithubProvider`'s methods can now return `ProviderError` and the types in
+`src/ticketing/types.rs` directly — no Jira type needs impersonating, and
+nothing about `TicketProvider`'s signatures needs to change again for that
+reason. The `"Blocks"`-constant question (previous bullet) and the
+`NewTicket.issue_type_name` and fat-trait-vs-capability-traits questions
+below are the remaining open items before/during phase 5-6 implementation.
+
 ## Phase 5 — `GithubProvider`, read path (not started)
 
 The six board methods (`search`, `transitions`, `transition`,
@@ -323,11 +401,12 @@ than defaulted:
   location for Jira's fields while `merge` keeps reading the flat keys as a
   silent fallback. That gives every adapter the same shape without a breaking
   migration.
-- **The trait is still Jira-shaped.** `TicketProvider` returns `JiraError` and
-  passes `crate::jira::types::Issue` through, so a second adapter has to
-  impersonate Jira's types. Owning the error and read-path types gets more
-  expensive every phase, since retrofitting them touches every call site — do
-  it before or alongside phase 5, not after phase 6.
+- ~~**The trait is still Jira-shaped.**~~ Resolved by the phase 5 prep work
+  above: `TicketProvider` returns `ProviderError` and the provider-owned
+  types in `src/ticketing/types.rs`, not `JiraError`/`crate::jira::types::*`.
+  The one item that work explicitly deferred rather than folded in: the
+  `"Blocks"`-string-becomes-a-constant question (see that section's last
+  bullet).
 - **Fat trait vs. capability traits.** One 14-method trait forces
   `GithubProvider` to answer for operations GitHub has no equivalent of (rank,
   transitions). If phases 5-6 produce more than two or three

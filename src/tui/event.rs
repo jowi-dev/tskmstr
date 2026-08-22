@@ -27,9 +27,10 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
-use crate::jira::client::{JiraError, RankAnchor};
-use crate::jira::types::Issue;
+use crate::jira::client::RankAnchor;
+use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
+use crate::ticketing::types::Issue;
 use crate::tui::app::{
     App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, bot_watch_indicator,
     lane_run_indicator,
@@ -1301,7 +1302,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
 /// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
 /// error) becomes.
-fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, JiraError> {
+fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, ProviderError> {
     let result = deps.jira.search(query)?;
     Ok(TicketPage {
         truncated: result.next_page_token.is_some(),
@@ -1635,8 +1636,8 @@ fn to_ticket_summary(
 mod tests {
     use super::*;
     use crate::jira::fake::FakeJiraClient;
-    use crate::jira::types::{IssueFields, JiraUser, Status, StatusCategory};
     use crate::ticketing::provider::JiraProvider;
+    use crate::ticketing::types::{IssueFields, JiraUser, Status, StatusCategory};
 
     fn issue(key: &str, status: &str) -> Issue {
         Issue {
@@ -1692,7 +1693,7 @@ mod tests {
 
     #[test]
     fn fetch_tickets_maps_issues_to_ticket_summaries() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do")],
@@ -1723,7 +1724,7 @@ mod tests {
 
     #[test]
     fn fetch_tickets_appends_search_truncated_when_a_page_was_left_unfollowed() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do"), issue("PROJ-2", "To Do")],
@@ -1744,7 +1745,9 @@ mod tests {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
         let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
-            [Msg::TicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            [Msg::TicketsFailed(message)] => {
+                assert_eq!(message, "ticket provider API error (500): boom")
+            }
             other => panic!("expected TicketsFailed, got {other:?}"),
         }
     }
@@ -1774,7 +1777,7 @@ mod tests {
         let msgs = fetch_assignable_users(&deps(jira), "PROJ");
         match msgs.as_slice() {
             [Msg::AssignableUsersFailed(message)] => {
-                assert_eq!(message, "Jira API error (500): boom")
+                assert_eq!(message, "ticket provider API error (500): boom")
             }
             other => panic!("expected AssignableUsersFailed, got {other:?}"),
         }
@@ -1994,7 +1997,7 @@ mod tests {
 
     #[test]
     fn to_ticket_summary_with_assignee_extracts_display_name() {
-        use crate::jira::types::UserRef;
+        use crate::ticketing::types::UserRef;
 
         let mut issue = issue("PROJ-1", "To Do");
         issue.fields.assignee = Some(UserRef {
@@ -2011,7 +2014,7 @@ mod tests {
 
     #[test]
     fn fetch_rank_tickets_maps_issues_to_ticket_summaries() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do")],
@@ -2042,7 +2045,9 @@ mod tests {
             },
         );
         match msgs.as_slice() {
-            [Msg::RankTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            [Msg::RankTicketsFailed(message)] => {
+                assert_eq!(message, "ticket provider API error (500): boom")
+            }
             other => panic!("expected RankTicketsFailed, got {other:?}"),
         }
     }
@@ -2084,7 +2089,9 @@ mod tests {
             RankAnchor::Before("PROJ-7".to_string()),
         );
         match msgs.as_slice() {
-            [Msg::RankFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            [Msg::RankFailed(message)] => {
+                assert_eq!(message, "ticket provider API error (500): boom")
+            }
             other => panic!("expected RankFailed, got {other:?}"),
         }
     }
@@ -2093,7 +2100,7 @@ mod tests {
 
     #[test]
     fn fetch_retro_tickets_with_no_store_reports_unavailable() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "Done")],
@@ -2129,14 +2136,16 @@ mod tests {
             },
         );
         match msgs.as_slice() {
-            [Msg::RetroTicketsFailed(message)] => assert_eq!(message, "Jira API error (500): boom"),
+            [Msg::RetroTicketsFailed(message)] => {
+                assert_eq!(message, "ticket provider API error (500): boom")
+            }
             other => panic!("expected RetroTicketsFailed, got {other:?}"),
         }
     }
 
     #[test]
     fn fetch_retro_tickets_excludes_tickets_with_a_recorded_verdict() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "Done"), issue("PROJ-2", "Done")],
@@ -2167,7 +2176,7 @@ mod tests {
 
     #[test]
     fn fetch_retro_tickets_ticket_with_no_run_has_run_none() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "Done")],
@@ -2196,7 +2205,7 @@ mod tests {
 
     #[test]
     fn fetch_retro_tickets_ticket_with_a_lane_run_reports_cost_and_model_mix() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "Done")],
@@ -2341,7 +2350,7 @@ mod tests {
 
     #[test]
     fn run_cmds_feeds_tickets_loaded_back_through_update() {
-        use crate::jira::types::SearchResult;
+        use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do")],
