@@ -1,13 +1,11 @@
 # GitHub Issues as a ticket backend (issue #3), phases 1-7
 
-Status: **phases 1-3 complete** and merged to `main` (merge commits
-`f86ff4f`, `5ae20bc`, `c00e95e`; the underlying work is `1446509`, `721a331`,
-and phase 3's commits below). **Phase 4 complete** on branch
-`issue-3-phase-4-gh-issue-ops` (commit `59efbed`), not yet merged. **Phase 5
-prep complete** on branch `issue-3-phase-5-prep-provider-types` (commits
-`877296d`, `b77baaf`), not yet merged. **Phase 5 complete** on branch
-`issue-3-phase-5-github-read-path` (commits below), not yet merged. Phases
-6-7 are specified below per the issue but not started.
+Status: **phases 1-5 (and the phase 5 prep refactor) complete** and merged to
+`main` (merge commits `f86ff4f`, `5ae20bc`, `c00e95e`, and `e0aaf33` for
+phase 5; the underlying work is `1446509`, `721a331`, phase 3's commits
+below, `59efbed`, `877296d`/`b77baaf`, and phase 5's commits below). **Phase
+6 complete** on branch `issue-3-phase-6-github-write-path` (commits below),
+not yet merged. Phase 7 is specified below per the issue but not started.
 
 Let `tm` treat GitHub Issues as a first-class ticket backend, selected per
 repo, so a GitHub-only project (tskmstr itself included) gets the full
@@ -546,10 +544,184 @@ that costs anything in practice for a process that exits after one command.
   `backend`-keyed enum of provider-specific fields would be a cleaner shape
   if a third adapter ever arrives.
 
-## Phase 6 — `GithubProvider`, write path (not started)
+## Phase 6 — `GithubProvider`, write path (complete, branch `issue-3-phase-6-github-write-path`)
 
-Transitions as label swap + close/reopen, assign, comment, create, update
-body, links, local rank table.
+Commits, in order: `7200dd5` (`IssueEditRequest.body` +
+`create_issue_dependency`/`delete_issue_dependency` GraphQL mutations on
+`GhCli`), `4613f3c` (the local `ticket_rank` table in `RunStore`), `0c1fb57`
+(every `GithubProvider` write-path method), `e54a671` (wiring the rank store
+into `main.rs`'s `GithubProvider` construction). Full test suite 1959 tests
+(up from 1929 at phase 5's tip — 30 new tests), clippy, and fmt all pass.
+
+**`GhCli` gained a `body` field on `IssueEditRequest`** (`src/github/gh_cli.rs`),
+wired into `issue_edit_args` as `--body`: phase 4 only needed label/assignee/
+state edits, so the body flag wasn't added until `update_description` needed
+it.
+
+**`GhCli` gained `create_issue_dependency`/`delete_issue_dependency`**,
+GitHub's native issue-dependencies write side. Confirmed live via `gh api
+graphql` introspection during this phase (the read-side query phase 4
+introspected covers `blockedBy`/`blocking`, but says nothing about how to
+write them): `addBlockedBy`/`removeBlockedBy` mutations, each taking
+`input: { issueId, blockingIssueId }` — both opaque GraphQL node ids, not
+issue numbers, unlike every other `GhCli` method. Each call is two `gh api
+graphql` round trips: a query resolving both issues' node ids by number
+(`ISSUE_NODE_IDS_QUERY`, aliasing `blocker`/`blocked` in one request), then
+the mutation itself. `FakeGhCli` gained matching
+`with_create_issue_dependency_result`/`create_issue_dependency_calls` and
+`with_delete_issue_dependency_result`/`delete_issue_dependency_calls`
+builders, following phase 4/5's exact pattern.
+
+**The local `ticket_rank` table** landed in `src/runs/mod.rs` as migration
+8: `ticket_rank(ticket_key TEXT PRIMARY KEY, rank REAL NOT NULL)`, plus three
+`RunStore` methods following the `ticket_audits`/`ticket_retros` convention
+exactly — `set_ticket_rank` (upsert, unlike the audit/retro tables' append-only
+history, since rank is a single current position not an event log),
+`ticket_rank` (single lookup), and `all_ticket_ranks` (every ranked ticket,
+ascending by rank, for `GithubProvider::search` to consult).
+
+**`GithubProvider`** (`src/ticketing/github_provider.rs`) implements every
+write-path method:
+
+- **`create_issue`**: `gh issue create` with `tm:status/todo` applied as a
+  label at creation time (matching the label taxonomy every other issue
+  carries) and the requested assignee, if any. See "the one real design
+  decision" below for `issue_type_name`.
+- **`assign`**: exclusive single-assignee semantics (matching Jira's
+  `Option<&str>` signature) built on top of GitHub's multi-assignee model —
+  every existing assignee other than the requested one is removed, and the
+  requested one is added only if not already present, avoiding a redundant
+  add-and-remove-the-same-login round trip. `None` removes every assignee.
+  Already-correct state (the requested assignee is already the sole
+  assignee) makes no `gh` call at all.
+- **`add_comment`**/**`update_description`**: `gh issue comment`/`gh issue
+  edit --body`, Markdown pass-through, no ADF involved.
+- **`create_link`**/**`delete_link`**: thin wrappers over
+  `GhCli::create_issue_dependency`/`delete_issue_dependency`, parsing issue
+  numbers out of ticket keys (`create_link`) or the link id itself
+  (`delete_link` — see below).
+- **`rank`**: writes to the local `ticket_rank` table via a new
+  `compute_new_ranks` pure function — fractional-index interpolation between
+  the anchor's rank and its nearest neighbor on the requested side (a fresh,
+  unranked anchor is first assigned a rank past the current maximum, i.e.
+  logically "at the end," matching the design doc's "unranked issues fall to
+  the end" for the anchor's own case). Returns `ProviderError::Api` if no
+  rank store is attached, rather than silently no-oping.
+- **`search`**'s `Ranked`/`ReadyCandidates` branches now call a new
+  `apply_local_rank_order` helper: issues with a recorded rank sort first
+  (ascending by rank), everything else follows sorted by issue number —
+  degenerating to phase 5's plain issue-number order when nothing is ranked
+  or no store is attached, so every phase 5 test for those two queries kept
+  passing unmodified.
+- **`add_remote_link`** is a deliberate no-op returning `Ok(())` — see "the
+  one real design decision" below.
+- The **error-mapping fix** flagged in phase 5's review: `get_issue`/
+  `transitions`/`transition` previously mapped every `issue_view` failure to
+  `ProviderError::NotFound` unconditionally, swallowing the difference
+  between "the issue doesn't exist" and "`gh` isn't installed" / "the
+  process timed out." A new `map_issue_view_error` helper narrows this: only
+  `GhError::Command` (the process ran and `gh` itself reported failure —
+  the only way `issue_view` fails in practice for a missing issue) becomes
+  `NotFound`; `GhError::Spawn`/`Parse`/`Timeout` pass through via
+  `ProviderError::from` instead.
+- `closedAt` threading for `ShippedAwaitingRetro` (the other phase 5 review
+  flag) was **not** done this phase — see "what phase 6 revealed" below.
+
+### The one real design decision this phase forced
+
+Phase 5's synthesized link ids (`gh-dep-blocked-by-<neighbor>`/
+`gh-dep-blocking-<neighbor>`) only encoded the *neighbor's* issue number, not
+the issue being viewed. That's enough to render a link in `get_issue`'s
+result, but `TicketProvider::delete_link` receives only the id, with no
+other context (unlike `create_link`, which gets both keys directly) — there
+was no way to recover which two issues to call
+`GhCli::delete_issue_dependency` on from a one-sided id. The fix: a new id
+shape, `link_id(blocker_number, blocked_number) -> "gh-dep-<blocker>-blocks-<blocked>"`,
+deliberately symmetric regardless of which of `issue_dependencies`'
+connections (`blocked_by` or `blocking`) the link was discovered from — a
+`Blocks` relationship is one thing between two issues, not two things, so
+both directions produce the same id for the same pair. `parse_link_id` is
+the exact inverse, used by `delete_link`; an id that doesn't parse (e.g. a
+link fetched under phase 5's old shape, never re-fetched before being
+deleted under phase 6) is `ProviderError::LinkIdNotFound`, the same error a
+genuinely unknown id would produce, rather than a panic or a silently wrong
+mutation.
+
+Two smaller decisions this phase also had to make, both flagged as open in
+phase 5's carry-forward list:
+
+- **`NewTicket.issue_type_name` is ignored for GitHub.** An issue is just an
+  issue — there's no GitHub concept an issue type could map onto, and
+  encoding it as a label (the taxonomy's only extensibility point) would
+  conflate two unrelated label namespaces. `create_issue` simply doesn't
+  read the field. `NewTicket` itself keeps the field rather than becoming
+  `Option`-al or Jira-only via a wrapper type: the field is harmless dead
+  weight on the GitHub path, and reshaping the boundary struct now, with
+  exactly one adapter that ignores one field, would be solving a problem
+  that doesn't exist yet (revisit if a third adapter's needs disagree with
+  both existing ones).
+- **`add_remote_link` is a no-op, not a body-append.** GitHub already
+  renders the PR↔issue backlink for free from the `Closes #123` line
+  `associate` (`src/ticketing/mod.rs`) puts in the PR body — nothing
+  `add_remote_link` could post would add information already visible on the
+  issue page. A body-append was the only real alternative considered, and
+  was rejected as strictly worse: it would restate a link GitHub already
+  displays natively, and would need to be idempotency-checked against
+  `associate`'s own re-invocation, for zero benefit.
+
+### What phase 6 revealed about phase 7
+
+- **The local rank store's lifetime is now the concrete pattern a third
+  adapter would follow.** `GithubProvider` gained an `Option<&'a RunStore>`
+  field, attached via a `with_rank_store` builder — `None` by default, so
+  every phase 5 test that doesn't touch `rank`/`Ranked`/`ReadyCandidates`
+  needed no changes. Production wiring (`main.rs`'s `ticket_provider_for`)
+  leaks a freshly opened `RunStore` the same way it already leaks a
+  `ShellGhCli`, for the same `'static`-required-by-`Box<dyn TicketProvider>`
+  reason. `JiraProvider` gained no equivalent field at all — Jira has its
+  own native rank and never touches this table, confirming the carry-forward
+  note's expectation that this wouldn't need to be threaded through the
+  trait itself, only through `GithubProvider`'s own constructor.
+- **Fat trait vs. capability traits: the threshold is no longer crossed —
+  the fat trait stays.** Phase 5 counted eight stub methods against the
+  carry-forward's "two or three" split signal. After this phase, zero
+  `TicketProvider` methods on `GithubProvider` return a not-implemented
+  stub: every method is either a real implementation or (for
+  `add_remote_link`) a deliberate, permanent, documented no-op —
+  categorically different from "not built yet." Splitting `TicketProvider`
+  into `TicketRead`/`TicketWrite`/`Rankable`/`Linkable`/`Transitionable` now
+  would be a refactor in search of a problem: there is no caller that wants
+  a narrower trait than the one both adapters already fully implement. This
+  carry-forward item is resolved, not deferred — revisit only if a third
+  adapter can't implement some slice of the trait at all (as opposed to
+  implementing it differently, which both existing adapters already do
+  freely).
+- **`ShippedAwaitingRetro`'s missing time-window filtering is still open**,
+  carried forward unchanged from phase 5: `IssueInfo` still carries no
+  closed-at timestamp. This phase touched `create_issue`/`issue_edit`/issue
+  dependencies, none of which read or need `closedAt`, so there was no
+  natural point to add it without scope creep into a query path this phase
+  wasn't otherwise touching. Left for phase 7 (or a dedicated follow-up) —
+  needs a new `GhCli` field threaded through `issue_list`'s JSON fields and
+  `IssueInfo`.
+- **The `"Blocks"`-string-becomes-a-constant question is still open**,
+  also carried forward unchanged: `to_issue_links` still hardcodes the
+  literal, for the same reason phase 5 left it — no call site threading a
+  provider reference through `src/blocker_stacking.rs`/`open_blockers`
+  exists yet, and this phase's link work (`create_link`/`delete_link`) only
+  ever *sends* dependency mutations, it doesn't touch the two functions that
+  read the hardcoded string back.
+- **Test doubles remain ad hoc, not a shared conformance suite** — phase 5's
+  carry-forward flagged this as worth weighing once a second implementation
+  existed to compare against. Having now written the write-path tests, the
+  overlap is real (transition synthesis, key parsing, and error-mapping
+  shape are structurally identical exercises against `FakeGhCli` vs.
+  `FakeJiraClient`) but the two fakes' call-recording APIs differ enough
+  (`FakeGhCli`'s per-method `with_*`/`*_calls()` vs. `FakeJiraClient`'s
+  broader surface) that extracting a shared suite now would mean designing
+  a third abstraction on top of both fakes rather than just writing tests
+  against the trait. Left for phase 7 or later to decide with the dogfooding
+  workload as a forcing function, rather than speculatively here.
 
 ## Phase 7 — dogfood (not started)
 
@@ -573,49 +745,45 @@ than defaulted:
   `src/ticketing/types.rs`, not `JiraError`/`crate::jira::types::*`. The
   `"Blocks"`-string-becomes-a-constant item that work deferred is still open
   — see below.
-- **Fat trait vs. capability traits — the threshold named here is now
-  crossed.** `GithubProvider` (phase 5) has eight stub methods
-  (`create_issue`, `add_remote_link`, `assign`, `rank`, `create_link`,
-  `delete_link`, `update_description`, `add_comment`), past the "two or
-  three" this bullet named as the signal to split `TicketProvider` into
-  narrower capabilities (`TicketRead`/`TicketWrite`/`Rankable`/`Linkable`/
-  `Transitionable`). Phase 6 implementing several of these will shrink the
-  count but can't clear it entirely — `rank` has no GitHub equivalent to
-  ever implement, only a local table to back it with — so phase 6 should
-  make the split decision explicitly rather than let the count quietly stay
-  past the line this bullet drew.
-- **The local rank table doesn't exist yet.** Phase 5's `search` sorts
-  `Ranked`/`ReadyCandidates` by plain ascending issue number, which is only
-  correct in the degenerate case where nothing is ranked — every issue looks
-  unranked because there's nowhere to record rank at all. Phase 6 needs to
-  actually add the `runs.db` `ticket_rank` table the issue's design
-  describes, wire `GithubProvider::rank` to write to it, and wire `search`
-  to read from it.
-- **`ShippedAwaitingRetro` has no time-window filtering** — `IssueInfo`
-  carries no closed-at timestamp, so phase 5's `search` returns every closed
-  issue. Needs a new `GhCli` field (`closedAt`) threaded through `issue_list`
-  before this query variant means the same thing under both backends.
+- ~~**Fat trait vs. capability traits.**~~ Resolved by phase 6, the other
+  direction from what phase 5 expected: rather than crossing further past
+  the "two or three" split threshold, implementing the remaining methods
+  brought the stub count to *zero* (every method is either a real
+  implementation or `add_remote_link`'s deliberate, permanent no-op). The
+  fat trait stays — see phase 6's "what phase 6 revealed" section for the
+  reasoning. Revisit only if a future third adapter genuinely can't
+  implement some slice of the trait at all.
+- ~~**The local rank table doesn't exist yet.**~~ Resolved by phase 6: the
+  `runs.db` `ticket_rank` table exists (migration 8), `GithubProvider::rank`
+  writes to it via `compute_new_ranks`, and `search`'s `Ranked`/
+  `ReadyCandidates` branches read from it via `apply_local_rank_order`.
+- ~~**`NewTicket.issue_type_name`.**~~ Resolved by phase 6: ignored for
+  GitHub (an issue has no type concept to map it onto); the field stays on
+  `NewTicket` rather than becoming `Option`-al, since it's harmless dead
+  weight with only one adapter ignoring it so far. See phase 6's "the one
+  real design decision" section.
+- **`ShippedAwaitingRetro` still has no time-window filtering** — `IssueInfo`
+  carries no closed-at timestamp, so `search` returns every closed issue
+  under the github backend. Needs a new `GhCli` field (`closedAt`) threaded
+  through `issue_list` before this query variant means the same thing under
+  both backends. Not touched by phase 6 (see that phase's report); still
+  open for phase 7 or a dedicated follow-up.
 - **`"Blocks"`-string-becomes-a-constant** is still open: `GithubProvider`
-  (phase 5) hardcodes it the same way `src/blocker_stacking.rs`/
-  `open_blockers` already do, for the same reason phase 5 prep left it
-  alone — no call site threading a provider reference through those two
-  pure functions exists yet.
-- **`NewTicket.issue_type_name`** is a Jira-only field sitting on the
-  provider-boundary struct. `create_issue` is a stub through phase 5, so
-  nothing yet exercises this; phase 6, which has to actually implement
-  `create_issue`, is where this gets decided from working code rather than
-  a signature guess.
-- **Test doubles.** Both `JiraProvider` and `GithubProvider` still get an
-  ad-hoc, non-shared test-double integration (`FakeJiraClient` implements
-  `TicketProvider` directly; `GithubProvider` borrows a `&dyn GhCli` and
-  tests construct a `FakeGhCli`) rather than a shared conformance suite.
-  Phase 6 should weigh whether the two backends' read-path tests (status
-  synthesis, transition synthesis, key mapping) have enough structural
-  overlap to be worth extracting one, now that a second implementation
-  exists to compare against the first.
+  hardcodes it the same way `src/blocker_stacking.rs`/`open_blockers`
+  already do, for the same reason every prior phase left it alone — no call
+  site threading a provider reference through those two pure functions
+  exists yet, and phase 6's link work only sends dependency mutations, it
+  never reads the hardcoded string back.
+- **Test doubles remain ad hoc, not a shared conformance suite.** Phase 6
+  confirmed real structural overlap now exists (transition synthesis, key
+  parsing, error-mapping shape) between `GithubProvider`'s and
+  `JiraProvider`'s tests, but the two fakes' call-recording APIs differ
+  enough that extracting a shared suite now would mean designing a third
+  abstraction rather than just writing tests against the trait. Left for
+  phase 7 or later, with the dogfooding workload as a forcing function.
 - **`Config`'s Jira fields are always present (as empty strings) under the
   GitHub backend**, rather than `Config` being reshaped so Jira-only and
   GitHub-only fields can't coexist meaninglessly — a deliberate
   minimal-blast-radius choice phase 5 made explicitly rather than solved;
   see that phase's report for the reasoning and the cleaner shape it
-  suggests if a third adapter ever arrives.
+  suggests if a third adapter ever arrives. Not touched by phase 6.

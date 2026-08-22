@@ -1,6 +1,5 @@
-//! [`GithubProvider`]: the GitHub Issues [`TicketProvider`] implementation,
-//! read path only (phase 5 of `docs/plans/github-issues-backend.md`; GitHub
-//! issue #3).
+//! [`GithubProvider`]: the GitHub Issues [`TicketProvider`] implementation
+//! (phases 5-6 of `docs/plans/github-issues-backend.md`; GitHub issue #3).
 //!
 //! Status lives in the reserved `tm:status/*` label namespace rather than a
 //! workflow field GitHub doesn't have: no label (or `tm:status/todo`) means
