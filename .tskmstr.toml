@@ -8,6 +8,10 @@ provider = "github"
 # valid in a repo-local .tskmstr.toml (see resolve_repo_path in
 # src/config/mod.rs) -- the same value in the global config would error.
 repo = "."
+# Explicit rather than relying on the origin/HEAD fallback: a clone whose
+# origin/HEAD symbolic ref was never set (git remote set-head) has nothing
+# for resolve_base to fall back to, and the lane run fails preflight.
+base_branch = "main"
 # prompt_file is a plain relative path, not `~`-expanded or resolved
 # against `repo`: resolve_prompt_path (src/work/run.rs) only understands a
 # leading `~` or an absolute path, so this is resolved against whatever
