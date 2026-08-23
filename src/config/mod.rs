@@ -25,6 +25,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod backend_identity;
+pub use backend_identity::{
+    BackendIdentity, BackendIdentityResolver, FakeBackendIdentityResolver,
+    FsBackendIdentityResolver, compatible_lane_names, resolve_audit_host_dir,
+};
+
 /// Raw, partially-specified configuration as parsed directly from TOML.
 ///
 /// Every field is optional because either the global or the repo file alone
@@ -636,6 +642,57 @@ pub enum ConfigError {
         #[source]
         source: toml::ser::Error,
     },
+
+    /// A relative (non-`~`, non-absolute) path was set for `field` by the
+    /// *global* config, which has no repo directory of its own to resolve a
+    /// relative path against. Only a repo-local `.tskmstr.toml` may use a
+    /// relative path for a lane's `repo` or `[work.audit].dir` — see
+    /// GitHub issue #5 phase 2: `docs/plans/issue-5-lane-backend-routing.md`.
+    #[error(
+        "relative path `{value}` for `{field}` is only allowed in a repo-local .tskmstr.toml \
+         (the global config has no repo directory to resolve it against)"
+    )]
+    RelativePathRequiresRepoConfig {
+        /// Dotted config path of the field that was set to a relative path,
+        /// e.g. `work.lanes.tskmstr.repo` or `work.audit.dir`.
+        field: String,
+        /// The relative path as written in config.
+        value: String,
+    },
+}
+
+/// Resolves `raw` (a `[work.lanes.<name>].repo` or `[work.audit].dir`
+/// value) against `defining_dir` when `raw` is a plain relative path
+/// (neither `~`-prefixed nor absolute): `defining_dir` is the repo
+/// directory of whichever config file actually set this value, `None` when
+/// that was the global config, which has no repo directory of its own.
+///
+/// A leading `~` (see [`crate::work::naming::expand_tilde`]) and an already
+/// absolute path are returned unchanged, exactly as before this function
+/// existed — resolution is caller-side for those, same as every other
+/// path-shaped config field's convention (see e.g.
+/// [`RawWorkConfig::worktree_root`]'s doc comment).
+fn resolve_repo_path(
+    raw: &str,
+    defining_dir: Option<&Path>,
+    field: impl Into<String>,
+) -> Result<String, ConfigError> {
+    if raw.starts_with('~') || Path::new(raw).is_absolute() {
+        return Ok(raw.to_string());
+    }
+    match defining_dir {
+        // `raw == "."` is special-cased to avoid a literal trailing `/.`
+        // component (`dir.join(".")` would otherwise produce one) — this is
+        // the exact case the plan's design calls out: a repo-local
+        // `.tskmstr.toml` setting `repo = "."` must resolve to that repo's
+        // root, not `<root>/.`.
+        Some(dir) if raw == "." => Ok(dir.to_string_lossy().into_owned()),
+        Some(dir) => Ok(dir.join(raw).to_string_lossy().into_owned()),
+        None => Err(ConfigError::RelativePathRequiresRepoConfig {
+            field: field.into(),
+            value: raw.to_string(),
+        }),
+    }
 }
 
 /// Seed values used to bootstrap a brand-new global config file.
@@ -812,7 +869,7 @@ fn merge_with_repo_dir(
         .clone()
         .or(global.board_column_order.clone())
         .unwrap_or_default();
-    let work = merge_work(global.work.clone(), repo.work.clone())?;
+    let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
 
     let expected_path = default_global_config_path();
 
@@ -905,9 +962,21 @@ fn merge_backend(
 /// entirely replaces the global lane of the same name (see
 /// [`RawWorkConfig::lanes`] for rationale), rather than being merged field by
 /// field the way the top-level `[work]` scalars are.
+///
+/// `repo_dir`, when given, is the directory of the repo-local `.tskmstr.toml`
+/// that `repo` was parsed from (see [`merge_with_repo_dir`]'s own doc
+/// comment) — the "defining directory" a lane's `repo` (or
+/// `[work.audit].dir`) resolves a relative path against, when that specific
+/// value actually came from `repo` rather than falling back to `global` (see
+/// [`resolve_repo_path`]). A value that falls back to the global config, and
+/// is relative, is a [`ConfigError::RelativePathRequiresRepoConfig`]
+/// regardless of `repo_dir` — the global config has no repo directory of its
+/// own, no matter what directory happened to be passed in for other
+/// purposes (e.g. `[backend.github].repo`'s origin-remote default).
 fn merge_work(
     global: Option<RawWorkConfig>,
     repo: Option<RawWorkConfig>,
+    repo_dir: Option<&Path>,
 ) -> Result<WorkConfig, ConfigError> {
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
@@ -923,7 +992,7 @@ fn merge_work(
         .or(global.tmux_windows)
         .unwrap_or_default();
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
-    let audit = merge_audit(global.audit, repo.audit);
+    let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
@@ -935,6 +1004,13 @@ fn merge_work(
     if review_watch.model.is_none() {
         review_watch.model = audit.model.clone();
     }
+
+    // Captured before `repo.lanes` is consumed below: which lane names this
+    // *specific* `repo` config defined, so a lane replaced wholesale from
+    // `repo` resolves its relative `repo` path against `repo_dir`, while a
+    // lane inherited unchanged from `global` (not present in `repo.lanes`)
+    // has no defining repo directory at all — see [`resolve_repo_path`].
+    let repo_lane_names: std::collections::BTreeSet<String> = repo.lanes.keys().cloned().collect();
 
     let mut raw_lanes = global.lanes;
     for (name, lane) in repo.lanes {
@@ -948,6 +1024,13 @@ fn merge_work(
                 lane: name.clone(),
                 field: "repo",
             })?;
+            let defining_dir = if repo_lane_names.contains(&name) {
+                repo_dir
+            } else {
+                None
+            };
+            let repo_path =
+                resolve_repo_path(&repo_path, defining_dir, format!("work.lanes.{name}.repo"))?;
             Ok((
                 name,
                 LaneConfig {
@@ -981,14 +1064,33 @@ fn merge_work(
 /// whole-section replacement: `[work.audit]` is a single section, not a
 /// keyed collection, so there's no "which entry" ambiguity for whole-section
 /// replacement to resolve.
-fn merge_audit(global: Option<RawAuditConfig>, repo: Option<RawAuditConfig>) -> AuditConfig {
+///
+/// `repo_dir` is the defining directory `dir` resolves a relative path
+/// against, but only when `dir` itself actually came from `repo` (not a
+/// fallback to `global`) — see [`merge_work`]'s doc comment and
+/// [`resolve_repo_path`].
+fn merge_audit(
+    global: Option<RawAuditConfig>,
+    repo: Option<RawAuditConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<AuditConfig, ConfigError> {
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
-    AuditConfig {
-        dir: repo.dir.or(global.dir),
+
+    let (dir, defining_dir) = match repo.dir {
+        Some(dir) => (Some(dir), repo_dir),
+        None => (global.dir, None),
+    };
+    let dir = match dir {
+        Some(dir) => Some(resolve_repo_path(&dir, defining_dir, "work.audit.dir")?),
+        None => None,
+    };
+
+    Ok(AuditConfig {
+        dir,
         prompt: repo.prompt.or(global.prompt),
         model: repo.model.or(global.model),
-    }
+    })
 }
 
 /// Merge a repo-local `[work.review_watch]` section on top of a global one,
@@ -2524,7 +2626,7 @@ mod tests {
             lanes,
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), None).expect("lane with repo should be valid");
+        let cfg = merge_work(Some(global), None, None).expect("lane with repo should be valid");
         assert_eq!(cfg.lanes.get("solo").unwrap().repo, "/repo/solo");
     }
 
@@ -2536,7 +2638,7 @@ mod tests {
             lanes,
             ..Default::default()
         };
-        let err = merge_work(Some(global), None).expect_err("lane without repo should fail");
+        let err = merge_work(Some(global), None, None).expect_err("lane without repo should fail");
         match err {
             ConfigError::MissingLaneField { lane, field } => {
                 assert_eq!(lane, "solo");
@@ -2554,7 +2656,7 @@ mod tests {
             lanes,
             ..Default::default()
         };
-        let err = merge_work(Some(global), None).expect_err("lane without repo should fail");
+        let err = merge_work(Some(global), None, None).expect_err("lane without repo should fail");
         let message = err.to_string();
         assert!(
             message.contains("solo"),
@@ -2590,7 +2692,7 @@ mod tests {
             audit: None,
             review_watch: None,
         };
-        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
         assert_eq!(cfg.worktree_root, Some("/repo/worktrees".to_string()));
         // Non-overridden fields fall back to global.
@@ -2619,7 +2721,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
         assert_eq!(cfg.audit.dir, Some("/repo-local/axiom".to_string()));
         // Non-overridden fields fall back to global.
@@ -2629,7 +2731,7 @@ mod tests {
 
     #[test]
     fn merge_work_audit_absent_from_both_is_default() {
-        let cfg = merge_work(None, None).expect("should merge");
+        let cfg = merge_work(None, None, None).expect("should merge");
         assert_eq!(cfg.audit, AuditConfig::default());
     }
 
@@ -2657,7 +2759,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden fields win.
         assert_eq!(cfg.review_watch.dir, Some("/repo-local/axiom".to_string()));
         assert_eq!(cfg.review_watch.max_wait_mins, 120);
@@ -2673,7 +2775,7 @@ mod tests {
 
     #[test]
     fn merge_work_review_watch_absent_from_both_is_default() {
-        let cfg = merge_work(None, None).expect("should merge");
+        let cfg = merge_work(None, None, None).expect("should merge");
         assert_eq!(cfg.review_watch, ReviewWatchConfig::default());
     }
 
@@ -2687,7 +2789,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), None).expect("should merge");
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
         assert_eq!(
             cfg.review_watch.dir,
             Some("~/Projects/axiom".to_string()),
@@ -2709,7 +2811,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), None).expect("should merge");
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
         assert_eq!(cfg.review_watch.dir, Some("~/Projects/other".to_string()));
     }
 
@@ -2723,7 +2825,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), None).expect("should merge");
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
         assert_eq!(
             cfg.review_watch.model,
             Some("fable".to_string()),
@@ -2745,7 +2847,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(Some(global), None).expect("should merge");
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
         assert_eq!(cfg.review_watch.model, Some("sonnet".to_string()));
     }
 
@@ -2758,7 +2860,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = merge_work(Some(global), None).expect_err("should reject bad value");
+        let err = merge_work(Some(global), None, None).expect_err("should reject bad value");
         match err {
             ConfigError::InvalidOnBotsDone { value } => assert_eq!(value, "sometimes"),
             other => panic!("expected InvalidOnBotsDone, got {other:?}"),
@@ -2798,7 +2900,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         let lane = cfg.lanes.get("partner-integrations").unwrap();
         assert_eq!(lane.repo, "/repo-local/axiom");
         assert_eq!(lane.base_branch, None);
@@ -2840,7 +2942,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cfg = merge_work(Some(global), Some(repo)).expect("should merge");
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         assert_eq!(cfg.lanes.get("lane-a").unwrap().repo, "/global/a");
         assert_eq!(cfg.lanes.get("lane-b").unwrap().repo, "/repo-local/b");
     }
@@ -2885,5 +2987,247 @@ mod tests {
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.work.worktree_root, Some("/repo/worktrees".to_string()));
         assert_eq!(cfg.work.lanes.get("solo").unwrap().repo, "/repo-local/solo");
+    }
+
+    // --- relative lane `repo` / `[work.audit].dir` paths (GitHub issue #5
+    // phase 2) ---
+
+    #[test]
+    fn load_repo_local_relative_lane_repo_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.lanes.tskmstr]
+            repo = "."
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.lanes.get("tskmstr").unwrap().repo,
+            dir.path().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn load_repo_local_relative_audit_dir_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.audit]
+            dir = "."
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.audit.dir,
+            Some(dir.path().to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn load_repo_local_relative_lane_repo_resolves_against_repo_dir_with_subpath() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.lanes.sibling]
+            repo = "../other-repo"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        let expected = dir.path().join("../other-repo");
+        assert_eq!(
+            cfg.work.lanes.get("sibling").unwrap().repo,
+            expected.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn merge_work_relative_lane_repo_from_global_only_is_a_config_error() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some("relative/solo".to_string()),
+                ..Default::default()
+            },
+        );
+        let global = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject relative path");
+        match err {
+            ConfigError::RelativePathRequiresRepoConfig { field, value } => {
+                assert_eq!(field, "work.lanes.solo.repo");
+                assert_eq!(value, "relative/solo");
+            }
+            other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_work_relative_audit_dir_from_global_only_is_a_config_error() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("relative/axiom".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject relative path");
+        match err {
+            ConfigError::RelativePathRequiresRepoConfig { field, value } => {
+                assert_eq!(field, "work.audit.dir");
+                assert_eq!(value, "relative/axiom");
+            }
+            other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_work_relative_lane_repo_with_repo_dir_resolves_against_it() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some(".".to_string()),
+                ..Default::default()
+            },
+        );
+        let repo = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+
+        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo/solo")))
+            .expect("should resolve against repo_dir");
+        assert_eq!(cfg.lanes.get("solo").unwrap().repo, "/repo/solo");
+    }
+
+    #[test]
+    fn merge_work_lane_absolute_repo_is_unaffected_by_repo_dir() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some("/absolute/solo".to_string()),
+                ..Default::default()
+            },
+        );
+        let repo = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+
+        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo/dir")))
+            .expect("absolute paths pass through unchanged");
+        assert_eq!(cfg.lanes.get("solo").unwrap().repo, "/absolute/solo");
+    }
+
+    #[test]
+    fn merge_work_lane_tilde_repo_is_unaffected_by_repo_dir() {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some("~/Projects/solo".to_string()),
+                ..Default::default()
+            },
+        );
+        let repo = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+
+        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo/dir")))
+            .expect("tilde paths pass through unexpanded and unresolved");
+        assert_eq!(cfg.lanes.get("solo").unwrap().repo, "~/Projects/solo");
+    }
+
+    #[test]
+    fn merge_work_relative_lane_inherited_from_global_with_repo_dir_present_still_errors() {
+        // Even when merge_work is given a repo_dir (e.g. the repo-local
+        // config's own directory, for a *different* section's relative
+        // path), a lane that itself came only from the global config still
+        // has no defining directory of its own -- repo_dir must not leak
+        // across to a value it didn't define.
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "solo".to_string(),
+            RawLaneConfig {
+                repo: Some("relative/solo".to_string()),
+                ..Default::default()
+            },
+        );
+        let global = RawWorkConfig {
+            lanes,
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, Some(Path::new("/repo/dir")))
+            .expect_err("a global-only lane has no defining repo dir even when one is given");
+        assert!(matches!(
+            err,
+            ConfigError::RelativePathRequiresRepoConfig { .. }
+        ));
     }
 }
