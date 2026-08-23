@@ -46,12 +46,13 @@
 //! 6. Resolve the branch owner (see [`resolve_branch_owner`]) and cut this
 //!    run's fresh branch off the resolved base (`GitOps::switch_new_branch`,
 //!    always `--no-track`). The branch name is `<owner>/<wt_name>-<slug>`
-//!    when a Jira summary is available for the run's ticket (see
-//!    [`resolve_ticket_slug`] and [`naming::branch_name_with_slug`]),
-//!    falling back to the original `<owner>/<wt_name>-<timestamp>`
-//!    (`naming::branch_name`]) whenever it isn't — no ticket, no Jira
-//!    dependency, a failed lookup, or an empty summary all land on the
-//!    fallback, silently, since a Jira hiccup must never fail a run. Either
+//!    when a ticket summary is available from the configured backend's
+//!    ticket provider (see [`resolve_ticket_slug`] and
+//!    [`naming::branch_name_with_slug`]), falling back to the original
+//!    `<owner>/<wt_name>-<timestamp>` (`naming::branch_name`]) whenever it
+//!    isn't — no ticket, no ticket-provider dependency, a failed lookup, or
+//!    an empty summary all land on the fallback, silently, since a
+//!    ticket-provider hiccup must never fail a run. Either
 //!    way, the candidate branch name is resolved against
 //!    [`naming::resolve_branch_collision`] first, since (unlike the
 //!    timestamp) a slug does not guarantee uniqueness across re-runs.
@@ -147,8 +148,9 @@ pub enum RunLaneError {
     )]
     NoBaseBranch(String),
 
-    /// The run's ticket has two or more direct Jira `Blocks` blockers that
-    /// are not yet merged (see [`resolve_blocker_stacking`]'s decision
+    /// The run's ticket has two or more direct `Blocks` blockers (per the
+    /// configured ticket provider) that are not yet merged (see
+    /// [`resolve_blocker_stacking`]'s decision
     /// table). A run branch can only be stacked on one unmerged dependency
     /// at a time, so this refuses before any run row is created rather than
     /// guessing which blocker to build on.
@@ -255,15 +257,16 @@ pub struct RunLaneDeps<'a> {
     pub run_store: &'a RunStore,
     /// "Now" source for the run's timestamp.
     pub clock: &'a dyn Clock,
-    /// Jira client used to look up a run's ticket summary, for the
-    /// human-readable branch-name slug (step 6 of this module's doc
-    /// comment). `None` when Jira isn't configured/authenticated for this
-    /// invocation — `tm work run` still works without Jira access, it just
-    /// falls back to the original timestamp-based branch name (see
-    /// [`resolve_ticket_slug`]). Never treated as a hard requirement: `tm
-    /// work run` has always worked without Jira, and this feature must not
-    /// change that.
-    pub jira: Option<&'a dyn TicketProvider>,
+    /// The ticket provider for `config.backend` (Jira or GitHub — see
+    /// [`crate::ticketing::provider::TicketProvider`]), used to look up a
+    /// run's ticket summary for the human-readable branch-name slug (step 6
+    /// of this module's doc comment). `None` when no provider could be
+    /// constructed/authenticated for this invocation — `tm work run` still
+    /// works without ticket-backend access, it just falls back to the
+    /// original timestamp-based branch name (see [`resolve_ticket_slug`]).
+    /// Never treated as a hard requirement: `tm work run` has always worked
+    /// without it, and this feature must not change that.
+    pub ticket_provider: Option<&'a dyn TicketProvider>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -411,30 +414,34 @@ pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> Str
 }
 
 /// Resolve the human-readable slug to fold into a lane run's branch name
-/// (see [`naming::branch_name_with_slug`]), from the run's ticket's Jira
-/// summary.
+/// (see [`naming::branch_name_with_slug`]), from the run's ticket's summary
+/// as reported by whichever [`TicketProvider`] `config.backend` selects
+/// (Jira or GitHub).
 ///
 /// Returns `None` — meaning [`prepare_run_lane`]'s step 6 falls back to the
 /// original timestamp-based [`naming::branch_name`] — whenever any of these
 /// hold:
 /// - `ticket` is `None` (the run isn't scoped to a ticket at all, e.g. a
 ///   bare lane run keyed by lane name).
-/// - `jira` is `None` (Jira isn't configured/authenticated for this
-///   invocation).
+/// - `ticket_provider` is `None` (no ticket backend is
+///   configured/authenticated for this invocation).
 /// - The `get_issue` call fails for any reason (network error, 404, auth
 ///   failure, ...).
 /// - The issue's summary is empty or contains no alphanumeric characters,
 ///   per [`naming::slugify_summary`].
 ///
-/// Every one of those is swallowed silently (no warning printed): a Jira
-/// hiccup must never fail a run, and the existing timestamp naming is a
-/// perfectly good branch name on its own — this is a "nice to have when
-/// available" enhancement, not a dependency `tm work run` should ever block
-/// on or complain about losing.
-fn resolve_ticket_slug(jira: Option<&dyn TicketProvider>, ticket: Option<&str>) -> Option<String> {
-    let jira = jira?;
+/// Every one of those is swallowed silently (no warning printed): a
+/// ticket-backend hiccup must never fail a run, and the existing timestamp
+/// naming is a perfectly good branch name on its own — this is a "nice to
+/// have when available" enhancement, not a dependency `tm work run` should
+/// ever block on or complain about losing.
+fn resolve_ticket_slug(
+    ticket_provider: Option<&dyn TicketProvider>,
+    ticket: Option<&str>,
+) -> Option<String> {
+    let ticket_provider = ticket_provider?;
     let ticket = ticket?;
-    let issue = jira.get_issue(ticket).ok()?;
+    let issue = ticket_provider.get_issue(ticket).ok()?;
     naming::slugify_summary(&issue.fields.summary)
 }
 
@@ -445,7 +452,7 @@ pub struct BlockerResolution {
     /// `Some(base)` — always `origin/<head_ref_name>` — when exactly one
     /// direct blocker is unmerged and has an open PR to stack on. `None`
     /// means "use the normal base" (no blockers, a merged blocker, a
-    /// no-PR/closed-PR blocker, or Jira/gh unavailable/failing).
+    /// no-PR/closed-PR blocker, or the ticket provider/gh unavailable/failing).
     pub stacked_base: Option<String>,
     /// Lines [`prepare_run_lane`] prints, in order — the stacking
     /// announcement, a no-PR warning, or a resolution-failure warning.
@@ -455,7 +462,8 @@ pub struct BlockerResolution {
 impl BlockerResolution {
     /// A resolution carrying a single warning line and no base override —
     /// every "fall back to normal base" outcome that still has something
-    /// worth telling the caller (a no-PR blocker, or a Jira/gh failure).
+    /// worth telling the caller (a no-PR blocker, or a ticket-provider/gh
+    /// failure).
     fn warning(message: String) -> Self {
         Self {
             stacked_base: None,
@@ -468,7 +476,7 @@ impl BlockerResolution {
 /// ticket's PR branch instead of the normal base, and what (if anything) to
 /// print about it.
 ///
-/// Only consulted when the run has a ticket, a Jira client is configured,
+/// Only consulted when the run has a ticket, a ticket provider is configured,
 /// and no `--from` override was given — [`prepare_run_lane`] skips calling
 /// this at all in every other case, since `--from` is an explicit "use this
 /// base" instruction that blocker logic must never second-guess.
@@ -493,7 +501,7 @@ impl BlockerResolution {
 ///   both be stacked on, and this is the one case where blocker resolution
 ///   refuses the run outright rather than falling back.
 ///
-/// Any Jira failure while resolving blockers (a bad `get_issue`), or a
+/// Any ticket-provider failure while resolving blockers (a bad `get_issue`), or a
 /// **transient** `gh` failure from [`GhCli::pr_list_all`] (network error,
 /// rate limit, a `5xx`, expired auth, `gh` missing, a timeout — see
 /// [`GhError::is_permanent`]), short-circuits to `stacked_base: None` plus a
@@ -524,19 +532,19 @@ impl BlockerResolution {
 /// call — one `gh` invocation per run, not one per blocker (see
 /// [`crate::blocker_stacking::find_blocker_pr`]'s doc comment).
 pub fn resolve_blocker_stacking(
-    jira: Option<&dyn TicketProvider>,
+    ticket_provider: Option<&dyn TicketProvider>,
     gh: &dyn GhCli,
     repo_root: &Path,
     ticket: Option<&str>,
 ) -> Result<BlockerResolution, RunLaneError> {
-    let Some(jira) = jira else {
+    let Some(ticket_provider) = ticket_provider else {
         return Ok(BlockerResolution::default());
     };
     let Some(ticket) = ticket else {
         return Ok(BlockerResolution::default());
     };
 
-    let issue = match jira.get_issue(ticket) {
+    let issue = match ticket_provider.get_issue(ticket) {
         Ok(issue) => issue,
         Err(err) => {
             return Ok(BlockerResolution::warning(format!(
@@ -799,7 +807,7 @@ pub fn prepare_run_lane(
     // Blocked-ticket branch-off: resolved once, up front, before step 4's
     // worktree provisioning (which needs a base too, if the worktree is
     // new) and step 6's branch cut both consult it — resolving it inside
-    // resolve_base itself would make the Jira/gh calls twice per run.
+    // resolve_base itself would make the ticket-provider/gh calls twice per run.
     // Skipped entirely when `--from` was given: an explicit base override
     // must never be second-guessed by blocker logic. See
     // resolve_blocker_stacking's doc comment for the full decision table.
@@ -811,7 +819,12 @@ pub fn prepare_run_lane(
     // `Err`, since prepare_run_lane's caller has no other opportunity to
     // record it anywhere durable.
     let blocker_resolution = if request.from_base.is_none() {
-        match resolve_blocker_stacking(deps.jira, deps.gh, &repo_root, request.ticket.as_deref()) {
+        match resolve_blocker_stacking(
+            deps.ticket_provider,
+            deps.gh,
+            &repo_root,
+            request.ticket.as_deref(),
+        ) {
             Ok(resolution) => resolution,
             Err(err) => {
                 append_log_line(&log_path, &format!("error: {err}"));
@@ -867,8 +880,9 @@ pub fn prepare_run_lane(
         return Err(RunLaneError::WorktreeDirty(wt_path));
     }
 
-    // Step 6: cut this run's fresh branch. When the run's ticket has a Jira
-    // summary available, the branch is named from a short slug of it
+    // Step 6: cut this run's fresh branch. When the run's ticket has a
+    // summary available from the ticket provider, the branch is named from
+    // a short slug of it
     // (`<owner>/<wt_name>-<slug>`, e.g. `jowi-dev/ax-414-delete-bid-
     // connector`) instead of the timestamp — see resolve_ticket_slug's doc
     // comment for the full list of fallback conditions, all of which land
@@ -879,7 +893,7 @@ pub fn prepare_run_lane(
     // origin-remote-tracking ref before it's cut.
     let base = resolve_base(deps.git)?;
     let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root);
-    let candidate = match resolve_ticket_slug(deps.jira, request.ticket.as_deref()) {
+    let candidate = match resolve_ticket_slug(deps.ticket_provider, request.ticket.as_deref()) {
         Some(slug) => naming::branch_name_with_slug(&owner, &wt_name, &slug),
         None => naming::branch_name(&owner, &wt_name, &timestamp),
     };
@@ -1488,7 +1502,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1552,7 +1566,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1601,7 +1615,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1649,7 +1663,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1696,7 +1710,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1745,7 +1759,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1797,7 +1811,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1877,7 +1891,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1950,7 +1964,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2022,7 +2036,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2067,7 +2081,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2110,7 +2124,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2154,7 +2168,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2204,7 +2218,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2251,7 +2265,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2298,7 +2312,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2343,7 +2357,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2364,6 +2378,71 @@ mod tests {
 
         let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
         assert_eq!(run.ticket, "ABC-123");
+    }
+
+    // Issue #5 fix 3: under the github backend, the ticket provider wired
+    // into RunLaneDeps.ticket_provider is a GithubProvider, not a Jira
+    // client — so GH-N slug resolution must actually resolve the issue's
+    // summary via `gh`, not silently fail. Mirrors
+    // `run_lane_fg_uses_jira_summary_slug_for_branch_name_when_available`
+    // above, but with a real `GithubProvider` over a `FakeGhCli`.
+    #[test]
+    fn run_lane_fg_uses_github_summary_slug_for_branch_name_when_available() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let issue_gh = FakeGhCli::new().with_issue_view(
+            3,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 3,
+                url: "https://github.com/jowi-dev/tskmstr/issues/3".to_string(),
+                title: "Delete bid connector".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            }),
+        );
+        let github_provider = crate::ticketing::github_provider::GithubProvider::new(
+            &issue_gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&github_provider),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("GH-3".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+
+        // Same shape as the Jira case: wt_name is the lowercased ticket,
+        // the slug comes from the GitHub issue's title via GithubProvider's
+        // get_issue mapping (title -> Issue.fields.summary).
+        assert_eq!(outcome.branch, "claude/gh-3-delete-bid-connector");
     }
 
     // --- Jira-summary-slug branch naming and its fallbacks (module doc's
@@ -2396,7 +2475,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -2437,7 +2516,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2481,7 +2560,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -2525,7 +2604,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -2568,7 +2647,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -2616,7 +2695,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -2662,7 +2741,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2713,7 +2792,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2761,7 +2840,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2811,7 +2890,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2861,7 +2940,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2923,7 +3002,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2967,7 +3046,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3017,7 +3096,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3065,7 +3144,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3116,7 +3195,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3187,7 +3266,7 @@ mod tests {
             spawner: &prepare_spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: None,
+            ticket_provider: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3461,7 +3540,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -3525,7 +3604,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -3586,7 +3665,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -3646,7 +3725,7 @@ mod tests {
             spawner: &FakeProcessSpawner::success(canned_json()),
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,
@@ -3694,7 +3773,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            jira: Some(&jira),
+            ticket_provider: Some(&jira),
         };
         let paths = RunLanePaths {
             home,

@@ -247,6 +247,19 @@ fn ticket_provider_for(
     }
 }
 
+/// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
+/// (see `run_work`'s doc comment): the same provider [`ticket_provider_for`]
+/// builds for `config.backend`, or `None` on any construction/auth failure
+/// — never a hard error, since `tm work run` has always worked without
+/// ticket-backend access and this feature must not change that.
+fn run_ticket_provider(
+    config: &Config,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Option<Box<dyn TicketProvider>> {
+    ticket_provider_for(config, keychain, env_token).ok()
+}
+
 /// `tm review fix <KEY>` is always special-cased in `main` as
 /// [`run_review_fix`] instead (see the comment above that early-return),
 /// since `ReviewCmd::Fix` is `tm review`'s only subcommand and always needs
@@ -262,17 +275,19 @@ fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
 /// Dispatch `tm work new/remove/list/restore/start/run`.
 ///
 /// Loads config leniently (like `tm runs`, unlike every other command):
-/// `tm work` should still work with an absent/invalid Jira config, since
-/// most of its subcommands don't touch Jira at all. A missing `[work]`
-/// section just means no lanes and every default falls back to
-/// `tskmstr::cli::work`'s own hardcoded fallbacks (e.g. `~/Worktrees`).
+/// `tm work` should still work with an absent/invalid ticket-backend config,
+/// since most of its subcommands don't touch a ticket provider at all. A
+/// missing `[work]` section just means no lanes and every default falls back
+/// to `tskmstr::cli::work`'s own hardcoded fallbacks (e.g. `~/Worktrees`).
 ///
-/// `WorkCmd::Run` is the one exception that *can* use Jira (for the
-/// human-readable branch-name slug — see
-/// `tskmstr::work::run::resolve_ticket_slug`), but only opportunistically:
-/// it's still built from this same leniently-loaded `full_config`, and a
-/// missing/invalid config or unresolvable token just means no Jira client
-/// is wired in, not a hard error. See that match arm for the fallback.
+/// `WorkCmd::Run` is the one exception that *can* use a ticket provider (for
+/// the human-readable branch-name slug — see
+/// `tskmstr::work::run::resolve_ticket_slug`), selected by `config.backend`
+/// via [`ticket_provider_for`] (the same construction `tm ticket`/`tm board`
+/// use), but only opportunistically: it's still built from this same
+/// leniently-loaded `full_config`, and a missing/invalid config or a
+/// construction/auth failure just means no ticket provider is wired in, not
+/// a hard error. See that match arm for the fallback.
 fn run_work(
     cmd: WorkCmd,
     paths: &ConfigPaths,
@@ -349,14 +364,13 @@ fn run_work(
             let clock = tskmstr::work::run::SystemClock;
             let detach = tskmstr::work::detach::RealDetachSpawner;
             let current_exe = std::env::current_exe()?;
-            // Best-effort Jira client for the branch-name slug: absent
-            // config or an unresolvable token silently means no client,
-            // never a hard error — see this function's doc comment.
-            let jira: Option<Box<dyn TicketProvider>> = full_config.as_ref().and_then(|cfg| {
-                resolve_token(keychain, env_token.clone())
-                    .ok()
-                    .map(|token| jira_client_for(cfg, &token))
-            });
+            // Best-effort ticket provider for the branch-name slug: absent
+            // config or a construction/auth failure silently means no
+            // provider, never a hard error — see this function's doc
+            // comment.
+            let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
+                .as_ref()
+                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -365,7 +379,7 @@ fn run_work(
                 detach: &detach,
                 current_exe: &current_exe,
                 run_db_path: &run_db_path,
-                jira: jira.as_deref(),
+                ticket_provider: ticket_provider.as_deref(),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -1270,4 +1284,83 @@ fn run_pr(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tskmstr::keychain::InMemoryKeychain;
+
+    fn github_config(repo: &str) -> Config {
+        Config {
+            backend: BackendKind::Github,
+            jira_base_url: String::new(),
+            jira_email: String::new(),
+            default_project_key: String::new(),
+            github_repo: Some(repo.to_string()),
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: None,
+            run_db_path: None,
+            review_bots: Vec::new(),
+            board_column_order: Vec::new(),
+            work: tskmstr::config::WorkConfig::default(),
+        }
+    }
+
+    fn jira_config() -> Config {
+        Config {
+            backend: BackendKind::Jira,
+            jira_base_url: "https://example.atlassian.net".to_string(),
+            jira_email: "dev@example.com".to_string(),
+            default_project_key: "PROJ".to_string(),
+            github_repo: None,
+            default_assignee_account_id: None,
+            status_on_pr: None,
+            status_on_create: None,
+            run_db_path: None,
+            review_bots: Vec::new(),
+            board_column_order: Vec::new(),
+            work: tskmstr::config::WorkConfig::default(),
+        }
+    }
+
+    // `tm work run`'s branch-name-slug provider must be selected by
+    // `config.backend` (via `ticket_provider_for`, the same construction
+    // `tm ticket`/`tm board` use), not always Jira — see issue #5's root
+    // cause 3. A github-backend config with no jira credentials at all
+    // must still get a usable provider: `run_ticket_provider` must not
+    // fall through to a Jira-token lookup that has nothing to resolve.
+    #[test]
+    fn run_ticket_provider_github_backend_does_not_need_a_jira_token() {
+        let config = github_config("jowi-dev/tskmstr");
+        let keychain = InMemoryKeychain::empty();
+
+        let provider = run_ticket_provider(&config, &keychain, None);
+
+        assert!(
+            provider.is_some(),
+            "github backend must not require a Jira token to produce a ticket provider"
+        );
+    }
+
+    #[test]
+    fn run_ticket_provider_jira_backend_is_none_without_a_token() {
+        let config = jira_config();
+        let keychain = InMemoryKeychain::empty();
+
+        let provider = run_ticket_provider(&config, &keychain, None);
+
+        assert!(provider.is_none());
+    }
+
+    #[test]
+    fn run_ticket_provider_jira_backend_is_some_with_env_token() {
+        let config = jira_config();
+        let keychain = InMemoryKeychain::empty();
+
+        let provider = run_ticket_provider(&config, &keychain, Some("tok".to_string()));
+
+        assert!(provider.is_some());
+    }
 }
