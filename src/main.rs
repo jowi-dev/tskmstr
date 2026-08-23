@@ -371,6 +371,21 @@ fn run_work(
             let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
                 .as_ref()
                 .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
+            // The invoking repo's own backend identity, for the
+            // lane/backend-compatibility preflight (GitHub issue #5 phase
+            // 2). A placeholder when `full_config` is absent: unreachable in
+            // practice, since `work_config.lanes` is then empty and
+            // `prepare_run_lane`'s `UnknownLane` check fails first, before
+            // this value is ever consulted.
+            let current_backend_identity = full_config
+                .as_ref()
+                .map(tskmstr::config::BackendIdentity::from_config)
+                .unwrap_or(tskmstr::config::BackendIdentity::Jira {
+                    base_url: String::new(),
+                    project_key: String::new(),
+                });
+            let backend_identity_resolver =
+                tskmstr::config::FsBackendIdentityResolver { home: home.clone() };
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -380,6 +395,9 @@ fn run_work(
                 current_exe: &current_exe,
                 run_db_path: &run_db_path,
                 ticket_provider: ticket_provider.as_deref(),
+                current_repo_dir: &cwd,
+                current_backend_identity: &current_backend_identity,
+                backend_identity_resolver: &backend_identity_resolver,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,

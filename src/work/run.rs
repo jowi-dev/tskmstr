@@ -82,7 +82,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::blocker_stacking::{self, StackDecision};
-use crate::config::WorkConfig;
+use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::provider::TicketProvider;
@@ -190,6 +190,59 @@ pub enum RunLaneError {
         .0.display()
     )]
     WorktreePathMismatch(PathBuf),
+
+    /// A config error occurred while resolving a directory's backend
+    /// identity (see [`crate::config::BackendIdentityResolver`]) — most
+    /// likely the lane repo's own `.tskmstr.toml`/global config failed to
+    /// merge.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+
+    /// The lane's repo resolves to a different backend identity than the
+    /// invoking repo's — launching it would run a session whose cwd-driven
+    /// backend resolution talks to the wrong ticket provider (or the right
+    /// provider, wrong project). Checked before any prompt/worktree/run-row
+    /// work, exactly like [`RunLaneError::UnknownLane`]. See GitHub issue #5
+    /// phase 2: `docs/plans/issue-5-lane-backend-routing.md`.
+    ///
+    /// Boxed (see [`BackendMismatchInfo`]): this is by far the largest
+    /// variant of `RunLaneError` (two [`BackendIdentity`]s and two
+    /// [`PathBuf`]s), and clippy's `result_large_err` flags every `Result<_,
+    /// RunLaneError>`-returning function in this module for the size every
+    /// other, much smaller, variant would otherwise pay for.
+    #[error("{0}")]
+    BackendMismatch(Box<BackendMismatchInfo>),
+}
+
+/// Detail carried by [`RunLaneError::BackendMismatch`]; see that variant's
+/// doc comment for why it's boxed.
+#[derive(Debug)]
+pub struct BackendMismatchInfo {
+    /// Name of the lane that was refused.
+    pub lane: String,
+    /// The lane's configured (already `~`/relative-resolved) repo path.
+    pub lane_repo: PathBuf,
+    /// The invoking repo's own directory.
+    pub current_repo: PathBuf,
+    /// The lane repo's resolved backend identity.
+    pub lane_backend: BackendIdentity,
+    /// The invoking repo's resolved backend identity.
+    pub current_backend: BackendIdentity,
+}
+
+impl std::fmt::Display for BackendMismatchInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lane `{}` (repo {}) is backend-incompatible with the current repo ({}): \
+             lane resolves to {}, current repo resolves to {}",
+            self.lane,
+            self.lane_repo.display(),
+            self.current_repo.display(),
+            self.lane_backend,
+            self.current_backend,
+        )
+    }
 }
 
 /// A clock abstraction supplying "now" as already-broken-down local time
@@ -267,6 +320,21 @@ pub struct RunLaneDeps<'a> {
     /// Never treated as a hard requirement: `tm work run` has always worked
     /// without it, and this feature must not change that.
     pub ticket_provider: Option<&'a dyn TicketProvider>,
+    /// The invoking repo's own directory (typically `cwd`), named in
+    /// [`RunLaneError::BackendMismatch`]'s error message alongside the
+    /// lane's repo.
+    pub current_repo_dir: &'a Path,
+    /// The invoking repo's resolved backend identity, compared against each
+    /// launched lane's own resolved identity (see
+    /// [`RunLaneError::BackendMismatch`]). See GitHub issue #5 phase 2:
+    /// `docs/plans/issue-5-lane-backend-routing.md`.
+    pub current_backend_identity: &'a BackendIdentity,
+    /// Resolves a directory's backend identity — used to resolve the lane
+    /// repo's own identity for the compatibility preflight. Behind a trait
+    /// so tests can stay hermetic; see
+    /// [`crate::config::FsBackendIdentityResolver`] for the real
+    /// filesystem-backed implementation.
+    pub backend_identity_resolver: &'a dyn BackendIdentityResolver,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -746,6 +814,23 @@ pub fn prepare_run_lane(
         .get(lane)
         .ok_or_else(|| RunLaneError::UnknownLane(lane.to_string()))?;
     let repo_root = PathBuf::from(&lane_config.repo);
+
+    // Backend-compatibility preflight (GitHub issue #5 phase 2): refuse a
+    // lane whose repo resolves to a different backend identity than the
+    // invoking repo's own, before any prompt/worktree/run-row work below —
+    // see RunLaneError::BackendMismatch's doc comment for why.
+    let lane_backend = deps.backend_identity_resolver.resolve(&repo_root)?;
+    if lane_backend != *deps.current_backend_identity {
+        return Err(RunLaneError::BackendMismatch(Box::new(
+            BackendMismatchInfo {
+                lane: lane.to_string(),
+                lane_repo: repo_root,
+                current_repo: deps.current_repo_dir.to_path_buf(),
+                lane_backend,
+                current_backend: deps.current_backend_identity.clone(),
+            },
+        )));
+    }
 
     // Step 2: resolve and preflight the prompt file.
     let prompt_path = resolve_prompt_path(
@@ -1329,7 +1414,40 @@ mod tests {
     use crate::work::git::FakeGitOps;
     use crate::work::runner::FakeProcessSpawner;
     use std::collections::BTreeMap;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    /// A [`BackendIdentityResolver`] test double that resolves every
+    /// directory to the same, fixed identity, regardless of what's asked.
+    /// Used by the many `prepare_run_lane`/`run_lane_fg` tests below that
+    /// aren't exercising the backend-compatibility preflight itself (see
+    /// [`compatible_test_identity`]/[`compatible_test_resolver`]) — they
+    /// don't need to care what directory the lane happens to be in, only
+    /// that it's always reported compatible.
+    struct AlwaysBackendIdentityResolver(BackendIdentity);
+
+    impl BackendIdentityResolver for AlwaysBackendIdentityResolver {
+        fn resolve(&self, _dir: &Path) -> Result<BackendIdentity, ConfigError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// The fixed identity [`compatible_test_resolver`] always resolves to,
+    /// shared with every test's `current_backend_identity` so the
+    /// preflight's equality check always passes for tests that don't care
+    /// about it.
+    fn compatible_test_identity() -> &'static BackendIdentity {
+        static IDENTITY: OnceLock<BackendIdentity> = OnceLock::new();
+        IDENTITY.get_or_init(|| BackendIdentity::Jira {
+            base_url: String::new(),
+            project_key: String::new(),
+        })
+    }
+
+    fn compatible_test_resolver() -> &'static dyn BackendIdentityResolver {
+        static RESOLVER: OnceLock<AlwaysBackendIdentityResolver> = OnceLock::new();
+        RESOLVER.get_or_init(|| AlwaysBackendIdentityResolver(compatible_test_identity().clone()))
+    }
 
     /// A minimal Jira issue fixture with `summary` as its only field of
     /// interest to these tests — see [`resolve_ticket_slug`].
@@ -1503,6 +1621,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1567,6 +1688,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1616,6 +1740,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1664,6 +1791,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1711,6 +1841,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1760,6 +1893,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1812,6 +1948,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1892,6 +2031,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -1965,6 +2107,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2037,6 +2182,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2082,6 +2230,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2101,6 +2252,80 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, RunLaneError::UnknownLane(_)));
+    }
+
+    #[test]
+    fn run_lane_fg_errors_before_any_run_row_when_lane_backend_is_incompatible() {
+        // GitHub issue #5 phase 2: a lane whose repo resolves to a
+        // different backend identity than the invoking repo's own must be
+        // refused before any prompt/worktree/run-row work -- see
+        // RunLaneError::BackendMismatch.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let current_identity = BackendIdentity::Github {
+            repo: "jowi-dev/tskmstr".to_string(),
+        };
+        let lane_identity = BackendIdentity::Jira {
+            base_url: "https://axiom.atlassian.net".to_string(),
+            project_key: "AX".to_string(),
+        };
+        let resolver = crate::config::FakeBackendIdentityResolver::new()
+            .with_identity(repo_root.clone(), lane_identity.clone());
+        let current_repo_dir = tmp.path().join("current-repo");
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: &current_repo_dir,
+            current_backend_identity: &current_identity,
+            backend_identity_resolver: &resolver,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let err = run_lane_fg(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            &mut out,
+        )
+        .unwrap_err();
+
+        match &err {
+            RunLaneError::BackendMismatch(info) => {
+                assert_eq!(info.lane, "mylane");
+                assert_eq!(info.lane_repo, repo_root);
+                assert_eq!(info.current_repo, current_repo_dir);
+                assert_eq!(info.lane_backend, lane_identity);
+                assert_eq!(info.current_backend, current_identity);
+            }
+            other => panic!("expected BackendMismatch, got {other:?}"),
+        }
+        assert!(
+            run_store.list_runs().unwrap().is_empty(),
+            "must not create a run row before the backend-compatibility preflight passes"
+        );
     }
 
     #[test]
@@ -2125,6 +2350,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2169,6 +2397,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2219,6 +2450,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2266,6 +2500,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2313,6 +2550,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2358,6 +2598,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2424,6 +2667,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&github_provider),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2476,6 +2722,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2517,6 +2766,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2561,6 +2813,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2605,6 +2860,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2648,6 +2906,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2696,6 +2957,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2742,6 +3006,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2793,6 +3060,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2841,6 +3111,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2891,6 +3164,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -2941,6 +3217,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3003,6 +3282,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3047,6 +3329,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3097,6 +3382,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3145,6 +3433,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3196,6 +3487,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3267,6 +3561,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3541,6 +3838,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3605,6 +3905,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -3666,6 +3969,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -3726,6 +4032,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
@@ -3774,6 +4083,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = RunLanePaths {
             home,
