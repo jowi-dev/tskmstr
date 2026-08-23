@@ -2380,6 +2380,71 @@ mod tests {
         assert_eq!(run.ticket, "ABC-123");
     }
 
+    // Issue #5 fix 3: under the github backend, the ticket provider wired
+    // into RunLaneDeps.ticket_provider is a GithubProvider, not a Jira
+    // client — so GH-N slug resolution must actually resolve the issue's
+    // summary via `gh`, not silently fail. Mirrors
+    // `run_lane_fg_uses_jira_summary_slug_for_branch_name_when_available`
+    // above, but with a real `GithubProvider` over a `FakeGhCli`.
+    #[test]
+    fn run_lane_fg_uses_github_summary_slug_for_branch_name_when_available() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let issue_gh = FakeGhCli::new().with_issue_view(
+            3,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 3,
+                url: "https://github.com/jowi-dev/tskmstr/issues/3".to_string(),
+                title: "Delete bid connector".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            }),
+        );
+        let github_provider = crate::ticketing::github_provider::GithubProvider::new(
+            &issue_gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&github_provider),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("GH-3".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+
+        // Same shape as the Jira case: wt_name is the lowercased ticket,
+        // the slug comes from the GitHub issue's title via GithubProvider's
+        // get_issue mapping (title -> Issue.fields.summary).
+        assert_eq!(outcome.branch, "claude/gh-3-delete-bid-connector");
+    }
+
     // --- Jira-summary-slug branch naming and its fallbacks (module doc's
     // step 6): a ticket with a Jira summary available produces
     // `<owner>/<wt_name>-<slug>`; anything short of that (no ticket, no
