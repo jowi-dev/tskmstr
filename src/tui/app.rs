@@ -81,6 +81,32 @@ pub fn query_for_filter(filter: &AssigneeFilter, project_key: &str) -> TicketQue
     }
 }
 
+/// One option in the board's assign picker: who to hand the selected card
+/// to. Unlike [`AssigneeFilter`] there is no `Everyone`, and `Me` is an
+/// action (assign to the current user) rather than a view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignChoice {
+    /// Assign the ticket to the current user, resolved via
+    /// [`crate::ticketing::provider::TicketProvider::myself`] so it works
+    /// under either backend (Jira accountId or GitHub login).
+    Me,
+    /// Clear the ticket's assignee.
+    Unassign,
+    /// Assign the ticket to a specific assignable user.
+    User(JiraUser),
+}
+
+impl AssignChoice {
+    /// The human-readable label for this choice, shown in the picker list.
+    pub fn label(&self) -> String {
+        match self {
+            AssignChoice::Me => "Me".to_string(),
+            AssignChoice::Unassign => "Unassign".to_string(),
+            AssignChoice::User(user) => user.display_name.clone(),
+        }
+    }
+}
+
 /// One column of the sprint board: all tickets currently in a given status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
@@ -620,6 +646,19 @@ pub struct App {
     /// Error from the last failed assignable-users fetch, shown in the
     /// picker until the next successful fetch.
     pub filter_picker_error: Option<String>,
+    /// Whether the assign picker overlay is shown.
+    pub show_assign_picker: bool,
+    /// Key of the ticket the assign picker was opened on. `Some` whenever
+    /// the picker is open; captured at open time so the picker stays aimed
+    /// at that card no matter what the board does underneath it.
+    pub assign_picker_key: Option<String>,
+    /// Index into [`App::assign_options`] of the currently highlighted
+    /// option.
+    pub assign_picker_selected: usize,
+    /// Error from the last failed assignable-users fetch, shown in the
+    /// assign picker until the next successful fetch. Kept separate from
+    /// [`App::filter_picker_error`] so each picker renders its own state.
+    pub assign_picker_error: Option<String>,
     /// [`Screen::Rank`]'s ticket list, in Jira backlog rank order. Kept
     /// entirely separate from `columns` so leaving the rank screen never
     /// requires refetching (or clobbers) the board.
@@ -807,6 +846,17 @@ impl App {
         options
     }
 
+    /// The assign picker's option list: `Me` and `Unassign` always, then
+    /// every cached assignable user (the same lazily fetched
+    /// [`App::assignable_users`] cache the filter picker uses).
+    pub fn assign_options(&self) -> Vec<AssignChoice> {
+        let mut options = vec![AssignChoice::Me, AssignChoice::Unassign];
+        if let Some(users) = &self.assignable_users {
+            options.extend(users.iter().cloned().map(AssignChoice::User));
+        }
+        options
+    }
+
     /// The run cards in `self.runs` whose status is `RUN_COLUMNS[col]`,
     /// preserving `self.runs`' order. Empty (rather than panicking) if `col`
     /// is out of bounds.
@@ -906,6 +956,29 @@ pub enum Msg {
     AssignableUsersLoaded(Vec<JiraUser>),
     /// Assignable users failed to load.
     AssignableUsersFailed(String),
+    /// Open the assign picker overlay on the selected ticket. Only
+    /// meaningful on [`Screen::Board`]; a no-op when nothing is selected.
+    OpenAssignPicker,
+    /// Move the assign picker's highlighted option up.
+    AssignPickerUp,
+    /// Move the assign picker's highlighted option down.
+    AssignPickerDown,
+    /// Apply the assign picker's highlighted choice and close the picker.
+    AssignPickerSelect,
+    /// Close the assign picker without changing the ticket's assignee.
+    AssignPickerClose,
+    /// The outcome of a successful [`Cmd::AssignTicket`]: `key` is now
+    /// assigned to `assignee` (a display name), or unassigned when `None`.
+    /// Updates the card in place -- assignee never changes a card's column,
+    /// so no refetch is needed.
+    AssignApplied {
+        /// Key of the ticket that was assigned.
+        key: String,
+        /// Display name of the new assignee, or `None` when unassigned.
+        assignee: Option<String>,
+    },
+    /// [`Cmd::AssignTicket`] failed; the message goes to the status line.
+    AssignFailed(String),
     /// The ticket list finished loading.
     TicketsLoaded(Vec<TicketSummary>),
     /// The ticket list failed to load.
@@ -1152,6 +1225,18 @@ pub enum Cmd {
     FetchAssignableUsers {
         /// Project key to list assignable users for.
         project: String,
+    },
+    /// Change `key`'s assignee per `choice`. [`AssignChoice::Me`] is
+    /// resolved in the executor via
+    /// [`crate::ticketing::provider::TicketProvider::myself`], which is
+    /// backend-correct under both Jira and GitHub and yields a display name
+    /// for the card; the CLI's cached-accountId fast path is deliberately
+    /// not used here.
+    AssignTicket {
+        /// Ticket key to (un)assign.
+        key: String,
+        /// Who to assign it to.
+        choice: AssignChoice,
     },
     /// Fetch the workflow transitions available on `key`.
     FetchTransitions {
@@ -1478,14 +1563,55 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::AssignableUsersLoaded(users) => {
             app.assignable_users = Some(users);
             app.filter_picker_error = None;
+            app.assign_picker_error = None;
             let count = app.filter_options().len();
             if count > 0 {
                 app.filter_picker_selected = app.filter_picker_selected.min(count - 1);
             }
+            let count = app.assign_options().len();
+            if count > 0 {
+                app.assign_picker_selected = app.assign_picker_selected.min(count - 1);
+            }
             (app, Vec::new())
         }
         Msg::AssignableUsersFailed(err) => {
-            app.filter_picker_error = Some(err);
+            app.filter_picker_error = Some(err.clone());
+            app.assign_picker_error = Some(err);
+            (app, Vec::new())
+        }
+        Msg::OpenAssignPicker => open_assign_picker(app),
+        Msg::AssignPickerUp => {
+            app.assign_picker_selected = app.assign_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::AssignPickerDown => {
+            let count = app.assign_options().len();
+            if count > 0 {
+                app.assign_picker_selected = (app.assign_picker_selected + 1).min(count - 1);
+            }
+            (app, Vec::new())
+        }
+        Msg::AssignPickerSelect => assign_picker_select(app),
+        Msg::AssignPickerClose => {
+            app.show_assign_picker = false;
+            (app, Vec::new())
+        }
+        Msg::AssignApplied { key, assignee } => {
+            for column in &mut app.columns {
+                for ticket in &mut column.tickets {
+                    if ticket.key == key {
+                        ticket.assignee = assignee.clone();
+                    }
+                }
+            }
+            app.status_line = match &assignee {
+                Some(name) => format!("{key} -> assigned to {name}"),
+                None => format!("{key} -> unassigned"),
+            };
+            (app, Vec::new())
+        }
+        Msg::AssignFailed(err) => {
+            app.status_line = err;
             (app, Vec::new())
         }
         Msg::OpenRank => open_rank(app),
@@ -2452,6 +2578,47 @@ fn filter_picker_select(mut app: App) -> (App, Vec<Cmd>) {
     app.status_line = "Refreshing...".to_string();
     let query = query_for_filter(&app.filter, &app.project_key);
     (app, vec![Cmd::FetchTickets { query }])
+}
+
+/// Handle [`Msg::OpenAssignPicker`]: show the picker for the selected card,
+/// and fetch assignable users if they haven't been cached yet. A no-op if no
+/// ticket is selected (e.g. an empty board).
+fn open_assign_picker(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    app.assign_picker_key = Some(ticket.key.clone());
+    app.show_assign_picker = true;
+    app.assign_picker_error = None;
+    app.assign_picker_selected = 0;
+
+    let cmds = if app.assignable_users.is_none() {
+        vec![Cmd::FetchAssignableUsers {
+            project: app.project_key.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    (app, cmds)
+}
+
+/// Handle [`Msg::AssignPickerSelect`]: apply the highlighted choice to the
+/// ticket the picker was opened on, and close the picker. A no-op if the
+/// selection is out of range or the picker's target ticket is somehow unset.
+fn assign_picker_select(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(choice) = app
+        .assign_options()
+        .get(app.assign_picker_selected)
+        .cloned()
+    else {
+        return (app, Vec::new());
+    };
+    let Some(key) = app.assign_picker_key.take() else {
+        return (app, Vec::new());
+    };
+    app.show_assign_picker = false;
+    app.status_line = format!("Assigning {key}...");
+    (app, vec![Cmd::AssignTicket { key, choice }])
 }
 
 /// Handle [`Msg::Enter`]: activate whatever is selected on the current
@@ -3853,6 +4020,198 @@ mod tests {
         assert_eq!(app.filter_picker_error, Some("boom".to_string()));
         assert_eq!(app.assignable_users, None);
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn open_assign_picker_shows_it_and_fetches_users_when_uncached() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::OpenAssignPicker);
+        assert!(app.show_assign_picker);
+        assert_eq!(app.assign_picker_key, Some("PROJ-1".to_string()));
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchAssignableUsers {
+                project: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn open_assign_picker_does_not_refetch_when_users_already_cached() {
+        let app = App {
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::OpenAssignPicker);
+        assert!(app.show_assign_picker);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn open_assign_picker_is_a_noop_on_an_empty_board() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::OpenAssignPicker);
+        assert!(!app.show_assign_picker);
+        assert_eq!(app.assign_picker_key, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assign_picker_up_and_down_navigate_and_clamp() {
+        let app = App {
+            show_assign_picker: true,
+            assign_picker_selected: 0,
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        // 3 options: Me, Unassign, Jane Doe.
+        let (app, _) = update(app, Msg::AssignPickerUp);
+        assert_eq!(app.assign_picker_selected, 0);
+        let (app, _) = update(app, Msg::AssignPickerDown);
+        assert_eq!(app.assign_picker_selected, 1);
+        let (app, _) = update(app, Msg::AssignPickerDown);
+        assert_eq!(app.assign_picker_selected, 2);
+        let (app, _) = update(app, Msg::AssignPickerDown);
+        assert_eq!(app.assign_picker_selected, 2);
+        let (app, _) = update(app, Msg::AssignPickerUp);
+        assert_eq!(app.assign_picker_selected, 1);
+    }
+
+    #[test]
+    fn assign_picker_select_me_emits_assign_ticket_and_closes_picker() {
+        let app = App {
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assign_picker_selected: 0,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::AssignPickerSelect);
+        assert!(!app.show_assign_picker);
+        assert_eq!(app.assign_picker_key, None);
+        assert_eq!(
+            cmds,
+            vec![Cmd::AssignTicket {
+                key: "PROJ-1".to_string(),
+                choice: AssignChoice::Me,
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_picker_select_unassign_emits_assign_ticket() {
+        let app = App {
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assign_picker_selected: 1,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::AssignPickerSelect);
+        assert!(!app.show_assign_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::AssignTicket {
+                key: "PROJ-1".to_string(),
+                choice: AssignChoice::Unassign,
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_picker_select_user_emits_assign_ticket() {
+        let app = App {
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assign_picker_selected: 2,
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::AssignPickerSelect);
+        assert!(!app.show_assign_picker);
+        assert_eq!(
+            cmds,
+            vec![Cmd::AssignTicket {
+                key: "PROJ-1".to_string(),
+                choice: AssignChoice::User(jira_user("acct-1", "Jane Doe")),
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_picker_select_out_of_range_is_a_noop() {
+        let app = App {
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assign_picker_selected: 10,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::AssignPickerSelect);
+        assert!(app.show_assign_picker);
+        assert_eq!(app.assign_picker_key, Some("PROJ-1".to_string()));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assign_applied_updates_card_assignee_and_status_line() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: Some("Jane Doe".to_string()),
+            },
+        );
+        assert_eq!(
+            app.selected_ticket().unwrap().assignee,
+            Some("Jane Doe".to_string())
+        );
+        assert_eq!(app.status_line, "PROJ-1 -> assigned to Jane Doe");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assign_applied_with_none_unassigns_card_and_sets_status_line() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: None,
+            },
+        );
+        assert_eq!(app.selected_ticket().unwrap().assignee, None);
+        assert_eq!(app.status_line, "PROJ-1 -> unassigned");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assign_failed_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::AssignFailed("boom".to_string()));
+        assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn assignable_users_loaded_clears_assign_picker_error_and_clamps_selection() {
+        let app = App {
+            assign_picker_error: Some("boom".to_string()),
+            assign_picker_selected: 10,
+            ..App::new()
+        };
+        let (app, _) = update(
+            app,
+            Msg::AssignableUsersLoaded(vec![jira_user("acct-1", "Jane Doe")]),
+        );
+        assert_eq!(app.assign_picker_error, None);
+        // 3 options: Me, Unassign, Jane Doe.
+        assert_eq!(app.assign_picker_selected, 2);
+    }
+
+    #[test]
+    fn assignable_users_failed_sets_assign_picker_error() {
+        let app = App::new();
+        let (app, _) = update(app, Msg::AssignableUsersFailed("boom".to_string()));
+        assert_eq!(app.assign_picker_error, Some("boom".to_string()));
     }
 
     #[test]
