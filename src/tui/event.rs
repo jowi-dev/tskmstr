@@ -32,8 +32,8 @@ use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::Issue;
 use crate::tui::app::{
-    App, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator, bot_watch_indicator,
-    lane_run_indicator,
+    App, AssignChoice, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator,
+    bot_watch_indicator, lane_run_indicator,
 };
 use crate::tui::app::{query_for_filter, update};
 use crate::tui::keymap::{RetroOverlay, map_key};
@@ -276,6 +276,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                     &app.screen,
                     app.show_help,
                     app.show_filter_picker,
+                    app.show_assign_picker,
                     app.show_lane_picker,
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
@@ -746,6 +747,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                     &app.screen,
                     app.show_help,
                     app.show_filter_picker,
+                    app.show_assign_picker,
                     app.show_lane_picker,
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
@@ -978,6 +980,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::FetchAssignableUsers { project } => fetch_assignable_users(deps, &project),
         Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
         Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
+        Cmd::AssignTicket { key, choice } => assign_ticket_cmd(deps, &key, &choice),
         Cmd::OpenUrl(url) => open_url(&url),
         Cmd::FetchRankTickets { query } => fetch_rank_tickets(deps, &query),
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
@@ -1515,6 +1518,38 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
     }
 }
 
+/// Run `Cmd::AssignTicket`: resolve `choice` to a target account/display name
+/// and call [`crate::ticketing::provider::TicketProvider::assign`].
+///
+/// [`AssignChoice::Me`] goes through [`crate::ticketing::provider::TicketProvider::myself`]
+/// rather than any cached account ID: the only cache available to the board
+/// TUI is a Jira accountId (see [`crate::ticketing::mod`]'s
+/// `default_assignee_account_id`), which is meaningless under the GitHub
+/// backend (its assignee is a login, not a Jira accountId). `myself()` is
+/// also the only source of a human-readable display name for the card, which
+/// a raw accountId/login lookup wouldn't give us for free.
+fn assign_ticket_cmd(deps: &TuiDeps, key: &str, choice: &AssignChoice) -> Vec<Msg> {
+    let (account_id, display_name) = match choice {
+        AssignChoice::Me => match deps.jira.myself() {
+            Ok(myself) => (Some(myself.account_id), Some(myself.display_name)),
+            Err(err) => return vec![Msg::AssignFailed(format!("assign {key} failed: {err}"))],
+        },
+        AssignChoice::Unassign => (None, None),
+        AssignChoice::User(user) => (
+            Some(user.account_id.clone()),
+            Some(user.display_name.clone()),
+        ),
+    };
+
+    match deps.jira.assign(key, account_id.as_deref()) {
+        Ok(()) => vec![Msg::AssignApplied {
+            key: key.to_string(),
+            assignee: display_name,
+        }],
+        Err(err) => vec![Msg::AssignFailed(format!("assign {key} failed: {err}"))],
+    }
+}
+
 /// Run `Cmd::ResolvePrForTicket`: look up `key`'s open GitHub PR (if any),
 /// one `gh pr list` call, and report the result as
 /// [`Msg::BrowserOptionsResolved`]. Never fails outright -- every failure
@@ -1657,7 +1692,7 @@ mod tests {
     use super::*;
     use crate::jira::fake::FakeJiraClient;
     use crate::ticketing::provider::JiraProvider;
-    use crate::ticketing::types::{IssueFields, JiraUser, Status, StatusCategory};
+    use crate::ticketing::types::{IssueFields, JiraUser, Myself, Status, StatusCategory};
 
     fn issue(key: &str, status: &str) -> Issue {
         Issue {
@@ -1833,6 +1868,82 @@ mod tests {
         match msgs.as_slice() {
             [Msg::TransitionFailed(_)] => {}
             other => panic!("expected TransitionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_to_user_emits_assign_applied_with_display_name() {
+        let jira = FakeJiraClient::new();
+        let choice = AssignChoice::User(JiraUser {
+            account_id: "acct-1".to_string(),
+            display_name: "Jane Doe".to_string(),
+        });
+        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &choice);
+        assert_eq!(
+            msgs,
+            vec![Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: Some("Jane Doe".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_unassign_emits_assign_applied_with_none() {
+        let jira = FakeJiraClient::new();
+        let d = deps(jira);
+        let msgs = assign_ticket_cmd(&d, "PROJ-1", &AssignChoice::Unassign);
+        assert_eq!(
+            msgs,
+            vec![Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_me_resolves_myself_then_assigns_with_resolved_id() {
+        let jira = FakeJiraClient::new().with_myself(Myself {
+            account_id: "acct-1".to_string(),
+            display_name: "Ada Lovelace".to_string(),
+            email_address: None,
+        });
+        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &AssignChoice::Me);
+        assert_eq!(
+            msgs,
+            vec![Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: Some("Ada Lovelace".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_me_myself_failure_emits_assign_failed_without_assigning() {
+        let jira = FakeJiraClient::new().with_myself_unauthorized();
+        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &AssignChoice::Me);
+        match msgs.as_slice() {
+            [Msg::AssignFailed(message)] => {
+                assert!(message.starts_with("assign PROJ-1 failed:"));
+            }
+            other => panic!("expected AssignFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_ticket_assign_failure_emits_assign_failed() {
+        let jira = FakeJiraClient::new().with_assign_error(500, "boom");
+        let choice = AssignChoice::User(JiraUser {
+            account_id: "acct-1".to_string(),
+            display_name: "Jane Doe".to_string(),
+        });
+        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &choice);
+        match msgs.as_slice() {
+            [Msg::AssignFailed(message)] => {
+                assert!(message.starts_with("assign PROJ-1 failed:"));
+            }
+            other => panic!("expected AssignFailed, got {other:?}"),
         }
     }
 
