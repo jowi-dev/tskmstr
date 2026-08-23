@@ -102,7 +102,7 @@ pub mod github_provider;
 pub mod provider;
 pub mod types;
 
-use crate::config::Config;
+use crate::config::{BackendKind, Config};
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
 use crate::jira::client::RankAnchor;
@@ -328,6 +328,23 @@ pub fn associate_ticket(
     associate(ctx, key, &pr, None)
 }
 
+/// Default assignee for a newly created ticket, per backend.
+///
+/// [`Config::default_assignee_account_id`] is a Jira accountId written by
+/// `tm auth login`, so it is only meaningful to the Jira backend; the GitHub
+/// backend identifies users by login instead, and feeding it the cached
+/// accountId would assign garbage. Under GitHub the current user's login is
+/// resolved via [`TicketProvider::myself`], opportunistically: a `myself()`
+/// failure degrades to an unassigned ticket rather than failing the create,
+/// since a default assignee has always been optional (`None` when nothing is
+/// cached under Jira).
+fn default_new_ticket_assignee(provider: &dyn TicketProvider, config: &Config) -> Option<String> {
+    match config.backend {
+        BackendKind::Jira => config.default_assignee_account_id.clone(),
+        BackendKind::Github => provider.myself().ok().map(|myself| myself.account_id),
+    }
+}
+
 /// Fetch the pull request for the current branch, turning "no PR" into
 /// [`TicketingError::NoPrForBranch`] (which requires knowing the branch
 /// name, hence the extra `current_branch` call on that path).
@@ -358,7 +375,7 @@ pub fn auto_create_and_associate(
         summary: pr.title.clone(),
         description: format!("{}\n\n{}", pr.body, pr.url),
         issue_type_name: "Task".to_string(),
-        assignee_account_id: ctx.config.default_assignee_account_id.clone(),
+        assignee_account_id: default_new_ticket_assignee(ctx.jira, ctx.config),
     };
     let issue = ctx.jira.create_issue(&req)?;
     let status_transition = ctx
@@ -441,7 +458,7 @@ pub fn create_ticket(
         summary: title.to_string(),
         description: body.unwrap_or_default().to_string(),
         issue_type_name: "Task".to_string(),
-        assignee_account_id: ctx.config.default_assignee_account_id.clone(),
+        assignee_account_id: default_new_ticket_assignee(ctx.jira, ctx.config),
     };
     let issue = ctx.jira.create_issue(&req)?;
     let status_transition =
@@ -629,10 +646,11 @@ pub enum AssignOutcome {
     AssignedToUser(String),
     /// Assigned to the current user; carries a display label for the CLI to
     /// print. This is [`crate::ticketing::types::Myself::display_name`] when
-    /// [`Config::default_assignee_account_id`] wasn't cached and `myself()`
-    /// had to be called, or the cached account ID itself when it was
-    /// (fetching `myself()` just to get a display name isn't worth the extra
-    /// request when the cached ID already lets the assign call proceed).
+    /// `myself()` had to be called, or the cached
+    /// [`Config::default_assignee_account_id`] itself when the Jira backend
+    /// could use it directly (fetching `myself()` just to get a display name
+    /// isn't worth the extra request when the cached ID already lets the
+    /// assign call proceed).
     AssignedToMe(String),
     /// The issue's assignee was cleared.
     Unassigned,
@@ -652,7 +670,9 @@ pub enum AssignOutcome {
 /// assigning a ticket that lives in a different project still works.
 /// [`AssignTarget::Me`] prefers `config`'s cached
 /// [`Config::default_assignee_account_id`] (set by `tm auth login`) over an
-/// extra `myself()` call.
+/// extra `myself()` call — but only under the Jira backend, since that cache
+/// is a Jira accountId; the GitHub backend always resolves the current
+/// user's login via `myself()`.
 pub fn assign_ticket(
     jira: &dyn TicketProvider,
     config: &Config,
@@ -665,7 +685,12 @@ pub fn assign_ticket(
             Ok(AssignOutcome::Unassigned)
         }
         AssignTarget::Me => {
-            let (account_id, label) = match &config.default_assignee_account_id {
+            let cached = match config.backend {
+                BackendKind::Jira => config.default_assignee_account_id.as_ref(),
+                // The cached id is a Jira accountId, not a GitHub login.
+                BackendKind::Github => None,
+            };
+            let (account_id, label) = match cached {
                 Some(account_id) => (account_id.clone(), account_id.clone()),
                 None => {
                     let myself = jira.myself()?;
@@ -1232,6 +1257,20 @@ mod tests {
         }
     }
 
+    /// Like [`config`] but selecting the github backend, with the cached
+    /// Jira accountId still present — the poison value the github arms must
+    /// never send to the provider.
+    fn github_config() -> Config {
+        Config {
+            backend: crate::config::BackendKind::Github,
+            jira_base_url: String::new(),
+            jira_email: String::new(),
+            default_project_key: String::new(),
+            github_repo: Some("jowi-dev/tskmstr".to_string()),
+            ..config()
+        }
+    }
+
     #[test]
     fn associate_ticket_happy_path_prefixes_title_and_posts_remote_link() {
         let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
@@ -1391,6 +1430,30 @@ mod tests {
             jira.transition_calls().is_empty(),
             "no status_on_pr configured, so transition should never be called"
         );
+    }
+
+    #[test]
+    fn auto_create_and_associate_under_github_backend_assigns_myself_not_cached_account_id() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("GH-9"))
+            .with_myself(Myself {
+                account_id: "gh-login".to_string(),
+                display_name: "GH Login".to_string(),
+                email_address: None,
+            });
+        let gh = FakeGhCli::new();
+        let cfg = github_config();
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        auto_create_and_associate(&ctx, &pr("Add the widget")).expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].assignee_account_id, Some("gh-login".to_string()));
     }
 
     fn transition(id: &str, name: &str, to_status: &str) -> Transition {
@@ -1699,6 +1762,40 @@ mod tests {
             "https://example.atlassian.net/browse/PROJ-9"
         );
         assert_eq!(outcome.status_transition, None);
+    }
+
+    #[test]
+    fn create_ticket_under_github_backend_assigns_myself_not_cached_account_id() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("GH-9"))
+            .with_myself(Myself {
+                account_id: "gh-login".to_string(),
+                display_name: "GH Login".to_string(),
+                email_address: None,
+            });
+        let cfg = github_config();
+
+        create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
+            .expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].assignee_account_id, Some("gh-login".to_string()));
+    }
+
+    #[test]
+    fn create_ticket_under_github_backend_creates_unassigned_when_myself_fails() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue("GH-9"))
+            .with_myself_unauthorized();
+        let cfg = github_config();
+
+        create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
+            .expect("should succeed");
+
+        let calls = jira.create_issue_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].assignee_account_id, None);
     }
 
     #[test]
@@ -2336,6 +2433,25 @@ mod tests {
         assert_eq!(
             jira.assign_calls(),
             vec![("PROJ-372".to_string(), Some("acct-me".to_string()))]
+        );
+    }
+
+    #[test]
+    fn assign_ticket_me_under_github_backend_resolves_myself_ignoring_cached_account_id() {
+        let provider = FakeJiraClient::new().with_myself(Myself {
+            account_id: "gh-login".to_string(),
+            display_name: "GH Login".to_string(),
+            email_address: None,
+        });
+        let cfg = github_config(); // cached default_assignee_account_id is Some("acct-1")
+
+        let outcome =
+            assign_ticket(&provider, &cfg, "GH-4", &AssignTarget::Me).expect("should succeed");
+
+        assert_eq!(outcome, AssignOutcome::AssignedToMe("GH Login".to_string()));
+        assert_eq!(
+            provider.assign_calls(),
+            vec![("GH-4".to_string(), Some("gh-login".to_string()))]
         );
     }
 
