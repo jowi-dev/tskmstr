@@ -1385,7 +1385,20 @@ mod tests {
     // fall through to a Jira-token lookup that has nothing to resolve.
     #[test]
     fn run_ticket_provider_github_backend_does_not_need_a_jira_token() {
-        let config = github_config("jowi-dev/tskmstr");
+        // `ticket_provider_for`'s github arm opens a `RunStore` at
+        // `config.run_db_path`, defaulting to `$HOME/.local/share/tskmstr/
+        // runs.db` (`run_db_path_from_config`) when unset. Leaving it unset
+        // here made this test depend on the real process `$HOME` being
+        // writable -- true in an ordinary dev shell, false in `nix build`'s
+        // sandboxed `$HOME` (verified: this test fails there with "github
+        // backend must not require a Jira token to produce a ticket
+        // provider", because `RunStore::open` fails and `run_ticket_provider`
+        // swallows it into `None` per its documented opportunistic
+        // contract). Point it at a temp dir instead, so the test is
+        // hermetic regardless of the ambient `$HOME`.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = github_config("jowi-dev/tskmstr");
+        config.run_db_path = Some(tmp.path().join("runs.db").to_string_lossy().into_owned());
         let keychain = InMemoryKeychain::empty();
 
         let provider = run_ticket_provider(&config, &keychain, None);
