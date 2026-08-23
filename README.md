@@ -470,7 +470,15 @@ Each lane is configured under `[work.lanes.<name>]` in `config.toml`
 built-in defaults). `tm work run <lane>` provisions the lane's worktree if
 missing, cuts a fresh timestamped branch off the resolved base for this
 run, and invokes `claude` with the lane's prompt (`~/.claude/prompts/
-<lane>.md` by convention).
+<lane>.md` by convention). In a repo-local `.tskmstr.toml`, `repo` may
+also be a relative path — see "Relative `repo`/`dir` paths in a repo-local
+config" below.
+
+`tm work run <lane> [ticket]` and the board's `w` key (see "Board-launched
+lane runs" below) both refuse a lane whose `repo` resolves to a different
+ticket backend than the current repo's own: the CLI as a hard preflight
+error naming both backends, the board by filtering the lane out of the
+picker (GitHub issue #5).
 
 Interactive by default: provisioning/preflight run in the foreground so
 errors surface immediately, then `claude` is launched in a `work` window of
@@ -551,6 +559,7 @@ to" windows.
 | `f` | Open the assignee filter picker (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
+| `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
@@ -674,6 +683,34 @@ an `audit` run records `[work.audit].dir`, your own checkout, and that can
 never be handed to `git worktree remove`. A worktree that is already gone is
 reported, not an error.
 
+### Board-launched lane runs
+
+Pressing `w` on a board ticket runs `tm work run <lane> <KEY>` for it (see
+"`tm work`" above) without leaving the board: zero lanes launches directly
+if there's exactly one, opens a picker if there's more than one, and sets a
+status-line message if there are none.
+
+"None"/"more than one" is computed only over lanes whose configured `repo`
+resolves to the *same backend* as the board's own repo — same
+`BackendKind`, and for GitHub the same `[backend.github].repo` slug, or for
+Jira the same base URL and project key (GitHub issue #5). A lane rooted in
+a differently-backed repo would launch a session that can't resolve the
+selected ticket's key at all (a GitHub-backend board handing a `GH-3`
+ticket to a Jira-backed lane, or vice versa), so it's filtered out of the
+count and the picker rather than offered. When every configured lane gets
+filtered this way, the status line says so explicitly — `no compatible
+lanes (N hidden: backend mismatch)` — instead of the plain `no lanes
+configured` it shows when `[work.lanes]` is genuinely empty. `tm work run
+<lane> <KEY>` run directly from the CLI enforces the same check as a hard
+preflight error naming both backends, before any worktree or run-row work
+happens.
+
+This is also why a lane's `repo` accepts a relative path: written in a
+repo-local `.tskmstr.toml`, `repo = "."` roots the lane in that same repo,
+which is guaranteed backend-compatible with the board that offers it. See
+"Relative `repo`/`dir` paths in a repo-local config" under Configuration
+below.
+
 ### Board-launched audit sessions
 
 Pressing `a` on a board ticket launches a ticket-audit Claude session for
@@ -694,6 +731,14 @@ hook settings; `{key}` in `prompt` is replaced with the ticket key. The
 launch pre-registers a `kind = "audit"` run, and the in-session
 `tm ticket audit <KEY>` adopts it (via `TSKMSTR_SESSION_RUN_ID`), so the
 whole conversation's telemetry lands on one run.
+
+If `dir`'s resolved backend doesn't match the current repo's own — the
+same mismatch `w`'s lane filtering checks for (GitHub issue #5) — the
+audit session falls back to launching in the current repo instead of
+refusing outright, since a repo hosting the ticket's own backend always
+resolves the ticket correctly. The status line notes the fallback:
+`launched audit for <KEY> in the current repo (configured audit dir is
+backend-incompatible) -- press a to attach`.
 
 `model` is separate from `[work].default_model`, which only applies to
 headless `tm work run` lanes. Leave it unset and the session takes whatever
@@ -887,6 +932,33 @@ between the two files whenever the Jira backend is selected, or `tm`
 refuses to run; `default_assignee_account_id`, `status_on_pr`,
 `status_on_create`, `review_bots`, `board_column_order`, and `[backend]`
 are optional.
+
+### Relative `repo`/`dir` paths in a repo-local config
+
+A `[work.lanes.<name>].repo` or `[work.audit].dir` value set by a
+repo-local `.tskmstr.toml` may be a plain relative path (not `~`-prefixed,
+not absolute); it resolves against that repo's own root. `repo = "."` is
+the common case — it resolves to the repo root itself, not `<root>/.` —
+letting a repo point a lane straight at itself:
+
+```toml
+[work.lanes.tskmstr]
+repo = "."
+```
+
+This is what makes a lane trivially backend-compatible with the repo that
+defines it (see "Board-launched lane runs" above): the lane's repo and the
+board's own repo are the same directory, so their resolved backends can
+never mismatch.
+
+The same relative value set by the *global* config
+(`~/.config/tskmstr/config.toml`) is a hard error
+(`RelativePathRequiresRepoConfig`, naming the field and the value) rather
+than resolving against some fallback directory — the global config has no
+repo of its own to resolve a relative path against, and a lane inherited
+verbatim into every project (the root cause behind GitHub issue #5) is
+exactly the failure mode this restriction rules out. Use an absolute or
+`~`-prefixed path for any lane/audit-dir value set globally.
 
 ### `[backend]`: choosing a ticket provider
 
