@@ -1523,8 +1523,9 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
 ///
 /// [`AssignChoice::Me`] goes through [`crate::ticketing::provider::TicketProvider::myself`]
 /// rather than any cached account ID: the only cache available to the board
-/// TUI is a Jira accountId (see [`crate::ticketing::mod`]'s
-/// `default_assignee_account_id`), which is meaningless under the GitHub
+/// TUI is a Jira accountId
+/// ([`crate::config::Config::default_assignee_account_id`]), which is
+/// meaningless under the GitHub
 /// backend (its assignee is a login, not a Jira accountId). `myself()` is
 /// also the only source of a human-readable display name for the card, which
 /// a raw accountId/login lookup wouldn't give us for free.
