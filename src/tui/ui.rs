@@ -21,8 +21,8 @@ use ratatui::widgets::{
 use crate::cli::runs::format_age;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
-    App, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, RETRO_SEVERITIES,
-    RUN_COLUMNS, RunCard, RunIndicator, Screen, TicketSummary,
+    App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column,
+    RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator, Screen, TicketSummary,
 };
 use crate::tui::theme;
 
@@ -124,6 +124,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_filter_picker(frame, app);
     }
 
+    if app.show_assign_picker {
+        draw_assign_picker(frame, app);
+    }
+
     if app.show_lane_picker {
         draw_lane_picker(frame, app);
     }
@@ -185,7 +189,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  p priority  a audit  s session  w work  b bots  v view run  L logs  V vdiff  F fix  R retro  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  w work  b bots  v view run  L logs  V vdiff  F fix  R retro  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1325,6 +1329,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("o           open in browser (picks Jira/GitHub if a PR exists, board only)"),
         Line::from("O           open Jira directly, no PR lookup"),
         Line::from("f           filter by assignee (board only)"),
+        Line::from("A           assign ticket (board only)"),
         Line::from("p           priority (stack-rank) view (board only)"),
         Line::from("Enter/Space grab or drop a ticket (priority view only)"),
         Line::from("?           toggle this help"),
@@ -1383,6 +1388,77 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
     let mut state = ListState::default();
     if !options.is_empty() {
         state.select(Some(app.filter_picker_selected.min(options.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A centered floating window listing the board assign picker's options
+/// (`Me`, `Unassign`, then each cached assignable user) for the ticket named
+/// in the title, `app.assign_picker_key`. The option matching the card's
+/// *current* assignee is marked with a leading `*` -- a [`AssignChoice::User`]
+/// whose display name equals the card's assignee, or `Unassign` when the
+/// card has none -- mirroring [`draw_filter_picker`]'s active-filter marker.
+/// While assignable users are still loading, a loading line is shown in
+/// place of the user options; if the last fetch failed, the error is shown
+/// instead.
+///
+/// [`AssignChoice::User`]: crate::tui::app::AssignChoice::User
+fn draw_assign_picker(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let key = app.assign_picker_key.as_deref();
+    let title = match key {
+        Some(key) => format!("Assign: {key}"),
+        None => "Assign".to_string(),
+    };
+    let current_assignee = key.and_then(|key| {
+        app.columns
+            .iter()
+            .flat_map(|column| &column.tickets)
+            .find(|ticket| ticket.key == key)
+            .map(|ticket| ticket.assignee.clone())
+    });
+
+    let options = app.assign_options();
+    let mut items: Vec<ListItem> = options
+        .iter()
+        .map(|option| {
+            let is_current = match (&current_assignee, option) {
+                (Some(Some(assignee)), AssignChoice::User(user)) => &user.display_name == assignee,
+                (Some(None), AssignChoice::Unassign) => true,
+                _ => false,
+            };
+            let line = if is_current {
+                Line::from(vec![
+                    Span::styled("* ", theme::ACTIVE_FILTER_MARKER),
+                    Span::raw(option.label()),
+                ])
+            } else {
+                Line::from(format!("  {}", option.label()))
+            };
+            ListItem::new(line)
+        })
+        .collect();
+
+    if app.assignable_users.is_none() {
+        match &app.assign_picker_error {
+            Some(err) => items.push(ListItem::new(format!("Error: {err}"))),
+            None => items.push(ListItem::new("Loading users...")),
+        }
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(bold_title(title)),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    if !options.is_empty() {
+        state.select(Some(app.assign_picker_selected.min(options.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -2280,6 +2356,61 @@ mod tests {
         let app = App {
             show_filter_picker: true,
             filter_picker_error: Some("boom".to_string()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Error: boom"));
+    }
+
+    #[test]
+    fn draws_assign_picker_overlay_with_options_and_current_assignee_marker() {
+        let mut assigned = ticket("PROJ-1");
+        assigned.assignee = Some("Jane Doe".to_string());
+        let app = App {
+            columns: group_into_columns(vec![assigned], &[]),
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assignable_users: Some(vec![jira_user("acct-1", "Jane Doe")]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Assign: PROJ-1"));
+        assert!(text.contains("Me"));
+        assert!(text.contains("Unassign"));
+        assert!(text.contains("* Jane Doe"));
+    }
+
+    #[test]
+    fn draws_assign_picker_marks_unassign_when_card_has_no_assignee() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("* Unassign"));
+    }
+
+    #[test]
+    fn draws_assign_picker_loading_line_when_users_uncached() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Loading users"));
+    }
+
+    #[test]
+    fn draws_assign_picker_error_line_when_last_fetch_failed() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            show_assign_picker: true,
+            assign_picker_key: Some("PROJ-1".to_string()),
+            assign_picker_error: Some("boom".to_string()),
             ..App::new()
         };
         let text = buffer_text(&render(&app));
