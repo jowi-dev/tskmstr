@@ -686,9 +686,9 @@ reported, not an error.
 ### Board-launched lane runs
 
 Pressing `w` on a board ticket runs `tm work run <lane> <KEY>` for it (see
-"`tm work`" above) without leaving the board: zero lanes launches directly
-if there's exactly one, opens a picker if there's more than one, and sets a
-status-line message if there are none.
+"`tm work`" above) without leaving the board: it launches directly if
+there's exactly one lane, opens a picker if there's more than one, and sets
+a status-line message if there are none.
 
 "None"/"more than one" is computed only over lanes whose configured `repo`
 resolves to the *same backend* as the board's own repo — same

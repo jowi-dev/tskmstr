@@ -3,10 +3,10 @@ provider = "github"
 
 [work.lanes.tskmstr]
 # Relative-path idiom (GitHub issue #5 phase 2): "." resolves to this
-# repo's own root, so the lane runs in-place rather than in a separate
-# worktree-of-a-worktree. Only valid in a repo-local .tskmstr.toml (see
-# resolve_repo_path in src/config/mod.rs) -- the same value in the global
-# config would error.
+# repo's own root, so per-ticket worktrees are provisioned from this repo
+# and the lane is always backend-compatible with this repo's board. Only
+# valid in a repo-local .tskmstr.toml (see resolve_repo_path in
+# src/config/mod.rs) -- the same value in the global config would error.
 repo = "."
 # prompt_file is a plain relative path, not `~`-expanded or resolved
 # against `repo`: resolve_prompt_path (src/work/run.rs) only understands a
