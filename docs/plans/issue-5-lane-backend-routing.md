@@ -149,6 +149,15 @@ GH ticket from this repo's board offers/launches the tskmstr lane in a tskmstr w
   from phase 2 — the bug fix edited an existing test, not add a new one)
   all clean. `nix build` succeeds (`result -> tskmstr-0.1.0` in the
   Nix store).
+- Post-merge dogfood finding (first real `w` press on this board): the lane
+  launched but failed base resolution — `could not resolve a base branch
+  for `tskmstr` (no --from, lane base_branch, or origin/HEAD)`. This clone's
+  `origin/HEAD` symbolic ref was never set (`git remote set-head`), so
+  `resolve_base`'s final fallback had nothing to resolve; the axiom lane
+  never hit this because it sets `base_branch` explicitly. Fixed by adding
+  `base_branch = "main"` to `[work.lanes.tskmstr]` (committed) and running
+  `git remote set-head origin main` in this clone (local state, fixes the
+  fallback for anything else that wants it).
 
 ### Phase 2 notes
 
