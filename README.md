@@ -557,6 +557,7 @@ to" windows.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
@@ -579,6 +580,20 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### Assigning a ticket from the board
+
+Pressing `A` on the board opens a floating picker for the selected card,
+listing `Me`, `Unassign`, and every user assignable in `default_project_key`
+(the same lazily fetched, session-cached list the assignee filter picker
+uses). `j`/`k` navigate, `Enter` applies the highlighted choice via the
+ticket provider and closes the picker, `Esc`/`q` closes it without changing
+anything. The option matching the card's current assignee is marked with a
+leading `*`. Applying a choice updates the card and the status line in
+place, with no board refetch. Under the GitHub backend this is exclusive
+single-assignee semantics on top of GitHub's multi-assignee model —
+multi-assignee support is deliberately out of scope here (see
+`docs/plans/github-issues-backend.md`'s phase 6 notes).
 
 ### Priority view (stack-ranking)
 
