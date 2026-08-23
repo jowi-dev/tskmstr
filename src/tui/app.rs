@@ -672,6 +672,15 @@ pub struct App {
     /// wired up, which disables `w`'s launch entirely (see
     /// [`Msg::LaneRunAction`]'s "no lanes configured" case).
     pub lane_names: Vec<String>,
+    /// Count of configured `[work.lanes]` entries hidden from `lane_names`
+    /// because their repo's resolved backend identity doesn't match the
+    /// board's own repo (see [`crate::config::compatible_lane_names`]),
+    /// threaded from config at construction alongside `lane_names` (see
+    /// [`App::with_hidden_lane_count`]). Used only for status-line/picker
+    /// messaging so a backend mismatch reads as "hidden", not "unconfigured"
+    /// — see GitHub issue #5 phase 2:
+    /// `docs/plans/issue-5-lane-backend-routing.md`.
+    pub hidden_lane_count: usize,
     /// Ticket keys with a lane-run launcher child currently in flight (no
     /// run row recorded yet). Populated by [`Msg::LaneRunAction`]/
     /// [`Msg::LanePickerSelect`], cleared by [`Msg::LaneRunLaunchResult`].
@@ -745,12 +754,19 @@ impl App {
         Self::default()
     }
 
-    /// Set `lane_names`, for threading `config.work.lanes.keys()` into the
-    /// board at construction (see [`App::lane_names`]'s doc comment). Not
-    /// yet wired into `main.rs`/`tui::event`; chunk 2 of
-    /// `docs/plans/board-lane-runs.md` calls this from the executor side.
+    /// Set `lane_names`, for threading the board's repo-compatible
+    /// `[work.lanes]` names into the board at construction (see
+    /// [`App::lane_names`]'s doc comment). Called from `tui::event::run`.
     pub fn with_lane_names(mut self, lane_names: Vec<String>) -> Self {
         self.lane_names = lane_names;
+        self
+    }
+
+    /// Set `hidden_lane_count` (see that field's doc comment), for threading
+    /// how many configured lanes were filtered out for a backend mismatch
+    /// into the board at construction, alongside [`Self::with_lane_names`].
+    pub fn with_hidden_lane_count(mut self, hidden_lane_count: usize) -> Self {
+        self.hidden_lane_count = hidden_lane_count;
         self
     }
 
@@ -1826,9 +1842,12 @@ fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
 /// lane run (pending launch, or [`RunIndicator::Starting`]/`Running`/
 /// `Waiting` in `lane_run_status`), sets a status message instead of
 /// launching another one -- terminal indicators (`Done`/`Failed`) don't
-/// block a relaunch. Otherwise: zero configured lanes sets a status message;
-/// exactly one lane launches directly (marking the ticket pending); more
-/// than one opens the lane picker, highlighting the first lane.
+/// block a relaunch. Otherwise: zero configured (repo-compatible) lanes sets
+/// a status message -- noting how many lanes were hidden for a backend
+/// mismatch (`hidden_lane_count`) when that's why the list is empty, rather
+/// than claiming nothing is configured at all; exactly one lane launches
+/// directly (marking the ticket pending); more than one opens the lane
+/// picker, highlighting the first lane.
 fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
     let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
@@ -1847,7 +1866,14 @@ fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
 
     match app.lane_names.len() {
         0 => {
-            app.status_line = "no lanes configured".to_string();
+            app.status_line = if app.hidden_lane_count > 0 {
+                format!(
+                    "no compatible lanes ({} hidden: backend mismatch)",
+                    app.hidden_lane_count
+                )
+            } else {
+                "no lanes configured".to_string()
+            };
             (app, Vec::new())
         }
         1 => {
@@ -5451,6 +5477,17 @@ mod tests {
         assert!(App::new().lane_names.is_empty());
     }
 
+    #[test]
+    fn with_hidden_lane_count_sets_hidden_lane_count() {
+        let app = App::new().with_hidden_lane_count(3);
+        assert_eq!(app.hidden_lane_count, 3);
+    }
+
+    #[test]
+    fn app_defaults_to_zero_hidden_lane_count() {
+        assert_eq!(App::new().hidden_lane_count, 0);
+    }
+
     // --- Msg::LaneRunAction / Msg::LanePicker* / Msg::LaneRunLaunchResult / Msg::LaneRunStatusLoaded ---
 
     #[test]
@@ -5465,6 +5502,20 @@ mod tests {
         let app = board_with(vec![ticket("PROJ-1")], 0);
         let (app, cmds) = update(app, Msg::LaneRunAction);
         assert_eq!(app.status_line, "no lanes configured");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn lane_run_action_with_zero_lanes_and_hidden_lanes_notes_the_backend_mismatch() {
+        // GitHub issue #5 phase 2: when every configured lane was filtered
+        // out for a backend mismatch, the status line should say so rather
+        // than claim nothing is configured at all.
+        let app = board_with(vec![ticket("PROJ-1")], 0).with_hidden_lane_count(2);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert_eq!(
+            app.status_line,
+            "no compatible lanes (2 hidden: backend mismatch)"
+        );
         assert!(cmds.is_empty());
     }
 

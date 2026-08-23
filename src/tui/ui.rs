@@ -1387,11 +1387,14 @@ fn draw_filter_picker(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A centered floating window listing the configured `[work.lanes]` names
-/// (`app.lane_names`, in `BTreeMap` order), for [`Msg::LaneRunAction`]'s lane
-/// picker. Unlike [`draw_filter_picker`], the data is synchronous (no lazy
-/// fetch, so no loading/error line) and there's no "active lane" to mark --
-/// only the highlighted row, via the list's own `highlight_style`.
+/// A centered floating window listing the board's repo-compatible
+/// `[work.lanes]` names (`app.lane_names`, in `BTreeMap` order), for
+/// [`Msg::LaneRunAction`]'s lane picker. Unlike [`draw_filter_picker`], the
+/// data is synchronous (no lazy fetch, so no loading/error line) and there's
+/// no "active lane" to mark -- only the highlighted row, via the list's own
+/// `highlight_style`. The title notes how many lanes were hidden for a
+/// backend mismatch (`app.hidden_lane_count`), if any -- see GitHub issue
+/// #5 phase 2: `docs/plans/issue-5-lane-backend-routing.md`.
 ///
 /// [`Msg::LaneRunAction`]: crate::tui::app::Msg::LaneRunAction
 fn draw_lane_picker(frame: &mut Frame, app: &App) {
@@ -1404,11 +1407,16 @@ fn draw_lane_picker(frame: &mut Frame, app: &App) {
         .map(|lane| ListItem::new(format!("  {lane}")))
         .collect();
 
+    let title = if app.hidden_lane_count > 0 {
+        format!("Lane ({} hidden: backend mismatch)", app.hidden_lane_count)
+    } else {
+        "Lane".to_string()
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(bold_title("Lane")),
+                .title(bold_title(title)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 

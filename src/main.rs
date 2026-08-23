@@ -371,6 +371,21 @@ fn run_work(
             let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
                 .as_ref()
                 .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
+            // The invoking repo's own backend identity, for the
+            // lane/backend-compatibility preflight (GitHub issue #5 phase
+            // 2). A placeholder when `full_config` is absent: unreachable in
+            // practice, since `work_config.lanes` is then empty and
+            // `prepare_run_lane`'s `UnknownLane` check fails first, before
+            // this value is ever consulted.
+            let current_backend_identity = full_config
+                .as_ref()
+                .map(tskmstr::config::BackendIdentity::from_config)
+                .unwrap_or(tskmstr::config::BackendIdentity::Jira {
+                    base_url: String::new(),
+                    project_key: String::new(),
+                });
+            let backend_identity_resolver =
+                tskmstr::config::FsBackendIdentityResolver { home: home.clone() };
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -380,6 +395,9 @@ fn run_work(
                 current_exe: &current_exe,
                 run_db_path: &run_db_path,
                 ticket_provider: ticket_provider.as_deref(),
+                current_repo_dir: &cwd,
+                current_backend_identity: &current_backend_identity,
+                backend_identity_resolver: &backend_identity_resolver,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -468,10 +486,42 @@ fn run_board(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
-    let lanes = config.work.lanes.clone();
-    let lane_names: Vec<String> = lanes.keys().cloned().collect();
-    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     let cwd = std::env::current_dir()?;
+    let lanes = config.work.lanes.clone();
+
+    // Backend-compatibility filtering (GitHub issue #5 phase 2): resolved
+    // once here, eagerly, rather than per keypress or via a `Cmd` — there
+    // are typically only 1-3 lanes, and this is the same I/O `config::load`
+    // already does for the process's own cwd. See
+    // `docs/plans/issue-5-lane-backend-routing.md`.
+    let current_backend_identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let backend_identity_resolver =
+        tskmstr::config::FsBackendIdentityResolver { home: home.clone() };
+    let (lane_names, hidden_lane_count) = tskmstr::config::compatible_lane_names(
+        &current_backend_identity,
+        &lanes,
+        &backend_identity_resolver,
+    );
+
+    // Audit-dir fallback (GitHub issue #5 phase 2): fall back to the
+    // current repo, rather than refuse, when the configured audit dir's
+    // backend is incompatible -- see `resolve_audit_host_dir`'s doc
+    // comment.
+    let mut audit = config.work.audit;
+    let mut audit_dir_fallback = false;
+    if let Some(raw_dir) = audit.dir.clone() {
+        let expanded = tskmstr::work::naming::expand_tilde(&raw_dir, &home);
+        let (effective_dir, fell_back) = tskmstr::config::resolve_audit_host_dir(
+            &expanded,
+            &current_backend_identity,
+            &cwd,
+            &backend_identity_resolver,
+        );
+        audit.dir = Some(effective_dir.to_string_lossy().into_owned());
+        audit_dir_fallback = fell_back;
+    }
+
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     run(TuiDeps {
         jira,
         base_url: config.jira_base_url,
@@ -479,12 +529,14 @@ fn run_board(
         board_column_order: config.board_column_order,
         store,
         tmux: Box::new(tmux),
-        audit: config.work.audit,
+        audit,
         review_watch: config.work.review_watch,
         xdg_data_home,
         home,
         launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
         lane_names,
+        hidden_lane_count,
+        audit_dir_fallback,
         gh: Box::new(ShellGhCli::new()),
         git: Box::new(ShellGitOps::new()),
         cwd,

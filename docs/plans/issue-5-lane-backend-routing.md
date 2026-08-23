@@ -75,8 +75,92 @@ GH ticket from this repo's board offers/launches the tskmstr lane in a tskmstr w
 ## Status
 
 - [x] Phase 1
-- [ ] Phase 2
+- [x] Phase 2
 - [ ] Phase 3
+
+### Phase 2 notes
+
+- New module `src/config/backend_identity.rs` (re-exported from
+  `crate::config`): `BackendIdentity` (`Jira { base_url, project_key }` /
+  `Github { repo }`, derived infallibly from an already-merged `Config` via
+  `BackendIdentity::from_config`), the `BackendIdentityResolver` trait
+  (`resolve(&self, dir) -> Result<BackendIdentity, ConfigError>`), a
+  production `FsBackendIdentityResolver` (wraps `config::load` pointed at an
+  arbitrary directory instead of the process's cwd — the exact same I/O
+  `load` already does, just parameterized), and a `FakeBackendIdentityResolver`
+  test double. Two pure functions built on top, both taking `&dyn
+  BackendIdentityResolver` so callers can fake the I/O: `compatible_lane_names`
+  (board filter) and `resolve_audit_host_dir` (audit fallback).
+- **Design decision, not explicitly spelled out in the plan**: all
+  filtering/fallback decisions are resolved *eagerly at startup* in
+  `main.rs` (`run_board`/`run_work`), not lazily per keypress or via a new
+  `Cmd` variant. `run_board` computes the board's own `BackendIdentity` once,
+  partitions `config.work.lanes` into compatible names before `TuiDeps` is
+  even constructed, and pre-resolves the effective audit host dir the same
+  way (baking the fallback directly into the `AuditConfig` handed to
+  `TuiDeps`, plus a plain `audit_dir_fallback: bool` for status-line
+  wording). This keeps `tui::app`'s reducer and `tui::event`'s `TuiDeps`
+  free of any new I/O seam — `App`/`update` only ever see the *result*
+  (`lane_names`, `hidden_lane_count`, `audit_dir_fallback`), matching the
+  "resolve at TUI startup where `lane_names` is currently wired" option the
+  task offered. `tm work run`'s preflight is the one place identity
+  resolution stays live (via `RunLaneDeps::backend_identity_resolver`) since
+  it's a single directory, checked once, immediately before use.
+- **`tm work run` preflight**: `RunLaneDeps` gained
+  `current_repo_dir`/`current_backend_identity`/`backend_identity_resolver`;
+  `prepare_run_lane` resolves the lane repo's identity and compares it to
+  the invoking repo's right after resolving `repo_root`, before the
+  prompt-file check — the earliest point, so a backend mismatch is reported
+  before any other preflight failure. `RunLaneError::BackendMismatch` is
+  `Box<BackendMismatchInfo>` (not inline fields): clippy's `result_large_err`
+  flagged every `Result<_, RunLaneError>` function once the two
+  `BackendIdentity`s + two `PathBuf`s were added inline, so the payload is
+  boxed and `Display`s via a dedicated `BackendMismatchInfo` type instead of
+  thiserror's field interpolation. `RunDeps` (`src/cli/work.rs`) grew the
+  same three fields to pass through. This touched 40 existing
+  `RunLaneDeps { .. }` test literals in `src/work/run.rs` plus 9 in
+  `src/cli/work.rs`; all were mechanically extended with a shared
+  `compatible_test_identity()`/`compatible_test_resolver()` pair (a
+  `BackendIdentityResolver` that always reports the same fixed identity
+  regardless of directory) so tests unrelated to backend compatibility
+  don't have to care about it.
+- **Board lane filtering**: `App` gained `hidden_lane_count` +
+  `with_hidden_lane_count` (mirroring `lane_names`/`with_lane_names`).
+  `lane_run_action`'s zero-lane status message and `draw_lane_picker`'s
+  title both branch on it: "no compatible lanes (N hidden: backend
+  mismatch)" instead of "no lanes configured" / a bare "Lane" title, when
+  lanes exist but were all filtered out. `App::lane_names`'s stale "not yet
+  wired into main.rs" doc comment (dating to before `board-lane-runs.md`
+  landed) was corrected while touching the adjacent method.
+- **Audit-dir fallback**: implemented entirely in `main.rs`, not
+  `work::audit::launch_audit` — `resolve_audit_host_dir`'s result is baked
+  into the `AuditConfig.dir` string handed to `TuiDeps` before construction,
+  so `launch_audit`'s own signature/tests are untouched. `TuiDeps` gained a
+  plain `audit_dir_fallback: bool` `launch_audit_cmd` (`src/tui/event.rs`)
+  checks to word its success message differently ("launched audit for
+  {key} in the current repo (configured audit dir is backend-incompatible)
+  -- press a to attach") — no new I/O in the TUI event layer.
+- **Relative lane `repo` / `[work.audit].dir` paths**: resolved at
+  config-merge time, not at consumption time (unlike `~`-expansion, which
+  stays the caller's job per existing convention) — `merge_with_repo_dir`
+  already threads a `repo_dir: Option<&Path>` through for
+  `[backend.github].repo`'s origin-remote default, so `merge_work`/
+  `merge_audit` reuse it as the "defining directory" for a relative value,
+  *provided that specific value actually came from the repo-local config*
+  (checked via `repo.lanes.contains_key(name)` for lanes, and `repo.dir.is_some()`
+  for audit — not merely "repo_dir happens to be `Some`", since `load()`
+  passes a cwd-fallback `repo_dir` even when no repo-local `.tskmstr.toml`
+  exists at all). A relative value that falls back to the global config is
+  `ConfigError::RelativePathRequiresRepoConfig`, naming the dotted field
+  path (`work.lanes.<name>.repo` / `work.audit.dir`) and the offending
+  value. `repo = "."` is special-cased to resolve to the defining dir
+  itself (not `<dir>/.`); any other relative value is a plain
+  `dir.join(value)` (so `"../sibling"` resolves un-normalized, same as a
+  naive `PathBuf::join` would — no lexical `..`-collapsing was added, since
+  nothing needed it).
+- Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (1983 lib tests + 3 bin tests + 0 doctests, up from phase 1's
+  1963) all clean.
 
 ### Phase 1 notes
 

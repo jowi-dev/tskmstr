@@ -357,6 +357,16 @@ pub struct RunDeps<'a> {
     /// timestamp-based branch name; it is never a hard error for `tm work
     /// run` to have no ticket-backend access.
     pub ticket_provider: Option<&'a dyn TicketProvider>,
+    /// The invoking repo's own directory (typically `cwd`), passed through
+    /// to [`crate::work::run::RunLaneDeps::current_repo_dir`].
+    pub current_repo_dir: &'a Path,
+    /// The invoking repo's resolved backend identity, passed through to
+    /// [`crate::work::run::RunLaneDeps::current_backend_identity`]. See
+    /// GitHub issue #5 phase 2: `docs/plans/issue-5-lane-backend-routing.md`.
+    pub current_backend_identity: &'a crate::config::BackendIdentity,
+    /// Resolves a directory's backend identity, passed through to
+    /// [`crate::work::run::RunLaneDeps::backend_identity_resolver`].
+    pub backend_identity_resolver: &'a dyn crate::config::BackendIdentityResolver,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -405,6 +415,9 @@ pub fn run(
         run_store: deps.run_store,
         clock: deps.clock,
         ticket_provider: deps.ticket_provider,
+        current_repo_dir: deps.current_repo_dir,
+        current_backend_identity: deps.current_backend_identity,
+        backend_identity_resolver: deps.backend_identity_resolver,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -947,11 +960,37 @@ impl fmt::Debug for WorkContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LaneConfig;
+    use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, LaneConfig};
     use crate::work::git::FakeGitOps;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use std::collections::BTreeMap;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    /// A [`BackendIdentityResolver`] test double that resolves every
+    /// directory to the same, fixed identity — see
+    /// `crate::work::run::tests`'s identical helper for why: these tests
+    /// aren't exercising the backend-compatibility preflight itself.
+    struct AlwaysBackendIdentityResolver(BackendIdentity);
+
+    impl BackendIdentityResolver for AlwaysBackendIdentityResolver {
+        fn resolve(&self, _dir: &Path) -> Result<BackendIdentity, ConfigError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn compatible_test_identity() -> &'static BackendIdentity {
+        static IDENTITY: OnceLock<BackendIdentity> = OnceLock::new();
+        IDENTITY.get_or_init(|| BackendIdentity::Jira {
+            base_url: String::new(),
+            project_key: String::new(),
+        })
+    }
+
+    fn compatible_test_resolver() -> &'static dyn BackendIdentityResolver {
+        static RESOLVER: OnceLock<AlwaysBackendIdentityResolver> = OnceLock::new();
+        RESOLVER.get_or_init(|| AlwaysBackendIdentityResolver(compatible_test_identity().clone()))
+    }
 
     fn config_with_lanes(lanes: BTreeMap<String, LaneConfig>) -> WorkConfig {
         WorkConfig {
@@ -2206,6 +2245,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2318,6 +2360,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2381,6 +2426,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let mut out = Vec::new();
 
@@ -2532,6 +2580,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let mut out = Vec::new();
 
@@ -2601,6 +2652,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let mut out = Vec::new();
 
@@ -2656,6 +2710,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2761,6 +2818,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2817,6 +2877,9 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let mut out = Vec::new();
 
@@ -2865,6 +2928,9 @@ mod tests {
             run_store: &run_store,
             clock: &clock,
             ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),
