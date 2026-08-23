@@ -76,7 +76,79 @@ GH ticket from this repo's board offers/launches the tskmstr lane in a tskmstr w
 
 - [x] Phase 1
 - [x] Phase 2
-- [ ] Phase 3
+- [x] Phase 3
+
+### Phase 3 notes
+
+- **Dogfood lane**: `.tskmstr.toml` gained `[work.lanes.tskmstr]` with
+  `repo = "."` (phase 2's relative-repo idiom, resolving to this repo's
+  own root) and an explicit `prompt_file = "prompts/tskmstr-lane.md"`.
+  `resolve_prompt_path` (`src/work/run.rs`) only understands a leading `~`
+  or an absolute path — unlike `resolve_repo_path`, it was intentionally
+  left out of phase 2's relative-path plumbing, and phase 3 stays in scope
+  by not adding any. A plain relative `prompt_file` value is instead left
+  to resolve against whatever directory the `tm` process is invoked from,
+  which is always this repo's root for both `tm work run` and the board —
+  noted as a config comment in `.tskmstr.toml` in case that assumption
+  ever stops holding (switch to an absolute path if so).
+- `prompts/tskmstr-lane.md` is a short autonomous work-lane prompt: run
+  `tm ready <KEY>` first and branch on exit code (`0` ready -> proceed,
+  `3` stackable -> proceed on the blocker's PR branch, `1` blocked -> stop
+  and record why), work only the named ticket, TDD, run `cargo fmt
+  --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+  before finishing, no AI attribution in commits. It does not reference
+  `{key}` itself — `resolve_prompt_path`'s caller already appends `"Work
+  ticket: <ticket>."` to whatever the prompt file contains (see
+  `src/work/run.rs`'s module doc, step 7), so the prompt file only needed
+  to describe the workflow.
+- **Verification**: `cargo run -- auth status` (which loads config the
+  same way every other command does) succeeded with the github-backend
+  message rather than erroring, proving `.tskmstr.toml` — including the
+  new `[work.lanes.tskmstr]` table and its `repo = "."` resolution —
+  parses cleanly under `merge_work`/`resolve_repo_path`. `cargo run --
+  work list`/`board --help` also ran clean (no regressions in existing
+  read-only paths). Did not run `tm work run tskmstr` for real or launch
+  the board TUI, per the task's scope — those would provision a worktree/
+  tmux session and are exactly what "do not run for real" ruled out.
+- **Docs**: README gained a `w` row in the keybindings table (previously
+  absent entirely — a pre-existing gap, left as-is beyond adding this one
+  row, since fully documenting `w`'s pre-issue-5 behavior is out of this
+  phase's scope), a new "Board-launched lane runs" section describing the
+  zero/one/many-lanes behavior and the backend-compatibility filter
+  ("hidden: backend mismatch" status note) plus its `tm work run`
+  preflight-error counterpart, an addition to "Board-launched audit
+  sessions" documenting the audit-dir fallback and its exact status-line
+  wording, and a new "Relative `repo`/`dir` paths in a repo-local config"
+  subsection under Configuration covering the `repo = "."` idiom and why
+  the same relative value in the global config is
+  `RelativePathRequiresRepoConfig`.
+- **Real bug found while dogfooding, fixed in this branch**: `nix build`
+  (never previously run for this feature — phase 3 is the first phase
+  that runs it) failed a test unrelated to any phase-3 change:
+  `tests::run_ticket_provider_github_backend_does_not_need_a_jira_token`
+  (added in phase 1, `src/main.rs`) opens a `RunStore` at the *default*
+  XDG run-db path (`$HOME/.local/share/tskmstr/runs.db`) because its
+  `Config` fixture left `run_db_path` unset. That default resolves fine
+  under an ordinary dev shell's real, writable `$HOME`, but `nix build`
+  sandboxes `$HOME` to something unwritable, so `RunStore::open` fails,
+  `run_ticket_provider` swallows the error into `None` per its documented
+  opportunistic contract, and the test's `is_some()` assertion fails —
+  even though the production code path (`ticket_provider_for`'s github
+  arm) is correct. Reproduced locally without nix by pointing `$HOME` at
+  a `chmod 555` directory and running the test binary directly (`cargo
+  test` itself needs a writable `$HOME` for its own registry cache, so
+  `CARGO_HOME` had to stay pointed at the real one while only `$HOME` was
+  swapped). Fix: the test now sets `config.run_db_path` to a
+  `tempfile::tempdir()` path instead of leaving it unset, making it
+  hermetic regardless of the ambient `$HOME` — no production code
+  changed. Verified: the test fails against the pre-fix code under the
+  `chmod 555` `$HOME` repro, and passes both there and normally after the
+  fix; `nix build` failed before this commit and succeeds after it.
+- Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (1983 lib tests + 3 bin tests + 0 doctests, unchanged count
+  from phase 2 — the bug fix edited an existing test, not add a new one)
+  all clean. `nix build` succeeds (`result -> tskmstr-0.1.0` in the
+  Nix store).
 
 ### Phase 2 notes
 
