@@ -74,6 +74,45 @@ GH ticket from this repo's board offers/launches the tskmstr lane in a tskmstr w
 
 ## Status
 
-- [ ] Phase 1
+- [x] Phase 1
 - [ ] Phase 2
 - [ ] Phase 3
+
+### Phase 1 notes
+
+- `RunLaneDeps`/`RunDeps`'s `jira` field is renamed to `ticket_provider`
+  (already typed as `Option<&dyn TicketProvider>`, so this was a rename, not
+  a retyping) throughout `src/work/run.rs` and `src/cli/work.rs`.
+  `resolve_ticket_slug` and `resolve_blocker_stacking` take
+  `ticket_provider` instead of `jira` and are otherwise unchanged — they
+  were already backend-agnostic; the bug was entirely in `main.rs`'s
+  wiring, which unconditionally called `jira_client_for` instead of
+  branching on `config.backend`.
+- Fix: extracted `run_ticket_provider` in `src/main.rs`, which wraps the
+  existing `ticket_provider_for` (the same construction `tm ticket`/`tm
+  board` already use) as `.ok()` — preserving the prior opportunistic
+  contract (`None` on any construction/auth failure, never a hard error for
+  `tm work run`). `WorkCmd::Run` now calls this instead of hand-rolling a
+  Jira-only client.
+- Deviation from a literal read of "nothing in `src/work/` should name Jira
+  types": `FakeJiraClient` (a generic `TicketProvider` test double already
+  shared crate-wide, per its own doc comment) remains in `src/work/run.rs`'s
+  *existing* tests unrelated to backend selection (e.g. blocker-stacking
+  fixtures). Interpreted the constraint as scoped to production code (the
+  run path) — confirmed via grep that no non-test code in `src/work/` names
+  a concrete Jira type. Added one new test,
+  `run_lane_fg_uses_github_summary_slug_for_branch_name_when_available`,
+  using a real `GithubProvider` over `FakeGhCli` (mirroring
+  `github_provider.rs`'s own test setup) to prove GH-N slug resolution
+  actually works end to end.
+- TDD note: the routing bug lives in `main.rs`, which has no prior test
+  culture (no injectable `GhCli`/keychain seam beyond what
+  `ticket_provider_for` already offers, and phase 1 was scoped to reuse that
+  construction rather than add a new one). Wrote `run_ticket_provider` first
+  with the old Jira-only behavior, added a failing test asserting a
+  github-backend config with no Jira token still yields a provider, watched
+  it fail, then swapped the implementation to call `ticket_provider_for`
+  and watched it pass. Two more tests cover the Jira backend's existing
+  None-without-a-token / Some-with-a-token behavior is unchanged.
+- Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (1960 lib tests + 3 new bin tests + doctests) all clean.
