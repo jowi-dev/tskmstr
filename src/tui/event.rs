@@ -140,6 +140,21 @@ pub struct TuiDeps {
     /// [`crate::tui::app::App::with_lane_names`] at construction (see that
     /// method's doc comment).
     pub lane_names: Vec<String>,
+    /// Count of configured `[work.lanes]` entries hidden from `lane_names`
+    /// because their repo's resolved backend identity doesn't match this
+    /// repo's own (see [`crate::config::compatible_lane_names`]), threaded
+    /// into [`crate::tui::app::App::with_hidden_lane_count`] at
+    /// construction. See GitHub issue #5 phase 2:
+    /// `docs/plans/issue-5-lane-backend-routing.md`.
+    pub hidden_lane_count: usize,
+    /// Whether `audit.dir` above was already redirected from
+    /// `[work.audit].dir`'s configured value to the current repo (`cwd`)
+    /// because the configured dir's resolved backend identity didn't match
+    /// this repo's own (see [`crate::config::resolve_audit_host_dir`]).
+    /// [`launch_audit_cmd`] notes this in its status-line message when
+    /// `true`, per the plan's "surface the fallback in the status line"
+    /// decision.
+    pub audit_dir_fallback: bool,
     /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`] to list a
     /// ticket's repo's open pull requests.
     pub gh: Box<dyn crate::github::gh_cli::GhCli>,
@@ -234,7 +249,8 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         board_column_order: deps.board_column_order.clone(),
         ..App::new()
     }
-    .with_lane_names(deps.lane_names.clone());
+    .with_lane_names(deps.lane_names.clone())
+    .with_hidden_lane_count(deps.hidden_lane_count);
     let query = query_for_filter(&app.filter, &app.project_key);
     app = run_cmds(
         app,
@@ -1250,6 +1266,10 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         &deps.home,
         key,
     ) {
+        Ok(_) if deps.audit_dir_fallback => format!(
+            "launched audit for {key} in the current repo (configured audit dir is \
+             backend-incompatible) -- press a to attach"
+        ),
         Ok(_) => format!("launched audit for {key} -- press a to attach"),
         Err(crate::work::audit::AuditLaunchError::AlreadyRunning {
             session_name,
@@ -1684,6 +1704,8 @@ mod tests {
             xdg_data_home: None,
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             lane_names: Vec::new(),
+            hidden_lane_count: 0,
+            audit_dir_fallback: false,
             gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
             git: Box::new(crate::work::git::FakeGitOps::new()),
             cwd: std::path::PathBuf::from("/repo"),
@@ -2909,6 +2931,36 @@ mod tests {
                 "launched audit for PROJ-1 -- press a to attach".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn launch_audit_cmd_success_with_fallback_notes_backend_mismatch() {
+        // GitHub issue #5 phase 2: `deps.audit_dir_fallback` is set by
+        // `main.rs` when the configured audit dir was already redirected to
+        // the current repo for a backend mismatch; the launch message
+        // should say so rather than the plain "launched audit" text.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        deps.audit = crate::config::AuditConfig {
+            dir: Some("/repo/tskmstr".to_string()),
+            prompt: None,
+            model: None,
+        };
+        deps.audit_dir_fallback = true;
+
+        let msgs = launch_audit_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::AuditActionResult(message)] => {
+                assert!(
+                    message.contains("backend-incompatible"),
+                    "expected a backend-mismatch note, got: {message}"
+                );
+            }
+            other => panic!("expected AuditActionResult, got {other:?}"),
+        }
     }
 
     #[test]
