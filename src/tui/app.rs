@@ -1608,7 +1608,15 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 Some(name) => format!("{key} -> assigned to {name}"),
                 None => format!("{key} -> unassigned"),
             };
-            (app, Vec::new())
+            // The board's assignee filter (`f`) is applied server-side, so an
+            // assign/unassign can move the card out from under the active
+            // filter (e.g. assigning away from yourself under the default
+            // `Me` filter). Refetch under the current filter so a
+            // now-non-matching card doesn't linger until a manual `r`; the
+            // local patch above still keeps the card visually correct in the
+            // meantime.
+            let query = query_for_filter(&app.filter, &app.project_key);
+            (app, vec![Cmd::FetchTickets { query }])
         }
         Msg::AssignFailed(err) => {
             app.status_line = err;
@@ -4165,7 +4173,12 @@ mod tests {
             Some("Jane Doe".to_string())
         );
         assert_eq!(app.status_line, "PROJ-1 -> assigned to Jane Doe");
-        assert!(cmds.is_empty());
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::MyOpen
+            }]
+        );
     }
 
     #[test]
@@ -4180,7 +4193,67 @@ mod tests {
         );
         assert_eq!(app.selected_ticket().unwrap().assignee, None);
         assert_eq!(app.status_line, "PROJ-1 -> unassigned");
-        assert!(cmds.is_empty());
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::MyOpen
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_applied_refetches_under_the_active_non_me_filter() {
+        let app = App {
+            filter: AssigneeFilter::Everyone,
+            project_key: "PROJ".to_string(),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(
+            app,
+            Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: Some("Jane Doe".to_string()),
+            },
+        );
+        assert_eq!(app.status_line, "PROJ-1 -> assigned to Jane Doe");
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::Everyone {
+                    project_key: "PROJ".to_string()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn assign_applied_then_refetch_missing_the_assigned_card_does_not_panic() {
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::AssignApplied {
+                key: "PROJ-1".to_string(),
+                assignee: Some("Jane Doe".to_string()),
+            },
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::MyOpen
+            }]
+        );
+        // Simulate the refetch resolving under the still-active `Me` filter:
+        // PROJ-1 was assigned away, so it no longer matches and drops out of
+        // the result set. Reselecting must not panic and should land on
+        // whatever is left.
+        let (app, _) = update(app, Msg::TicketsLoaded(vec![ticket("PROJ-2")]));
+        let remaining: Vec<&str> = app
+            .columns
+            .iter()
+            .flat_map(|c| c.tickets.iter().map(|t| t.key.as_str()))
+            .collect();
+        assert_eq!(remaining, vec!["PROJ-2"]);
+        assert_eq!(app.selected_ticket().unwrap().key, "PROJ-2");
     }
 
     #[test]
