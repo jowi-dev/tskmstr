@@ -1677,6 +1677,7 @@ mod tests {
             "o browser",
             "O jira",
             "f filter",
+            "A assign",
             "p priority",
             "a audit",
             "s session",
@@ -2764,6 +2765,16 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("priority"));
         assert!(text.contains("grab"));
+    }
+
+    #[test]
+    fn help_overlay_documents_assign_key() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("A           assign ticket (board only)"));
     }
 
     fn run_card(id: i64, ticket: &str, lane: &str, status: RunStatus) -> RunCard {
