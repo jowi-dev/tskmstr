@@ -147,6 +147,15 @@ pub enum Command {
         #[command(subcommand)]
         cmd: BackendCmd,
     },
+    /// Interactively onboard the current repo: choose a ticket backend,
+    /// write `.tskmstr.toml`, scaffold a work lane, create the GitHub
+    /// backend's status labels, and set up session assets so `tm board`
+    /// works immediately after.
+    Init {
+        /// Accept the default answer for every question (scripted setup).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `tm backend` subcommands.
@@ -1163,6 +1172,18 @@ mod tests {
                 .expect("should answer")
         );
         assert_eq!(prompter.messages, vec!["proceed?".to_string()]);
+    }
+
+    #[test]
+    fn parses_init() {
+        let cli = Cli::try_parse_from(["tm", "init"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Init { yes: false })));
+    }
+
+    #[test]
+    fn parses_init_yes() {
+        let cli = Cli::try_parse_from(["tm", "init", "--yes"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Init { yes: true })));
     }
 
     #[test]

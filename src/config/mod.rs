@@ -1170,7 +1170,7 @@ fn dirs_home() -> PathBuf {
 /// [`crate::github::gh_cli::ShellGhCli`]'s private `resolve_repo` already
 /// does, for the `pr_*` methods): that requires `gh` to be authenticated,
 /// which config loading shouldn't depend on just to resolve a default.
-fn detect_origin_repo(dir: &Path) -> Option<String> {
+pub(crate) fn detect_origin_repo(dir: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(dir)

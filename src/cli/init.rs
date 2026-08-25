@@ -327,6 +327,36 @@ pub fn run_init(
     Ok(())
 }
 
+/// Detect the GitHub `owner/name` slug from `dir`'s `origin` remote, for
+/// offering as the wizard's default. `None` on any failure.
+pub fn detect_origin_slug(dir: &Path) -> Option<String> {
+    config::detect_origin_repo(dir)
+}
+
+/// Detect the default branch from `dir`'s `origin/HEAD` symbolic ref, for
+/// offering as the lane `base_branch` default. `None` on any failure —
+/// notably on clones where `git remote set-head` never ran, which is exactly
+/// why the wizard writes the answer explicitly.
+pub fn detect_origin_default_branch(dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let symref = String::from_utf8_lossy(&output.stdout);
+    parse_origin_head(symref.trim()).map(str::to_string)
+}
+
+/// `origin/main` -> `main`.
+fn parse_origin_head(symref: &str) -> Option<&str> {
+    symref
+        .strip_prefix("origin/")
+        .filter(|branch| !branch.is_empty())
+}
+
 /// One of the optional `[work.audit]` / `[work.review_watch]` sections the
 /// wizard can fill in.
 struct SessionSection {
@@ -1441,7 +1471,8 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n";
+        let original =
+            "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
 
@@ -1498,6 +1529,17 @@ mod tests {
             after.contains("# my notes"),
             "existing comments preserved: {after}"
         );
+    }
+
+    #[test]
+    fn parse_origin_head_strips_the_remote_prefix() {
+        assert_eq!(parse_origin_head("origin/main"), Some("main"));
+        assert_eq!(
+            parse_origin_head("origin/feature/nested"),
+            Some("feature/nested")
+        );
+        assert_eq!(parse_origin_head("origin/"), None);
+        assert_eq!(parse_origin_head("main"), None);
     }
 
     #[test]
