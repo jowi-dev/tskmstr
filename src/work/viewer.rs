@@ -208,7 +208,7 @@ mod tests {
         fn select_window(&self, _: &str, _: &str) -> Result<(), TmuxError> {
             Err(Self::error())
         }
-        fn attach(&self, _: &str) -> Result<(), TmuxError> {
+        fn attach(&self, _: &str) -> Result<crate::work::tmux::AttachOutcome, TmuxError> {
             Err(Self::error())
         }
         fn kill_session(&self, _: &str) -> Result<(), TmuxError> {

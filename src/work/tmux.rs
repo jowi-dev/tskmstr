@@ -184,8 +184,10 @@ pub trait TmuxOps {
     /// Connect the user to session `name`: `tmux attach-session -t <name>`
     /// (blocking until detach) from outside tmux, `tmux switch-client -t
     /// <name>` (returning immediately) when already inside a tmux client
-    /// (see [`is_inside_tmux`] and the module docs, issue #6).
-    fn attach(&self, name: &str) -> Result<(), TmuxError>;
+    /// (see [`is_inside_tmux`] and the module docs, issue #6). The returned
+    /// [`AttachOutcome`] says which of the two happened, so callers can
+    /// word their "you're back" messaging accordingly.
+    fn attach(&self, name: &str) -> Result<AttachOutcome, TmuxError>;
 
     /// Kill session `name` (`tmux kill-session -t <name>`).
     fn kill_session(&self, name: &str) -> Result<(), TmuxError>;
@@ -396,6 +398,19 @@ fn select_window_args(name: &str, window: &str) -> Vec<String> {
     ]
 }
 
+/// How a successful [`TmuxOps::attach`] connected the user to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// `tmux attach-session` ran and blocked until the user detached (or
+    /// the session ended); by the time the caller sees this, the user is
+    /// back in the caller's own terminal.
+    Detached,
+    /// `tmux switch-client` jumped the caller's existing tmux client to the
+    /// target session and returned immediately; the user is now looking at
+    /// that session while the caller keeps running in its own window.
+    Switched,
+}
+
 /// Whether the caller is already inside a tmux client, judged from the
 /// value of its `$TMUX` environment variable (pass
 /// `std::env::var_os("TMUX")`; the parameter is explicit for testability,
@@ -584,7 +599,7 @@ impl TmuxOps for ShellTmuxOps {
         require_success("tmux select-window", &output)
     }
 
-    fn attach(&self, name: &str) -> Result<(), TmuxError> {
+    fn attach(&self, name: &str) -> Result<AttachOutcome, TmuxError> {
         let inside_tmux = is_inside_tmux(std::env::var_os("TMUX").as_deref());
         let command = if inside_tmux {
             "tmux switch-client"
@@ -603,7 +618,11 @@ impl TmuxOps for ShellTmuxOps {
                 message: err.to_string(),
             })?;
         if status.success() {
-            Ok(())
+            Ok(if inside_tmux {
+                AttachOutcome::Switched
+            } else {
+                AttachOutcome::Detached
+            })
         } else {
             Err(TmuxError::Command {
                 command: command.to_string(),
@@ -652,6 +671,7 @@ pub struct FakeTmuxOps {
     has_session_result: std::cell::RefCell<Result<bool, TmuxError>>,
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
     list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
+    attach_outcome: std::cell::RefCell<AttachOutcome>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -728,13 +748,15 @@ pub enum TmuxCall {
 }
 
 impl FakeTmuxOps {
-    /// Create a fake where `has_session` returns `Ok(false)` and
-    /// `list_sessions`/`list_windows` return `Ok(vec![])` unless overridden.
+    /// Create a fake where `has_session` returns `Ok(false)`,
+    /// `list_sessions`/`list_windows` return `Ok(vec![])`, and `attach`
+    /// returns `Ok(AttachOutcome::Detached)` unless overridden.
     pub fn new() -> Self {
         Self {
             has_session_result: std::cell::RefCell::new(Ok(false)),
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
             list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
+            attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -754,6 +776,12 @@ impl FakeTmuxOps {
     /// Set the result `list_windows` will return.
     pub fn with_list_windows(self, result: Result<Vec<TmuxWindow>, TmuxError>) -> Self {
         *self.list_windows_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the [`AttachOutcome`] a successful `attach` will report.
+    pub fn with_attach_outcome(self, outcome: AttachOutcome) -> Self {
+        *self.attach_outcome.borrow_mut() = outcome;
         self
     }
 
@@ -837,11 +865,11 @@ impl TmuxOps for FakeTmuxOps {
         Ok(())
     }
 
-    fn attach(&self, name: &str) -> Result<(), TmuxError> {
+    fn attach(&self, name: &str) -> Result<AttachOutcome, TmuxError> {
         self.calls
             .borrow_mut()
             .push(TmuxCall::Attach(name.to_string()));
-        Ok(())
+        Ok(*self.attach_outcome.borrow())
     }
 
     fn kill_session(&self, name: &str) -> Result<(), TmuxError> {

@@ -41,7 +41,7 @@ use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
 use crate::work::audit::AUDIT_WINDOW_NAME;
 use crate::work::bugbot::CLEANUP_WINDOW_NAME;
-use crate::work::tmux::TmuxOps;
+use crate::work::tmux::{AttachOutcome, TmuxOps};
 
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -502,11 +502,17 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
     msgs
 }
 
-/// Suspend the board's alternate screen and raw mode, run `tmux
-/// attach-session -t <session_name>` with inherited stdio (blocking until
-/// the user detaches, e.g. `C-b d`, or the session ends), then restore the
-/// alternate screen and raw mode and clear the terminal so the board redraws
-/// cleanly. Returns a status-line message describing the outcome.
+/// Suspend the board's alternate screen and raw mode, run
+/// [`TmuxOps::attach`] with inherited stdio — outside tmux that's a
+/// blocking `tmux attach-session -t <session_name>` (until the user
+/// detaches, e.g. `C-b d`, or the session ends); inside tmux it's a `tmux
+/// switch-client -t <session_name>` that returns immediately while the
+/// user's client is now showing the target session (issue #6) — then
+/// restore the alternate screen and raw mode and clear the terminal so the
+/// board redraws cleanly. In the switch case the board keeps running in its
+/// own tmux window, ready for the user to jump back (`prefix + s`,
+/// `switch-client -l`). Returns a status-line message describing the
+/// outcome, worded per [`AttachOutcome`].
 ///
 /// Shared by all three keys that attach: `a` (a live `audit` window), `b` (a
 /// live `bugbot` window), and `s` (the ticket's session as such, issue #2
@@ -554,6 +560,11 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    so the status line reports the `tmux attach-session` failure and the
 ///    board must be fully usable afterwards (this is the same restore path
 ///    as step 4, reached without ever having attached).
+/// 7. Run the board itself inside a tmux session and press `s` on a ticket
+///    with a live session: the client must switch to that session (no
+///    "sessions should be nested with care" refusal). Jump back to the
+///    board's window (`prefix + s`): it must be redrawn cleanly with the
+///    status line reading `switched client to tm-<key>`.
 fn attach_session<B: Backend>(
     terminal: &mut Terminal<B>,
     tmux: &dyn TmuxOps,
@@ -569,7 +580,8 @@ fn attach_session<B: Backend>(
     let _ = terminal.clear();
 
     match result {
-        Ok(()) => format!("detached from {session_name}"),
+        Ok(AttachOutcome::Detached) => format!("detached from {session_name}"),
+        Ok(AttachOutcome::Switched) => format!("switched client to {session_name}"),
         Err(err) => format!("attach to {session_name} failed: {err}"),
     }
 }
@@ -3159,6 +3171,30 @@ mod tests {
             &mut launches,
         );
         assert_eq!(app.status_line, "detached from tm-proj-1");
+    }
+
+    /// From inside tmux, attach runs `switch-client` and returns immediately
+    /// while the user is now looking at the target session -- the status
+    /// line must not claim they detached (issue #6).
+    #[test]
+    fn run_cmds_attach_reports_switch_wording_when_client_switched() {
+        let mut d = deps(FakeJiraClient::new());
+        d.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new()
+                .with_attach_outcome(crate::work::tmux::AttachOutcome::Switched),
+        );
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(app.status_line, "switched client to tm-proj-1");
     }
 
     // --- Cmd::LaunchLaneRun routing (run_cmds intercepts it before `execute`) ---
