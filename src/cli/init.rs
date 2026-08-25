@@ -223,6 +223,39 @@ pub fn run_init(
     }
 
     let scaffold = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
+    session_step(
+        ctx,
+        yes,
+        &mut doc,
+        &repo_config_path,
+        prompter,
+        out,
+        &SessionSection {
+            table: "audit",
+            question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
+            default_prompt: "/ticket-audit {key}",
+        },
+    )?;
+    session_step(
+        ctx,
+        yes,
+        &mut doc,
+        &repo_config_path,
+        prompter,
+        out,
+        &SessionSection {
+            table: "review_watch",
+            question: "Configure review-watch sessions ([work.review_watch])?",
+            default_prompt: "/bugbot-triage {key} {findings_file}",
+        },
+    )?;
+    let install_hooks = !ctx.hooks_installed
+        && ask_confirm(
+            yes,
+            prompter,
+            "Install the Claude Code session hooks (tm work hooks install --user)?",
+            false,
+        )?;
 
     // --- Writes ---
     ensure_global_exists(ctx, global_seed.as_ref(), out)?;
@@ -278,9 +311,114 @@ pub fn run_init(
         )?;
     }
 
+    if install_hooks {
+        if let Err(message) = (ctx.hook_installer)(out) {
+            writeln!(out, "warning: hook install failed: {message}")?;
+        }
+    } else if !ctx.hooks_installed {
+        writeln!(
+            out,
+            "hint: run `tm work hooks install --user` to enable session telemetry."
+        )?;
+    }
+
     writeln!(out)?;
     writeln!(out, "Done. Run `tm board` to open the board.")?;
     Ok(())
+}
+
+/// One of the optional `[work.audit]` / `[work.review_watch]` sections the
+/// wizard can fill in.
+struct SessionSection {
+    /// Table name under `[work]`.
+    table: &'static str,
+    /// The confirm question enabling the section.
+    question: &'static str,
+    /// The prompt the section runs when none is configured, whose leading
+    /// `/skill` is checked for existence.
+    default_prompt: &'static str,
+}
+
+/// Ask about an optional session section and write its `dir`. The prompt's
+/// skill is user-supplied, not shipped with tm, so a missing one warns with
+/// the expected paths instead of failing.
+#[allow(clippy::too_many_arguments)]
+fn session_step(
+    ctx: &InitContext,
+    yes: bool,
+    doc: &mut DocumentMut,
+    repo_config_path: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+    section: &SessionSection,
+) -> Result<(), InitCliError> {
+    let repo_dir = repo_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let present = doc
+        .get("work")
+        .and_then(Item::as_table_like)
+        .and_then(|work| work.get(section.table))
+        .is_some();
+    if !ask_confirm(yes, prompter, section.question, present)? {
+        return Ok(());
+    }
+
+    // review_watch's dir falls back to audit's at load time; offer the same
+    // fallback as the default here.
+    let dir_default = str_at(doc, &["work", section.table, "dir"])
+        .or_else(|| str_at(doc, &["work", "audit", "dir"]))
+        .unwrap_or(".")
+        .to_string();
+    let dir = ask_required(
+        yes,
+        prompter,
+        out,
+        &format!(
+            "Session directory for [work.{}] (\".\" = this repo)",
+            section.table
+        ),
+        &dir_default,
+        "the session directory",
+    )?;
+    set_str(doc, &["work", section.table], "dir", &dir, repo_config_path)?;
+
+    let prompt = str_at(doc, &["work", section.table, "prompt"])
+        .unwrap_or(section.default_prompt)
+        .to_string();
+    let resolved_dir = resolve_repo_relative(&dir, &repo_dir, ctx.home);
+    warn_if_skill_missing(out, &prompt, &resolved_dir, ctx.home)?;
+    Ok(())
+}
+
+/// Warn when the skill a session prompt invokes (its leading `/name` token)
+/// exists neither in the session directory's repo-local skills nor in the
+/// user-level ones.
+fn warn_if_skill_missing(
+    out: &mut dyn Write,
+    prompt: &str,
+    dir: &Path,
+    home: &Path,
+) -> io::Result<()> {
+    let Some(skill) = prompt
+        .split_whitespace()
+        .next()
+        .and_then(|first| first.strip_prefix('/'))
+    else {
+        return Ok(());
+    };
+    let repo_skill = dir.join(".claude/skills").join(skill);
+    let home_skill = home.join(".claude/skills").join(skill);
+    if repo_skill.exists() || home_skill.exists() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "warning: the /{skill} skill is user-supplied (tm does not ship it); expected at {} or {}.",
+        repo_skill.display(),
+        home_skill.display()
+    )
 }
 
 /// Ask which ticket backend the repo uses, re-prompting until the answer
@@ -441,7 +579,7 @@ fn lane_step(
         repo_config_path,
     )?;
 
-    let resolved = resolve_prompt_file(&prompt_file, &repo_dir, ctx.home);
+    let resolved = resolve_repo_relative(&prompt_file, &repo_dir, ctx.home);
     if resolved.exists() {
         return Ok(None);
     }
@@ -462,14 +600,15 @@ fn lane_step(
     }
 }
 
-/// Where a lane `prompt_file` value points on disk. Relative paths resolve
-/// against the repo root here (at run time they resolve against whatever
-/// directory `tm` is invoked from, which is normally the same place).
-fn resolve_prompt_file(prompt_file: &str, repo_dir: &Path, home: &Path) -> PathBuf {
-    if let Some(rest) = prompt_file.strip_prefix("~/") {
+/// Where a config path value (lane `prompt_file`, session `dir`) points on
+/// disk. Relative paths resolve against the repo root here (a lane
+/// `prompt_file` resolves against `tm`'s invocation directory at run time,
+/// which is normally the same place).
+fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
         return home.join(rest);
     }
-    let path = Path::new(prompt_file);
+    let path = Path::new(value);
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1141,6 +1280,158 @@ mod tests {
         );
         let config = config::load(&env.paths).expect("config should load");
         assert!(config.work.lanes.contains_key("repo"), "lane still written");
+    }
+
+    #[test]
+    fn audit_step_configures_dir_and_warns_about_missing_skill() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Confirms pop in order: labels yes, lane no, audit yes.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(repo_text.contains("[work.audit]"), "audit in: {repo_text}");
+        let config = config::load(&env.paths).expect("config should load");
+        assert!(config.work.audit.dir.is_some(), "audit dir parsed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("warning")
+                && rendered.contains("ticket-audit")
+                && rendered.contains(".claude/skills/ticket-audit"),
+            "user-supplied skill warning with expected path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn audit_step_present_skill_produces_no_warning() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+        std::fs::create_dir_all(env.home.join(".claude/skills/ticket-audit"))
+            .expect("create skill dir");
+
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            !rendered.contains("ticket-audit skill"),
+            "no warning when the skill exists: {rendered}"
+        );
+    }
+
+    #[test]
+    fn review_watch_step_configures_dir_and_warns_about_bugbot_skill() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Confirms: labels yes, lane no, audit no, review-watch yes.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("[work.review_watch]"),
+            "review_watch in: {repo_text}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("bugbot-triage"),
+            "bugbot skill warning in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn hooks_offer_runs_installer_on_confirm() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.hooks_installed = false;
+        let installer = |out: &mut dyn Write| -> Result<(), String> {
+            writeln!(out, "installer ran").map_err(|err| err.to_string())
+        };
+        ctx.hook_installer = &installer;
+
+        // Confirms: labels yes, lane no, audit no, review-watch no, hooks yes.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("installer ran"), "in: {rendered}");
+    }
+
+    #[test]
+    fn hooks_offer_declined_prints_install_hint() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.hooks_installed = false;
+
+        // All confirm defaults: the hooks question defaults to "no".
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("tm work hooks install --user"),
+            "hint in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn hooks_installer_failure_warns_but_completes() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.hooks_installed = false;
+        let installer = |_out: &mut dyn Write| -> Result<(), String> { Err("boom".to_string()) };
+        ctx.hook_installer = &installer;
+
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should still succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("warning") && rendered.contains("boom"),
+            "install failure warning in: {rendered}"
+        );
     }
 
     #[test]
