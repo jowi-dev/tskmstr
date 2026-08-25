@@ -25,8 +25,9 @@
 //!    and there is no `cwd` to fall back to (this is the specific case
 //!    `docs/plans/runner-port.md` §2 requires the `repo` field for).
 //! 2. Resolve the prompt file: `--prompt` override, else the lane's
-//!    `prompt_file`, else `~/.claude/prompts/<lane>.md` (`work.ml`'s
-//!    default). Error before spawning anything if it doesn't exist.
+//!    `prompt_file` (relative to the lane's repo root), else
+//!    `~/.claude/prompts/<lane>.md` (`work.ml`'s default). Error before
+//!    spawning anything if it doesn't exist.
 //! 3. Derive `wt_name` (worktree/branch-prefix name): the lowercased ticket
 //!    if one was given, else the lane name (`run_lane`'s `wt_name`).
 //! 4. Provision the worktree if `wt_path` doesn't exist yet, cutting
@@ -680,18 +681,36 @@ pub fn resolve_blocker_stacking(
 
 /// Resolve the prompt file path for a lane run: `--prompt` override, else
 /// the lane's configured `prompt_file`, else `~/.claude/prompts/<lane>.md`
-/// (`work.ml`'s default), `~`-expanded against `home`.
+/// (`work.ml`'s default). Every form is `~`-expanded against `home`.
+///
+/// A relative lane `prompt_file` resolves against `repo_root`, not the
+/// process's cwd, so a lane prompt can live in the repo it instructs
+/// (`prompt_file = "prompts/<lane>-lane.md"`, which is what `tm init`
+/// scaffolds) and a run works regardless of where `tm` was invoked from. A
+/// relative `--prompt` override stays cwd-relative: it is a path the caller
+/// just typed at a shell, so shell-relative is the only reading that won't
+/// surprise them.
 fn resolve_prompt_path(
     lane: &str,
     prompt_override: Option<&str>,
     lane_prompt_file: Option<&str>,
+    repo_root: &Path,
     home: &Path,
 ) -> PathBuf {
-    let raw = prompt_override
-        .or(lane_prompt_file)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("~/.claude/prompts/{lane}.md"));
-    expand_tilde(&raw, home)
+    if let Some(raw) = prompt_override {
+        return expand_tilde(raw, home);
+    }
+    match lane_prompt_file {
+        Some(raw) => {
+            let path = expand_tilde(raw, home);
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        }
+        None => expand_tilde(&format!("~/.claude/prompts/{lane}.md"), home),
+    }
 }
 
 /// The configured worktree root, `~`-expanded against `home`, falling back
@@ -837,6 +856,7 @@ pub fn prepare_run_lane(
         lane,
         request.prompt_override.as_deref(),
         lane_config.prompt_file.as_deref(),
+        &repo_root,
         &paths.home,
     );
     if !prompt_path.exists() {
@@ -1582,6 +1602,72 @@ mod tests {
         assert_eq!(
             resolve_branch_owner(&git, &gh, Path::new("/repo")),
             "claude"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_path_resolves_relative_lane_prompt_against_repo_root() {
+        assert_eq!(
+            resolve_prompt_path(
+                "mylane",
+                None,
+                Some("prompts/mylane-lane.md"),
+                Path::new("/repo"),
+                Path::new("/home/j"),
+            ),
+            PathBuf::from("/repo/prompts/mylane-lane.md")
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_path_leaves_absolute_and_tilde_lane_prompts_alone() {
+        assert_eq!(
+            resolve_prompt_path(
+                "mylane",
+                None,
+                Some("/elsewhere/lane.md"),
+                Path::new("/repo"),
+                Path::new("/home/j"),
+            ),
+            PathBuf::from("/elsewhere/lane.md")
+        );
+        assert_eq!(
+            resolve_prompt_path(
+                "mylane",
+                None,
+                Some("~/prompts/lane.md"),
+                Path::new("/repo"),
+                Path::new("/home/j"),
+            ),
+            PathBuf::from("/home/j/prompts/lane.md")
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_path_keeps_cli_override_relative_to_cwd() {
+        assert_eq!(
+            resolve_prompt_path(
+                "mylane",
+                Some("scratch.md"),
+                Some("prompts/mylane-lane.md"),
+                Path::new("/repo"),
+                Path::new("/home/j"),
+            ),
+            PathBuf::from("scratch.md")
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_path_falls_back_to_home_claude_prompts() {
+        assert_eq!(
+            resolve_prompt_path(
+                "mylane",
+                None,
+                None,
+                Path::new("/repo"),
+                Path::new("/home/j"),
+            ),
+            PathBuf::from("/home/j/.claude/prompts/mylane.md")
         );
     }
 

@@ -83,14 +83,14 @@ GH ticket from this repo's board offers/launches the tskmstr lane in a tskmstr w
 - **Dogfood lane**: `.tskmstr.toml` gained `[work.lanes.tskmstr]` with
   `repo = "."` (phase 2's relative-repo idiom, resolving to this repo's
   own root) and an explicit `prompt_file = "prompts/tskmstr-lane.md"`.
-  `resolve_prompt_path` (`src/work/run.rs`) only understands a leading `~`
-  or an absolute path — unlike `resolve_repo_path`, it was intentionally
-  left out of phase 2's relative-path plumbing, and phase 3 stays in scope
-  by not adding any. A plain relative `prompt_file` value is instead left
-  to resolve against whatever directory the `tm` process is invoked from,
-  which is always this repo's root for both `tm work run` and the board —
-  noted as a config comment in `.tskmstr.toml` in case that assumption
-  ever stops holding (switch to an absolute path if so).
+  At the time, `resolve_prompt_path` (`src/work/run.rs`) understood only a
+  leading `~` or an absolute path — unlike `resolve_repo_path`, it was
+  intentionally left out of phase 2's relative-path plumbing, so a plain
+  relative `prompt_file` resolved against whatever directory the `tm`
+  process was invoked from. Superseded: `resolve_prompt_path` now resolves
+  a relative lane `prompt_file` against the lane's repo root (a relative
+  `--prompt` override stays cwd-relative), so the invocation directory no
+  longer matters.
 - `prompts/tskmstr-lane.md` is a short autonomous work-lane prompt: run
   `tm ready <KEY>` first and branch on exit code (`0` ready -> proceed,
   `3` stackable -> proceed on the blocker's PR branch, `1` blocked -> stop

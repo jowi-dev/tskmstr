@@ -12,10 +12,7 @@ repo = "."
 # origin/HEAD symbolic ref was never set (git remote set-head) has nothing
 # for resolve_base to fall back to, and the lane run fails preflight.
 base_branch = "main"
-# prompt_file is a plain relative path, not `~`-expanded or resolved
-# against `repo`: resolve_prompt_path (src/work/run.rs) only understands a
-# leading `~` or an absolute path, so this is resolved against whatever
-# directory `tm` is invoked from. That's fine here because `tm work run`/
-# the board are always run from this repo's root -- if that stops being
-# true, switch this to an absolute path.
+# A relative prompt_file resolves against the lane's repo root (see
+# resolve_prompt_path in src/work/run.rs), so the prompt lives in the repo
+# it instructs and a run works no matter where `tm` was invoked from.
 prompt_file = "prompts/tskmstr-lane.md"
