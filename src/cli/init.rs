@@ -1435,6 +1435,72 @@ mod tests {
     }
 
     #[test]
+    fn rerun_declining_the_write_leaves_the_file_untouched() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+
+        // Change the slug, then decline the write. Confirms pop in order:
+        // labels yes, lane no, audit no, review-watch no, write no.
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("someone-else/other")
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let after = std::fs::read_to_string(repo_config).expect("read");
+        assert_eq!(after, original, "declined write must change nothing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("will become:") && rendered.contains("someone-else/other"),
+            "preview shown before asking in: {rendered}"
+        );
+        assert!(
+            rendered.contains("unchanged"),
+            "decline notice in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rerun_yes_writes_additions_without_prompting() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Backend configured, but no lane yet: --yes scaffolds the lane and
+        // overwrites without asking.
+        let original = "# my notes\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(prompter.messages.is_empty(), "no prompts under --yes");
+        let after = std::fs::read_to_string(repo_config).expect("read");
+        assert!(
+            after.contains("[work.lanes.repo]"),
+            "lane added under --yes: {after}"
+        );
+        assert!(
+            after.contains("# my notes"),
+            "existing comments preserved: {after}"
+        );
+    }
+
+    #[test]
     fn github_flow_answered_slug_overrides_detected_default() {
         let env = test_env();
         let gh = FakeGhCli::new();
