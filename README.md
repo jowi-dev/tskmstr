@@ -881,14 +881,16 @@ loop from the board without leaving the keyboard: `V` opens the review, `F`
 dispatches a fix pass over whatever comments you left.
 
 Pressing `V` on a board ticket resolves its latest `kind = "lane"` run and
-opens `vdiff` with `current_dir` set to that run's `worktree` — the same
-worktree `tm work run` provisioned, on its existing branch. `vdiff` detects
-the PR's base branch itself, so no `--pr` flag or other resolution is
-needed. Unlike `a`/`w`/`b`, this is a foreground, terminal-suspending
-launch (mirroring `L`'s log viewer): the board leaves the alternate screen
-and hands the terminal to `vdiff` directly, since it's an interactive
-GUI/TUI that needs the real TTY, and returns to an intact board once you
-quit it. A ticket with no lane run, a lane run whose worktree has since
+opens `vdiff --tui` with `current_dir` set to that run's `worktree` — the
+same worktree `tm work run` provisioned, on its existing branch. `--tui`
+picks vdiff's terminal frontend over its default window: the board is
+already something you are driving over a TTY, possibly a remote one with no
+display attached. `vdiff` detects the PR's base branch itself, so no `--pr`
+flag or other resolution is needed. Unlike `a`/`w`/`b`, this is a
+foreground, terminal-suspending launch (mirroring `L`'s log viewer): the
+board leaves the alternate screen and hands the terminal to `vdiff`
+directly, since it's an interactive frontend that needs the real TTY, and
+returns to an intact board once you quit it. A ticket with no lane run, a lane run whose worktree has since
 been removed (`tm work remove`), or a `vdiff` not found on `PATH` all set a
 status-line message rather than launching anything or appearing to hang.
 

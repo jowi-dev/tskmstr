@@ -662,6 +662,18 @@ fn resolve_vdiff_worktree(
     Ok(worktree)
 }
 
+/// The executable [`view_diff`] launches. A bare name, looked up on `PATH`:
+/// every flag belongs in [`VDIFF_ARGS`], since anything in here is taken
+/// literally as the file to execute.
+const VDIFF_PROGRAM: &str = "vdiff";
+
+/// The flags [`view_diff`] launches [`VDIFF_PROGRAM`] with. `--tui` selects
+/// vdiff's ratatui frontend over its default egui window: the board is
+/// already a terminal application the user is driving over a TTY (possibly a
+/// remote one), so handing the review off to a windowed GUI is the wrong
+/// medium — and on a machine with no display, no medium at all.
+const VDIFF_ARGS: [&str; 1] = ["--tui"];
+
 /// Run [`Cmd::ViewDiff`]: resolve `key`'s lane-run worktree (via
 /// [`resolve_vdiff_worktree`]) and open it in `vdiff`, suspending and
 /// restoring the board's terminal state around the blocking call exactly
@@ -699,7 +711,8 @@ fn view_diff<B: Backend>(
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 
-    let result = std::process::Command::new("vdiff")
+    let result = std::process::Command::new(VDIFF_PROGRAM)
+        .args(VDIFF_ARGS)
         .current_dir(&worktree)
         .status();
 
@@ -3457,6 +3470,26 @@ mod tests {
     }
 
     // --- resolve_vdiff_worktree (Cmd::ViewDiff's testable resolution logic) ---
+
+    #[test]
+    fn vdiff_launches_the_terminal_frontend() {
+        assert!(
+            VDIFF_ARGS.contains(&"--tui"),
+            "the board runs inside a terminal; vdiff must open its TUI, not the GUI"
+        );
+    }
+
+    /// A flag glued onto the program name (`Command::new("vdiff --tui")`)
+    /// makes the whole string the executable to look up, so the launch fails
+    /// with `NotFound` and the board reports "vdiff not found on PATH" no
+    /// matter how correctly vdiff is installed.
+    #[test]
+    fn vdiff_program_is_a_bare_executable_name() {
+        assert!(
+            !VDIFF_PROGRAM.contains(char::is_whitespace),
+            "flags belong in VDIFF_ARGS, not the program name: {VDIFF_PROGRAM:?}"
+        );
+    }
 
     #[test]
     fn resolve_vdiff_worktree_with_no_store_reports_unavailable() {
