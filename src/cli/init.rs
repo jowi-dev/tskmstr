@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::config::{self, BackendKind, Config, ConfigError, ConfigPaths};
+use crate::config::{self, BackendKind, Config, ConfigError, ConfigPaths, GlobalConfigSeed};
 use crate::github::gh_cli::GhCli;
 use crate::keychain::{KeychainError, KeychainStore};
 use crate::ticketing::provider::TicketProvider;
@@ -97,6 +97,8 @@ pub fn run_init(
     // --- Questions ---
     let backend = ask_backend(ctx, yes, &doc, prompter, out)?;
     let mut create_labels_in: Option<String> = None;
+    let mut global_seed: Option<GlobalConfigSeed> = None;
+    let mut needs_login = false;
 
     match backend {
         BackendKind::Github => {
@@ -135,11 +137,93 @@ pub fn run_init(
                 create_labels_in = Some(slug);
             }
         }
-        BackendKind::Jira => todo!("jira path"),
+        BackendKind::Jira => {
+            let global_doc = read_global_doc(ctx);
+            let global_field = |key: &str| -> Option<String> {
+                global_doc
+                    .as_ref()
+                    .and_then(|d| jira_field(d, key))
+                    .map(str::to_string)
+            };
+            // Defaults prefer a repo-local override, then the global config —
+            // the same precedence `config::merge` resolves at load time.
+            let default_for = |key: &str| -> String {
+                jira_field(&doc, key)
+                    .map(str::to_string)
+                    .or_else(|| global_field(key))
+                    .unwrap_or_default()
+            };
+
+            let base_url = ask_required(
+                yes,
+                prompter,
+                out,
+                "Jira base URL (e.g. https://your-site.atlassian.net)",
+                &default_for("jira_base_url"),
+                "the Jira base URL",
+            )?;
+            let email = ask_required(
+                yes,
+                prompter,
+                out,
+                "Jira email",
+                &default_for("jira_email"),
+                "the Jira email",
+            )?;
+            let project_key = ask_required(
+                yes,
+                prompter,
+                out,
+                "Default Jira project key",
+                &default_for("default_project_key"),
+                "the default Jira project key",
+            )?
+            .to_uppercase();
+
+            set_str(
+                &mut doc,
+                &["backend"],
+                "provider",
+                "jira",
+                &repo_config_path,
+            )?;
+            if ctx.paths.global.exists() {
+                // The global config stays authoritative (restructuring it is
+                // out of scope); only answers that differ from it land as
+                // repo-local `[backend.jira]` overrides.
+                for (key, answer) in [
+                    ("jira_base_url", &base_url),
+                    ("jira_email", &email),
+                    ("default_project_key", &project_key),
+                ] {
+                    if global_field(key).as_deref() != Some(answer.as_str()) {
+                        set_str(
+                            &mut doc,
+                            &["backend", "jira"],
+                            key,
+                            answer,
+                            &repo_config_path,
+                        )?;
+                    }
+                }
+            } else {
+                global_seed = Some(GlobalConfigSeed {
+                    jira_base_url: base_url,
+                    jira_email: email,
+                    default_project_key: project_key,
+                });
+            }
+
+            let token = match &ctx.env_token {
+                Some(token) => Some(token.clone()),
+                None => ctx.keychain.get_token()?,
+            };
+            needs_login = token.is_none();
+        }
     }
 
     // --- Writes ---
-    ensure_global_exists(ctx, out)?;
+    ensure_global_exists(ctx, global_seed.as_ref(), out)?;
     if !write_repo_file(
         yes,
         prompter,
@@ -157,6 +241,24 @@ pub fn run_init(
     config::load(ctx.paths)?;
 
     // --- Side effects ---
+    if needs_login {
+        if yes {
+            writeln!(
+                out,
+                "No Jira API token found. Run `tm auth login` to store one."
+            )?;
+        } else {
+            writeln!(out, "No Jira API token found; starting `tm auth login`.")?;
+            let auth_ctx = super::auth::AuthContext {
+                paths: ctx.paths,
+                keychain: ctx.keychain,
+                env_token: ctx.env_token.clone(),
+                jira_client_factory: ctx.jira_client_factory,
+            };
+            super::auth::login(&auth_ctx, prompter, out)?;
+        }
+    }
+
     if let Some(slug) = create_labels_in
         && let Err(err) = super::backend::init_labels(BackendKind::Github, &slug, ctx.gh, out)
     {
@@ -295,21 +397,44 @@ fn table_at<'a>(
 }
 
 /// Create the global config file when missing: `config::load` hard-errors
-/// without one, so `tm init` must be reachable before it exists. The GitHub
-/// backend needs no global fields, so a placeholder is enough.
-fn ensure_global_exists(ctx: &InitContext, out: &mut dyn Write) -> Result<(), InitCliError> {
+/// without one, so `tm init` must be reachable before it exists. The Jira
+/// path seeds it with the answered fields; the GitHub backend needs no
+/// global fields, so a placeholder is enough.
+fn ensure_global_exists(
+    ctx: &InitContext,
+    seed: Option<&GlobalConfigSeed>,
+    out: &mut dyn Write,
+) -> Result<(), InitCliError> {
     if ctx.paths.global.exists() {
         return Ok(());
     }
-    if let Some(parent) = ctx.paths.global.parent() {
-        std::fs::create_dir_all(parent)?;
+    match seed {
+        Some(seed) => config::write_global(&ctx.paths.global, seed)?,
+        None => {
+            if let Some(parent) = ctx.paths.global.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(
+                &ctx.paths.global,
+                "# tskmstr global config (created by `tm init`)\n",
+            )?;
+        }
     }
-    std::fs::write(
-        &ctx.paths.global,
-        "# tskmstr global config (created by `tm init`)\n",
-    )?;
     writeln!(out, "Wrote {}", ctx.paths.global.display())?;
     Ok(())
+}
+
+/// Parse the global config for offering its values as defaults; `None` when
+/// it is missing or unparseable (`config::load` reports the latter later).
+fn read_global_doc(ctx: &InitContext) -> Option<DocumentMut> {
+    let text = std::fs::read_to_string(&ctx.paths.global).ok()?;
+    text.parse().ok()
+}
+
+/// Read a Jira config field the way `config::merge` resolves it within one
+/// file: the `[backend.jira]` table wins over the legacy flat key.
+fn jira_field<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a str> {
+    str_at(doc, &["backend", "jira", key]).or_else(|| str_at(doc, &[key]))
 }
 
 /// Write the repo-local `.tskmstr.toml`. An existing file is shown as it
@@ -527,6 +652,178 @@ mod tests {
             "label warning in: {rendered}"
         );
         config::load(&env.paths).expect("config written despite label failure");
+    }
+
+    fn ok_jira_factory(_cfg: &Config, _token: &str) -> Box<dyn TicketProvider> {
+        Box::new(crate::ticketing::provider::JiraProvider::new(
+            crate::jira::fake::FakeJiraClient::new().with_myself(crate::ticketing::types::Myself {
+                account_id: "acct-1".to_string(),
+                display_name: "Jane Doe".to_string(),
+                email_address: None,
+            }),
+        ))
+    }
+
+    /// An `InitContext` with no origin remote, so the backend defaults to
+    /// Jira.
+    fn jira_ctx<'a>(
+        env: &'a TestEnv,
+        gh: &'a FakeGhCli,
+        keychain: &'a InMemoryKeychain,
+    ) -> InitContext<'a> {
+        InitContext {
+            paths: &env.paths,
+            home: &env.home,
+            keychain,
+            env_token: None,
+            jira_client_factory: &ok_jira_factory,
+            gh,
+            origin_slug: None,
+            origin_default_branch: None,
+            hooks_installed: true,
+            hook_installer: &no_hook_installer,
+        }
+    }
+
+    fn write_jira_global(path: &Path) {
+        config::write_global(
+            path,
+            &config::GlobalConfigSeed {
+                jira_base_url: "https://example.atlassian.net".to_string(),
+                jira_email: "dev@example.com".to_string(),
+                default_project_key: "PROJ".to_string(),
+            },
+        )
+        .expect("write global config");
+    }
+
+    #[test]
+    fn jira_flow_fresh_writes_global_and_hands_off_to_auth_login() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = jira_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new()
+            .with_line("jira")
+            .with_line("https://example.atlassian.net")
+            .with_line("dev@example.com")
+            .with_line("proj")
+            .with_password("super-secret-token");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.backend, BackendKind::Jira);
+        assert_eq!(config.jira_base_url, "https://example.atlassian.net");
+        assert_eq!(config.default_project_key, "PROJ", "project key uppercased");
+
+        assert_eq!(
+            keychain.get_token().expect("keychain readable").as_deref(),
+            Some("super-secret-token"),
+            "login handoff stored the validated token"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("Authenticated as Jane Doe"),
+            "login output in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn jira_flow_existing_global_keeps_defaults_out_of_repo_config() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::with_token("existing-token");
+        let ctx = jira_ctx(&env, &gh, &keychain);
+        write_jira_global(&env.paths.global);
+
+        // Only the backend question is answered; the three Jira fields take
+        // the defaults offered from the existing global config.
+        let mut prompter = FakePrompter::new().with_line("jira");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            !repo_text.contains("jira_base_url"),
+            "unchanged values stay in the global config: {repo_text}"
+        );
+        let config = config::load(&env.paths).expect("config should load");
+        assert_eq!(config.default_project_key, "PROJ");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            !rendered.contains("Authenticated"),
+            "no login handoff when a token already resolves: {rendered}"
+        );
+    }
+
+    #[test]
+    fn jira_flow_differing_answer_lands_as_repo_local_override() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::with_token("existing-token");
+        let ctx = jira_ctx(&env, &gh, &keychain);
+        write_jira_global(&env.paths.global);
+
+        // FakePrompter returns queued answers verbatim (no empty-line ->
+        // default mapping), so "keeping" a value means answering with it.
+        let mut prompter = FakePrompter::new()
+            .with_line("jira")
+            .with_line("https://example.atlassian.net")
+            .with_line("dev@example.com")
+            .with_line("other");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("default_project_key = \"OTHER\""),
+            "override in repo config: {repo_text}"
+        );
+        assert!(
+            !repo_text.contains("jira_base_url"),
+            "unchanged fields stay global: {repo_text}"
+        );
+        let config = config::load(&env.paths).expect("config should load");
+        assert_eq!(config.default_project_key, "OTHER");
+        assert_eq!(config.jira_base_url, "https://example.atlassian.net");
+    }
+
+    #[test]
+    fn jira_flow_yes_with_existing_global_prints_login_hint() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = jira_ctx(&env, &gh, &keychain);
+        ctx.jira_client_factory = &no_jira_factory;
+        write_jira_global(&env.paths.global);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(prompter.messages.is_empty(), "no prompts under --yes");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("tm auth login"),
+            "login hint in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn jira_flow_yes_without_global_defaults_errors() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = jira_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        let err = run_init(&ctx, true, &mut prompter, &mut out)
+            .expect_err("--yes with nothing to default from should fail");
+        assert!(matches!(err, InitCliError::MissingDefault { .. }));
     }
 
     #[test]
