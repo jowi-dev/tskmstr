@@ -42,11 +42,15 @@
 //!   ...
 //! ```
 //!
-//! `work.ml` has no `$TMUX`/inside-vs-outside-tmux branch anywhere: it
-//! always shells out to `tmux attach-session -t '<name>'` regardless of
-//! whether the caller is already inside a tmux client. [`ShellTmuxOps`]
-//! ports that verbatim (no `switch-client` path) rather than inventing a
-//! distinction the OCaml version never made.
+//! `work.ml` had no `$TMUX`/inside-vs-outside-tmux branch anywhere: it
+//! always shelled out to `tmux attach-session -t '<name>'` regardless of
+//! whether the caller was already inside a tmux client, so attaching from
+//! inside tmux failed with tmux's nested-session refusal ("sessions should
+//! be nested with care"). This is the one place [`ShellTmuxOps`] departs
+//! from the verbatim port (issue #6): when `$TMUX` is set (see
+//! [`is_inside_tmux`]), [`TmuxOps::attach`] runs `tmux switch-client -t
+//! '<name>'` instead, jumping the caller's existing client to the target
+//! session on the same server rather than nesting a new client.
 //!
 //! `tmux kill-session -t '<name>'` and the `list-sessions` format string
 //! (`'#{session_name}|#{session_path}'`, parsed by splitting on `|` and
@@ -177,9 +181,10 @@ pub trait TmuxOps {
     /// (`tmux select-window -t <name>:<window>`).
     fn select_window(&self, name: &str, window: &str) -> Result<(), TmuxError>;
 
-    /// Attach the current terminal to session `name`
-    /// (`tmux attach-session -t <name>`). See the module docs for why this
-    /// never branches on being already inside tmux.
+    /// Connect the user to session `name`: `tmux attach-session -t <name>`
+    /// (blocking until detach) from outside tmux, `tmux switch-client -t
+    /// <name>` (returning immediately) when already inside a tmux client
+    /// (see [`is_inside_tmux`] and the module docs, issue #6).
     fn attach(&self, name: &str) -> Result<(), TmuxError>;
 
     /// Kill session `name` (`tmux kill-session -t <name>`).
@@ -391,12 +396,24 @@ fn select_window_args(name: &str, window: &str) -> Vec<String> {
     ]
 }
 
-fn attach_args(name: &str) -> Vec<String> {
-    vec![
-        "attach-session".to_string(),
-        "-t".to_string(),
-        name.to_string(),
-    ]
+/// Whether the caller is already inside a tmux client, judged from the
+/// value of its `$TMUX` environment variable (pass
+/// `std::env::var_os("TMUX")`; the parameter is explicit for testability,
+/// like `expand_tilde`'s `home`). An empty value counts as *not* inside:
+/// clearing `$TMUX` is tmux's own documented escape hatch for forcing a
+/// nested client, and `TMUX= tmux attach` sets it to empty rather than
+/// unsetting it.
+pub fn is_inside_tmux(tmux_env: Option<&std::ffi::OsStr>) -> bool {
+    tmux_env.is_some_and(|value| !value.is_empty())
+}
+
+fn attach_args(name: &str, inside_tmux: bool) -> Vec<String> {
+    let verb = if inside_tmux {
+        "switch-client"
+    } else {
+        "attach-session"
+    };
+    vec![verb.to_string(), "-t".to_string(), name.to_string()]
 }
 
 fn kill_session_args(name: &str) -> Vec<String> {
@@ -568,21 +585,28 @@ impl TmuxOps for ShellTmuxOps {
     }
 
     fn attach(&self, name: &str) -> Result<(), TmuxError> {
+        let inside_tmux = is_inside_tmux(std::env::var_os("TMUX").as_deref());
+        let command = if inside_tmux {
+            "tmux switch-client"
+        } else {
+            "tmux attach-session"
+        };
         // Interactive: inherit the caller's stdio (the default for
         // `status()`, unlike `output()`) so the terminal actually attaches,
-        // matching `Sys.command`'s inherited-stdio semantics.
+        // matching `Sys.command`'s inherited-stdio semantics. (switch-client
+        // returns immediately, but inherited stdio is harmless there.)
         let status = Command::new("tmux")
-            .args(attach_args(name))
+            .args(attach_args(name, inside_tmux))
             .status()
             .map_err(|err| TmuxError::Spawn {
-                command: "tmux attach-session".to_string(),
+                command: command.to_string(),
                 message: err.to_string(),
             })?;
         if status.success() {
             Ok(())
         } else {
             Err(TmuxError::Command {
-                command: "tmux attach-session".to_string(),
+                command: command.to_string(),
                 exit_code: status.code(),
                 stderr: String::new(),
             })
@@ -990,11 +1014,36 @@ mod tests {
     }
 
     #[test]
-    fn attach_args_match_work_ml() {
+    fn attach_args_outside_tmux_match_work_ml() {
         assert_eq!(
-            attach_args("axiom-lane"),
+            attach_args("axiom-lane", false),
             vec!["attach-session", "-t", "axiom-lane"]
         );
+    }
+
+    #[test]
+    fn attach_args_inside_tmux_switch_client() {
+        assert_eq!(
+            attach_args("axiom-lane", true),
+            vec!["switch-client", "-t", "axiom-lane"]
+        );
+    }
+
+    #[test]
+    fn is_inside_tmux_set_to_socket_path() {
+        assert!(is_inside_tmux(Some(std::ffi::OsStr::new(
+            "/tmp/tmux-501/default,1234,0"
+        ))));
+    }
+
+    #[test]
+    fn is_inside_tmux_unset() {
+        assert!(!is_inside_tmux(None));
+    }
+
+    #[test]
+    fn is_inside_tmux_empty_counts_as_unset() {
+        assert!(!is_inside_tmux(Some(std::ffi::OsStr::new(""))));
     }
 
     #[test]
