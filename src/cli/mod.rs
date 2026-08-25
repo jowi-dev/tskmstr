@@ -14,6 +14,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
 pub mod backend;
+pub mod init;
 pub mod pr;
 pub mod ready;
 pub mod review;
@@ -145,6 +146,15 @@ pub enum Command {
         /// Which backend action to perform.
         #[command(subcommand)]
         cmd: BackendCmd,
+    },
+    /// Interactively onboard the current repo: choose a ticket backend,
+    /// write `.tskmstr.toml`, scaffold a work lane, create the GitHub
+    /// backend's status labels, and set up session assets so `tm board`
+    /// works immediately after.
+    Init {
+        /// Accept the default answer for every question (scripted setup).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -919,6 +929,12 @@ pub trait Prompter {
     /// Prompt for a yes/no confirmation, defaulting to "no" on an empty
     /// answer.
     fn confirm(&mut self, message: &str) -> io::Result<bool>;
+
+    /// Prompt for a yes/no confirmation with an explicit default for an
+    /// empty answer, so questions whose sensible answer is "yes" (e.g. the
+    /// `tm init` wizard's scaffolding steps) don't inherit [`Self::confirm`]'s
+    /// hardcoded "no".
+    fn confirm_with_default(&mut self, message: &str, default: bool) -> io::Result<bool>;
 }
 
 /// [`Prompter`] backed by the real terminal (stdin for text, `rpassword` for
@@ -949,12 +965,20 @@ impl Prompter for RealPrompter {
     }
 
     fn confirm(&mut self, message: &str) -> io::Result<bool> {
-        print!("{message} [y/N]: ");
+        self.confirm_with_default(message, false)
+    }
+
+    fn confirm_with_default(&mut self, message: &str, default: bool) -> io::Result<bool> {
+        let hint = if default { "[Y/n]" } else { "[y/N]" };
+        print!("{message} {hint}: ");
         io::stdout().flush()?;
 
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
-        Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+        Ok(match line.trim() {
+            "" => default,
+            answer => matches!(answer, "y" | "Y" | "yes" | "Yes" | "YES"),
+        })
     }
 }
 
@@ -1029,6 +1053,11 @@ impl Prompter for FakePrompter {
     fn confirm(&mut self, message: &str) -> io::Result<bool> {
         self.messages.push(message.to_string());
         Ok(self.confirms.pop_front().unwrap_or(false))
+    }
+
+    fn confirm_with_default(&mut self, message: &str, default: bool) -> io::Result<bool> {
+        self.messages.push(message.to_string());
+        Ok(self.confirms.pop_front().unwrap_or(default))
     }
 }
 
@@ -1118,6 +1147,44 @@ impl EditorPrompter for FakeEditorPrompter {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn fake_prompter_confirm_with_default_falls_back_to_default() {
+        let mut prompter = FakePrompter::new();
+        assert!(
+            prompter
+                .confirm_with_default("proceed?", true)
+                .expect("should answer")
+        );
+        assert!(
+            !prompter
+                .confirm_with_default("proceed?", false)
+                .expect("should answer")
+        );
+    }
+
+    #[test]
+    fn fake_prompter_confirm_with_default_prefers_queued_answer() {
+        let mut prompter = FakePrompter::new().with_confirm(false);
+        assert!(
+            !prompter
+                .confirm_with_default("proceed?", true)
+                .expect("should answer")
+        );
+        assert_eq!(prompter.messages, vec!["proceed?".to_string()]);
+    }
+
+    #[test]
+    fn parses_init() {
+        let cli = Cli::try_parse_from(["tm", "init"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Init { yes: false })));
+    }
+
+    #[test]
+    fn parses_init_yes() {
+        let cli = Cli::try_parse_from(["tm", "init", "--yes"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Init { yes: true })));
+    }
 
     #[test]
     fn parses_auth_login() {

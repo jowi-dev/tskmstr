@@ -179,6 +179,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Work { cmd } => run_work(cmd, &paths, &keychain, env_token),
         Command::Review { cmd } => run_review(cmd),
         Command::Backend { cmd } => run_backend(cmd, &paths),
+        Command::Init { yes } => run_init(yes, &paths, &keychain, env_token),
     }
 }
 
@@ -622,6 +623,90 @@ fn run_auth(
         AuthCmd::Status => tskmstr::cli::auth::status(&ctx, &mut stdout)?,
     }
     Ok(())
+}
+
+/// Dispatch `tm init`: detect the repo's origin remote, default branch, and
+/// hook-install state, then run the onboarding wizard against real deps.
+fn run_init(
+    yes: bool,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let repo_dir = paths
+        .repo
+        .as_deref()
+        .and_then(|repo_config| repo_config.parent().map(PathBuf::from));
+
+    let gh = ShellGhCli::new();
+    let origin_slug = repo_dir
+        .as_deref()
+        .and_then(tskmstr::cli::init::detect_origin_slug);
+    let origin_default_branch = repo_dir
+        .as_deref()
+        .and_then(tskmstr::cli::init::detect_origin_default_branch);
+
+    let (hooks_dir, settings_path) = user_hooks_paths(&home);
+    // A dry-run install with nothing left to add means installed; any error
+    // (e.g. no Claude settings file yet) just means "not installed".
+    let hooks_installed = tskmstr::work::hooks_install::install_user_hooks(
+        &hooks_dir,
+        &settings_path,
+        "tm-init-probe",
+        true,
+    )
+    .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
+    .unwrap_or(false);
+    let hook_installer = |out: &mut dyn std::io::Write| -> Result<(), String> {
+        let (hooks_dir, settings_path) = user_hooks_paths(
+            &std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("~")),
+        );
+        let clock = tskmstr::work::run::SystemClock;
+        let (year, month, day, hour, min, sec) = tskmstr::work::run::Clock::now_parts(&clock);
+        let backup_suffix =
+            tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
+        let report = tskmstr::work::hooks_install::install_user_hooks(
+            &hooks_dir,
+            &settings_path,
+            &backup_suffix,
+            false,
+        )
+        .map_err(|err| err.to_string())?;
+        report.write_summary(out).map_err(|err| err.to_string())
+    };
+
+    let ctx = tskmstr::cli::init::InitContext {
+        paths,
+        home: &home,
+        keychain,
+        env_token,
+        jira_client_factory: &jira_client_for,
+        gh: &gh,
+        origin_slug,
+        origin_default_branch,
+        hooks_installed,
+        hook_installer: &hook_installer,
+    };
+    let mut prompter = RealPrompter;
+    let mut stdout = std::io::stdout();
+    tskmstr::cli::init::run_init(&ctx, yes, &mut prompter, &mut stdout)?;
+    Ok(())
+}
+
+/// The user-level hooks dir and Claude settings path `tm work hooks install
+/// --user` targets, honoring the same env overrides.
+fn user_hooks_paths(home: &std::path::Path) -> (PathBuf, PathBuf) {
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let hooks_dir = tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), home);
+    let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let settings_path =
+        tskmstr::work::hooks_install::user_settings_path(claude_config_dir.as_deref(), home);
+    (hooks_dir, settings_path)
 }
 
 /// Load config and build a real ticket provider (Jira or GitHub, per
