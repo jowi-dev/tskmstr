@@ -29,8 +29,10 @@
 //! `tm work start [<dir>]` is Joe's main tmux entry point (see the plan's
 //! amended inventory): `dir` defaults to `cwd` when omitted. It ports
 //! `work.ml`'s `start`/`tmux_new_session`/`tmux_attach` verbatim other than
-//! reading window names from config instead of a hardcoded list (see
-//! `crate::work::tmux` module docs).
+//! reading window names from config instead of a hardcoded list, and the
+//! attach step being inside-tmux aware — `switch-client` instead of
+//! `attach-session` when `$TMUX` is set, issue #6 (see
+//! `crate::work::tmux` module docs for both).
 //!
 //! # `list`/`restore`
 //!

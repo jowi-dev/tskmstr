@@ -645,7 +645,13 @@ is the action history. A repeat action whose window name is still taken
 individual action, the session merely existing means "this ticket has been
 touched".
 
-Press `s` on the board to attach to the selected ticket's session.
+Press `s` on the board to attach to the selected ticket's session. Every
+attach — `s`, `a`, `b`, `tm work start` — is inside-tmux aware: from a
+plain terminal it runs a blocking `tmux attach-session`; when `$TMUX` is
+set it runs `tmux switch-client` instead, jumping your current client to
+the session rather than tripping tmux's nested-session refusal. The board
+keeps running in its own window — switch back to it the usual tmux ways
+(`prefix + s`, `switch-client -l`).
 
 #### Interactive windows own their process; headless ones only watch
 
