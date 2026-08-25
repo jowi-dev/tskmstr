@@ -222,7 +222,7 @@ pub fn run_init(
         }
     }
 
-    let scaffold = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
+    let scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
     session_step(
         ctx,
         yes,
@@ -272,7 +272,7 @@ pub fn run_init(
         return Ok(());
     }
 
-    if let Some((path, contents)) = scaffold {
+    for (path, contents) in scaffolds {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -512,8 +512,10 @@ fn ask_required(
 
 /// Ask about a work lane and write it into `doc`: `repo = "."` by default,
 /// an explicit `base_branch` (the `origin/HEAD` fallback fails on clones
-/// where that ref was never set), and a `prompt_file`. Returns a starter
-/// prompt to scaffold, if the user wants one.
+/// where that ref was never set), and a `prompt_file`. Returns the starter
+/// prompts to scaffold — one for a newly configured lane, plus one for each
+/// already-configured lane whose prompt file is missing (see
+/// [`audit_existing_lane_prompts`]).
 fn lane_step(
     ctx: &InitContext,
     yes: bool,
@@ -521,7 +523,7 @@ fn lane_step(
     repo_config_path: &Path,
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
-) -> Result<Option<(PathBuf, String)>, InitCliError> {
+) -> Result<Vec<(PathBuf, String)>, InitCliError> {
     let repo_dir = repo_config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -534,6 +536,7 @@ fn lane_step(
         .map(|lanes| lanes.iter().map(|(name, _)| name.to_string()).collect())
         .unwrap_or_default();
 
+    let mut scaffolds = Vec::new();
     let wanted = if existing_lanes.is_empty() {
         ask_confirm(
             yes,
@@ -543,10 +546,21 @@ fn lane_step(
         )?
     } else {
         writeln!(out, "Existing lanes: {}", existing_lanes.join(", "))?;
+        // Before the add/update question, since declining it is the common
+        // re-run answer and must not skip the check.
+        scaffolds.extend(audit_existing_lane_prompts(
+            ctx,
+            yes,
+            doc,
+            &existing_lanes,
+            &repo_dir,
+            prompter,
+            out,
+        )?);
         ask_confirm(yes, prompter, "Add or update a lane?", false)?
     };
     if !wanted {
-        return Ok(None);
+        return Ok(scaffolds);
     }
 
     let name_default = repo_dir
@@ -610,30 +624,101 @@ fn lane_step(
     )?;
 
     let resolved = resolve_repo_relative(&prompt_file, &repo_dir, ctx.home);
-    if resolved.exists() {
-        return Ok(None);
+    if !resolved.exists() {
+        scaffolds.extend(offer_lane_prompt(
+            yes, prompter, out, &name, &resolved, false,
+        )?);
     }
+    Ok(scaffolds)
+}
+
+/// Check every already-configured lane for a missing prompt file and offer to
+/// scaffold each one.
+///
+/// A lane run resolves its prompt before doing anything else and fails
+/// preflight when the file is absent (`RunLaneError::PromptFileMissing`), and
+/// a lane can acquire that state without ever passing through this wizard —
+/// hand-written config, or a `prompt_file` left unset so the run falls back
+/// to `~/.claude/prompts/<lane>.md`. Since a re-run's "Add or update a lane?"
+/// defaults to no, the check has to be independent of that answer, or a
+/// re-run walks straight past the one thing that would break the lane.
+fn audit_existing_lane_prompts(
+    ctx: &InitContext,
+    yes: bool,
+    doc: &DocumentMut,
+    lanes: &[String],
+    repo_dir: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<Vec<(PathBuf, String)>, InitCliError> {
+    let mut scaffolds = Vec::new();
+    for lane in lanes {
+        let resolved = existing_lane_prompt_path(ctx, doc, lane, repo_dir);
+        if resolved.exists() {
+            continue;
+        }
+        writeln!(
+            out,
+            "lane `{lane}` has no prompt file at {}.",
+            resolved.display()
+        )?;
+        scaffolds.extend(offer_lane_prompt(
+            yes, prompter, out, lane, &resolved, true,
+        )?);
+    }
+    Ok(scaffolds)
+}
+
+/// Where an already-configured lane's prompt file resolves to, mirroring
+/// `resolve_prompt_path` in `src/work/run.rs`: the lane's `prompt_file`
+/// (relative to the repo root), else the `~/.claude/prompts/<lane>.md`
+/// fallback the run would use.
+fn existing_lane_prompt_path(
+    ctx: &InitContext,
+    doc: &DocumentMut,
+    lane: &str,
+    repo_dir: &Path,
+) -> PathBuf {
+    match str_at(doc, &["work", "lanes", lane, "prompt_file"]) {
+        Some(value) => resolve_repo_relative(value, repo_dir, ctx.home),
+        None => ctx.home.join(format!(".claude/prompts/{lane}.md")),
+    }
+}
+
+/// Offer to scaffold a starter prompt at `resolved` for `lane`, warning with
+/// the preflight consequence when declined. `existing` distinguishes an
+/// already-configured lane (whose prompt the wizard is only auditing) from
+/// one just configured in this run, for the "why nothing was written"
+/// wording.
+fn offer_lane_prompt(
+    yes: bool,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+    lane: &str,
+    resolved: &Path,
+    existing: bool,
+) -> Result<Option<(PathBuf, String)>, InitCliError> {
     if ask_confirm(
         yes,
         prompter,
         &format!("Scaffold a starter lane prompt at {}?", resolved.display()),
         true,
     )? {
-        Ok(Some((resolved, lane_prompt_template(&name))))
-    } else {
-        writeln!(
-            out,
-            "warning: no prompt file at {}; `tm work run {name} <KEY>` will fail preflight until it exists.",
-            resolved.display()
-        )?;
-        Ok(None)
+        return Ok(Some((resolved.to_path_buf(), lane_prompt_template(lane))));
     }
+    let lead = if existing { "left" } else { "warning:" };
+    writeln!(
+        out,
+        "{lead} no prompt file at {}; `tm work run {lane} <KEY>` will fail preflight until it exists.",
+        resolved.display()
+    )?;
+    Ok(None)
 }
 
 /// Where a config path value (lane `prompt_file`, session `dir`) points on
-/// disk. Relative paths resolve against the repo root here (a lane
-/// `prompt_file` resolves against `tm`'s invocation directory at run time,
-/// which is normally the same place).
+/// disk. Relative paths resolve against the repo root, matching how
+/// `resolve_prompt_path` (`src/work/run.rs`) resolves a lane `prompt_file`
+/// at run time.
 fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
         return home.join(rest);
@@ -1238,6 +1323,63 @@ mod tests {
         assert!(
             rendered.contains("already up to date"),
             "no-op notice in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_step_scaffolds_an_existing_lanes_missing_prompt_without_updating_the_lane() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Same as the no-op re-run above, except the configured prompt file
+        // was never written — the case a plain re-run used to walk past.
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+
+        // Every confirm takes its default: don't update the lane, but do
+        // scaffold the missing prompt.
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = repo_config.parent().unwrap();
+        let template = std::fs::read_to_string(repo_dir.join("prompts/custom.md"))
+            .expect("missing prompt scaffolded");
+        assert!(template.contains("mylane work lane"), "body: {template}");
+        assert_eq!(
+            std::fs::read_to_string(repo_config).expect("read"),
+            original,
+            "scaffolding a prompt must not rewrite the config"
+        );
+    }
+
+    #[test]
+    fn lane_step_declining_an_existing_lanes_missing_prompt_warns_with_the_fallback_path() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // No `prompt_file` at all: the run-time fallback is
+        // `~/.claude/prompts/<lane>.md`, and the warning must name it.
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+
+        // Confirms pop in order: labels yes, scaffold the missing prompt no.
+        let mut prompter = FakePrompter::new().with_confirm(true).with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let fallback = env.home.join(".claude/prompts/mylane.md");
+        assert!(!fallback.exists(), "declined scaffold writes nothing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains(&fallback.display().to_string()),
+            "warning should name the fallback path, got: {rendered}"
         );
     }
 

@@ -37,7 +37,12 @@ backend's `tm:status/*` labels, optionally fills in `[work.audit]` /
 session hooks are absent — everything `tm board` and the board's `w`/`a`
 keys need. Re-running it is a review pass: every question offers the
 current value as its default, and nothing is overwritten without
-confirmation. `tm init --yes` accepts every default for scripted setup.
+confirmation. A re-run also audits the lanes already in the config and
+offers to scaffold a starter prompt for any whose `prompt_file` (or
+`~/.claude/prompts/<lane>.md` fallback) is missing — that check runs
+whether or not you take up the "add or update a lane?" question, since a
+missing prompt is what fails a lane run's preflight. `tm init --yes`
+accepts every default for scripted setup.
 
 Under the Jira backend, `tm init` hands off to `tm auth login` when no
 API token resolves; you can also bootstrap auth directly:
