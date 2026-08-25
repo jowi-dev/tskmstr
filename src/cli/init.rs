@@ -222,6 +222,8 @@ pub fn run_init(
         }
     }
 
+    let scaffold = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
+
     // --- Writes ---
     ensure_global_exists(ctx, global_seed.as_ref(), out)?;
     if !write_repo_file(
@@ -235,6 +237,14 @@ pub fn run_init(
     )? {
         writeln!(out, "Nothing else to do.")?;
         return Ok(());
+    }
+
+    if let Some((path, contents)) = scaffold {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, contents)?;
+        writeln!(out, "Wrote {}", path.display())?;
     }
 
     // Prove the board can start from what was written.
@@ -330,6 +340,167 @@ fn ask_required(
         }
         writeln!(out, "This field is required.")?;
     }
+}
+
+/// Ask about a work lane and write it into `doc`: `repo = "."` by default,
+/// an explicit `base_branch` (the `origin/HEAD` fallback fails on clones
+/// where that ref was never set), and a `prompt_file`. Returns a starter
+/// prompt to scaffold, if the user wants one.
+fn lane_step(
+    ctx: &InitContext,
+    yes: bool,
+    doc: &mut DocumentMut,
+    repo_config_path: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<Option<(PathBuf, String)>, InitCliError> {
+    let repo_dir = repo_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let existing_lanes: Vec<String> = doc
+        .get("work")
+        .and_then(Item::as_table_like)
+        .and_then(|work| work.get("lanes"))
+        .and_then(Item::as_table_like)
+        .map(|lanes| lanes.iter().map(|(name, _)| name.to_string()).collect())
+        .unwrap_or_default();
+
+    let wanted = if existing_lanes.is_empty() {
+        ask_confirm(
+            yes,
+            prompter,
+            "Configure a work lane for this repo (used by the board's `w` key)?",
+            true,
+        )?
+    } else {
+        writeln!(out, "Existing lanes: {}", existing_lanes.join(", "))?;
+        ask_confirm(yes, prompter, "Add or update a lane?", false)?
+    };
+    if !wanted {
+        return Ok(None);
+    }
+
+    let name_default = repo_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = ask_required(
+        yes,
+        prompter,
+        out,
+        "Lane name",
+        &name_default,
+        "the lane name",
+    )?;
+
+    let existing = |field: &str| -> Option<String> {
+        str_at(doc, &["work", "lanes", name.as_str(), field]).map(str::to_string)
+    };
+    let repo = ask_required(
+        yes,
+        prompter,
+        out,
+        "Lane repo (\".\" = this repo)",
+        &existing("repo").unwrap_or_else(|| ".".to_string()),
+        "the lane repo",
+    )?;
+    let base_branch = ask_required(
+        yes,
+        prompter,
+        out,
+        "Lane base branch",
+        &existing("base_branch")
+            .or_else(|| ctx.origin_default_branch.clone())
+            .unwrap_or_else(|| "main".to_string()),
+        "the lane base branch",
+    )?;
+    let prompt_file = ask_required(
+        yes,
+        prompter,
+        out,
+        "Lane prompt file",
+        &existing("prompt_file").unwrap_or_else(|| format!("prompts/{name}-lane.md")),
+        "the lane prompt file",
+    )?;
+
+    let lane_path = ["work", "lanes", name.as_str()];
+    set_str(doc, &lane_path, "repo", &repo, repo_config_path)?;
+    set_str(
+        doc,
+        &lane_path,
+        "base_branch",
+        &base_branch,
+        repo_config_path,
+    )?;
+    set_str(
+        doc,
+        &lane_path,
+        "prompt_file",
+        &prompt_file,
+        repo_config_path,
+    )?;
+
+    let resolved = resolve_prompt_file(&prompt_file, &repo_dir, ctx.home);
+    if resolved.exists() {
+        return Ok(None);
+    }
+    if ask_confirm(
+        yes,
+        prompter,
+        &format!("Scaffold a starter lane prompt at {}?", resolved.display()),
+        true,
+    )? {
+        Ok(Some((resolved, lane_prompt_template(&name))))
+    } else {
+        writeln!(
+            out,
+            "warning: no prompt file at {}; `tm work run {name} <KEY>` will fail preflight until it exists.",
+            resolved.display()
+        )?;
+        Ok(None)
+    }
+}
+
+/// Where a lane `prompt_file` value points on disk. Relative paths resolve
+/// against the repo root here (at run time they resolve against whatever
+/// directory `tm` is invoked from, which is normally the same place).
+fn resolve_prompt_file(prompt_file: &str, repo_dir: &Path, home: &Path) -> PathBuf {
+    if let Some(rest) = prompt_file.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    let path = Path::new(prompt_file);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_dir.join(path)
+    }
+}
+
+/// Starter contents for a scaffolded lane prompt file.
+fn lane_prompt_template(lane: &str) -> String {
+    format!(
+        "# {lane} work lane\n\
+         \n\
+         Autonomous work session for a single ticket in this repository. Do\n\
+         not scope-creep beyond the named ticket.\n\
+         \n\
+         ## Start\n\
+         \n\
+         1. Run `tm ready <KEY>` and stop if it reports the ticket blocked.\n\
+         2. Work only `<KEY>`. Note unrelated bugs or cleanup as follow-ups\n\
+            instead of fixing them here.\n\
+         \n\
+         ## Workflow\n\
+         \n\
+         - Write a failing test before the implementation that makes it pass.\n\
+         - Keep commits small and focused, one logical change per commit.\n\
+         \n\
+         ## Before finishing\n\
+         \n\
+         <!-- List the checks a run must leave green, e.g. your formatter,\n\
+              linter, and test suite. -->\n"
+    )
 }
 
 /// Confirm a yes/no question; with `yes`, take `default` silently.
@@ -824,6 +995,152 @@ mod tests {
         let err = run_init(&ctx, true, &mut prompter, &mut out)
             .expect_err("--yes with nothing to default from should fail");
         assert!(matches!(err, InitCliError::MissingDefault { .. }));
+    }
+
+    #[test]
+    fn lane_step_scaffolds_lane_and_prompt_by_default() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        // The lane name defaults to the repo directory name ("repo" in the
+        // test env); base_branch comes from the detected origin/HEAD.
+        let lane = config
+            .work
+            .lanes
+            .get("repo")
+            .expect("lane scaffolded under the repo dir name");
+        assert_eq!(lane.base_branch.as_deref(), Some("main"));
+        assert_eq!(lane.prompt_file.as_deref(), Some("prompts/repo-lane.md"));
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        let prompt_path = repo_dir.join("prompts/repo-lane.md");
+        let template = std::fs::read_to_string(&prompt_path).expect("starter prompt scaffolded");
+        assert!(template.contains("work lane"), "template body: {template}");
+    }
+
+    #[test]
+    fn lane_step_declined_writes_no_work_section() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Confirms pop in order: labels yes, lane no.
+        let mut prompter = FakePrompter::new().with_confirm(true).with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(!repo_text.contains("[work"), "no work section: {repo_text}");
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        assert!(!repo_dir.join("prompts").exists(), "no prompt scaffolded");
+    }
+
+    #[test]
+    fn lane_step_rerun_with_existing_lane_changes_nothing_by_default() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+
+        // Accept every default: existing lanes mean the lane question
+        // defaults to "no", so a plain re-run must change nothing.
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let after = std::fs::read_to_string(repo_config).expect("read");
+        assert_eq!(after, original, "re-run must not rewrite the file");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("already up to date"),
+            "no-op notice in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_step_updating_existing_lane_offers_current_values_as_defaults() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+
+        // Update the lane but keep every value: lines pop in question order
+        // (backend, slug, lane name), and only the lane name diverges from
+        // its default; repo/base_branch/prompt_file fall back to the current
+        // values as defaults.
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("mylane")
+            .with_confirm(true) // labels
+            .with_confirm(true); // update lane
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let after = std::fs::read_to_string(repo_config).expect("read");
+        assert_eq!(
+            after, original,
+            "keeping the current values must not rewrite the file"
+        );
+        let config = config::load(&env.paths).expect("config should load");
+        assert_eq!(
+            config
+                .work
+                .lanes
+                .get("mylane")
+                .unwrap()
+                .base_branch
+                .as_deref(),
+            Some("develop")
+        );
+    }
+
+    #[test]
+    fn lane_step_declining_prompt_scaffold_warns_with_expected_path() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Confirms pop in order: labels yes, lane yes, scaffold no.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        assert!(!repo_dir.join("prompts/repo-lane.md").exists());
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("warning") && rendered.contains("prompts/repo-lane.md"),
+            "missing-prompt warning in: {rendered}"
+        );
+        let config = config::load(&env.paths).expect("config should load");
+        assert!(config.work.lanes.contains_key("repo"), "lane still written");
     }
 
     #[test]
