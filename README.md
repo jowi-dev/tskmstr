@@ -22,7 +22,25 @@ direnv allow      # or: nix develop
 Either drops you into a shell with `cargo`, `rustc`, `clippy`, `rustfmt`,
 and `gh` on `PATH`.
 
-Then bootstrap auth:
+To onboard a repo in one step, run the interactive wizard from its root:
+
+```
+tm init
+```
+
+It asks for the ticket backend (defaulting to `github` when an `origin`
+remote is detected, with the slug pre-filled), writes the repo-local
+`.tskmstr.toml`, scaffolds a work lane (`repo = "."`, an explicit
+`base_branch`, and an optional starter prompt file), creates the GitHub
+backend's `tm:status/*` labels, optionally fills in `[work.audit]` /
+`[work.review_watch]`, and offers `tm work hooks install --user` when the
+session hooks are absent — everything `tm board` and the board's `w`/`a`
+keys need. Re-running it is a review pass: every question offers the
+current value as its default, and nothing is overwritten without
+confirmation. `tm init --yes` accepts every default for scripted setup.
+
+Under the Jira backend, `tm init` hands off to `tm auth login` when no
+API token resolves; you can also bootstrap auth directly:
 
 ```
 tm auth login
@@ -46,6 +64,7 @@ tm auth status
 
 | Command | What it does |
 |---|---|
+| `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
@@ -923,6 +942,9 @@ rendering an empty box — that's the steady state this screen is meant to
 reach, not an error.
 
 ## Configuration
+
+`tm init` writes both files described below interactively; everything here
+can also be authored by hand.
 
 Global config lives at `~/.config/tskmstr/config.toml`:
 
