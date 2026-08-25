@@ -14,6 +14,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
 pub mod backend;
+pub mod init;
 pub mod pr;
 pub mod ready;
 pub mod review;
@@ -1141,20 +1142,26 @@ mod tests {
     #[test]
     fn fake_prompter_confirm_with_default_falls_back_to_default() {
         let mut prompter = FakePrompter::new();
-        assert!(prompter
-            .confirm_with_default("proceed?", true)
-            .expect("should answer"));
-        assert!(!prompter
-            .confirm_with_default("proceed?", false)
-            .expect("should answer"));
+        assert!(
+            prompter
+                .confirm_with_default("proceed?", true)
+                .expect("should answer")
+        );
+        assert!(
+            !prompter
+                .confirm_with_default("proceed?", false)
+                .expect("should answer")
+        );
     }
 
     #[test]
     fn fake_prompter_confirm_with_default_prefers_queued_answer() {
         let mut prompter = FakePrompter::new().with_confirm(false);
-        assert!(!prompter
-            .confirm_with_default("proceed?", true)
-            .expect("should answer"));
+        assert!(
+            !prompter
+                .confirm_with_default("proceed?", true)
+                .expect("should answer")
+        );
         assert_eq!(prompter.messages, vec!["proceed?".to_string()]);
     }
 
