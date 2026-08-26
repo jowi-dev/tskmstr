@@ -52,6 +52,52 @@ impl BackendIdentity {
             },
         }
     }
+
+    /// The canonical scope string stored alongside ticket keys in the run
+    /// store (GitHub issue #10): a bare key like `GH-3` is only unique
+    /// within its ticket namespace, so every cross-repo store qualifies the
+    /// key with this string. Jira keys are globally unique per instance
+    /// and project, GitHub issue numbers only within their repo — both
+    /// backends go through this same path so a third backend needs no new
+    /// special casing, per the issue's design notes.
+    pub fn scope(&self) -> String {
+        match self {
+            BackendIdentity::Jira {
+                base_url,
+                project_key,
+            } => format!("jira:{base_url}:{project_key}"),
+            BackendIdentity::Github { repo } => format!("github:{repo}"),
+        }
+    }
+
+    /// A tmux-safe slug identifying this scope, used by
+    /// [`crate::work::naming::ticket_session_name`] to keep two repos'
+    /// same-numbered tickets in distinct tmux sessions (session names are
+    /// global to the tmux server). Lowercased with every character outside
+    /// `[a-z0-9-]` mapped to `-`, so the result is safe in tmux target
+    /// syntax (which reserves `.` and `:`) and deterministic — the board
+    /// recomputes it from its own identity to recognize its sessions.
+    ///
+    /// Jira uses the project key alone: the key's own `PROJ-` prefix
+    /// already carries the project, so a host-qualified slug would only
+    /// add length, and two Jira instances sharing a project key is no
+    /// worse than the pre-#10 behavior of no scoping at all.
+    pub fn session_slug(&self) -> String {
+        let raw = match self {
+            BackendIdentity::Jira { project_key, .. } => project_key.as_str(),
+            BackendIdentity::Github { repo } => repo.as_str(),
+        };
+        raw.to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Display for BackendIdentity {
@@ -200,6 +246,51 @@ mod tests {
             max_turns: None,
             permission_mode: None,
         }
+    }
+
+    #[test]
+    fn scope_for_jira_carries_base_url_and_project_key() {
+        assert_eq!(
+            jira("https://x.atlassian.net", "PROJ").scope(),
+            "jira:https://x.atlassian.net:PROJ"
+        );
+    }
+
+    #[test]
+    fn scope_for_github_carries_the_repo_slug() {
+        assert_eq!(
+            github("jowi-dev/tskmstr").scope(),
+            "github:jowi-dev/tskmstr"
+        );
+    }
+
+    #[test]
+    fn scope_distinguishes_same_project_key_on_different_jira_instances() {
+        assert_ne!(
+            jira("https://a.atlassian.net", "PROJ").scope(),
+            jira("https://b.atlassian.net", "PROJ").scope()
+        );
+    }
+
+    #[test]
+    fn session_slug_for_github_sanitizes_the_repo_slug() {
+        assert_eq!(
+            github("jowi-dev/tskmstr").session_slug(),
+            "jowi-dev-tskmstr"
+        );
+    }
+
+    #[test]
+    fn session_slug_for_github_maps_dots_and_underscores_to_dashes() {
+        assert_eq!(
+            github("Some_Org/repo.name").session_slug(),
+            "some-org-repo-name"
+        );
+    }
+
+    #[test]
+    fn session_slug_for_jira_is_the_lowercased_project_key() {
+        assert_eq!(jira("https://x.atlassian.net", "AX").session_slug(), "ax");
     }
 
     #[test]
