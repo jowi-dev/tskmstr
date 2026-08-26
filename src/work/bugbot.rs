@@ -191,6 +191,7 @@ pub fn launch_cleanup(
 
     let run_id = deps.store.start_run(&StartRun {
         ticket: req.key.to_string(),
+        scope: req.identity.scope(),
         lane: CLEANUP_KIND.to_string(),
         worktree: dir_str.clone(),
         branch: None,

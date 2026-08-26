@@ -217,6 +217,17 @@ impl<'a> GithubProvider<'a> {
             .collect())
     }
 
+    /// The rank-store scope every rank read/write of this provider uses:
+    /// its own repo's [`crate::config::BackendIdentity::scope`]. GitHub
+    /// issue numbers restart at 1 per repo, so `GH-3`'s rank in this repo
+    /// and another's must live under different keys (GitHub issue #10).
+    fn rank_scope(&self) -> String {
+        crate::config::BackendIdentity::Github {
+            repo: self.repo.clone(),
+        }
+        .scope()
+    }
+
     /// Sort `issues` for the `Ranked`/`ReadyCandidates` [`TicketQuery`]
     /// variants: issues with a recorded local rank come first, ascending by
     /// rank; every other issue follows, ascending by issue number. With no
@@ -226,7 +237,7 @@ impl<'a> GithubProvider<'a> {
     fn apply_local_rank_order(&self, mut issues: Vec<Issue>) -> Vec<Issue> {
         let ranks: HashMap<String, f64> = self
             .rank_store
-            .and_then(|store| store.all_ticket_ranks().ok())
+            .and_then(|store| store.all_ticket_ranks(&self.rank_scope()).ok())
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -746,7 +757,8 @@ impl TicketProvider for GithubProvider<'_> {
             RankAnchor::Before(key) => (key.clone(), true),
             RankAnchor::After(key) => (key.clone(), false),
         };
-        let existing = store.all_ticket_ranks().map_err(store_err)?;
+        let scope = self.rank_scope();
+        let existing = store.all_ticket_ranks(&scope).map_err(store_err)?;
         let moving: Vec<String> = keys
             .iter()
             .filter(|key| **key != anchor_key)
@@ -754,7 +766,9 @@ impl TicketProvider for GithubProvider<'_> {
             .collect();
         let assignments = compute_new_ranks(&existing, &moving, &anchor_key, before);
         for (key, rank) in &assignments {
-            store.set_ticket_rank(key, *rank).map_err(store_err)?;
+            store
+                .set_ticket_rank(&scope, key, *rank)
+                .map_err(store_err)?;
         }
         Ok(())
     }
@@ -1532,7 +1546,7 @@ mod tests {
             )
             .unwrap();
 
-        let ranks = store.all_ticket_ranks().unwrap();
+        let ranks = store.all_ticket_ranks("github:jowi-dev/tskmstr").unwrap();
         let by_key: HashMap<String, f64> = ranks.into_iter().collect();
         assert!(by_key["GH-1"] < by_key["GH-2"]);
     }
@@ -1540,8 +1554,12 @@ mod tests {
     #[test]
     fn rank_after_places_moving_keys_between_anchor_and_successor() {
         let store = crate::runs::RunStore::open(std::path::Path::new(":memory:")).unwrap();
-        store.set_ticket_rank("GH-1", 100.0).unwrap();
-        store.set_ticket_rank("GH-5", 300.0).unwrap();
+        store
+            .set_ticket_rank("github:jowi-dev/tskmstr", "GH-1", 100.0)
+            .unwrap();
+        store
+            .set_ticket_rank("github:jowi-dev/tskmstr", "GH-5", 300.0)
+            .unwrap();
         let fake = FakeGhCli::new();
         let provider =
             GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string()).with_rank_store(&store);
@@ -1553,7 +1571,11 @@ mod tests {
             )
             .unwrap();
 
-        let by_key: HashMap<String, f64> = store.all_ticket_ranks().unwrap().into_iter().collect();
+        let by_key: HashMap<String, f64> = store
+            .all_ticket_ranks("github:jowi-dev/tskmstr")
+            .unwrap()
+            .into_iter()
+            .collect();
         assert!(by_key["GH-1"] < by_key["GH-2"]);
         assert!(by_key["GH-2"] < by_key["GH-3"]);
         assert!(by_key["GH-3"] < by_key["GH-5"]);
@@ -1584,7 +1606,9 @@ mod tests {
     #[test]
     fn search_ranked_uses_local_rank_when_available() {
         let store = crate::runs::RunStore::open(std::path::Path::new(":memory:")).unwrap();
-        store.set_ticket_rank("GH-5", 100.0).unwrap();
+        store
+            .set_ticket_rank("github:jowi-dev/tskmstr", "GH-5", 100.0)
+            .unwrap();
         let fake = FakeGhCli::new().with_issue_list(Ok(vec![
             issue_info(1, "One", IssueState::Open, &[]),
             issue_info(5, "Five", IssueState::Open, &[]),

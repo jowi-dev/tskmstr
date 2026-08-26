@@ -242,6 +242,7 @@ mod tests {
     /// meaningful.
     fn run(id: i64, kind: &str, status: RunStatus, log: Option<&str>) -> Run {
         Run {
+            scope: String::new(),
             id,
             ticket: "PROJ-1".to_string(),
             lane: "mylane".to_string(),

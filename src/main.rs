@@ -977,6 +977,7 @@ fn run_ticket_audit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let db_path = run_db_path_from_config(&config);
+    let scope = tskmstr::config::BackendIdentity::from_config(&config).scope();
     let mut stdout = std::io::stdout();
     let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
     let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
@@ -986,6 +987,7 @@ fn run_ticket_audit(
             let store = tskmstr::runs::RunStore::open(&db_path)?;
             tskmstr::cli::ticket::audit_record(
                 &store,
+                &scope,
                 &key,
                 verdict.as_str(),
                 notes.as_deref(),
@@ -1005,6 +1007,7 @@ fn run_ticket_audit(
                     tskmstr::cli::ticket::audit_read(
                         jira.as_ref(),
                         &status,
+                        &scope,
                         &key,
                         &session_env,
                         &sessions_dir,
@@ -1017,6 +1020,7 @@ fn run_ticket_audit(
                     tskmstr::cli::ticket::audit_read(
                         jira.as_ref(),
                         &status,
+                        &scope,
                         &key,
                         &session_env,
                         &sessions_dir,
@@ -1049,6 +1053,7 @@ fn run_ticket_retro(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let db_path = run_db_path_from_config(&config);
+    let scope = tskmstr::config::BackendIdentity::from_config(&config).scope();
     let store = tskmstr::runs::RunStore::open(&db_path)?;
 
     let verdict = if clean {
@@ -1061,6 +1066,7 @@ fn run_ticket_retro(
     let mut stdout = std::io::stdout();
     tskmstr::cli::ticket::retro(
         &store,
+        &scope,
         &key,
         verdict,
         severity,
@@ -1273,6 +1279,14 @@ fn run_runs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
     let mut stdout = std::io::stdout();
+    // Same lenient stance as `resolve_run_db_path`: ticket-keyed lookups
+    // scope to the invoking repo when its config loads (GitHub issue #10),
+    // and fall back to unscoped — the pre-#10 behavior — when it doesn't,
+    // so `tm runs` still works on a machine with no config at all.
+    let scope = config::load(&default_config_paths())
+        .ok()
+        .map(|cfg| tskmstr::config::BackendIdentity::from_config(&cfg).scope());
+    let scope = scope.as_deref();
 
     match cmd {
         None if by_outcome => {
@@ -1292,6 +1306,7 @@ fn run_runs(
         }) => {
             let params = tskmstr::runs::StartRun {
                 ticket,
+                scope: scope.unwrap_or_default().to_string(),
                 lane,
                 worktree,
                 branch,
@@ -1344,11 +1359,11 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Show { ticket, json, kind }) => {
-            tskmstr::cli::runs::show(&store, &ticket, kind.as_deref(), json, &mut stdout)?;
+            tskmstr::cli::runs::show(&store, scope, &ticket, kind.as_deref(), json, &mut stdout)?;
         }
         Some(RunsCmd::Resume { ticket }) => {
             let mut stderr = std::io::stderr();
-            tskmstr::cli::runs::resume(&store, &ticket, &mut stdout, &mut stderr)?;
+            tskmstr::cli::runs::resume(&store, scope, &ticket, &mut stdout, &mut stderr)?;
         }
         Some(RunsCmd::Reopen {
             ticket_or_id,
@@ -1357,6 +1372,7 @@ fn run_runs(
         }) => {
             tskmstr::cli::runs::reopen(
                 &store,
+                scope,
                 &ticket_or_id,
                 kind.as_deref(),
                 to.into(),
@@ -1366,7 +1382,7 @@ fn run_runs(
         Some(RunsCmd::Register { kind, key }) => {
             let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
-            tskmstr::cli::runs::register(&store, &sessions_dir, &session_env, &kind, &key);
+            tskmstr::cli::runs::register(&store, scope, &sessions_dir, &session_env, &kind, &key);
         }
         Some(RunsCmd::Watch) => {
             tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
@@ -1383,6 +1399,7 @@ fn run_runs(
             let sleeper = tskmstr::work::review_watch::RealSleeper;
             tskmstr::cli::runs::logs(
                 &store,
+                scope,
                 &home,
                 &ticket_or_id,
                 kind.as_deref(),

@@ -217,7 +217,8 @@ pub fn fix(
     dispatch: Dispatch,
     out: &mut dyn Write,
 ) -> Result<FixOutcome, ReviewCliError> {
-    let run = resolve_run(deps.run_store, key, Some("lane"))?;
+    let scope = deps.backend_identity.scope();
+    let run = resolve_run(deps.run_store, Some(&scope), key, Some("lane"))?;
     let branch = run
         .branch
         .clone()
@@ -264,6 +265,7 @@ pub fn fix(
         deps.run_store,
         deps.clock,
         paths,
+        &scope,
         &run.ticket,
         &run.lane,
         &worktree,
@@ -380,6 +382,7 @@ mod tests {
     fn seed_lane_run(run_store: &RunStore, worktree: &Path) {
         run_store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -441,6 +444,7 @@ mod tests {
         let (tmp, run_store, worktree) = setup();
         run_store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -601,7 +605,7 @@ mod tests {
         assert_eq!(recorded[0].working_dir, worktree);
 
         let review_fix_run = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
             .unwrap()
             .unwrap();
         assert_eq!(review_fix_run.ticket, "PROJ-1");
@@ -652,7 +656,7 @@ mod tests {
         fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
 
         let review_fix_run = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
             .unwrap()
             .unwrap();
         let (window_name, env, command) = tmux
@@ -735,7 +739,7 @@ mod tests {
         assert!(spawner.recorded.lock().unwrap().is_empty());
 
         let review_fix_run = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
             .unwrap()
             .unwrap();
 
@@ -859,7 +863,7 @@ mod tests {
         );
 
         let review_fix_run = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("review-fix"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
             .unwrap()
             .unwrap();
         assert_eq!(review_fix_run.status, crate::runs::RunStatus::Done);

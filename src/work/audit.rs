@@ -213,6 +213,7 @@ pub fn launch_audit(
 
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
+        scope: identity.scope(),
         lane: "audit".to_string(),
         worktree: dir_str.clone(),
         branch: None,

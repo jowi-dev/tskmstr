@@ -180,7 +180,10 @@ pub fn event(
 ///
 /// Prints `No runs recorded.` instead of an empty table when there are none.
 pub fn list(store: &RunStore, kind: Option<&str>, out: &mut dyn Write) -> Result<(), RunsCliError> {
-    let runs = store.list_runs_filtered(kind)?;
+    // Deliberately unscoped: a bare `tm runs` is the machine-wide dashboard
+    // (and must work with no config at all), unlike the ticket-keyed
+    // lookups below, which scope to the invoking repo when one resolves.
+    let runs = store.list_runs_filtered(None, kind)?;
 
     if runs.is_empty() {
         writeln!(out, "No runs recorded.")?;
@@ -410,6 +413,7 @@ fn last_event_column(run: &RunSummary) -> String {
 /// `kind`, if given).
 pub(crate) fn resolve_run(
     store: &RunStore,
+    scope: Option<&str>,
     ticket_or_id: &str,
     kind: Option<&str>,
 ) -> Result<Run, RunsCliError> {
@@ -419,7 +423,7 @@ pub(crate) fn resolve_run(
 
     let ticket = ticket_or_id.to_uppercase();
     store
-        .latest_run_for_ticket_kind(&ticket, kind)?
+        .latest_run_for_ticket_kind(scope, &ticket, kind)?
         .ok_or(RunsCliError::NoRunForTicket { ticket })
 }
 
@@ -438,18 +442,19 @@ pub(crate) fn resolve_run(
 /// (of `kind`, if given).
 pub fn show(
     store: &RunStore,
+    scope: Option<&str>,
     ticket: &str,
     kind: Option<&str>,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
     if json {
-        return show_json(store, ticket, kind, out);
+        return show_json(store, scope, ticket, kind, out);
     }
 
     let ticket = ticket.to_uppercase();
     let run = store
-        .latest_run_for_ticket_kind(&ticket, kind)?
+        .latest_run_for_ticket_kind(scope, &ticket, kind)?
         .ok_or_else(|| RunsCliError::NoRunForTicket {
             ticket: ticket.clone(),
         })?;
@@ -693,13 +698,14 @@ struct ShowJson<'a> {
 /// (of `kind`, if given).
 fn show_json(
     store: &RunStore,
+    scope: Option<&str>,
     ticket: &str,
     kind: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
     let ticket = ticket.to_uppercase();
     let run = store
-        .latest_run_for_ticket_kind(&ticket, kind)?
+        .latest_run_for_ticket_kind(scope, &ticket, kind)?
         .ok_or_else(|| RunsCliError::NoRunForTicket {
             ticket: ticket.clone(),
         })?;
@@ -841,17 +847,17 @@ fn format_event_line(event: &RunEvent) -> String {
 /// id.
 pub fn resume(
     store: &RunStore,
+    scope: Option<&str>,
     ticket: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
     let ticket = ticket.to_uppercase();
-    let run =
-        store
-            .latest_run_for_ticket(&ticket)?
-            .ok_or_else(|| RunsCliError::NoRunForTicket {
-                ticket: ticket.clone(),
-            })?;
+    let run = store
+        .latest_run_for_ticket(scope, &ticket)?
+        .ok_or_else(|| RunsCliError::NoRunForTicket {
+            ticket: ticket.clone(),
+        })?;
 
     let session_id = run.session_id.as_ref().ok_or(RunsCliError::NoSessionId {
         ticket: ticket.clone(),
@@ -893,12 +899,13 @@ pub fn resume(
 /// resolved run's status isn't terminal.
 pub fn reopen(
     store: &RunStore,
+    scope: Option<&str>,
     ticket_or_id: &str,
     kind: Option<&str>,
     to: RunStatus,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
-    let run = resolve_run(store, ticket_or_id, kind)?;
+    let run = resolve_run(store, scope, ticket_or_id, kind)?;
     let reopened = store.reopen_run(run.id, to)?;
 
     writeln!(
@@ -1006,6 +1013,7 @@ fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
 #[allow(clippy::too_many_arguments)]
 pub fn logs(
     store: &RunStore,
+    scope: Option<&str>,
     home: &Path,
     ticket_or_id: &str,
     kind: Option<&str>,
@@ -1014,7 +1022,7 @@ pub fn logs(
     sleeper: &dyn crate::work::review_watch::Sleeper,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
-    let run = resolve_run(store, ticket_or_id, kind)?;
+    let run = resolve_run(store, scope, ticket_or_id, kind)?;
     let path = resolve_log_path(&run, home).ok_or_else(|| RunsCliError::NoLogPath {
         ticket: run.ticket.clone(),
         id: run.id,
@@ -1072,9 +1080,16 @@ pub fn logs(
 /// swallowed here too, matching every existing call site
 /// (`tm ticket audit`/`create`): a broken runs DB or marker directory must
 /// never fail this command, since registration is pure telemetry.
-pub fn register(store: &RunStore, sessions_dir: &Path, env: &SessionEnv, kind: &str, key: &str) {
+pub fn register(
+    store: &RunStore,
+    scope: Option<&str>,
+    sessions_dir: &Path,
+    env: &SessionEnv,
+    kind: &str,
+    key: &str,
+) {
     let ticket = key.to_uppercase();
-    let _ = register_session(store, sessions_dir, env, kind, &ticket);
+    let _ = register_session(store, scope, sessions_dir, env, kind, &ticket);
 }
 
 /// Format `secs` as a short human-readable age.
@@ -1111,6 +1126,7 @@ mod tests {
 
     fn start_params(ticket: &str) -> StartRun {
         StartRun {
+            scope: String::new(),
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
             worktree: "/tmp/wt".to_string(),
@@ -1562,7 +1578,7 @@ mod tests {
             )
             .unwrap();
         store
-            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
 
         let defect_id = store.start_run(&start_params("PROJ-2")).unwrap();
@@ -1578,6 +1594,7 @@ mod tests {
             .unwrap();
         store
             .record_retro(
+                "",
                 "PROJ-2",
                 crate::runs::RetroVerdict::Defect,
                 Some(crate::runs::RetroSeverity::Major),
@@ -1588,6 +1605,7 @@ mod tests {
         // PROJ-3 shipped a defect but has no recorded run at all.
         store
             .record_retro(
+                "",
                 "PROJ-3",
                 crate::runs::RetroVerdict::Defect,
                 Some(crate::runs::RetroSeverity::Minor),
@@ -1623,6 +1641,7 @@ mod tests {
 
         let lane_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -1645,6 +1664,7 @@ mod tests {
 
         let audit_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt2".to_string(),
@@ -1666,7 +1686,7 @@ mod tests {
             .unwrap();
 
         store
-            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
 
         let mut out = Vec::new();
@@ -1859,7 +1879,7 @@ mod tests {
         event(&store, id, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.starts_with(&format!("Run {id}: PROJ-1 [backend/lane] done\n")));
@@ -1887,7 +1907,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(
@@ -1913,7 +1933,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("findings 0 (clean)\n"), "got: {output:?}");
@@ -1936,7 +1956,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("findings 4\n"), "got: {output:?}");
@@ -1957,7 +1977,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("tool  Bash — cargo test"));
@@ -1979,7 +1999,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("tool_use  {\"file\":\"a.rs\"}"));
@@ -2024,7 +2044,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Tools: Bash \u{d7}2, Edit \u{d7}1"));
@@ -2044,7 +2064,7 @@ mod tests {
         event(&store, id, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Tools:"));
@@ -2059,7 +2079,7 @@ mod tests {
         event(&store, id, "second", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         let first_pos = output.find("second").expect("second event present");
@@ -2085,7 +2105,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Checklist (1/2 done)"));
@@ -2107,7 +2127,7 @@ mod tests {
         event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Checklist"));
@@ -2141,7 +2161,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Model usage"));
@@ -2165,7 +2185,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Model usage (live)"));
@@ -2190,7 +2210,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Model usage"));
@@ -2226,7 +2246,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("Agent usage"));
@@ -2249,7 +2269,7 @@ mod tests {
         event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(!output.contains("Agent usage"));
@@ -2262,7 +2282,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(output.contains("(no events)"));
@@ -2276,7 +2296,7 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err = show(&store, "PROJ-404", None, false, &mut out).expect_err("should fail");
+        let err = show(&store, None, "PROJ-404", None, false, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2291,7 +2311,7 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err = show(&store, "PROJ-404", None, true, &mut out).expect_err("should fail");
+        let err = show(&store, None, "PROJ-404", None, true, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2314,7 +2334,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        show(&store, "PROJ-1", Some("lane"), false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", Some("lane"), false, &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("[backend/lane]"));
@@ -2327,7 +2347,8 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        let err = show(&store, "PROJ-1", Some("audit"), false, &mut out).expect_err("should fail");
+        let err =
+            show(&store, None, "PROJ-1", Some("audit"), false, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2349,7 +2370,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        show(&store, "PROJ-1", Some("lane"), true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", Some("lane"), true, &mut out).expect("should succeed");
 
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
@@ -2385,7 +2406,7 @@ mod tests {
         event(&store, id, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, true, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         let value: serde_json::Value =
@@ -2438,7 +2459,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "proj-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "proj-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2452,7 +2473,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2477,7 +2498,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2520,7 +2541,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2550,7 +2571,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2588,7 +2609,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2624,7 +2645,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut out).expect("should succeed");
         let output = String::from_utf8(out).unwrap();
 
         assert!(
@@ -2644,7 +2665,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2666,7 +2687,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2715,7 +2736,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2729,7 +2750,7 @@ mod tests {
         assert_eq!(agent_usage[0]["outputTokens"], 1143 * 2);
 
         let mut human_out = Vec::new();
-        show(&store, "PROJ-1", None, false, &mut human_out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, false, &mut human_out).expect("should succeed");
         let human_output = String::from_utf8(human_out).unwrap();
         assert!(human_output.contains("2x"));
         assert!(human_output.contains("out 2.3k"));
@@ -2751,7 +2772,7 @@ mod tests {
         event(&store, id, "second", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        show(&store, "PROJ-1", None, true, &mut out).expect("should succeed");
+        show(&store, None, "PROJ-1", None, true, &mut out).expect("should succeed");
         let value: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap())
             .expect("output should be valid JSON");
 
@@ -2782,7 +2803,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "sess-abc\n");
     }
@@ -2805,7 +2826,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
 
         let warning = String::from_utf8(stderr).unwrap();
         assert!(warning.contains("PROJ-1"));
@@ -2828,7 +2849,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
 
         assert!(stderr.is_empty());
         assert_eq!(String::from_utf8(out).unwrap(), "sess-live\n");
@@ -2841,7 +2862,7 @@ mod tests {
         let mut out = Vec::new();
         let mut stderr = Vec::new();
 
-        let err = resume(&store, "PROJ-404", &mut out, &mut stderr).expect_err("should fail");
+        let err = resume(&store, None, "PROJ-404", &mut out, &mut stderr).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2867,7 +2888,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        let err = resume(&store, "PROJ-1", &mut out, &mut stderr).expect_err("should fail");
+        let err = resume(&store, None, "PROJ-1", &mut out, &mut stderr).expect_err("should fail");
 
         match &err {
             RunsCliError::NoSessionId { ticket, run_id } => {
@@ -2909,7 +2930,7 @@ mod tests {
         let id = finished_run(&store, "PROJ-1", RunStatus::Done);
 
         let mut out = Vec::new();
-        reopen(&store, "proj-1", None, RunStatus::Queued, &mut out).expect("should succeed");
+        reopen(&store, None, "proj-1", None, RunStatus::Queued, &mut out).expect("should succeed");
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -2928,6 +2949,7 @@ mod tests {
         let mut out = Vec::new();
         reopen(
             &store,
+            None,
             &id.to_string(),
             Some("audit"),
             RunStatus::Running,
@@ -2945,8 +2967,8 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err =
-            reopen(&store, "999", None, RunStatus::Queued, &mut out).expect_err("should fail");
+        let err = reopen(&store, None, "999", None, RunStatus::Queued, &mut out)
+            .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::NoRunWithId(999)));
         assert!(out.is_empty());
@@ -2958,8 +2980,8 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err =
-            reopen(&store, "PROJ-404", None, RunStatus::Queued, &mut out).expect_err("should fail");
+        let err = reopen(&store, None, "PROJ-404", None, RunStatus::Queued, &mut out)
+            .expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2975,8 +2997,8 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap(); // left running
 
         let mut out = Vec::new();
-        let err =
-            reopen(&store, "proj-1", None, RunStatus::Queued, &mut out).expect_err("should fail");
+        let err = reopen(&store, None, "proj-1", None, RunStatus::Queued, &mut out)
+            .expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -3008,6 +3030,7 @@ mod tests {
 
         logs(
             &store,
+            None,
             dir.path(),
             "proj-1",
             None,
@@ -3041,6 +3064,7 @@ mod tests {
 
         logs(
             &store,
+            None,
             dir.path(),
             "ax-408",
             None,
@@ -3071,6 +3095,7 @@ mod tests {
 
         logs(
             &store,
+            None,
             dir.path(),
             "ax-408",
             None,
@@ -3103,6 +3128,7 @@ mod tests {
 
         let err = logs(
             &store,
+            None,
             dir.path(),
             "proj-1",
             None,
@@ -3130,6 +3156,7 @@ mod tests {
 
         let err = logs(
             &store,
+            None,
             dir.path(),
             "proj-1",
             None,
@@ -3210,7 +3237,14 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp/wt"),
         };
 
-        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "PROJ-1");
+        register(
+            &store,
+            None,
+            markers_dir.path(),
+            &env,
+            "bugbot-cleanup",
+            "PROJ-1",
+        );
 
         assert!(store.list_runs().unwrap().is_empty());
     }
@@ -3222,7 +3256,14 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "proj-1");
+        register(
+            &store,
+            None,
+            markers_dir.path(),
+            &env,
+            "bugbot-cleanup",
+            "proj-1",
+        );
 
         let runs = store.list_runs().unwrap();
         assert_eq!(runs.len(), 1, "expected exactly one registered run");
@@ -3243,6 +3284,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "bugbot-cleanup".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -3256,7 +3298,14 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        register(&store, markers_dir.path(), &env, "bugbot-cleanup", "PROJ-1");
+        register(
+            &store,
+            None,
+            markers_dir.path(),
+            &env,
+            "bugbot-cleanup",
+            "PROJ-1",
+        );
 
         assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
         let run = store.run_by_id(pre_id).unwrap().expect("run row exists");

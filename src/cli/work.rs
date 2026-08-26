@@ -644,7 +644,7 @@ pub fn session(
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
-    let runs = store.runs_for_ticket(&ticket)?;
+    let runs = store.runs_for_ticket(Some(&identity.scope()), &ticket)?;
     if runs.is_empty() {
         return Err(WorkCliError::NoRunsForTicket(ticket));
     }
@@ -739,7 +739,7 @@ pub fn clean(
         writeln!(out, "No tmux session {session_name} to kill")?;
     }
 
-    let runs = store.runs_for_ticket(&ticket)?;
+    let runs = store.runs_for_ticket(Some(&identity.scope()), &ticket)?;
     let Some((repo_root, wt_path)) = removable_worktree(ctx, &runs) else {
         writeln!(
             out,
@@ -1827,6 +1827,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let run_id = store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -1896,6 +1897,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let run_id = store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -1961,6 +1963,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/wt/proj-1".to_string(),
@@ -2059,6 +2062,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -2110,6 +2114,7 @@ mod tests {
         // An audit run, rooted in the real repo rather than a worktree.
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: repo.to_string_lossy().into_owned(),
@@ -2183,6 +2188,7 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
@@ -2345,7 +2351,7 @@ mod tests {
         assert_eq!(window_name, "work");
 
         let run_row = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("lane"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2780,7 +2786,7 @@ mod tests {
         assert_eq!(detach.recorded.lock().unwrap().len(), 1);
 
         let run_row = run_store
-            .latest_run_for_ticket_kind("PROJ-1", Some("lane"))
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("lane"))
             .unwrap()
             .unwrap();
         let (window_name, env, command) = tmux

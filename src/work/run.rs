@@ -1031,6 +1031,7 @@ pub fn prepare_run_lane(
     let ticket_field = request.ticket.clone().unwrap_or_else(|| lane.to_string());
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: ticket_field.clone(),
+        scope: deps.current_backend_identity.scope(),
         lane: lane.to_string(),
         worktree: wt_path.to_string_lossy().into_owned(),
         branch: Some(branch.clone()),
@@ -1176,6 +1177,7 @@ pub fn prepare_review_fix(
     run_store: &RunStore,
     clock: &dyn Clock,
     paths: &RunLanePaths,
+    scope: &str,
     ticket: &str,
     lane: &str,
     worktree: &Path,
@@ -1194,6 +1196,7 @@ pub fn prepare_review_fix(
 
     let run_id = run_store.start_run(&StartRun {
         ticket: ticket.to_string(),
+        scope: scope.to_string(),
         lane: lane.to_string(),
         worktree: worktree.to_string_lossy().into_owned(),
         branch: Some(branch.to_string()),
@@ -4215,6 +4218,7 @@ mod tests {
             &run_store,
             &clock,
             &paths,
+            "",
             "PROJ-1",
             "mylane",
             &worktree,
@@ -4262,6 +4266,7 @@ mod tests {
             &run_store,
             &clock,
             &paths,
+            "",
             "PROJ-1",
             "mylane",
             &worktree,
@@ -4290,6 +4295,7 @@ mod tests {
             &run_store,
             &clock,
             &paths,
+            "",
             "PROJ-1",
             "mylane",
             &worktree,
@@ -4326,6 +4332,7 @@ mod tests {
             &run_store,
             &clock,
             &paths,
+            "",
             "PROJ-1",
             "mylane",
             &worktree,

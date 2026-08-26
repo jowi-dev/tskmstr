@@ -304,13 +304,14 @@ pub enum WatchOutcome {
 /// the same question `tm pr watch` already answers here, so it's answered the
 /// same way rather than inventing a second resolution.
 pub(crate) fn resolve_watch_repo_root(
+    scope: Option<&str>,
     lanes: &std::collections::BTreeMap<String, crate::config::LaneConfig>,
     run_store: &RunStore,
     git: &dyn GitOps,
     cwd: &Path,
     key: &str,
 ) -> Result<PathBuf, PrCliError> {
-    if let Some(run) = run_store.latest_run_for_ticket_kind(key, Some("lane"))?
+    if let Some(run) = run_store.latest_run_for_ticket_kind(scope, key, Some("lane"))?
         && let Some(lane) = lanes.get(&run.lane)
     {
         return Ok(PathBuf::from(&lane.repo));
@@ -361,7 +362,9 @@ pub fn watch(
     foreground: bool,
     out: &mut dyn Write,
 ) -> Result<WatchOutcome, PrCliError> {
+    let scope = crate::config::BackendIdentity::from_config(ctx.config).scope();
     let repo_root = resolve_watch_repo_root(
+        Some(&scope),
         &ctx.config.work.lanes,
         deps.run_store,
         deps.git,
@@ -375,9 +378,9 @@ pub fn watch(
     })?;
     let pr_number = pr.number;
 
-    if let Some(existing) = deps
-        .run_store
-        .latest_run_for_ticket_kind(key, Some("review-watch"))?
+    if let Some(existing) =
+        deps.run_store
+            .latest_run_for_ticket_kind(Some(&scope), key, Some("review-watch"))?
         && existing.status == RunStatus::Running
     {
         return Err(PrCliError::AlreadyWatching {
@@ -424,6 +427,7 @@ pub fn watch(
 
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: key.to_string(),
+        scope,
         lane: "review-watch".to_string(),
         worktree: repo_root.to_string_lossy().into_owned(),
         branch: None,
@@ -1120,6 +1124,7 @@ mod tests {
         let run_store = open_run_store(db_dir.path());
         let existing_id = run_store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-372".to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/irrelevant".to_string(),
@@ -1184,6 +1189,7 @@ mod tests {
         let run_store = open_run_store(db_dir.path());
         run_store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "AX-408".to_string(),
                 lane: "axiom".to_string(),
                 worktree: "/worktrees/axiom-ax-408".to_string(),

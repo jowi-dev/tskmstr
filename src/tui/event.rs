@@ -372,14 +372,22 @@ fn run_cmds<B: Backend>(
             continue;
         }
         if let Cmd::ViewLogs { key } = cmd {
-            let message = view_logs(terminal, deps.store.as_ref(), &deps.home, &key);
+            let scope = deps.backend_identity.scope();
+            let message = view_logs(
+                terminal,
+                deps.store.as_ref(),
+                Some(&scope),
+                &deps.home,
+                &key,
+            );
             let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
             app = next_app;
             pending.extend(more_cmds);
             continue;
         }
         if let Cmd::ViewDiff { key } = cmd {
-            let message = view_diff(terminal, deps.store.as_ref(), &key);
+            let scope = deps.backend_identity.scope();
+            let message = view_diff(terminal, deps.store.as_ref(), Some(&scope), &key);
             let (next_app, more_cmds) = update(app, Msg::DiffActionResult(message));
             app = next_app;
             pending.extend(more_cmds);
@@ -606,13 +614,14 @@ fn attach_session<B: Backend>(
 fn view_logs<B: Backend>(
     terminal: &mut Terminal<B>,
     store: Option<&crate::runs::RunStore>,
+    scope: Option<&str>,
     home: &std::path::Path,
     key: &str,
 ) -> String {
     let Some(store) = store else {
         return "no run store available".to_string();
     };
-    let run = match crate::cli::runs::resolve_run(store, key, None) {
+    let run = match crate::cli::runs::resolve_run(store, scope, key, None) {
         Ok(run) => run,
         Err(_) => return format!("no runs recorded for {key}"),
     };
@@ -655,10 +664,11 @@ fn view_logs<B: Backend>(
 /// remove`, which deletes the worktree but not its run history.
 fn resolve_vdiff_worktree(
     store: Option<&crate::runs::RunStore>,
+    scope: Option<&str>,
     key: &str,
 ) -> Result<std::path::PathBuf, String> {
     let store = store.ok_or_else(|| "no run store available".to_string())?;
-    let run = crate::cli::runs::resolve_run(store, key, Some("lane"))
+    let run = crate::cli::runs::resolve_run(store, scope, key, Some("lane"))
         .map_err(|_| format!("no lane run for {key}"))?;
     let worktree = std::path::PathBuf::from(&run.worktree);
     if !worktree.is_dir() {
@@ -709,9 +719,10 @@ const VDIFF_ARGS: [&str; 1] = ["--tui"];
 fn view_diff<B: Backend>(
     terminal: &mut Terminal<B>,
     store: Option<&crate::runs::RunStore>,
+    scope: Option<&str>,
     key: &str,
 ) -> String {
-    let worktree = match resolve_vdiff_worktree(store, key) {
+    let worktree = match resolve_vdiff_worktree(store, scope, key) {
         Ok(worktree) => worktree,
         Err(message) => return message,
     };
@@ -904,7 +915,7 @@ fn load_ticket_run_detail(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     let Some(store) = &deps.store else {
         return vec![Msg::RunDetailFailed("run database unavailable".to_string())];
     };
-    let run = match store.latest_run_for_ticket(key) {
+    let run = match store.latest_run_for_ticket(Some(&deps.backend_identity.scope()), key) {
         Ok(Some(run)) => run,
         Ok(None) => return vec![Msg::RunDetailFailed(format!("no runs for {key}"))],
         Err(err) => return vec![Msg::RunDetailFailed(err.to_string())],
@@ -1092,7 +1103,10 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
     // per ticket here is exactly "the live run if one exists, otherwise the
     // most recent terminal one" -- precisely the run `audit_indicator` wants.
     let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
-    for run in store.list_runs_filtered(Some("audit")).unwrap_or_default() {
+    for run in store
+        .list_runs_filtered(Some(&deps.backend_identity.scope()), Some("audit"))
+        .unwrap_or_default()
+    {
         latest_by_ticket
             .entry(run.ticket)
             .or_insert((run.status, run.awaiting_input));
@@ -1146,7 +1160,10 @@ fn load_lane_run_status(deps: &TuiDeps) -> Vec<Msg> {
     // per ticket here is exactly "the live run if one exists, otherwise the
     // most recent terminal one" -- precisely what `lane_run_indicator` wants.
     let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
-    for run in store.list_runs_filtered(Some("lane")).unwrap_or_default() {
+    for run in store
+        .list_runs_filtered(Some(&deps.backend_identity.scope()), Some("lane"))
+        .unwrap_or_default()
+    {
         latest_by_ticket
             .entry(run.ticket)
             .or_insert((run.status, run.awaiting_input));
@@ -1180,7 +1197,10 @@ fn load_bot_watch_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let mut latest_by_ticket: HashMap<String, crate::runs::RunStatus> = HashMap::new();
     for run in store
-        .list_runs_filtered(Some(REVIEW_WATCH_KIND))
+        .list_runs_filtered(
+            Some(&deps.backend_identity.scope()),
+            Some(REVIEW_WATCH_KIND),
+        )
         .unwrap_or_default()
     {
         latest_by_ticket.entry(run.ticket).or_insert(run.status);
@@ -1219,7 +1239,7 @@ fn load_cleanup_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let mut latest_by_ticket: HashMap<String, (crate::runs::RunStatus, bool)> = HashMap::new();
     for run in store
-        .list_runs_filtered(Some(CLEANUP_KIND))
+        .list_runs_filtered(Some(&deps.backend_identity.scope()), Some(CLEANUP_KIND))
         .unwrap_or_default()
     {
         latest_by_ticket
@@ -1451,8 +1471,9 @@ pub fn fetch_retro_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
         )];
     };
 
+    let scope = deps.backend_identity.scope();
     let keys: Vec<String> = tickets.iter().map(|t| t.key.clone()).collect();
-    let verdicts = match store.retro_verdicts_for_tickets(&keys) {
+    let verdicts = match store.retro_verdicts_for_tickets(Some(&scope), &keys) {
         Ok(verdicts) => verdicts,
         Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
     };
@@ -1462,7 +1483,7 @@ pub fn fetch_retro_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
         if verdicts.contains_key(&ticket.key) {
             continue;
         }
-        let run = match store.latest_run_for_ticket_kind(&ticket.key, Some("lane")) {
+        let run = match store.latest_run_for_ticket_kind(Some(&scope), &ticket.key, Some("lane")) {
             Ok(Some(run)) => Some(crate::tui::app::RetroRunInfo {
                 cost_usd: run.cost_usd,
                 model_summary: run
@@ -1500,7 +1521,13 @@ pub fn record_retro(
     let Some(store) = &deps.store else {
         return vec![Msg::RetroFailed("run database unavailable".to_string())];
     };
-    match store.record_retro(key, verdict, severity, notes) {
+    match store.record_retro(
+        &deps.backend_identity.scope(),
+        key,
+        verdict,
+        severity,
+        notes,
+    ) {
         Ok(()) => vec![Msg::RetroRecorded {
             key: key.to_string(),
             verdict,
@@ -1677,6 +1704,7 @@ fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<M
 fn resolve_repo_root_for_pr_lookup(deps: &TuiDeps, key: &str) -> Option<std::path::PathBuf> {
     match &deps.store {
         Some(store) => crate::cli::pr::resolve_watch_repo_root(
+            Some(&deps.backend_identity.scope()),
             &deps.lanes,
             store,
             deps.git.as_ref(),
@@ -2332,7 +2360,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store
-            .record_retro("PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
+            .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
         let mut deps = deps(jira);
         deps.store = Some(store);
@@ -2474,7 +2502,7 @@ mod tests {
             .store
             .as_ref()
             .unwrap()
-            .latest_retro_for_ticket("PROJ-1")
+            .latest_retro_for_ticket(None, "PROJ-1")
             .unwrap()
             .expect("expected a recorded retro");
         assert_eq!(
@@ -2622,6 +2650,7 @@ mod tests {
 
     fn start_params(ticket: &str) -> crate::runs::StartRun {
         crate::runs::StartRun {
+            scope: String::new(),
             ticket: ticket.to_string(),
             lane: "backend".to_string(),
             worktree: "/tmp/wt".to_string(),
@@ -3525,7 +3554,7 @@ mod tests {
 
     #[test]
     fn resolve_vdiff_worktree_with_no_store_reports_unavailable() {
-        let result = resolve_vdiff_worktree(None, "PROJ-1");
+        let result = resolve_vdiff_worktree(None, None, "PROJ-1");
         assert_eq!(result, Err("no run store available".to_string()));
     }
 
@@ -3533,7 +3562,7 @@ mod tests {
     fn resolve_vdiff_worktree_with_no_lane_run_reports_no_run() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(result, Err("no lane run for PROJ-1".to_string()));
     }
 
@@ -3544,6 +3573,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: worktree.path().to_string_lossy().to_string(),
@@ -3553,7 +3583,7 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
-        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(result, Err("no lane run for PROJ-1".to_string()));
     }
 
@@ -3564,6 +3594,7 @@ mod tests {
         let gone = dir.path().join("gone-worktree");
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: gone.to_string_lossy().to_string(),
@@ -3573,7 +3604,7 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
-        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(
             result,
             Err(format!(
@@ -3590,6 +3621,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         store
             .start_run(&crate::runs::StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "backend".to_string(),
                 worktree: worktree.path().to_string_lossy().to_string(),
@@ -3599,7 +3631,7 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
-        let result = resolve_vdiff_worktree(Some(&store), "PROJ-1");
+        let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(result, Ok(worktree.path().to_path_buf()));
     }
 

@@ -265,6 +265,7 @@ fn adopt_run(
 /// fresh start will sweep it in its turn once it finishes.
 pub fn register_session(
     store: &RunStore,
+    scope: Option<&str>,
     dir: &Path,
     env: &SessionEnv,
     kind: &str,
@@ -319,6 +320,10 @@ pub fn register_session(
 
     let new_id = store.start_run(&StartRun {
         ticket: ticket.to_string(),
+        // A fresh session-started row is scoped like any other run; `None`
+        // (no loadable config) degrades to a legacy-unscoped row rather
+        // than refusing to register.
+        scope: scope.unwrap_or_default().to_string(),
         lane: kind.to_string(),
         worktree: env.cwd.display().to_string(),
         branch: None,
@@ -484,7 +489,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/wt"),
         };
 
-        let result = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let result = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .expect("should not error");
 
         assert_eq!(result, None);
@@ -499,7 +504,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.lane_run_id = Some("77".to_string());
 
-        let result = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let result = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .expect("should not error");
 
         assert_eq!(result, None);
@@ -513,7 +518,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .expect("should not error")
             .expect("expected a new run id");
 
@@ -542,6 +547,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -555,7 +561,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .expect("should not error")
             .expect("expected the adopted run id");
 
@@ -588,6 +594,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "proj-1".to_string(),
                 lane: "mylane".to_string(),
                 worktree: "/Worktrees/axiom/proj-1".to_string(),
@@ -601,7 +608,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, markers_dir.path(), &env, "lane", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "lane", "PROJ-1")
             .unwrap()
             .expect("expected the adopted run id");
 
@@ -617,6 +624,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "create".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -630,7 +638,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .expect("should fall through to a fresh run");
 
@@ -651,6 +659,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-2".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -664,7 +673,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .expect("should fall through to a fresh run");
 
@@ -681,7 +690,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(999_999);
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .expect("should fall through to a fresh run");
 
@@ -698,6 +707,7 @@ mod tests {
 
         let pre_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-1".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/repo/axiom".to_string(),
@@ -712,7 +722,7 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .expect("should fall through to a fresh run");
 
@@ -730,10 +740,10 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
-        let second = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -748,10 +758,10 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
-        let second = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-2")
+        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -776,10 +786,10 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
-        let second = register_session(&store, markers_dir.path(), &env, "create", "PROJ-1")
+        let second = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -798,12 +808,12 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
         store.finish_run(first, &FinishRun::default()).unwrap();
 
-        let second = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -822,9 +832,16 @@ mod tests {
 
         // A stale marker pointing at an already-finished run.
         let stale_env = env_with_session("sess-stale");
-        let stale_id = register_session(&store, markers_dir.path(), &stale_env, "audit", "OLD-1")
-            .unwrap()
-            .unwrap();
+        let stale_id = register_session(
+            &store,
+            None,
+            markers_dir.path(),
+            &stale_env,
+            "audit",
+            "OLD-1",
+        )
+        .unwrap()
+        .unwrap();
         store.finish_run(stale_id, &FinishRun::default()).unwrap();
 
         // A marker with garbage contents that doesn't parse as an id.
@@ -832,9 +849,16 @@ mod tests {
 
         // A fresh registration should sweep both of the above.
         let fresh_env = env_with_session("sess-fresh");
-        let fresh_id = register_session(&store, markers_dir.path(), &fresh_env, "audit", "NEW-1")
-            .unwrap()
-            .unwrap();
+        let fresh_id = register_session(
+            &store,
+            None,
+            markers_dir.path(),
+            &fresh_env,
+            "audit",
+            "NEW-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(!markers_dir.path().join("sess-stale").exists());
         assert!(!markers_dir.path().join("sess-garbage").exists());
@@ -853,14 +877,28 @@ mod tests {
         let store = open_store(db_dir.path());
 
         let other_env = env_with_session("sess-other");
-        register_session(&store, markers_dir.path(), &other_env, "audit", "OTHER-1")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            None,
+            markers_dir.path(),
+            &other_env,
+            "audit",
+            "OTHER-1",
+        )
+        .unwrap()
+        .unwrap();
 
         let fresh_env = env_with_session("sess-fresh");
-        register_session(&store, markers_dir.path(), &fresh_env, "audit", "NEW-1")
-            .unwrap()
-            .unwrap();
+        register_session(
+            &store,
+            None,
+            markers_dir.path(),
+            &fresh_env,
+            "audit",
+            "NEW-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(markers_dir.path().join("sess-other").exists());
     }
@@ -872,7 +910,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -901,7 +939,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
         store
@@ -941,7 +979,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -970,10 +1008,10 @@ mod tests {
         // The session audits PROJ-1, then reads PROJ-2 for context — the
         // marker now points at PROJ-2's run. Recording PROJ-1's verdict must
         // not finish PROJ-2's run or delete its marker.
-        register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
-        let b_id = register_session(&store, markers_dir.path(), &env, "audit", "PROJ-2")
+        let b_id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -1002,7 +1040,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let id = register_session(&store, markers_dir.path(), &env, "create", "PROJ-1")
+        let id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
             .unwrap()
             .unwrap();
 
@@ -1076,7 +1114,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        register_session(&store, markers_dir.path(), &env, "audit", "PROJ-1")
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
             .unwrap()
             .unwrap();
 

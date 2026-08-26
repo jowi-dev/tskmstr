@@ -644,6 +644,7 @@ mod tests {
     fn start_watch_run(store: &RunStore, ticket: &str) -> i64 {
         store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: ticket.to_string(),
                 lane: "review-watch".to_string(),
                 worktree: "/irrelevant".to_string(),

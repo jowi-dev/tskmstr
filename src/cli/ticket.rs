@@ -161,8 +161,10 @@ pub fn create(
     let outcome = create_ticket(ctx, &title, opts.body.as_deref(), status_target)?;
 
     if let Some(store) = session_store {
+        let scope = crate::config::BackendIdentity::from_config(ctx.config).scope();
         let _ = register_session(
             store,
+            Some(&scope),
             sessions_dir,
             session_env,
             "create",
@@ -626,6 +628,7 @@ pub enum AuditStoreStatus<'a> {
 pub fn audit_read(
     jira: &dyn TicketProvider,
     store: &AuditStoreStatus,
+    scope: &str,
     key: &str,
     session_env: &SessionEnv,
     sessions_dir: &Path,
@@ -634,7 +637,14 @@ pub fn audit_read(
     let normalized = normalize_key(key)?;
 
     if let AuditStoreStatus::Open(store) = store {
-        let _ = register_session(store, sessions_dir, session_env, "audit", &normalized);
+        let _ = register_session(
+            store,
+            Some(scope),
+            sessions_dir,
+            session_env,
+            "audit",
+            &normalized,
+        );
     }
 
     let issue = jira
@@ -683,7 +693,7 @@ pub fn audit_read(
 
     match store {
         AuditStoreStatus::Open(store) => {
-            match store.latest_audit_for_ticket(&normalized)? {
+            match store.latest_audit_for_ticket(Some(scope), &normalized)? {
                 Some(audit) => match &audit.notes {
                     Some(notes) => writeln!(
                         out,
@@ -696,7 +706,7 @@ pub fn audit_read(
             }
 
             if let Some(line) = store
-                .latest_finished_run_for_ticket_kind(&normalized, "audit")
+                .latest_finished_run_for_ticket_kind(Some(scope), &normalized, "audit")
                 .ok()
                 .flatten()
                 .and_then(|run| run.model_usage)
@@ -730,8 +740,10 @@ pub fn audit_read(
 /// audit conversation. Swallows any [`crate::runs::session::SessionError`]
 /// (same contract as [`audit_read`]/[`create`]): a broken runs DB or an
 /// already-finished/absent marker never blocks this command's own output.
+#[allow(clippy::too_many_arguments)]
 pub fn audit_record(
     store: &RunStore,
+    scope: &str,
     key: &str,
     verdict: &str,
     notes: Option<&str>,
@@ -740,7 +752,7 @@ pub fn audit_record(
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
-    store.record_audit(&normalized, verdict, notes)?;
+    store.record_audit(scope, &normalized, verdict, notes)?;
     writeln!(out, "Recorded audit for {normalized}: {verdict}")?;
     let _ = finish_session(
         store,
@@ -772,6 +784,7 @@ pub fn audit_record(
 /// an empty body; `note` is otherwise optional.
 pub fn retro(
     store: &RunStore,
+    scope: &str,
     key: &str,
     verdict: crate::runs::RetroVerdict,
     severity: Option<crate::runs::RetroSeverity>,
@@ -785,7 +798,7 @@ pub fn retro(
     }
 
     let normalized = normalize_key(key)?;
-    store.record_retro(&normalized, verdict, severity, note)?;
+    store.record_retro(scope, &normalized, verdict, severity, note)?;
 
     match severity {
         Some(severity) => writeln!(
@@ -2448,6 +2461,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2480,6 +2494,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "PROJ-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2499,7 +2514,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open_run_store(dir.path());
         store
-            .record_audit("PROJ-372", "ready", Some("looks good"))
+            .record_audit("", "PROJ-372", "ready", Some("looks good"))
             .unwrap();
         let status = AuditStoreStatus::Open(&store);
         let mut out = Vec::new();
@@ -2507,6 +2522,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2528,6 +2544,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2550,6 +2567,7 @@ mod tests {
         let err = audit_read(
             &jira,
             &status,
+            "",
             "not-a-key!",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2573,6 +2591,7 @@ mod tests {
         let err = audit_read(
             &jira,
             &status,
+            "",
             "proj-404",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2597,6 +2616,7 @@ mod tests {
 
         audit_record(
             &store,
+            "",
             "proj-372",
             "ready",
             Some("looks good"),
@@ -2610,7 +2630,7 @@ mod tests {
         assert_eq!(output, "Recorded audit for PROJ-372: ready\n");
 
         let audit = store
-            .latest_audit_for_ticket("PROJ-372")
+            .latest_audit_for_ticket(None, "PROJ-372")
             .unwrap()
             .expect("expected an audit");
         assert_eq!(audit.verdict, "ready");
@@ -2625,6 +2645,7 @@ mod tests {
 
         let err = audit_record(
             &store,
+            "",
             "not-a-key!",
             "ready",
             None,
@@ -2647,6 +2668,7 @@ mod tests {
 
         retro(
             &store,
+            "",
             "proj-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -2659,7 +2681,7 @@ mod tests {
         assert_eq!(output, "Recorded retro for PROJ-372: clean\n");
 
         let recorded = store
-            .latest_retro_for_ticket("PROJ-372")
+            .latest_retro_for_ticket(None, "PROJ-372")
             .unwrap()
             .expect("expected a retro");
         assert_eq!(recorded.verdict, crate::runs::RetroVerdict::Clean);
@@ -2674,6 +2696,7 @@ mod tests {
 
         retro(
             &store,
+            "",
             "proj-372",
             crate::runs::RetroVerdict::Defect,
             Some(crate::runs::RetroSeverity::Major),
@@ -2686,7 +2709,7 @@ mod tests {
         assert_eq!(output, "Recorded retro for PROJ-372: defect (major)\n");
 
         let recorded = store
-            .latest_retro_for_ticket("PROJ-372")
+            .latest_retro_for_ticket(None, "PROJ-372")
             .unwrap()
             .expect("expected a retro");
         assert_eq!(recorded.verdict, crate::runs::RetroVerdict::Defect);
@@ -2702,6 +2725,7 @@ mod tests {
 
         let err = retro(
             &store,
+            "",
             "not-a-key!",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -2723,6 +2747,7 @@ mod tests {
 
         let err = retro(
             &store,
+            "",
             "PROJ-372",
             crate::runs::RetroVerdict::Clean,
             None,
@@ -2732,7 +2757,10 @@ mod tests {
         .expect_err("should fail");
         assert!(matches!(err, TicketCliError::RetroNoteEmpty));
         assert!(
-            store.latest_retro_for_ticket("PROJ-372").unwrap().is_none(),
+            store
+                .latest_retro_for_ticket(None, "PROJ-372")
+                .unwrap()
+                .is_none(),
             "nothing should be recorded when the note is rejected"
         );
     }
@@ -2745,6 +2773,7 @@ mod tests {
 
         let err = retro(
             &store,
+            "",
             "PROJ-372",
             crate::runs::RetroVerdict::Defect,
             None,
@@ -2765,6 +2794,7 @@ mod tests {
         let store = open_run_store(dir.path());
         let run_id = store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-372".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -2790,6 +2820,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2812,6 +2843,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2832,6 +2864,7 @@ mod tests {
         let store = open_run_store(dir.path());
         store
             .start_run(&StartRun {
+                scope: String::new(),
                 ticket: "PROJ-372".to_string(),
                 lane: "audit".to_string(),
                 worktree: "/tmp/wt".to_string(),
@@ -2847,6 +2880,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2871,6 +2905,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &env,
             markers_dir.path(),
@@ -2896,6 +2931,7 @@ mod tests {
         audit_read(
             &jira,
             &status,
+            "",
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
@@ -2915,13 +2951,14 @@ mod tests {
 
         // Simulate the read-mode registration that would have happened
         // earlier in the same Claude Code session.
-        register_session(&store, markers_dir.path(), &env, "audit", "PROJ-372").unwrap();
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-372").unwrap();
         let marker = markers_dir.path().join("sess-1");
         assert!(marker.exists());
 
         let mut out = Vec::new();
         audit_record(
             &store,
+            "",
             "proj-372",
             "ready",
             None,
