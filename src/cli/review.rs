@@ -24,7 +24,7 @@
 //! 5. Dispatch, per [`Dispatch`] — the same three-way resolution
 //!    [`crate::cli::work::run`] uses, and for the same reasons:
 //!    - [`Dispatch::Interactive`] (the default) hosts the pass in a `fix`
-//!      window of the ticket's `tm-<key>` session, so it can be attached to
+//!      window of the ticket's `tm-<scope>-<key>` session, so it can be attached to
 //!      and steered. A repeat pass becomes `fix-2`.
 //!    - [`Dispatch::HeadlessForeground`] (`--fg`) runs
 //!      [`crate::work::run::run_claude_and_finish`] synchronously.
@@ -161,6 +161,11 @@ pub struct ReviewFixDeps<'a> {
     pub clock: &'a dyn Clock,
     /// `vdiff --export-comments` seam (real or fake).
     pub vdiff: &'a dyn VdiffOps,
+    /// The invoking repo's backend identity; its
+    /// [`session_slug`](crate::config::BackendIdentity::session_slug)
+    /// qualifies the ticket's session name so same-numbered tickets in
+    /// different repos never share a session (GitHub issue #10).
+    pub backend_identity: &'a crate::config::BackendIdentity,
     /// Detached-supervisor process spawning (real or fake). Only used for
     /// [`Dispatch::Headless`].
     pub detach: &'a dyn DetachSpawner,
@@ -246,6 +251,7 @@ pub fn fix(
             let windows = deps.tmux.list_windows()?;
             Some(resolve_action_window(
                 &windows,
+                &deps.backend_identity.session_slug(),
                 &run.ticket,
                 FIX_WINDOW_NAME,
             )?)
@@ -360,6 +366,17 @@ mod tests {
         (tmp, run_store, worktree)
     }
 
+    /// Canonical test identity; its `session_slug()` is `proj`, so ticket
+    /// sessions in these tests are named `tm-proj-<lowercased key>`.
+    fn test_identity() -> &'static crate::config::BackendIdentity {
+        static IDENTITY: std::sync::OnceLock<crate::config::BackendIdentity> =
+            std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| crate::config::BackendIdentity::Jira {
+            base_url: "https://x.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
+        })
+    }
+
     fn seed_lane_run(run_store: &RunStore, worktree: &Path) {
         run_store
             .start_run(&StartRun {
@@ -409,6 +426,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -453,6 +471,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -487,6 +506,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -523,6 +543,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -560,6 +581,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -622,6 +644,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -643,7 +666,7 @@ mod tests {
                     command,
                     ..
                 } => {
-                    assert_eq!(name, "tm-proj-1");
+                    assert_eq!(name, "tm-proj-proj-1");
                     Some((window_name.clone(), env.clone(), command.clone()))
                 }
                 _ => None,
@@ -662,7 +685,7 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(
-            printed.contains("window    tm-proj-1:fix (log viewer)"),
+            printed.contains("window    tm-proj-proj-1:fix (log viewer)"),
             "{printed}"
         );
     }
@@ -683,7 +706,7 @@ mod tests {
         // A dead `fix` window from the previous pass, so this one has to
         // suffix past it.
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "fix".to_string(),
             dead: true,
         }]));
@@ -700,6 +723,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -735,7 +759,7 @@ mod tests {
         );
 
         let printed = String::from_utf8(out).unwrap();
-        assert!(printed.contains("window    tm-proj-1:fix-2"));
+        assert!(printed.contains("window    tm-proj-proj-1:fix-2"));
     }
 
     #[test]
@@ -750,7 +774,7 @@ mod tests {
         let vdiff = FakeVdiffOps::with_export(Ok("## src/foo.rs\n\ncomment".to_string()));
         let detach = FakeDetachSpawner::new(4242);
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "fix".to_string(),
             dead: false,
         }]));
@@ -767,6 +791,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -806,6 +831,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -864,6 +890,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -905,6 +932,7 @@ mod tests {
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             tmux: &tmux,
+            backend_identity: test_identity(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();

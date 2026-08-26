@@ -144,7 +144,7 @@ pub enum WorkCliError {
 
     /// `tm work session <KEY>` was given a ticket with no recorded runs.
     /// Reconstruction rebuilds a session *from* the run rows, so with none
-    /// there is nothing to rebuild — and a bare `tm-<key>` session with a
+    /// there is nothing to rebuild — and a bare `tm-<scope>-<key>` session with a
     /// single shell rooted nowhere in particular would be a worse answer
     /// than saying so.
     #[error("no runs recorded for {0} — nothing to rebuild a session from")]
@@ -157,7 +157,7 @@ pub enum WorkCliError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dispatch {
     /// The default since issue #2 phase 3: `claude` runs interactively in a
-    /// window of the ticket's `tm-<key>` session, so the run can be attached
+    /// window of the ticket's `tm-<scope>-<key>` session, so the run can be attached
     /// to and steered. Returns as soon as the window is launched.
     #[default]
     Interactive,
@@ -378,7 +378,7 @@ pub struct RunDeps<'a> {
 /// without going through this CLI layer at all.
 ///
 /// [`Dispatch::Interactive`] (the default) hosts `claude` in a window of the
-/// ticket's `tm-<key>` session and returns as soon as the window is launched;
+/// ticket's `tm-<scope>-<key>` session and returns as soon as the window is launched;
 /// see [`run_interactive`]. [`Dispatch::HeadlessForeground`] runs
 /// synchronously in this process ([`crate::work::run::run_lane_fg`]) and
 /// returns once `claude` has finished. [`Dispatch::Headless`] does
@@ -448,7 +448,12 @@ pub fn run(
     // no difference to that.
     let session_key = request.ticket.clone().unwrap_or_else(|| lane.to_string());
     let windows = ctx.tmux.list_windows()?;
-    let viewer_target = resolve_action_window(&windows, &session_key, WORK_WINDOW_NAME)?;
+    let viewer_target = resolve_action_window(
+        &windows,
+        &run_deps.current_backend_identity.session_slug(),
+        &session_key,
+        WORK_WINDOW_NAME,
+    )?;
 
     // Detached: provisioning/preflight/start_run happen here, in the
     // foreground, with pid = None (the supervisor records its own pid on
@@ -523,7 +528,7 @@ pub fn run(
 }
 
 /// The interactive half of [`run`]: host this lane run's `claude` in a
-/// window of the ticket's `tm-<key>` session.
+/// window of the ticket's `tm-<scope>-<key>` session.
 ///
 /// Ordering matters. The window is resolved (and a double-launch refused)
 /// from one `tmux list_windows` snapshot *before*
@@ -546,7 +551,12 @@ fn run_interactive(
 ) -> Result<bool, WorkCliError> {
     let session_key = request.ticket.clone().unwrap_or_else(|| lane.to_string());
     let windows = ctx.tmux.list_windows()?;
-    let target = resolve_action_window(&windows, &session_key, WORK_WINDOW_NAME)?;
+    let target = resolve_action_window(
+        &windows,
+        &run_deps.current_backend_identity.session_slug(),
+        &session_key,
+        WORK_WINDOW_NAME,
+    )?;
 
     let prepared =
         crate::work::run::prepare_run_lane(run_deps, ctx.config, paths, lane, request, None, out)?;
@@ -604,7 +614,7 @@ pub fn supervise(
     Ok(!outcome.is_error)
 }
 
-/// `tm work session <KEY>`: rebuild `key`'s `tm-<key>` tmux session and its
+/// `tm work session <KEY>`: rebuild `key`'s `tm-<scope>-<key>` tmux session and its
 /// window set from the ticket's run rows — the after-a-reboot,
 /// after-a-`kill-session`, after-a-`tmux kill-server` operation.
 ///
@@ -628,6 +638,7 @@ pub fn supervise(
 pub fn session(
     ctx: &WorkContext<'_>,
     store: &RunStore,
+    identity: &crate::config::BackendIdentity,
     current_exe: &Path,
     key: &str,
     out: &mut dyn Write,
@@ -640,7 +651,13 @@ pub fn session(
 
     let windows = ctx.tmux.list_windows()?;
     let viewer = |run_id: i64| crate::work::viewer::viewer_command(current_exe, run_id);
-    let plan = crate::work::session::plan_session(&ticket, &runs, &windows, &viewer);
+    let plan = crate::work::session::plan_session(
+        &identity.session_slug(),
+        &ticket,
+        &runs,
+        &windows,
+        &viewer,
+    );
 
     if plan.windows.is_empty() {
         writeln!(
@@ -674,7 +691,7 @@ pub fn session(
 }
 
 /// `tm work clean <KEY>`: finish with a ticket in one command — kill its
-/// `tm-<key>` session and remove its lane-run worktree.
+/// `tm-<scope>-<key>` session and remove its lane-run worktree.
 ///
 /// This is the payoff of issue #2's consolidation. Before it, being done with
 /// a ticket meant killing `tm-audit-<key>`, killing `tm-bugbot-<key>`,
@@ -708,11 +725,12 @@ pub fn session(
 pub fn clean(
     ctx: &WorkContext<'_>,
     store: &RunStore,
+    identity: &crate::config::BackendIdentity,
     key: &str,
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
-    let session_name = naming::ticket_session_name(&ticket);
+    let session_name = naming::ticket_session_name(&identity.session_slug(), &ticket);
 
     if ctx.tmux.has_session(&session_name)? {
         writeln!(out, "Killing tmux session: {session_name}")?;
@@ -983,9 +1001,11 @@ mod tests {
 
     fn compatible_test_identity() -> &'static BackendIdentity {
         static IDENTITY: OnceLock<BackendIdentity> = OnceLock::new();
+        // `session_slug()` is `proj`, so ticket sessions in these tests are
+        // named `tm-proj-<lowercased key>`.
         IDENTITY.get_or_init(|| BackendIdentity::Jira {
-            base_url: String::new(),
-            project_key: String::new(),
+            base_url: "https://x.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
         })
     }
 
@@ -1819,33 +1839,41 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let mut out = Vec::new();
 
-        session(&ctx, &store, &current_exe, "proj-1", &mut out).unwrap();
+        session(
+            &ctx,
+            &store,
+            compatible_test_identity(),
+            &current_exe,
+            "proj-1",
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             tmux.calls(),
             vec![
                 TmuxCall::ListWindows,
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/wt/proj-1".to_string(),
                     window_name: "work".to_string(),
                     env: Vec::new(),
                     command: format!("'/usr/local/bin/tm' runs logs {run_id} --follow"),
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "shell".to_string(),
                     dir: "/wt/proj-1".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "work".to_string(),
                 },
             ]
         );
 
         let printed = out_string(&out);
-        assert!(printed.contains("tm-proj-1:work"), "{printed}");
+        assert!(printed.contains("tm-proj-proj-1:work"), "{printed}");
         assert!(printed.contains("attach:"), "{printed}");
     }
 
@@ -1881,7 +1909,15 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let mut out = Vec::new();
 
-        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+        session(
+            &ctx,
+            &store,
+            compatible_test_identity(),
+            &current_exe,
+            "PROJ-1",
+            &mut out,
+        )
+        .unwrap();
 
         assert!(
             tmux.calls().iter().any(|call| matches!(
@@ -1906,12 +1942,12 @@ mod tests {
         let git = FakeGitOps::new();
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![
             TmuxWindow {
-                session: "tm-proj-1".to_string(),
+                session: "tm-proj-proj-1".to_string(),
                 name: "work".to_string(),
                 dead: false,
             },
             TmuxWindow {
-                session: "tm-proj-1".to_string(),
+                session: "tm-proj-proj-1".to_string(),
                 name: "shell".to_string(),
                 dead: false,
             },
@@ -1937,7 +1973,15 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let mut out = Vec::new();
 
-        session(&ctx, &store, &current_exe, "PROJ-1", &mut out).unwrap();
+        session(
+            &ctx,
+            &store,
+            compatible_test_identity(),
+            &current_exe,
+            "PROJ-1",
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             tmux.calls(),
@@ -1965,7 +2009,15 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let mut out = Vec::new();
 
-        let err = session(&ctx, &store, &current_exe, "PROJ-404", &mut out).unwrap_err();
+        let err = session(
+            &ctx,
+            &store,
+            compatible_test_identity(),
+            &current_exe,
+            "PROJ-404",
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, WorkCliError::NoRunsForTicket(_)));
     }
@@ -2018,13 +2070,13 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        clean(&ctx, &store, "proj-1", &mut out).unwrap();
+        clean(&ctx, &store, compatible_test_identity(), "proj-1", &mut out).unwrap();
 
         assert_eq!(
             tmux.calls(),
             vec![
-                TmuxCall::HasSession("tm-proj-1".to_string()),
-                TmuxCall::KillSession("tm-proj-1".to_string()),
+                TmuxCall::HasSession("tm-proj-proj-1".to_string()),
+                TmuxCall::KillSession("tm-proj-proj-1".to_string()),
             ],
             "one kill-session, not one per action"
         );
@@ -2069,7 +2121,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+        clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
 
         assert!(
             git.remove_worktree_calls().is_empty(),
@@ -2078,7 +2130,7 @@ mod tests {
         // The session cleanup still happened.
         assert!(
             tmux.calls()
-                .contains(&TmuxCall::KillSession("tm-proj-1".to_string()))
+                .contains(&TmuxCall::KillSession("tm-proj-proj-1".to_string()))
         );
         let printed = out_string(&out);
         assert!(printed.contains("No lane-run worktree"), "{printed}");
@@ -2102,11 +2154,11 @@ mod tests {
         let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let mut out = Vec::new();
 
-        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+        clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
 
         assert_eq!(
             tmux.calls(),
-            vec![TmuxCall::HasSession("tm-proj-1".to_string())]
+            vec![TmuxCall::HasSession("tm-proj-proj-1".to_string())]
         );
     }
 
@@ -2142,7 +2194,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        clean(&ctx, &store, "PROJ-1", &mut out).unwrap();
+        clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
 
         assert!(git.remove_worktree_calls().is_empty());
         let printed = out_string(&out);
@@ -2284,7 +2336,7 @@ mod tests {
                     command,
                     ..
                 } => {
-                    assert_eq!(name, "tm-proj-1");
+                    assert_eq!(name, "tm-proj-proj-1");
                     Some((window_name.clone(), env.clone(), command.clone()))
                 }
                 _ => None,
@@ -2316,8 +2368,8 @@ mod tests {
         assert!(prompt.contains("Do the lane thing."));
 
         let printed = out_string(&out);
-        assert!(printed.contains("window    tm-proj-1:work"));
-        assert!(printed.contains("attach:   tmux attach -t tm-proj-1"));
+        assert!(printed.contains("window    tm-proj-proj-1:work"));
+        assert!(printed.contains("attach:   tmux attach -t tm-proj-proj-1"));
     }
 
     #[test]
@@ -2335,7 +2387,7 @@ mod tests {
 
         let git = FakeGitOps::new();
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "work".to_string(),
             dead: false,
         }]));
@@ -2742,7 +2794,7 @@ mod tests {
                     command,
                     ..
                 } => {
-                    assert_eq!(name, "tm-proj-1");
+                    assert_eq!(name, "tm-proj-proj-1");
                     Some((window_name.clone(), env.clone(), command.clone()))
                 }
                 _ => None,
@@ -2767,7 +2819,7 @@ mod tests {
 
         let printed = out_string(&out);
         assert!(
-            printed.contains("window    tm-proj-1:work (log viewer)"),
+            printed.contains("window    tm-proj-proj-1:work (log viewer)"),
             "{printed}"
         );
         // The log line stays: the file, not the window, is the archive.
@@ -2793,7 +2845,7 @@ mod tests {
 
         let git = FakeGitOps::new();
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "work".to_string(),
             dead: false,
         }]));

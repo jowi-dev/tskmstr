@@ -312,7 +312,7 @@ pub struct RunModelUsage {
 /// A ticket's board-launched audit session state, per
 /// `docs/plans/board-audits.md`'s "Board integration" design. Derived, never
 /// stored: [`audit_indicator`] computes it fresh each poll from a live
-/// `audit` window in the ticket's `tm-<key>` tmux session and the ticket's
+/// `audit` window in the ticket's `tm-<scope>-<key>` tmux session and the ticket's
 /// latest `kind = "audit"` run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditIndicator {
@@ -343,7 +343,7 @@ pub enum AuditIndicator {
 ///
 /// `window_live` means exactly that: a live *window* for this action
 /// (`audit`, or `bugbot` for `cleanup_status`) inside the ticket's shared
-/// `tm-<key>` session. It was called `has_session` until issue #2 phase 5,
+/// `tm-<scope>-<key>` session. It was called `has_session` until issue #2 phase 5,
 /// from when each action owned a whole session; once one session came to hold
 /// a ticket's entire action history, session existence stopped being a
 /// liveness signal at all and the old name actively misled (see
@@ -627,6 +627,12 @@ pub struct App {
     /// The configured default Jira project key, used to scope every
     /// [`AssigneeFilter`] other than [`AssigneeFilter::Me`].
     pub project_key: String,
+    /// The current repo's [`crate::config::BackendIdentity::session_slug`],
+    /// qualifying every ticket-session name this board builds (see
+    /// [`crate::work::naming::ticket_session_name`]) so same-numbered
+    /// tickets in different repos never share a tmux session (GitHub issue
+    /// #10). Set from `TuiDeps` at construction, like `project_key`.
+    pub session_slug: String,
     /// Configured board column order (status names, case-insensitive),
     /// from [`crate::config::Config::board_column_order`]. Listed columns
     /// sort first, in this order; unlisted columns keep the default
@@ -1083,11 +1089,11 @@ pub enum Msg {
     /// line.
     RunsReaped(usize),
     /// The `a` key was pressed on [`Screen::Board`] for the selected ticket:
-    /// attach to its `tm-<key>` session if its `audit` window is live,
+    /// attach to its `tm-<scope>-<key>` session if its `audit` window is live,
     /// otherwise launch a new one. See [`audit_action`].
     AuditAction,
     /// The `s` key was pressed on [`Screen::Board`]: attach to the selected
-    /// ticket's `tm-<key>` session, whatever is in it. See [`session_action`].
+    /// ticket's `tm-<scope>-<key>` session, whatever is in it. See [`session_action`].
     SessionAction,
     /// The outcome of [`Cmd::AttachSession`] when it came from
     /// [`Msg::SessionAction`], as a ready-to-display status line.
@@ -1098,7 +1104,7 @@ pub enum Msg {
     /// The outcome of [`Cmd::LaunchAudit`] or [`Cmd::AttachSession`], already
     /// rendered to a human-readable status-line message (e.g. `launched
     /// audit for PROJ-1 -- press a to attach`, or `detached from
-    /// tm-proj-1`). Kept as a single string variant (mirroring
+    /// tm-proj-proj-1`). Kept as a single string variant (mirroring
     /// [`Msg::RankApplied`]/[`Msg::TicketsFailed`]'s reuse pattern) rather
     /// than a dedicated success/failure pair, since every outcome is purely
     /// a status-line update from `update`'s point of view.
@@ -1294,7 +1300,7 @@ pub enum Cmd {
         /// Ticket key to launch an audit session for.
         key: String,
     },
-    /// Attach the terminal to `session_name` (the ticket's `tm-<key>`
+    /// Attach the terminal to `session_name` (the ticket's `tm-<scope>-<key>`
     /// session), suspending and restoring the board's terminal state around
     /// the blocking `tmux attach-session` call. Handled specially by the
     /// board's event loop, unlike every other `Cmd` here -- see
@@ -1944,12 +1950,8 @@ fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
         .get(&key)
         .is_some_and(|entry| entry.window_live);
     if window_live {
-        return (
-            app,
-            vec![Cmd::AttachSession {
-                session_name: crate::work::naming::ticket_session_name(&key),
-            }],
-        );
+        let session_name = crate::work::naming::ticket_session_name(&app.session_slug, &key);
+        return (app, vec![Cmd::AttachSession { session_name }]);
     }
 
     match app.bot_watch_status.get(&key) {
@@ -2044,7 +2046,7 @@ fn lane_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 }
 
 /// Handle [`Msg::AuditAction`]: for the selected board ticket, attach to its
-/// `tm-<key>` session if [`App::audit_status`] reports a live `audit`
+/// `tm-<scope>-<key>` session if [`App::audit_status`] reports a live `audit`
 /// window, otherwise launch a new one. A no-op when no ticket is selected.
 fn audit_action(app: App) -> (App, Vec<Cmd>) {
     let Some(ticket) = app.selected_ticket() else {
@@ -2057,7 +2059,7 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
         .is_some_and(|entry| entry.window_live);
     let cmd = if window_live {
         Cmd::AttachSession {
-            session_name: crate::work::naming::ticket_session_name(&key),
+            session_name: crate::work::naming::ticket_session_name(&app.session_slug, &key),
         }
     } else {
         Cmd::LaunchAudit { key }
@@ -2066,7 +2068,7 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
 }
 
 /// Handle [`Msg::SessionAction`]: attach to the selected board ticket's
-/// `tm-<key>` session. A no-op when no ticket is selected.
+/// `tm-<scope>-<key>` session. A no-op when no ticket is selected.
 ///
 /// Deliberately unconditional, unlike [`audit_action`]'s attach-or-launch.
 /// Two reasons:
@@ -2087,7 +2089,7 @@ fn session_action(app: App) -> (App, Vec<Cmd>) {
     let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
     };
-    let session_name = crate::work::naming::ticket_session_name(&ticket.key);
+    let session_name = crate::work::naming::ticket_session_name(&app.session_slug, &ticket.key);
     (app, vec![Cmd::AttachSession { session_name }])
 }
 
@@ -2948,6 +2950,9 @@ mod tests {
             columns: group_into_columns(tickets, &[]),
             selected_col: 0,
             selected_row,
+            // The canonical test scope slug: attach-path reducers build
+            // session names as `tm-proj-<lowercased key>`.
+            session_slug: "proj".to_string(),
             ..App::new()
         }
     }
@@ -5299,7 +5304,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string()
+                session_name: "tm-proj-proj-1".to_string()
             }]
         );
     }
@@ -5316,7 +5321,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string()
+                session_name: "tm-proj-proj-1".to_string()
             }]
         );
     }
@@ -5554,7 +5559,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string()
+                session_name: "tm-proj-proj-1".to_string()
             }]
         );
     }

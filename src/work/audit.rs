@@ -29,7 +29,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::config::AuditConfig;
+use crate::config::{AuditConfig, BackendIdentity};
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::naming::{expand_tilde, ticket_session_name};
 use crate::work::tmux::{
@@ -176,11 +176,17 @@ pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
 /// [`crate::work::naming::expand_tilde`], matching every other `~`-expanding
 /// config caller in this codebase (config values are never expanded by the
 /// `config` module itself).
+///
+/// `identity` is the invoking repo's [`BackendIdentity`]; its
+/// [`session_slug`](BackendIdentity::session_slug) qualifies the ticket's
+/// session name so same-numbered tickets in different repos never share a
+/// session (GitHub issue #10).
 pub fn launch_audit(
     store: &RunStore,
     tmux: &dyn TmuxOps,
     audit_cfg: &AuditConfig,
     home: &Path,
+    identity: &BackendIdentity,
     key: &str,
 ) -> Result<LaunchOutcome, AuditLaunchError> {
     let raw_dir = audit_cfg
@@ -190,7 +196,7 @@ pub fn launch_audit(
     let dir = expand_tilde(raw_dir, home);
     let dir_str = dir.to_string_lossy().into_owned();
 
-    let session_name = ticket_session_name(key);
+    let session_name = ticket_session_name(&identity.session_slug(), key);
     // One `list_windows` snapshot answers both questions — "is an audit
     // already running?" and "does the session exist yet?" — so the two
     // decisions cannot disagree about a session that appeared or vanished
@@ -257,6 +263,15 @@ mod tests {
         }
     }
 
+    /// Canonical test identity; its `session_slug()` is `proj`, so ticket
+    /// sessions in these tests are named `tm-proj-<lowercased key>`.
+    fn test_identity() -> crate::config::BackendIdentity {
+        crate::config::BackendIdentity::Jira {
+            base_url: "https://x.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
+        }
+    }
+
     /// The `command` string of the single `NewSessionWithCommand` call `tmux`
     /// recorded, for the tests that only care about how `claude` was invoked.
     fn launched_command(tmux: &FakeTmuxOps) -> Option<String> {
@@ -288,10 +303,10 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("~/Projects/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
             .expect("launch should succeed");
 
-        assert_eq!(outcome.session_name, "tm-proj-1");
+        assert_eq!(outcome.session_name, "tm-proj-proj-1");
 
         let run = store
             .run_by_id(outcome.run_id)
@@ -310,19 +325,19 @@ mod tests {
             vec![
                 TmuxCall::ListWindows,
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                     window_name: "audit".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
                     command: "claude '/ticket-audit PROJ-1'".to_string(),
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: SHELL_WINDOW_NAME.to_string(),
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "audit".to_string(),
                 },
             ]
@@ -337,7 +352,7 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = AuditConfig::default();
 
-        let err = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+        let err = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
             .expect_err("should refuse to launch");
 
         assert!(matches!(err, AuditLaunchError::NotConfigured));
@@ -362,11 +377,11 @@ mod tests {
     fn launch_audit_errors_and_creates_no_run_when_the_audit_window_is_live() {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = tmux_with_windows(&[("tm-proj-1", "audit", false)]);
+        let tmux = tmux_with_windows(&[("tm-proj-proj-1", "audit", false)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("~/Projects/axiom");
 
-        let err = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+        let err = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
             .expect_err("should refuse to double-launch");
 
         match err {
@@ -374,7 +389,7 @@ mod tests {
                 session_name,
                 window_name,
             } => {
-                assert_eq!(session_name, "tm-proj-1");
+                assert_eq!(session_name, "tm-proj-proj-1");
                 assert_eq!(window_name, "audit");
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
@@ -392,11 +407,11 @@ mod tests {
         // refuse, and don't try to create a duplicate session.
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = tmux_with_windows(&[("tm-proj-1", SHELL_WINDOW_NAME, false)]);
+        let tmux = tmux_with_windows(&[("tm-proj-proj-1", SHELL_WINDOW_NAME, false)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
             .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "audit");
@@ -405,7 +420,7 @@ mod tests {
             vec![
                 TmuxCall::ListWindows,
                 TmuxCall::NewWindowWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "audit".to_string(),
                     dir: "/repo/axiom".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
@@ -421,11 +436,11 @@ mod tests {
         // over dead aftermath takes the next free name.
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = tmux_with_windows(&[("tm-proj-1", "audit", true)]);
+        let tmux = tmux_with_windows(&[("tm-proj-proj-1", "audit", true)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1")
+        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
             .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "audit-2");
@@ -436,11 +451,12 @@ mod tests {
         // A window whose pane exited is aftermath, not a running audit.
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
-        let tmux = tmux_with_windows(&[("tm-proj-1", "audit", true)]);
+        let tmux = tmux_with_windows(&[("tm-proj-proj-1", "audit", true)]);
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-1").expect("launch should succeed");
+        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
+            .expect("launch should succeed");
 
         assert!(
             tmux.calls()
@@ -463,7 +479,7 @@ mod tests {
             model: None,
         };
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-9").unwrap();
+        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-9").unwrap();
 
         assert_eq!(
             launched_command(&tmux),
@@ -483,7 +499,7 @@ mod tests {
             model: Some("opus".to_string()),
         };
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, "PROJ-9").unwrap();
+        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-9").unwrap();
 
         assert_eq!(
             launched_command(&tmux),

@@ -171,6 +171,13 @@ pub struct TuiDeps {
     /// lane's `repo` the same way `tm pr watch`'s
     /// `crate::cli::pr::resolve_watch_repo_root` does.
     pub lanes: std::collections::BTreeMap<String, crate::config::LaneConfig>,
+    /// The board's own repo's resolved backend identity (the same value
+    /// issue #5's lane-compatibility filtering derives `lane_names` from).
+    /// Its [`session_slug`](crate::config::BackendIdentity::session_slug)
+    /// qualifies every ticket-session name the board builds or recognizes,
+    /// so same-numbered tickets in different repos never alias (GitHub
+    /// issue #10).
+    pub backend_identity: crate::config::BackendIdentity,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
@@ -246,6 +253,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 
     let mut app = App {
         project_key: deps.project_key.clone(),
+        session_slug: deps.backend_identity.session_slug(),
         board_column_order: deps.board_column_order.clone(),
         ..App::new()
     }
@@ -548,9 +556,9 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    normally (tmux's own raw mode takes over; this process's is off).
 /// 3. Detach with `C-b d`: confirm the board's alternate screen re-enters,
 ///    the screen clears and redraws cleanly (no leftover tmux output visible
-///    behind it), and the status line reads `detached from tm-<key>`.
+///    behind it), and the status line reads `detached from tm-<scope>-<key>`.
 /// 4. Kill the tmux session from another terminal while attached (`tmux
-///    kill-session -t tm-<key>`); confirm `tmux attach-session`
+///    kill-session -t tm-<scope>-<key>`); confirm `tmux attach-session`
 ///    exiting with an error still leaves this terminal fully usable (raw
 ///    mode re-enabled, alternate screen re-entered, board redrawn) rather
 ///    than stranding the shell.
@@ -564,7 +572,7 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    with a live session: the client must switch to that session (no
 ///    "sessions should be nested with care" refusal). Jump back to the
 ///    board's window (`prefix + s`): it must be redrawn cleanly with the
-///    status line reading `switched client to tm-<key>`.
+///    status line reading `switched client to tm-<scope>-<key>`.
 fn attach_session<B: Backend>(
     terminal: &mut Terminal<B>,
     tmux: &dyn TmuxOps,
@@ -1074,7 +1082,7 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let sessions = live_action_tickets(
         &deps.tmux.list_windows().unwrap_or_default(),
-        TICKET_SESSION_PREFIX,
+        &ticket_session_prefix(&deps.backend_identity.session_slug()),
         AUDIT_WINDOW_NAME,
     );
 
@@ -1205,7 +1213,7 @@ fn load_cleanup_status(deps: &TuiDeps) -> Vec<Msg> {
 
     let sessions = live_action_tickets(
         &deps.tmux.list_windows().unwrap_or_default(),
-        TICKET_SESSION_PREFIX,
+        &ticket_session_prefix(&deps.backend_identity.session_slug()),
         CLEANUP_WINDOW_NAME,
     );
 
@@ -1270,12 +1278,17 @@ fn live_action_tickets(
         .collect()
 }
 
-/// Session-name prefix every ticket session shares (see
-/// [`crate::work::naming::ticket_session_name`]), and so the prefix
+/// Session-name prefix every ticket session of the board's own scope shares
+/// (see [`crate::work::naming::ticket_session_name`]), and so the prefix
 /// [`live_action_tickets`] strips. One prefix for both badge maps now that a
 /// ticket's audit and bugbot windows live in the same session -- the *window*
-/// name is what tells them apart.
-const TICKET_SESSION_PREFIX: &str = "tm-";
+/// name is what tells them apart. Computed from the board's own
+/// [`crate::config::BackendIdentity::session_slug`] rather than a bare
+/// `tm-`, so sessions belonging to another repo's same-numbered tickets are
+/// simply not recognized (GitHub issue #10).
+fn ticket_session_prefix(session_slug: &str) -> String {
+    format!("tm-{session_slug}-")
+}
 
 /// Run `Cmd::LaunchAudit`: launch a ticket-audit session for `key` via
 /// [`crate::work::audit::launch_audit`], mapping the outcome to a
@@ -1292,6 +1305,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         deps.tmux.as_ref(),
         &deps.audit,
         &deps.home,
+        &deps.backend_identity,
         key,
     ) {
         Ok(_) if deps.audit_dir_fallback => format!(
@@ -1328,6 +1342,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         cfg: &deps.review_watch,
         home: &deps.home,
         xdg_data_home: deps.xdg_data_home.as_deref(),
+        identity: &deps.backend_identity,
         key,
     };
 
@@ -1771,6 +1786,10 @@ mod tests {
             git: Box::new(crate::work::git::FakeGitOps::new()),
             cwd: std::path::PathBuf::from("/repo"),
             lanes: std::collections::BTreeMap::new(),
+            backend_identity: crate::config::BackendIdentity::Jira {
+                base_url: "https://x.atlassian.net".to_string(),
+                project_key: "PROJ".to_string(),
+            },
         }
     }
 
@@ -2827,9 +2846,9 @@ mod tests {
 
     #[test]
     fn live_action_tickets_maps_the_owning_session_back_to_its_ticket_key() {
-        let windows = vec![window("tm-proj-1", "audit", false)];
+        let windows = vec![window("tm-proj-proj-1", "audit", false)];
         assert_eq!(
-            live_action_tickets(&windows, TICKET_SESSION_PREFIX, AUDIT_WINDOW_NAME),
+            live_action_tickets(&windows, &ticket_session_prefix("proj"), AUDIT_WINDOW_NAME),
             HashSet::from(["PROJ-1".to_string()])
         );
     }
@@ -2838,8 +2857,11 @@ mod tests {
     fn live_action_tickets_ignores_dead_windows() {
         // A window whose pane exited (`remain-on-exit`) is aftermath, not a
         // running action.
-        let windows = vec![window("tm-proj-1", "audit", true)];
-        assert!(live_action_tickets(&windows, TICKET_SESSION_PREFIX, AUDIT_WINDOW_NAME).is_empty());
+        let windows = vec![window("tm-proj-proj-1", "audit", true)];
+        assert!(
+            live_action_tickets(&windows, &ticket_session_prefix("proj"), AUDIT_WINDOW_NAME)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2847,30 +2869,40 @@ mod tests {
         // The whole point of window-name liveness: a ticket's session can be
         // up with only unrelated windows in it.
         let windows = vec![
-            window("tm-proj-1", "shell", false),
-            window("tm-proj-1", "fix", false),
+            window("tm-proj-proj-1", "shell", false),
+            window("tm-proj-proj-1", "fix", false),
         ];
-        assert!(live_action_tickets(&windows, TICKET_SESSION_PREFIX, AUDIT_WINDOW_NAME).is_empty());
+        assert!(
+            live_action_tickets(&windows, &ticket_session_prefix("proj"), AUDIT_WINDOW_NAME)
+                .is_empty()
+        );
     }
 
     #[test]
     fn live_action_tickets_ignores_sessions_without_the_prefix() {
         let windows = vec![window("axiom-lane", "audit", false)];
-        assert!(live_action_tickets(&windows, TICKET_SESSION_PREFIX, AUDIT_WINDOW_NAME).is_empty());
+        assert!(
+            live_action_tickets(&windows, &ticket_session_prefix("proj"), AUDIT_WINDOW_NAME)
+                .is_empty()
+        );
     }
 
     #[test]
     fn live_action_tickets_does_not_cross_match_the_other_action_kind() {
         let windows = vec![
-            window("tm-proj-1", AUDIT_WINDOW_NAME, false),
-            window("tm-proj-2", CLEANUP_WINDOW_NAME, false),
+            window("tm-proj-proj-1", AUDIT_WINDOW_NAME, false),
+            window("tm-proj-proj-2", CLEANUP_WINDOW_NAME, false),
         ];
         assert_eq!(
-            live_action_tickets(&windows, TICKET_SESSION_PREFIX, AUDIT_WINDOW_NAME),
+            live_action_tickets(&windows, &ticket_session_prefix("proj"), AUDIT_WINDOW_NAME),
             HashSet::from(["PROJ-1".to_string()])
         );
         assert_eq!(
-            live_action_tickets(&windows, TICKET_SESSION_PREFIX, CLEANUP_WINDOW_NAME),
+            live_action_tickets(
+                &windows,
+                &ticket_session_prefix("proj"),
+                CLEANUP_WINDOW_NAME
+            ),
             HashSet::from(["PROJ-2".to_string()])
         );
     }
@@ -2904,7 +2936,7 @@ mod tests {
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
                 crate::work::tmux::TmuxWindow {
-                    session: "tm-proj-1".to_string(),
+                    session: "tm-proj-proj-1".to_string(),
                     name: "audit".to_string(),
                     dead: false,
                 },
@@ -2932,7 +2964,7 @@ mod tests {
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
                 crate::work::tmux::TmuxWindow {
-                    session: "tm-proj-2".to_string(),
+                    session: "tm-proj-proj-2".to_string(),
                     name: "audit".to_string(),
                     dead: false,
                 },
@@ -3132,7 +3164,7 @@ mod tests {
         };
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![window(
-                "tm-proj-1",
+                "tm-proj-proj-1",
                 AUDIT_WINDOW_NAME,
                 false,
             )])),
@@ -3142,7 +3174,7 @@ mod tests {
         assert_eq!(
             msgs,
             vec![Msg::AuditActionResult(
-                "audit already running (tm-proj-1:audit) -- press a to attach".to_string()
+                "audit already running (tm-proj-proj-1:audit) -- press a to attach".to_string()
             )]
         );
     }
@@ -3157,13 +3189,13 @@ mod tests {
         let app = run_cmds(
             App::new(),
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string(),
+                session_name: "tm-proj-proj-1".to_string(),
             }],
             &d,
             &mut terminal,
             &mut launches,
         );
-        assert_eq!(app.status_line, "detached from tm-proj-1");
+        assert_eq!(app.status_line, "detached from tm-proj-proj-1");
     }
 
     /// Phase 5's board attach reuses `attach_session`'s suspend/restore dance
@@ -3177,13 +3209,13 @@ mod tests {
         let app = run_cmds(
             App::new(),
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string(),
+                session_name: "tm-proj-proj-1".to_string(),
             }],
             &d,
             &mut terminal,
             &mut launches,
         );
-        assert_eq!(app.status_line, "detached from tm-proj-1");
+        assert_eq!(app.status_line, "detached from tm-proj-proj-1");
     }
 
     /// From inside tmux, attach runs `switch-client` and returns immediately
@@ -3201,13 +3233,13 @@ mod tests {
         let app = run_cmds(
             App::new(),
             vec![Cmd::AttachSession {
-                session_name: "tm-proj-1".to_string(),
+                session_name: "tm-proj-proj-1".to_string(),
             }],
             &d,
             &mut terminal,
             &mut launches,
         );
-        assert_eq!(app.status_line, "switched client to tm-proj-1");
+        assert_eq!(app.status_line, "switched client to tm-proj-proj-1");
     }
 
     // --- Cmd::LaunchLaneRun routing (run_cmds intercepts it before `execute`) ---
@@ -3636,7 +3668,7 @@ mod tests {
         };
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![window(
-                "tm-proj-1",
+                "tm-proj-proj-1",
                 CLEANUP_WINDOW_NAME,
                 false,
             )])),
@@ -3646,7 +3678,7 @@ mod tests {
         assert_eq!(
             msgs,
             vec![Msg::BotsActionResult(
-                "bugbot cleanup already running (tm-proj-1:bugbot) -- press b to attach"
+                "bugbot cleanup already running (tm-proj-proj-1:bugbot) -- press b to attach"
                     .to_string()
             )]
         );
@@ -3983,7 +4015,7 @@ mod tests {
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
                 crate::work::tmux::TmuxWindow {
-                    session: "tm-proj-1".to_string(),
+                    session: "tm-proj-proj-1".to_string(),
                     name: CLEANUP_WINDOW_NAME.to_string(),
                     dead: false,
                 },
@@ -4011,7 +4043,7 @@ mod tests {
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
                 crate::work::tmux::TmuxWindow {
-                    session: "tm-proj-2".to_string(),
+                    session: "tm-proj-proj-2".to_string(),
                     name: CLEANUP_WINDOW_NAME.to_string(),
                     dead: false,
                 },
@@ -4039,7 +4071,7 @@ mod tests {
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
                 crate::work::tmux::TmuxWindow {
-                    session: "tm-proj-1".to_string(),
+                    session: "tm-proj-proj-1".to_string(),
                     name: "audit".to_string(),
                     dead: false,
                 },

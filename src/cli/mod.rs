@@ -184,7 +184,7 @@ pub enum ReviewCmd {
     /// creates no run row if no comments were captured.
     ///
     /// Interactive by default: the fix pass runs in a `fix` window of the
-    /// ticket's `tm-<key>` tmux session (a second pass becomes `fix-2`), so
+    /// ticket's `tm-<scope>-<key>` tmux session (a second pass becomes `fix-2`), so
     /// it can be attached to and steered. `--headless` runs the one-shot
     /// `claude -p` pass under a detached supervisor instead, and `--fg` runs
     /// that pass synchronously.
@@ -233,7 +233,7 @@ pub enum WorkCmd {
     /// Recreate tmux sessions for every existing worktree that doesn't
     /// already have one running (e.g. after a reboot).
     Restore,
-    /// Rebuild a ticket's `tm-<key>` tmux session and its windows from the
+    /// Rebuild a ticket's `tm-<scope>-<key>` tmux session and its windows from the
     /// ticket's recorded runs — after a reboot, a `tmux kill-server`, or an
     /// accidental `kill-session`.
     ///
@@ -247,7 +247,7 @@ pub enum WorkCmd {
         /// Jira ticket key, e.g. `PROJ-123`.
         key: String,
     },
-    /// Finish with a ticket: kill its `tm-<key>` tmux session and remove its
+    /// Finish with a ticket: kill its `tm-<scope>-<key>` tmux session and remove its
     /// lane-run worktree.
     ///
     /// One `kill-session` plus one worktree removal, because the ticket's
@@ -270,7 +270,7 @@ pub enum WorkCmd {
     ///
     /// Interactive by default: provisioning/preflight run in the foreground
     /// (so errors surface immediately), then `claude` is launched in a
-    /// `work` window of the ticket's `tm-<key>` tmux session — attach to
+    /// `work` window of the ticket's `tm-<scope>-<key>` tmux session — attach to
     /// steer it mid-run — and this invocation returns the terminal right
     /// away.
     ///

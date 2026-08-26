@@ -24,7 +24,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::config::ReviewWatchConfig;
+use crate::config::{BackendIdentity, ReviewWatchConfig};
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::audit::SHELL_WINDOW_NAME;
 use crate::work::naming::{expand_tilde, ticket_session_name};
@@ -132,6 +132,11 @@ pub struct CleanupLaunchRequest<'a> {
     pub home: &'a Path,
     /// `$XDG_DATA_HOME`, if set, for the findings-file path.
     pub xdg_data_home: Option<&'a Path>,
+    /// The invoking repo's [`BackendIdentity`]; its
+    /// [`session_slug`](BackendIdentity::session_slug) qualifies the ticket's
+    /// session name so same-numbered tickets in different repos never share
+    /// a session (GitHub issue #10).
+    pub identity: &'a BackendIdentity,
     /// The ticket key this cleanup session is for, e.g. `PROJ-372`.
     pub key: &'a str,
 }
@@ -171,7 +176,7 @@ pub fn launch_cleanup(
     let dir = expand_tilde(raw_dir, req.home);
     let dir_str = dir.to_string_lossy().into_owned();
 
-    let session_name = ticket_session_name(req.key);
+    let session_name = ticket_session_name(&req.identity.session_slug(), req.key);
     // One snapshot answers both "already running?" and "does the session
     // exist yet?"; see `launch_audit`.
     let windows = deps.tmux.list_windows()?;
@@ -249,6 +254,9 @@ pub struct RealCleanupLauncher<'a> {
     pub home: &'a Path,
     /// `$XDG_DATA_HOME`, if set.
     pub xdg_data_home: Option<&'a Path>,
+    /// The invoking repo's [`BackendIdentity`] (see
+    /// [`CleanupLaunchRequest::identity`]).
+    pub identity: &'a BackendIdentity,
 }
 
 impl CleanupLauncher for RealCleanupLauncher<'_> {
@@ -261,6 +269,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
             cfg: self.cfg,
             home: self.home,
             xdg_data_home: self.xdg_data_home,
+            identity: self.identity,
             key,
         };
         if let Err(err) = launch_cleanup(&deps, &req) {
@@ -287,6 +296,17 @@ mod tests {
             dir: Some(dir.to_string()),
             ..ReviewWatchConfig::default()
         }
+    }
+
+    /// Canonical test identity; its `session_slug()` is `proj`, so ticket
+    /// sessions in these tests are named `tm-proj-<lowercased key>`.
+    fn test_identity() -> &'static crate::config::BackendIdentity {
+        static IDENTITY: std::sync::OnceLock<crate::config::BackendIdentity> =
+            std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| crate::config::BackendIdentity::Jira {
+            base_url: "https://x.atlassian.net".to_string(),
+            project_key: "PROJ".to_string(),
+        })
     }
 
     #[test]
@@ -326,12 +346,13 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-1",
         };
 
         let outcome = launch_cleanup(&deps, &req).expect("launch should succeed");
 
-        assert_eq!(outcome.session_name, "tm-proj-1");
+        assert_eq!(outcome.session_name, "tm-proj-proj-1");
 
         let run = store
             .run_by_id(outcome.run_id)
@@ -351,7 +372,7 @@ mod tests {
             vec![
                 TmuxCall::ListWindows,
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                     window_name: CLEANUP_WINDOW_NAME.to_string(),
                     env: vec![(
@@ -364,12 +385,12 @@ mod tests {
                     ),
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: SHELL_WINDOW_NAME.to_string(),
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: CLEANUP_WINDOW_NAME.to_string(),
                 },
             ]
@@ -391,6 +412,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-1",
         };
 
@@ -406,7 +428,7 @@ mod tests {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: CLEANUP_WINDOW_NAME.to_string(),
             dead: false,
         }]));
@@ -420,6 +442,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-1",
         };
 
@@ -430,7 +453,7 @@ mod tests {
                 session_name,
                 window_name,
             } => {
-                assert_eq!(session_name, "tm-proj-1");
+                assert_eq!(session_name, "tm-proj-proj-1");
                 assert_eq!(window_name, CLEANUP_WINDOW_NAME);
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
@@ -446,7 +469,7 @@ mod tests {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
         let tmux = FakeTmuxOps::new().with_list_windows(Ok(vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "audit".to_string(),
             dead: false,
         }]));
@@ -460,6 +483,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-1",
         };
 
@@ -471,7 +495,7 @@ mod tests {
             vec![
                 TmuxCall::ListWindows,
                 TmuxCall::NewWindowWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: CLEANUP_WINDOW_NAME.to_string(),
                     dir: "/repo/axiom".to_string(),
                     env: vec![(
@@ -506,6 +530,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-9",
         };
 
@@ -546,6 +571,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
             key: "PROJ-9",
         };
 
@@ -580,6 +606,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
         };
 
         launcher.launch_cleanup("PROJ-1");
@@ -611,6 +638,7 @@ mod tests {
             cfg: &cfg,
             home: &home,
             xdg_data_home: None,
+            identity: test_identity(),
         };
 
         // Must not propagate/panic per the `CleanupLauncher` contract.

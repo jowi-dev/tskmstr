@@ -10,7 +10,7 @@
 //! server restart, or a reboot would silently destroy a run mid-flight and
 //! leave its row stuck at `running` until `tm runs reap`.
 //!
-//! So a headless run still *gets* a window in the ticket's `tm-<key>`
+//! So a headless run still *gets* a window in the ticket's `tm-<scope>-<key>`
 //! session — otherwise the session stops being the ticket's whole action
 //! history — but the window is a **viewer**: it runs `tm runs logs <id>
 //! --follow` and owns nothing. Two consequences follow, and both are the
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn launch_and_report_viewer_reports_the_window_and_how_to_attach() {
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
         let mut out = Vec::new();
 
@@ -232,11 +232,11 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("window    tm-proj-1:work (log viewer)"),
+            text.contains("window    tm-proj-proj-1:work (log viewer)"),
             "{text}"
         );
         assert!(
-            text.contains("attach:   tmux attach -t tm-proj-1"),
+            text.contains("attach:   tmux attach -t tm-proj-proj-1"),
             "{text}"
         );
     }
@@ -245,7 +245,7 @@ mod tests {
     /// running by now, so a tmux failure must not become a command failure.
     #[test]
     fn launch_and_report_viewer_reports_a_tmux_failure_without_failing() {
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let mut out = Vec::new();
 
         launch_and_report_viewer(
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn launch_viewer_window_creates_the_session_with_a_shell_window() {
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", Path::new("/bin/tm"), 9).unwrap();
@@ -288,19 +288,19 @@ mod tests {
             tmux.calls(),
             vec![
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/wt/proj-1".to_string(),
                     window_name: "work".to_string(),
                     env: Vec::new(),
                     command: "'/bin/tm' runs logs 9 --follow".to_string(),
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "shell".to_string(),
                     dir: "/wt/proj-1".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "work".to_string(),
                 },
             ]
@@ -310,11 +310,11 @@ mod tests {
     #[test]
     fn launch_viewer_window_appends_to_an_existing_ticket_session() {
         let windows = vec![TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: "audit".to_string(),
             dead: true,
         }];
-        let target = resolve_action_window(&windows, "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&windows, "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", Path::new("/bin/tm"), 9).unwrap();
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(
             tmux.calls(),
             vec![TmuxCall::NewWindowWithCommand {
-                name: "tm-proj-1".to_string(),
+                name: "tm-proj-proj-1".to_string(),
                 window_name: "work".to_string(),
                 dir: "/wt/proj-1".to_string(),
                 env: Vec::new(),
@@ -337,7 +337,7 @@ mod tests {
     /// to start in this window to adopt a row that is already owned.
     #[test]
     fn launch_viewer_window_passes_no_run_id_environment() {
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", &PathBuf::from("/bin/tm"), 9).unwrap();

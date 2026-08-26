@@ -124,12 +124,14 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
     let sleeper = tskmstr::work::review_watch::RealSleeper;
     let tmux = ShellTmuxOps::new();
     let git = ShellGitOps::new();
+    let backend_identity = tskmstr::config::BackendIdentity::from_config(&config);
     let cleanup_launcher = tskmstr::work::bugbot::RealCleanupLauncher {
         store: &run_store,
         tmux: &tmux,
         cfg: &config.work.review_watch,
         home: &home,
         xdg_data_home: xdg_data_home.as_deref(),
+        identity: &backend_identity,
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -337,11 +339,20 @@ fn run_work(
         WorkCmd::Session { key } => {
             let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
             let current_exe = std::env::current_exe()?;
-            tskmstr::cli::work::session(&ctx, &run_store, &current_exe, &key, &mut stdout)?;
+            let identity = backend_identity_or_placeholder(full_config.as_ref());
+            tskmstr::cli::work::session(
+                &ctx,
+                &run_store,
+                &identity,
+                &current_exe,
+                &key,
+                &mut stdout,
+            )?;
         }
         WorkCmd::Clean { key } => {
             let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
-            tskmstr::cli::work::clean(&ctx, &run_store, &key, &mut stdout)?;
+            let identity = backend_identity_or_placeholder(full_config.as_ref());
+            tskmstr::cli::work::clean(&ctx, &run_store, &identity, &key, &mut stdout)?;
         }
         WorkCmd::Start { dir } => {
             let dir_path = dir.map(PathBuf::from);
@@ -374,17 +385,9 @@ fn run_work(
                 .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
             // The invoking repo's own backend identity, for the
             // lane/backend-compatibility preflight (GitHub issue #5 phase
-            // 2). A placeholder when `full_config` is absent: unreachable in
-            // practice, since `work_config.lanes` is then empty and
-            // `prepare_run_lane`'s `UnknownLane` check fails first, before
-            // this value is ever consulted.
-            let current_backend_identity = full_config
-                .as_ref()
-                .map(tskmstr::config::BackendIdentity::from_config)
-                .unwrap_or(tskmstr::config::BackendIdentity::Jira {
-                    base_url: String::new(),
-                    project_key: String::new(),
-                });
+            // 2). See `backend_identity_or_placeholder` on why the
+            // missing-config placeholder is safe here.
+            let current_backend_identity = backend_identity_or_placeholder(full_config.as_ref());
             let backend_identity_resolver =
                 tskmstr::config::FsBackendIdentityResolver { home: home.clone() };
             let run_deps = tskmstr::cli::work::RunDeps {
@@ -542,8 +545,24 @@ fn run_board(
         git: Box::new(ShellGitOps::new()),
         cwd,
         lanes,
+        backend_identity: current_backend_identity,
     })?;
     Ok(())
+}
+
+/// The invoking repo's own [`tskmstr::config::BackendIdentity`], or a
+/// placeholder when no config could be loaded. The placeholder's empty
+/// Jira identity matches no real lane/scope: commands that reach it either
+/// fail earlier for the missing config (e.g. `prepare_run_lane`'s
+/// `UnknownLane` check, since a missing config also means zero lanes) or
+/// degrade to unscoped behavior, which is the pre-issue-#10 status quo.
+fn backend_identity_or_placeholder(config: Option<&Config>) -> tskmstr::config::BackendIdentity {
+    config
+        .map(tskmstr::config::BackendIdentity::from_config)
+        .unwrap_or(tskmstr::config::BackendIdentity::Jira {
+            base_url: String::new(),
+            project_key: String::new(),
+        })
 }
 
 /// The default global/repo config paths for this machine and working
@@ -1206,6 +1225,11 @@ fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
         state_dir: home.join(".local/state/tskmstr/work"),
         hooks_deploy_dir: home.join(".local/share/tskmstr/hooks"),
     };
+    // Lenient, like `resolve_run_db_path`: a fix pass must still dispatch on
+    // a machine whose ticket config can't load; the placeholder identity
+    // just degrades the session name to an unscoped slug.
+    let full_config = config::load(&default_config_paths()).ok();
+    let backend_identity = backend_identity_or_placeholder(full_config.as_ref());
     let deps = tskmstr::cli::review::ReviewFixDeps {
         git: &git,
         gh: &gh,
@@ -1217,6 +1241,7 @@ fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
         current_exe: &current_exe,
         run_db_path: &run_db_path,
         tmux: &tmux,
+        backend_identity: &backend_identity,
     };
     let mut stdout = std::io::stdout();
 

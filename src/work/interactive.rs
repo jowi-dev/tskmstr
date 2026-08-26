@@ -4,7 +4,7 @@
 //! `tm work run` and `tm review fix` used to have exactly one shape — a
 //! `setsid`'d supervisor driving `claude -p`, watchable only through its log
 //! file. This module is the other shape, and now the default: the run's
-//! `claude` process lives in a named window of the ticket's `tm-<key>`
+//! `claude` process lives in a named window of the ticket's `tm-<scope>-<key>`
 //! session, so it can be attached to and steered mid-run.
 //!
 //! The lifecycle is [`crate::work::audit::launch_audit`]'s, generalized:
@@ -98,7 +98,8 @@ pub enum InteractiveLaunchError {
 /// snapshot, consumed by [`launch_interactive_run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionWindow {
-    /// The ticket's session (`tm-<lowercased key>`).
+    /// The ticket's session (`tm-<scope slug>-<lowercased key>`, see
+    /// [`ticket_session_name`]).
     pub session_name: String,
     /// The window this run's `claude` will run in: the plain action name, or
     /// a [`unique_window_name`] suffixed variant when a previous attempt's
@@ -114,16 +115,22 @@ pub struct ActionWindow {
 /// `action` run should take, refusing with
 /// [`InteractiveLaunchError::AlreadyRunning`] if one is already live.
 ///
+/// `scope_slug` is the current repo's
+/// [`crate::config::BackendIdentity::session_slug`], qualifying the session
+/// name so same-numbered tickets in different repos never share a session
+/// (GitHub issue #10).
+///
 /// Pure over a [`TmuxOps::list_windows`] snapshot. Call it *before*
 /// provisioning anything: unlike an audit launch, a work run's caller has
 /// already cut a branch and started a run row by the time it can launch, so
 /// the refusal has to come first or it leaves both behind.
 pub fn resolve_action_window(
     windows: &[TmuxWindow],
+    scope_slug: &str,
     session_key: &str,
     action: &str,
 ) -> Result<ActionWindow, InteractiveLaunchError> {
-    let session_name = ticket_session_name(session_key);
+    let session_name = ticket_session_name(scope_slug, session_key);
     if has_live_window(windows, &session_name, action) {
         return Err(InteractiveLaunchError::AlreadyRunning {
             session_name,
@@ -316,12 +323,12 @@ mod tests {
 
     #[test]
     fn resolve_action_window_creates_the_session_when_the_ticket_has_none() {
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
 
         assert_eq!(
             target,
             ActionWindow {
-                session_name: "tm-proj-1".to_string(),
+                session_name: "tm-proj-proj-1".to_string(),
                 window_name: "work".to_string(),
                 session_exists: false,
             }
@@ -331,11 +338,11 @@ mod tests {
     #[test]
     fn resolve_action_window_appends_to_an_existing_ticket_session() {
         let windows = vec![
-            window("tm-proj-1", "audit", true),
-            window("tm-proj-1", "shell", false),
+            window("tm-proj-proj-1", "audit", true),
+            window("tm-proj-proj-1", "shell", false),
         ];
 
-        let target = resolve_action_window(&windows, "proj-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&windows, "proj", "proj-1", WORK_WINDOW_NAME).unwrap();
 
         assert_eq!(target.window_name, "work");
         assert!(target.session_exists);
@@ -344,27 +351,27 @@ mod tests {
     #[test]
     fn resolve_action_window_suffixes_past_a_dead_predecessor() {
         let windows = vec![
-            window("tm-proj-1", "fix", true),
-            window("tm-proj-1", "shell", false),
+            window("tm-proj-proj-1", "fix", true),
+            window("tm-proj-proj-1", "shell", false),
         ];
 
-        let target = resolve_action_window(&windows, "PROJ-1", FIX_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&windows, "proj", "PROJ-1", FIX_WINDOW_NAME).unwrap();
 
         assert_eq!(target.window_name, "fix-2");
     }
 
     #[test]
     fn resolve_action_window_refuses_while_the_action_is_live() {
-        let windows = vec![window("tm-proj-1", "work", false)];
+        let windows = vec![window("tm-proj-proj-1", "work", false)];
 
-        let err = resolve_action_window(&windows, "PROJ-1", WORK_WINDOW_NAME).unwrap_err();
+        let err = resolve_action_window(&windows, "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap_err();
 
         match err {
             InteractiveLaunchError::AlreadyRunning {
                 session_name,
                 window_name,
             } => {
-                assert_eq!(session_name, "tm-proj-1");
+                assert_eq!(session_name, "tm-proj-proj-1");
                 assert_eq!(window_name, "work");
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
@@ -375,20 +382,20 @@ mod tests {
     fn resolve_action_window_refuses_while_a_repeat_of_the_action_is_live() {
         // `fix-2`'s action is still `fix` (see `tmux::window_action`), so a
         // live second pass blocks a third.
-        let windows = vec![window("tm-proj-1", "fix-2", false)];
+        let windows = vec![window("tm-proj-proj-1", "fix-2", false)];
 
-        let err = resolve_action_window(&windows, "PROJ-1", FIX_WINDOW_NAME).unwrap_err();
+        let err = resolve_action_window(&windows, "proj", "PROJ-1", FIX_WINDOW_NAME).unwrap_err();
 
         assert!(matches!(err, InteractiveLaunchError::AlreadyRunning { .. }));
     }
 
     #[test]
     fn resolve_action_window_ignores_another_tickets_live_window() {
-        let windows = vec![window("tm-proj-2", "work", false)];
+        let windows = vec![window("tm-proj-proj-2", "work", false)];
 
-        let target = resolve_action_window(&windows, "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&windows, "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
 
-        assert_eq!(target.session_name, "tm-proj-1");
+        assert_eq!(target.session_name, "tm-proj-proj-1");
         assert!(!target.session_exists);
     }
 
@@ -440,7 +447,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
         let prompt_path = tmp.path().join("state/proj-1.prompt.md");
         let prepared = prepared(&worktree, "do the thing");
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_interactive_run(&tmux, &target, &prepared, &prompt_path).unwrap();
@@ -451,19 +458,19 @@ mod tests {
             tmux.calls(),
             vec![
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: dir.clone(),
                     window_name: "work".to_string(),
                     env: vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string())],
                     command,
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "shell".to_string(),
                     dir,
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "work".to_string(),
                 },
             ]
@@ -480,8 +487,8 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
         let prompt_path = tmp.path().join("state/proj-1.prompt.md");
         let prepared = prepared(&worktree, "fix the comments");
-        let windows = vec![window("tm-proj-1", "audit", true)];
-        let target = resolve_action_window(&windows, "PROJ-1", FIX_WINDOW_NAME).unwrap();
+        let windows = vec![window("tm-proj-proj-1", "audit", true)];
+        let target = resolve_action_window(&windows, "proj", "PROJ-1", FIX_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_interactive_run(&tmux, &target, &prepared, &prompt_path).unwrap();
@@ -496,7 +503,7 @@ mod tests {
                     ..
                 },
             ] => {
-                assert_eq!(name, "tm-proj-1");
+                assert_eq!(name, "tm-proj-proj-1");
                 assert_eq!(window_name, "fix");
                 assert_eq!(dir, &worktree.to_string_lossy().into_owned());
                 assert_eq!(
@@ -517,7 +524,7 @@ mod tests {
     fn launch_interactive_run_never_passes_the_supervisor_owned_run_id_var() {
         let tmp = tempdir().unwrap();
         let prepared = prepared(&tmp.path().join("wt"), "do the thing");
-        let target = resolve_action_window(&[], "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_interactive_run(&tmux, &target, &prepared, &tmp.path().join("p.md")).unwrap();

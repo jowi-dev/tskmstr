@@ -206,7 +206,7 @@ pub trait TmuxOps {
     ///
     /// This is the liveness signal for tmux-hosted actions. Session
     /// existence cannot serve that role: one session holds a ticket's whole
-    /// action history (`tm-<key>`, see [`crate::work::audit`]), so its
+    /// action history (`tm-<scope>-<key>`, see [`crate::work::audit`]), so its
     /// existence only means "this ticket has been touched" — it is the
     /// presence of a live window *named after the action* that means the
     /// action is running.

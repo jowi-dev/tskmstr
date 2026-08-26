@@ -82,22 +82,31 @@ pub fn session_name_from_dir(dir: &str) -> String {
     base.replace('.', "-")
 }
 
-/// The deterministic tmux session name for ticket `key`: `tm-<lowercased
-/// key>`.
+/// The deterministic tmux session name for ticket `key` in the scope named
+/// by `scope_slug`: `tm-<scope_slug>-<lowercased key>`.
 ///
 /// One session per ticket, holding one window per action taken against it
-/// (`audit`, `work`, `bugbot`, `fix`, `shell`, …), so `tmux attach -t
-/// tm-proj-123` shows a ticket's whole history and finishing with it is one
-/// `kill-session`. Deterministic so the board can map a ticket to its session
-/// by name alone, with no lookup through the run store — this replaced the
+/// (`audit`, `work`, `bugbot`, `fix`, `shell`, …), so attaching to it shows
+/// a ticket's whole history and finishing with it is one `kill-session`.
+/// Deterministic so the board can map a ticket to its session by name
+/// alone, with no lookup through the run store — this replaced the
 /// per-action `tm-audit-<key>` / `tm-bugbot-<key>` sessions, which split one
 /// ticket across several unrelated tmux sessions.
 ///
-/// Lowercased only — never otherwise transformed — so uppercasing the suffix
-/// recovers the original (always-uppercase) Jira key exactly; the board's
-/// liveness mapping depends on that round trip.
-pub fn ticket_session_name(key: &str) -> String {
-    format!("tm-{}", key.to_lowercase())
+/// `scope_slug` is [`crate::config::BackendIdentity::session_slug`]: tmux
+/// session names are global to the tmux server, and GitHub issue numbers
+/// restart at 1 in every repo, so an unscoped `tm-gh-3` would alias two
+/// repos' unrelated tickets into one session (GitHub issue #10).
+///
+/// The key is lowercased only — never otherwise transformed — so uppercasing
+/// the suffix after stripping the `tm-<scope_slug>-` prefix recovers the
+/// original (always-uppercase) ticket key exactly; the board's liveness
+/// mapping depends on that round trip. The `-` separator can in principle
+/// still alias (a repo named `<other>-gh` and issue `3` collide with
+/// `<other>`'s `GH-3`), but tmux reserves every character that would make
+/// the separator unambiguous (`.`/`:`), so that residual case is accepted.
+pub fn ticket_session_name(scope_slug: &str, key: &str) -> String {
+    format!("tm-{}-{}", scope_slug, key.to_lowercase())
 }
 
 /// Format a broken-down local time as `work.ml`'s `timestamp` does:
@@ -393,18 +402,35 @@ mod tests {
 
     #[test]
     fn ticket_session_name_lowercases_the_key() {
-        assert_eq!(ticket_session_name("PROJ-123"), "tm-proj-123");
+        assert_eq!(ticket_session_name("proj", "PROJ-123"), "tm-proj-proj-123");
+    }
+
+    #[test]
+    fn ticket_session_name_scopes_by_the_repo_slug() {
+        // Two repos' issue #3 must land in two distinct tmux sessions —
+        // tmux session names are global to the server (GitHub issue #10).
+        assert_ne!(
+            ticket_session_name("jowi-dev-tskmstr", "GH-3"),
+            ticket_session_name("jowi-dev-otherrepo", "GH-3")
+        );
+        assert_eq!(
+            ticket_session_name("jowi-dev-tskmstr", "GH-3"),
+            "tm-jowi-dev-tskmstr-gh-3"
+        );
     }
 
     #[test]
     fn ticket_session_name_round_trips_back_to_the_key() {
-        // The board's window-name liveness mapping strips `tm-` and
-        // uppercases; that only recovers the key because lowercasing is the
-        // sole transformation here.
+        // The board's window-name liveness mapping strips its own scope's
+        // `tm-<slug>-` prefix and uppercases; that only recovers the key
+        // because lowercasing is the sole transformation applied to it here.
         let key = "PROJ-123";
-        let session = ticket_session_name(key);
+        let session = ticket_session_name("some-scope", key);
         assert_eq!(
-            session.strip_prefix("tm-").unwrap().to_uppercase(),
+            session
+                .strip_prefix("tm-some-scope-")
+                .unwrap()
+                .to_uppercase(),
             key.to_string()
         );
     }

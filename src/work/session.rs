@@ -1,9 +1,9 @@
 //! Ticket-session reconstruction: issue #2 phase 4 of
 //! `docs/plans/one-session-per-ticket.md`.
 //!
-//! A ticket's `tm-<key>` session is convenience, not state. It dies with the
+//! A ticket's `tm-<scope>-<key>` session is convenience, not state. It dies with the
 //! tmux server — a reboot, a `tmux kill-server`, an accidental `tmux
-//! kill-session -t tm-proj-1` — while the run rows and log files that record
+//! kill-session -t tm-proj-proj-1` — while the run rows and log files that record
 //! what actually happened do not. [`plan_session`] rebuilds the session from
 //! those rows, so losing it costs nothing but a keystroke.
 //!
@@ -92,7 +92,8 @@ pub struct PlannedWindow {
 /// What [`reconstruct_session`] is going to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPlan {
-    /// The ticket's session name (`tm-<lowercased key>`).
+    /// The ticket's session name (`tm-<scope slug>-<lowercased key>`, see
+    /// [`ticket_session_name`]).
     pub session_name: String,
     /// Whether the session already exists — a session always has at least
     /// one window, so an empty window list means it does not.
@@ -105,6 +106,11 @@ pub struct SessionPlan {
 /// (chronological, as [`crate::runs::RunStore::runs_for_ticket`] returns
 /// them) and `windows`, a [`TmuxOps::list_windows`] snapshot.
 ///
+/// `scope_slug` is the current repo's
+/// [`crate::config::BackendIdentity::session_slug`], qualifying the session
+/// name so same-numbered tickets in different repos never share a session
+/// (GitHub issue #10).
+///
 /// Pure, so the whole decision table above is testable against plain row and
 /// name lists. `viewer_command` builds a headless run's follow command
 /// (injected rather than called directly so this stays independent of how the
@@ -114,12 +120,13 @@ pub struct SessionPlan {
 /// worktree, which is the ticket's current worktree; windows are append-only,
 /// so a `shell` that predates reconstruction keeps whatever root it had.
 pub fn plan_session(
+    scope_slug: &str,
     session_key: &str,
     runs: &[Run],
     windows: &[crate::work::tmux::TmuxWindow],
     viewer_command: &dyn Fn(i64) -> String,
 ) -> SessionPlan {
-    let session_name = ticket_session_name(session_key);
+    let session_name = ticket_session_name(scope_slug, session_key);
     let mut existing = session_window_names(windows, &session_name);
     let session_exists = !existing.is_empty();
     let mut planned = Vec::new();
@@ -262,7 +269,7 @@ mod tests {
 
     fn window(name: &str, dead: bool) -> TmuxWindow {
         TmuxWindow {
-            session: "tm-proj-1".to_string(),
+            session: "tm-proj-proj-1".to_string(),
             name: name.to_string(),
             dead,
         }
@@ -285,9 +292,9 @@ mod tests {
     fn a_live_headless_run_is_rebuilt_as_a_log_viewer() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
 
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
 
-        assert_eq!(plan.session_name, "tm-proj-1");
+        assert_eq!(plan.session_name, "tm-proj-proj-1");
         assert!(!plan.session_exists);
         assert_eq!(
             plan.windows,
@@ -319,7 +326,7 @@ mod tests {
         lane.session_id = Some("sess-abc".to_string());
         let runs = vec![lane];
 
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
 
         assert_eq!(plan.windows[0].name, "work");
         assert_eq!(
@@ -344,7 +351,7 @@ mod tests {
             run(3, "review-fix", RunStatus::Interrupted, None),
         ];
 
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -361,7 +368,7 @@ mod tests {
             run(3, "review-fix", RunStatus::Queued, Some("/state/b.log")),
         ];
 
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -374,7 +381,7 @@ mod tests {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("work", false), window("shell", false)];
 
-        let plan = plan_session("PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
 
         assert!(plan.session_exists);
         assert!(
@@ -389,7 +396,7 @@ mod tests {
         let runs = vec![run(7, "review-fix", RunStatus::Running, Some("/s/a.log"))];
         let windows = vec![window("fix-2", false), window("shell", false)];
 
-        let plan = plan_session("PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
 
         assert!(plan.windows.is_empty());
     }
@@ -399,7 +406,7 @@ mod tests {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("work", true), window("shell", false)];
 
-        let plan = plan_session("PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -410,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_ticket_with_no_runs_plans_nothing() {
-        let plan = plan_session("PROJ-1", &[], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer);
 
         assert!(plan.windows.is_empty());
     }
@@ -422,7 +429,7 @@ mod tests {
         let mut lane = run(2, "lane", RunStatus::Done, Some("/s/a.log"));
         lane.worktree = "/wt/proj-1".to_string();
 
-        let plan = plan_session("PROJ-1", &[audit, lane], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[audit, lane], &[], &viewer);
 
         assert_eq!(plan.windows[0].name, "shell");
         assert_eq!(plan.windows[0].dir, "/wt/proj-1");
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn reconstruct_creates_the_session_from_the_first_planned_window() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -440,19 +447,19 @@ mod tests {
             tmux.calls(),
             vec![
                 TmuxCall::NewSessionWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/wt/proj-1".to_string(),
                     window_name: "work".to_string(),
                     env: Vec::new(),
                     command: "tm runs logs 7 --follow".to_string(),
                 },
                 TmuxCall::NewWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "shell".to_string(),
                     dir: "/wt/proj-1".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "work".to_string(),
                 },
             ]
@@ -463,7 +470,7 @@ mod tests {
     fn reconstruct_appends_every_window_when_the_session_survives() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("shell", false)];
-        let plan = plan_session("PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -472,14 +479,14 @@ mod tests {
             tmux.calls(),
             vec![
                 TmuxCall::NewWindowWithCommand {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window_name: "work".to_string(),
                     dir: "/wt/proj-1".to_string(),
                     env: Vec::new(),
                     command: "tm runs logs 7 --follow".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "work".to_string(),
                 },
             ]
@@ -489,7 +496,7 @@ mod tests {
     #[test]
     fn reconstruct_creates_a_shell_only_session_when_nothing_is_in_flight() {
         let runs = vec![run(1, "lane", RunStatus::Done, Some("/s/a.log"))];
-        let plan = plan_session("PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -498,12 +505,12 @@ mod tests {
             tmux.calls(),
             vec![
                 TmuxCall::NewSession {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     dir: "/wt/proj-1".to_string(),
                     primary_window: "shell".to_string(),
                 },
                 TmuxCall::SelectWindow {
-                    name: "tm-proj-1".to_string(),
+                    name: "tm-proj-proj-1".to_string(),
                     window: "shell".to_string(),
                 },
             ]
@@ -512,7 +519,7 @@ mod tests {
 
     #[test]
     fn reconstruct_touches_nothing_for_an_empty_plan() {
-        let plan = plan_session("PROJ-1", &[], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
