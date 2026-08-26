@@ -115,12 +115,12 @@ tm auth status
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
 | `tm work list` | List every current tmux session with a worktree/session kind column |
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
-| `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
-| `tm work clean <KEY>` | Finish with `<KEY>`: one `kill-session` on `tm-<key>` plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
+| `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<scope>-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
+| `tm work clean <KEY>` | Finish with `<KEY>`: one `kill-session` on `tm-<scope>-<key>` plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
-| `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
+| `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
-| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 
 ## `tm runs`
 
@@ -510,8 +510,8 @@ picker (GitHub issue #5).
 
 Interactive by default: provisioning/preflight run in the foreground so
 errors surface immediately, then `claude` is launched in a `work` window of
-the ticket's `tm-<key>` tmux session and the invocation returns the terminal
-right away. `tmux attach -t tm-<key>` to watch or steer the run mid-flight.
+the ticket's `tm-<scope>-<key>` tmux session and the invocation returns the terminal
+right away. `tmux attach -t tm-<scope>-<key>` to watch or steer the run mid-flight.
 The run row is finished by the session's own `SessionEnd` hook, so the
 prompt opens by telling the session to run `tm runs register --kind lane
 <KEY>` — that is what lets it adopt the run row `tm work run` pre-registered
@@ -589,7 +589,7 @@ to" windows.
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
-| `s` | Attach to the selected ticket's `tm-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
+| `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
@@ -659,11 +659,24 @@ Unassigned`).
 ### One tmux session per ticket
 
 Every action tskmstr takes against a ticket runs in a window of that
-ticket's own detached tmux session, named `tm-<lowercased key>` — the audit
-in a window named `audit`, the bugbot-cleanup session in `bugbot`, plus a
-plain `shell` window rooted where the session was created, for
-`claude --resume`, manual git work, and running tests. So `tmux attach -t
-tm-proj-123` shows one ticket's whole history, live windows included.
+ticket's own detached tmux session, named `tm-<scope>-<lowercased key>` —
+the audit in a window named `audit`, the bugbot-cleanup session in
+`bugbot`, plus a plain `shell` window rooted where the session was created,
+for `claude --resume`, manual git work, and running tests. So `tmux attach
+-t tm-proj-proj-123` shows one ticket's whole history, live windows
+included.
+
+The `<scope>` segment is the repo's backend identity slug — the lowercased
+`owner-name` repo slug under the GitHub backend, the lowercased project key
+under Jira. tmux session names are global to the tmux server, and GitHub
+issue numbers restart at 1 in every repo, so an unscoped `tm-gh-3` would
+alias two repos' unrelated `GH-3` tickets into one session; the scope
+segment keeps them apart, and each repo's board only recognizes sessions
+carrying its own prefix. The same scoping applies inside `runs.db`: runs,
+audit/retro verdicts, and the local `ticket_rank` table are all recorded
+under the repo's scope, so ranking `GH-3` on one repo's board never touches
+another repo's `GH-3`. Rows written before scoping existed stay readable
+from every repo.
 
 Windows are append-only: nothing renames or reorders them, so window order
 is the action history. A repeat action whose window name is still taken
@@ -763,7 +776,7 @@ below.
 ### Board-launched audit sessions
 
 Pressing `a` on a board ticket launches a ticket-audit Claude session for
-it in the `audit` window of its `tm-<key>` session — several tickets can
+it in the `audit` window of its `tm-<scope>-<key>` session — several tickets can
 run concurrently. Pressing `a` again on the same ticket attaches the
 terminal to that session (the board suspends, tmux takes over; detach with
 `C-b d` to land back on the board). Launching requires:
@@ -863,7 +876,7 @@ unresolved findings. Zero unresolved findings always goes straight to
 When there are findings, the watcher writes them to
 `${XDG_DATA_HOME:-~/.local/share}/tskmstr/findings/<key>.json` before
 finishing, and the cleanup session (the `bugbot` window of the ticket's
-`tm-<key>` session, launched the same way the `audit` window is) runs
+`tm-<scope>-<key>` session, launched the same way the `audit` window is) runs
 `prompt` with both `{key}` and `{findings_file}` substituted. Unlike the
 audit session, nothing in this repo calls `tm ticket audit` for you
 inside the cleanup conversation — the axiom-side `/bugbot-triage` skill's
@@ -902,8 +915,8 @@ same shape as `w`/`b`: `tm review fix` resolves the ticket's lane run,
 renders its captured `vdiff` comments via `vdiff --export-comments`, and
 dispatches a tracked run in the ticket's existing worktree and branch — no
 new worktree, no new branch. The pass itself runs interactively in a `fix`
-window of the ticket's `tm-<key>` session (`fix-2` for a second pass), so
-`tmux attach -t tm-<key>` shows it alongside the ticket's other actions. Its run rows
+window of the ticket's `tm-<scope>-<key>` session (`fix-2` for a second pass), so
+`tmux attach -t tm-<scope>-<key>` shows it alongside the ticket's other actions. Its run rows
 use `kind = "review-fix"`, so they never shadow the lane run and show up
 separately in `tm runs`; there is no board badge for them yet, so track
 progress via `tm runs` or the run-detail overlay (`v`). A ticket with no
