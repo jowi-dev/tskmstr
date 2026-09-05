@@ -109,6 +109,25 @@ pub fn ticket_session_name(scope_slug: &str, key: &str) -> String {
     format!("tm-{}-{}", scope_slug, key.to_lowercase())
 }
 
+/// The deterministic tmux session name for the scope's single board-launched
+/// ticket-*creation* session: `tm-<scope_slug>-create` (GitHub issue #15).
+///
+/// Keyless by necessity — no ticket exists yet when the session launches, so
+/// [`ticket_session_name`]'s per-key naming cannot apply. One create session
+/// per scope: a second launch attaches to the live one instead of starting a
+/// parallel draft.
+///
+/// The `create` suffix cannot collide with a real ticket's session: every
+/// backend's keys take the `<PREFIX>-<number>` shape (`PROJ-123`, `GH-3`),
+/// so [`ticket_session_name`]'s lowercased key always contains a digit,
+/// which bare `create` never does. The board's liveness maps are safe too:
+/// they only recognize sessions holding a live window named after a ticket
+/// *action* (`audit`, `bugbot`, ...), and a create session's windows are
+/// named `create`.
+pub fn create_session_name(scope_slug: &str) -> String {
+    format!("tm-{scope_slug}-create")
+}
+
 /// Format a broken-down local time as `work.ml`'s `timestamp` does:
 ///
 /// ```ocaml
@@ -433,6 +452,32 @@ mod tests {
                 .to_uppercase(),
             key.to_string()
         );
+    }
+
+    #[test]
+    fn create_session_name_is_keyless_and_scope_qualified() {
+        assert_eq!(
+            create_session_name("jowi-dev-tskmstr"),
+            "tm-jowi-dev-tskmstr-create"
+        );
+        // Scoped for the same reason ticket sessions are (GitHub issue #10):
+        // tmux session names are global to the server.
+        assert_ne!(
+            create_session_name("jowi-dev-tskmstr"),
+            create_session_name("jowi-dev-otherrepo")
+        );
+    }
+
+    #[test]
+    fn create_session_name_cannot_collide_with_a_ticket_session() {
+        // Every real key lowercases to something containing a digit, so no
+        // ticket's session can equal the scope's create session.
+        for key in ["GH-15", "PROJ-123", "AX-1"] {
+            assert_ne!(
+                ticket_session_name("scope", key),
+                create_session_name("scope")
+            );
+        }
     }
 
     #[test]
