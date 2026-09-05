@@ -2953,7 +2953,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo/root"))).expect("should merge");
+        let cfg =
+            merge_work(None, Some(repo), Some(Path::new("/repo/root"))).expect("should merge");
         assert_eq!(cfg.manual.dir, Some("/repo/root/subdir".to_string()));
     }
 

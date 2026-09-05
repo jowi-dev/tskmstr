@@ -24,7 +24,7 @@ use thiserror::Error;
 use crate::config::{BackendIdentity, ManualConfig};
 use crate::work::naming::{expand_tilde, ticket_session_name};
 use crate::work::tmux::{
-    has_live_window, session_window_names, unique_window_name, TmuxError, TmuxOps,
+    TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
 
 /// Why a manual session could not be ensured.
