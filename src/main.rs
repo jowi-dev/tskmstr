@@ -749,6 +749,7 @@ fn run_init(
         origin_default_branch,
         hooks_installed,
         hook_installer: &hook_installer,
+        runner: init_runner,
     };
     let mut prompter = RealPrompter;
     let mut stdout = std::io::stdout();

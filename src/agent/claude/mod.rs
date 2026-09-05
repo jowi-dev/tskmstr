@@ -150,6 +150,14 @@ impl AgentRunner for ClaudeRunner {
         "claude"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn skills_dir(&self, base: &Path) -> PathBuf {
+        base.join(".claude/skills")
+    }
+
     /// Build the [`AgentInvocation`] for one run from already-resolved
     /// [`InvocationInputs`], applying the same model/max-turns/
     /// permission-mode defaults `work.ml`'s `run_lane` applies when a
@@ -445,6 +453,19 @@ mod tests {
             run_id: Some("run-123".to_string()),
             mode: RunMode::Headless,
         }
+    }
+
+    #[test]
+    fn display_name_is_claude_code() {
+        assert_eq!(ClaudeRunner.display_name(), "Claude Code");
+    }
+
+    #[test]
+    fn skills_dir_is_dot_claude_skills() {
+        assert_eq!(
+            ClaudeRunner.skills_dir(Path::new("/repo")),
+            PathBuf::from("/repo/.claude/skills")
+        );
     }
 
     #[test]

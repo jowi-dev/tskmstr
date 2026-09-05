@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::agent::AgentRunner;
 use crate::config::{self, BackendKind, Config, ConfigError, ConfigPaths, GlobalConfigSeed};
 use crate::github::gh_cli::GhCli;
 use crate::keychain::{KeychainError, KeychainStore};
@@ -68,6 +69,11 @@ pub struct InitContext<'a> {
     pub hooks_installed: bool,
     /// Performs `tm work hooks install --user`; `Err` is a display message.
     pub hook_installer: &'a dyn Fn(&mut dyn Write) -> Result<(), String>,
+    /// The AI coding agent this wizard onboards session assets for (`tm
+    /// init` runs before any config necessarily exists, so this is the
+    /// default runner — see `main.rs`'s `run_init`, which mirrors
+    /// `agent_runner_or_default`'s other no-config callers).
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// `tm init`: inspect the repo, ask the questions the config files would
@@ -253,7 +259,10 @@ pub fn run_init(
         && ask_confirm(
             yes,
             prompter,
-            "Install the Claude Code session hooks (tm work hooks install --user)?",
+            &format!(
+                "Install the {} session hooks (tm work hooks install --user)?",
+                ctx.runner.display_name()
+            ),
             false,
         )?;
 
@@ -418,7 +427,7 @@ fn session_step(
         .unwrap_or(section.default_prompt)
         .to_string();
     let resolved_dir = resolve_repo_relative(&dir, &repo_dir, ctx.home);
-    warn_if_skill_missing(out, &prompt, &resolved_dir, ctx.home)?;
+    warn_if_skill_missing(ctx, out, &prompt, &resolved_dir)?;
     Ok(())
 }
 
@@ -426,10 +435,10 @@ fn session_step(
 /// exists neither in the session directory's repo-local skills nor in the
 /// user-level ones.
 fn warn_if_skill_missing(
+    ctx: &InitContext,
     out: &mut dyn Write,
     prompt: &str,
     dir: &Path,
-    home: &Path,
 ) -> io::Result<()> {
     let Some(skill) = prompt
         .split_whitespace()
@@ -438,8 +447,8 @@ fn warn_if_skill_missing(
     else {
         return Ok(());
     };
-    let repo_skill = dir.join(".claude/skills").join(skill);
-    let home_skill = home.join(".claude/skills").join(skill);
+    let repo_skill = ctx.runner.skills_dir(dir).join(skill);
+    let home_skill = ctx.runner.skills_dir(ctx.home).join(skill);
     if repo_skill.exists() || home_skill.exists() {
         return Ok(());
     }
@@ -671,8 +680,8 @@ fn audit_existing_lane_prompts(
 
 /// Where an already-configured lane's prompt file resolves to, mirroring
 /// `resolve_prompt_path` in `src/work/run.rs`: the lane's `prompt_file`
-/// (relative to the repo root), else the `~/.claude/prompts/<lane>.md`
-/// fallback the run would use.
+/// (relative to the repo root), else the runner's own default lane-prompt
+/// path (`~/.claude/prompts/<lane>.md` for `claude`) the run would use.
 fn existing_lane_prompt_path(
     ctx: &InitContext,
     doc: &DocumentMut,
@@ -681,7 +690,7 @@ fn existing_lane_prompt_path(
 ) -> PathBuf {
     match str_at(doc, &["work", "lanes", lane, "prompt_file"]) {
         Some(value) => resolve_repo_relative(value, repo_dir, ctx.home),
-        None => ctx.home.join(format!(".claude/prompts/{lane}.md")),
+        None => ctx.runner.default_lane_prompt_path(ctx.home, lane),
     }
 }
 
@@ -898,6 +907,7 @@ fn write_repo_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::cli::FakePrompter;
     use crate::github::gh_cli::{FakeGhCli, GhError};
     use crate::keychain::InMemoryKeychain;
@@ -954,6 +964,7 @@ mod tests {
             origin_default_branch: Some("main".to_string()),
             hooks_installed: true,
             hook_installer: &no_hook_installer,
+            runner: &ClaudeRunner,
         }
     }
 
@@ -1107,6 +1118,7 @@ mod tests {
             origin_default_branch: None,
             hooks_installed: true,
             hook_installer: &no_hook_installer,
+            runner: &ClaudeRunner,
         }
     }
 

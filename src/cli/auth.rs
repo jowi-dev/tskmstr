@@ -137,7 +137,7 @@ fn bootstrap_config(
         review_bots: vec!["cursor[bot]".to_string()],
         board_column_order: Vec::new(),
         work: config::WorkConfig::default(),
-        agent: config::AgentKind::Claude,
+        agent: config::AgentKind::default(),
     })
 }
 

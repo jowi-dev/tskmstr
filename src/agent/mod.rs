@@ -410,6 +410,18 @@ pub trait AgentRunner {
     /// Short name, e.g. `"claude"` — branch-owner fallback and display.
     fn name(&self) -> &'static str;
 
+    /// Human-readable product name for user-facing prose, e.g. `"Claude
+    /// Code"` — distinct from [`AgentRunner::name`], which is the CLI/program
+    /// identifier used for branch-owner fallback and internal display, not
+    /// prose a user reads. Used by `tm init`'s hook-install prompt.
+    fn display_name(&self) -> &'static str;
+
+    /// Where this runner discovers slash-command skills under a repo
+    /// checkout or a home directory, e.g. `<base>/.claude/skills`. Used by
+    /// `tm init`'s "does the skill this lane's prompt invokes exist"
+    /// probes, once against the repo dir and once against `home`.
+    fn skills_dir(&self, base: &Path) -> PathBuf;
+
     /// Build one run's argv/env (headless or interactive).
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation;
 
@@ -545,4 +557,112 @@ pub trait AgentRunner {
     /// leading `"claude-"` prefix; an adapter whose model names carry no
     /// such prefix returns `model` unchanged.
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// Files allowed to carry a functional (non-test) `claude`/`anthropic`
+    /// literal outside `src/agent/`, per
+    /// `no_agent_literals_outside_the_adapter_module`'s doc comment.
+    const ALLOWLIST: &[&str] = &[
+        // `AgentKind::Claude` — ADR-0003's one-enum rule (mirrored by
+        // `docs/decisions/0004-agent-runners.md`) sanctions the discriminant
+        // living here, the same way `BackendKind::Jira`/`Github` live in
+        // this same file.
+        "src/config/mod.rs",
+        // `agent_runner_for`'s one `match` on `AgentKind` — the one factory
+        // dispatch site `docs/plans/agent-runner.md` calls for.
+        "src/main.rs",
+    ];
+
+    /// Recursively collects every `.rs` file under `dir`.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read_dir({}): {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Strips `//`-to-end-of-line comments (this naively covers `///` and
+    /// `//!` doc comments too, and is fine for this purpose: URLs containing
+    /// `//` inside a string literal are rare enough in this codebase not to
+    /// produce a false negative, and we only care about false positives
+    /// disappearing, never new ones appearing) and drops everything from the
+    /// first line equal to `#[cfg(test)]` onward (test modules sit at file
+    /// end in this codebase), returning the remaining lines paired with
+    /// their original 1-indexed line numbers.
+    fn strip_comments_and_tests(contents: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (idx, line) in contents.lines().enumerate() {
+            if line.trim() == "#[cfg(test)]" {
+                break;
+            }
+            let stripped = match line.find("//") {
+                Some(pos) => &line[..pos],
+                None => line,
+            };
+            out.push((idx + 1, stripped.to_string()));
+        }
+        out
+    }
+
+    /// Grep-guard for `docs/plans/agent-runner.md`'s phase 7 acceptance
+    /// criterion: "no `claude`/`anthropic` literals outside the adapter
+    /// module, verifiable by grep". Walks every `.rs` file under `src/`
+    /// except `src/agent/**`, strips comments and trailing test modules (see
+    /// [`strip_comments_and_tests`]), and asserts no case-insensitive
+    /// `claude` or `anthropic` substring remains in the functional code —
+    /// test fixtures asserting claude-specific behavior stay legal (they
+    /// live in `#[cfg(test)]` blocks or inside `src/agent/`), but a
+    /// functional literal (a hardcoded `"claude"` program name, a
+    /// user-facing string naming Claude Code, an `ANTHROPIC_*` env var) does
+    /// not. See [`ALLOWLIST`] for the two sanctioned exceptions.
+    #[test]
+    fn no_agent_literals_outside_the_adapter_module() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = manifest_dir.join("src");
+        let agent_dir = src_dir.join("agent");
+
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+
+        let mut violations = Vec::new();
+        for path in &files {
+            if path.starts_with(&agent_dir) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(manifest_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ALLOWLIST.contains(&rel.as_str()) {
+                continue;
+            }
+
+            let contents = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            for (line_no, line) in strip_comments_and_tests(&contents) {
+                let lower = line.to_lowercase();
+                if lower.contains("claude") || lower.contains("anthropic") {
+                    violations.push(format!("{rel}:{line_no}: {}", line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "found claude/anthropic literals outside src/agent/ (and outside the allowlist):\n{}",
+            violations.join("\n")
+        );
+    }
 }
