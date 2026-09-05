@@ -29,16 +29,13 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::config::{AuditConfig, BackendIdentity};
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::naming::{expand_tilde, ticket_session_name};
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
-
-/// Default prompt template used when [`AuditConfig::prompt`] is unset. See
-/// [`audit_prompt`].
-const DEFAULT_PROMPT_TEMPLATE: &str = "/ticket-audit {key}";
 
 /// Environment variable name the launched session's `claude` process
 /// receives, carrying the pre-registered run id for
@@ -108,49 +105,12 @@ pub struct LaunchOutcome {
     pub window_name: String,
 }
 
-/// Substitutes `{key}` in `template` (or [`DEFAULT_PROMPT_TEMPLATE`] when
-/// `template` is `None`) with `key`, producing the prompt text handed to
-/// `claude` on launch.
-pub fn audit_prompt(template: Option<&str>, key: &str) -> String {
-    template
-        .unwrap_or(DEFAULT_PROMPT_TEMPLATE)
-        .replace("{key}", key)
-}
-
-/// Quotes `s` as a single POSIX shell word: wraps it in single quotes,
-/// escaping any embedded single quote as `'\''`. Needed because
-/// [`TmuxOps::new_session_with_command`]'s `command` argument is a single
-/// string tmux hands to the user's `$SHELL -c` — unlike the rest of this
-/// codebase's `Command`/argv-based shelling-out (which never touches a
-/// shell's string-splicing rules at all), this one positional string must
-/// itself be valid shell syntax.
-///
-/// Shared with [`crate::work::interactive`], which builds the same kind of
-/// command string for tmux-hosted work and fix runs.
-pub(crate) fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Builds the shell command line a tmux-hosted session runs: `claude` with an
-/// optional `--model` and `prompt` as its positional argument, every value
-/// [`shell_quote`]d.
-///
-/// `--model` is emitted only when `model` is `Some`, so an unconfigured launch
-/// keeps the exact command shape it had before the option existed. Passing the
-/// flag explicitly is what lets a launched session escape an
-/// enterprise-managed model pin — see [`crate::config::RawAuditConfig::model`].
-///
-/// Shared with [`crate::work::bugbot`]'s cleanup launcher, which hosts its
-/// sessions the same way.
-pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
-    match model {
-        Some(model) => format!(
-            "claude --model {} {}",
-            shell_quote(model),
-            shell_quote(prompt)
-        ),
-        None => format!("claude {}", shell_quote(prompt)),
-    }
+/// Substitutes `{key}` in `template` with `key`, producing the prompt text
+/// handed to the agent on launch. `template` is already resolved by the
+/// caller — [`launch_audit`] passes `audit_cfg.prompt`, falling back to
+/// [`AgentRunner::default_audit_prompt_template`] when unset.
+pub fn audit_prompt(template: &str, key: &str) -> String {
+    template.replace("{key}", key)
 }
 
 /// Launches (or refuses to double-launch) a ticket-audit session for `key`.
@@ -164,7 +124,8 @@ pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
 ///    pre-registration.
 /// 3. Otherwise pre-registers a run (`kind = "audit"`, `lane = "audit"`,
 ///    `pid = None`; see the module docs) and starts `claude <prompt>` (with
-///    `--model` when `audit_cfg.model` is set — see [`claude_command`]) in
+///    `--model` when `audit_cfg.model` is set — see
+///    [`AgentRunner::interactive_shell_command`]) in
 ///    that window, with `SESSION_RUN_ID_ENV` set to the new run's id so the
 ///    in-session `tm ticket audit` can adopt it. The session (plus its
 ///    [`SHELL_WINDOW_NAME`] window) is created if this is the ticket's first
@@ -181,12 +142,18 @@ pub(crate) fn claude_command(model: Option<&str>, prompt: &str) -> String {
 /// [`session_slug`](BackendIdentity::session_slug) qualifies the ticket's
 /// session name so same-numbered tickets in different repos never share a
 /// session (GitHub issue #10).
+///
+/// `runner` is the AI coding agent this session launches (Claude today; see
+/// [`AgentRunner`] and GitHub issue #17) — it supplies both the default
+/// prompt template (when `audit_cfg.prompt` is unset) and the rendered
+/// shell command.
 pub fn launch_audit(
     store: &RunStore,
     tmux: &dyn TmuxOps,
     audit_cfg: &AuditConfig,
     home: &Path,
     identity: &BackendIdentity,
+    runner: &dyn AgentRunner,
     key: &str,
 ) -> Result<LaunchOutcome, AuditLaunchError> {
     let raw_dir = audit_cfg
@@ -222,8 +189,12 @@ pub fn launch_audit(
         log_path: None,
     })?;
 
-    let prompt = audit_prompt(audit_cfg.prompt.as_deref(), key);
-    let command = claude_command(audit_cfg.model.as_deref(), &prompt);
+    let template = audit_cfg
+        .prompt
+        .as_deref()
+        .unwrap_or_else(|| runner.default_audit_prompt_template());
+    let prompt = audit_prompt(template, key);
+    let command = runner.interactive_shell_command(audit_cfg.model.as_deref(), &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
     if existing_windows.is_empty() {
@@ -247,6 +218,7 @@ pub fn launch_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::runs::RunStatus;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use std::path::PathBuf;
@@ -285,13 +257,16 @@ mod tests {
 
     #[test]
     fn audit_prompt_defaults_to_ticket_audit_template() {
-        assert_eq!(audit_prompt(None, "PROJ-1"), "/ticket-audit PROJ-1");
+        assert_eq!(
+            audit_prompt(ClaudeRunner.default_audit_prompt_template(), "PROJ-1"),
+            "/ticket-audit PROJ-1"
+        );
     }
 
     #[test]
     fn audit_prompt_substitutes_key_in_custom_template() {
         assert_eq!(
-            audit_prompt(Some("/custom-audit for {key} please"), "PROJ-1"),
+            audit_prompt("/custom-audit for {key} please", "PROJ-1"),
             "/custom-audit for PROJ-1 please"
         );
     }
@@ -304,8 +279,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("~/Projects/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect("launch should succeed");
+        let outcome = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-proj-1");
 
@@ -353,8 +336,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = AuditConfig::default();
 
-        let err = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect_err("should refuse to launch");
+        let err = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect_err("should refuse to launch");
 
         assert!(matches!(err, AuditLaunchError::NotConfigured));
         assert!(store.list_runs().unwrap().is_empty());
@@ -382,8 +373,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("~/Projects/axiom");
 
-        let err = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect_err("should refuse to double-launch");
+        let err = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect_err("should refuse to double-launch");
 
         match err {
             AuditLaunchError::AlreadyRunning {
@@ -412,8 +411,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect("launch should succeed");
+        let outcome = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "audit");
         assert_eq!(
@@ -441,8 +448,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        let outcome = launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect("launch should succeed");
+        let outcome = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "audit-2");
     }
@@ -456,8 +471,16 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let audit_cfg = configured("/repo/axiom");
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-1")
-            .expect("launch should succeed");
+        launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-1",
+        )
+        .expect("launch should succeed");
 
         assert!(
             tmux.calls()
@@ -480,7 +503,16 @@ mod tests {
             model: None,
         };
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-9").unwrap();
+        launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-9",
+        )
+        .unwrap();
 
         assert_eq!(
             launched_command(&tmux),
@@ -500,7 +532,16 @@ mod tests {
             model: Some("opus".to_string()),
         };
 
-        launch_audit(&store, &tmux, &audit_cfg, &home, &test_identity(), "PROJ-9").unwrap();
+        launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-9",
+        )
+        .unwrap();
 
         assert_eq!(
             launched_command(&tmux),

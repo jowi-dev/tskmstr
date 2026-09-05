@@ -178,6 +178,10 @@ pub struct TuiDeps {
     /// so same-numbered tickets in different repos never alias (GitHub
     /// issue #10).
     pub backend_identity: crate::config::BackendIdentity,
+    /// The AI coding agent board-launched audit/cleanup sessions run
+    /// (Claude today; see [`crate::agent::AgentRunner`] and GitHub issue
+    /// #17), selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    pub runner: &'static dyn crate::agent::AgentRunner,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
@@ -1326,6 +1330,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         &deps.audit,
         &deps.home,
         &deps.backend_identity,
+        deps.runner,
         key,
     ) {
         Ok(_) if deps.audit_dir_fallback => format!(
@@ -1357,6 +1362,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     let launch_deps = crate::work::bugbot::CleanupLaunchDeps {
         store,
         tmux: deps.tmux.as_ref(),
+        runner: deps.runner,
     };
     let request = crate::work::bugbot::CleanupLaunchRequest {
         cfg: &deps.review_watch,
@@ -1818,6 +1824,7 @@ mod tests {
                 base_url: "https://x.atlassian.net".to_string(),
                 project_key: "PROJ".to_string(),
             },
+            runner: &crate::agent::claude::ClaudeRunner,
         }
     }
 

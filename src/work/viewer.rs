@@ -44,7 +44,8 @@
 
 use std::path::Path;
 
-use crate::work::audit::{SHELL_WINDOW_NAME, shell_quote};
+use crate::agent::shell_quote;
+use crate::work::audit::SHELL_WINDOW_NAME;
 use crate::work::interactive::ActionWindow;
 use crate::work::tmux::{TmuxError, TmuxOps};
 

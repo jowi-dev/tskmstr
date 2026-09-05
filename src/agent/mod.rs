@@ -21,16 +21,38 @@
 //! out of `src/work/runner.rs` and behind [`AgentRunner::parse_outcome`],
 //! and adds [`AgentRunner::resume_command`] so every user-facing resume hint
 //! is sourced from the adapter instead of a `claude --resume` literal
-//! scattered across callers. Later phases add more methods to the trait
-//! (interactive shell-string rendering, telemetry deployment, pricing).
+//! scattered across callers. Phase 4 moves interactive shell-string
+//! rendering ([`AgentRunner::interactive_shell_command`],
+//! [`AgentRunner::tmux_command_line`]), the default audit/cleanup prompt
+//! templates, the default lane-prompt path, and the branch-owner fallback
+//! behind the trait, and moves the shared [`shell_quote`] helper here from
+//! `src/work/audit.rs`. Later phases add telemetry deployment and pricing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::runs::ModelUsageMap;
 
 pub mod claude;
+
+/// Quotes `s` as a single POSIX shell word: wraps it in single quotes,
+/// escaping any embedded single quote as `'\''`. Needed because
+/// [`crate::work::tmux::TmuxOps::new_session_with_command`]'s `command`
+/// argument is a single string tmux hands to the user's `$SHELL -c` —
+/// unlike the rest of this codebase's `Command`/argv-based shelling-out
+/// (which never touches a shell's string-splicing rules at all), this one
+/// positional string must itself be valid shell syntax.
+///
+/// Shared by every caller that renders a shell command line for a
+/// tmux-hosted session: [`crate::work::audit::launch_audit`],
+/// [`crate::work::bugbot::launch_cleanup`], and
+/// [`AgentRunner::tmux_command_line`]'s default implementation. Moved here
+/// (from `src/work/audit.rs`) in phase 4 of GitHub issue #17 so it sits
+/// alongside the shell-string rendering it backs.
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 /// Environment variable holding the tracked run id, exported for the
 /// `TSKMSTR_RUN_ID`-gated hooks (see `src/agent/claude/hooks.rs`, not yet
@@ -97,7 +119,7 @@ pub enum RunMode {
     #[default]
     Headless,
     /// A steerable session hosted in a tmux window: the prompt is
-    /// positional (as in [`crate::work::audit::claude_command`]), there is
+    /// positional (as in [`AgentRunner::interactive_shell_command`]), there is
     /// no turn budget to enforce and no result JSON to parse, and the run
     /// row is adopted and finished by the session's own hooks.
     Interactive,
@@ -257,4 +279,63 @@ pub trait AgentRunner {
     /// User-facing resume hint for a finished run's session id, e.g. `claude
     /// --resume <id>`.
     fn resume_command(&self, session_id: &str) -> String;
+
+    /// Shell command string for a tmux-hosted audit/bugbot session: the
+    /// adapter's CLI with an optional `--model` and `prompt` as its
+    /// positional argument. Replaces `work::audit::claude_command`.
+    fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String;
+
+    /// Render `invocation` into the shell command line a tmux window runs,
+    /// reading the prompt back from `prompt_file` rather than embedding it
+    /// directly (a fix prompt has no length bound, and `ARG_MAX` is a real
+    /// ceiling).
+    ///
+    /// Two things this must not lose:
+    ///
+    /// - **The `env -u` prefix.** [`AgentInvocation::env_remove`] is
+    ///   billing-safety critical and there is no `tmux` flag that *unsets*
+    ///   an environment variable (`-e` only sets), so it has to be
+    ///   re-expressed as `env -u` inside the command string. See that
+    ///   field's doc comment.
+    /// - **The double quotes around `$(cat ...)`.** Unquoted, the shell
+    ///   would word-split the prompt into hundreds of arguments.
+    ///
+    /// `invocation.args[0]` is the prompt under [`RunMode::Interactive`]
+    /// (the prompt is positional there), and it is what gets replaced by
+    /// the `cat`; every later argument is passed through [`shell_quote`]d.
+    /// This "prompt sits at `args[0]`" convention is part of
+    /// [`AgentInvocation`]'s interactive contract — an adapter whose
+    /// interactive invocation doesn't shape its argv this way must override
+    /// this default rather than rely on it.
+    ///
+    /// Provided default, ported from `work::interactive::tmux_command_line`
+    /// (deleted); `ClaudeRunner` uses it unmodified.
+    fn tmux_command_line(&self, invocation: &AgentInvocation, prompt_file: &Path) -> String {
+        let mut parts = vec!["env".to_string()];
+        for var in &invocation.env_remove {
+            parts.push("-u".to_string());
+            parts.push(var.clone());
+        }
+        parts.push(invocation.program.clone());
+        parts.push(format!(
+            "\"$(cat {})\"",
+            shell_quote(&prompt_file.to_string_lossy())
+        ));
+        for arg in invocation.args.iter().skip(1) {
+            parts.push(shell_quote(arg));
+        }
+        parts.join(" ")
+    }
+
+    /// Default prompt template used when `[work.audit].prompt` is unset,
+    /// e.g. `"/ticket-audit {key}"`.
+    fn default_audit_prompt_template(&self) -> &'static str;
+
+    /// Default prompt template used when `[work.review_watch].prompt` is
+    /// unset, e.g. `"/bugbot-triage {key} {findings_file}"`.
+    fn default_cleanup_prompt_template(&self) -> &'static str;
+
+    /// Default lane-prompt file path when neither `--prompt` nor the lane's
+    /// `prompt_file` is given, e.g. `~/.claude/prompts/<lane>.md`.
+    fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf;
 }

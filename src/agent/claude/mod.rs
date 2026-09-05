@@ -51,9 +51,13 @@
 //! rather than [`TSKMSTR_RUN_ID`](crate::agent::TSKMSTR_RUN_ID). See
 //! [`RunMode`].
 
+use std::path::{Path, PathBuf};
+
 use crate::agent::{
     AgentInvocation, AgentRunner, InvocationInputs, OutcomeParseError, RunMode, RunOutcome,
+    shell_quote,
 };
+use crate::work::naming::expand_tilde;
 
 /// Driver model default when a lane/run doesn't specify one, mirroring
 /// `run_lane`'s `let model = match opts.model with Some m -> m | None ->
@@ -112,10 +116,11 @@ impl AgentRunner for ClaudeRunner {
                 args.push("-p".to_string());
                 args.push(inputs.prompt);
             }
-            // Positional prompt, mirroring `audit::claude_command`'s
+            // Positional prompt, mirroring `interactive_shell_command`'s
             // `claude <prompt>`. Kept at `args[0]` so
-            // `interactive::tmux_command_line` can swap it for a
-            // `"$(cat <prompt file>)"` read without re-deriving the argv.
+            // `AgentRunner::tmux_command_line`'s default impl can swap it
+            // for a `"$(cat <prompt file>)"` read without re-deriving the
+            // argv.
             RunMode::Interactive => args.push(inputs.prompt),
         }
         args.push("--model".to_string());
@@ -223,6 +228,40 @@ impl AgentRunner for ClaudeRunner {
     fn resume_command(&self, session_id: &str) -> String {
         format!("claude --resume {session_id}")
     }
+
+    /// Builds `claude --model <model> <prompt>` (or `claude <prompt>` when
+    /// `model` is `None`), every value [`shell_quote`]d. `--model` is
+    /// emitted only when `model` is `Some`, so an unconfigured launch keeps
+    /// the exact command shape it had before the option existed. Moved
+    /// verbatim from `work::audit::claude_command` (deleted); shared by
+    /// [`crate::work::audit::launch_audit`] and
+    /// [`crate::work::bugbot::launch_cleanup`], which host their sessions
+    /// the same way.
+    fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String {
+        match model {
+            Some(model) => format!(
+                "claude --model {} {}",
+                shell_quote(model),
+                shell_quote(prompt)
+            ),
+            None => format!("claude {}", shell_quote(prompt)),
+        }
+    }
+
+    fn default_audit_prompt_template(&self) -> &'static str {
+        "/ticket-audit {key}"
+    }
+
+    fn default_cleanup_prompt_template(&self) -> &'static str {
+        "/bugbot-triage {key} {findings_file}"
+    }
+
+    /// `~/.claude/prompts/<lane>.md` — `work.ml`'s default lane-prompt
+    /// convention. The `.claude` directory is claude's, so this default is
+    /// claude-owned rather than a runner-agnostic constant.
+    fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf {
+        expand_tilde(&format!("~/.claude/prompts/{lane}.md"), home)
+    }
 }
 
 /// Raw shape of the `claude -p --output-format json` result, deserialized
@@ -247,7 +286,6 @@ struct RawResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn base_inputs() -> InvocationInputs {
         InvocationInputs {
@@ -272,6 +310,87 @@ mod tests {
             ClaudeRunner.resume_command("sess-123"),
             "claude --resume sess-123"
         );
+    }
+
+    #[test]
+    fn interactive_shell_command_quotes_model_and_prompt() {
+        assert_eq!(
+            ClaudeRunner.interactive_shell_command(Some("opus"), "/ticket-audit PROJ-9"),
+            "claude --model 'opus' '/ticket-audit PROJ-9'"
+        );
+        assert_eq!(
+            ClaudeRunner.interactive_shell_command(None, "/ticket-audit PROJ-9"),
+            "claude '/ticket-audit PROJ-9'"
+        );
+    }
+
+    #[test]
+    fn default_audit_prompt_template_is_ticket_audit() {
+        assert_eq!(
+            ClaudeRunner.default_audit_prompt_template(),
+            "/ticket-audit {key}"
+        );
+    }
+
+    #[test]
+    fn default_cleanup_prompt_template_is_bugbot_triage() {
+        assert_eq!(
+            ClaudeRunner.default_cleanup_prompt_template(),
+            "/bugbot-triage {key} {findings_file}"
+        );
+    }
+
+    #[test]
+    fn default_lane_prompt_path_is_home_claude_prompts() {
+        assert_eq!(
+            ClaudeRunner.default_lane_prompt_path(Path::new("/home/j"), "mylane"),
+            PathBuf::from("/home/j/.claude/prompts/mylane.md")
+        );
+    }
+
+    #[test]
+    fn tmux_command_line_strips_billing_env_and_reads_the_prompt_from_the_file() {
+        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
+            prompt: "do the thing".to_string(),
+            model: Some("fable".to_string()),
+            max_turns: Some("200".to_string()),
+            permission_mode: Some("acceptEdits".to_string()),
+            settings_path: PathBuf::from("/hooks/settings.json"),
+            run_id: Some("7".to_string()),
+            mode: RunMode::Interactive,
+        });
+
+        let command =
+            ClaudeRunner.tmux_command_line(&invocation, Path::new("/state/proj-1.prompt.md"));
+
+        assert_eq!(
+            command,
+            "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDECODE claude \
+             \"$(cat '/state/proj-1.prompt.md')\" '--model' 'fable' '--settings' \
+             '/hooks/settings.json' '--permission-mode' 'acceptEdits'"
+        );
+        assert!(
+            !command.contains("do the thing"),
+            "the prompt itself must never reach the command string — it is unbounded"
+        );
+    }
+
+    #[test]
+    fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
+        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
+            prompt: "prompt".to_string(),
+            model: Some("fable".to_string()),
+            max_turns: Some("200".to_string()),
+            permission_mode: Some("acceptEdits".to_string()),
+            settings_path: PathBuf::from("/hooks/settings.json"),
+            run_id: Some("7".to_string()),
+            mode: RunMode::Interactive,
+        });
+
+        let command =
+            ClaudeRunner.tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));
+
+        assert!(command.contains(r#""$(cat '/state/o'\''brien.prompt.md')""#));
     }
 
     #[test]

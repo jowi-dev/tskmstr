@@ -570,7 +570,7 @@ fn run_interactive(
         "{}-{}.prompt.md",
         prepared.wt_name, prepared.timestamp
     ));
-    launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path)?;
+    launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path, run_deps.runner)?;
 
     writeln!(
         out,

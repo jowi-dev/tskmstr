@@ -289,7 +289,7 @@ pub fn fix(
             "{}-{}.prompt.md",
             prepared.wt_name, prepared.timestamp
         ));
-        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path)?;
+        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path, deps.runner)?;
 
         writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
         writeln!(out, "worktree  {}", worktree.display())?;

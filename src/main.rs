@@ -134,6 +134,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         home: &home,
         xdg_data_home: xdg_data_home.as_deref(),
         identity: &backend_identity,
+        runner: agent_runner_for(&config),
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -509,6 +510,7 @@ fn run_board(
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
+    let runner = agent_runner_for(&config);
     let jira = ticket_provider_for(&config, keychain, env_token)?;
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
@@ -571,6 +573,7 @@ fn run_board(
         cwd,
         lanes,
         backend_identity: current_backend_identity,
+        runner,
     })?;
     Ok(())
 }

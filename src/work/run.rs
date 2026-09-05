@@ -464,13 +464,18 @@ pub fn sanitize_branch_owner(s: &str) -> String {
 /// 1. `git config --get j.branchOwner` — explicit per-machine override.
 /// 2. `gh api user -q .login` — the active `gh` session's GitHub handle.
 /// 3. `git config --get github.user` — a common local convention.
-/// 4. `"claude"` — fallback so runs never fail on naming.
+/// 4. [`AgentRunner::name`] — fallback so runs never fail on naming.
 ///
 /// Every source's failure (a `git`/`gh` error, not just "not found") is
 /// tolerated the same as an empty result, matching `work.ml`'s
 /// `2>/dev/null`-redirected shell-outs, which never distinguish "command
 /// failed" from "command printed nothing".
-pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> String {
+pub fn resolve_branch_owner(
+    git: &dyn GitOps,
+    gh: &dyn GhCli,
+    dir: &Path,
+    runner: &dyn AgentRunner,
+) -> String {
     let non_empty = |s: Option<String>| -> Option<String> {
         let sanitized = sanitize_branch_owner(&s?);
         if sanitized.is_empty() {
@@ -483,7 +488,7 @@ pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> Str
     non_empty(git.config_get(dir, "j.branchOwner").ok().flatten())
         .or_else(|| non_empty(gh.current_user_login().ok().flatten()))
         .or_else(|| non_empty(git.config_get(dir, "github.user").ok().flatten()))
-        .unwrap_or_else(|| "claude".to_string())
+        .unwrap_or_else(|| runner.name().to_string())
 }
 
 /// Resolve the human-readable slug to fold into a lane run's branch name
@@ -684,8 +689,10 @@ pub fn resolve_blocker_stacking(
 }
 
 /// Resolve the prompt file path for a lane run: `--prompt` override, else
-/// the lane's configured `prompt_file`, else `~/.claude/prompts/<lane>.md`
-/// (`work.ml`'s default). Every form is `~`-expanded against `home`.
+/// the lane's configured `prompt_file`, else
+/// [`runner`](AgentRunner::default_lane_prompt_path)'s default lane-prompt
+/// path (`~/.claude/prompts/<lane>.md` for `claude` — `work.ml`'s default).
+/// Every form is `~`-expanded against `home`.
 ///
 /// A relative lane `prompt_file` resolves against `repo_root`, not the
 /// process's cwd, so a lane prompt can live in the repo it instructs
@@ -700,6 +707,7 @@ fn resolve_prompt_path(
     lane_prompt_file: Option<&str>,
     repo_root: &Path,
     home: &Path,
+    runner: &dyn AgentRunner,
 ) -> PathBuf {
     if let Some(raw) = prompt_override {
         return expand_tilde(raw, home);
@@ -713,7 +721,7 @@ fn resolve_prompt_path(
                 repo_root.join(path)
             }
         }
-        None => expand_tilde(&format!("~/.claude/prompts/{lane}.md"), home),
+        None => runner.default_lane_prompt_path(home, lane),
     }
 }
 
@@ -869,6 +877,7 @@ pub fn prepare_run_lane(
         lane_config.prompt_file.as_deref(),
         &repo_root,
         &paths.home,
+        deps.runner,
     );
     if !prompt_path.exists() {
         return Err(RunLaneError::PromptFileMissing(prompt_path));
@@ -1008,7 +1017,7 @@ pub fn prepare_run_lane(
     // resolve_branch_collision against both a local and an
     // origin-remote-tracking ref before it's cut.
     let base = resolve_base(deps.git)?;
-    let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root);
+    let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root, deps.runner);
     let candidate = match resolve_ticket_slug(deps.ticket_provider, request.ticket.as_deref()) {
         Some(slug) => naming::branch_name_with_slug(&owner, &wt_name, &slug),
         None => naming::branch_name(&owner, &wt_name, &timestamp),
@@ -1592,7 +1601,7 @@ mod tests {
         let git = FakeGitOps::new().with_config_value("j.branchOwner", "from-git-config");
         let gh = FakeGhCli::new().with_current_user_login(Ok(Some("from-gh".to_string())));
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-git-config"
         );
     }
@@ -1602,7 +1611,7 @@ mod tests {
         let git = FakeGitOps::new();
         let gh = FakeGhCli::new().with_current_user_login(Ok(Some("from-gh".to_string())));
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-gh"
         );
     }
@@ -1612,7 +1621,7 @@ mod tests {
         let git = FakeGitOps::new().with_config_value("github.user", "from-github-user");
         let gh = FakeGhCli::new();
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-github-user"
         );
     }
@@ -1622,7 +1631,7 @@ mod tests {
         let git = FakeGitOps::new();
         let gh = FakeGhCli::new();
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "claude"
         );
     }
@@ -1636,6 +1645,7 @@ mod tests {
                 Some("prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/repo/prompts/mylane-lane.md")
         );
@@ -1650,6 +1660,7 @@ mod tests {
                 Some("/elsewhere/lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/elsewhere/lane.md")
         );
@@ -1660,6 +1671,7 @@ mod tests {
                 Some("~/prompts/lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/home/j/prompts/lane.md")
         );
@@ -1674,6 +1686,7 @@ mod tests {
                 Some("prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("scratch.md")
         );
@@ -1688,6 +1701,7 @@ mod tests {
                 None,
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/home/j/.claude/prompts/mylane.md")
         );

@@ -36,19 +36,21 @@
 //!
 //! tmux takes the window's command as a single string and hands it to the
 //! user's `$SHELL -c`. A fix prompt embeds the entire `vdiff
-//! --export-comments` markdown and has no length bound;
-//! [`crate::work::audit::shell_quote`] escapes correctly but cannot shorten
-//! anything, and `ARG_MAX` is a real ceiling. So the prompt is written to a
-//! file next to the run's other state and the command reads it back with
-//! `"$(cat '<path>')"` — the same trick `work.ml` used for its `-p` value.
+//! --export-comments` markdown and has no length bound; shell-quoting
+//! escapes correctly but cannot shorten anything, and `ARG_MAX` is a real
+//! ceiling. So the prompt is written to a file next to the run's other
+//! state and the command reads it back with `"$(cat '<path>')"` — the same
+//! trick `work.ml` used for its `-p` value. Rendering that command line is
+//! [`crate::agent::AgentRunner::tmux_command_line`]'s job (moved there in
+//! GitHub issue #17 phase 4, deleted from this module).
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::agent::AgentInvocation;
-use crate::work::audit::{SESSION_RUN_ID_ENV, SHELL_WINDOW_NAME, shell_quote};
+use crate::agent::AgentRunner;
+use crate::work::audit::{SESSION_RUN_ID_ENV, SHELL_WINDOW_NAME};
 use crate::work::naming::ticket_session_name;
 use crate::work::run::PreparedRun;
 use crate::work::tmux::{
@@ -145,48 +147,6 @@ pub fn resolve_action_window(
     })
 }
 
-/// The shell command line a tmux window runs for `invocation`, reading the
-/// prompt back from `prompt_file`:
-///
-/// ```text
-/// env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDECODE \
-///   claude "$(cat '<prompt_file>')" '--model' 'fable' '--settings' '<path>' \
-///   '--permission-mode' 'acceptEdits'
-/// ```
-///
-/// Flag names are quoted along with their values — [`shell_quote`] is applied
-/// uniformly rather than trying to recognize which arguments are flags.
-///
-/// Two things this must not lose:
-///
-/// - **The `env -u` prefix.** [`AgentInvocation::env_remove`] is
-///   billing-safety critical and there is no `tmux` flag that *unsets* an
-///   environment variable (`-e` only sets), so it has to be re-expressed as
-///   `env -u` inside the command string. See that field's doc comment.
-/// - **The double quotes around `$(cat ...)`.** Unquoted, the shell would
-///   word-split the prompt into hundreds of arguments.
-///
-/// `invocation.args[0]` is the prompt under
-/// [`crate::agent::RunMode::Interactive`] (the prompt is positional
-/// there), and it is what gets replaced by the `cat`; every later argument
-/// is passed through [`shell_quote`]d.
-pub fn tmux_command_line(invocation: &AgentInvocation, prompt_file: &Path) -> String {
-    let mut parts = vec!["env".to_string()];
-    for var in &invocation.env_remove {
-        parts.push("-u".to_string());
-        parts.push(var.clone());
-    }
-    parts.push(invocation.program.clone());
-    parts.push(format!(
-        "\"$(cat {})\"",
-        shell_quote(&prompt_file.to_string_lossy())
-    ));
-    for arg in invocation.args.iter().skip(1) {
-        parts.push(shell_quote(arg));
-    }
-    parts.join(" ")
-}
-
 /// Instructions prepended to an interactive run's prompt, telling the
 /// session to adopt its pre-registered run row on its first turn.
 ///
@@ -215,13 +175,14 @@ pub fn interactive_prompt(kind: &str, ticket: &str, body: &str) -> String {
     format!("{}{body}", registration_preamble(kind, ticket))
 }
 
-/// Launch `prepared`'s `claude` process in `target`, rooted in the run's
+/// Launch `prepared`'s agent process in `target`, rooted in the run's
 /// worktree.
 ///
 /// Writes `prepared.invocation`'s prompt (its positional first argument) to
-/// `prompt_path` and starts a window running [`tmux_command_line`] against
-/// that file, with `SESSION_RUN_ID_ENV` carrying the pre-registered run id
-/// for the session to adopt.
+/// `prompt_path` and starts a window running
+/// [`runner.tmux_command_line`](crate::agent::AgentRunner::tmux_command_line)
+/// against that file, with `SESSION_RUN_ID_ENV` carrying the pre-registered
+/// run id for the session to adopt.
 ///
 /// Creates the ticket's session — plus the worktree-rooted
 /// [`SHELL_WINDOW_NAME`] window every ticket session gets — when this is its
@@ -232,6 +193,7 @@ pub fn launch_interactive_run(
     target: &ActionWindow,
     prepared: &PreparedRun,
     prompt_path: &Path,
+    runner: &dyn AgentRunner,
 ) -> Result<(), InteractiveLaunchError> {
     let prompt = prepared
         .invocation
@@ -250,7 +212,7 @@ pub fn launch_interactive_run(
         source,
     })?;
 
-    let command = tmux_command_line(&prepared.invocation, prompt_path);
+    let command = runner.tmux_command_line(&prepared.invocation, prompt_path);
     let dir = prepared.worktree.to_string_lossy().into_owned();
     let env = [(SESSION_RUN_ID_ENV.to_string(), prepared.run_id.to_string())];
 
@@ -284,7 +246,7 @@ pub fn launch_interactive_run(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
-    use crate::agent::{AgentRunner, InvocationInputs, RunMode};
+    use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode};
     use crate::work::tmux::{FakeTmuxOps, TmuxCall};
     use tempfile::tempdir;
 
@@ -401,33 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn tmux_command_line_strips_billing_env_and_reads_the_prompt_from_the_file() {
-        let invocation = interactive_invocation("do the thing");
-
-        let command = tmux_command_line(&invocation, Path::new("/state/proj-1.prompt.md"));
-
-        assert_eq!(
-            command,
-            "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDECODE claude \
-             \"$(cat '/state/proj-1.prompt.md')\" '--model' 'fable' '--settings' \
-             '/hooks/settings.json' '--permission-mode' 'acceptEdits'"
-        );
-        assert!(
-            !command.contains("do the thing"),
-            "the prompt itself must never reach the command string — it is unbounded"
-        );
-    }
-
-    #[test]
-    fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
-        let invocation = interactive_invocation("prompt");
-
-        let command = tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));
-
-        assert!(command.contains(r#""$(cat '/state/o'\''brien.prompt.md')""#));
-    }
-
-    #[test]
     fn registration_preamble_names_the_kind_and_ticket_to_register() {
         let preamble = registration_preamble("review-fix", "PROJ-1");
 
@@ -451,10 +386,10 @@ mod tests {
         let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
-        launch_interactive_run(&tmux, &target, &prepared, &prompt_path).unwrap();
+        launch_interactive_run(&tmux, &target, &prepared, &prompt_path, &ClaudeRunner).unwrap();
 
         let dir = worktree.to_string_lossy().into_owned();
-        let command = tmux_command_line(&prepared.invocation, &prompt_path);
+        let command = ClaudeRunner.tmux_command_line(&prepared.invocation, &prompt_path);
         assert_eq!(
             tmux.calls(),
             vec![
@@ -492,7 +427,7 @@ mod tests {
         let target = resolve_action_window(&windows, "proj", "PROJ-1", FIX_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
-        launch_interactive_run(&tmux, &target, &prepared, &prompt_path).unwrap();
+        launch_interactive_run(&tmux, &target, &prepared, &prompt_path, &ClaudeRunner).unwrap();
 
         match tmux.calls().as_slice() {
             [
@@ -528,7 +463,14 @@ mod tests {
         let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
-        launch_interactive_run(&tmux, &target, &prepared, &tmp.path().join("p.md")).unwrap();
+        launch_interactive_run(
+            &tmux,
+            &target,
+            &prepared,
+            &tmp.path().join("p.md"),
+            &ClaudeRunner,
+        )
+        .unwrap();
 
         let env = tmux
             .calls()
