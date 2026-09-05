@@ -23,7 +23,8 @@ pub struct TicketSummary {
     pub summary: String,
     /// Current workflow status name.
     pub status: String,
-    /// Browsable URL for the issue (`{base_url}/browse/{key}`).
+    /// Browsable URL for the issue, as the provider renders it via
+    /// [`crate::ticketing::provider::TicketProvider::issue_url`].
     pub url: String,
     /// Plain-text description, as the provider renders it via
     /// [`crate::ticketing::provider::TicketProvider::description_text`].
@@ -1109,6 +1110,19 @@ pub enum Msg {
     /// than a dedicated success/failure pair, since every outcome is purely
     /// a status-line update from `update`'s point of view.
     AuditActionResult(String),
+    /// The `c` key was pressed on [`Screen::Board`]: launch (or re-attach to)
+    /// the scope's single ticket-creation session (GitHub issue #15).
+    ///
+    /// Keyless and unconditional, unlike [`Msg::AuditAction`]: no ticket is
+    /// selected into it, and there is no polled per-ticket liveness map to
+    /// consult for a keyless session — [`crate::work::create::launch_create`]
+    /// resolves already-running from one `list_windows` snapshot at launch
+    /// time, and the board answers that outcome by attaching either way.
+    CreateAction,
+    /// The outcome of [`Cmd::LaunchCreate`], already rendered to a
+    /// human-readable status-line message. Kept as a single string variant
+    /// for the same reason [`Msg::AuditActionResult`] is.
+    CreateActionResult(String),
     /// The `w` key was pressed on [`Screen::Board`] for the selected ticket:
     /// launch a lane run for it, per [`lane_run_action`]'s precedence rule
     /// (already-active guard, zero/one/many configured lanes).
@@ -1300,6 +1314,14 @@ pub enum Cmd {
         /// Ticket key to launch an audit session for.
         key: String,
     },
+    /// Launch the scope's ticket-creation session (see
+    /// [`crate::work::create::launch_create`]) and attach to it immediately —
+    /// or attach to the already-live one. Handled specially by the board's
+    /// event loop, like [`Cmd::AttachSession`], because attaching needs
+    /// `&mut Terminal`; unlike [`Cmd::LaunchAudit`], which stays detached and
+    /// leaves attaching to a second keypress, the whole point of the create
+    /// flow is to start dictating right away (GitHub issue #15).
+    LaunchCreate,
     /// Attach the terminal to `session_name` (the ticket's `tm-<scope>-<key>`
     /// session), suspending and restoring the board's terminal state around
     /// the blocking `tmux attach-session` call. Handled specially by the
@@ -1708,6 +1730,13 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::AuditActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
+        // Keyless and map-free by design -- see Msg::CreateAction's doc
+        // comment for why there is no attach-or-launch split here.
+        Msg::CreateAction => (app, vec![Cmd::LaunchCreate]),
+        Msg::CreateActionResult(message) => {
             app.status_line = message;
             (app, Vec::new())
         }
@@ -5606,6 +5635,35 @@ mod tests {
             app.status_line,
             "launched audit for PROJ-1 -- press a to attach"
         );
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::CreateAction (GitHub issue #15) ---
+
+    #[test]
+    fn create_action_emits_launch_create_with_no_ticket_selected() {
+        // Keyless: unlike every other board action, creating a ticket needs
+        // no selection -- an empty board must still be able to launch.
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::CreateAction);
+        assert_eq!(cmds, vec![Cmd::LaunchCreate]);
+    }
+
+    #[test]
+    fn create_action_emits_launch_create_regardless_of_selection() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (_app, cmds) = update(app, Msg::CreateAction);
+        assert_eq!(cmds, vec![Cmd::LaunchCreate]);
+    }
+
+    #[test]
+    fn create_action_result_sets_status_line() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::CreateActionResult("detached from tm-proj-create".to_string()),
+        );
+        assert_eq!(app.status_line, "detached from tm-proj-create");
         assert!(cmds.is_empty());
     }
 

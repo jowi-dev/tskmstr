@@ -209,33 +209,66 @@ pub trait TicketProvider {
     /// whatever format the backend stores it in (ADF, for Jira). `""` when
     /// there's no description.
     fn description_text(&self, issue: &Issue) -> String;
+
+    /// Browsable URL for the ticket `key`, in this backend's own link shape
+    /// (`{base_url}/browse/{key}` for Jira, the issue page for GitHub). No
+    /// caller builds a ticket URL from config any more — under the github
+    /// backend `jira_base_url` is empty, and `/browse/GH-13` is not a link
+    /// (GitHub issue #13).
+    fn issue_url(&self, key: &str) -> String;
+
+    /// Translate a status target ([`crate::config::Config::status_on_pr`],
+    /// [`crate::config::Config::status_on_create`], or an explicit
+    /// `tm ticket transition <KEY> <STATUS>` argument) into this backend's
+    /// own status vocabulary before transition matching. The default is the
+    /// identity: a Jira workflow's status names are already Jira's
+    /// vocabulary, and `tm` can't know one workflow's aliases for another's
+    /// statuses. The github backend overrides this to map common Jira
+    /// review-status names onto its fixed `tm:status/*` vocabulary, so a
+    /// `status_on_pr = "Code Review"` inherited from a Jira-centric global
+    /// config still lands the ticket in In Review instead of warning and
+    /// leaving it in To Do (GitHub issue #13).
+    fn normalize_status_target(&self, target: &str) -> String {
+        target.to_string()
+    }
 }
 
 /// [`TicketProvider`] backed by a boxed [`JiraClient`].
 ///
 /// Every method forwards unchanged to the wrapped client — this phase is a
 /// pure retyping of every ticketing call site from `&dyn JiraClient` to
-/// `&dyn TicketProvider`, with no behavior change.
-pub struct JiraProvider(Box<dyn JiraClient>);
+/// `&dyn TicketProvider`, with no behavior change. `base_url` exists only
+/// for [`TicketProvider::issue_url`]: the [`JiraClient`] trait has no way to
+/// report the instance it talks to, so the provider carries it alongside.
+pub struct JiraProvider {
+    client: Box<dyn JiraClient>,
+    base_url: String,
+}
 
 impl JiraProvider {
     /// Wrap any Jira client — live or fake — as a [`TicketProvider`].
-    pub fn new(client: impl JiraClient + 'static) -> Self {
-        Self(Box::new(client))
+    /// `base_url` is the Jira instance's browsable root
+    /// ([`crate::config::Config::jira_base_url`]), used only to render
+    /// ticket URLs.
+    pub fn new(client: impl JiraClient + 'static, base_url: impl Into<String>) -> Self {
+        Self {
+            client: Box::new(client),
+            base_url: base_url.into(),
+        }
     }
 }
 
 impl TicketProvider for JiraProvider {
     fn myself(&self) -> Result<Myself, ProviderError> {
-        Ok(self.0.myself()?)
+        Ok(self.client.myself()?)
     }
 
     fn get_issue(&self, key: &str) -> Result<Issue, ProviderError> {
-        Ok(self.0.get_issue(key)?)
+        Ok(self.client.get_issue(key)?)
     }
 
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        Ok(self.0.create_issue(&CreateIssueRequest {
+        Ok(self.client.create_issue(&CreateIssueRequest {
             project_key: req.project_key.clone(),
             summary: req.summary.clone(),
             description: text_to_adf(&req.description),
@@ -245,51 +278,53 @@ impl TicketProvider for JiraProvider {
     }
 
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError> {
-        Ok(self.0.add_remote_link(key, link)?)
+        Ok(self.client.add_remote_link(key, link)?)
     }
 
     fn transitions(&self, key: &str) -> Result<Vec<Transition>, ProviderError> {
-        Ok(self.0.transitions(key)?)
+        Ok(self.client.transitions(key)?)
     }
 
     fn transition(&self, key: &str, transition_id: &str) -> Result<(), ProviderError> {
-        Ok(self.0.transition(key, transition_id)?)
+        Ok(self.client.transition(key, transition_id)?)
     }
 
     fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
-        Ok(self.0.search(&render_jql(query))?)
+        Ok(self.client.search(&render_jql(query))?)
     }
 
     fn get_project(&self, key: &str) -> Result<(), ProviderError> {
-        Ok(self.0.get_project(key)?)
+        Ok(self.client.get_project(key)?)
     }
 
     fn assignable_users(&self, project: &str) -> Result<Vec<JiraUser>, ProviderError> {
-        Ok(self.0.assignable_users(project)?)
+        Ok(self.client.assignable_users(project)?)
     }
 
     fn assign(&self, key: &str, account_id: Option<&str>) -> Result<(), ProviderError> {
-        Ok(self.0.assign(key, account_id)?)
+        Ok(self.client.assign(key, account_id)?)
     }
 
     fn rank(&self, keys: &[String], anchor: RankAnchor) -> Result<(), ProviderError> {
-        Ok(self.0.rank(keys, anchor)?)
+        Ok(self.client.rank(keys, anchor)?)
     }
 
     fn create_link(&self, req: &CreateLinkRequest) -> Result<(), ProviderError> {
-        Ok(self.0.create_link(req)?)
+        Ok(self.client.create_link(req)?)
     }
 
     fn delete_link(&self, link_id: &str) -> Result<(), ProviderError> {
-        Ok(self.0.delete_link(link_id)?)
+        Ok(self.client.delete_link(link_id)?)
     }
 
     fn update_description(&self, key: &str, description: &str) -> Result<(), ProviderError> {
-        Ok(self.0.update_description(key, &text_to_adf(description))?)
+        Ok(self
+            .client
+            .update_description(key, &text_to_adf(description))?)
     }
 
     fn add_comment(&self, key: &str, body: &str) -> Result<(), ProviderError> {
-        Ok(self.0.add_comment(key, &text_to_adf(body))?)
+        Ok(self.client.add_comment(key, &text_to_adf(body))?)
     }
 
     fn description_text(&self, issue: &Issue) -> String {
@@ -299,6 +334,10 @@ impl TicketProvider for JiraProvider {
             .as_ref()
             .map(adf_to_text)
             .unwrap_or_default()
+    }
+
+    fn issue_url(&self, key: &str) -> String {
+        format!("{}/browse/{key}", self.base_url)
     }
 }
 
@@ -390,6 +429,14 @@ impl TicketProvider for FakeJiraClient {
             .map(adf_to_text)
             .unwrap_or_default()
     }
+
+    /// The fake's fixture instance is `https://example.atlassian.net`,
+    /// matching the `jira_base_url` every test `Config` fixture uses, so
+    /// URL assertions written against config-built URLs keep passing
+    /// unchanged now that the URL comes from the provider.
+    fn issue_url(&self, key: &str) -> String {
+        format!("https://example.atlassian.net/browse/{key}")
+    }
 }
 
 #[cfg(test)]
@@ -417,8 +464,10 @@ mod tests {
 
     #[test]
     fn jira_provider_forwards_get_issue_to_the_wrapped_client() {
-        let provider =
-            JiraProvider::new(FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")));
+        let provider = JiraProvider::new(
+            FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")),
+            "https://example.atlassian.net",
+        );
 
         let result = provider.get_issue("PROJ-1").expect("issue should be found");
 
@@ -427,7 +476,10 @@ mod tests {
 
     #[test]
     fn jira_provider_converts_errors_to_provider_error() {
-        let provider = JiraProvider::new(FakeJiraClient::new().with_issue_not_found("PROJ-1"));
+        let provider = JiraProvider::new(
+            FakeJiraClient::new().with_issue_not_found("PROJ-1"),
+            "https://example.atlassian.net",
+        );
 
         let err = provider.get_issue("PROJ-1").expect_err("should fail");
 
@@ -436,7 +488,10 @@ mod tests {
 
     #[test]
     fn jira_provider_is_usable_as_a_trait_object() {
-        let provider: Box<dyn TicketProvider> = Box::new(JiraProvider::new(FakeJiraClient::new()));
+        let provider: Box<dyn TicketProvider> = Box::new(JiraProvider::new(
+            FakeJiraClient::new(),
+            "https://example.atlassian.net",
+        ));
 
         provider
             .transition("PROJ-1", "31")
@@ -495,7 +550,7 @@ mod tests {
 
     #[test]
     fn jira_provider_search_forwards_rendered_jql_to_the_wrapped_client() {
-        let provider = JiraProvider::new(FakeJiraClient::new());
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net");
 
         let result = provider
             .search(&TicketQuery::MyOpen)
@@ -507,7 +562,7 @@ mod tests {
     #[test]
     fn create_issue_converts_markdown_description_to_adf() {
         let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
-        let provider = JiraProvider::new(fake);
+        let provider = JiraProvider::new(fake, "https://example.atlassian.net");
 
         provider
             .create_issue(&NewTicket {
@@ -573,6 +628,26 @@ mod tests {
         assert_eq!(
             TicketProvider::description_text(&fake, &with_description),
             "plain text"
+        );
+    }
+
+    #[test]
+    fn jira_provider_issue_url_is_base_url_browse_key() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://jira.example.com");
+
+        assert_eq!(
+            provider.issue_url("PROJ-7"),
+            "https://jira.example.com/browse/PROJ-7"
+        );
+    }
+
+    #[test]
+    fn fake_ticket_provider_issue_url_uses_the_fixture_base_url() {
+        let fake = FakeJiraClient::new();
+
+        assert_eq!(
+            TicketProvider::issue_url(&fake, "PROJ-7"),
+            "https://example.atlassian.net/browse/PROJ-7"
         );
     }
 

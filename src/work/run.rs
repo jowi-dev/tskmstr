@@ -1584,6 +1584,7 @@ mod tests {
             tmux_primary_window: None,
             lanes,
             audit: crate::config::AuditConfig::default(),
+            create: crate::config::CreateConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
         }
     }

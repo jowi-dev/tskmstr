@@ -291,6 +291,13 @@ pub struct RawWorkConfig {
     /// [`AuditConfig::dir`] is required for [`crate::work::audit::launch_audit`]
     /// to do anything.
     pub audit: Option<RawAuditConfig>,
+    /// `[work.create]` settings for board-launched ticket-creation sessions.
+    /// See [`RawCreateConfig`].
+    ///
+    /// When unset in both global and repo config, launching a create session
+    /// is disabled (GitHub issue #15): [`CreateConfig::dir`] is required for
+    /// [`crate::work::create::launch_create`] to do anything.
+    pub create: Option<RawCreateConfig>,
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
@@ -320,6 +327,35 @@ pub struct RawAuditConfig {
     /// enterprise-managed model pin, is whatever the policy pins rather than
     /// anything tskmstr configures. Set this to launch audits on a specific
     /// model regardless of that pin.
+    pub model: Option<String>,
+}
+
+/// Raw, partially-specified `[work.create]` subsection as parsed directly
+/// from TOML. Mirrors [`RawAuditConfig`]'s shape (GitHub issue #15): a
+/// board-launched ticket-creation session is the same kind of tmux-hosted
+/// interactive `claude` conversation an audit is, just keyless — no ticket
+/// exists yet when it launches.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawCreateConfig {
+    /// Directory a launched ticket-creation session runs in (the repo whose
+    /// `.claude/` provides the ticket-create skill and hook settings), e.g.
+    /// `~/Projects/axiom`. Tilde is not expanded by this module, matching
+    /// [`RawAuditConfig::dir`]; expansion is the launching caller's
+    /// responsibility. Required to enable launching at all.
+    ///
+    /// Deliberately does *not* fall back to [`RawAuditConfig::dir`] the way
+    /// [`RawReviewWatchConfig::dir`] does: absence of this field is the
+    /// switch that disables the board's create key entirely, and a silent
+    /// audit-dir inheritance would defeat that gate.
+    pub dir: Option<String>,
+    /// Prompt fed to `claude` on launch. Defaults to `/ticket-create` when
+    /// unset. Unlike [`RawAuditConfig::prompt`], no `{key}` substitution
+    /// applies — there is no ticket key yet.
+    pub prompt: Option<String>,
+    /// Model alias passed to the launched session as `claude --model <model>`.
+    /// Same rationale as [`RawAuditConfig::model`]: an interactive session's
+    /// model choice is worth setting independently of the lane default, and
+    /// an explicit `--model` is what escapes an enterprise-managed pin.
     pub model: Option<String>,
 }
 
@@ -467,6 +503,10 @@ pub struct WorkConfig {
     /// `dir`/`prompt` set, launching disabled) when the `[work.audit]`
     /// section is absent from both global and repo config.
     pub audit: AuditConfig,
+    /// Validated `[work.create]` settings. See [`CreateConfig`]; empty (no
+    /// `dir` set, launching disabled) when the `[work.create]` section is
+    /// absent from both global and repo config.
+    pub create: CreateConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
 }
@@ -486,6 +526,23 @@ pub struct AuditConfig {
     /// See [`RawAuditConfig::prompt`].
     pub prompt: Option<String>,
     /// See [`RawAuditConfig::model`].
+    pub model: Option<String>,
+}
+
+/// Fully validated `[work.create]` subsection.
+///
+/// Like [`AuditConfig`], `dir` is not required at merge time — an absent
+/// `dir` means create-session launching is disabled, which
+/// [`crate::work::create::launch_create`] reports as a status-line error,
+/// not a config-load failure (GitHub issue #15's "config-gated" acceptance
+/// criterion).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateConfig {
+    /// See [`RawCreateConfig::dir`].
+    pub dir: Option<String>,
+    /// See [`RawCreateConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawCreateConfig::model`].
     pub model: Option<String>,
 }
 
@@ -1086,6 +1143,7 @@ fn merge_work(
         .unwrap_or_default();
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
+    let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
@@ -1147,6 +1205,7 @@ fn merge_work(
         tmux_primary_window,
         lanes,
         audit,
+        create,
         review_watch,
     })
 }
@@ -1180,6 +1239,34 @@ fn merge_audit(
     };
 
     Ok(AuditConfig {
+        dir,
+        prompt: repo.prompt.or(global.prompt),
+        model: repo.model.or(global.model),
+    })
+}
+
+/// Merge a repo-local `[work.create]` section on top of a global one, field
+/// by field, exactly like [`merge_audit`] — same "single section, no
+/// whole-vs-field ambiguity" rationale, and the same `repo_dir` relative-path
+/// resolution rule for `dir`.
+fn merge_create(
+    global: Option<RawCreateConfig>,
+    repo: Option<RawCreateConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<CreateConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let (dir, defining_dir) = match repo.dir {
+        Some(dir) => (Some(dir), repo_dir),
+        None => (global.dir, None),
+    };
+    let dir = match dir {
+        Some(dir) => Some(resolve_repo_path(&dir, defining_dir, "work.create.dir")?),
+        None => None,
+    };
+
+    Ok(CreateConfig {
         dir,
         prompt: repo.prompt.or(global.prompt),
         model: repo.model.or(global.model),
@@ -2869,6 +2956,7 @@ mod tests {
             tmux_primary_window: Some("code".to_string()),
             lanes: BTreeMap::new(),
             audit: None,
+            create: None,
             review_watch: None,
         };
         let repo = RawWorkConfig {
@@ -2880,6 +2968,7 @@ mod tests {
             tmux_primary_window: None,
             lanes: BTreeMap::new(),
             audit: None,
+            create: None,
             review_watch: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
@@ -3039,6 +3128,138 @@ mod tests {
         };
         let cfg = merge_work(Some(global), None, None).expect("should merge");
         assert_eq!(cfg.review_watch.model, Some("sonnet".to_string()));
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_create_dir_field_by_field() {
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: Some("/global-ticket-create".to_string()),
+                model: Some("opus".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                dir: Some("/repo-local/axiom".to_string()),
+                prompt: None,
+                model: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        // Overridden field wins.
+        assert_eq!(cfg.create.dir, Some("/repo-local/axiom".to_string()));
+        // Non-overridden fields fall back to global.
+        assert_eq!(cfg.create.prompt, Some("/global-ticket-create".to_string()));
+        assert_eq!(cfg.create.model, Some("opus".to_string()));
+    }
+
+    #[test]
+    fn merge_work_create_absent_from_both_is_default() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.create, CreateConfig::default());
+    }
+
+    #[test]
+    fn merge_work_create_dir_does_not_fall_back_to_audit_dir() {
+        // Unlike review_watch, absence of [work.create].dir means the board's
+        // create key is disabled -- it must not silently inherit audit's dir.
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                prompt: None,
+                model: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
+        assert_eq!(cfg.create.dir, None);
+    }
+
+    #[test]
+    fn merge_work_relative_create_dir_from_global_only_is_a_config_error() {
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                dir: Some("relative/axiom".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject relative path");
+        match err {
+            ConfigError::RelativePathRequiresRepoConfig { field, value } => {
+                assert_eq!(field, "work.create.dir");
+                assert_eq!(value, "relative/axiom");
+            }
+            other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_repo_local_relative_create_dir_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.create]
+            dir = "."
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.create.dir,
+            Some(dir.path().to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn load_work_create_section_parses_fields() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.create]
+            dir = "~/Projects/axiom"
+            prompt = "/ticket-create"
+            model = "opus"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.work.create.dir, Some("~/Projects/axiom".to_string()));
+        assert_eq!(cfg.work.create.prompt, Some("/ticket-create".to_string()));
+        assert_eq!(cfg.work.create.model, Some("opus".to_string()));
     }
 
     #[test]

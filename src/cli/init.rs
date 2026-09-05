@@ -1097,6 +1097,7 @@ mod tests {
                 display_name: "Jane Doe".to_string(),
                 email_address: None,
             }),
+            "https://example.atlassian.net",
         ))
     }
 

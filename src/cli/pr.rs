@@ -189,7 +189,7 @@ pub fn status(
 
     match resolve_existing_key(ctx.jira, &pr)? {
         Some(key) => {
-            let issue_url = format!("{}/browse/{key}", ctx.config.jira_base_url);
+            let issue_url = ctx.jira.issue_url(&key);
             writeln!(out, "Ticket {key}: {issue_url}")?;
         }
         None => {
@@ -520,6 +520,40 @@ mod tests {
             work: crate::config::WorkConfig::default(),
             agent: crate::config::AgentKind::Claude,
         }
+    }
+
+    #[test]
+    fn status_ticket_url_comes_from_the_provider_not_config() {
+        // An empty jira_base_url (the github backend's shape) must not
+        // produce a broken "/browse/PROJ-372" — the URL comes from the
+        // provider (GitHub issue #13).
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new().with_pr_view(Ok(Some(pr_with_title("[PROJ-372] Fix the thing"))));
+        let cfg = Config {
+            jira_base_url: String::new(),
+            ..config()
+        };
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+
+        status(
+            &ctx,
+            &PrStatusOptions { auto_ticket: false },
+            &mut prompter,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            output.contains("Ticket PROJ-372: https://example.atlassian.net/browse/PROJ-372"),
+            "ticket URL should come from the provider: {output}"
+        );
     }
 
     #[test]

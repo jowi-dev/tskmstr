@@ -497,6 +497,12 @@ pub trait AgentRunner {
     /// unset, e.g. `"/bugbot-triage {key} {findings_file}"`.
     fn default_cleanup_prompt_template(&self) -> &'static str;
 
+    /// Default prompt used when `[work.create].prompt` is unset, e.g.
+    /// `"/ticket-create"`. Unlike the audit and cleanup templates, no
+    /// placeholder substitution applies — a create session starts before any
+    /// ticket key exists.
+    fn default_create_prompt(&self) -> &'static str;
+
     /// Default lane-prompt file path when neither `--prompt` nor the lane's
     /// `prompt_file` is given, e.g. `~/.claude/prompts/<lane>.md`.
     fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf;

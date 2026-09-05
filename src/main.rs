@@ -553,15 +553,33 @@ fn run_board(
         audit_dir_fallback = fell_back;
     }
 
+    // Create-dir fallback (GitHub issue #15): same treatment as the audit
+    // dir above, so an in-session `tm ticket create` files against the
+    // board's own backend rather than whatever backend the configured dir's
+    // repo config selects.
+    let mut create = config.work.create;
+    let mut create_dir_fallback = false;
+    if let Some(raw_dir) = create.dir.clone() {
+        let expanded = tskmstr::work::naming::expand_tilde(&raw_dir, &home);
+        let (effective_dir, fell_back) = tskmstr::config::resolve_audit_host_dir(
+            &expanded,
+            &current_backend_identity,
+            &cwd,
+            &backend_identity_resolver,
+        );
+        create.dir = Some(effective_dir.to_string_lossy().into_owned());
+        create_dir_fallback = fell_back;
+    }
+
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     run(TuiDeps {
         jira,
-        base_url: config.jira_base_url,
         project_key: config.default_project_key,
         board_column_order: config.board_column_order,
         store,
         tmux: Box::new(tmux),
         audit,
+        create,
         review_watch: config.work.review_watch,
         xdg_data_home,
         home,
@@ -569,6 +587,7 @@ fn run_board(
         lane_names,
         hidden_lane_count,
         audit_dir_fallback,
+        create_dir_fallback,
         gh: Box::new(ShellGhCli::new()),
         git: Box::new(ShellGitOps::new()),
         cwd,
@@ -636,11 +655,14 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
 }
 
 fn jira_client_for(config: &Config, token: &str) -> Box<dyn TicketProvider> {
-    Box::new(JiraProvider::new(HttpJiraClient::new(JiraClientContext {
-        base_url: config.jira_base_url.clone(),
-        email: config.jira_email.clone(),
-        token: token.to_string(),
-    })))
+    Box::new(JiraProvider::new(
+        HttpJiraClient::new(JiraClientContext {
+            base_url: config.jira_base_url.clone(),
+            email: config.jira_email.clone(),
+            token: token.to_string(),
+        }),
+        config.jira_base_url.clone(),
+    ))
 }
 
 fn run_auth(

@@ -332,6 +332,10 @@ impl AgentRunner for ClaudeRunner {
         "/bugbot-triage {key} {findings_file}"
     }
 
+    fn default_create_prompt(&self) -> &'static str {
+        "/ticket-create"
+    }
+
     /// `~/.claude/prompts/<lane>.md` — `work.ml`'s default lane-prompt
     /// convention. The `.claude` directory is claude's, so this default is
     /// claude-owned rather than a runner-agnostic constant.
@@ -507,6 +511,11 @@ mod tests {
             ClaudeRunner.default_cleanup_prompt_template(),
             "/bugbot-triage {key} {findings_file}"
         );
+    }
+
+    #[test]
+    fn default_create_prompt_is_ticket_create() {
+        assert_eq!(ClaudeRunner.default_create_prompt(), "/ticket-create");
     }
 
     #[test]

@@ -93,15 +93,14 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
-/// Dependencies the TUI needs to talk to Jira, build browsable URLs, and
-/// (per `docs/plans/board-audits.md`'s "Board integration" design) launch
-/// and attach to board-launched ticket-audit sessions.
+/// Dependencies the TUI needs to talk to the ticket backend and (per
+/// `docs/plans/board-audits.md`'s "Board integration" design) launch and
+/// attach to board-launched ticket-audit sessions. Browsable ticket URLs
+/// come from the provider itself ([`TicketProvider::issue_url`]), not a
+/// separate base-URL field.
 pub struct TuiDeps {
     /// Client used to fetch tickets, transitions, and apply transitions.
     pub jira: Box<dyn TicketProvider>,
-    /// Base URL of the Jira instance, used to build `{base_url}/browse/{key}`
-    /// links for [`Cmd::OpenUrl`].
-    pub base_url: String,
     /// The configured default Jira project key, used to scope every
     /// assignee filter other than `Me`.
     pub project_key: String,
@@ -121,8 +120,12 @@ pub struct TuiDeps {
     /// status-line error) when `dir` is unset. See
     /// [`crate::work::audit::launch_audit`].
     pub audit: crate::config::AuditConfig,
+    /// Validated `[work.create]` settings; launching the ticket-creation
+    /// session is disabled (a status-line error) when `dir` is unset. See
+    /// [`crate::work::create::launch_create`].
+    pub create: crate::config::CreateConfig,
     /// The user's home directory, used to expand a leading `~` in
-    /// `audit.dir`.
+    /// `audit.dir`/`create.dir`.
     pub home: std::path::PathBuf,
     /// Launcher used to spawn `tm work run <lane> <key>` for
     /// [`Cmd::LaunchLaneRun`] (see `docs/plans/board-lane-runs.md`). Boxed
@@ -155,6 +158,16 @@ pub struct TuiDeps {
     /// `true`, per the plan's "surface the fallback in the status line"
     /// decision.
     pub audit_dir_fallback: bool,
+    /// Whether `create.dir` above was already redirected from
+    /// `[work.create].dir`'s configured value to the current repo (`cwd`)
+    /// because the configured dir's resolved backend identity didn't match
+    /// this repo's own — the same
+    /// [`resolve_audit_host_dir`](crate::config::resolve_audit_host_dir)
+    /// treatment `audit_dir_fallback` reports, applied to the create dir so
+    /// an in-session `tm ticket create` files against the board's own
+    /// backend. [`launch_create_and_attach`] notes this in its status-line
+    /// message when `true`.
+    pub create_dir_fallback: bool,
     /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`] to list a
     /// ticket's repo's open pull requests.
     pub gh: Box<dyn crate::github::gh_cli::GhCli>,
@@ -355,6 +368,17 @@ fn run_cmds<B: Backend>(
             // *launch* outcomes, which are audit-specific.
             let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::LaunchCreate = cmd {
+            // Launch-then-attach in one keypress (issue #15): the launch
+            // itself is `execute`-shaped, but the immediate attach needs
+            // `&mut Terminal`, so the whole command is intercepted here like
+            // `Cmd::AttachSession`.
+            let message = launch_create_and_attach(terminal, deps);
+            let (next_app, more_cmds) = update(app, Msg::CreateActionResult(message));
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -1071,6 +1095,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
         | Cmd::AttachSession { .. }
+        | Cmd::LaunchCreate
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
         | Cmd::ViewLogs { .. }
@@ -1356,6 +1381,43 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     vec![Msg::AuditActionResult(message)]
 }
 
+/// Run `Cmd::LaunchCreate`: launch the scope's ticket-creation session via
+/// [`crate::work::create::launch_create`] and attach to it immediately
+/// (issue #15's dictation flow), returning the status-line message the user
+/// sees once they detach and land back on the board.
+///
+/// An [`AlreadyRunning`](crate::work::create::CreateLaunchError::AlreadyRunning)
+/// outcome attaches too — a second `c` press is "take me back to my draft",
+/// never a duplicate session. Only `NotConfigured` and tmux failures skip
+/// the attach, surfacing as a plain status line. Unlike [`launch_audit_cmd`]
+/// there is no `deps.store` guard: no run row is pre-registered (the
+/// in-session `tm ticket create` registers its own `kind = "create"` run via
+/// the session marker), so a broken runs DB never blocks creating tickets.
+fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDeps) -> String {
+    let session_name = match crate::work::create::launch_create(
+        deps.tmux.as_ref(),
+        &deps.create,
+        &deps.home,
+        &deps.backend_identity,
+        deps.runner,
+    ) {
+        Ok(outcome) => outcome.session_name,
+        Err(crate::work::create::CreateLaunchError::AlreadyRunning { session_name, .. }) => {
+            session_name
+        }
+        Err(err) => return err.to_string(),
+    };
+    let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+    if deps.create_dir_fallback {
+        format!(
+            "{message} (create session ran in the current repo; configured create dir is \
+             backend-incompatible)"
+        )
+    } else {
+        message
+    }
+}
+
 /// Run `Cmd::LaunchCleanup`: launch a bugbot-cleanup session for `key` via
 /// [`crate::work::bugbot::launch_cleanup`], mapping the outcome to a
 /// status-line message. Mirrors [`launch_audit_cmd`] exactly, including its
@@ -1405,7 +1467,7 @@ fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, Pro
         tickets: result
             .issues
             .into_iter()
-            .map(|issue| to_ticket_summary(deps.jira.as_ref(), issue, &deps.base_url))
+            .map(|issue| to_ticket_summary(deps.jira.as_ref(), issue))
             .collect(),
     })
 }
@@ -1744,14 +1806,10 @@ fn open_url(url: &str) -> Vec<Msg> {
     }
 }
 
-/// Convert a Jira [`Issue`] into a [`crate::tui::app::TicketSummary`],
-/// deriving `url` from `base_url` and `description` from
+/// Convert a backend [`Issue`] into a [`crate::tui::app::TicketSummary`],
+/// deriving `url` from [`TicketProvider::issue_url`] and `description` from
 /// [`TicketProvider::description_text`].
-fn to_ticket_summary(
-    jira: &dyn TicketProvider,
-    issue: Issue,
-    base_url: &str,
-) -> crate::tui::app::TicketSummary {
+fn to_ticket_summary(jira: &dyn TicketProvider, issue: Issue) -> crate::tui::app::TicketSummary {
     let description = jira.description_text(&issue);
     let assignee = issue
         .fields
@@ -1759,7 +1817,7 @@ fn to_ticket_summary(
         .as_ref()
         .map(|a| a.display_name.clone());
     crate::tui::app::TicketSummary {
-        url: format!("{base_url}/browse/{}", issue.key),
+        url: jira.issue_url(&issue.key),
         key: issue.key,
         summary: issue.fields.summary,
         status_category: issue.fields.status.status_category.key.clone(),
@@ -1809,13 +1867,13 @@ mod tests {
 
     fn deps(jira: FakeJiraClient) -> TuiDeps {
         TuiDeps {
-            jira: Box::new(JiraProvider::new(jira)),
-            base_url: "https://example.atlassian.net".to_string(),
+            jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),
             store: None,
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             audit: crate::config::AuditConfig::default(),
+            create: crate::config::CreateConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
             review_watch: crate::config::ReviewWatchConfig::default(),
             xdg_data_home: None,
@@ -1823,6 +1881,7 @@ mod tests {
             lane_names: Vec::new(),
             hidden_lane_count: 0,
             audit_dir_fallback: false,
+            create_dir_fallback: false,
             gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
             git: Box::new(crate::work::git::FakeGitOps::new()),
             cwd: std::path::PathBuf::from("/repo"),
@@ -2182,11 +2241,7 @@ mod tests {
 
     #[test]
     fn to_ticket_summary_derives_url_and_extracts_description() {
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue("PROJ-1", "To Do"),
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue("PROJ-1", "To Do"));
         assert_eq!(summary.key, "PROJ-1");
         assert_eq!(summary.status, "To Do");
         assert_eq!(summary.url, "https://example.atlassian.net/browse/PROJ-1");
@@ -2194,24 +2249,29 @@ mod tests {
     }
 
     #[test]
+    fn to_ticket_summary_url_comes_from_the_provider() {
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let provider = crate::ticketing::github_provider::GithubProvider::new(
+            &gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+
+        let summary = to_ticket_summary(&provider, issue("GH-13", "To Do"));
+
+        assert_eq!(summary.url, "https://github.com/jowi-dev/tskmstr/issues/13");
+    }
+
+    #[test]
     fn to_ticket_summary_with_no_description_is_empty_string() {
         let mut issue = issue("PROJ-1", "To Do");
         issue.fields.description = None;
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue,
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
         assert_eq!(summary.description, "");
     }
 
     #[test]
     fn to_ticket_summary_with_no_assignee_is_none() {
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue("PROJ-1", "To Do"),
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue("PROJ-1", "To Do"));
         assert_eq!(summary.assignee, None);
     }
 
@@ -2224,11 +2284,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue,
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
         assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
     }
 
@@ -3286,6 +3342,107 @@ mod tests {
             &mut launches,
         );
         assert_eq!(app.status_line, "switched client to tm-proj-proj-1");
+    }
+
+    // --- Cmd::LaunchCreate routing (run_cmds intercepts it before `execute`,
+    //     issue #15) ---
+
+    /// A `deps` whose `[work.create]` is configured and whose tmux fake
+    /// reports `windows` (each `(session, window, dead)`).
+    fn create_deps(windows: &[(&str, &str, bool)]) -> TuiDeps {
+        let mut d = deps(FakeJiraClient::new());
+        d.create = crate::config::CreateConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            model: None,
+        };
+        d.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(windows
+                .iter()
+                .map(|(session, name, dead)| crate::work::tmux::TmuxWindow {
+                    session: (*session).to_string(),
+                    name: (*name).to_string(),
+                    dead: *dead,
+                })
+                .collect())),
+        );
+        d
+    }
+
+    #[test]
+    fn run_cmds_launch_create_unconfigured_reports_status_line_without_attaching() {
+        // `deps()` leaves `create.dir` unset; the status line must be the
+        // NotConfigured message, not an attach outcome.
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchCreate],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            app.status_line,
+            "ticket creation is not configured; set [work.create].dir"
+        );
+    }
+
+    #[test]
+    fn run_cmds_launch_create_launches_then_attaches_immediately() {
+        // The launch/attach tmux call sequence itself is pinned by
+        // `crate::work::create`'s unit tests; this covers the routing: one
+        // `Cmd` ends in `attach_session`'s message, with no second keypress.
+        let d = create_deps(&[]);
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchCreate],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(app.status_line, "detached from tm-proj-create");
+    }
+
+    #[test]
+    fn run_cmds_launch_create_attaches_to_a_live_create_session_instead_of_erroring() {
+        // With the create window already live, `launch_create` reports
+        // AlreadyRunning -- which must read as "attach to the draft", never
+        // surface as an error message (issue #15's deliberate re-entry).
+        let d = create_deps(&[("tm-proj-create", "create", false)]);
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchCreate],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(app.status_line, "detached from tm-proj-create");
+    }
+
+    #[test]
+    fn run_cmds_launch_create_notes_the_dir_fallback_in_the_status_line() {
+        let mut d = create_deps(&[]);
+        d.create_dir_fallback = true;
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::LaunchCreate],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            app.status_line,
+            "detached from tm-proj-create (create session ran in the current repo; configured \
+             create dir is backend-incompatible)"
+        );
     }
 
     // --- Cmd::LaunchLaneRun routing (run_cmds intercepts it before `execute`) ---
