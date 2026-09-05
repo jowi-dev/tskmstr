@@ -466,7 +466,7 @@ pub fn create_ticket(
 
     Ok(CreateTicketOutcome {
         issue_key: issue.key.clone(),
-        issue_url: format!("{}/browse/{}", ctx.config.jira_base_url, issue.key),
+        issue_url: ctx.jira.issue_url(&issue.key),
         status_transition,
     })
 }
@@ -1196,7 +1196,7 @@ fn associate(
 
     Ok(AssociateOutcome {
         issue_key: key.to_string(),
-        issue_url: format!("{}/browse/{}", ctx.config.jira_base_url, key),
+        issue_url: ctx.jira.issue_url(key),
         title_updated,
         remote_link_added: true,
         status_transition,
@@ -1312,6 +1312,57 @@ mod tests {
                     title: "GitHub PR #42: Fix the thing".to_string(),
                 }
             )]
+        );
+    }
+
+    #[test]
+    fn create_ticket_issue_url_comes_from_the_provider_not_config() {
+        // github_config's jira_base_url is empty — before GitHub issue #13
+        // this rendered the broken "/browse/GH-9". The URL must come from
+        // the provider (the fake's fixture instance) instead.
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("GH-9"));
+        let cfg = github_config();
+
+        let outcome = create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
+            .expect("should succeed");
+
+        assert_eq!(
+            outcome.issue_url,
+            "https://example.atlassian.net/browse/GH-9"
+        );
+    }
+
+    #[test]
+    fn associate_under_the_github_provider_renders_a_github_issue_url() {
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr("[GH-10] Fix the thing"))))
+            .with_issue_view(
+                10,
+                Ok(crate::github::gh_cli::IssueInfo {
+                    number: 10,
+                    url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                    title: "Fix the thing".to_string(),
+                    body: String::new(),
+                    state: crate::github::gh_cli::IssueState::Open,
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                }),
+            );
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let cfg = github_config();
+        let ctx = TicketingContext {
+            jira: &provider,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "GH-10").expect("should succeed");
+
+        assert_eq!(
+            outcome.issue_url,
+            "https://github.com/jowi-dev/tskmstr/issues/10"
         );
     }
 
