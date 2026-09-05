@@ -87,9 +87,9 @@ pub enum SpawnError {
 }
 
 /// What a [`ProcessSpawner`] needs to run one `claude -p` invocation: the
-/// already-built [`crate::work::claude::ClaudeInvocation`]'s pieces, plus
+/// already-built [`crate::agent::AgentInvocation`]'s pieces, plus
 /// the working directory and output destination that
-/// [`crate::work::claude::ClaudeInvocation`] deliberately leaves out (see
+/// [`crate::agent::AgentInvocation`] deliberately leaves out (see
 /// that module's doc comment: "Output redirection is a spawn-time concern,
 /// not an argv concern").
 pub struct SpawnRequest<'a> {
@@ -100,7 +100,7 @@ pub struct SpawnRequest<'a> {
     /// Environment variables to set before spawning.
     pub env_set: &'a [(String, String)],
     /// Environment variables to remove before spawning (billing safety —
-    /// see [`crate::work::claude::ClaudeInvocation::env_remove`]).
+    /// see [`crate::agent::AgentInvocation::env_remove`]).
     pub env_remove: &'a [String],
     /// Working directory for the spawned process, mirroring `work.ml`'s
     /// `cd '<wt_path>' && ...` shell prefix.

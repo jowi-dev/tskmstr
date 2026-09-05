@@ -7,11 +7,13 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use tskmstr::agent::AgentRunner;
+use tskmstr::agent::claude::ClaudeRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
 };
-use tskmstr::config::{self, BackendKind, Config, ConfigPaths};
+use tskmstr::config::{self, AgentKind, BackendKind, Config, ConfigPaths};
 use tskmstr::github::gh_cli::{GhCli, ShellGhCli};
 use tskmstr::jira::client::{HttpJiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
@@ -250,6 +252,21 @@ fn ticket_provider_for(
     }
 }
 
+/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]), mirroring
+/// [`ticket_provider_for`]: the one factory that turns [`AgentKind`] into a
+/// live implementation, so nothing else outside config parsing needs to
+/// `match` on it (see `docs/plans/agent-runner.md` and GitHub issue #17).
+///
+/// The [`AgentKind::Claude`] arm leaks a freshly constructed [`ClaudeRunner`]
+/// to get a `&'static dyn AgentRunner` — [`ClaudeRunner`] is a zero-sized
+/// unit struct and `tm` is a short-lived CLI process, so leaking one costs
+/// nothing, the same trade [`ticket_provider_for`] makes for `ShellGhCli`.
+fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
+    match config.agent {
+        AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
+    }
+}
+
 /// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
 /// (see `run_work`'s doc comment): the same provider [`ticket_provider_for`]
 /// builds for `config.backend`, or `None` on any construction/auth failure
@@ -402,6 +419,7 @@ fn run_work(
                 current_repo_dir: &cwd,
                 current_backend_identity: &current_backend_identity,
                 backend_identity_resolver: &backend_identity_resolver,
+                runner: agent_runner_or_default(full_config.as_ref()),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -563,6 +581,17 @@ fn backend_identity_or_placeholder(config: Option<&Config>) -> tskmstr::config::
             base_url: String::new(),
             project_key: String::new(),
         })
+}
+
+/// [`agent_runner_for`] for an optionally-loaded config, mirroring
+/// [`backend_identity_or_placeholder`]: callers that load config leniently
+/// (`tm work run`, `tm review fix` — see their doc comments) still need a
+/// runner, defaulting to [`AgentKind::Claude`] (the same default an absent
+/// `[agent]` table resolves to) when no config loaded at all.
+fn agent_runner_or_default(config: Option<&Config>) -> &'static dyn AgentRunner {
+    config
+        .map(agent_runner_for)
+        .unwrap_or_else(|| Box::leak(Box::new(ClaudeRunner)))
 }
 
 /// The default global/repo config paths for this machine and working
@@ -1248,6 +1277,7 @@ fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
         run_db_path: &run_db_path,
         tmux: &tmux,
         backend_identity: &backend_identity,
+        runner: agent_runner_or_default(full_config.as_ref()),
     };
     let mut stdout = std::io::stdout();
 
@@ -1512,6 +1542,15 @@ mod tests {
     // cause 3. A github-backend config with no jira credentials at all
     // must still get a usable provider: `run_ticket_provider` must not
     // fall through to a Jira-token lookup that has nothing to resolve.
+    #[test]
+    fn agent_runner_for_claude_returns_the_claude_runner() {
+        let config = jira_config();
+
+        let runner = agent_runner_for(&config);
+
+        assert_eq!(runner.name(), "claude");
+    }
+
     #[test]
     fn run_ticket_provider_github_backend_does_not_need_a_jira_token() {
         // `ticket_provider_for`'s github arm opens a `RunStore` at

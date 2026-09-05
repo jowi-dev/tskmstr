@@ -1,5 +1,6 @@
 //! tskmstr: a CLI + TUI for linking Jira tickets with GitHub pull requests.
 
+pub mod agent;
 pub mod blocker_stacking;
 pub mod cli;
 pub mod config;

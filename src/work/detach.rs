@@ -364,7 +364,7 @@ impl DetachSpawner for FakeDetachSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::claude::ClaudeInvocation;
+    use crate::agent::AgentInvocation;
 
     fn sample_prepared_run() -> PreparedRun {
         PreparedRun {
@@ -375,7 +375,7 @@ mod tests {
             timestamp: "20260101-120000".to_string(),
             worktree: PathBuf::from("/Worktrees/axiom/abc-123"),
             branch: "claude/abc-123-20260101-120000".to_string(),
-            invocation: ClaudeInvocation {
+            invocation: AgentInvocation {
                 program: "claude".to_string(),
                 args: vec!["-p".to_string(), "do the thing".to_string()],
                 env_set: vec![("TSKMSTR_RUN_ID".to_string(), "1".to_string())],

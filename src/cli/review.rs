@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
@@ -178,6 +179,10 @@ pub struct ReviewFixDeps<'a> {
     /// tmux operations (real or fake), for hosting an interactive fix pass
     /// in the ticket's session. Only used for [`Dispatch::Interactive`].
     pub tmux: &'a dyn TmuxOps,
+    /// The AI coding agent this fix pass's invocation is built for, passed
+    /// through to [`prepare_review_fix`]. See [`crate::agent::AgentRunner`]
+    /// and GitHub issue #17.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
@@ -273,6 +278,7 @@ pub fn fix(
         prompt,
         pid,
         dispatch.run_mode(),
+        deps.runner,
     )?;
 
     if dispatch == Dispatch::Interactive {
@@ -350,6 +356,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::github::gh_cli::FakeGhCli;
     use crate::runs::StartRun;
     use crate::work::detach::FakeDetachSpawner;
@@ -430,6 +437,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -476,6 +484,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -511,6 +520,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -548,6 +558,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -586,6 +597,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -649,6 +661,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -728,6 +741,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -796,6 +810,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -836,6 +851,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -895,6 +911,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -937,6 +954,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();

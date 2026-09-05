@@ -6,7 +6,6 @@
 
 pub mod audit;
 pub mod bugbot;
-pub mod claude;
 pub mod detach;
 pub mod git;
 pub mod hooks;

@@ -65,8 +65,8 @@
 //!    untracked by ticket), lane, worktree, branch, and the current
 //!    process's pid (this *is* the driver process for `--fg`, unlike the
 //!    detached path's separate supervisor).
-//! 10. Build the `claude` invocation ([`crate::work::claude`]) with the new
-//!     run id wired in as `TSKMSTR_RUN_ID`, and spawn it
+//! 10. Build the agent invocation ([`crate::agent::AgentRunner::build_invocation`])
+//!     with the new run id wired in as `TSKMSTR_RUN_ID`, and spawn it
 //!     ([`crate::work::runner`]), stdout redirected to
 //!     `state_dir/<wt_name>-<timestamp>.json`.
 //! 11. Parse the result JSON ([`crate::work::runner::parse_run_outcome`]).
@@ -82,12 +82,12 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::{AgentRunner, InvocationInputs, RunMode};
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::provider::TicketProvider;
-use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
 use crate::work::hooks::{self, HooksError};
 use crate::work::interactive::interactive_prompt;
@@ -336,6 +336,10 @@ pub struct RunLaneDeps<'a> {
     /// [`crate::config::FsBackendIdentityResolver`] for the real
     /// filesystem-backed implementation.
     pub backend_identity_resolver: &'a dyn BackendIdentityResolver,
+    /// The AI coding agent this run's invocation is built for (Claude
+    /// today; see [`crate::agent::AgentRunner`] and GitHub issue #17),
+    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -414,8 +418,8 @@ pub struct PreparedRun {
     pub worktree: PathBuf,
     /// The fresh branch cut for this run.
     pub branch: String,
-    /// The fully resolved `claude` invocation.
-    pub invocation: crate::work::claude::ClaudeInvocation,
+    /// The fully resolved agent invocation.
+    pub invocation: crate::agent::AgentInvocation,
     /// Where the spawned `claude` process's stdout (its result JSON) is
     /// written, and later read back from.
     pub out_json_path: PathBuf,
@@ -1068,7 +1072,7 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let invocation = build_claude_invocation(ClaudeInvocationInputs {
+    let invocation = deps.runner.build_invocation(InvocationInputs {
         prompt,
         model,
         max_turns,
@@ -1155,8 +1159,9 @@ pub enum ReviewFixError {
 ///   reviewing in `vdiff`) would get silently folded into this fix pass's
 ///   session and attributed to it. So the check stays, just worded for this
 ///   case ([`ReviewFixError::WorktreeDirty`]) instead of reused verbatim.
-/// - **Hook deployment, [`RunStore::start_run`], [`build_claude_invocation`]:
-///   kept unchanged**, exactly as in `prepare_run_lane`.
+/// - **Hook deployment, [`RunStore::start_run`],
+///   [`crate::agent::AgentRunner::build_invocation`]: kept unchanged**,
+///   exactly as in `prepare_run_lane`.
 ///
 /// Run rows are started with `kind = "review-fix"`, distinct from `"lane"`
 /// so this run never shadows the ticket's lane run in
@@ -1185,6 +1190,7 @@ pub fn prepare_review_fix(
     prompt: String,
     pid: Option<u32>,
     mode: RunMode,
+    runner: &dyn AgentRunner,
 ) -> Result<PreparedRun, ReviewFixError> {
     if !git.status_is_clean(worktree)? {
         return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
@@ -1212,7 +1218,7 @@ pub fn prepare_review_fix(
         RunMode::Interactive => interactive_prompt("review-fix", ticket, &prompt),
     };
 
-    let invocation = build_claude_invocation(ClaudeInvocationInputs {
+    let invocation = runner.build_invocation(InvocationInputs {
         prompt,
         model: None,
         max_turns: None,
@@ -1425,6 +1431,7 @@ pub fn supervise_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
@@ -1713,6 +1720,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1780,6 +1788,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1832,6 +1841,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1883,6 +1893,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1933,6 +1944,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1985,6 +1997,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2040,6 +2053,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2123,6 +2137,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2199,6 +2214,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2274,6 +2290,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2322,6 +2339,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2383,6 +2401,7 @@ mod tests {
             current_repo_dir: &current_repo_dir,
             current_backend_identity: &current_identity,
             backend_identity_resolver: &resolver,
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2442,6 +2461,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2489,6 +2509,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2542,6 +2563,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2592,6 +2614,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2642,6 +2665,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2690,6 +2714,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2759,6 +2784,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2814,6 +2840,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2858,6 +2885,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2905,6 +2933,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2952,6 +2981,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2998,6 +3028,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3049,6 +3080,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3098,6 +3130,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3152,6 +3185,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3203,6 +3237,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3256,6 +3291,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3309,6 +3345,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3374,6 +3411,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3421,6 +3459,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3474,6 +3513,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3525,6 +3565,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3579,6 +3620,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3653,6 +3695,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3930,6 +3973,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3997,6 +4041,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4061,6 +4106,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4124,6 +4170,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -4175,6 +4222,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -4226,6 +4274,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -4274,6 +4323,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap_err();
 
@@ -4303,6 +4353,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Interactive,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -4340,6 +4391,7 @@ mod tests {
             "fix the review comments".to_string(),
             Some(4242),
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap();
 

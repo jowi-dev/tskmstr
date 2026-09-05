@@ -14,7 +14,7 @@
 //!    [`crate::work::run::prepare_review_fix`]).
 //! 2. Launch the window with the run id in `TSKMSTR_SESSION_RUN_ID` (via
 //!    `tmux -e`), *never* `TSKMSTR_RUN_ID` — see
-//!    [`crate::work::claude::RunMode`] for why that distinction is
+//!    [`crate::agent::RunMode`] for why that distinction is
 //!    load-bearing and symptomless when wrong.
 //! 3. The session adopts the pre-registered row on its first turn, through
 //!    [`crate::runs::session::register_session`].
@@ -47,8 +47,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::AgentInvocation;
 use crate::work::audit::{SESSION_RUN_ID_ENV, SHELL_WINDOW_NAME, shell_quote};
-use crate::work::claude::ClaudeInvocation;
 use crate::work::naming::ticket_session_name;
 use crate::work::run::PreparedRun;
 use crate::work::tmux::{
@@ -159,7 +159,7 @@ pub fn resolve_action_window(
 ///
 /// Two things this must not lose:
 ///
-/// - **The `env -u` prefix.** [`ClaudeInvocation::env_remove`] is
+/// - **The `env -u` prefix.** [`AgentInvocation::env_remove`] is
 ///   billing-safety critical and there is no `tmux` flag that *unsets* an
 ///   environment variable (`-e` only sets), so it has to be re-expressed as
 ///   `env -u` inside the command string. See that field's doc comment.
@@ -167,10 +167,10 @@ pub fn resolve_action_window(
 ///   word-split the prompt into hundreds of arguments.
 ///
 /// `invocation.args[0]` is the prompt under
-/// [`crate::work::claude::RunMode::Interactive`] (the prompt is positional
+/// [`crate::agent::RunMode::Interactive`] (the prompt is positional
 /// there), and it is what gets replaced by the `cat`; every later argument
 /// is passed through [`shell_quote`]d.
-pub fn tmux_command_line(invocation: &ClaudeInvocation, prompt_file: &Path) -> String {
+pub fn tmux_command_line(invocation: &AgentInvocation, prompt_file: &Path) -> String {
     let mut parts = vec!["env".to_string()];
     for var in &invocation.env_remove {
         parts.push("-u".to_string());
@@ -283,7 +283,8 @@ pub fn launch_interactive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
+    use crate::agent::claude::ClaudeRunner;
+    use crate::agent::{AgentRunner, InvocationInputs, RunMode};
     use crate::work::tmux::{FakeTmuxOps, TmuxCall};
     use tempfile::tempdir;
 
@@ -295,8 +296,8 @@ mod tests {
         }
     }
 
-    fn interactive_invocation(prompt: &str) -> ClaudeInvocation {
-        build_claude_invocation(ClaudeInvocationInputs {
+    fn interactive_invocation(prompt: &str) -> AgentInvocation {
+        ClaudeRunner.build_invocation(InvocationInputs {
             prompt: prompt.to_string(),
             model: Some("fable".to_string()),
             max_turns: Some("200".to_string()),
@@ -516,10 +517,10 @@ mod tests {
     }
 
     /// The one env-var assertion that matters at the tmux seam: whatever
-    /// [`crate::work::claude::build_claude_invocation`] decided,
+    /// [`crate::agent::claude::ClaudeRunner::build_invocation`] decided,
     /// `TSKMSTR_RUN_ID` must never reach a tmux-hosted window — it would
     /// gate off the SessionEnd hook that is the only thing left to finish
-    /// the run. See [`crate::work::claude::RunMode`].
+    /// the run. See [`crate::agent::RunMode`].
     #[test]
     fn launch_interactive_run_never_passes_the_supervisor_owned_run_id_var() {
         let tmp = tempdir().unwrap();

@@ -49,11 +49,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::{AgentRunner, RunMode};
 use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
-use crate::work::claude::RunMode;
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
 use crate::work::interactive::{
@@ -369,6 +369,10 @@ pub struct RunDeps<'a> {
     /// Resolves a directory's backend identity, passed through to
     /// [`crate::work::run::RunLaneDeps::backend_identity_resolver`].
     pub backend_identity_resolver: &'a dyn crate::config::BackendIdentityResolver,
+    /// The AI coding agent this run's invocation is built for, passed
+    /// through to [`crate::work::run::RunLaneDeps::runner`]. See
+    /// [`crate::agent::AgentRunner`] and GitHub issue #17.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -420,6 +424,7 @@ pub fn run(
         current_repo_dir: deps.current_repo_dir,
         current_backend_identity: deps.current_backend_identity,
         backend_identity_resolver: deps.backend_identity_resolver,
+        runner: deps.runner,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -980,6 +985,7 @@ impl fmt::Debug for WorkContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, LaneConfig};
     use crate::work::git::FakeGitOps;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
@@ -2308,6 +2314,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2423,6 +2430,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2489,6 +2497,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2643,6 +2652,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2715,6 +2725,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2773,6 +2784,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2881,6 +2893,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2940,6 +2953,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2991,6 +3005,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),

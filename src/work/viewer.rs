@@ -85,7 +85,7 @@ pub fn viewer_command(tm_program: &Path, run_id: i64) -> String {
 /// the run row. The supervisor already owns this run's lifecycle through
 /// `TSKMSTR_RUN_ID`, and handing a second owner the same run is what the
 /// whole env-var split exists to prevent (see
-/// [`crate::work::claude::RunMode`]).
+/// [`crate::agent::RunMode`]).
 pub fn launch_viewer_window(
     tmux: &dyn TmuxOps,
     target: &ActionWindow,
