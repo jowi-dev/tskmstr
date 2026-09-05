@@ -591,6 +591,7 @@ to" windows.
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
+| `c` | Launch the scope's ticket-creation session and attach to it immediately, or re-attach to a live one (board only); see "Board-launched ticket creation" below |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
@@ -677,6 +678,10 @@ audit/retro verdicts, and the local `ticket_rank` table are all recorded
 under the repo's scope, so ranking `GH-3` on one repo's board never touches
 another repo's `GH-3`. Rows written before scoping existed stay readable
 from every repo.
+
+One deliberate exception to per-ticket naming: the board's ticket-creation
+session (`c`, see "Board-launched ticket creation" below) has no ticket yet,
+so the whole scope shares a single keyless `tm-<scope>-create` session.
 
 Windows are append-only: nothing renames or reorders them, so window order
 is the action history. A repeat action whose window name is still taken
@@ -819,6 +824,41 @@ events; `tm runs watch` renders the same state as a `waiting` marker on
 running audit/create cards. The board polls the run store and tmux for
 badge updates every ~2s; the ticket list itself still refreshes only on
 `r`.
+
+### Board-launched ticket creation
+
+Pressing `c` on the board launches an interactive Claude session running the
+configured create prompt (default `/ticket-create`) and — unlike `a`'s
+detached audit launch — attaches immediately: the point is to start
+dictating the new ticket right away. Detach (`C-b d`) to land back on the
+board; the new ticket shows up on the next `r` refresh. Launching requires:
+
+```toml
+[work.create]
+dir = "~/Projects/axiom"     # required: where the session runs
+# prompt = "/ticket-create"  # optional; this is the default
+# model = "fable"            # optional; passed as `claude --model`
+```
+
+`dir` is the repo whose `.claude/` provides the ticket-create skill and hook
+settings. Without the section (or `dir`), `c` reports a status-line message
+instead of acting. Unlike `[work.review_watch].dir`, there is no fallback to
+`[work.audit].dir` — the section's absence is what disables the key. `dir`
+gets the same backend-compatibility fallback the audit dir does: if its
+resolved backend doesn't match the current repo's own, the session launches
+in the current repo instead, so the in-session `tm ticket create` files
+against the board's backend, and the post-detach status line notes the
+fallback.
+
+No ticket exists when the session launches, so per-ticket session naming
+can't apply: the whole scope shares one keyless `tm-<scope>-create` session
+holding a `create` window. One draft at a time — pressing `c` while it is
+live re-attaches to it rather than starting a parallel session (a dead
+window from a finished draft is aftermath; relaunching appends a suffixed
+`create-2` window and lands on it). No run row is pre-registered either:
+`tm ticket create` registers its own `kind = "create"` run through the
+session marker once the ticket exists, so usage telemetry needs no
+launch-side plumbing.
 
 ### Board-launched bot-findings watch
 
