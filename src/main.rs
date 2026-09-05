@@ -528,7 +528,6 @@ fn run_board(
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     run(TuiDeps {
         jira,
-        base_url: config.jira_base_url,
         project_key: config.default_project_key,
         board_column_order: config.board_column_order,
         store,
