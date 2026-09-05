@@ -23,7 +23,8 @@ pub struct TicketSummary {
     pub summary: String,
     /// Current workflow status name.
     pub status: String,
-    /// Browsable URL for the issue (`{base_url}/browse/{key}`).
+    /// Browsable URL for the issue, as the provider renders it via
+    /// [`crate::ticketing::provider::TicketProvider::issue_url`].
     pub url: String,
     /// Plain-text description, as the provider renders it via
     /// [`crate::ticketing::provider::TicketProvider::description_text`].

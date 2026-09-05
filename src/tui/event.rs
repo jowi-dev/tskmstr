@@ -93,15 +93,14 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
-/// Dependencies the TUI needs to talk to Jira, build browsable URLs, and
-/// (per `docs/plans/board-audits.md`'s "Board integration" design) launch
-/// and attach to board-launched ticket-audit sessions.
+/// Dependencies the TUI needs to talk to the ticket backend and (per
+/// `docs/plans/board-audits.md`'s "Board integration" design) launch and
+/// attach to board-launched ticket-audit sessions. Browsable ticket URLs
+/// come from the provider itself ([`TicketProvider::issue_url`]), not a
+/// separate base-URL field.
 pub struct TuiDeps {
     /// Client used to fetch tickets, transitions, and apply transitions.
     pub jira: Box<dyn TicketProvider>,
-    /// Base URL of the Jira instance, used to build `{base_url}/browse/{key}`
-    /// links for [`Cmd::OpenUrl`].
-    pub base_url: String,
     /// The configured default Jira project key, used to scope every
     /// assignee filter other than `Me`.
     pub project_key: String,
@@ -1392,7 +1391,7 @@ fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, Pro
         tickets: result
             .issues
             .into_iter()
-            .map(|issue| to_ticket_summary(deps.jira.as_ref(), issue, &deps.base_url))
+            .map(|issue| to_ticket_summary(deps.jira.as_ref(), issue))
             .collect(),
     })
 }
@@ -1731,14 +1730,10 @@ fn open_url(url: &str) -> Vec<Msg> {
     }
 }
 
-/// Convert a Jira [`Issue`] into a [`crate::tui::app::TicketSummary`],
-/// deriving `url` from `base_url` and `description` from
+/// Convert a backend [`Issue`] into a [`crate::tui::app::TicketSummary`],
+/// deriving `url` from [`TicketProvider::issue_url`] and `description` from
 /// [`TicketProvider::description_text`].
-fn to_ticket_summary(
-    jira: &dyn TicketProvider,
-    issue: Issue,
-    base_url: &str,
-) -> crate::tui::app::TicketSummary {
+fn to_ticket_summary(jira: &dyn TicketProvider, issue: Issue) -> crate::tui::app::TicketSummary {
     let description = jira.description_text(&issue);
     let assignee = issue
         .fields
@@ -1746,7 +1741,7 @@ fn to_ticket_summary(
         .as_ref()
         .map(|a| a.display_name.clone());
     crate::tui::app::TicketSummary {
-        url: format!("{base_url}/browse/{}", issue.key),
+        url: jira.issue_url(&issue.key),
         key: issue.key,
         summary: issue.fields.summary,
         status_category: issue.fields.status.status_category.key.clone(),
@@ -1796,8 +1791,7 @@ mod tests {
 
     fn deps(jira: FakeJiraClient) -> TuiDeps {
         TuiDeps {
-            jira: Box::new(JiraProvider::new(jira)),
-            base_url: "https://example.atlassian.net".to_string(),
+            jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),
             store: None,
@@ -2168,11 +2162,7 @@ mod tests {
 
     #[test]
     fn to_ticket_summary_derives_url_and_extracts_description() {
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue("PROJ-1", "To Do"),
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue("PROJ-1", "To Do"));
         assert_eq!(summary.key, "PROJ-1");
         assert_eq!(summary.status, "To Do");
         assert_eq!(summary.url, "https://example.atlassian.net/browse/PROJ-1");
@@ -2180,24 +2170,29 @@ mod tests {
     }
 
     #[test]
+    fn to_ticket_summary_url_comes_from_the_provider() {
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let provider = crate::ticketing::github_provider::GithubProvider::new(
+            &gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+
+        let summary = to_ticket_summary(&provider, issue("GH-13", "To Do"));
+
+        assert_eq!(summary.url, "https://github.com/jowi-dev/tskmstr/issues/13");
+    }
+
+    #[test]
     fn to_ticket_summary_with_no_description_is_empty_string() {
         let mut issue = issue("PROJ-1", "To Do");
         issue.fields.description = None;
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue,
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
         assert_eq!(summary.description, "");
     }
 
     #[test]
     fn to_ticket_summary_with_no_assignee_is_none() {
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue("PROJ-1", "To Do"),
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue("PROJ-1", "To Do"));
         assert_eq!(summary.assignee, None);
     }
 
@@ -2210,11 +2205,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
-        let summary = to_ticket_summary(
-            &FakeJiraClient::new(),
-            issue,
-            "https://example.atlassian.net",
-        );
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
         assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
     }
 

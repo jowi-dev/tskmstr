@@ -410,10 +410,11 @@ pub fn associate_existing_ticket_for_pr_create(
     let pr = current_branch_pr(ctx)?;
 
     let status_transition = ctx.config.status_on_pr.as_ref().and_then(|target| {
-        if issue.fields.status.name.eq_ignore_ascii_case(target) {
+        let target = ctx.jira.normalize_status_target(target);
+        if issue.fields.status.name.eq_ignore_ascii_case(&target) {
             None
         } else {
-            Some(apply_status_transition(ctx.jira, key, target))
+            Some(apply_status_transition(ctx.jira, key, &target))
         }
     });
 
@@ -466,13 +467,18 @@ pub fn create_ticket(
 
     Ok(CreateTicketOutcome {
         issue_key: issue.key.clone(),
-        issue_url: format!("{}/browse/{}", ctx.config.jira_base_url, issue.key),
+        issue_url: ctx.jira.issue_url(&issue.key),
         status_transition,
     })
 }
 
 /// Move an issue to `target`'s workflow status.
 ///
+/// `target` is first translated into the backend's own status vocabulary
+/// via [`TicketProvider::normalize_status_target`] (a no-op for Jira), so a
+/// Jira-shaped `status_on_pr`/`status_on_create` value inherited by a
+/// github-backend repo still names a real status; every outcome reports the
+/// normalized name, since that's the status the ticket actually lands in.
 /// Fetches the issue's available transitions and picks the first one whose
 /// target status name matches `target` case-insensitively, falling back to
 /// matching the transition's own name case-insensitively if none of the
@@ -482,6 +488,7 @@ pub fn create_ticket(
 /// reported as a [`StatusTransition::Warning`], since the ticket has
 /// already been created (and, where applicable, linked) by this point.
 fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
+    let target = &jira.normalize_status_target(target);
     let transitions = match jira.transitions(key) {
         Ok(transitions) => transitions,
         Err(err) => {
@@ -561,6 +568,11 @@ pub enum TransitionOutcome {
 /// `tm ticket transition <KEY> <STATUS>`: move `key` to `target`'s workflow
 /// status.
 ///
+/// Like [`apply_status_transition`], `target` is translated into the
+/// backend's own status vocabulary first
+/// ([`TicketProvider::normalize_status_target`]) so the explicit command
+/// accepts the same names the advisory paths do.
+///
 /// Unlike [`apply_status_transition`] (used by the advisory
 /// `status_on_pr`/`status_on_create` paths, where a transition problem is
 /// merely a warning since the ticket was already created/linked by the time
@@ -580,6 +592,7 @@ pub fn transition_ticket(
     key: &str,
     target: &str,
 ) -> Result<TransitionOutcome, TicketingError> {
+    let target = &jira.normalize_status_target(target);
     let issue = jira.get_issue(key)?;
     if issue.fields.status.name.eq_ignore_ascii_case(target) {
         return Ok(TransitionOutcome::AlreadyInStatus(issue.fields.status.name));
@@ -1196,7 +1209,7 @@ fn associate(
 
     Ok(AssociateOutcome {
         issue_key: key.to_string(),
-        issue_url: format!("{}/browse/{}", ctx.config.jira_base_url, key),
+        issue_url: ctx.jira.issue_url(key),
         title_updated,
         remote_link_added: true,
         status_transition,
@@ -1313,6 +1326,142 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn create_ticket_issue_url_comes_from_the_provider_not_config() {
+        // github_config's jira_base_url is empty — before GitHub issue #13
+        // this rendered the broken "/browse/GH-9". The URL must come from
+        // the provider (the fake's fixture instance) instead.
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("GH-9"));
+        let cfg = github_config();
+
+        let outcome = create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
+            .expect("should succeed");
+
+        assert_eq!(
+            outcome.issue_url,
+            "https://example.atlassian.net/browse/GH-9"
+        );
+    }
+
+    #[test]
+    fn associate_under_the_github_provider_renders_a_github_issue_url() {
+        let gh = FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr("[GH-10] Fix the thing"))))
+            .with_issue_view(
+                10,
+                Ok(crate::github::gh_cli::IssueInfo {
+                    number: 10,
+                    url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                    title: "Fix the thing".to_string(),
+                    body: String::new(),
+                    state: crate::github::gh_cli::IssueState::Open,
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                }),
+            );
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let cfg = github_config();
+        let ctx = TicketingContext {
+            jira: &provider,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "GH-10").expect("should succeed");
+
+        assert_eq!(
+            outcome.issue_url,
+            "https://github.com/jowi-dev/tskmstr/issues/10"
+        );
+    }
+
+    /// A [`FakeGhCli`] serving `GH-10` as an open issue carrying `labels`,
+    /// with the current branch's PR already titled `[GH-10] Fix the thing`.
+    fn gh_with_issue_10(labels: &[&str]) -> FakeGhCli {
+        FakeGhCli::new()
+            .with_pr_view(Ok(Some(pr("[GH-10] Fix the thing"))))
+            .with_issue_view(
+                10,
+                Ok(crate::github::gh_cli::IssueInfo {
+                    number: 10,
+                    url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                    title: "Fix the thing".to_string(),
+                    body: String::new(),
+                    state: crate::github::gh_cli::IssueState::Open,
+                    labels: labels.iter().map(|s| s.to_string()).collect(),
+                    assignees: Vec::new(),
+                }),
+            )
+    }
+
+    #[test]
+    fn pr_create_jira_status_on_pr_is_normalized_onto_the_github_vocabulary() {
+        // The inherited-from-Jira `status_on_pr = "Code Review"` names no
+        // GitHub status; before GitHub issue #13 the transition warned and
+        // silently left the ticket in To Do.
+        let gh = gh_with_issue_10(&["tm:status/todo"]);
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let cfg = Config {
+            status_on_pr: Some("Code Review".to_string()),
+            ..github_config()
+        };
+        let ctx = TicketingContext {
+            jira: &provider,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "GH-10").expect("should succeed");
+
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::Applied("In Review".to_string()))
+        );
+        let edits = gh.issue_edit_calls();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].2.add_labels,
+            vec!["tm:status/in-review".to_string()]
+        );
+    }
+
+    #[test]
+    fn pr_create_normalized_status_on_pr_skips_when_already_in_review() {
+        let gh = gh_with_issue_10(&["tm:status/in-review"]);
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let cfg = Config {
+            status_on_pr: Some("Code Review".to_string()),
+            ..github_config()
+        };
+        let ctx = TicketingContext {
+            jira: &provider,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            associate_existing_ticket_for_pr_create(&ctx, "GH-10").expect("should succeed");
+
+        assert_eq!(outcome.status_transition, None);
+        assert!(gh.issue_edit_calls().is_empty());
+    }
+
+    #[test]
+    fn transition_ticket_normalizes_the_target_through_the_provider() {
+        let gh = gh_with_issue_10(&["tm:status/todo"]);
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+
+        let outcome = transition_ticket(&provider, "GH-10", "Code Review").expect("should succeed");
+
+        assert_eq!(outcome, TransitionOutcome::Applied("In Review".to_string()));
     }
 
     #[test]
