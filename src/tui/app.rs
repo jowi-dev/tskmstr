@@ -1096,6 +1096,10 @@ pub enum Msg {
     /// The `s` key was pressed on [`Screen::Board`]: attach to the selected
     /// ticket's `tm-<scope>-<key>` session, whatever is in it. See [`session_action`].
     SessionAction,
+    /// The `m` key was pressed on [`Screen::Board`]: ensure the selected
+    /// ticket's session holds the configured `[work.manual]` window layout,
+    /// then attach. See [`manual_session_action`].
+    ManualSessionAction,
     /// The outcome of [`Cmd::AttachSession`] when it came from
     /// [`Msg::SessionAction`], as a ready-to-display status line.
     SessionAttachResult(String),
@@ -1330,6 +1334,14 @@ pub enum Cmd {
     AttachSession {
         /// Name of the tmux session to attach to.
         session_name: String,
+    },
+    /// Ensure the ticket's session holds every configured `[work.manual]`
+    /// window (see [`crate::work::manual::ensure_manual_session`]), then
+    /// attach to it. Handled specially by the board's event loop for the
+    /// same `&mut Terminal` reason as [`Cmd::AttachSession`].
+    EnsureManualSession {
+        /// Ticket key to open a manual session for.
+        key: String,
     },
     /// Launch a lane run for `key` on `lane` (see `tm work run <lane>
     /// <key>`, spawned via `std::env::current_exe()` as a watched child
@@ -1721,6 +1733,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::AuditAction => audit_action(app),
         Msg::SessionAction => session_action(app),
+        Msg::ManualSessionAction => manual_session_action(app),
         Msg::SessionAttachResult(message) => {
             app.status_line = message;
             (app, Vec::new())
@@ -2120,6 +2133,25 @@ fn session_action(app: App) -> (App, Vec<Cmd>) {
     };
     let session_name = crate::work::naming::ticket_session_name(&app.session_slug, &ticket.key);
     (app, vec![Cmd::AttachSession { session_name }])
+}
+
+/// Handle [`Msg::ManualSessionAction`]: ensure the selected board ticket's
+/// session holds the configured `[work.manual]` window layout, then attach.
+/// A no-op when no ticket is selected.
+///
+/// Unlike [`session_action`], there *is* something to launch here — but only
+/// the missing pieces of the operator's own default layout, never a driver
+/// process, so no liveness map or run row is involved (see
+/// [`crate::work::manual`]'s module docs). The config gate ("[work.manual]
+/// unset disables the key") lives in
+/// [`crate::work::manual::ensure_manual_session`], whose `NotConfigured`
+/// error becomes the status line, mirroring [`audit_action`]'s posture.
+fn manual_session_action(app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    (app, vec![Cmd::EnsureManualSession { key }])
 }
 
 /// Handle [`Msg::ViewRunAction`]: open the run detail overlay on
@@ -5375,6 +5407,33 @@ mod tests {
         let app = App::new();
 
         let (_app, cmds) = update(app, Msg::SessionAction);
+
+        assert!(cmds.is_empty());
+    }
+
+    /// GitHub issue #14: `m` opens the selected ticket's session with the
+    /// operator's configured manual layout. The `update` layer only names the
+    /// ticket; layout, gating, and attach live behind
+    /// [`Cmd::EnsureManualSession`].
+    #[test]
+    fn manual_session_action_targets_the_selected_ticket() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+
+        let (_app, cmds) = update(app, Msg::ManualSessionAction);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::EnsureManualSession {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn manual_session_action_is_a_no_op_with_no_ticket_selected() {
+        let app = App::new();
+
+        let (_app, cmds) = update(app, Msg::ManualSessionAction);
 
         assert!(cmds.is_empty());
     }

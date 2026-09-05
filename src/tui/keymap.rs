@@ -214,6 +214,7 @@ pub fn map_key(
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('s') if *screen == Screen::Board => Some(Msg::SessionAction),
+        KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
@@ -869,6 +870,51 @@ mod tests {
                     false,
                     RetroOverlay::None,
                     KeyCode::Char('a')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn m_triggers_manual_session_action_on_board() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('m')
+            ),
+            Some(Msg::ManualSessionAction)
+        );
+    }
+
+    #[test]
+    fn m_is_unbound_off_the_board_screen() {
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('m')
                 ),
                 None
             );
@@ -1942,6 +1988,7 @@ mod tests {
             (KeyCode::Char('r'), Some(Msg::Refresh)),
             (KeyCode::Char('v'), None),
             (KeyCode::Char('a'), None),
+            (KeyCode::Char('m'), None),
         ];
         for (key, expected) in cases {
             assert_eq!(

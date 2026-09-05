@@ -1586,6 +1586,7 @@ mod tests {
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
+            manual: crate::config::ManualConfig::default(),
         }
     }
 

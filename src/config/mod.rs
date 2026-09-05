@@ -301,6 +301,13 @@ pub struct RawWorkConfig {
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
+    /// `[work.manual]` settings for the board's manual-session key. See
+    /// [`RawManualConfig`].
+    ///
+    /// When unset in both global and repo config, the manual-session board
+    /// action is disabled: [`ManualConfig::windows`] must be non-empty for
+    /// `crate::work::manual::ensure_manual_session` to do anything.
+    pub manual: Option<RawManualConfig>,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -357,6 +364,37 @@ pub struct RawCreateConfig {
     /// model choice is worth setting independently of the lane default, and
     /// an explicit `--model` is what escapes an enterprise-managed pin.
     pub model: Option<String>,
+}
+
+/// Raw, partially-specified `[work.manual]` subsection as parsed directly
+/// from TOML.
+///
+/// Configures the board's manual-session key: the operator's default tmux
+/// window layout for hand-working a ticket (e.g. code, fish, claude, server)
+/// without any Claude-driven flow.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawManualConfig {
+    /// Working directory the manual windows open in. Tilde is not expanded
+    /// by this module, matching [`RawAuditConfig::dir`]; expansion is the
+    /// launching caller's responsibility. Required for the manual-session
+    /// action to launch (alongside a non-empty `windows` list).
+    pub dir: Option<String>,
+    /// Windows to ensure in the ticket's tmux session, in order. Merge
+    /// precedence: a repo-local list replaces the global list *as a whole*
+    /// (like [`RawWorkConfig::tmux_windows`] and lanes), never element by
+    /// element. Required (non-empty) to enable the action at all.
+    pub windows: Option<Vec<RawManualWindow>>,
+}
+
+/// One window entry in [`RawManualConfig::windows`]: a window name plus an
+/// optional command to run in it (absent = plain shell window).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RawManualWindow {
+    /// tmux window name, e.g. `code`.
+    pub name: String,
+    /// Command run in the window, handed to `$SHELL -c` by tmux. When unset,
+    /// the window is a plain interactive shell.
+    pub command: Option<String>,
 }
 
 /// Raw, partially-specified `[work.review_watch]` subsection as parsed
@@ -509,6 +547,10 @@ pub struct WorkConfig {
     pub create: CreateConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
+    /// Validated `[work.manual]` settings. See [`ManualConfig`]; empty (no
+    /// windows, action disabled) when the `[work.manual]` section is absent
+    /// from both global and repo config.
+    pub manual: ManualConfig,
 }
 
 /// Fully validated `[work.audit]` subsection.
@@ -544,6 +586,31 @@ pub struct CreateConfig {
     pub prompt: Option<String>,
     /// See [`RawCreateConfig::model`].
     pub model: Option<String>,
+}
+
+/// Fully validated `[work.manual]` subsection.
+///
+/// Like [`AuditConfig::dir`], nothing here is required at merge time — an
+/// empty `windows` list (or an absent `dir`) means the board's
+/// manual-session action is disabled, which
+/// `crate::work::manual::ensure_manual_session` reports as a status-line
+/// error, not a config-load failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManualConfig {
+    /// See [`RawManualConfig::dir`].
+    pub dir: Option<String>,
+    /// See [`RawManualConfig::windows`]. Empty when unset in both global and
+    /// repo config.
+    pub windows: Vec<ManualWindow>,
+}
+
+/// Validated form of [`RawManualWindow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualWindow {
+    /// See [`RawManualWindow::name`].
+    pub name: String,
+    /// See [`RawManualWindow::command`].
+    pub command: Option<String>,
 }
 
 /// Fully validated `[work.review_watch]` subsection.
@@ -1144,6 +1211,7 @@ fn merge_work(
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
+    let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
@@ -1207,7 +1275,44 @@ fn merge_work(
         audit,
         create,
         review_watch,
+        manual,
     })
+}
+
+/// Merge a repo-local `[work.manual]` section on top of a global one.
+/// `dir` merges field by field with relative-path resolution, exactly like
+/// [`merge_audit`]'s `dir`; `windows` is replaced as a whole list (like
+/// [`RawWorkConfig::tmux_windows`] and lanes) because element-wise merging
+/// of an ordered layout has no sensible semantics.
+fn merge_manual(
+    global: Option<RawManualConfig>,
+    repo: Option<RawManualConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<ManualConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let (dir, defining_dir) = match repo.dir {
+        Some(dir) => (Some(dir), repo_dir),
+        None => (global.dir, None),
+    };
+    let dir = match dir {
+        Some(dir) => Some(resolve_repo_path(&dir, defining_dir, "work.manual.dir")?),
+        None => None,
+    };
+
+    let windows = repo
+        .windows
+        .or(global.windows)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|raw| ManualWindow {
+            name: raw.name,
+            command: raw.command,
+        })
+        .collect();
+
+    Ok(ManualConfig { dir, windows })
 }
 
 /// Merge a repo-local `[work.audit]` section on top of a global one, field by
@@ -2958,6 +3063,7 @@ mod tests {
             audit: None,
             create: None,
             review_watch: None,
+            manual: None,
         };
         let repo = RawWorkConfig {
             worktree_root: Some("/repo/worktrees".to_string()),
@@ -2970,6 +3076,7 @@ mod tests {
             audit: None,
             create: None,
             review_watch: None,
+            manual: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
@@ -3012,6 +3119,122 @@ mod tests {
     fn merge_work_audit_absent_from_both_is_default() {
         let cfg = merge_work(None, None, None).expect("should merge");
         assert_eq!(cfg.audit, AuditConfig::default());
+    }
+
+    #[test]
+    fn load_full_work_manual_section_parses_dir_and_windows() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.manual]
+            dir = "~/Projects/axiom"
+            windows = [
+                { name = "code", command = "nvim" },
+                { name = "fish" },
+                { name = "claude", command = "claude" },
+                { name = "server", command = "make server" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+
+        assert_eq!(cfg.work.manual.dir, Some("~/Projects/axiom".to_string()));
+        assert_eq!(
+            cfg.work.manual.windows,
+            vec![
+                ManualWindow {
+                    name: "code".to_string(),
+                    command: Some("nvim".to_string()),
+                },
+                ManualWindow {
+                    name: "fish".to_string(),
+                    command: None,
+                },
+                ManualWindow {
+                    name: "claude".to_string(),
+                    command: Some("claude".to_string()),
+                },
+                ManualWindow {
+                    name: "server".to_string(),
+                    command: Some("make server".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_work_manual_absent_from_both_is_default() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.manual, ManualConfig::default());
+        assert!(cfg.manual.windows.is_empty());
+        assert_eq!(cfg.manual.dir, None);
+    }
+
+    #[test]
+    fn merge_work_manual_dir_merges_field_by_field_windows_replace_wholesale() {
+        let global = RawWorkConfig {
+            manual: Some(RawManualConfig {
+                dir: Some("~/Projects/axiom".to_string()),
+                windows: Some(vec![
+                    RawManualWindow {
+                        name: "code".to_string(),
+                        command: Some("nvim".to_string()),
+                    },
+                    RawManualWindow {
+                        name: "fish".to_string(),
+                        command: None,
+                    },
+                ]),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            manual: Some(RawManualConfig {
+                dir: None,
+                windows: Some(vec![RawManualWindow {
+                    name: "server".to_string(),
+                    command: Some("make server".to_string()),
+                }]),
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        // dir falls back to global, field by field.
+        assert_eq!(cfg.manual.dir, Some("~/Projects/axiom".to_string()));
+        // windows are replaced as a whole list, not appended.
+        assert_eq!(
+            cfg.manual.windows,
+            vec![ManualWindow {
+                name: "server".to_string(),
+                command: Some("make server".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_work_manual_relative_dir_resolves_against_repo_dir() {
+        let repo = RawWorkConfig {
+            manual: Some(RawManualConfig {
+                dir: Some("subdir".to_string()),
+                windows: None,
+            }),
+            ..Default::default()
+        };
+        let cfg =
+            merge_work(None, Some(repo), Some(Path::new("/repo/root"))).expect("should merge");
+        assert_eq!(cfg.manual.dir, Some("/repo/root/subdir".to_string()));
     }
 
     #[test]

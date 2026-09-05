@@ -590,6 +590,7 @@ to" windows.
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
+| `m` | Ensure the selected ticket's session holds your configured `[work.manual]` window layout, then attach (board only); see "Board-opened manual sessions" below |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
 | `c` | Launch the scope's ticket-creation session and attach to it immediately, or re-attach to a live one (board only); see "Board-launched ticket creation" below |
 | `v` | Open the run-detail overlay for the selected ticket's latest run, any `kind` (board only) |
@@ -825,6 +826,38 @@ running audit/create cards. The board polls the run store and tmux for
 badge updates every ~2s; the ticket list itself still refreshes only on
 `r`.
 
+### Board-opened manual sessions
+
+Every other board action drives a Claude session; for a ticket small enough
+that the round trip is slower than making the change by hand, `m` is the
+human escape hatch. Pressing it ensures the selected ticket's
+`tm-<scope>-<key>` session exists with your default manual window layout and
+attaches. The layout comes from config:
+
+```toml
+[work.manual]
+dir = "~/Projects/axiom"    # required: working directory for the windows
+windows = [                 # required, in creation order
+  { name = "code", command = "nvim" },
+  { name = "fish" },        # no command = plain interactive shell
+  { name = "claude", command = "claude" },
+  { name = "server", command = "make server" },
+]
+```
+
+With no `[work.manual]` section (or an empty `windows` list), `m` reports a
+status-line message instead of acting. Windows are created only when
+missing — pressing `m` again just re-attaches, and pressing it on a session
+that already holds `audit`/`work`/`fix` windows adds the manual windows
+alongside them without duplicating anything. A window whose pane has died
+is replaced under a `-2` repeat suffix, like every other tmux-hosted
+action.
+
+Manual sessions are human work: no run row is registered in runs.db, and no
+badge appears on the card. `dir` is a plain configured directory for now;
+opening the windows in the ticket's own worktree (so `tm pr create` can
+link the branch) is a possible future refinement.
+
 ### Board-launched ticket creation
 
 Pressing `c` on the board launches an interactive Claude session running the
@@ -1045,9 +1078,9 @@ are optional.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
-A `[work.lanes.<name>].repo` or `[work.audit].dir` value set by a
-repo-local `.tskmstr.toml` may be a plain relative path (not `~`-prefixed,
-not absolute); it resolves against that repo's own root. `repo = "."` is
+A `[work.lanes.<name>].repo`, `[work.audit].dir`, or `[work.manual].dir`
+value set by a repo-local `.tskmstr.toml` may be a plain relative path (not
+`~`-prefixed, not absolute); it resolves against that repo's own root. `repo = "."` is
 the common case — it resolves to the repo root itself, not `<root>/.` —
 letting a repo point a lane straight at itself:
 
@@ -1068,7 +1101,7 @@ than resolving against some fallback directory — the global config has no
 repo of its own to resolve a relative path against, and a lane inherited
 verbatim into every project (the root cause behind GitHub issue #5) is
 exactly the failure mode this restriction rules out. Use an absolute or
-`~`-prefixed path for any lane/audit-dir value set globally.
+`~`-prefixed path for any lane/audit/manual dir value set globally.
 
 ### `[backend]`: choosing a ticket provider
 

@@ -10,6 +10,7 @@ pub mod create;
 pub mod detach;
 pub mod git;
 pub mod interactive;
+pub mod manual;
 pub mod naming;
 pub mod review_watch;
 pub mod run;
