@@ -1484,6 +1484,7 @@ mod tests {
             review_bots: Vec::new(),
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
+            agent: tskmstr::config::AgentKind::Claude,
         }
     }
 
@@ -1501,6 +1502,7 @@ mod tests {
             review_bots: Vec::new(),
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
+            agent: tskmstr::config::AgentKind::Claude,
         }
     }
 

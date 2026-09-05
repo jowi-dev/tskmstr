@@ -18,6 +18,12 @@
 //! implementation yet (currently `"github"`, see GitHub issue #3) is
 //! [`ConfigError::ProviderNotImplemented`] — [`load`]/[`merge`] never
 //! panics or silently falls back to Jira for either case.
+//!
+//! An optional `[agent]` table selects which AI coding agent a config uses
+//! (see [`AgentKind`]); it defaults to Claude when absent, so an existing
+//! config with no `[agent]` table keeps working unchanged. A runner name
+//! that doesn't parse into an [`AgentKind`] is [`ConfigError::InvalidRunner`].
+//! See GitHub issue #17 and `docs/plans/agent-runner.md`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,6 +104,14 @@ pub struct RawConfig {
     /// `default_project_key` fields above are required exactly as before
     /// `[backend]` existed.
     pub backend: Option<RawBackendConfig>,
+    /// `[agent]` settings: which AI coding agent this config selects. See
+    /// [`RawAgentConfig`].
+    ///
+    /// When unset in both global and repo config, defaults to
+    /// [`AgentKind::Claude`], so an existing config with no `[agent]` table
+    /// at all keeps working unchanged. See GitHub issue #17 and
+    /// `docs/plans/agent-runner.md`.
+    pub agent: Option<RawAgentConfig>,
 }
 
 /// Raw, partially-specified `[backend]` section as parsed directly from
@@ -185,6 +199,49 @@ impl BackendKind {
         match s {
             "jira" => Some(BackendKind::Jira),
             "github" => Some(BackendKind::Github),
+            _ => None,
+        }
+    }
+}
+
+/// Raw, partially-specified `[agent]` section as parsed directly from TOML.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawAgentConfig {
+    /// Which AI coding agent to use: `"claude"` (default, and currently the
+    /// only recognized value). An unrecognized value is
+    /// [`ConfigError::InvalidRunner`].
+    pub runner: Option<String>,
+}
+
+/// Which AI coding agent a config selects.
+///
+/// This is the one enum a new agent adapter extends: add a variant here, add
+/// its config validation as a new arm of the `match` in
+/// [`merge_with_repo_dir`] (mirroring how [`BackendKind`] is handled), add
+/// its `AgentRunner` implementation (see `docs/plans/agent-runner.md`, GitHub
+/// issue #17), and wire it into `agent_runner_for` in `main.rs`. Nothing else
+/// needs to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    /// Claude Code, via the Claude agent adapter. The only implementation so
+    /// far, and the default when `[agent]` is absent.
+    #[default]
+    Claude,
+}
+
+impl AgentKind {
+    /// The lowercase string stored in config for this runner.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+        }
+    }
+
+    /// Parses a config `runner` string. Returns `None` for unrecognized
+    /// values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(AgentKind::Claude),
             _ => None,
         }
     }
@@ -376,6 +433,10 @@ pub struct Config {
     /// defaults set) when the `[work]` section is absent from both global
     /// and repo config.
     pub work: WorkConfig,
+    /// Which AI coding agent this config selects. See [`AgentKind`]; defaults
+    /// to [`AgentKind::Claude`] when `[agent]` is absent from both global and
+    /// repo config. See GitHub issue #17 and `docs/plans/agent-runner.md`.
+    pub agent: AgentKind,
 }
 
 /// Fully validated `[work]` section.
@@ -613,6 +674,14 @@ pub enum ConfigError {
         provider: &'static str,
     },
 
+    /// `[agent].runner` was set to a value that isn't a recognized agent
+    /// runner name, mirroring [`ConfigError::InvalidProvider`].
+    #[error("invalid [agent] runner `{value}`; expected \"claude\"")]
+    InvalidRunner {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
     /// A parent directory for a config file could not be created.
     #[error("failed to create config directory {path}: {source}")]
     CreateDir {
@@ -733,6 +802,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         board_column_order: None,
         work: None,
         backend: None,
+        agent: None,
     }
 }
 
@@ -820,6 +890,7 @@ fn merge_with_repo_dir(
     let repo = repo.unwrap_or_default();
 
     let backend = merge_backend(global.backend.clone(), repo.backend.clone())?;
+    let agent = merge_agent(global.agent.clone(), repo.agent.clone())?;
 
     let jira_base_url = resolved_jira_field(
         &repo,
@@ -895,6 +966,7 @@ fn merge_with_repo_dir(
             review_bots,
             board_column_order,
             work,
+            agent,
         }),
         BackendKind::Github => {
             let configured_repo = repo
@@ -928,6 +1000,7 @@ fn merge_with_repo_dir(
                 review_bots,
                 board_column_order,
                 work,
+                agent,
             })
         }
     }
@@ -952,6 +1025,26 @@ fn merge_backend(
     match repo.provider.or(global.provider) {
         Some(value) => BackendKind::parse(&value).ok_or(ConfigError::InvalidProvider { value }),
         None => Ok(BackendKind::default()),
+    }
+}
+
+/// Merge a repo-local `[agent]` section on top of a global one, field by
+/// field, then parse the resulting `runner` string (if any) into an
+/// [`AgentKind`], exactly mirroring [`merge_backend`].
+///
+/// Absence in both global and repo config defaults to [`AgentKind::Claude`],
+/// so an existing config with no `[agent]` table at all keeps working
+/// unchanged.
+fn merge_agent(
+    global: Option<RawAgentConfig>,
+    repo: Option<RawAgentConfig>,
+) -> Result<AgentKind, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    match repo.runner.or(global.runner) {
+        Some(value) => AgentKind::parse(&value).ok_or(ConfigError::InvalidRunner { value }),
+        None => Ok(AgentKind::default()),
     }
 }
 
@@ -1293,6 +1386,7 @@ mod tests {
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
             work: None,
             backend: None,
+            agent: None,
         }
     }
 
@@ -1319,6 +1413,7 @@ mod tests {
             board_column_order: None,
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -1345,6 +1440,7 @@ mod tests {
             board_column_order: None,
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -1374,6 +1470,7 @@ mod tests {
             board_column_order: None,
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -1403,6 +1500,7 @@ mod tests {
             board_column_order: None,
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -1432,6 +1530,7 @@ mod tests {
             board_column_order: None,
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
@@ -1461,6 +1560,7 @@ mod tests {
             board_column_order: Some(vec!["Code Review".into()]),
             work: None,
             backend: None,
+            agent: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
@@ -2430,6 +2530,96 @@ mod tests {
     #[test]
     fn backend_kind_default_is_jira() {
         assert_eq!(BackendKind::default(), BackendKind::Jira);
+    }
+
+    // --- `[agent]` section ---
+
+    #[test]
+    fn agent_kind_parse_and_as_str_round_trip() {
+        assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::parse("nonsense"), None);
+        assert_eq!(AgentKind::Claude.as_str(), "claude");
+    }
+
+    #[test]
+    fn agent_kind_default_is_claude() {
+        assert_eq!(AgentKind::default(), AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_absent_from_both_defaults_to_claude() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_runner_claude_explicit_succeeds() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+            }),
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_invalid_runner_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("bogus".to_string()),
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("claude"),
+            "error should name the valid runner options: {message}"
+        );
+        match err {
+            ConfigError::InvalidRunner { value } => assert_eq!(value, "bogus"),
+            other => panic!("expected InvalidRunner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_repo_overrides_global_runner() {
+        // `global`'s runner value is invalid on its own; the merge only
+        // succeeds because `repo`'s valid `"claude"` wins over it -- proving
+        // repo-level precedence the same way
+        // `merge_backend_repo_overrides_global_provider` does for `[backend]`.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("bogus".to_string()),
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo override should take effect");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_repo_runner_absent_falls_back_to_global() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            default_project_key: Some("REPO".to_string()),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Claude);
     }
 
     // --- `[work]` section ---
