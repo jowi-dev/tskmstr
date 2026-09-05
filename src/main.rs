@@ -363,6 +363,7 @@ fn run_work(
                 &identity,
                 &current_exe,
                 &key,
+                agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
             )?;
         }
@@ -449,8 +450,14 @@ fn run_work(
             let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
             let spawner = tskmstr::work::runner::StdProcessSpawner;
             let gh = ShellGhCli::new();
-            let succeeded =
-                tskmstr::cli::work::supervise(&spawner, &gh, &run_store, &state, &mut stdout)?;
+            let succeeded = tskmstr::cli::work::supervise(
+                &spawner,
+                &gh,
+                &run_store,
+                &state,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
             // The state file has served its one-shot handoff purpose; a
             // failed removal isn't worth failing the (already recorded) run
             // over. On a supervisor crash it survives for debugging.
@@ -1313,9 +1320,10 @@ fn run_runs(
     // scope to the invoking repo when its config loads (GitHub issue #10),
     // and fall back to unscoped — the pre-#10 behavior — when it doesn't,
     // so `tm runs` still works on a machine with no config at all.
-    let scope = config::load(&default_config_paths())
-        .ok()
-        .map(|cfg| tskmstr::config::BackendIdentity::from_config(&cfg).scope());
+    let full_config = config::load(&default_config_paths()).ok();
+    let scope = full_config
+        .as_ref()
+        .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).scope());
     let scope = scope.as_deref();
 
     match cmd {
@@ -1393,7 +1401,14 @@ fn run_runs(
         }
         Some(RunsCmd::Resume { ticket }) => {
             let mut stderr = std::io::stderr();
-            tskmstr::cli::runs::resume(&store, scope, &ticket, &mut stdout, &mut stderr)?;
+            tskmstr::cli::runs::resume(
+                &store,
+                scope,
+                &ticket,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+                &mut stderr,
+            )?;
         }
         Some(RunsCmd::Reopen {
             ticket_or_id,

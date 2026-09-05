@@ -69,7 +69,7 @@
 //!     with the new run id wired in as `TSKMSTR_RUN_ID`, and spawn it
 //!     ([`crate::work::runner`]), stdout redirected to
 //!     `state_dir/<wt_name>-<timestamp>.json`.
-//! 11. Parse the result JSON ([`crate::work::runner::parse_run_outcome`]).
+//! 11. Parse the result JSON ([`crate::agent::AgentRunner::parse_outcome`]).
 //!     A non-zero exit status forces a failed outcome regardless of what
 //!     the JSON says (mirrors `work.ml`'s `if status <> 0 then ... exit
 //!     status`, which never gets as far as inspecting `is_error`).
@@ -92,7 +92,7 @@ use crate::work::git::{GitError, GitOps};
 use crate::work::hooks::{self, HooksError};
 use crate::work::interactive::interactive_prompt;
 use crate::work::naming::{self, expand_tilde};
-use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest, parse_run_outcome};
+use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest};
 
 /// Errors that can occur while running [`run_lane_fg`].
 #[derive(Debug, Error)]
@@ -391,7 +391,7 @@ pub struct RunLaneRequest {
     pub mode: RunMode,
 }
 
-/// Everything [`run_claude_and_finish`] needs to spawn `claude`, wait, parse
+/// Everything [`run_agent_and_finish`] needs to spawn the agent, wait, parse
 /// its result, and finish the tracked run — the output of
 /// [`prepare_run_lane`] (steps 1-9 of the module doc's sequence), consumed by
 /// steps 10-13.
@@ -783,11 +783,11 @@ fn append_log_line(log_path: &Path, line: &str) {
 ///
 /// Composed from [`prepare_run_lane`] (steps 1-9, provisioning through
 /// `start_run`, recording *this* process's pid since `--fg` is itself the
-/// driver) followed by [`run_claude_and_finish`] (steps 10-13, spawn through
+/// driver) followed by [`run_agent_and_finish`] (steps 10-13, spawn through
 /// the printed summary) — the same split the detached path
 /// (`src/work/detach.rs`) uses, except the detached path hands
 /// [`prepare_run_lane`]'s output to a re-exec'd supervisor instead of
-/// calling [`run_claude_and_finish`] itself.
+/// calling [`run_agent_and_finish`] itself.
 pub fn run_lane_fg(
     deps: &RunLaneDeps<'_>,
     config: &WorkConfig,
@@ -805,7 +805,14 @@ pub fn run_lane_fg(
         Some(std::process::id()),
         out,
     )?;
-    run_claude_and_finish(deps.spawner, deps.gh, deps.run_store, &prepared, out)
+    run_agent_and_finish(
+        deps.spawner,
+        deps.gh,
+        deps.run_store,
+        &prepared,
+        deps.runner,
+        out,
+    )
 }
 
 /// Steps 1-9 of the module doc's ported sequence: resolve the lane, preflight
@@ -1270,8 +1277,8 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
     pr_url_regex().find(text).map(|m| m.as_str().to_string())
 }
 
-/// Steps 10-13 of the module doc's ported sequence: spawn `claude`, wait,
-/// parse its result JSON, [`RunStore::finish_run`], and print the summary to
+/// Steps 10-13 of the module doc's ported sequence: spawn the agent, wait,
+/// parse its result, [`RunStore::finish_run`], and print the summary to
 /// `out`. The one tail both `--fg` ([`run_lane_fg`]) and the detached
 /// supervisor ([`supervise_run`]) call — per
 /// `docs/plans/runner-port.md` §4, there is exactly one spawn-wait-parse
@@ -1280,12 +1287,15 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
 /// `gh` is used for the post-run PR-URL lookup (`gh pr list --head <branch>`,
 /// falling back to scraping the result text — see [`resolve_pr_url`]),
 /// ported from `work.ml`'s detached wrapper script so both `--fg` and
-/// detached runs record `pr_url` the same way.
-pub fn run_claude_and_finish(
+/// detached runs record `pr_url` the same way. `runner` is the adapter whose
+/// [`AgentRunner::parse_outcome`] and [`AgentRunner::resume_command`] this
+/// tail defers to — see GitHub issue #17.
+pub fn run_agent_and_finish(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
     run_store: &RunStore,
     prepared: &PreparedRun,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     let invocation = &prepared.invocation;
@@ -1300,23 +1310,24 @@ pub fn run_claude_and_finish(
     })?;
 
     // Parse the outcome and classify the run's terminal status. A non-zero
-    // exit is always Failed, regardless of what (if anything) the JSON says
-    // -- that's an unambiguous signal from the process itself. Otherwise:
+    // exit is always Failed, regardless of what (if anything) the result
+    // says -- that's an unambiguous signal from the process itself.
+    // Otherwise:
     //
-    // - JSON parsed and `is_error` was explicit -> Failed/Done, exactly as
+    // - Result parsed and `is_error` was explicit -> Failed/Done, exactly as
     //   before.
-    // - JSON failed to parse (or had no usable session_id) -> Interrupted:
+    // - Result failed to parse (or had no usable session_id) -> Interrupted:
     //   we genuinely don't know what happened, which is a different claim
     //   than "the agent failed".
-    // - JSON parsed but `is_error` was entirely absent -> Interrupted, not
+    // - Result parsed but `is_error` was entirely absent -> Interrupted, not
     //   Done. This is the fix for the bug this variant exists for: a mid-run
     //   event that ends the turn gracefully (exit 0) without ever writing an
     //   `is_error` field -- e.g. a usage-limit forced model switch -- used to
     //   default straight to `Done` via `unwrap_or(false)`. See
     //   `RunStatus::Interrupted`'s doc comment and
-    //   `parse_run_outcome_leaves_is_error_none_when_absent`.
-    let raw_json = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
-    let parsed = parse_run_outcome(&raw_json).ok();
+    //   `AgentRunner::parse_outcome`'s tests for the exact contract.
+    let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
+    let parsed = runner.parse_outcome(&raw_result).ok();
     let run_status = if !status.success() {
         RunStatus::Failed
     } else {
@@ -1392,7 +1403,7 @@ pub fn run_claude_and_finish(
     writeln!(out, "error     {is_error}")?;
     writeln!(out)?;
     if let Some(session_id) = &session_id {
-        writeln!(out, "resume:   claude --resume {session_id}")?;
+        writeln!(out, "resume:   {}", runner.resume_command(session_id))?;
     }
     writeln!(out, "summary:")?;
     write!(out, "{summary}")?;
@@ -1422,10 +1433,11 @@ pub fn supervise_run(
     run_store: &RunStore,
     prepared: &PreparedRun,
     supervisor_pid: u32,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
-    run_claude_and_finish(spawner, gh, run_store, prepared, out)
+    run_agent_and_finish(spawner, gh, run_store, prepared, runner, out)
 }
 
 #[cfg(test)]
@@ -2024,12 +2036,12 @@ mod tests {
     /// The regression this suite exists for: the in-session agent
     /// deliberately finishes its own run (`tm runs finish <id> --status
     /// blocked --blocker "..."`) before `claude -p` exits 0. The
-    /// supervisor's own `run_claude_and_finish` tail must not clobber that
+    /// supervisor's own `run_agent_and_finish` tail must not clobber that
     /// status back to `Done` -- but it should still fill in the telemetry
     /// (turns, cost, session id) that only it can observe, since the
     /// session-set outcome leaves those fields `None`.
     #[test]
-    fn run_claude_and_finish_preserves_session_set_blocked_status_on_zero_exit() {
+    fn run_agent_and_finish_preserves_session_set_blocked_status_on_zero_exit() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2091,11 +2103,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(canned_json());
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -2113,7 +2126,7 @@ mod tests {
     /// is an unambiguous crash signal and must mark the run `Failed` even
     /// if the in-session agent already set some other status for itself.
     #[test]
-    fn run_claude_and_finish_nonzero_exit_overrides_session_set_status_to_failed() {
+    fn run_agent_and_finish_nonzero_exit_overrides_session_set_status_to_failed() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2171,11 +2184,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::with_exit_code(canned_json(), 1);
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -2190,7 +2204,7 @@ mod tests {
     /// ambiguous exit-0-but-no-`is_error` result is a weaker signal than a
     /// deliberate `tm runs finish` call.
     #[test]
-    fn run_claude_and_finish_does_not_interrupt_a_session_set_blocked_status() {
+    fn run_agent_and_finish_does_not_interrupt_a_session_set_blocked_status() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2251,11 +2265,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(json.to_string());
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -3104,7 +3119,7 @@ mod tests {
     // tolerant of neither resolving (see resolve_pr_url). ---
 
     #[test]
-    fn run_claude_and_finish_records_pr_url_from_gh_lookup() {
+    fn run_agent_and_finish_records_pr_url_from_gh_lookup() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3160,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn run_claude_and_finish_falls_back_to_scraping_result_text_when_gh_finds_nothing() {
+    fn run_agent_and_finish_falls_back_to_scraping_result_text_when_gh_finds_nothing() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3212,7 +3227,7 @@ mod tests {
     }
 
     #[test]
-    fn run_claude_and_finish_pr_url_is_none_when_neither_gh_nor_scrape_find_one() {
+    fn run_agent_and_finish_pr_url_is_none_when_neither_gh_nor_scrape_find_one() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3263,7 +3278,7 @@ mod tests {
         assert!(!outcome.is_error);
     }
 
-    // --- prepare_run_lane / run_claude_and_finish / supervise_run:
+    // --- prepare_run_lane / run_agent_and_finish / supervise_run:
     // the detached path's split of run_lane_fg's sequence. ---
 
     #[test]
@@ -3657,6 +3672,7 @@ mod tests {
             &run_store,
             &prepared,
             9999,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -3724,6 +3740,7 @@ mod tests {
             &run_store,
             &prepared,
             4321,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();

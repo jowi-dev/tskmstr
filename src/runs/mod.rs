@@ -225,8 +225,8 @@ pub enum RunStatus {
     /// explicitly `false`), which is exactly the shape a mid-run event like a
     /// usage-limit model switch can produce. Treating that as `Done` is the
     /// bug this variant exists to avoid — see
-    /// [`crate::work::runner::parse_run_outcome`]'s doc comment. Terminal for
-    /// board/ordering purposes, same as `Done`/`Failed`.
+    /// [`crate::agent::AgentRunner::parse_outcome`]'s doc comment. Terminal
+    /// for board/ordering purposes, same as `Done`/`Failed`.
     Interrupted,
 }
 
@@ -1408,7 +1408,7 @@ impl RunStore {
     }
 
     /// Records the outcome of a finished run the way `tm work run`'s
-    /// supervisor does (see [`crate::work::run::run_claude_and_finish`]),
+    /// supervisor does (see [`crate::work::run::run_agent_and_finish`]),
     /// without letting the supervisor's own inferred status clobber one the
     /// in-session agent already set by calling `tm runs finish` itself
     /// (e.g. `tm runs finish <id> --status blocked --blocker "..."` before

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::runs::session::{SessionEnv, register_session};
 use crate::runs::{
     FinishRun, Run, RunEvent, RunStatus, RunStore, RunStoreError, RunSummary, StartRun,
@@ -849,6 +850,7 @@ pub fn resume(
     store: &RunStore,
     scope: Option<&str>,
     ticket: &str,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
@@ -872,11 +874,12 @@ pub fn resume(
     if run.status.is_terminal() {
         writeln!(
             err,
-            "warning: run {} for {ticket} is already {} — `claude --resume` will work, \
+            "warning: run {} for {ticket} is already {} — `{} --resume` will work, \
              but the run row will still look finished. Run `tm runs reopen {ticket}` first \
              if you want it to look active again.",
             run.id,
-            run.status.as_str()
+            run.status.as_str(),
+            runner.name()
         )?;
     }
 
@@ -1118,6 +1121,7 @@ pub fn format_age(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use tempfile::tempdir;
 
     fn open_store(dir: &std::path::Path) -> RunStore {
@@ -2803,7 +2807,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &ClaudeRunner, &mut out, &mut stderr)
+            .expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "sess-abc\n");
     }
@@ -2826,7 +2831,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &ClaudeRunner, &mut out, &mut stderr)
+            .expect("should succeed");
 
         let warning = String::from_utf8(stderr).unwrap();
         assert!(warning.contains("PROJ-1"));
@@ -2849,7 +2855,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        resume(&store, None, "proj-1", &mut out, &mut stderr).expect("should succeed");
+        resume(&store, None, "proj-1", &ClaudeRunner, &mut out, &mut stderr)
+            .expect("should succeed");
 
         assert!(stderr.is_empty());
         assert_eq!(String::from_utf8(out).unwrap(), "sess-live\n");
@@ -2862,7 +2869,15 @@ mod tests {
         let mut out = Vec::new();
         let mut stderr = Vec::new();
 
-        let err = resume(&store, None, "PROJ-404", &mut out, &mut stderr).expect_err("should fail");
+        let err = resume(
+            &store,
+            None,
+            "PROJ-404",
+            &ClaudeRunner,
+            &mut out,
+            &mut stderr,
+        )
+        .expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -2888,7 +2903,8 @@ mod tests {
 
         let mut out = Vec::new();
         let mut stderr = Vec::new();
-        let err = resume(&store, None, "PROJ-1", &mut out, &mut stderr).expect_err("should fail");
+        let err = resume(&store, None, "PROJ-1", &ClaudeRunner, &mut out, &mut stderr)
+            .expect_err("should fail");
 
         match &err {
             RunsCliError::NoSessionId { ticket, run_id } => {

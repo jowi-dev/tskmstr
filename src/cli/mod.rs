@@ -886,7 +886,7 @@ impl From<FinishStatusArg> for crate::runs::RunStatus {
 /// making the run actionable again, so it's deliberately excluded, same as
 /// the rest of [`FinishStatusArg`]. `Blocked` is the one exception: it's
 /// also included as a *repair* target for rows a bug mislabeled `done` (see
-/// the `run_claude_and_finish`/`finish_run_from_supervisor` fix this exists
+/// the `run_agent_and_finish`/`finish_run_from_supervisor` fix this exists
 /// alongside) -- moving such a row to `blocked` is restoring its true state,
 /// not recreating a fresh terminal one.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]

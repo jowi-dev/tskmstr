@@ -11,18 +11,24 @@
 //! that factory holds a `&dyn AgentRunner` rather than naming a concrete
 //! runner. [`crate::agent::claude::ClaudeRunner`] is the only implementation
 //! so far; see GitHub issue #17 and `docs/plans/agent-runner.md` for the
-//! full phase plan this module is phase 2 of.
+//! full phase plan this module is phase 3 of.
 //!
-//! This phase moves the invocation builder — [`RunMode`],
-//! [`InvocationInputs`], [`AgentInvocation`], and the `TSKMSTR_RUN_ID`/
-//! `TSKMSTR_SESSION_RUN_ID` env-var contract — out of `src/work/claude.rs`
-//! (deleted) and behind [`AgentRunner::build_invocation`], with
-//! [`crate::agent::claude::ClaudeRunner`] as the sole implementation. Later
-//! phases add more methods to the trait (outcome parsing, interactive
-//! shell-string rendering, telemetry deployment, pricing); this phase adds
-//! exactly the two methods an invocation-building caller needs.
+//! Phase 2 moved the invocation builder — [`RunMode`], [`InvocationInputs`],
+//! [`AgentInvocation`], and the `TSKMSTR_RUN_ID`/`TSKMSTR_SESSION_RUN_ID`
+//! env-var contract — out of `src/work/claude.rs` (deleted) and behind
+//! [`AgentRunner::build_invocation`]. This phase moves result parsing —
+//! [`RunOutcome`], [`OutcomeParseError`], and the `parse_run_outcome` logic —
+//! out of `src/work/runner.rs` and behind [`AgentRunner::parse_outcome`],
+//! and adds [`AgentRunner::resume_command`] so every user-facing resume hint
+//! is sourced from the adapter instead of a `claude --resume` literal
+//! scattered across callers. Later phases add more methods to the trait
+//! (interactive shell-string rendering, telemetry deployment, pricing).
 
 use std::path::PathBuf;
+
+use thiserror::Error;
+
+use crate::runs::ModelUsageMap;
 
 pub mod claude;
 
@@ -165,12 +171,67 @@ pub struct AgentInvocation {
     pub env_remove: Vec<String>,
 }
 
+/// Errors from [`AgentRunner::parse_outcome`].
+#[derive(Debug, Error)]
+pub enum OutcomeParseError {
+    /// The raw result text did not parse as JSON at all.
+    #[error("failed to parse agent result JSON: {0}")]
+    Malformed(#[from] serde_json::Error),
+
+    /// The JSON parsed, but `session_id` was missing, empty, or not a
+    /// string. See [`AgentRunner::parse_outcome`]'s doc comment for why
+    /// `session_id` is the one field every adapter must treat as required.
+    #[error("agent result JSON is missing a non-empty session_id")]
+    MissingSessionId,
+}
+
+/// The typed result of one finished headless agent invocation, parsed from
+/// whatever raw result text the adapter's process wrote (e.g. `claude -p
+/// --output-format json`'s stdout). The exact raw shape is adapter-owned —
+/// see [`crate::agent::claude::ClaudeRunner`]'s `parse_outcome` for the
+/// `claude`-specific field mapping this shape mirrors today — but this
+/// struct itself is runner-agnostic: it's what every caller downstream of
+/// [`AgentRunner::parse_outcome`] depends on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunOutcome {
+    /// The resumable session id, required — see
+    /// [`OutcomeParseError::MissingSessionId`]. Feeds `tm runs finish
+    /// --session-id` and [`AgentRunner::resume_command`].
+    pub session_id: String,
+    /// Estimated cost in USD for this invocation, absent when the adapter's
+    /// result carried no such field.
+    pub cost_usd: Option<f64>,
+    /// Number of turns/steps the agent took, absent when the adapter's
+    /// result carried no such field.
+    pub num_turns: Option<u64>,
+    /// Whether the agent reported this invocation as an error, verbatim —
+    /// `None` when the underlying field is entirely absent from the result,
+    /// distinct from an explicit `false`.
+    ///
+    /// An absent value is exactly the shape a mid-run event like a
+    /// usage-limit forced model switch can leave behind — the turn ends
+    /// gracefully (the process exits 0) but never reports an error field at
+    /// all. The caller ([`crate::work::run::run_agent_and_finish`]) treats
+    /// `None` here as suspicious — `RunStatus::Interrupted`, not `Done` —
+    /// while `Some(true)`/`Some(false)` still drive `Failed`/`Done` exactly
+    /// as before.
+    pub is_error: Option<bool>,
+    /// The free-text summary/response, absent when missing, distinct from an
+    /// explicit empty string.
+    pub result: Option<String>,
+    /// Per-model token/cost usage, present only when the adapter's result
+    /// carried a non-empty map — an empty map normalizes to `None`. Feeds
+    /// `tm runs finish --model-usage` (only passed by the caller when this
+    /// is `Some`).
+    pub model_usage: Option<ModelUsageMap>,
+}
+
 /// Backend-agnostic AI coding agent operations. See the module doc comment
 /// for how this relates to [`crate::agent::claude::ClaudeRunner`] and
 /// `main.rs`'s `agent_runner_for`.
 ///
-/// This phase's trait carries exactly the two methods an invocation-building
-/// caller needs. Later phases (outcome parsing, interactive shell-string
+/// This phase's trait carries the invocation-building methods plus outcome
+/// parsing and the resume hint. Later phases (interactive shell-string
 /// rendering, telemetry deployment, session identity, pricing) add more
 /// methods here — see `docs/plans/agent-runner.md`'s phase list.
 pub trait AgentRunner {
@@ -179,4 +240,21 @@ pub trait AgentRunner {
 
     /// Build one run's argv/env (headless or interactive).
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation;
+
+    /// Parse a finished headless run's raw result text into a
+    /// [`RunOutcome`].
+    ///
+    /// Hard errors on unparseable input ([`OutcomeParseError::Malformed`])
+    /// or a missing/empty `session_id`
+    /// ([`OutcomeParseError::MissingSessionId`]): a run with no session id
+    /// to resume isn't a usable outcome, only an unparseable one. Every
+    /// other field is tolerant of absence: an empty `model_usage` map
+    /// normalizes to `None`, and `is_error`'s absence is preserved as `None`
+    /// rather than defaulted to `false` — see [`RunOutcome::is_error`]'s doc
+    /// comment for why that distinction matters to the caller.
+    fn parse_outcome(&self, raw: &str) -> Result<RunOutcome, OutcomeParseError>;
+
+    /// User-facing resume hint for a finished run's session id, e.g. `claude
+    /// --resume <id>`.
+    fn resume_command(&self, session_id: &str) -> String;
 }

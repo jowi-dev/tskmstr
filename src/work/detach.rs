@@ -12,7 +12,7 @@
 //! survive its own child.
 //!
 //! `docs/plans/runner-port.md` §4 deliberately moves that wait-then-finish
-//! logic in-process (one Rust function, [`crate::work::run::run_claude_and_finish`],
+//! logic in-process (one Rust function, [`crate::work::run::run_agent_and_finish`],
 //! shared by `--fg` and detached instead of duplicated between `--fg`'s
 //! inline `jq` calls and a generated shell wrapper's `jq` calls). That
 //! architecture win has a cost: something now has to *stay alive* after

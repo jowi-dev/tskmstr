@@ -606,6 +606,7 @@ pub fn supervise(
     gh: &dyn GhCli,
     run_store: &RunStore,
     state: &crate::work::detach::SupervisorState,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let outcome = crate::work::run::supervise_run(
@@ -614,6 +615,7 @@ pub fn supervise(
         run_store,
         &state.prepared,
         std::process::id(),
+        runner,
         out,
     )?;
     Ok(!outcome.is_error)
@@ -646,6 +648,7 @@ pub fn session(
     identity: &crate::config::BackendIdentity,
     current_exe: &Path,
     key: &str,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
@@ -677,9 +680,9 @@ pub fn session(
 
     for window in &plan.windows {
         let role = match (&window.command, window.run_id) {
-            (Some(_), _) => "log viewer",
-            (None, Some(_)) => "shell (its claude session died with the pane)",
-            (None, None) => "shell",
+            (Some(_), _) => "log viewer".to_string(),
+            (None, Some(_)) => format!("shell (its {} session died with the pane)", runner.name()),
+            (None, None) => "shell".to_string(),
         };
         writeln!(
             out,
@@ -687,7 +690,7 @@ pub fn session(
             plan.session_name, window.name
         )?;
         if let Some(session_id) = &window.resume_session_id {
-            writeln!(out, "resume:   claude --resume {session_id}")?;
+            writeln!(out, "resume:   {}", runner.resume_command(session_id))?;
         }
     }
     writeln!(out, "attach:   tmux attach -t {}", plan.session_name)?;
@@ -1852,6 +1855,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "proj-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -1923,6 +1927,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -1988,6 +1993,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -2024,6 +2030,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-404",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap_err();
@@ -3032,7 +3039,15 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(canned_claude_json());
         let mut out = Vec::new();
 
-        let succeeded = supervise(&supervisor_spawner, &gh, &run_store, &state, &mut out).unwrap();
+        let succeeded = supervise(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            &state,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(succeeded);
         let run_row = run_store.run_by_id(state.prepared.run_id).unwrap().unwrap();
