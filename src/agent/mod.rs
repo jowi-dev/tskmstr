@@ -33,8 +33,17 @@
 //! backend-agnostic error every caller downstream of those methods depends
 //! on: `src/agent/claude/hooks.rs` and `src/agent/claude/hooks_install.rs`
 //! (moved from `src/work/`) are now adapter-private, called only from
-//! [`crate::agent::claude::ClaudeRunner`]'s impls. Later phases add session
-//! identity and pricing.
+//! [`crate::agent::claude::ClaudeRunner`]'s impls. This phase (6) moves
+//! session identity and pricing: [`SessionEnvVars`] and
+//! [`AgentRunner::session_env_vars`] replace the `CLAUDE_CODE_SESSION_ID`/
+//! `CLAUDE_PID` literals [`crate::runs::session::SessionEnv::from_process_env`]
+//! used to read directly, [`AgentRunner::price_for_model`] replaces
+//! `crate::runs::pricing::price_for_model`'s claude-keyed table lookup (the
+//! table itself moved into [`crate::agent::claude::ClaudeRunner`]), and
+//! [`AgentRunner::display_model_name`] replaces
+//! `crate::runs::format_model_usage_compact`'s `strip_prefix("claude-")`.
+//! `crate::runs::pricing::ModelPrice`/`estimate_cost_usd` stay
+//! runner-agnostic arithmetic, unchanged in shape.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +51,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::runs::ModelUsageMap;
+use crate::runs::pricing::ModelPrice;
 
 pub mod claude;
 
@@ -373,6 +383,21 @@ pub struct RunOutcome {
     pub model_usage: Option<ModelUsageMap>,
 }
 
+/// The env var names a live agent session exposes its identity through,
+/// read by [`crate::runs::session::SessionEnv::from_process_env`] to build
+/// an interactive session's [`crate::runs::session::SessionEnv`]. See
+/// [`crate::agent::claude::ClaudeRunner`]'s [`AgentRunner::session_env_vars`]
+/// impl for the specific vars `claude` sets and the "observed but
+/// undocumented" caveat that comes with them.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionEnvVars {
+    /// Env var carrying the live session's id, matching the `session_id`
+    /// value the adapter's telemetry hooks receive on stdin.
+    pub session_id: &'static str,
+    /// Env var carrying the live session's process id.
+    pub pid: &'static str,
+}
+
 /// Backend-agnostic AI coding agent operations. See the module doc comment
 /// for how this relates to [`crate::agent::claude::ClaudeRunner`] and
 /// `main.rs`'s `agent_runner_for`.
@@ -503,4 +528,21 @@ pub trait AgentRunner {
     /// installed (the `tm init` onboarding probe). `false` for a runner
     /// with no user-level telemetry to install.
     fn user_hooks_installed(&self, home: &Path, xdg_data_home: Option<&Path>) -> bool;
+
+    /// Env var names carrying session identity inside a live session,
+    /// consumed by [`crate::runs::session::SessionEnv::from_process_env`].
+    fn session_env_vars(&self) -> SessionEnvVars;
+
+    /// Price table lookup for estimated interactive-session costs (`tm
+    /// ticket audit`/`create` have no authoritative `costUSD` the way a
+    /// headless lane run's `modelUsage` does — see
+    /// `crate::runs::pricing`'s module docs). `None` for any model this
+    /// runner has no price entry for.
+    fn price_for_model(&self, model: &str) -> Option<ModelPrice>;
+
+    /// Short display form of a reported model name, e.g. for
+    /// [`crate::runs::format_model_usage_compact`]. `claude` strips the
+    /// leading `"claude-"` prefix; an adapter whose model names carry no
+    /// such prefix returns `model` unchanged.
+    fn display_model_name<'a>(&self, model: &'a str) -> &'a str;
 }

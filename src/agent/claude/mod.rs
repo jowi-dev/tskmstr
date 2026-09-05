@@ -60,12 +60,70 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RunMode, RunOutcome, shell_quote,
+    RunMode, RunOutcome, SessionEnvVars, shell_quote,
 };
+use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
 
 pub mod hooks;
 pub mod hooks_install;
+
+/// The price table. Add an entry here for any new model name that shows up
+/// in `message.model` (transcript) or `modelUsage` (lane runs) and needs
+/// estimated-cost support in interactive sessions. Keyed by the exact model
+/// string Claude Code reports (e.g. `claude-sonnet-5`), not a display alias.
+///
+/// **THIS TABLE IS ESTIMATED, NOT A VENDOR PRICE LIST, AND NEEDS MANUAL
+/// UPDATES.** `claude-sonnet-5`'s rates were reverse-engineered on
+/// 2026-08-14 from this machine's own authoritative lane-run
+/// `runs.model_usage.costUSD` values (least-squares fit against 12 samples,
+/// zero residual error) and happen to match Anthropic's published Sonnet 4.5
+/// per-token pricing exactly, which is a reassuring sanity check on the
+/// method. `claude-opus-5` and `claude-fable-5` are internal aliases with no
+/// published price sheet at all; their rates were fit the same way (9 and 14
+/// samples respectively) with a small nonzero residual (a few tenths of a
+/// percent), most likely because real sessions mix 5-minute and 1-hour
+/// prompt-cache write pricing, which this single-rate-per-model table can't
+/// distinguish. `claude-haiku-4-5-20251001` had only one sample to fit
+/// against, so treat it as the least confident entry.
+const PRICE_TABLE: &[(&str, ModelPrice)] = &[
+    (
+        "claude-sonnet-5",
+        ModelPrice {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+            cache_read_per_million: 0.30,
+            cache_write_per_million: 3.75,
+        },
+    ),
+    (
+        "claude-opus-5",
+        ModelPrice {
+            input_per_million: 5.87,
+            output_per_million: 29.37,
+            cache_read_per_million: 0.59,
+            cache_write_per_million: 7.34,
+        },
+    ),
+    (
+        "claude-fable-5",
+        ModelPrice {
+            input_per_million: 11.04,
+            output_per_million: 55.18,
+            cache_read_per_million: 1.10,
+            cache_write_per_million: 13.79,
+        },
+    ),
+    (
+        "claude-haiku-4-5-20251001",
+        ModelPrice {
+            input_per_million: 1.00,
+            output_per_million: 5.00,
+            cache_read_per_million: 0.10,
+            cache_write_per_million: 1.25,
+        },
+    ),
+];
 
 /// Driver model default when a lane/run doesn't specify one, mirroring
 /// `run_lane`'s `let model = match opts.model with Some m -> m | None ->
@@ -317,6 +375,38 @@ impl AgentRunner for ClaudeRunner {
         hooks_install::install_user_hooks(&hooks_dir, &settings_path, "tm-init-probe", true)
             .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
             .unwrap_or(false)
+    }
+
+    /// `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` are **observed but
+    /// undocumented** environment variables Claude Code sets for Bash-tool
+    /// subprocesses; anything reading them must degrade to a silent no-op
+    /// when they're absent, since their availability is not a documented
+    /// guarantee. [`crate::runs::session::SessionEnv::from_process_env`] does
+    /// exactly that: absence or garbage in either becomes `None`, never an
+    /// error. Moved here (from `src/runs/session.rs`'s module docs) in phase
+    /// 6 of GitHub issue #17 (`docs/plans/agent-runner.md`), since the exact
+    /// var names are claude's, not `tskmstr`'s own contract.
+    fn session_env_vars(&self) -> crate::agent::SessionEnvVars {
+        SessionEnvVars {
+            session_id: "CLAUDE_CODE_SESSION_ID",
+            pid: "CLAUDE_PID",
+        }
+    }
+
+    /// Looks up `model`'s [`ModelPrice`] in [`PRICE_TABLE`] by exact name
+    /// match. `None` for any model not yet priced here.
+    fn price_for_model(&self, model: &str) -> Option<ModelPrice> {
+        PRICE_TABLE
+            .iter()
+            .find(|(name, _)| *name == model)
+            .map(|(_, price)| *price)
+    }
+
+    /// Strips a leading `"claude-"` prefix for brevity (e.g.
+    /// `claude-sonnet-5` -> `sonnet-5`), matching every model name Claude
+    /// Code reports. Unchanged when the prefix isn't present.
+    fn display_model_name<'a>(&self, model: &'a str) -> &'a str {
+        model.strip_prefix("claude-").unwrap_or(model)
     }
 }
 
@@ -848,5 +938,47 @@ mod tests {
     fn parse_outcome_treats_empty_model_usage_map_as_none() {
         let json = r#"{"session_id": "sess-abc", "modelUsage": {}}"#;
         assert_eq!(ClaudeRunner.parse_outcome(json).unwrap().model_usage, None);
+    }
+
+    // --- session identity ---
+
+    #[test]
+    fn session_env_vars_name_the_claude_variables() {
+        let vars = ClaudeRunner.session_env_vars();
+        assert_eq!(vars.session_id, "CLAUDE_CODE_SESSION_ID");
+        assert_eq!(vars.pid, "CLAUDE_PID");
+    }
+
+    // --- pricing ---
+
+    #[test]
+    fn price_for_model_finds_known_models() {
+        assert!(ClaudeRunner.price_for_model("claude-sonnet-5").is_some());
+        assert!(ClaudeRunner.price_for_model("claude-opus-5").is_some());
+        assert!(ClaudeRunner.price_for_model("claude-fable-5").is_some());
+        assert!(
+            ClaudeRunner
+                .price_for_model("claude-haiku-4-5-20251001")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn price_for_model_returns_none_for_unknown_model() {
+        assert_eq!(ClaudeRunner.price_for_model("claude-does-not-exist"), None);
+    }
+
+    // --- display_model_name ---
+
+    #[test]
+    fn display_model_name_strips_the_claude_prefix() {
+        assert_eq!(
+            ClaudeRunner.display_model_name("claude-sonnet-5"),
+            "sonnet-5"
+        );
+        assert_eq!(
+            ClaudeRunner.display_model_name("some-other-model"),
+            "some-other-model"
+        );
     }
 }

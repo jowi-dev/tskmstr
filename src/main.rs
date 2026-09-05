@@ -846,7 +846,9 @@ fn run_ticket(
             // telemetry (see `docs/plans/session-usage.md`).
             let session_store =
                 tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
-            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let runner = agent_runner_for(&config);
+            let session_env =
+                tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
             tskmstr::cli::ticket::create(
                 &ctx,
@@ -1007,7 +1009,9 @@ fn run_ticket_audit(
     let db_path = run_db_path_from_config(&config);
     let scope = tskmstr::config::BackendIdentity::from_config(&config).scope();
     let mut stdout = std::io::stdout();
-    let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+    let runner = agent_runner_for(&config);
+    let session_env =
+        tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
     let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
 
     match record {
@@ -1021,6 +1025,7 @@ fn run_ticket_audit(
                 notes.as_deref(),
                 &session_env,
                 &sessions_dir,
+                runner,
                 &mut stdout,
             )?;
         }
@@ -1039,6 +1044,7 @@ fn run_ticket_audit(
                         &key,
                         &session_env,
                         &sessions_dir,
+                        runner,
                         &mut stdout,
                     )?;
                 }
@@ -1052,6 +1058,7 @@ fn run_ticket_audit(
                         &key,
                         &session_env,
                         &sessions_dir,
+                        runner,
                         &mut stdout,
                     )?;
                 }
@@ -1371,7 +1378,13 @@ fn run_runs(
                 model_usage,
                 findings_count,
             };
-            tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
+            tskmstr::cli::runs::finish(
+                &store,
+                run_id,
+                &outcome,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Event {
             run_id,
@@ -1389,7 +1402,15 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Show { ticket, json, kind }) => {
-            tskmstr::cli::runs::show(&store, scope, &ticket, kind.as_deref(), json, &mut stdout)?;
+            tskmstr::cli::runs::show(
+                &store,
+                scope,
+                &ticket,
+                kind.as_deref(),
+                json,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Resume { ticket }) => {
             let mut stderr = std::io::stderr();
@@ -1417,12 +1438,17 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Register { kind, key }) => {
-            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let runner = agent_runner_or_default(full_config.as_ref());
+            let session_env =
+                tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
             tskmstr::cli::runs::register(&store, scope, &sessions_dir, &session_env, &kind, &key);
         }
         Some(RunsCmd::Watch) => {
-            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
+            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps {
+                store,
+                runner: agent_runner_or_default(full_config.as_ref()),
+            })?;
         }
         Some(RunsCmd::Logs {
             ticket_or_id,

@@ -768,19 +768,20 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// Fills in an ESTIMATED `cost_usd` for every entry in `map` that doesn't
-/// already carry one, using [`pricing::estimate_cost_usd`], and marks each
-/// one [`ModelUsage::estimated`]. Entries that already have a `cost_usd`
-/// (the authoritative case, from `claude -p`'s `modelUsage`) are left
-/// completely untouched — this never overwrites an authoritative figure.
-/// Entries for a model absent from [`pricing::PRICE_TABLE`] are also left
-/// alone (no estimate rather than a wrong one).
-pub fn estimate_missing_costs(map: &mut ModelUsageMap) {
+/// already carry one, using `runner`'s [`crate::agent::AgentRunner::price_for_model`]
+/// and [`pricing::estimate_cost_usd`], and marks each one
+/// [`ModelUsage::estimated`]. Entries that already have a `cost_usd` (the
+/// authoritative case, from `claude -p`'s `modelUsage`) are left completely
+/// untouched — this never overwrites an authoritative figure. Entries for a
+/// model `runner` has no price entry for are also left alone (no estimate
+/// rather than a wrong one).
+pub fn estimate_missing_costs(map: &mut ModelUsageMap, runner: &dyn crate::agent::AgentRunner) {
     for (model, usage) in map.iter_mut() {
         if usage.cost_usd.is_some() {
             continue;
         }
-        if let Some(cost) = pricing::estimate_cost_usd(model, usage) {
-            usage.cost_usd = Some(cost);
+        if let Some(price) = runner.price_for_model(model) {
+            usage.cost_usd = Some(pricing::estimate_cost_usd(&price, usage));
             usage.estimated = true;
         }
     }
@@ -1157,20 +1158,24 @@ struct ToolDetail {
 
 /// Renders a [`ModelUsageMap`] as one compact line, e.g. `fable-5 58.6k out
 /// / sonnet-5 30.7k out`: one `{model} {out} out` segment per model, joined
-/// by ` / `, with a leading `claude-` stripped from each model name for
-/// brevity. Returns `None` for an empty map.
+/// by ` / `, with each model name shortened via `runner`'s
+/// [`crate::agent::AgentRunner::display_model_name`] (`claude` strips a
+/// leading `claude-`) for brevity. Returns `None` for an empty map.
 ///
 /// Shared by [`format_event_detail`]'s `"usage"` rendering and `tm ticket
 /// audit`'s `Last audit usage:` line (see
 /// `docs/plans/session-usage.md`'s "Surfaces" section).
-pub fn format_model_usage_compact(map: &ModelUsageMap) -> Option<String> {
+pub fn format_model_usage_compact(
+    map: &ModelUsageMap,
+    runner: &dyn crate::agent::AgentRunner,
+) -> Option<String> {
     if map.is_empty() {
         return None;
     }
     let parts: Vec<String> = map
         .iter()
         .map(|(name, usage)| {
-            let short = name.strip_prefix("claude-").unwrap_or(name);
+            let short = runner.display_model_name(name);
             format!("{short} {} out", format_token_count(usage.output_tokens))
         })
         .collect();
@@ -1193,7 +1198,11 @@ pub fn format_model_usage_compact(map: &ModelUsageMap) -> Option<String> {
 /// Returns `None` for any other kind, missing `detail`, or `detail` that
 /// doesn't parse as the expected shape, so callers can fall back to
 /// rendering the raw detail JSON.
-pub fn format_event_detail(kind: &str, detail: Option<&str>) -> Option<String> {
+pub fn format_event_detail(
+    kind: &str,
+    detail: Option<&str>,
+    runner: &dyn crate::agent::AgentRunner,
+) -> Option<String> {
     let detail = detail?;
     match kind {
         "tool" => {
@@ -1214,7 +1223,7 @@ pub fn format_event_detail(kind: &str, detail: Option<&str>) -> Option<String> {
         }
         "usage" => {
             let parsed: UsageDetail = serde_json::from_str(detail).ok()?;
-            format_model_usage_compact(&parsed.models)
+            format_model_usage_compact(&parsed.models, runner)
         }
         _ => None,
     }
@@ -2439,6 +2448,7 @@ pub fn default_db_path(home: &Path, xdg_data_home: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use regex::Regex;
     use tempfile::tempdir;
 
@@ -5274,8 +5284,11 @@ mod tests {
 
     #[test]
     fn format_event_detail_renders_tool_with_summary() {
-        let rendered =
-            format_event_detail("tool", Some(r#"{"tool":"Bash","summary":"cargo test"}"#));
+        let rendered = format_event_detail(
+            "tool",
+            Some(r#"{"tool":"Bash","summary":"cargo test"}"#),
+            &ClaudeRunner,
+        );
         assert_eq!(rendered, Some("Bash — cargo test".to_string()));
     }
 
@@ -5284,20 +5297,24 @@ mod tests {
         let rendered = format_event_detail(
             "tool",
             Some(r#"{"tool":"Read","summary":"src/main.rs","agent":"Explore"}"#),
+            &ClaudeRunner,
         );
         assert_eq!(rendered, Some("[Explore] Read — src/main.rs".to_string()));
     }
 
     #[test]
     fn format_event_detail_renders_tool_name_only() {
-        let rendered = format_event_detail("tool", Some(r#"{"tool":"Bash"}"#));
+        let rendered = format_event_detail("tool", Some(r#"{"tool":"Bash"}"#), &ClaudeRunner);
         assert_eq!(rendered, Some("Bash".to_string()));
     }
 
     #[test]
     fn format_event_detail_ignores_empty_summary_and_agent() {
-        let rendered =
-            format_event_detail("tool", Some(r#"{"tool":"Bash","summary":"","agent":""}"#));
+        let rendered = format_event_detail(
+            "tool",
+            Some(r#"{"tool":"Bash","summary":"","agent":""}"#),
+            &ClaudeRunner,
+        );
         assert_eq!(rendered, Some("Bash".to_string()));
     }
 
@@ -5306,26 +5323,27 @@ mod tests {
         let rendered = format_event_detail(
             "checklist",
             Some(r#"{"items":[{"text":"a","done":true},{"text":"b","done":false}]}"#),
+            &ClaudeRunner,
         );
         assert_eq!(rendered, Some("1/2 done".to_string()));
     }
 
     #[test]
     fn format_event_detail_returns_none_for_unknown_kind() {
-        let rendered = format_event_detail("stop", Some(r#"{"tool":"Bash"}"#));
+        let rendered = format_event_detail("stop", Some(r#"{"tool":"Bash"}"#), &ClaudeRunner);
         assert_eq!(rendered, None);
     }
 
     #[test]
     fn format_event_detail_returns_none_for_malformed_tool_detail() {
-        let rendered = format_event_detail("tool", Some("not json"));
+        let rendered = format_event_detail("tool", Some("not json"), &ClaudeRunner);
         assert_eq!(rendered, None);
     }
 
     #[test]
     fn format_event_detail_returns_none_for_missing_detail() {
-        assert_eq!(format_event_detail("tool", None), None);
-        assert_eq!(format_event_detail("checklist", None), None);
+        assert_eq!(format_event_detail("tool", None, &ClaudeRunner), None);
+        assert_eq!(format_event_detail("checklist", None, &ClaudeRunner), None);
     }
 
     #[test]
@@ -5893,7 +5911,7 @@ mod tests {
             },
         );
 
-        estimate_missing_costs(&mut map);
+        estimate_missing_costs(&mut map, &ClaudeRunner);
 
         let usage = &map["claude-sonnet-5"];
         assert_eq!(usage.cost_usd, Some(3.00));
@@ -5915,7 +5933,7 @@ mod tests {
             },
         );
 
-        estimate_missing_costs(&mut map);
+        estimate_missing_costs(&mut map, &ClaudeRunner);
 
         let usage = &map["claude-sonnet-5"];
         assert_eq!(
@@ -5941,7 +5959,7 @@ mod tests {
             },
         );
 
-        estimate_missing_costs(&mut map);
+        estimate_missing_costs(&mut map, &ClaudeRunner);
 
         let usage = &map["claude-unknown-model"];
         assert_eq!(usage.cost_usd, None);
@@ -6152,6 +6170,7 @@ mod tests {
             Some(
                 r#"{"models":{"claude-fable-5":{"outputTokens":89200},"claude-sonnet-5":{"outputTokens":30700}}}"#,
             ),
+            &ClaudeRunner,
         );
         assert_eq!(
             rendered,
@@ -6161,7 +6180,10 @@ mod tests {
 
     #[test]
     fn format_event_detail_returns_none_for_malformed_usage_detail() {
-        assert_eq!(format_event_detail("usage", Some("not json")), None);
+        assert_eq!(
+            format_event_detail("usage", Some("not json"), &ClaudeRunner),
+            None
+        );
     }
 
     #[test]
