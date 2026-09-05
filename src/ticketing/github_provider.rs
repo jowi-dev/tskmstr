@@ -845,6 +845,20 @@ impl TicketProvider for GithubProvider<'_> {
             Err(_) => format!("https://github.com/{}/issues", self.repo),
         }
     }
+
+    /// Map common Jira names for the review status onto this backend's
+    /// fixed `"In Review"` (see [`status_for_slug`]); everything else
+    /// passes through unchanged, matching (or failing against) the
+    /// synthesized transition list as-is. Only review names need aliasing:
+    /// Jira's other conventional status names (`To Do`, `In Progress`,
+    /// `Done`, `Blocked`) are already this backend's vocabulary, but the
+    /// review status has no single conventional Jira name.
+    fn normalize_status_target(&self, target: &str) -> String {
+        match target.to_lowercase().as_str() {
+            "code review" | "under review" | "review" => "In Review".to_string(),
+            _ => target.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1358,6 +1372,36 @@ mod tests {
             .unwrap();
 
         assert!(fake.issue_create_calls()[0].1.assignees.is_empty());
+    }
+
+    #[test]
+    fn normalize_status_target_maps_common_jira_review_names_onto_in_review() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(provider.normalize_status_target("Code Review"), "In Review");
+        assert_eq!(provider.normalize_status_target("code review"), "In Review");
+        assert_eq!(
+            provider.normalize_status_target("Under Review"),
+            "In Review"
+        );
+        assert_eq!(provider.normalize_status_target("Review"), "In Review");
+    }
+
+    #[test]
+    fn normalize_status_target_leaves_unrecognized_names_unchanged() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(provider.normalize_status_target("In Review"), "In Review");
+        assert_eq!(
+            provider.normalize_status_target("In Progress"),
+            "In Progress"
+        );
+        assert_eq!(
+            provider.normalize_status_target("Some Custom Status"),
+            "Some Custom Status"
+        );
     }
 
     #[test]

@@ -216,6 +216,21 @@ pub trait TicketProvider {
     /// backend `jira_base_url` is empty, and `/browse/GH-13` is not a link
     /// (GitHub issue #13).
     fn issue_url(&self, key: &str) -> String;
+
+    /// Translate a status target ([`crate::config::Config::status_on_pr`],
+    /// [`crate::config::Config::status_on_create`], or an explicit
+    /// `tm ticket transition <KEY> <STATUS>` argument) into this backend's
+    /// own status vocabulary before transition matching. The default is the
+    /// identity: a Jira workflow's status names are already Jira's
+    /// vocabulary, and `tm` can't know one workflow's aliases for another's
+    /// statuses. The github backend overrides this to map common Jira
+    /// review-status names onto its fixed `tm:status/*` vocabulary, so a
+    /// `status_on_pr = "Code Review"` inherited from a Jira-centric global
+    /// config still lands the ticket in In Review instead of warning and
+    /// leaving it in To Do (GitHub issue #13).
+    fn normalize_status_target(&self, target: &str) -> String {
+        target.to_string()
+    }
 }
 
 /// [`TicketProvider`] backed by a boxed [`JiraClient`].
