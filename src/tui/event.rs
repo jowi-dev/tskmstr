@@ -121,8 +121,12 @@ pub struct TuiDeps {
     /// status-line error) when `dir` is unset. See
     /// [`crate::work::audit::launch_audit`].
     pub audit: crate::config::AuditConfig,
+    /// Validated `[work.manual]` settings; the board's manual-session key is
+    /// disabled (a status-line error) when `dir` is unset or `windows` is
+    /// empty. See [`crate::work::manual::ensure_manual_session`].
+    pub manual: crate::config::ManualConfig,
     /// The user's home directory, used to expand a leading `~` in
-    /// `audit.dir`.
+    /// `audit.dir` and `manual.dir`.
     pub home: std::path::PathBuf,
     /// Launcher used to spawn `tm work run <lane> <key>` for
     /// [`Cmd::LaunchLaneRun`] (see `docs/plans/board-lane-runs.md`). Boxed
@@ -315,7 +319,9 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// transitions after opening the detail screen).
 ///
 /// [`Cmd::AttachSession`] is intercepted here rather than passed to `execute`:
-/// see the module docs. [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
+/// see the module docs. [`Cmd::EnsureManualSession`] is intercepted for the
+/// same reason (its ensure step ends in that very attach).
+/// [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
 /// [`Cmd::LaunchReviewFix`] are intercepted for the same kind of reason --
 /// they need mutable access to `launches`, the in-flight launcher registry,
 /// which `execute`'s signature has no access to. A spawn failure feeds an
@@ -345,12 +351,36 @@ fn run_cmds<B: Backend>(
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
         if let Cmd::AttachSession { session_name } = cmd {
-            // One result `Msg` for all three keys that attach (`a`, `b`, `s`):
-            // the Cmd is "attach to this ticket's session" in every case, and
-            // only its status line differs. `Msg::AuditActionResult` stays for
-            // *launch* outcomes, which are audit-specific.
+            // One result `Msg` for every key that attaches (`a`, `b`, `s`,
+            // and `m`'s attach step): the Cmd is "attach to this ticket's
+            // session" in every case, and only its status line differs.
+            // `Msg::AuditActionResult` stays for *launch* outcomes, which are
+            // audit-specific.
             let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::EnsureManualSession { key } = cmd {
+            // Intercepted for the same reason as `Cmd::AttachSession`: the
+            // ensure step needs no terminal, but the attach that follows it
+            // does. The ensure failing (not configured, tmux error) becomes
+            // the status line and no attach is attempted.
+            let (next_app, more_cmds) = match crate::work::manual::ensure_manual_session(
+                deps.tmux.as_ref(),
+                &deps.manual,
+                &deps.home,
+                &deps.backend_identity,
+                &key,
+            ) {
+                Ok(outcome) => {
+                    let message =
+                        attach_session(terminal, deps.tmux.as_ref(), &outcome.session_name);
+                    update(app, Msg::SessionAttachResult(message))
+                }
+                Err(err) => update(app, Msg::SessionAttachResult(err.to_string())),
+            };
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -1060,6 +1090,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LoadRunDetail { .. }
         | Cmd::ReapRuns
         | Cmd::AttachSession { .. }
+        | Cmd::EnsureManualSession { .. }
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
         | Cmd::ViewLogs { .. }
@@ -1803,6 +1834,7 @@ mod tests {
             store: None,
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             audit: crate::config::AuditConfig::default(),
+            manual: crate::config::ManualConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
             review_watch: crate::config::ReviewWatchConfig::default(),
             xdg_data_home: None,
@@ -3206,6 +3238,67 @@ mod tests {
                 "audit already running (tm-proj-proj-1:audit) -- press a to attach".to_string()
             )]
         );
+    }
+
+    // --- Cmd::EnsureManualSession routing (run_cmds intercepts it before `execute`) ---
+
+    /// GitHub issue #14: with no `[work.manual]` configured, `m` reports the
+    /// gate on the status line and never touches the terminal or tmux.
+    #[test]
+    fn run_cmds_manual_session_not_configured_surfaces_error_text() {
+        let d = deps(FakeJiraClient::new());
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::EnsureManualSession {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert!(
+            app.status_line.contains("[work.manual]"),
+            "status line should point at the missing config section: {}",
+            app.status_line
+        );
+    }
+
+    /// GitHub issue #14: a configured `m` press ensures the layout windows
+    /// and ends attached, reporting the attach outcome like every other
+    /// attach key.
+    #[test]
+    fn run_cmds_manual_session_creates_layout_and_attaches() {
+        let mut d = deps(FakeJiraClient::new());
+        d.manual = crate::config::ManualConfig {
+            dir: Some("/work/dir".to_string()),
+            windows: vec![
+                crate::config::ManualWindow {
+                    name: "code".to_string(),
+                    command: Some("nvim".to_string()),
+                },
+                crate::config::ManualWindow {
+                    name: "fish".to_string(),
+                    command: None,
+                },
+            ],
+        };
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::EnsureManualSession {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        // "detached from" proves the ensure step succeeded AND the attach
+        // ran against the ticket's session; window-creation details are
+        // covered by `crate::work::manual`'s own tests.
+        assert_eq!(app.status_line, "detached from tm-proj-proj-1");
     }
 
     // --- Cmd::AttachSession routing (run_cmds intercepts it before `execute`) ---

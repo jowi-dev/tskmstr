@@ -534,6 +534,7 @@ fn run_board(
         store,
         tmux: Box::new(tmux),
         audit,
+        manual: config.work.manual,
         review_watch: config.work.review_watch,
         xdg_data_home,
         home,
