@@ -1093,7 +1093,11 @@ associating a PR needs no remote link (the `Closes #N` line already renders
 the backlink); links (`Blocks`) use GitHub's native issue-dependencies
 GraphQL mutations; and rank has no GitHub equivalent, so it's tracked in a
 local `ticket_rank` table in `runs.db` (unranked issues sort to the end by
-issue number, same as before anything is ranked). See
+issue number, same as before anything is ranked). Ticket URLs — the ones
+`tm pr create`/`tm pr status`/`tm ticket create` print and the board's
+`o`/`O` keys open — are the issue's own GitHub page
+(`https://github.com/<owner>/<name>/issues/<n>`); each backend renders its
+own links, never `{jira_base_url}/browse/...`. See
 `docs/plans/github-issues-backend.md` for the full design and phase status.
 
 This repo dogfoods the GitHub backend on itself: its own `.tskmstr.toml`
@@ -1150,6 +1154,15 @@ request rather than an automatic side effect of creating/linking a ticket.
 If `<KEY>` is already in `<STATUS>`, it prints a message and exits 0
 without calling the transition API. Omit `<STATUS>` to list the ticket's
 current status and available transitions instead.
+
+Under the GitHub backend, all three of these paths first translate the
+requested status into the backend's fixed vocabulary (To Do / In Progress /
+In Review / Blocked / Done): common Jira names for the review status —
+`"Code Review"`, `"Under Review"`, `"Review"` — map onto `"In Review"`, so
+a Jira-shaped `status_on_pr` inherited from a global config still moves the
+ticket rather than warning and leaving it in To Do. Any other name is
+matched as-is, and a repo-local `.tskmstr.toml` can always override
+`status_on_pr`/`status_on_create` outright.
 
 `board_column_order` lists workflow status names (case-insensitive match)
 in the order the board's columns should appear, e.g. `["To Do", "In
