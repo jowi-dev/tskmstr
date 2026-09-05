@@ -326,10 +326,11 @@ fn heading_level_number(level: HeadingLevel) -> u8 {
 /// recurses into its content with each resulting line prefixed with `> `;
 /// `bulletList`/`orderedList` recurse into each `listItem`, prefixing the
 /// item's first line with `- ` or `N. ` and indenting any additional lines
-/// to match. Node types this function doesn't recognize (tables, media,
-/// mentions, etc.) are ignored rather than erroring, so unfamiliar Jira
-/// descriptions degrade to a shorter summary instead of a failure. Lines are
-/// joined with `\n`.
+/// to match. Node types this function doesn't recognize (task lists, panels,
+/// tables, etc.) degrade to their inner text -- direct text children plus a
+/// recursive walk of their `content` -- so unfamiliar wrappers lose their
+/// structure but never their words; only nodes with no textual content at
+/// all (media, mentions) produce nothing. Lines are joined with `\n`.
 pub fn adf_to_text(value: &Value) -> String {
     let Some(content) = value.get("content").and_then(|v| v.as_array()) else {
         return String::new();
@@ -343,7 +344,7 @@ pub fn adf_to_text(value: &Value) -> String {
 }
 
 /// Render a single ADF block node as zero or more plain-text lines. Unknown
-/// node types produce no lines.
+/// node types degrade to their inner text via [`fallback_lines`].
 fn node_lines(node: &Value) -> Vec<String> {
     match node.get("type").and_then(|v| v.as_str()) {
         Some("paragraph") | Some("heading") => {
@@ -372,8 +373,49 @@ fn node_lines(node: &Value) -> Vec<String> {
             .collect(),
         Some("bulletList") => list_lines(node, |_i| "- ".to_string()),
         Some("orderedList") => list_lines(node, |i| format!("{}. ", i + 1)),
-        _ => vec![],
+        _ => fallback_lines(node),
     }
+}
+
+/// Degrade a node type [`node_lines`] doesn't recognize (`taskList`,
+/// `panel`, `expand`, `table`, ...) to its visible text instead of dropping
+/// its whole subtree (GH-16: a description that was a single `taskList`
+/// rendered completely blank). Direct `text`/`hardBreak` children accumulate
+/// into lines exactly like [`extract_inline_text`]; every other child is
+/// rendered via [`node_lines`], so recognized nodes nested inside an
+/// unfamiliar wrapper render normally and unknown ones recurse back here. A
+/// node with no textual content anywhere in its subtree (media, mentions,
+/// cards) still produces no lines.
+fn fallback_lines(node: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inline = String::new();
+
+    for child in child_content(node) {
+        match child.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(text) = child.get("text").and_then(|v| v.as_str()) {
+                    inline.push_str(text);
+                }
+            }
+            Some("hardBreak") => inline.push('\n'),
+            _ => {
+                flush_fallback_inline(&mut out, &mut inline);
+                out.extend(node_lines(child));
+            }
+        }
+    }
+
+    flush_fallback_inline(&mut out, &mut inline);
+    out
+}
+
+/// Push `inline`'s accumulated text onto `out` as one line per physical line
+/// (hardBreaks became `\n`), then clear it. No-op when empty.
+fn flush_fallback_inline(out: &mut Vec<String>, inline: &mut String) {
+    if inline.is_empty() {
+        return;
+    }
+    out.extend(std::mem::take(inline).split('\n').map(str::to_string));
 }
 
 /// Render a `bulletList`/`orderedList` node's items as lines, using
@@ -740,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn adf_to_text_ignores_unknown_node_types() {
+    fn adf_to_text_ignores_unknown_nodes_with_no_text_content() {
         let doc = json!({
             "type": "doc",
             "version": 1,
@@ -751,6 +793,112 @@ mod tests {
             ]
         });
         assert_eq!(adf_to_text(&doc), "kept\nalso kept");
+    }
+
+    #[test]
+    fn adf_to_text_renders_task_list_item_text() {
+        // Pinned from AX-68 (GH-16): a real description that is a single
+        // taskList rendered completely blank, because the unknown-node arm
+        // dropped the node and its whole subtree.
+        let doc = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "taskList",
+                    "attrs": { "localId": "6dd21186-ad23-4f40-ab39-dd551a8f303c" },
+                    "content": [
+                        {
+                            "type": "taskItem",
+                            "attrs": {
+                                "localId": "d39df687-49f9-4f0b-a440-7088602a3d44",
+                                "state": "TODO"
+                            },
+                            "content": [
+                                { "type": "text", "text": "Drop " },
+                                { "type": "text", "text": "campaigns", "marks": [{ "type": "code" }] },
+                                { "type": "text", "text": " table" }
+                            ]
+                        },
+                        {
+                            "type": "taskItem",
+                            "attrs": {
+                                "localId": "1d40e7f8-3bff-4c90-ad8c-0b5e53282a7e",
+                                "state": "DONE"
+                            },
+                            "content": [
+                                { "type": "text", "text": "Drop " },
+                                { "type": "text", "text": "campaigns_footprints ", "marks": [{ "type": "code" }] },
+                                { "type": "text", "text": "table" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            adf_to_text(&doc),
+            "Drop campaigns table\nDrop campaigns_footprints table"
+        );
+    }
+
+    #[test]
+    fn adf_to_text_recurses_into_unknown_containers() {
+        // An unknown wrapper (panel, expand, ...) must degrade to its inner
+        // text -- including recognized nodes nested inside it -- rather than
+        // disappearing entirely.
+        let doc = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "panel",
+                    "attrs": { "panelType": "info" },
+                    "content": [
+                        { "type": "paragraph", "content": [{ "type": "text", "text": "note" }] },
+                        {
+                            "type": "codeBlock",
+                            "attrs": { "language": "sh" },
+                            "content": [{ "type": "text", "text": "echo hi" }]
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(adf_to_text(&doc), "note\necho hi");
+    }
+
+    #[test]
+    fn adf_to_text_renders_table_cell_text() {
+        let doc = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "table",
+                    "content": [
+                        {
+                            "type": "tableRow",
+                            "content": [
+                                {
+                                    "type": "tableHeader",
+                                    "content": [
+                                        { "type": "paragraph", "content": [{ "type": "text", "text": "name" }] }
+                                    ]
+                                },
+                                {
+                                    "type": "tableCell",
+                                    "content": [
+                                        { "type": "paragraph", "content": [{ "type": "text", "text": "value" }] }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(adf_to_text(&doc), "name\nvalue");
     }
 
     #[test]
