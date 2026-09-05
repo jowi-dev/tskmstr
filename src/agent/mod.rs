@@ -26,8 +26,17 @@
 //! [`AgentRunner::tmux_command_line`]), the default audit/cleanup prompt
 //! templates, the default lane-prompt path, and the branch-owner fallback
 //! behind the trait, and moves the shared [`shell_quote`] helper here from
-//! `src/work/audit.rs`. Later phases add telemetry deployment and pricing.
+//! `src/work/audit.rs`. This phase (5) moves telemetry — hook script
+//! deployment and user-level hooks install — behind
+//! [`AgentRunner::deploy_telemetry`], [`AgentRunner::install_user_hooks`],
+//! and [`AgentRunner::user_hooks_installed`], with [`AgentError`] as the
+//! backend-agnostic error every caller downstream of those methods depends
+//! on: `src/agent/claude/hooks.rs` and `src/agent/claude/hooks_install.rs`
+//! (moved from `src/work/`) are now adapter-private, called only from
+//! [`crate::agent::claude::ClaudeRunner`]'s impls. Later phases add session
+//! identity and pricing.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -147,11 +156,14 @@ pub struct InvocationInputs {
     /// Permission-mode override. `None` resolves to the adapter's own
     /// default.
     pub permission_mode: Option<String>,
-    /// Path to the generated hooks `--settings` JSON file
-    /// (`deploy_tm_hooks`'s return value in `work.ml`, `hooks::deploy_hooks`
-    /// in this port). Always passed — there is no code path that runs the
-    /// agent without a settings file.
-    pub settings_path: PathBuf,
+    /// Path to the generated hooks `--settings` JSON file, verbatim
+    /// [`AgentRunner::deploy_telemetry`]'s return value. `None` when the
+    /// configured runner deploys no telemetry at all — `ClaudeRunner`'s
+    /// `deploy_telemetry` always returns `Some`, so every current caller
+    /// still gets a `--settings` flag, but a future telemetry-less runner
+    /// must be able to omit it. See [`AgentRunner::deploy_telemetry`]'s doc
+    /// comment for the acceptance rule this shape exists to satisfy.
+    pub settings_path: Option<PathBuf>,
     /// The run id returned by `tm runs start`, if this run is tracked.
     /// `None` (or, defensively, `Some("")`) means untracked: no run-id
     /// variable is set at all, matching the wrapper script's `if [ -n
@@ -205,6 +217,119 @@ pub enum OutcomeParseError {
     /// `session_id` is the one field every adapter must treat as required.
     #[error("agent result JSON is missing a non-empty session_id")]
     MissingSessionId,
+}
+
+/// Backend-agnostic error from [`AgentRunner::deploy_telemetry`] and
+/// [`AgentRunner::install_user_hooks`], mirroring the pattern
+/// [`crate::ticketing::error::ProviderError`] established for issue #3: a
+/// caller downstream of [`AgentRunner`] (`src/work/run.rs`'s
+/// `RunLaneError`/`ReviewFixError`, `main.rs`'s dispatch) depends on one
+/// runner-agnostic error rather than naming
+/// [`crate::agent::claude::hooks::HooksError`] or
+/// [`crate::agent::claude::hooks_install::HooksInstallError`] directly.
+/// Unlike [`crate::ticketing::error::ProviderError`]'s field-by-field
+/// mirroring (multiple ticket backends, each with genuinely different
+/// failure shapes), `claude` is still the only adapter and its telemetry
+/// error types already carry high-quality messages, so this wraps them
+/// (plus the settings-JSON serialize/write step [`AgentRunner::deploy_telemetry`]
+/// folds in) transparently rather than re-deriving each variant.
+#[derive(Debug, Error)]
+pub enum AgentError {
+    /// Hook script deployment failed. See
+    /// [`crate::agent::claude::hooks::HooksError`].
+    #[error(transparent)]
+    Hooks(#[from] crate::agent::claude::hooks::HooksError),
+
+    /// User-level hooks install failed. See
+    /// [`crate::agent::claude::hooks_install::HooksInstallError`].
+    #[error(transparent)]
+    HooksInstall(#[from] crate::agent::claude::hooks_install::HooksInstallError),
+
+    /// Serializing the generated hooks `--settings` JSON to disk failed.
+    #[error("failed to serialize settings JSON: {0}")]
+    SettingsJson(#[from] serde_json::Error),
+
+    /// A filesystem operation failed (e.g. writing the settings file).
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// The outcome of an [`AgentRunner::install_user_hooks`] call — everything
+/// `tm work hooks install --user` needs to print its summary. Runner-agnostic:
+/// moved here from `src/work/hooks_install.rs` (now
+/// `src/agent/claude/hooks_install.rs`) in phase 5 of GitHub issue #17
+/// (`docs/plans/agent-runner.md`) since [`AgentRunner::install_user_hooks`]
+/// returns it directly and a future adapter with its own user-level
+/// telemetry would build the same shape rather than a claude-specific one.
+#[derive(Debug, Clone, Default)]
+pub struct InstallReport {
+    /// Hook script filenames written (missing, or present but stale).
+    pub scripts_copied: Vec<String>,
+    /// Hook script filenames already byte-identical on disk.
+    pub scripts_already_present: Vec<String>,
+    /// `"<event> -> <script>"` labels newly appended to `settings.json`.
+    pub hooks_added: Vec<String>,
+    /// `"<event> -> <script>"` labels already present in `settings.json`.
+    pub hooks_already_present: Vec<String>,
+    /// Where the pre-modification backup was written, if this wasn't a
+    /// dry run.
+    pub backup_path: Option<PathBuf>,
+    /// Whether this call was a dry run (nothing was written).
+    pub dry_run: bool,
+}
+
+impl InstallReport {
+    /// Render a plain-text (no emoji) summary of what changed/would
+    /// change, matching the rest of the CLI's output style.
+    pub fn write_summary(&self, out: &mut dyn Write) -> io::Result<()> {
+        if self.dry_run {
+            writeln!(out, "Dry run: no changes written.")?;
+        }
+
+        writeln!(out, "Hook scripts:")?;
+        if self.scripts_copied.is_empty() {
+            writeln!(out, "  copied: (none)")?;
+        } else {
+            writeln!(out, "  copied: {}", self.scripts_copied.join(", "))?;
+        }
+        writeln!(
+            out,
+            "  already up to date: {}",
+            if self.scripts_already_present.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.scripts_already_present.join(", ")
+            }
+        )?;
+
+        writeln!(out, "settings.json hook wiring:")?;
+        writeln!(
+            out,
+            "  added: {}",
+            if self.hooks_added.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.hooks_added.join(", ")
+            }
+        )?;
+        writeln!(
+            out,
+            "  already present: {}",
+            if self.hooks_already_present.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.hooks_already_present.join(", ")
+            }
+        )?;
+
+        match &self.backup_path {
+            Some(path) => writeln!(out, "Backup written to: {}", path.display())?,
+            None if !self.dry_run => writeln!(out, "Backup written to: (none)")?,
+            None => {}
+        }
+
+        Ok(())
+    }
 }
 
 /// The typed result of one finished headless agent invocation, parsed from
@@ -338,4 +463,44 @@ pub trait AgentRunner {
     /// Default lane-prompt file path when neither `--prompt` nor the lane's
     /// `prompt_file` is given, e.g. `~/.claude/prompts/<lane>.md`.
     fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf;
+
+    /// Deploy this runner's telemetry artifacts (hook scripts + a settings
+    /// file, for `claude`) into `deploy_dir`, returning the settings path
+    /// [`InvocationInputs::settings_path`] should carry, or `Ok(None)` for a
+    /// runner with no telemetry.
+    ///
+    /// **Acceptance rule: run start/finish recording must never depend on
+    /// this returning `Some`.** [`crate::runs::RunStore::start_run`]/
+    /// `finish_run` are already opaque to runner shape (see
+    /// `docs/plans/agent-runner.md`'s "Hook-scripts decision"), so a future
+    /// adapter that returns `None` here must still get its runs tracked —
+    /// only the telemetry-driven extras (session-usage cost, checklist/task
+    /// events, the `SessionEnd`-triggered interactive finish) are lost, not
+    /// run tracking itself.
+    fn deploy_telemetry(&self, deploy_dir: &Path) -> Result<Option<PathBuf>, AgentError>;
+
+    /// Merge this runner's user-level telemetry hooks into the user's own
+    /// agent settings (`tm work hooks install --user`), copying any hook
+    /// scripts into a runner-owned directory first. `Ok(None)` is the
+    /// no-user-telemetry shape for a runner that has nothing to install
+    /// (`claude` never returns it — see [`ClaudeRunner`](crate::agent::claude::ClaudeRunner)).
+    ///
+    /// `home`/`xdg_data_home` are the already-resolved environment reads a
+    /// caller has on hand; any adapter-specific env var (`claude`'s
+    /// `CLAUDE_CONFIG_DIR`) is resolved inside the adapter, not by the
+    /// caller. `backup_suffix`/`dry_run` mirror
+    /// [`crate::agent::claude::hooks_install::install_user_hooks`]'s
+    /// same-named parameters.
+    fn install_user_hooks(
+        &self,
+        home: &Path,
+        xdg_data_home: Option<&Path>,
+        backup_suffix: &str,
+        dry_run: bool,
+    ) -> Result<Option<InstallReport>, AgentError>;
+
+    /// Whether this runner's user-level telemetry hooks are already
+    /// installed (the `tm init` onboarding probe). `false` for a runner
+    /// with no user-level telemetry to install.
+    fn user_hooks_installed(&self, home: &Path, xdg_data_home: Option<&Path>) -> bool;
 }

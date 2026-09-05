@@ -2,6 +2,7 @@
 //! dependencies (config files, the macOS keychain, `gh`/`git`, and the Jira
 //! HTTP API), and dispatches to `tskmstr::cli`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -473,25 +474,25 @@ fn run_work(
                     return Err("tm work hooks install currently only supports --user".into());
                 }
                 let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-                let hooks_dir =
-                    tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), &home);
-                let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-                let settings_path = tskmstr::work::hooks_install::user_settings_path(
-                    claude_config_dir.as_deref(),
-                    &home,
-                );
                 let clock = tskmstr::work::run::SystemClock;
                 let (year, month, day, hour, min, sec) =
                     tskmstr::work::run::Clock::now_parts(&clock);
                 let backup_suffix =
                     tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
-                let report = tskmstr::work::hooks_install::install_user_hooks(
-                    &hooks_dir,
-                    &settings_path,
+                let runner = agent_runner_or_default(full_config.as_ref());
+                match runner.install_user_hooks(
+                    &home,
+                    xdg_data_home.as_deref(),
                     &backup_suffix,
                     dry_run,
-                )?;
-                report.write_summary(&mut stdout)?;
+                )? {
+                    Some(report) => report.write_summary(&mut stdout)?,
+                    None => writeln!(
+                        stdout,
+                        "{} has no user-level telemetry to install.",
+                        runner.name()
+                    )?,
+                }
             }
         },
     }
@@ -707,35 +708,34 @@ fn run_init(
         .as_deref()
         .and_then(tskmstr::cli::init::detect_origin_default_branch);
 
-    let (hooks_dir, settings_path) = user_hooks_paths(&home);
-    // A dry-run install with nothing left to add means installed; any error
-    // (e.g. no Claude settings file yet) just means "not installed".
-    let hooks_installed = tskmstr::work::hooks_install::install_user_hooks(
-        &hooks_dir,
-        &settings_path,
-        "tm-init-probe",
-        true,
-    )
-    .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
-    .unwrap_or(false);
+    // `tm init` runs before any config necessarily exists, so this probes
+    // the default runner ([`AgentKind::Claude`]) rather than one selected by
+    // config — mirrors `agent_runner_or_default`'s other no-config callers.
+    let init_runner = agent_runner_or_default(None);
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let hooks_installed = init_runner.user_hooks_installed(&home, xdg_data_home.as_deref());
     let hook_installer = |out: &mut dyn std::io::Write| -> Result<(), String> {
-        let (hooks_dir, settings_path) = user_hooks_paths(
-            &std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("~")),
-        );
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
         let clock = tskmstr::work::run::SystemClock;
         let (year, month, day, hour, min, sec) = tskmstr::work::run::Clock::now_parts(&clock);
         let backup_suffix =
             tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
-        let report = tskmstr::work::hooks_install::install_user_hooks(
-            &hooks_dir,
-            &settings_path,
-            &backup_suffix,
-            false,
-        )
-        .map_err(|err| err.to_string())?;
-        report.write_summary(out).map_err(|err| err.to_string())
+        let runner = agent_runner_or_default(None);
+        match runner
+            .install_user_hooks(&home, xdg_data_home.as_deref(), &backup_suffix, false)
+            .map_err(|err| err.to_string())?
+        {
+            Some(report) => report.write_summary(out).map_err(|err| err.to_string()),
+            None => writeln!(
+                out,
+                "{} has no user-level telemetry to install.",
+                runner.name()
+            )
+            .map_err(|err| err.to_string()),
+        }
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -754,17 +754,6 @@ fn run_init(
     let mut stdout = std::io::stdout();
     tskmstr::cli::init::run_init(&ctx, yes, &mut prompter, &mut stdout)?;
     Ok(())
-}
-
-/// The user-level hooks dir and Claude settings path `tm work hooks install
-/// --user` targets, honoring the same env overrides.
-fn user_hooks_paths(home: &std::path::Path) -> (PathBuf, PathBuf) {
-    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    let hooks_dir = tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), home);
-    let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    let settings_path =
-        tskmstr::work::hooks_install::user_settings_path(claude_config_dir.as_deref(), home);
-    (hooks_dir, settings_path)
 }
 
 /// Load config and build a real ticket provider (Jira or GitHub, per

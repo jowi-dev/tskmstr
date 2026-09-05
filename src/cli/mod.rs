@@ -325,7 +325,7 @@ pub enum WorkCmd {
         state_file: String,
     },
     /// Install/maintain tm's hook scripts outside a lane worktree (see
-    /// `tskmstr::work::hooks_install`).
+    /// `tskmstr::agent::claude::hooks_install`).
     Hooks {
         /// Which hooks action to perform.
         #[command(subcommand)]
@@ -344,7 +344,7 @@ pub enum HooksCmd {
     /// Deliberately narrow: never installs `guard-delegate.sh` (it would
     /// start denying ordinary edits in every session, not just lane runs)
     /// or the other lane-only scripts. See
-    /// `tskmstr::work::hooks_install` module docs for the full rationale.
+    /// `tskmstr::agent::claude::hooks_install` module docs for the full rationale.
     Install {
         /// Install at user level (`~/.claude/settings.json`, or
         /// `$CLAUDE_CONFIG_DIR/settings.json`). Currently the only

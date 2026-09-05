@@ -12,6 +12,11 @@
 //! than the OCaml version's hand-built `sprintf` string, which removes a
 //! latent escaping/injection risk for free (see plan §3) — but the *shape*
 //! (hook events, matchers, command order) is reproduced exactly.
+//!
+//! Moved from `src/work/hooks.rs` in phase 5 of GitHub issue #17
+//! (`docs/plans/agent-runner.md`): telemetry is adapter-owned, so this
+//! module lives behind [`crate::agent::claude::ClaudeRunner::deploy_telemetry`]
+//! rather than being called directly by `src/work/run.rs`.
 
 use std::path::Path;
 
@@ -61,28 +66,31 @@ pub enum HooksError {
 /// referenced by name where it's wired), but is kept identical to the OCaml
 /// source for easy comparison.
 const HOOK_SOURCES: &[(&str, &str)] = &[
-    ("tm-event.sh", include_str!("../../hooks/tm-event.sh")),
+    ("tm-event.sh", include_str!("../../../hooks/tm-event.sh")),
     (
         "tm-checklist.sh",
-        include_str!("../../hooks/tm-checklist.sh"),
+        include_str!("../../../hooks/tm-checklist.sh"),
     ),
-    ("tm-usage.sh", include_str!("../../hooks/tm-usage.sh")),
-    ("tm-tasklist.sh", include_str!("../../hooks/tm-tasklist.sh")),
+    ("tm-usage.sh", include_str!("../../../hooks/tm-usage.sh")),
+    (
+        "tm-tasklist.sh",
+        include_str!("../../../hooks/tm-tasklist.sh"),
+    ),
     (
         "tm-session-end.sh",
-        include_str!("../../hooks/tm-session-end.sh"),
+        include_str!("../../../hooks/tm-session-end.sh"),
     ),
     (
         "tm-session-state.sh",
-        include_str!("../../hooks/tm-session-state.sh"),
+        include_str!("../../../hooks/tm-session-state.sh"),
     ),
     (
         "guard-delegate.sh",
-        include_str!("../../hooks/guard-delegate.sh"),
+        include_str!("../../../hooks/guard-delegate.sh"),
     ),
     (
         "graphify-nudge.sh",
-        include_str!("../../hooks/graphify-nudge.sh"),
+        include_str!("../../../hooks/graphify-nudge.sh"),
     ),
 ];
 

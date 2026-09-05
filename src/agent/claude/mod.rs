@@ -36,7 +36,12 @@
 //! it never falls back to omitting a flag and trusting `claude`'s own
 //! default. This module ports that: absent `model`/`max_turns`/
 //! `permission_mode` resolve to the same defaults (`"fable"`, `"200"`,
-//! `"acceptEdits"`) rather than being left out of argv.
+//! `"acceptEdits"`) rather than being left out of argv. `--settings` is the
+//! one exception, since phase 5 of GitHub issue #17
+//! (`docs/plans/agent-runner.md`) made [`InvocationInputs::settings_path`]
+//! an `Option`, for a future telemetry-less runner's sake — `claude`'s own
+//! [`ClaudeRunner::deploy_telemetry`] always returns `Some`, so every
+//! current caller still gets `--settings` in argv exactly as before.
 //!
 //! # Two run modes
 //!
@@ -54,10 +59,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::{
-    AgentInvocation, AgentRunner, InvocationInputs, OutcomeParseError, RunMode, RunOutcome,
-    shell_quote,
+    AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
+    RunMode, RunOutcome, shell_quote,
 };
 use crate::work::naming::expand_tilde;
+
+pub mod hooks;
+pub mod hooks_install;
 
 /// Driver model default when a lane/run doesn't specify one, mirroring
 /// `run_lane`'s `let model = match opts.model with Some m -> m | None ->
@@ -125,8 +133,10 @@ impl AgentRunner for ClaudeRunner {
         }
         args.push("--model".to_string());
         args.push(model);
-        args.push("--settings".to_string());
-        args.push(inputs.settings_path.to_string_lossy().into_owned());
+        if let Some(settings_path) = inputs.settings_path {
+            args.push("--settings".to_string());
+            args.push(settings_path.to_string_lossy().into_owned());
+        }
         args.push("--permission-mode".to_string());
         args.push(permission_mode);
         if inputs.mode == RunMode::Headless {
@@ -262,6 +272,52 @@ impl AgentRunner for ClaudeRunner {
     fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf {
         expand_tilde(&format!("~/.claude/prompts/{lane}.md"), home)
     }
+
+    /// Deploys the eight embedded hook scripts and writes the generated
+    /// `--settings` JSON to `deploy_dir/settings.json`, folding in the
+    /// serialize-and-write step that used to live at each `src/work/run.rs`
+    /// call site (`prepare_run_lane`/`prepare_review_fix`'s "Step 8: deploy
+    /// hooks + settings"). Always returns `Some` — `claude` always has
+    /// telemetry to deploy.
+    fn deploy_telemetry(&self, deploy_dir: &Path) -> Result<Option<PathBuf>, AgentError> {
+        let settings = hooks::deploy_hooks(deploy_dir)?;
+        let settings_path = deploy_dir.join("settings.json");
+        let rendered = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, rendered)?;
+        Ok(Some(settings_path))
+    }
+
+    /// Resolves the XDG hooks dir and `claude`'s own settings path (reading
+    /// `CLAUDE_CONFIG_DIR` itself — see [`hooks_install::user_settings_path`]),
+    /// then delegates to [`hooks_install::install_user_hooks`]. Always
+    /// returns `Some` — `claude` always has user-level telemetry to install.
+    fn install_user_hooks(
+        &self,
+        home: &Path,
+        xdg_data_home: Option<&Path>,
+        backup_suffix: &str,
+        dry_run: bool,
+    ) -> Result<Option<InstallReport>, AgentError> {
+        let hooks_dir = hooks_install::user_hooks_dir(xdg_data_home, home);
+        let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let settings_path = hooks_install::user_settings_path(claude_config_dir.as_deref(), home);
+        let report =
+            hooks_install::install_user_hooks(&hooks_dir, &settings_path, backup_suffix, dry_run)?;
+        Ok(Some(report))
+    }
+
+    /// A dry-run [`hooks_install::install_user_hooks`] with nothing left to
+    /// add means installed; any error (e.g. no Claude settings file yet)
+    /// means not installed. Ported verbatim from the probe `main.rs`'s
+    /// `run_init` used to perform inline.
+    fn user_hooks_installed(&self, home: &Path, xdg_data_home: Option<&Path>) -> bool {
+        let hooks_dir = hooks_install::user_hooks_dir(xdg_data_home, home);
+        let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let settings_path = hooks_install::user_settings_path(claude_config_dir.as_deref(), home);
+        hooks_install::install_user_hooks(&hooks_dir, &settings_path, "tm-init-probe", true)
+            .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 /// Raw shape of the `claude -p --output-format json` result, deserialized
@@ -293,7 +349,9 @@ mod tests {
             model: Some("sonnet".to_string()),
             max_turns: Some("300".to_string()),
             permission_mode: Some("plan".to_string()),
-            settings_path: PathBuf::from("/Users/jowi/.local/share/tskmstr/hooks/settings.json"),
+            settings_path: Some(PathBuf::from(
+                "/Users/jowi/.local/share/tskmstr/hooks/settings.json",
+            )),
             run_id: Some("run-123".to_string()),
             mode: RunMode::Headless,
         }
@@ -355,7 +413,7 @@ mod tests {
             model: Some("fable".to_string()),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
-            settings_path: PathBuf::from("/hooks/settings.json"),
+            settings_path: Some(PathBuf::from("/hooks/settings.json")),
             run_id: Some("7".to_string()),
             mode: RunMode::Interactive,
         });
@@ -382,7 +440,7 @@ mod tests {
             model: Some("fable".to_string()),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
-            settings_path: PathBuf::from("/hooks/settings.json"),
+            settings_path: Some(PathBuf::from("/hooks/settings.json")),
             run_id: Some("7".to_string()),
             mode: RunMode::Interactive,
         });
@@ -611,6 +669,71 @@ mod tests {
                 "CLAUDECODE".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_invocation_omits_settings_flag_when_no_telemetry() {
+        // A future runner whose `deploy_telemetry` returns `None` must still
+        // produce a valid invocation — see `InvocationInputs::settings_path`'s
+        // doc comment. `claude` itself never hits this path (its
+        // `deploy_telemetry` always returns `Some`), but `build_invocation`
+        // must handle it regardless.
+        let inputs = InvocationInputs {
+            settings_path: None,
+            ..base_inputs()
+        };
+
+        let invocation = ClaudeRunner.build_invocation(inputs);
+
+        assert!(
+            !invocation.args.iter().any(|a| a == "--settings"),
+            "no --settings flag should be emitted when settings_path is None"
+        );
+    }
+
+    // --- telemetry ---
+
+    #[test]
+    fn deploy_telemetry_writes_settings_json_and_returns_its_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let settings_path = ClaudeRunner
+            .deploy_telemetry(dir.path())
+            .expect("deploy_telemetry should succeed")
+            .expect("claude always deploys telemetry");
+
+        assert_eq!(settings_path, dir.path().join("settings.json"));
+        let written = std::fs::read_to_string(&settings_path).expect("read settings.json");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("parse settings");
+        assert!(parsed.get("hooks").is_some());
+        assert!(dir.path().join("tm-event.sh").exists());
+    }
+
+    #[test]
+    fn user_hooks_installed_is_false_when_settings_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        assert!(!ClaudeRunner.user_hooks_installed(&home, None));
+    }
+
+    #[test]
+    fn install_user_hooks_installs_the_three_documented_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+        std::fs::write(claude_dir.join("settings.json"), r#"{"hooks":{}}"#)
+            .expect("write settings.json");
+
+        let report = ClaudeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("install_user_hooks should succeed")
+            .expect("claude always installs user hooks");
+
+        assert_eq!(report.hooks_added.len(), 3);
+        assert!(ClaudeRunner.user_hooks_installed(&home, None));
     }
 
     // --- parse_outcome ---

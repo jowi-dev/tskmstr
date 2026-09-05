@@ -264,7 +264,7 @@ mod tests {
             model: Some("fable".to_string()),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
-            settings_path: PathBuf::from("/hooks/settings.json"),
+            settings_path: Some(PathBuf::from("/hooks/settings.json")),
             run_id: Some("7".to_string()),
             mode: RunMode::Interactive,
         })

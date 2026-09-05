@@ -59,7 +59,9 @@
 //!    timestamp) a slug does not guarantee uniqueness across re-runs.
 //! 7. Read the prompt file and append `"\n\nWork ticket: <ticket>."` when a
 //!    ticket was given.
-//! 8. Deploy the hooks and write the generated `--settings` JSON to
+//! 8. Deploy the configured runner's telemetry
+//!    ([`crate::agent::AgentRunner::deploy_telemetry`]), which for `claude`
+//!    writes the generated `--settings` JSON to
 //!    `hooks_deploy_dir/settings.json`.
 //! 9. [`RunStore::start_run`] — ticket (falling back to the lane name when
 //!    untracked by ticket), lane, worktree, branch, and the current
@@ -82,14 +84,13 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::agent::{AgentRunner, InvocationInputs, RunMode};
+use crate::agent::{AgentError, AgentRunner, InvocationInputs, RunMode};
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::provider::TicketProvider;
 use crate::work::git::{GitError, GitOps};
-use crate::work::hooks::{self, HooksError};
 use crate::work::interactive::interactive_prompt;
 use crate::work::naming::{self, expand_tilde};
 use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest};
@@ -122,9 +123,10 @@ pub enum RunLaneError {
     #[error(transparent)]
     Gh(#[from] GhError),
 
-    /// Hook deployment failed.
+    /// Telemetry deployment failed (see
+    /// [`crate::agent::AgentRunner::deploy_telemetry`]).
     #[error(transparent)]
-    Hooks(#[from] HooksError),
+    Agent(#[from] AgentError),
 
     /// A run-state store operation failed.
     #[error(transparent)]
@@ -1039,10 +1041,11 @@ pub fn prepare_run_lane(
         None => prompt_text,
     };
 
-    // Step 8: deploy hooks + settings.
-    let settings = hooks::deploy_hooks(&paths.hooks_deploy_dir)?;
-    let settings_path = paths.hooks_deploy_dir.join("settings.json");
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    // Step 8: deploy telemetry via the configured runner — `None` for a
+    // future telemetry-less runner (see `AgentRunner::deploy_telemetry`'s
+    // acceptance rule; run tracking below never depends on this being
+    // `Some`).
+    let settings_path = deps.runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     // Step 9: start the tracked run. `pid` is `Some(current pid)` for --fg
     // (this process is the driver) and `None` for the detached path (the
@@ -1093,7 +1096,7 @@ pub fn prepare_run_lane(
         model,
         max_turns,
         permission_mode,
-        settings_path: settings_path.clone(),
+        settings_path,
         run_id: Some(run_id.to_string()),
         mode: request.mode,
     });
@@ -1131,9 +1134,10 @@ pub enum ReviewFixError {
     #[error(transparent)]
     Git(#[from] GitError),
 
-    /// Hook deployment failed.
+    /// Telemetry deployment failed (see
+    /// [`crate::agent::AgentRunner::deploy_telemetry`]).
     #[error(transparent)]
-    Hooks(#[from] HooksError),
+    Agent(#[from] AgentError),
 
     /// A run-state store operation failed.
     #[error(transparent)]
@@ -1212,9 +1216,7 @@ pub fn prepare_review_fix(
         return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
     }
 
-    let settings = hooks::deploy_hooks(&paths.hooks_deploy_dir)?;
-    let settings_path = paths.hooks_deploy_dir.join("settings.json");
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    let settings_path = runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     let run_id = run_store.start_run(&StartRun {
         ticket: ticket.to_string(),
@@ -1239,7 +1241,7 @@ pub fn prepare_review_fix(
         model: None,
         max_turns: None,
         permission_mode: None,
-        settings_path: settings_path.clone(),
+        settings_path,
         run_id: Some(run_id.to_string()),
         mode,
     });
