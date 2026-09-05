@@ -220,6 +220,7 @@ pub fn map_key(
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
         KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
         KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
+        KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
         KeyCode::Char('c') if *screen == Screen::Retro => Some(Msg::RetroMarkClean),
@@ -2086,6 +2087,53 @@ mod tests {
     }
 
     #[test]
+    fn c_triggers_create_action_on_board() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('c')
+            ),
+            Some(Msg::CreateAction)
+        );
+    }
+
+    #[test]
+    fn c_is_unbound_off_the_board_screen_except_retro() {
+        // On Screen::Retro, `c` marks a ticket clean (see the retro test
+        // below); everywhere else off the board it stays unbound.
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('c')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn d_and_c_trigger_retro_actions_on_retro_screen_only() {
         assert_eq!(
             map_key(
@@ -2125,6 +2173,11 @@ mod tests {
             Screen::Runs,
         ] {
             for key in [KeyCode::Char('d'), KeyCode::Char('c')] {
+                // `c` on the board is CreateAction (issue #15), not a stray
+                // retro binding -- covered by its own tests above.
+                if screen == Screen::Board && key == KeyCode::Char('c') {
+                    continue;
+                }
                 assert_eq!(
                     map_key(
                         &screen,
