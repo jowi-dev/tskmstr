@@ -59,17 +59,19 @@
 //!    timestamp) a slug does not guarantee uniqueness across re-runs.
 //! 7. Read the prompt file and append `"\n\nWork ticket: <ticket>."` when a
 //!    ticket was given.
-//! 8. Deploy the hooks and write the generated `--settings` JSON to
+//! 8. Deploy the configured runner's telemetry
+//!    ([`crate::agent::AgentRunner::deploy_telemetry`]), which for `claude`
+//!    writes the generated `--settings` JSON to
 //!    `hooks_deploy_dir/settings.json`.
 //! 9. [`RunStore::start_run`] — ticket (falling back to the lane name when
 //!    untracked by ticket), lane, worktree, branch, and the current
 //!    process's pid (this *is* the driver process for `--fg`, unlike the
 //!    detached path's separate supervisor).
-//! 10. Build the `claude` invocation ([`crate::work::claude`]) with the new
-//!     run id wired in as `TSKMSTR_RUN_ID`, and spawn it
+//! 10. Build the agent invocation ([`crate::agent::AgentRunner::build_invocation`])
+//!     with the new run id wired in as `TSKMSTR_RUN_ID`, and spawn it
 //!     ([`crate::work::runner`]), stdout redirected to
 //!     `state_dir/<wt_name>-<timestamp>.json`.
-//! 11. Parse the result JSON ([`crate::work::runner::parse_run_outcome`]).
+//! 11. Parse the result JSON ([`crate::agent::AgentRunner::parse_outcome`]).
 //!     A non-zero exit status forces a failed outcome regardless of what
 //!     the JSON says (mirrors `work.ml`'s `if status <> 0 then ... exit
 //!     status`, which never gets as far as inspecting `is_error`).
@@ -82,17 +84,16 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::{AgentError, AgentRunner, InvocationInputs, RunMode};
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::provider::TicketProvider;
-use crate::work::claude::{ClaudeInvocationInputs, RunMode, build_claude_invocation};
 use crate::work::git::{GitError, GitOps};
-use crate::work::hooks::{self, HooksError};
 use crate::work::interactive::interactive_prompt;
 use crate::work::naming::{self, expand_tilde};
-use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest, parse_run_outcome};
+use crate::work::runner::{ProcessSpawner, SpawnError, SpawnRequest};
 
 /// Errors that can occur while running [`run_lane_fg`].
 #[derive(Debug, Error)]
@@ -122,9 +123,10 @@ pub enum RunLaneError {
     #[error(transparent)]
     Gh(#[from] GhError),
 
-    /// Hook deployment failed.
+    /// Telemetry deployment failed (see
+    /// [`crate::agent::AgentRunner::deploy_telemetry`]).
     #[error(transparent)]
-    Hooks(#[from] HooksError),
+    Agent(#[from] AgentError),
 
     /// A run-state store operation failed.
     #[error(transparent)]
@@ -336,6 +338,10 @@ pub struct RunLaneDeps<'a> {
     /// [`crate::config::FsBackendIdentityResolver`] for the real
     /// filesystem-backed implementation.
     pub backend_identity_resolver: &'a dyn BackendIdentityResolver,
+    /// The AI coding agent this run's invocation is built for (Claude
+    /// today; see [`crate::agent::AgentRunner`] and GitHub issue #17),
+    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -387,7 +393,7 @@ pub struct RunLaneRequest {
     pub mode: RunMode,
 }
 
-/// Everything [`run_claude_and_finish`] needs to spawn `claude`, wait, parse
+/// Everything [`run_agent_and_finish`] needs to spawn the agent, wait, parse
 /// its result, and finish the tracked run — the output of
 /// [`prepare_run_lane`] (steps 1-9 of the module doc's sequence), consumed by
 /// steps 10-13.
@@ -414,8 +420,8 @@ pub struct PreparedRun {
     pub worktree: PathBuf,
     /// The fresh branch cut for this run.
     pub branch: String,
-    /// The fully resolved `claude` invocation.
-    pub invocation: crate::work::claude::ClaudeInvocation,
+    /// The fully resolved agent invocation.
+    pub invocation: crate::agent::AgentInvocation,
     /// Where the spawned `claude` process's stdout (its result JSON) is
     /// written, and later read back from.
     pub out_json_path: PathBuf,
@@ -460,13 +466,18 @@ pub fn sanitize_branch_owner(s: &str) -> String {
 /// 1. `git config --get j.branchOwner` — explicit per-machine override.
 /// 2. `gh api user -q .login` — the active `gh` session's GitHub handle.
 /// 3. `git config --get github.user` — a common local convention.
-/// 4. `"claude"` — fallback so runs never fail on naming.
+/// 4. [`AgentRunner::name`] — fallback so runs never fail on naming.
 ///
 /// Every source's failure (a `git`/`gh` error, not just "not found") is
 /// tolerated the same as an empty result, matching `work.ml`'s
 /// `2>/dev/null`-redirected shell-outs, which never distinguish "command
 /// failed" from "command printed nothing".
-pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> String {
+pub fn resolve_branch_owner(
+    git: &dyn GitOps,
+    gh: &dyn GhCli,
+    dir: &Path,
+    runner: &dyn AgentRunner,
+) -> String {
     let non_empty = |s: Option<String>| -> Option<String> {
         let sanitized = sanitize_branch_owner(&s?);
         if sanitized.is_empty() {
@@ -479,7 +490,7 @@ pub fn resolve_branch_owner(git: &dyn GitOps, gh: &dyn GhCli, dir: &Path) -> Str
     non_empty(git.config_get(dir, "j.branchOwner").ok().flatten())
         .or_else(|| non_empty(gh.current_user_login().ok().flatten()))
         .or_else(|| non_empty(git.config_get(dir, "github.user").ok().flatten()))
-        .unwrap_or_else(|| "claude".to_string())
+        .unwrap_or_else(|| runner.name().to_string())
 }
 
 /// Resolve the human-readable slug to fold into a lane run's branch name
@@ -680,8 +691,10 @@ pub fn resolve_blocker_stacking(
 }
 
 /// Resolve the prompt file path for a lane run: `--prompt` override, else
-/// the lane's configured `prompt_file`, else `~/.claude/prompts/<lane>.md`
-/// (`work.ml`'s default). Every form is `~`-expanded against `home`.
+/// the lane's configured `prompt_file`, else
+/// [`runner`](AgentRunner::default_lane_prompt_path)'s default lane-prompt
+/// path (`~/.claude/prompts/<lane>.md` for `claude` — `work.ml`'s default).
+/// Every form is `~`-expanded against `home`.
 ///
 /// A relative lane `prompt_file` resolves against `repo_root`, not the
 /// process's cwd, so a lane prompt can live in the repo it instructs
@@ -696,6 +709,7 @@ fn resolve_prompt_path(
     lane_prompt_file: Option<&str>,
     repo_root: &Path,
     home: &Path,
+    runner: &dyn AgentRunner,
 ) -> PathBuf {
     if let Some(raw) = prompt_override {
         return expand_tilde(raw, home);
@@ -709,7 +723,7 @@ fn resolve_prompt_path(
                 repo_root.join(path)
             }
         }
-        None => expand_tilde(&format!("~/.claude/prompts/{lane}.md"), home),
+        None => runner.default_lane_prompt_path(home, lane),
     }
 }
 
@@ -779,11 +793,11 @@ fn append_log_line(log_path: &Path, line: &str) {
 ///
 /// Composed from [`prepare_run_lane`] (steps 1-9, provisioning through
 /// `start_run`, recording *this* process's pid since `--fg` is itself the
-/// driver) followed by [`run_claude_and_finish`] (steps 10-13, spawn through
+/// driver) followed by [`run_agent_and_finish`] (steps 10-13, spawn through
 /// the printed summary) — the same split the detached path
 /// (`src/work/detach.rs`) uses, except the detached path hands
 /// [`prepare_run_lane`]'s output to a re-exec'd supervisor instead of
-/// calling [`run_claude_and_finish`] itself.
+/// calling [`run_agent_and_finish`] itself.
 pub fn run_lane_fg(
     deps: &RunLaneDeps<'_>,
     config: &WorkConfig,
@@ -801,7 +815,14 @@ pub fn run_lane_fg(
         Some(std::process::id()),
         out,
     )?;
-    run_claude_and_finish(deps.spawner, deps.gh, deps.run_store, &prepared, out)
+    run_agent_and_finish(
+        deps.spawner,
+        deps.gh,
+        deps.run_store,
+        &prepared,
+        deps.runner,
+        out,
+    )
 }
 
 /// Steps 1-9 of the module doc's ported sequence: resolve the lane, preflight
@@ -858,6 +879,7 @@ pub fn prepare_run_lane(
         lane_config.prompt_file.as_deref(),
         &repo_root,
         &paths.home,
+        deps.runner,
     );
     if !prompt_path.exists() {
         return Err(RunLaneError::PromptFileMissing(prompt_path));
@@ -997,7 +1019,7 @@ pub fn prepare_run_lane(
     // resolve_branch_collision against both a local and an
     // origin-remote-tracking ref before it's cut.
     let base = resolve_base(deps.git)?;
-    let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root);
+    let owner = resolve_branch_owner(deps.git, deps.gh, &repo_root, deps.runner);
     let candidate = match resolve_ticket_slug(deps.ticket_provider, request.ticket.as_deref()) {
         Some(slug) => naming::branch_name_with_slug(&owner, &wt_name, &slug),
         None => naming::branch_name(&owner, &wt_name, &timestamp),
@@ -1019,10 +1041,11 @@ pub fn prepare_run_lane(
         None => prompt_text,
     };
 
-    // Step 8: deploy hooks + settings.
-    let settings = hooks::deploy_hooks(&paths.hooks_deploy_dir)?;
-    let settings_path = paths.hooks_deploy_dir.join("settings.json");
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    // Step 8: deploy telemetry via the configured runner — `None` for a
+    // future telemetry-less runner (see `AgentRunner::deploy_telemetry`'s
+    // acceptance rule; run tracking below never depends on this being
+    // `Some`).
+    let settings_path = deps.runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     // Step 9: start the tracked run. `pid` is `Some(current pid)` for --fg
     // (this process is the driver) and `None` for the detached path (the
@@ -1068,12 +1091,12 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let invocation = build_claude_invocation(ClaudeInvocationInputs {
+    let invocation = deps.runner.build_invocation(InvocationInputs {
         prompt,
         model,
         max_turns,
         permission_mode,
-        settings_path: settings_path.clone(),
+        settings_path,
         run_id: Some(run_id.to_string()),
         mode: request.mode,
     });
@@ -1111,9 +1134,10 @@ pub enum ReviewFixError {
     #[error(transparent)]
     Git(#[from] GitError),
 
-    /// Hook deployment failed.
+    /// Telemetry deployment failed (see
+    /// [`crate::agent::AgentRunner::deploy_telemetry`]).
     #[error(transparent)]
-    Hooks(#[from] HooksError),
+    Agent(#[from] AgentError),
 
     /// A run-state store operation failed.
     #[error(transparent)]
@@ -1155,8 +1179,9 @@ pub enum ReviewFixError {
 ///   reviewing in `vdiff`) would get silently folded into this fix pass's
 ///   session and attributed to it. So the check stays, just worded for this
 ///   case ([`ReviewFixError::WorktreeDirty`]) instead of reused verbatim.
-/// - **Hook deployment, [`RunStore::start_run`], [`build_claude_invocation`]:
-///   kept unchanged**, exactly as in `prepare_run_lane`.
+/// - **Hook deployment, [`RunStore::start_run`],
+///   [`crate::agent::AgentRunner::build_invocation`]: kept unchanged**,
+///   exactly as in `prepare_run_lane`.
 ///
 /// Run rows are started with `kind = "review-fix"`, distinct from `"lane"`
 /// so this run never shadows the ticket's lane run in
@@ -1185,14 +1210,13 @@ pub fn prepare_review_fix(
     prompt: String,
     pid: Option<u32>,
     mode: RunMode,
+    runner: &dyn AgentRunner,
 ) -> Result<PreparedRun, ReviewFixError> {
     if !git.status_is_clean(worktree)? {
         return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
     }
 
-    let settings = hooks::deploy_hooks(&paths.hooks_deploy_dir)?;
-    let settings_path = paths.hooks_deploy_dir.join("settings.json");
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    let settings_path = runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     let run_id = run_store.start_run(&StartRun {
         ticket: ticket.to_string(),
@@ -1212,12 +1236,12 @@ pub fn prepare_review_fix(
         RunMode::Interactive => interactive_prompt("review-fix", ticket, &prompt),
     };
 
-    let invocation = build_claude_invocation(ClaudeInvocationInputs {
+    let invocation = runner.build_invocation(InvocationInputs {
         prompt,
         model: None,
         max_turns: None,
         permission_mode: None,
-        settings_path: settings_path.clone(),
+        settings_path,
         run_id: Some(run_id.to_string()),
         mode,
     });
@@ -1264,8 +1288,8 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
     pr_url_regex().find(text).map(|m| m.as_str().to_string())
 }
 
-/// Steps 10-13 of the module doc's ported sequence: spawn `claude`, wait,
-/// parse its result JSON, [`RunStore::finish_run`], and print the summary to
+/// Steps 10-13 of the module doc's ported sequence: spawn the agent, wait,
+/// parse its result, [`RunStore::finish_run`], and print the summary to
 /// `out`. The one tail both `--fg` ([`run_lane_fg`]) and the detached
 /// supervisor ([`supervise_run`]) call — per
 /// `docs/plans/runner-port.md` §4, there is exactly one spawn-wait-parse
@@ -1274,12 +1298,15 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
 /// `gh` is used for the post-run PR-URL lookup (`gh pr list --head <branch>`,
 /// falling back to scraping the result text — see [`resolve_pr_url`]),
 /// ported from `work.ml`'s detached wrapper script so both `--fg` and
-/// detached runs record `pr_url` the same way.
-pub fn run_claude_and_finish(
+/// detached runs record `pr_url` the same way. `runner` is the adapter whose
+/// [`AgentRunner::parse_outcome`] and [`AgentRunner::resume_command`] this
+/// tail defers to — see GitHub issue #17.
+pub fn run_agent_and_finish(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
     run_store: &RunStore,
     prepared: &PreparedRun,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     let invocation = &prepared.invocation;
@@ -1294,23 +1321,24 @@ pub fn run_claude_and_finish(
     })?;
 
     // Parse the outcome and classify the run's terminal status. A non-zero
-    // exit is always Failed, regardless of what (if anything) the JSON says
-    // -- that's an unambiguous signal from the process itself. Otherwise:
+    // exit is always Failed, regardless of what (if anything) the result
+    // says -- that's an unambiguous signal from the process itself.
+    // Otherwise:
     //
-    // - JSON parsed and `is_error` was explicit -> Failed/Done, exactly as
+    // - Result parsed and `is_error` was explicit -> Failed/Done, exactly as
     //   before.
-    // - JSON failed to parse (or had no usable session_id) -> Interrupted:
+    // - Result failed to parse (or had no usable session_id) -> Interrupted:
     //   we genuinely don't know what happened, which is a different claim
     //   than "the agent failed".
-    // - JSON parsed but `is_error` was entirely absent -> Interrupted, not
+    // - Result parsed but `is_error` was entirely absent -> Interrupted, not
     //   Done. This is the fix for the bug this variant exists for: a mid-run
     //   event that ends the turn gracefully (exit 0) without ever writing an
     //   `is_error` field -- e.g. a usage-limit forced model switch -- used to
     //   default straight to `Done` via `unwrap_or(false)`. See
     //   `RunStatus::Interrupted`'s doc comment and
-    //   `parse_run_outcome_leaves_is_error_none_when_absent`.
-    let raw_json = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
-    let parsed = parse_run_outcome(&raw_json).ok();
+    //   `AgentRunner::parse_outcome`'s tests for the exact contract.
+    let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
+    let parsed = runner.parse_outcome(&raw_result).ok();
     let run_status = if !status.success() {
         RunStatus::Failed
     } else {
@@ -1386,7 +1414,7 @@ pub fn run_claude_and_finish(
     writeln!(out, "error     {is_error}")?;
     writeln!(out)?;
     if let Some(session_id) = &session_id {
-        writeln!(out, "resume:   claude --resume {session_id}")?;
+        writeln!(out, "resume:   {}", runner.resume_command(session_id))?;
     }
     writeln!(out, "summary:")?;
     write!(out, "{summary}")?;
@@ -1416,15 +1444,17 @@ pub fn supervise_run(
     run_store: &RunStore,
     prepared: &PreparedRun,
     supervisor_pid: u32,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
-    run_claude_and_finish(spawner, gh, run_store, prepared, out)
+    run_agent_and_finish(spawner, gh, run_store, prepared, runner, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
@@ -1574,7 +1604,7 @@ mod tests {
         let git = FakeGitOps::new().with_config_value("j.branchOwner", "from-git-config");
         let gh = FakeGhCli::new().with_current_user_login(Ok(Some("from-gh".to_string())));
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-git-config"
         );
     }
@@ -1584,7 +1614,7 @@ mod tests {
         let git = FakeGitOps::new();
         let gh = FakeGhCli::new().with_current_user_login(Ok(Some("from-gh".to_string())));
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-gh"
         );
     }
@@ -1594,7 +1624,7 @@ mod tests {
         let git = FakeGitOps::new().with_config_value("github.user", "from-github-user");
         let gh = FakeGhCli::new();
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "from-github-user"
         );
     }
@@ -1604,7 +1634,7 @@ mod tests {
         let git = FakeGitOps::new();
         let gh = FakeGhCli::new();
         assert_eq!(
-            resolve_branch_owner(&git, &gh, Path::new("/repo")),
+            resolve_branch_owner(&git, &gh, Path::new("/repo"), &ClaudeRunner),
             "claude"
         );
     }
@@ -1618,6 +1648,7 @@ mod tests {
                 Some("prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/repo/prompts/mylane-lane.md")
         );
@@ -1632,6 +1663,7 @@ mod tests {
                 Some("/elsewhere/lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/elsewhere/lane.md")
         );
@@ -1642,6 +1674,7 @@ mod tests {
                 Some("~/prompts/lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/home/j/prompts/lane.md")
         );
@@ -1656,6 +1689,7 @@ mod tests {
                 Some("prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("scratch.md")
         );
@@ -1670,6 +1704,7 @@ mod tests {
                 None,
                 Path::new("/repo"),
                 Path::new("/home/j"),
+                &ClaudeRunner,
             ),
             PathBuf::from("/home/j/.claude/prompts/mylane.md")
         );
@@ -1714,6 +1749,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1781,6 +1817,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1833,6 +1870,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1884,6 +1922,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1934,6 +1973,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -1986,6 +2026,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2012,12 +2053,12 @@ mod tests {
     /// The regression this suite exists for: the in-session agent
     /// deliberately finishes its own run (`tm runs finish <id> --status
     /// blocked --blocker "..."`) before `claude -p` exits 0. The
-    /// supervisor's own `run_claude_and_finish` tail must not clobber that
+    /// supervisor's own `run_agent_and_finish` tail must not clobber that
     /// status back to `Done` -- but it should still fill in the telemetry
     /// (turns, cost, session id) that only it can observe, since the
     /// session-set outcome leaves those fields `None`.
     #[test]
-    fn run_claude_and_finish_preserves_session_set_blocked_status_on_zero_exit() {
+    fn run_agent_and_finish_preserves_session_set_blocked_status_on_zero_exit() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2041,6 +2082,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2078,11 +2120,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(canned_json());
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -2100,7 +2143,7 @@ mod tests {
     /// is an unambiguous crash signal and must mark the run `Failed` even
     /// if the in-session agent already set some other status for itself.
     #[test]
-    fn run_claude_and_finish_nonzero_exit_overrides_session_set_status_to_failed() {
+    fn run_agent_and_finish_nonzero_exit_overrides_session_set_status_to_failed() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2124,6 +2167,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2157,11 +2201,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::with_exit_code(canned_json(), 1);
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -2176,7 +2221,7 @@ mod tests {
     /// ambiguous exit-0-but-no-`is_error` result is a weaker signal than a
     /// deliberate `tm runs finish` call.
     #[test]
-    fn run_claude_and_finish_does_not_interrupt_a_session_set_blocked_status() {
+    fn run_agent_and_finish_does_not_interrupt_a_session_set_blocked_status() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -2200,6 +2245,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2236,11 +2282,12 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(json.to_string());
         let mut supervisor_out = Vec::new();
 
-        run_claude_and_finish(
+        run_agent_and_finish(
             &supervisor_spawner,
             &gh,
             &run_store,
             &prepared,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -2275,6 +2322,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2323,6 +2371,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2384,6 +2433,7 @@ mod tests {
             current_repo_dir: &current_repo_dir,
             current_backend_identity: &current_identity,
             backend_identity_resolver: &resolver,
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2443,6 +2493,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2490,6 +2541,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2543,6 +2595,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2593,6 +2646,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2643,6 +2697,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2691,6 +2746,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2760,6 +2816,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2815,6 +2872,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2859,6 +2917,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2906,6 +2965,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2953,6 +3013,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -2999,6 +3060,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3050,6 +3112,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3073,7 +3136,7 @@ mod tests {
     // tolerant of neither resolving (see resolve_pr_url). ---
 
     #[test]
-    fn run_claude_and_finish_records_pr_url_from_gh_lookup() {
+    fn run_agent_and_finish_records_pr_url_from_gh_lookup() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3099,6 +3162,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3128,7 +3192,7 @@ mod tests {
     }
 
     #[test]
-    fn run_claude_and_finish_falls_back_to_scraping_result_text_when_gh_finds_nothing() {
+    fn run_agent_and_finish_falls_back_to_scraping_result_text_when_gh_finds_nothing() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3153,6 +3217,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3179,7 +3244,7 @@ mod tests {
     }
 
     #[test]
-    fn run_claude_and_finish_pr_url_is_none_when_neither_gh_nor_scrape_find_one() {
+    fn run_agent_and_finish_pr_url_is_none_when_neither_gh_nor_scrape_find_one() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -3204,6 +3269,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3229,7 +3295,7 @@ mod tests {
         assert!(!outcome.is_error);
     }
 
-    // --- prepare_run_lane / run_claude_and_finish / supervise_run:
+    // --- prepare_run_lane / run_agent_and_finish / supervise_run:
     // the detached path's split of run_lane_fg's sequence. ---
 
     #[test]
@@ -3257,6 +3323,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3310,6 +3377,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3375,6 +3443,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3422,6 +3491,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3475,6 +3545,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3526,6 +3597,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3580,6 +3652,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3616,6 +3689,7 @@ mod tests {
             &run_store,
             &prepared,
             9999,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -3654,6 +3728,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3682,6 +3757,7 @@ mod tests {
             &run_store,
             &prepared,
             4321,
+            &ClaudeRunner,
             &mut supervisor_out,
         )
         .unwrap();
@@ -3931,6 +4007,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -3998,6 +4075,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4062,6 +4140,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4125,6 +4204,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -4176,6 +4256,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = RunLanePaths {
             home,
@@ -4227,6 +4308,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -4275,6 +4357,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap_err();
 
@@ -4304,6 +4387,7 @@ mod tests {
             "fix the review comments".to_string(),
             None,
             RunMode::Interactive,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -4341,6 +4425,7 @@ mod tests {
             "fix the review comments".to_string(),
             Some(4242),
             RunMode::Headless,
+            &ClaudeRunner,
         )
         .unwrap();
 

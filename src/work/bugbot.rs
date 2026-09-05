@@ -24,6 +24,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::config::{BackendIdentity, ReviewWatchConfig};
 use crate::runs::{RunStore, RunStoreError, StartRun};
 use crate::work::audit::SHELL_WINDOW_NAME;
@@ -32,10 +33,6 @@ use crate::work::review_watch::{CleanupLauncher, findings_file_path};
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
-
-/// Default prompt template used when [`ReviewWatchConfig::prompt`] is unset.
-/// See [`cleanup_prompt`].
-const DEFAULT_PROMPT_TEMPLATE: &str = "/bugbot-triage {key} {findings_file}";
 
 /// Name of the tmux window a launched cleanup session's `claude` process
 /// runs in. Public for the same reason
@@ -98,13 +95,13 @@ pub struct LaunchOutcome {
     pub window_name: String,
 }
 
-/// Substitutes `{key}` and `{findings_file}` in `template` (or
-/// [`DEFAULT_PROMPT_TEMPLATE`] when `template` is `None`), producing the
-/// prompt text handed to `claude` on launch. Mirrors
+/// Substitutes `{key}` and `{findings_file}` in `template`, producing the
+/// prompt text handed to the agent on launch. `template` is already resolved
+/// by the caller — [`launch_cleanup`] passes `req.cfg.prompt`, falling back
+/// to [`AgentRunner::default_cleanup_prompt_template`] when unset. Mirrors
 /// [`crate::work::audit::audit_prompt`], with a second placeholder.
-pub fn cleanup_prompt(template: Option<&str>, key: &str, findings_file: &Path) -> String {
+pub fn cleanup_prompt(template: &str, key: &str, findings_file: &Path) -> String {
     template
-        .unwrap_or(DEFAULT_PROMPT_TEMPLATE)
         .replace("{key}", key)
         .replace("{findings_file}", &findings_file.to_string_lossy())
 }
@@ -117,6 +114,11 @@ pub struct CleanupLaunchDeps<'a> {
     pub store: &'a RunStore,
     /// Tmux operations (real or fake).
     pub tmux: &'a dyn TmuxOps,
+    /// The AI coding agent this session launches (Claude today; see
+    /// [`AgentRunner`] and GitHub issue #17) — supplies the default prompt
+    /// template (when `req.cfg.prompt` is unset) and the rendered shell
+    /// command.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// Everything [`launch_cleanup`] needs to know about *this* launch, mirroring
@@ -201,8 +203,15 @@ pub fn launch_cleanup(
     })?;
 
     let findings_file = findings_file_path(req.home, req.xdg_data_home, req.key);
-    let prompt = cleanup_prompt(req.cfg.prompt.as_deref(), req.key, &findings_file);
-    let command = crate::work::audit::claude_command(req.cfg.model.as_deref(), &prompt);
+    let template = req
+        .cfg
+        .prompt
+        .as_deref()
+        .unwrap_or_else(|| deps.runner.default_cleanup_prompt_template());
+    let prompt = cleanup_prompt(template, req.key, &findings_file);
+    let command = deps
+        .runner
+        .interactive_shell_command(req.cfg.model.as_deref(), &prompt);
     let env = [(
         crate::work::audit::SESSION_RUN_ID_ENV.to_string(),
         run_id.to_string(),
@@ -258,6 +267,9 @@ pub struct RealCleanupLauncher<'a> {
     /// The invoking repo's [`BackendIdentity`] (see
     /// [`CleanupLaunchRequest::identity`]).
     pub identity: &'a BackendIdentity,
+    /// The AI coding agent cleanup sessions launch (Claude today; see
+    /// [`AgentRunner`] and GitHub issue #17).
+    pub runner: &'a dyn AgentRunner,
 }
 
 impl CleanupLauncher for RealCleanupLauncher<'_> {
@@ -265,6 +277,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
         let deps = CleanupLaunchDeps {
             store: self.store,
             tmux: self.tmux,
+            runner: self.runner,
         };
         let req = CleanupLaunchRequest {
             cfg: self.cfg,
@@ -282,6 +295,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::runs::RunStatus;
     use crate::work::review_watch::findings_file_path;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
@@ -314,7 +328,11 @@ mod tests {
     fn cleanup_prompt_defaults_to_bugbot_triage_template() {
         let findings_file = PathBuf::from("/home/user/.local/share/tskmstr/findings/proj-1.json");
         assert_eq!(
-            cleanup_prompt(None, "PROJ-1", &findings_file),
+            cleanup_prompt(
+                ClaudeRunner.default_cleanup_prompt_template(),
+                "PROJ-1",
+                &findings_file
+            ),
             "/bugbot-triage PROJ-1 /home/user/.local/share/tskmstr/findings/proj-1.json"
         );
     }
@@ -324,7 +342,7 @@ mod tests {
         let findings_file = PathBuf::from("/tmp/findings.json");
         assert_eq!(
             cleanup_prompt(
-                Some("/custom {key} using {findings_file} please"),
+                "/custom {key} using {findings_file} please",
                 "PROJ-1",
                 &findings_file
             ),
@@ -342,6 +360,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -408,6 +427,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -438,6 +458,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -479,6 +500,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -526,6 +548,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -567,6 +590,7 @@ mod tests {
         let deps = CleanupLaunchDeps {
             store: &store,
             tmux: &tmux,
+            runner: &ClaudeRunner,
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -608,6 +632,7 @@ mod tests {
             home: &home,
             xdg_data_home: None,
             identity: test_identity(),
+            runner: &ClaudeRunner,
         };
 
         launcher.launch_cleanup("PROJ-1");
@@ -640,6 +665,7 @@ mod tests {
             home: &home,
             xdg_data_home: None,
             identity: test_identity(),
+            runner: &ClaudeRunner,
         };
 
         // Must not propagate/panic per the `CleanupLauncher` contract.

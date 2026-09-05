@@ -191,6 +191,10 @@ pub struct TuiDeps {
     /// so same-numbered tickets in different repos never alias (GitHub
     /// issue #10).
     pub backend_identity: crate::config::BackendIdentity,
+    /// The AI coding agent board-launched audit/cleanup sessions run
+    /// (Claude today; see [`crate::agent::AgentRunner`] and GitHub issue
+    /// #17), selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    pub runner: &'static dyn crate::agent::AgentRunner,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
@@ -288,7 +292,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
     );
 
     while !app.quit {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &app, deps.runner))?;
 
         if event::poll(POLL_INTERVAL)? {
             if let CEvent::Key(key_event) = event::read()?
@@ -444,7 +448,7 @@ fn run_cmds<B: Backend>(
             // message would never reach the screen before the lookup
             // started, and the board would look just as hung as it did
             // before this fix, even though the wait is now bounded.
-            let _ = terminal.draw(|frame| draw(frame, &app));
+            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
             for msg in resolve_pr_for_ticket(deps, key, jira_url) {
                 let (next_app, more_cmds) = update(app, msg);
                 app = next_app;
@@ -781,6 +785,13 @@ fn view_diff<B: Backend>(
 pub struct WatchDeps {
     /// Store used to load and reap runs.
     pub store: crate::runs::RunStore,
+    /// The AI coding agent used only to shorten model names in the run
+    /// detail window's event timeline (see
+    /// [`crate::runs::format_model_usage_compact`]); selected by
+    /// `config.agent` via `main.rs`'s `agent_runner_for`, same as
+    /// [`TuiDeps::runner`]. Not a Jira/token dependency, so it doesn't
+    /// violate this struct's "local-only" stance above.
+    pub runner: &'static dyn crate::agent::AgentRunner,
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -806,7 +817,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
     app = run_watch_cmds(app, vec![Cmd::ReapRuns, Cmd::LoadRuns], &deps);
 
     while !app.quit {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &app, deps.runner))?;
 
         if event::poll(POLL_INTERVAL)? {
             if let CEvent::Key(key_event) = event::read()?
@@ -1351,6 +1362,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         &deps.audit,
         &deps.home,
         &deps.backend_identity,
+        deps.runner,
         key,
     ) {
         Ok(_) if deps.audit_dir_fallback => format!(
@@ -1387,6 +1399,7 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
         &deps.create,
         &deps.home,
         &deps.backend_identity,
+        deps.runner,
     ) {
         Ok(outcome) => outcome.session_name,
         Err(crate::work::create::CreateLaunchError::AlreadyRunning { session_name, .. }) => {
@@ -1418,6 +1431,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     let launch_deps = crate::work::bugbot::CleanupLaunchDeps {
         store,
         tmux: deps.tmux.as_ref(),
+        runner: deps.runner,
     };
     let request = crate::work::bugbot::CleanupLaunchRequest {
         cfg: &deps.review_watch,
@@ -1551,7 +1565,7 @@ pub fn fetch_retro_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
                     .model_usage
                     .as_deref()
                     .and_then(crate::runs::parse_model_usage)
-                    .and_then(|usage| crate::runs::format_model_usage_compact(&usage)),
+                    .and_then(|usage| crate::runs::format_model_usage_compact(&usage, deps.runner)),
             }),
             Ok(None) => None,
             Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
@@ -1876,6 +1890,7 @@ mod tests {
                 base_url: "https://x.atlassian.net".to_string(),
                 project_key: "PROJ".to_string(),
             },
+            runner: &crate::agent::claude::ClaudeRunner,
         }
     }
 
@@ -2700,7 +2715,10 @@ mod tests {
     }
 
     fn watch_deps(store: crate::runs::RunStore) -> WatchDeps {
-        WatchDeps { store }
+        WatchDeps {
+            store,
+            runner: &crate::agent::claude::ClaudeRunner,
+        }
     }
 
     fn start_params(ticket: &str) -> crate::runs::StartRun {

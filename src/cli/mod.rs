@@ -325,7 +325,7 @@ pub enum WorkCmd {
         state_file: String,
     },
     /// Install/maintain tm's hook scripts outside a lane worktree (see
-    /// `tskmstr::work::hooks_install`).
+    /// `tskmstr::agent::claude::hooks_install`).
     Hooks {
         /// Which hooks action to perform.
         #[command(subcommand)]
@@ -344,7 +344,7 @@ pub enum HooksCmd {
     /// Deliberately narrow: never installs `guard-delegate.sh` (it would
     /// start denying ordinary edits in every session, not just lane runs)
     /// or the other lane-only scripts. See
-    /// `tskmstr::work::hooks_install` module docs for the full rationale.
+    /// `tskmstr::agent::claude::hooks_install` module docs for the full rationale.
     Install {
         /// Install at user level (`~/.claude/settings.json`, or
         /// `$CLAUDE_CONFIG_DIR/settings.json`). Currently the only
@@ -886,7 +886,7 @@ impl From<FinishStatusArg> for crate::runs::RunStatus {
 /// making the run actionable again, so it's deliberately excluded, same as
 /// the rest of [`FinishStatusArg`]. `Blocked` is the one exception: it's
 /// also included as a *repair* target for rows a bug mislabeled `done` (see
-/// the `run_claude_and_finish`/`finish_run_from_supervisor` fix this exists
+/// the `run_agent_and_finish`/`finish_run_from_supervisor` fix this exists
 /// alongside) -- moving such a row to `blocked` is restoring its true state,
 /// not recreating a fresh terminal one.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]

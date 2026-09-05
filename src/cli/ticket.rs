@@ -625,6 +625,7 @@ pub enum AuditStoreStatus<'a> {
 /// audit conversation that follows this command. Registration failures are
 /// swallowed (`register_session`'s error contract requires callers to do
 /// this) — a broken runs DB or marker directory never blocks this read.
+#[allow(clippy::too_many_arguments)]
 pub fn audit_read(
     jira: &dyn TicketProvider,
     store: &AuditStoreStatus,
@@ -632,6 +633,7 @@ pub fn audit_read(
     key: &str,
     session_env: &SessionEnv,
     sessions_dir: &Path,
+    runner: &dyn crate::agent::AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
@@ -711,7 +713,7 @@ pub fn audit_read(
                 .flatten()
                 .and_then(|run| run.model_usage)
                 .and_then(|raw| crate::runs::parse_model_usage(&raw))
-                .and_then(|usage| crate::runs::format_model_usage_compact(&usage))
+                .and_then(|usage| crate::runs::format_model_usage_compact(&usage, runner))
             {
                 writeln!(out, "Last audit usage: {line}")?;
             }
@@ -749,6 +751,7 @@ pub fn audit_record(
     notes: Option<&str>,
     session_env: &SessionEnv,
     sessions_dir: &Path,
+    runner: &dyn crate::agent::AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), TicketCliError> {
     let normalized = normalize_key(key)?;
@@ -761,6 +764,7 @@ pub fn audit_record(
         "audit",
         &normalized,
         crate::runs::RunStatus::Done,
+        runner,
     );
     Ok(())
 }
@@ -833,6 +837,7 @@ pub(crate) fn normalize_key(key: &str) -> Result<String, TicketCliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::config::Config;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::pr::PrInfo;
@@ -883,6 +888,7 @@ mod tests {
             review_bots: vec!["cursor[bot]".to_string()],
             board_column_order: Vec::new(),
             work: crate::config::WorkConfig::default(),
+            agent: crate::config::AgentKind::Claude,
         }
     }
 
@@ -894,7 +900,7 @@ mod tests {
     fn no_session_env() -> SessionEnv {
         SessionEnv {
             session_id: None,
-            claude_pid: None,
+            agent_pid: None,
             lane_run_id: None,
             session_run_id: None,
             cwd: std::path::PathBuf::from("/tmp/wt"),
@@ -912,7 +918,7 @@ mod tests {
     fn session_env_with_id(session_id: &str) -> SessionEnv {
         SessionEnv {
             session_id: Some(session_id.to_string()),
-            claude_pid: Some(4242),
+            agent_pid: Some(4242),
             lane_run_id: None,
             session_run_id: None,
             cwd: std::path::PathBuf::from("/tmp/wt"),
@@ -2465,6 +2471,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2498,6 +2505,7 @@ mod tests {
             "PROJ-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2526,6 +2534,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2548,6 +2557,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should still succeed");
@@ -2571,6 +2581,7 @@ mod tests {
             "not-a-key!",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect_err("should fail");
@@ -2595,6 +2606,7 @@ mod tests {
             "proj-404",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect_err("should fail");
@@ -2622,6 +2634,7 @@ mod tests {
             Some("looks good"),
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2651,6 +2664,7 @@ mod tests {
             None,
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect_err("should fail");
@@ -2824,6 +2838,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2847,6 +2862,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2884,6 +2900,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2909,6 +2926,7 @@ mod tests {
             "proj-372",
             &env,
             markers_dir.path(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2935,6 +2953,7 @@ mod tests {
             "proj-372",
             &no_session_env(),
             &no_sessions_dir(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -2964,6 +2983,7 @@ mod tests {
             None,
             &env,
             markers_dir.path(),
+            &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");

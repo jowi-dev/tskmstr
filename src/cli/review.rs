@@ -27,7 +27,7 @@
 //!      window of the ticket's `tm-<scope>-<key>` session, so it can be attached to
 //!      and steered. A repeat pass becomes `fix-2`.
 //!    - [`Dispatch::HeadlessForeground`] (`--fg`) runs
-//!      [`crate::work::run::run_claude_and_finish`] synchronously.
+//!      [`crate::work::run::run_agent_and_finish`] synchronously.
 //!    - [`Dispatch::Headless`] writes a
 //!      [`crate::work::detach::SupervisorState`] and spawns the same `tm work
 //!      __supervise` supervisor `tm work run`'s headless path uses — the
@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
@@ -47,7 +48,7 @@ use crate::work::interactive::{
     FIX_WINDOW_NAME, InteractiveLaunchError, launch_interactive_run, resolve_action_window,
 };
 use crate::work::run::{
-    Clock, PreparedRun, RunLaneError, RunLanePaths, prepare_review_fix, run_claude_and_finish,
+    Clock, PreparedRun, RunLaneError, RunLanePaths, prepare_review_fix, run_agent_and_finish,
     run_log_path,
 };
 use crate::work::runner::ProcessSpawner;
@@ -94,7 +95,7 @@ pub enum ReviewCliError {
     Prepare(#[from] crate::work::run::ReviewFixError),
 
     /// The foreground spawn-wait-parse-finish tail
-    /// ([`run_claude_and_finish`]) failed.
+    /// ([`run_agent_and_finish`]) failed.
     #[error(transparent)]
     Run(#[from] RunLaneError),
 
@@ -144,7 +145,7 @@ pub enum FixOutcome {
 }
 
 /// Dependencies [`fix`] needs beyond [`RunLanePaths`]: every trait-object
-/// seam [`prepare_review_fix`]/[`run_claude_and_finish`]/the detached path
+/// seam [`prepare_review_fix`]/[`run_agent_and_finish`]/the detached path
 /// require, gathered the same way [`crate::cli::work::RunDeps`] gathers
 /// `tm work run`'s dependencies.
 pub struct ReviewFixDeps<'a> {
@@ -178,6 +179,10 @@ pub struct ReviewFixDeps<'a> {
     /// tmux operations (real or fake), for hosting an interactive fix pass
     /// in the ticket's session. Only used for [`Dispatch::Interactive`].
     pub tmux: &'a dyn TmuxOps,
+    /// The AI coding agent this fix pass's invocation is built for, passed
+    /// through to [`prepare_review_fix`]. See [`crate::agent::AgentRunner`]
+    /// and GitHub issue #17.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
@@ -273,6 +278,7 @@ pub fn fix(
         prompt,
         pid,
         dispatch.run_mode(),
+        deps.runner,
     )?;
 
     if dispatch == Dispatch::Interactive {
@@ -283,7 +289,7 @@ pub fn fix(
             "{}-{}.prompt.md",
             prepared.wt_name, prepared.timestamp
         ));
-        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path)?;
+        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path, deps.runner)?;
 
         writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
         writeln!(out, "worktree  {}", worktree.display())?;
@@ -298,7 +304,14 @@ pub fn fix(
     }
 
     if dispatch == Dispatch::HeadlessForeground {
-        let outcome = run_claude_and_finish(deps.spawner, deps.gh, deps.run_store, &prepared, out)?;
+        let outcome = run_agent_and_finish(
+            deps.spawner,
+            deps.gh,
+            deps.run_store,
+            &prepared,
+            deps.runner,
+            out,
+        )?;
         return Ok(FixOutcome::Dispatched {
             succeeded: !outcome.is_error,
         });
@@ -350,6 +363,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::github::gh_cli::FakeGhCli;
     use crate::runs::StartRun;
     use crate::work::detach::FakeDetachSpawner;
@@ -430,6 +444,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -476,6 +491,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -511,6 +527,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -548,6 +565,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -586,6 +604,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -649,6 +668,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -728,6 +748,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -796,6 +817,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -836,6 +858,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -895,6 +918,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -937,6 +961,7 @@ mod tests {
             run_db_path: &run_db_path,
             tmux: &tmux,
             backend_identity: test_identity(),
+            runner: &ClaudeRunner,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();

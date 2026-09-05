@@ -1,7 +1,7 @@
 //! Board-launched ticket-*creation* sessions (GitHub issue #15): the `c`
 //! key's launch half. Like an audit (see [`crate::work::audit`]), a create
-//! session is an interactive `claude` conversation and so is tmux-hosted —
-//! but three things set it apart:
+//! session is an interactive agent conversation and so is tmux-hosted — but
+//! three things set it apart:
 //!
 //! - **Keyless.** No ticket exists when the session launches, so per-ticket
 //!   session naming cannot apply; the whole scope shares one
@@ -23,18 +23,14 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::agent::AgentRunner;
 use crate::config::{BackendIdentity, CreateConfig};
 use crate::work::naming::{create_session_name, expand_tilde};
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
 
-/// Default prompt used when [`CreateConfig::prompt`] is unset. Unlike
-/// [`crate::work::audit`]'s template, no `{key}` substitution applies —
-/// there is no ticket key yet.
-const DEFAULT_PROMPT: &str = "/ticket-create";
-
-/// Name of the tmux window a launched create session's `claude` process runs
+/// Name of the tmux window a launched create session's agent process runs
 /// in.
 pub const CREATE_WINDOW_NAME: &str = "create";
 
@@ -68,16 +64,10 @@ pub enum CreateLaunchError {
 pub struct CreateLaunchOutcome {
     /// Name of the tmux session the caller should attach to.
     pub session_name: String,
-    /// Name of the window `claude` runs in: [`CREATE_WINDOW_NAME`], or a
+    /// Name of the window the agent runs in: [`CREATE_WINDOW_NAME`], or a
     /// [`unique_window_name`] suffixed variant when a previous create
     /// session's dead window still holds that name.
     pub window_name: String,
-}
-
-/// The prompt text handed to `claude` on launch: `template` verbatim, or
-/// [`DEFAULT_PROMPT`] when `template` is `None`.
-pub fn create_prompt(template: Option<&str>) -> String {
-    template.unwrap_or(DEFAULT_PROMPT).to_string()
 }
 
 /// Launches (or refuses to double-launch) the scope's ticket-creation
@@ -88,14 +78,18 @@ pub fn create_prompt(template: Option<&str>) -> String {
 /// 2. Errors with [`CreateLaunchError::AlreadyRunning`] if a live window
 ///    named [`CREATE_WINDOW_NAME`] already exists in the scope's
 ///    [`create_session_name`] session — the caller attaches to it instead.
-/// 3. Otherwise starts `claude <prompt>` (with `--model` when
-///    `create_cfg.model` is set — see
-///    [`crate::work::audit::claude_command`]) in that window: the session is
-///    created if this is the scope's first create launch, and the window
-///    appended to it otherwise, taking a [`unique_window_name`] suffix if a
-///    dead predecessor still holds the plain name. An appended window is
-///    also selected, so the immediate attach lands on the fresh `claude`
-///    rather than the dead aftermath.
+/// 3. Otherwise starts the runner's interactive CLI (with the model flag
+///    when `create_cfg.model` is set — see
+///    [`AgentRunner::interactive_shell_command`]) in that window, prompted
+///    with `create_cfg.prompt` or the runner's
+///    [`default_create_prompt`](AgentRunner::default_create_prompt) —
+///    unlike [`crate::work::audit`]'s template, no `{key}` substitution
+///    applies, as no ticket key exists yet. The session is created if this
+///    is the scope's first create launch, and the window appended to it
+///    otherwise, taking a [`unique_window_name`] suffix if a dead
+///    predecessor still holds the plain name. An appended window is also
+///    selected, so the immediate attach lands on the fresh agent rather
+///    than the dead aftermath.
 ///
 /// No run row is created and no environment is injected — see the module
 /// docs' "No run pre-registration".
@@ -109,6 +103,7 @@ pub fn launch_create(
     create_cfg: &CreateConfig,
     home: &Path,
     identity: &BackendIdentity,
+    runner: &dyn AgentRunner,
 ) -> Result<CreateLaunchOutcome, CreateLaunchError> {
     let raw_dir = create_cfg
         .dir
@@ -130,8 +125,11 @@ pub fn launch_create(
     let existing_windows = session_window_names(&windows, &session_name);
     let window_name = unique_window_name(CREATE_WINDOW_NAME, &existing_windows);
 
-    let prompt = create_prompt(create_cfg.prompt.as_deref());
-    let command = crate::work::audit::claude_command(create_cfg.model.as_deref(), &prompt);
+    let prompt = create_cfg
+        .prompt
+        .as_deref()
+        .unwrap_or_else(|| runner.default_create_prompt());
+    let command = runner.interactive_shell_command(create_cfg.model.as_deref(), prompt);
 
     if existing_windows.is_empty() {
         tmux.new_session_with_command(&session_name, &dir_str, &window_name, &[], &command)?;
@@ -182,15 +180,9 @@ mod tests {
             .collect()))
     }
 
-    #[test]
-    fn create_prompt_defaults_to_ticket_create() {
-        assert_eq!(create_prompt(None), "/ticket-create");
-    }
-
-    #[test]
-    fn create_prompt_uses_custom_template_verbatim() {
-        assert_eq!(create_prompt(Some("/my-create")), "/my-create");
-    }
+    /// The runner every test launches with; command-string assertions below
+    /// are claude-shaped because of it.
+    const RUNNER: &crate::agent::claude::ClaudeRunner = &crate::agent::claude::ClaudeRunner;
 
     #[test]
     fn launch_create_starts_a_keyless_session_with_no_env() {
@@ -198,8 +190,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("~/Projects/axiom");
 
-        let outcome =
-            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
+        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
+            .expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
         assert_eq!(outcome.window_name, "create");
@@ -224,7 +216,7 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = CreateConfig::default();
 
-        let err = launch_create(&tmux, &cfg, &home, &test_identity())
+        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
             .expect_err("should refuse to launch");
 
         assert!(matches!(err, CreateLaunchError::NotConfigured));
@@ -237,7 +229,7 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let err = launch_create(&tmux, &cfg, &home, &test_identity())
+        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
             .expect_err("should refuse to double-launch");
 
         match err {
@@ -261,8 +253,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome =
-            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
+        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
+            .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "create-2");
         assert_eq!(
@@ -292,8 +284,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome =
-            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
+        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
+            .expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
     }
@@ -308,7 +300,7 @@ mod tests {
             model: Some("opus".to_string()),
         };
 
-        launch_create(&tmux, &cfg, &home, &test_identity()).unwrap();
+        launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER).unwrap();
 
         let command = tmux.calls().iter().find_map(|call| match call {
             TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),

@@ -12,7 +12,7 @@
 //! survive its own child.
 //!
 //! `docs/plans/runner-port.md` §4 deliberately moves that wait-then-finish
-//! logic in-process (one Rust function, [`crate::work::run::run_claude_and_finish`],
+//! logic in-process (one Rust function, [`crate::work::run::run_agent_and_finish`],
 //! shared by `--fg` and detached instead of duplicated between `--fg`'s
 //! inline `jq` calls and a generated shell wrapper's `jq` calls). That
 //! architecture win has a cost: something now has to *stay alive* after
@@ -364,7 +364,7 @@ impl DetachSpawner for FakeDetachSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::claude::ClaudeInvocation;
+    use crate::agent::AgentInvocation;
 
     fn sample_prepared_run() -> PreparedRun {
         PreparedRun {
@@ -375,7 +375,7 @@ mod tests {
             timestamp: "20260101-120000".to_string(),
             worktree: PathBuf::from("/Worktrees/axiom/abc-123"),
             branch: "claude/abc-123-20260101-120000".to_string(),
-            invocation: ClaudeInvocation {
+            invocation: AgentInvocation {
                 program: "claude".to_string(),
                 args: vec!["-p".to_string(), "do the thing".to_string()],
                 env_set: vec![("TSKMSTR_RUN_ID".to_string(), "1".to_string())],

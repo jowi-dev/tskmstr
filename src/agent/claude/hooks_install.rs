@@ -1,14 +1,21 @@
 //! `tm work hooks install --user`: install tm's telemetry hooks into a
 //! user's *interactive* Claude Code settings, not a lane worktree.
 //!
-//! [`crate::work::hooks`] deploys hook scripts + a generated `settings.json`
-//! into a lane worktree on every `tm work run` — copy-on-every-run, no
-//! install step. Interactive sessions (`tm ticket audit`, `tm ticket
-//! create`) never go through that path: they run in the user's normal
-//! Claude Code, which reads `~/.claude/settings.json` (or
+//! [`crate::agent::claude::hooks`] deploys hook scripts + a generated
+//! `settings.json` into a lane worktree on every `tm work run` —
+//! copy-on-every-run, no install step. Interactive sessions (`tm ticket
+//! audit`, `tm ticket create`) never go through that path: they run in the
+//! user's normal Claude Code, which reads `~/.claude/settings.json` (or
 //! `$CLAUDE_CONFIG_DIR/settings.json`), and nothing has ever installed tm's
 //! hooks there. This module closes that gap with a one-time (idempotent,
 //! re-runnable) install.
+//!
+//! Moved from `src/work/hooks_install.rs` in phase 5 of GitHub issue #17
+//! (`docs/plans/agent-runner.md`): this module (and the `CLAUDE_CONFIG_DIR`
+//! resolution it performs) is claude-specific, so it lives behind
+//! [`crate::agent::claude::ClaudeRunner::install_user_hooks`]/
+//! [`crate::agent::claude::ClaudeRunner::user_hooks_installed`] rather than
+//! being called directly by `main.rs`.
 //!
 //! # Scope: three entries only
 //!
@@ -46,18 +53,20 @@
 //!   file is a hard [`HooksInstallError`], never silently overwritten or
 //!   recreated from scratch.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::work::hooks::{HooksError, deploy_hooks, hook_scripts};
+use crate::agent::InstallReport;
+use crate::agent::claude::hooks::{HooksError, deploy_hooks, hook_scripts};
 
 /// The event -> script -> timeout wiring this module installs at user
 /// level. Deliberately a small, hand-picked subset of
-/// [`crate::work::hooks::hook_scripts`] — see the module docs for why
-/// `guard-delegate.sh` and the four other lane-only scripts are excluded.
+/// [`crate::agent::claude::hooks::hook_scripts`] — see the module docs for
+/// why `guard-delegate.sh` and the four other lane-only scripts are
+/// excluded.
 pub const USER_HOOK_WIRING: &[(&str, &str, u64)] = &[
     ("Stop", "tm-usage.sh", 30),
     ("SubagentStop", "tm-usage.sh", 30),
@@ -190,79 +199,6 @@ pub fn user_settings_path(claude_config_dir: Option<&Path>, home: &Path) -> Path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".claude"));
     config_dir.join("settings.json")
-}
-
-/// The outcome of an [`install_user_hooks`] call — everything
-/// `tm work hooks install --user` needs to print its summary.
-#[derive(Debug, Clone, Default)]
-pub struct InstallReport {
-    /// Hook script filenames written (missing, or present but stale).
-    pub scripts_copied: Vec<String>,
-    /// Hook script filenames already byte-identical on disk.
-    pub scripts_already_present: Vec<String>,
-    /// `"<event> -> <script>"` labels newly appended to `settings.json`.
-    pub hooks_added: Vec<String>,
-    /// `"<event> -> <script>"` labels already present in `settings.json`.
-    pub hooks_already_present: Vec<String>,
-    /// Where the pre-modification backup was written, if this wasn't a
-    /// dry run.
-    pub backup_path: Option<PathBuf>,
-    /// Whether this call was a dry run (nothing was written).
-    pub dry_run: bool,
-}
-
-impl InstallReport {
-    /// Render a plain-text (no emoji) summary of what changed/would
-    /// change, matching the rest of the CLI's output style.
-    pub fn write_summary(&self, out: &mut dyn Write) -> io::Result<()> {
-        if self.dry_run {
-            writeln!(out, "Dry run: no changes written.")?;
-        }
-
-        writeln!(out, "Hook scripts:")?;
-        if self.scripts_copied.is_empty() {
-            writeln!(out, "  copied: (none)")?;
-        } else {
-            writeln!(out, "  copied: {}", self.scripts_copied.join(", "))?;
-        }
-        writeln!(
-            out,
-            "  already up to date: {}",
-            if self.scripts_already_present.is_empty() {
-                "(none)".to_string()
-            } else {
-                self.scripts_already_present.join(", ")
-            }
-        )?;
-
-        writeln!(out, "settings.json hook wiring:")?;
-        writeln!(
-            out,
-            "  added: {}",
-            if self.hooks_added.is_empty() {
-                "(none)".to_string()
-            } else {
-                self.hooks_added.join(", ")
-            }
-        )?;
-        writeln!(
-            out,
-            "  already present: {}",
-            if self.hooks_already_present.is_empty() {
-                "(none)".to_string()
-            } else {
-                self.hooks_already_present.join(", ")
-            }
-        )?;
-
-        match &self.backup_path {
-            Some(path) => writeln!(out, "Backup written to: {}", path.display())?,
-            None if !self.dry_run => writeln!(out, "Backup written to: (none)")?,
-            None => {}
-        }
-
-        Ok(())
-    }
 }
 
 /// Which of [`hook_scripts`]' embedded scripts are missing or stale (not

@@ -49,11 +49,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::agent::{AgentRunner, RunMode};
 use crate::config::WorkConfig;
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
-use crate::work::claude::RunMode;
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
 use crate::work::interactive::{
@@ -369,6 +369,10 @@ pub struct RunDeps<'a> {
     /// Resolves a directory's backend identity, passed through to
     /// [`crate::work::run::RunLaneDeps::backend_identity_resolver`].
     pub backend_identity_resolver: &'a dyn crate::config::BackendIdentityResolver,
+    /// The AI coding agent this run's invocation is built for, passed
+    /// through to [`crate::work::run::RunLaneDeps::runner`]. See
+    /// [`crate::agent::AgentRunner`] and GitHub issue #17.
+    pub runner: &'a dyn AgentRunner,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -420,6 +424,7 @@ pub fn run(
         current_repo_dir: deps.current_repo_dir,
         current_backend_identity: deps.current_backend_identity,
         backend_identity_resolver: deps.backend_identity_resolver,
+        runner: deps.runner,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -565,7 +570,7 @@ fn run_interactive(
         "{}-{}.prompt.md",
         prepared.wt_name, prepared.timestamp
     ));
-    launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path)?;
+    launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path, run_deps.runner)?;
 
     writeln!(
         out,
@@ -601,6 +606,7 @@ pub fn supervise(
     gh: &dyn GhCli,
     run_store: &RunStore,
     state: &crate::work::detach::SupervisorState,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let outcome = crate::work::run::supervise_run(
@@ -609,6 +615,7 @@ pub fn supervise(
         run_store,
         &state.prepared,
         std::process::id(),
+        runner,
         out,
     )?;
     Ok(!outcome.is_error)
@@ -641,6 +648,7 @@ pub fn session(
     identity: &crate::config::BackendIdentity,
     current_exe: &Path,
     key: &str,
+    runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
@@ -672,9 +680,9 @@ pub fn session(
 
     for window in &plan.windows {
         let role = match (&window.command, window.run_id) {
-            (Some(_), _) => "log viewer",
-            (None, Some(_)) => "shell (its claude session died with the pane)",
-            (None, None) => "shell",
+            (Some(_), _) => "log viewer".to_string(),
+            (None, Some(_)) => format!("shell (its {} session died with the pane)", runner.name()),
+            (None, None) => "shell".to_string(),
         };
         writeln!(
             out,
@@ -682,7 +690,7 @@ pub fn session(
             plan.session_name, window.name
         )?;
         if let Some(session_id) = &window.resume_session_id {
-            writeln!(out, "resume:   claude --resume {session_id}")?;
+            writeln!(out, "resume:   {}", runner.resume_command(session_id))?;
         }
     }
     writeln!(out, "attach:   tmux attach -t {}", plan.session_name)?;
@@ -980,6 +988,7 @@ impl fmt::Debug for WorkContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, LaneConfig};
     use crate::work::git::FakeGitOps;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
@@ -1847,6 +1856,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "proj-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -1918,6 +1928,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -1983,6 +1994,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-1",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap();
@@ -2019,6 +2031,7 @@ mod tests {
             compatible_test_identity(),
             &current_exe,
             "PROJ-404",
+            &ClaudeRunner,
             &mut out,
         )
         .unwrap_err();
@@ -2309,6 +2322,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2424,6 +2438,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2490,6 +2505,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2644,6 +2660,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2716,6 +2733,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2774,6 +2792,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2882,6 +2901,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2941,6 +2961,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let mut out = Vec::new();
 
@@ -2992,6 +3013,7 @@ mod tests {
             current_repo_dir: Path::new("/irrelevant-in-tests"),
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),
@@ -3018,7 +3040,15 @@ mod tests {
         let supervisor_spawner = FakeProcessSpawner::success(canned_claude_json());
         let mut out = Vec::new();
 
-        let succeeded = supervise(&supervisor_spawner, &gh, &run_store, &state, &mut out).unwrap();
+        let succeeded = supervise(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            &state,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(succeeded);
         let run_row = run_store.run_by_id(state.prepared.run_id).unwrap().unwrap();

@@ -1,5 +1,5 @@
-//! Process spawn + result parsing for the lane runner, ported from
-//! devtools' `~/devtools/work.ml`'s `run_lane`.
+//! Process spawning for the lane runner, ported from devtools'
+//! `~/devtools/work.ml`'s `run_lane`.
 //!
 //! [`ProcessSpawner`] is the trait callers depend on; [`StdProcessSpawner`]
 //! is the `std::process::Command`-based implementation used in production,
@@ -8,49 +8,18 @@
 //! invocation it was given and writes a canned JSON file to the requested
 //! output path, for tests.
 //!
-//! [`parse_run_outcome`] is the single result-parsing path called by §4 of
-//! `docs/plans/runner-port.md`: `work.ml` duplicates this logic between the
-//! `--fg` path (inline `jq` calls) and the detached path (a generated shell
-//! wrapper re-reading the same file via `jq`). This port has one function,
-//! called by both the foreground (step 9) and detached (step 10) paths.
-//!
-//! ## Field-by-field mapping from `work.ml`'s `jq` calls
-//!
-//! `run_lane` (lines ~524-563) and the detached wrapper script (lines
-//! ~615-622) read the same `out_json` file with these `jq` expressions, fed
-//! into these `tm runs finish` flags:
-//!
-//! | `jq` expression | `RunOutcome` field | `tm runs finish` flag |
-//! |---|---|---|
-//! | `.session_id // empty` | `session_id: String` (required) | `--session-id` |
-//! | `.num_turns // empty` | `num_turns: Option<u64>` | (printed in `--fg` summary; not a finish flag) |
-//! | `.total_cost_usd // empty` | `cost_usd: Option<f64>` | (printed in `--fg` summary; not a finish flag) |
-//! | `.is_error` | `is_error: Option<bool>` (absence is kept, not defaulted) | drives the `done`/`failed`/`interrupted` status passed to `finish_run` |
-//! | `.result // empty` / `.result // "no result field"` | `result: Option<String>` | scraped for the PR-URL fallback, not passed directly |
-//! | `.modelUsage // empty` | `model_usage: Option<ModelUsageMap>` | `--model-usage` (only when present and non-empty, per the wrapper's `[ -n "$MODEL_USAGE" ]` guard) |
-//!
-//! The wrapper also passes `--transcript <out_json>` (the file path itself,
-//! not a parsed field) — that's a step 9/10 concern (they already have the
-//! output path), not something [`RunOutcome`] needs to carry.
-//!
-//! `jq`'s `// empty` and `// false` are the OCaml side's way of tolerating
-//! absent fields: a missing field becomes an empty string (falsy in a shell
-//! `[ -n ... ]` test) or `false`, never a hard error. This port keeps that
-//! tolerance for every field except `session_id`: `work.ml` never checks
-//! whether `session_id` came back non-empty before using it (e.g. printing
-//! `claude --resume %s`), so an empty/missing session id would already be a
-//! silently-broken run on the OCaml side. Rust can do better than silently
-//! propagating an empty string, so [`parse_run_outcome`] treats a missing or
-//! empty `session_id` as a hard [`RunOutcomeError`] instead — a run with no
-//! session id to resume isn't a usable outcome, only an unparseable one.
+//! Result parsing used to live here (`parse_run_outcome`) but has moved
+//! behind [`crate::agent::AgentRunner::parse_outcome`] — see
+//! [`crate::agent::claude::ClaudeRunner`]'s implementation for the
+//! `claude`-specific field mapping and GitHub issue #17's phase 3. This
+//! module now owns only spawning: what runs where, not what its output
+//! means.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use thiserror::Error;
-
-use crate::runs::ModelUsageMap;
 
 /// Errors that can occur while spawning `claude` (or any process) via a
 /// [`ProcessSpawner`].
@@ -87,9 +56,9 @@ pub enum SpawnError {
 }
 
 /// What a [`ProcessSpawner`] needs to run one `claude -p` invocation: the
-/// already-built [`crate::work::claude::ClaudeInvocation`]'s pieces, plus
+/// already-built [`crate::agent::AgentInvocation`]'s pieces, plus
 /// the working directory and output destination that
-/// [`crate::work::claude::ClaudeInvocation`] deliberately leaves out (see
+/// [`crate::agent::AgentInvocation`] deliberately leaves out (see
 /// that module's doc comment: "Output redirection is a spawn-time concern,
 /// not an argv concern").
 pub struct SpawnRequest<'a> {
@@ -100,14 +69,14 @@ pub struct SpawnRequest<'a> {
     /// Environment variables to set before spawning.
     pub env_set: &'a [(String, String)],
     /// Environment variables to remove before spawning (billing safety —
-    /// see [`crate::work::claude::ClaudeInvocation::env_remove`]).
+    /// see [`crate::agent::AgentInvocation::env_remove`]).
     pub env_remove: &'a [String],
     /// Working directory for the spawned process, mirroring `work.ml`'s
     /// `cd '<wt_path>' && ...` shell prefix.
     pub current_dir: &'a Path,
     /// Where to write the spawned process's stdout, mirroring `work.ml`'s
-    /// `> '<out_json>'` redirect. This is the file [`parse_run_outcome`]
-    /// later reads back.
+    /// `> '<out_json>'` redirect. This is the file
+    /// [`crate::agent::AgentRunner::parse_outcome`] later reads back.
     pub stdout_path: &'a Path,
 }
 
@@ -255,111 +224,11 @@ impl ProcessSpawner for FakeProcessSpawner {
     }
 }
 
-/// Errors from [`parse_run_outcome`].
-#[derive(Debug, Error)]
-pub enum RunOutcomeError {
-    /// `out_json`'s contents did not parse as JSON at all.
-    #[error("failed to parse claude result JSON: {0}")]
-    Malformed(#[from] serde_json::Error),
-
-    /// The JSON parsed, but `session_id` was missing, empty, or not a
-    /// string. See this module's doc comment for why `session_id` is the
-    /// one field this port treats as required where `work.ml` did not.
-    #[error("claude result JSON is missing a non-empty session_id")]
-    MissingSessionId,
-}
-
-/// The typed result of one `claude -p --output-format json` invocation,
-/// parsed from the JSON it wrote to its stdout (`out_json` in `work.ml`'s
-/// naming). See this module's doc comment for the exact `jq` fields this
-/// mirrors and which `tm runs finish` flags each one feeds.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunOutcome {
-    /// `.session_id`, required — see [`RunOutcomeError::MissingSessionId`].
-    /// Feeds `tm runs finish --session-id`.
-    pub session_id: String,
-    /// `.total_cost_usd`, absent when the field is missing (mirrors `jq`'s
-    /// `// empty`).
-    pub cost_usd: Option<f64>,
-    /// `.num_turns`, absent when the field is missing.
-    pub num_turns: Option<u64>,
-    /// `.is_error`, verbatim — `None` when the field is entirely absent from
-    /// the result JSON, distinct from an explicit `false`.
-    ///
-    /// This diverges from `work.ml`'s `jq '.is_error // false'` (which this
-    /// port originally mirrored, defaulting absence to `false`): an absent
-    /// `is_error` turned out to be exactly the shape a mid-run event like a
-    /// usage-limit forced model switch can leave behind — the turn ends
-    /// gracefully (`claude` exits 0) but never writes an `is_error` field at
-    /// all. Defaulting that to `false` silently misclassified an ambiguous
-    /// outcome as a confirmed success. The caller
-    /// ([`crate::work::run::run_claude_and_finish`]) now treats `None` here
-    /// as suspicious — `RunStatus::Interrupted`, not `Done` — while
-    /// `Some(true)`/`Some(false)` still drive `Failed`/`Done` exactly as
-    /// before.
-    pub is_error: Option<bool>,
-    /// `.result`, the free-text summary/response. Absent when missing,
-    /// distinct from an explicit empty string.
-    pub result: Option<String>,
-    /// `.modelUsage`, parsed via [`ModelUsageMap`] when present and
-    /// non-empty. Feeds `tm runs finish --model-usage` (only passed by the
-    /// caller when this is `Some`, mirroring the wrapper's `[ -n
-    /// "$MODEL_USAGE" ]` guard).
-    pub model_usage: Option<ModelUsageMap>,
-}
-
-/// Raw shape of the `claude -p --output-format json` result, deserialized
-/// leniently: every field is optional at this layer so that any one missing
-/// field doesn't fail the whole parse. [`parse_run_outcome`] is the only
-/// place that decides which absences are fatal.
-#[derive(Debug, serde::Deserialize)]
-struct RawResult {
-    session_id: Option<String>,
-    #[serde(default)]
-    total_cost_usd: Option<f64>,
-    #[serde(default)]
-    num_turns: Option<u64>,
-    #[serde(default)]
-    is_error: Option<bool>,
-    #[serde(default)]
-    result: Option<String>,
-    #[serde(default, rename = "modelUsage")]
-    model_usage: Option<ModelUsageMap>,
-}
-
-/// Parses a `claude -p --output-format json` result (`json`, the raw file
-/// contents) into a [`RunOutcome`]. The single parsing path §4 of
-/// `docs/plans/runner-port.md` calls for: both the foreground (step 9) and
-/// detached (step 10) run paths call this instead of duplicating `jq`-style
-/// field extraction.
-///
-/// Hard errors on unparseable JSON ([`RunOutcomeError::Malformed`]) or a
-/// missing/empty `session_id` ([`RunOutcomeError::MissingSessionId`]).
-/// Every other field is tolerant of absence, matching `jq`'s `// empty`/`//
-/// false` fallbacks in `work.ml`.
-pub fn parse_run_outcome(json: &str) -> Result<RunOutcome, RunOutcomeError> {
-    let raw: RawResult = serde_json::from_str(json)?;
-
-    let session_id = raw
-        .session_id
-        .filter(|id| !id.is_empty())
-        .ok_or(RunOutcomeError::MissingSessionId)?;
-
-    let model_usage = raw.model_usage.filter(|models| !models.is_empty());
-
-    Ok(RunOutcome {
-        session_id,
-        cost_usd: raw.total_cost_usd,
-        num_turns: raw.num_turns,
-        is_error: raw.is_error,
-        result: raw.result,
-        model_usage,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentRunner as _;
+    use crate::agent::claude::ClaudeRunner;
 
     fn full_canned_json() -> String {
         r#"{
@@ -379,90 +248,6 @@ mod tests {
             }
         }"#
         .to_string()
-    }
-
-    #[test]
-    fn parse_run_outcome_parses_all_fields() {
-        let outcome = parse_run_outcome(&full_canned_json()).expect("should parse");
-
-        assert_eq!(outcome.session_id, "sess-123");
-        assert_eq!(outcome.cost_usd, Some(1.5));
-        assert_eq!(outcome.num_turns, Some(12));
-        assert_eq!(outcome.is_error, Some(false));
-        assert_eq!(
-            outcome.result,
-            Some("opened https://github.com/example/repo/pull/42".to_string())
-        );
-        let model_usage = outcome.model_usage.expect("model usage should be present");
-        assert_eq!(model_usage["claude-fable-5"].input_tokens, 100);
-        assert_eq!(model_usage["claude-fable-5"].cost_usd, Some(1.5));
-    }
-
-    #[test]
-    fn parse_run_outcome_tolerates_missing_optional_fields() {
-        let json = r#"{"session_id": "sess-abc"}"#;
-
-        let outcome = parse_run_outcome(json).expect("should parse");
-
-        assert_eq!(outcome.session_id, "sess-abc");
-        assert_eq!(outcome.cost_usd, None);
-        assert_eq!(outcome.num_turns, None);
-        assert_eq!(outcome.is_error, None);
-        assert_eq!(outcome.result, None);
-        assert_eq!(outcome.model_usage, None);
-    }
-
-    #[test]
-    fn parse_run_outcome_leaves_is_error_none_when_absent() {
-        // An absent `is_error` is distinct from an explicit `false`: this is
-        // exactly the shape a mid-run usage-limit model switch can leave
-        // behind (the turn ends gracefully with no `is_error` field at all),
-        // and the caller (run_claude_and_finish) must be able to tell the
-        // two apart to avoid misclassifying it as a successful `Done` run.
-        // See RunStatus::Interrupted's doc comment.
-        let json = r#"{"session_id": "sess-abc"}"#;
-        assert_eq!(parse_run_outcome(json).unwrap().is_error, None);
-    }
-
-    #[test]
-    fn parse_run_outcome_honors_is_error_explicit_false() {
-        let json = r#"{"session_id": "sess-abc", "is_error": false}"#;
-        assert_eq!(parse_run_outcome(json).unwrap().is_error, Some(false));
-    }
-
-    #[test]
-    fn parse_run_outcome_honors_is_error_true() {
-        let json = r#"{"session_id": "sess-abc", "is_error": true}"#;
-        assert_eq!(parse_run_outcome(json).unwrap().is_error, Some(true));
-    }
-
-    #[test]
-    fn parse_run_outcome_errors_on_malformed_json() {
-        let err = parse_run_outcome("not json").unwrap_err();
-        assert!(matches!(err, RunOutcomeError::Malformed(_)));
-    }
-
-    #[test]
-    fn parse_run_outcome_errors_on_missing_session_id() {
-        let json = r#"{"num_turns": 3}"#;
-        let err = parse_run_outcome(json).unwrap_err();
-        assert!(matches!(err, RunOutcomeError::MissingSessionId));
-    }
-
-    #[test]
-    fn parse_run_outcome_errors_on_empty_session_id() {
-        // Mirrors the doc comment: work.ml's jq `// empty` turns a missing
-        // field into an empty string, which this port treats the same as
-        // absent, not as a usable (empty) session id.
-        let json = r#"{"session_id": ""}"#;
-        let err = parse_run_outcome(json).unwrap_err();
-        assert!(matches!(err, RunOutcomeError::MissingSessionId));
-    }
-
-    #[test]
-    fn parse_run_outcome_treats_empty_model_usage_map_as_none() {
-        let json = r#"{"session_id": "sess-abc", "modelUsage": {}}"#;
-        assert_eq!(parse_run_outcome(json).unwrap().model_usage, None);
     }
 
     #[test]
@@ -489,7 +274,7 @@ mod tests {
 
         assert!(status.success());
         let written = std::fs::read_to_string(&out_path).unwrap();
-        let outcome = parse_run_outcome(&written).unwrap();
+        let outcome = ClaudeRunner.parse_outcome(&written).unwrap();
         assert_eq!(outcome.session_id, "sess-123");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -583,7 +368,7 @@ mod tests {
 
         assert!(status.success());
         let written = std::fs::read_to_string(&out_path).unwrap();
-        let outcome = parse_run_outcome(&written).unwrap();
+        let outcome = ClaudeRunner.parse_outcome(&written).unwrap();
         assert_eq!(outcome.session_id, "sess-real");
 
         std::fs::remove_dir_all(&dir).ok();

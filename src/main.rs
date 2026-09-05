@@ -2,16 +2,19 @@
 //! dependencies (config files, the macOS keychain, `gh`/`git`, and the Jira
 //! HTTP API), and dispatches to `tskmstr::cli`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 
+use tskmstr::agent::AgentRunner;
+use tskmstr::agent::claude::ClaudeRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
 };
-use tskmstr::config::{self, BackendKind, Config, ConfigPaths};
+use tskmstr::config::{self, AgentKind, BackendKind, Config, ConfigPaths};
 use tskmstr::github::gh_cli::{GhCli, ShellGhCli};
 use tskmstr::jira::client::{HttpJiraClient, JiraClientContext};
 use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
@@ -132,6 +135,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         home: &home,
         xdg_data_home: xdg_data_home.as_deref(),
         identity: &backend_identity,
+        runner: agent_runner_for(&config),
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -250,6 +254,21 @@ fn ticket_provider_for(
     }
 }
 
+/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]), mirroring
+/// [`ticket_provider_for`]: the one factory that turns [`AgentKind`] into a
+/// live implementation, so nothing else outside config parsing needs to
+/// `match` on it (see `docs/plans/agent-runner.md` and GitHub issue #17).
+///
+/// The [`AgentKind::Claude`] arm leaks a freshly constructed [`ClaudeRunner`]
+/// to get a `&'static dyn AgentRunner` — [`ClaudeRunner`] is a zero-sized
+/// unit struct and `tm` is a short-lived CLI process, so leaking one costs
+/// nothing, the same trade [`ticket_provider_for`] makes for `ShellGhCli`.
+fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
+    match config.agent {
+        AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
+    }
+}
+
 /// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
 /// (see `run_work`'s doc comment): the same provider [`ticket_provider_for`]
 /// builds for `config.backend`, or `None` on any construction/auth failure
@@ -346,6 +365,7 @@ fn run_work(
                 &identity,
                 &current_exe,
                 &key,
+                agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
             )?;
         }
@@ -402,6 +422,7 @@ fn run_work(
                 current_repo_dir: &cwd,
                 current_backend_identity: &current_backend_identity,
                 backend_identity_resolver: &backend_identity_resolver,
+                runner: agent_runner_or_default(full_config.as_ref()),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -431,8 +452,14 @@ fn run_work(
             let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
             let spawner = tskmstr::work::runner::StdProcessSpawner;
             let gh = ShellGhCli::new();
-            let succeeded =
-                tskmstr::cli::work::supervise(&spawner, &gh, &run_store, &state, &mut stdout)?;
+            let succeeded = tskmstr::cli::work::supervise(
+                &spawner,
+                &gh,
+                &run_store,
+                &state,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
             // The state file has served its one-shot handoff purpose; a
             // failed removal isn't worth failing the (already recorded) run
             // over. On a supervisor crash it survives for debugging.
@@ -447,25 +474,25 @@ fn run_work(
                     return Err("tm work hooks install currently only supports --user".into());
                 }
                 let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-                let hooks_dir =
-                    tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), &home);
-                let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-                let settings_path = tskmstr::work::hooks_install::user_settings_path(
-                    claude_config_dir.as_deref(),
-                    &home,
-                );
                 let clock = tskmstr::work::run::SystemClock;
                 let (year, month, day, hour, min, sec) =
                     tskmstr::work::run::Clock::now_parts(&clock);
                 let backup_suffix =
                     tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
-                let report = tskmstr::work::hooks_install::install_user_hooks(
-                    &hooks_dir,
-                    &settings_path,
+                let runner = agent_runner_or_default(full_config.as_ref());
+                match runner.install_user_hooks(
+                    &home,
+                    xdg_data_home.as_deref(),
                     &backup_suffix,
                     dry_run,
-                )?;
-                report.write_summary(&mut stdout)?;
+                )? {
+                    Some(report) => report.write_summary(&mut stdout)?,
+                    None => writeln!(
+                        stdout,
+                        "{} has no user-level telemetry to install.",
+                        runner.name()
+                    )?,
+                }
             }
         },
     }
@@ -484,6 +511,7 @@ fn run_board(
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
+    let runner = agent_runner_for(&config);
     let jira = ticket_provider_for(&config, keychain, env_token)?;
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
@@ -565,6 +593,7 @@ fn run_board(
         cwd,
         lanes,
         backend_identity: current_backend_identity,
+        runner,
     })?;
     Ok(())
 }
@@ -582,6 +611,17 @@ fn backend_identity_or_placeholder(config: Option<&Config>) -> tskmstr::config::
             base_url: String::new(),
             project_key: String::new(),
         })
+}
+
+/// [`agent_runner_for`] for an optionally-loaded config, mirroring
+/// [`backend_identity_or_placeholder`]: callers that load config leniently
+/// (`tm work run`, `tm review fix` — see their doc comments) still need a
+/// runner, defaulting to [`AgentKind::Claude`] (the same default an absent
+/// `[agent]` table resolves to) when no config loaded at all.
+fn agent_runner_or_default(config: Option<&Config>) -> &'static dyn AgentRunner {
+    config
+        .map(agent_runner_for)
+        .unwrap_or_else(|| Box::leak(Box::new(ClaudeRunner)))
 }
 
 /// The default global/repo config paths for this machine and working
@@ -690,35 +730,34 @@ fn run_init(
         .as_deref()
         .and_then(tskmstr::cli::init::detect_origin_default_branch);
 
-    let (hooks_dir, settings_path) = user_hooks_paths(&home);
-    // A dry-run install with nothing left to add means installed; any error
-    // (e.g. no Claude settings file yet) just means "not installed".
-    let hooks_installed = tskmstr::work::hooks_install::install_user_hooks(
-        &hooks_dir,
-        &settings_path,
-        "tm-init-probe",
-        true,
-    )
-    .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
-    .unwrap_or(false);
+    // `tm init` runs before any config necessarily exists, so this probes
+    // the default runner ([`AgentKind::Claude`]) rather than one selected by
+    // config — mirrors `agent_runner_or_default`'s other no-config callers.
+    let init_runner = agent_runner_or_default(None);
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let hooks_installed = init_runner.user_hooks_installed(&home, xdg_data_home.as_deref());
     let hook_installer = |out: &mut dyn std::io::Write| -> Result<(), String> {
-        let (hooks_dir, settings_path) = user_hooks_paths(
-            &std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("~")),
-        );
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
         let clock = tskmstr::work::run::SystemClock;
         let (year, month, day, hour, min, sec) = tskmstr::work::run::Clock::now_parts(&clock);
         let backup_suffix =
             tskmstr::work::naming::format_timestamp(year, month, day, hour, min, sec);
-        let report = tskmstr::work::hooks_install::install_user_hooks(
-            &hooks_dir,
-            &settings_path,
-            &backup_suffix,
-            false,
-        )
-        .map_err(|err| err.to_string())?;
-        report.write_summary(out).map_err(|err| err.to_string())
+        let runner = agent_runner_or_default(None);
+        match runner
+            .install_user_hooks(&home, xdg_data_home.as_deref(), &backup_suffix, false)
+            .map_err(|err| err.to_string())?
+        {
+            Some(report) => report.write_summary(out).map_err(|err| err.to_string()),
+            None => writeln!(
+                out,
+                "{} has no user-level telemetry to install.",
+                runner.name()
+            )
+            .map_err(|err| err.to_string()),
+        }
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -732,22 +771,12 @@ fn run_init(
         origin_default_branch,
         hooks_installed,
         hook_installer: &hook_installer,
+        runner: init_runner,
     };
     let mut prompter = RealPrompter;
     let mut stdout = std::io::stdout();
     tskmstr::cli::init::run_init(&ctx, yes, &mut prompter, &mut stdout)?;
     Ok(())
-}
-
-/// The user-level hooks dir and Claude settings path `tm work hooks install
-/// --user` targets, honoring the same env overrides.
-fn user_hooks_paths(home: &std::path::Path) -> (PathBuf, PathBuf) {
-    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    let hooks_dir = tskmstr::work::hooks_install::user_hooks_dir(xdg_data_home.as_deref(), home);
-    let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    let settings_path =
-        tskmstr::work::hooks_install::user_settings_path(claude_config_dir.as_deref(), home);
-    (hooks_dir, settings_path)
 }
 
 /// Load config and build a real ticket provider (Jira or GitHub, per
@@ -840,7 +869,9 @@ fn run_ticket(
             // telemetry (see `docs/plans/session-usage.md`).
             let session_store =
                 tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
-            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let runner = agent_runner_for(&config);
+            let session_env =
+                tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
             tskmstr::cli::ticket::create(
                 &ctx,
@@ -1001,7 +1032,9 @@ fn run_ticket_audit(
     let db_path = run_db_path_from_config(&config);
     let scope = tskmstr::config::BackendIdentity::from_config(&config).scope();
     let mut stdout = std::io::stdout();
-    let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+    let runner = agent_runner_for(&config);
+    let session_env =
+        tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
     let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
 
     match record {
@@ -1015,6 +1048,7 @@ fn run_ticket_audit(
                 notes.as_deref(),
                 &session_env,
                 &sessions_dir,
+                runner,
                 &mut stdout,
             )?;
         }
@@ -1033,6 +1067,7 @@ fn run_ticket_audit(
                         &key,
                         &session_env,
                         &sessions_dir,
+                        runner,
                         &mut stdout,
                     )?;
                 }
@@ -1046,6 +1081,7 @@ fn run_ticket_audit(
                         &key,
                         &session_env,
                         &sessions_dir,
+                        runner,
                         &mut stdout,
                     )?;
                 }
@@ -1270,6 +1306,7 @@ fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
         run_db_path: &run_db_path,
         tmux: &tmux,
         backend_identity: &backend_identity,
+        runner: agent_runner_or_default(full_config.as_ref()),
     };
     let mut stdout = std::io::stdout();
 
@@ -1305,9 +1342,10 @@ fn run_runs(
     // scope to the invoking repo when its config loads (GitHub issue #10),
     // and fall back to unscoped — the pre-#10 behavior — when it doesn't,
     // so `tm runs` still works on a machine with no config at all.
-    let scope = config::load(&default_config_paths())
-        .ok()
-        .map(|cfg| tskmstr::config::BackendIdentity::from_config(&cfg).scope());
+    let full_config = config::load(&default_config_paths()).ok();
+    let scope = full_config
+        .as_ref()
+        .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).scope());
     let scope = scope.as_deref();
 
     match cmd {
@@ -1363,7 +1401,13 @@ fn run_runs(
                 model_usage,
                 findings_count,
             };
-            tskmstr::cli::runs::finish(&store, run_id, &outcome, &mut stdout)?;
+            tskmstr::cli::runs::finish(
+                &store,
+                run_id,
+                &outcome,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Event {
             run_id,
@@ -1381,11 +1425,26 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Show { ticket, json, kind }) => {
-            tskmstr::cli::runs::show(&store, scope, &ticket, kind.as_deref(), json, &mut stdout)?;
+            tskmstr::cli::runs::show(
+                &store,
+                scope,
+                &ticket,
+                kind.as_deref(),
+                json,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Resume { ticket }) => {
             let mut stderr = std::io::stderr();
-            tskmstr::cli::runs::resume(&store, scope, &ticket, &mut stdout, &mut stderr)?;
+            tskmstr::cli::runs::resume(
+                &store,
+                scope,
+                &ticket,
+                agent_runner_or_default(full_config.as_ref()),
+                &mut stdout,
+                &mut stderr,
+            )?;
         }
         Some(RunsCmd::Reopen {
             ticket_or_id,
@@ -1402,12 +1461,17 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Register { kind, key }) => {
-            let session_env = tskmstr::runs::session::SessionEnv::from_process_env();
+            let runner = agent_runner_or_default(full_config.as_ref());
+            let session_env =
+                tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
             tskmstr::cli::runs::register(&store, scope, &sessions_dir, &session_env, &kind, &key);
         }
         Some(RunsCmd::Watch) => {
-            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps { store })?;
+            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps {
+                store,
+                runner: agent_runner_or_default(full_config.as_ref()),
+            })?;
         }
         Some(RunsCmd::Logs {
             ticket_or_id,
@@ -1506,6 +1570,7 @@ mod tests {
             review_bots: Vec::new(),
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
+            agent: tskmstr::config::AgentKind::Claude,
         }
     }
 
@@ -1523,6 +1588,7 @@ mod tests {
             review_bots: Vec::new(),
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
+            agent: tskmstr::config::AgentKind::Claude,
         }
     }
 
@@ -1532,6 +1598,15 @@ mod tests {
     // cause 3. A github-backend config with no jira credentials at all
     // must still get a usable provider: `run_ticket_provider` must not
     // fall through to a Jira-token lookup that has nothing to resolve.
+    #[test]
+    fn agent_runner_for_claude_returns_the_claude_runner() {
+        let config = jira_config();
+
+        let runner = agent_runner_for(&config);
+
+        assert_eq!(runner.name(), "claude");
+    }
+
     #[test]
     fn run_ticket_provider_github_backend_does_not_need_a_jira_token() {
         // `ticket_provider_for`'s github arm opens a `RunStore` at

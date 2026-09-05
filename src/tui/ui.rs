@@ -18,6 +18,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
+use crate::agent::AgentRunner;
 use crate::cli::runs::format_age;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
@@ -79,7 +80,10 @@ fn bot_watch_badge<'a>(badges: &BoardBadges<'a>, ticket_key: &str) -> Option<(&'
 }
 
 /// Draw the current screen (and the help overlay, if shown) into `frame`.
-pub fn draw(frame: &mut Frame, app: &App) {
+/// `runner` is only consulted by the run-detail window's event timeline
+/// (see [`draw_events_panel`]), which shortens model names via
+/// [`crate::agent::AgentRunner::display_model_name`].
+pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
     let (body, status_area) = split_body_and_status(frame.area());
 
     match app.screen {
@@ -92,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Board => {
             if app.show_run_detail {
-                draw_run_detail_window(frame, app);
+                draw_run_detail_window(frame, app, runner);
             }
         }
         Screen::Rank => {}
@@ -103,7 +107,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
         Screen::Runs => {
             if app.show_run_detail {
-                draw_run_detail_window(frame, app);
+                draw_run_detail_window(frame, app, runner);
             }
         }
         Screen::Retro => {}
@@ -863,7 +867,7 @@ const MIDDLE_ROW_HEIGHT: u16 = 8;
 /// (see [`draw_middle_row`]), and an events panel (see
 /// [`draw_events_panel`]) that alone scrolls with `app.run_detail_scroll` --
 /// the header and middle row are bounded summaries, the timeline isn't.
-fn draw_run_detail_window(frame: &mut Frame, app: &App) {
+fn draw_run_detail_window(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
     let area = centered_rect(90, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -902,7 +906,7 @@ fn draw_run_detail_window(frame: &mut Frame, app: &App) {
 
     draw_header_grid(frame, rows[0], detail);
     draw_middle_row(frame, rows[1], detail);
-    draw_events_panel(frame, rows[2], detail, app.run_detail_scroll);
+    draw_events_panel(frame, rows[2], detail, app.run_detail_scroll, runner);
 }
 
 /// The run-detail window's title: `Run {id}: {ticket}` for the common `lane`
@@ -1191,9 +1195,10 @@ fn draw_middle_row(frame: &mut Frame, area: Rect, detail: &crate::tui::app::RunD
 /// [`crate::runs::format_event_detail`] (falling back to the raw detail
 /// payload, then to nothing) -- the same fallback chain the pre-redesign
 /// window used, just with the kind pulled into its own styled span.
-fn event_line(event: &crate::tui::app::RunDetailEvent) -> Line<'static> {
-    let detail_text = crate::runs::format_event_detail(&event.kind, event.detail.as_deref())
-        .or_else(|| event.detail.clone());
+fn event_line(event: &crate::tui::app::RunDetailEvent, runner: &dyn AgentRunner) -> Line<'static> {
+    let detail_text =
+        crate::runs::format_event_detail(&event.kind, event.detail.as_deref(), runner)
+            .or_else(|| event.detail.clone());
     let mut spans = vec![
         Span::styled(event.at.clone(), theme::DIM),
         Span::raw("  "),
@@ -1207,11 +1212,19 @@ fn event_line(event: &crate::tui::app::RunDetailEvent) -> Line<'static> {
 
 /// The events panel's content: the timeline, newest first, or a dim
 /// `"(no events)"` placeholder.
-fn event_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
+fn event_lines(
+    detail: &crate::tui::app::RunDetail,
+    runner: &dyn AgentRunner,
+) -> Vec<Line<'static>> {
     if detail.events.is_empty() {
         return vec![Line::from(Span::styled("(no events)", theme::DIM))];
     }
-    detail.events.iter().rev().map(event_line).collect()
+    detail
+        .events
+        .iter()
+        .rev()
+        .map(|event| event_line(event, runner))
+        .collect()
 }
 
 /// Draws the run-detail window's Events panel: bordered, titled "Events",
@@ -1222,6 +1235,7 @@ fn draw_events_panel(
     area: Rect,
     detail: &crate::tui::app::RunDetail,
     scroll: u16,
+    runner: &dyn AgentRunner,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1229,7 +1243,7 @@ fn draw_events_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let paragraph = Paragraph::new(event_lines(detail)).scroll((scroll, 0));
+    let paragraph = Paragraph::new(event_lines(detail, runner)).scroll((scroll, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -1636,7 +1650,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal should build");
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| draw(frame, app, &crate::agent::claude::ClaudeRunner))
             .expect("draw should not panic");
         terminal.backend().buffer().clone()
     }

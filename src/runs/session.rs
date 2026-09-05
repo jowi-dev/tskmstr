@@ -23,7 +23,7 @@
 //! **Adoption of board-launched sessions.** `docs/plans/board-audits.md`'s
 //! "Adoption" design adds a second way a run can get a marker: a session
 //! [`crate::work::audit::launch_audit`] starts already has a run row
-//! (`pid = None`, created before `claude` even booted) and passes its id via
+//! (`pid = None`, created before the agent even booted) and passes its id via
 //! `TSKMSTR_SESSION_RUN_ID` (see [`SessionEnv::session_run_id`]). Before the
 //! marker/new-run logic above runs at all, [`register_session`] checks
 //! whether that env var points at a still-[`RunStatus::Running`] run whose
@@ -34,19 +34,22 @@
 //! existing marker-reuse/new-run behavior unchanged — the env var is
 //! advisory, the marker stays the source of truth.
 //!
-//! `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` (read by [`SessionEnv`]) are
-//! **observed but undocumented** environment variables Claude Code sets for
-//! Bash-tool subprocesses; anything reading them must degrade to a silent
-//! no-op when they're absent, since their availability is not a documented
-//! guarantee. [`SessionEnv::from_process_env`] does exactly that: absence or
-//! garbage in either becomes `None`, never an error.
+//! [`SessionEnv::session_id`]/[`SessionEnv::agent_pid`] are read from
+//! whichever env vars the configured runner's
+//! [`crate::agent::AgentRunner::session_env_vars`] names (`claude` sets
+//! `CLAUDE_CODE_SESSION_ID`/`CLAUDE_PID` for Bash-tool subprocesses — see
+//! that impl for the "observed but undocumented" caveat those two carry).
+//! [`SessionEnv::from_process_env`] degrades to a silent no-op when either
+//! is absent or unparseable: absence or garbage in either becomes `None`,
+//! never an error.
 //!
-//! `pid = CLAUDE_PID` matters beyond identification: [`crate::runs::RunStore::reap`]
+//! `pid` matters beyond identification: [`crate::runs::RunStore::reap`]
 //! reaps a stale-heartbeat running run on staleness alone when its `pid` is
 //! `NULL`, but skips it while the pid is alive. An interactive session idles
 //! between tool calls for long stretches, so a session run registered
 //! without a pid would be reaped `failed` after one quiet spell. Recording
-//! `CLAUDE_PID` at start keeps an idle-but-alive session's run alive too.
+//! the runner's pid var at start keeps an idle-but-alive session's run alive
+//! too.
 //!
 //! **Error-handling contract**: every fallible operation here returns a real
 //! [`SessionError`] rather than swallowing failures — this module does not
@@ -114,13 +117,17 @@ pub enum SessionError {
 /// construct it directly rather than mocking environment variables.
 #[derive(Debug, Clone)]
 pub struct SessionEnv {
-    /// `CLAUDE_CODE_SESSION_ID`: the Claude Code session UUID, matching the
-    /// `session_id` hooks receive on stdin. Observed but undocumented (see
-    /// module docs); `None` when unset or empty.
+    /// The live session's id, read from the configured runner's
+    /// [`crate::agent::SessionEnvVars::session_id`] env var (`claude`:
+    /// `CLAUDE_CODE_SESSION_ID`, matching the `session_id` hooks receive on
+    /// stdin). Observed but undocumented (see module docs); `None` when
+    /// unset or empty.
     pub session_id: Option<String>,
-    /// `CLAUDE_PID`: the Claude process pid. Observed but undocumented;
-    /// `None` when unset, empty, or unparseable as a `u32`.
-    pub claude_pid: Option<u32>,
+    /// The live session's process pid, read from the configured runner's
+    /// [`crate::agent::SessionEnvVars::pid`] env var (`claude`: `CLAUDE_PID`).
+    /// Observed but undocumented; `None` when unset, empty, or unparseable
+    /// as a `u32`.
+    pub agent_pid: Option<u32>,
     /// `TSKMSTR_RUN_ID`: set by the `tm work run` lane wrapper. When
     /// present, a lane run already owns telemetry for this process tree, so
     /// session registration is a no-op (see [`register_session`]).
@@ -145,18 +152,20 @@ fn non_empty_env(key: &str) -> Option<String> {
 
 impl SessionEnv {
     /// Reads [`SessionEnv`] from the current process's environment and
-    /// working directory.
+    /// working directory, using `vars` (the configured runner's
+    /// [`crate::agent::AgentRunner::session_env_vars`]) to name the
+    /// session-id/pid variables.
     ///
-    /// `CLAUDE_CODE_SESSION_ID` and `TSKMSTR_RUN_ID` are absent when unset or
-    /// empty; `CLAUDE_PID` and `TSKMSTR_SESSION_RUN_ID` are additionally
+    /// `vars.session_id` and `TSKMSTR_RUN_ID` are absent when unset or
+    /// empty; `vars.pid` and `TSKMSTR_SESSION_RUN_ID` are additionally
     /// absent when their values fail to parse (as a `u32`/`i64`
     /// respectively). `cwd` falls back to `PathBuf::new()` (an empty path)
     /// if [`std::env::current_dir`] fails, rather than erroring — this is
     /// telemetry, not a load-bearing path.
-    pub fn from_process_env() -> Self {
+    pub fn from_process_env(vars: &crate::agent::SessionEnvVars) -> Self {
         SessionEnv {
-            session_id: non_empty_env("CLAUDE_CODE_SESSION_ID"),
-            claude_pid: non_empty_env("CLAUDE_PID").and_then(|v| v.parse().ok()),
+            session_id: non_empty_env(vars.session_id),
+            agent_pid: non_empty_env(vars.pid).and_then(|v| v.parse().ok()),
             lane_run_id: non_empty_env("TSKMSTR_RUN_ID"),
             session_run_id: non_empty_env("TSKMSTR_SESSION_RUN_ID").and_then(|v| v.parse().ok()),
             cwd: std::env::current_dir().unwrap_or_default(),
@@ -209,7 +218,7 @@ fn read_marker(path: &Path) -> Option<i64> {
 
 /// Adopts a pre-registered run: creates `dir` if needed, writes the marker
 /// for `session_id` pointing at `run_id`, stamps `run_id`'s `session_id`,
-/// and stamps its `pid` when `claude_pid` is known. Shared by
+/// and stamps its `pid` when `agent_pid` is known. Shared by
 /// [`register_session`]'s adoption path; see the module docs' "Adoption of
 /// board-launched sessions" section.
 fn adopt_run(
@@ -217,7 +226,7 @@ fn adopt_run(
     dir: &Path,
     session_id: &str,
     run_id: i64,
-    claude_pid: Option<u32>,
+    agent_pid: Option<u32>,
 ) -> Result<i64, SessionError> {
     std::fs::create_dir_all(dir).map_err(|source| SessionError::CreateDir {
         path: dir.to_path_buf(),
@@ -231,7 +240,7 @@ fn adopt_run(
     })?;
 
     store.update_session_id(run_id, session_id)?;
-    if let Some(pid) = claude_pid {
+    if let Some(pid) = agent_pid {
         store.update_pid(run_id, pid)?;
     }
 
@@ -292,7 +301,7 @@ pub fn register_session(
         // `running`.
         && run.ticket.eq_ignore_ascii_case(ticket)
     {
-        return adopt_run(store, dir, session_id, candidate_id, env.claude_pid).map(Some);
+        return adopt_run(store, dir, session_id, candidate_id, env.agent_pid).map(Some);
     }
 
     let path = marker_path(dir, session_id);
@@ -327,7 +336,7 @@ pub fn register_session(
         lane: kind.to_string(),
         worktree: env.cwd.display().to_string(),
         branch: None,
-        pid: env.claude_pid,
+        pid: env.agent_pid,
         kind: kind.to_string(),
         log_path: None,
     })?;
@@ -400,6 +409,7 @@ pub fn finish_session(
     kind: &str,
     ticket: &str,
     status: RunStatus,
+    runner: &dyn crate::agent::AgentRunner,
 ) -> Result<Option<i64>, SessionError> {
     let Some(session_id) = env.session_id.as_deref() else {
         return Ok(None);
@@ -423,14 +433,14 @@ pub fn finish_session(
     // events tm-usage.sh recorded during the conversation (the same
     // events-fallback `crate::runs::latest_usage` reads for a *running*
     // run's live display) and estimates a cost from them via
-    // `crate::runs::estimate_missing_costs` — see
-    // `crate::runs::pricing`'s module docs for why this is always an
+    // `crate::runs::estimate_missing_costs` (using `runner`'s price table)
+    // — see `crate::runs::pricing`'s module docs for why this is always an
     // estimate, never authoritative. `None` (no usage events at all) leaves
     // `model_usage`/`cost_usd` untouched, same as before this rollup existed.
     let events = store.events_for_run(run_id)?;
     let outcome = match crate::runs::latest_usage(&events) {
         Some(mut usage) => {
-            crate::runs::estimate_missing_costs(&mut usage);
+            crate::runs::estimate_missing_costs(&mut usage, runner);
             FinishRun {
                 status,
                 cost_usd: crate::runs::total_cost_usd(&usage),
@@ -460,6 +470,7 @@ pub fn finish_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude::ClaudeRunner;
     use tempfile::tempdir;
 
     fn open_store(dir: &Path) -> RunStore {
@@ -469,7 +480,7 @@ mod tests {
     fn env_with_session(session_id: &str) -> SessionEnv {
         SessionEnv {
             session_id: Some(session_id.to_string()),
-            claude_pid: Some(4242),
+            agent_pid: Some(4242),
             lane_run_id: None,
             session_run_id: None,
             cwd: PathBuf::from("/tmp/wt"),
@@ -483,7 +494,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = SessionEnv {
             session_id: None,
-            claude_pid: None,
+            agent_pid: None,
             lane_run_id: None,
             session_run_id: None,
             cwd: PathBuf::from("/tmp/wt"),
@@ -921,6 +932,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -959,6 +971,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -990,6 +1003,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -1022,6 +1036,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -1051,6 +1066,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -1075,6 +1091,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -1088,7 +1105,7 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = SessionEnv {
             session_id: None,
-            claude_pid: None,
+            agent_pid: None,
             lane_run_id: None,
             session_run_id: None,
             cwd: PathBuf::from("/tmp/wt"),
@@ -1101,6 +1118,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 
@@ -1128,6 +1146,7 @@ mod tests {
             "audit",
             "PROJ-1",
             RunStatus::Done,
+            &ClaudeRunner,
         )
         .unwrap();
 

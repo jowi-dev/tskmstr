@@ -414,7 +414,7 @@ pub trait GhCli {
 
     /// The URL of the open pull request for `branch`, if any (`gh pr list
     /// --head <branch> --json url -q '.[0].url'`), used by `tm work run`'s
-    /// post-run PR-URL resolution (see `crate::work::run::run_claude_and_finish`).
+    /// post-run PR-URL resolution (see `crate::work::run::run_agent_and_finish`).
     ///
     /// Returns `Ok(None)` when there is no open pull request for `branch`,
     /// `gh` isn't installed, or the lookup otherwise fails — a missing PR is

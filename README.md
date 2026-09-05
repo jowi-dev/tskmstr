@@ -1030,6 +1030,9 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 
 # [backend]                           # optional, see below; "jira" is the default
 # provider = "jira"
+
+# [agent]                              # optional, see below; "claude" is the default
+# runner = "claude"
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
@@ -1225,6 +1228,37 @@ preferring the `default_assignee_account_id` cached by `tm auth login` over
 an extra Jira `myself` call; `--unassign` clears the assignee. Like `tm
 ticket transition`, every failure here is a hard error (non-zero exit) —
 this is an explicit command, not an automatic side effect.
+
+### `[agent]`: choosing an AI coding runner
+
+`[agent].runner` selects which AI coding agent `tm work run`, `tm review
+fix`, `tm ticket audit`/`create`, and `tm work hooks install --user` drive,
+mirroring `[backend].provider`'s shape: an unrecognized value is an
+invalid-runner error naming the value that was set, and it defaults to
+`"claude"` when `[agent]` is absent from both global and repo config, so an
+existing config with no `[agent]` table at all keeps working exactly as
+before.
+
+```toml
+# [agent]                              # optional, see below; "claude" is the default
+# runner = "claude"
+```
+
+`"claude"` (Claude Code) is the only implemented runner today. Everything
+this README describes as `claude`/Claude Code behavior — the `-p`/argv
+shape, the `--settings`-deployed telemetry hooks, the price table behind
+per-model cost estimates, the `claude --resume <id>` hint, the
+`~/.claude/prompts/<lane>.md`/`~/.claude/skills/` conventions — is sourced
+from that one adapter behind an internal `AgentRunner` trait, not
+hardcoded at each call site; a second adapter would plug in the same way
+`GithubProvider` did for `[backend]` (see
+`docs/decisions/0004-agent-runners.md`), without changing anything else in
+config, the TUI, or any `tm work`/`tm review`/`tm ticket` command. `[work].
+default_model`/`default_max_turns`/`default_permission_mode` (see "`tm
+work`" above) stay runner-neutral concepts — model, turn budget, and
+permission posture are meaningful for any agentic CLI — with each adapter
+mapping them onto its own flags; today that means `claude`'s
+`--model`/`--max-turns`/`--permission-mode`.
 
 ### Ranking
 
