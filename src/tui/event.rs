@@ -3347,14 +3347,16 @@ mod tests {
             prompt: None,
             model: None,
         };
-        d.tmux = Box::new(crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(windows
-            .iter()
-            .map(|(session, name, dead)| crate::work::tmux::TmuxWindow {
-                session: (*session).to_string(),
-                name: (*name).to_string(),
-                dead: *dead,
-            })
-            .collect())));
+        d.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(windows
+                .iter()
+                .map(|(session, name, dead)| crate::work::tmux::TmuxWindow {
+                    session: (*session).to_string(),
+                    name: (*name).to_string(),
+                    dead: *dead,
+                })
+                .collect())),
+        );
         d
     }
 

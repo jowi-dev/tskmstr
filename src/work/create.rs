@@ -198,8 +198,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("~/Projects/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity())
-            .expect("launch should succeed");
+        let outcome =
+            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
         assert_eq!(outcome.window_name, "create");
@@ -261,8 +261,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity())
-            .expect("launch should succeed");
+        let outcome =
+            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "create-2");
         assert_eq!(
@@ -292,8 +292,8 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity())
-            .expect("launch should succeed");
+        let outcome =
+            launch_create(&tmux, &cfg, &home, &test_identity()).expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
     }
