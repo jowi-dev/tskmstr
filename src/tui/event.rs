@@ -1796,7 +1796,7 @@ mod tests {
 
     fn deps(jira: FakeJiraClient) -> TuiDeps {
         TuiDeps {
-            jira: Box::new(JiraProvider::new(jira)),
+            jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             base_url: "https://example.atlassian.net".to_string(),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),

@@ -223,7 +223,12 @@ mod tests {
         jira: FakeJiraClient,
     ) -> impl Fn(&Config, &str) -> Box<dyn TicketProvider> {
         let jira = std::rc::Rc::new(jira);
-        move |_cfg, _token| Box::new(JiraProvider::new(FakeJiraClientHandle(jira.clone())))
+        move |_cfg, _token| {
+            Box::new(JiraProvider::new(
+                FakeJiraClientHandle(jira.clone()),
+                "https://example.atlassian.net",
+            ))
+        }
     }
 
     /// A cheaply cloneable handle wrapping a shared [`FakeJiraClient`] so it

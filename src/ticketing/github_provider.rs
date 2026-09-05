@@ -831,6 +831,20 @@ impl TicketProvider for GithubProvider<'_> {
             .map(str::to_string)
             .unwrap_or_default()
     }
+
+    /// The issue's own page, built from the configured repo slug rather
+    /// than fetched — `gh issue view` reports the same
+    /// `https://github.com/{owner}/{name}/issues/{number}` shape, and
+    /// building it locally keeps this method infallible and free. A key
+    /// whose number can't be parsed (which `normalize_key` upstream should
+    /// never let through) degrades to the repo's issues list rather than a
+    /// broken link.
+    fn issue_url(&self, key: &str) -> String {
+        match parse_issue_number(key) {
+            Ok(number) => format!("https://github.com/{}/issues/{number}", self.repo),
+            Err(_) => format!("https://github.com/{}/issues", self.repo),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1344,6 +1358,28 @@ mod tests {
             .unwrap();
 
         assert!(fake.issue_create_calls()[0].1.assignees.is_empty());
+    }
+
+    #[test]
+    fn issue_url_is_the_github_issue_page() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(
+            provider.issue_url("GH-13"),
+            "https://github.com/jowi-dev/tskmstr/issues/13"
+        );
+    }
+
+    #[test]
+    fn issue_url_unparseable_key_degrades_to_the_issues_list() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(
+            provider.issue_url("GH-abc"),
+            "https://github.com/jowi-dev/tskmstr/issues"
+        );
     }
 
     #[test]

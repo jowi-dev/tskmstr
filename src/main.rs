@@ -596,11 +596,14 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
 }
 
 fn jira_client_for(config: &Config, token: &str) -> Box<dyn TicketProvider> {
-    Box::new(JiraProvider::new(HttpJiraClient::new(JiraClientContext {
-        base_url: config.jira_base_url.clone(),
-        email: config.jira_email.clone(),
-        token: token.to_string(),
-    })))
+    Box::new(JiraProvider::new(
+        HttpJiraClient::new(JiraClientContext {
+            base_url: config.jira_base_url.clone(),
+            email: config.jira_email.clone(),
+            token: token.to_string(),
+        }),
+        config.jira_base_url.clone(),
+    ))
 }
 
 fn run_auth(
