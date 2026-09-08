@@ -903,11 +903,8 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
 /// never block the attach itself.
 fn stamp_root_session(tmux: &dyn TmuxOps, session_name: &str) {
     if let Ok(Some(host)) = tmux.current_session_name() {
-        let _ = tmux.set_session_option(
-            session_name,
-            crate::work::tmux::ROOT_SESSION_OPTION,
-            &host,
-        );
+        let _ =
+            tmux.set_session_option(session_name, crate::work::tmux::ROOT_SESSION_OPTION, &host);
     }
 }
 
@@ -2839,10 +2836,10 @@ mod tests {
         stamp_root_session(&tmux, "tm-proj-proj-1");
 
         assert!(
-            !tmux.calls().iter().any(|call| matches!(
-                call,
-                crate::work::tmux::TmuxCall::SetSessionOption { .. }
-            )),
+            !tmux
+                .calls()
+                .iter()
+                .any(|call| matches!(call, crate::work::tmux::TmuxCall::SetSessionOption { .. })),
             "expected no stamp outside tmux, got {:?}",
             tmux.calls()
         );

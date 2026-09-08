@@ -101,12 +101,14 @@ impl BackendIdentity {
     pub fn session_slug_for_scope(scope: &str) -> Option<String> {
         let raw = if let Some(repo) = scope.strip_prefix("github:") {
             repo
-        } else if let Some(rest) = scope.strip_prefix("jira:") {
+        } else {
             // `jira:<base_url>:<project_key>` — the base URL contains `:`,
             // so the project key is everything after the *last* colon.
-            rest.rsplit(':').next().unwrap_or_default()
-        } else {
-            return None;
+            scope
+                .strip_prefix("jira:")?
+                .rsplit(':')
+                .next()
+                .unwrap_or_default()
         };
         if raw.is_empty() {
             return None;
