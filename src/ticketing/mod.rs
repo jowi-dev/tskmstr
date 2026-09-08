@@ -1455,6 +1455,57 @@ mod tests {
     }
 
     #[test]
+    fn auto_create_under_github_backend_moves_fresh_ticket_to_in_review_with_jira_status_on_pr() {
+        // GitHub issue #24's first acceptance criterion, fresh-ticket half:
+        // `tm pr create` with no existing key auto-creates the issue (born
+        // `tm:status/todo`) and must still land it In Review even when the
+        // configured `status_on_pr` is a Jira-shaped name inherited from
+        // global config.
+        let created = crate::github::gh_cli::IssueInfo {
+            number: 11,
+            url: "https://github.com/jowi-dev/tskmstr/issues/11".to_string(),
+            title: "Add the widget".to_string(),
+            body: String::new(),
+            state: crate::github::gh_cli::IssueState::Open,
+            labels: vec!["tm:status/todo".to_string()],
+            assignees: Vec::new(),
+        };
+        let gh = FakeGhCli::new()
+            .with_issue_create_result(Ok(created.clone()))
+            .with_issue_view(11, Ok(created));
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let cfg = Config {
+            status_on_pr: Some("Code Review".to_string()),
+            ..github_config()
+        };
+        let ctx = TicketingContext {
+            jira: &provider,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome =
+            auto_create_and_associate(&ctx, &pr("Add the widget")).expect("should succeed");
+
+        assert_eq!(outcome.issue_key, "GH-11");
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::Applied("In Review".to_string()))
+        );
+        let edits = gh.issue_edit_calls();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].2.add_labels,
+            vec!["tm:status/in-review".to_string()]
+        );
+        assert_eq!(
+            edits[0].2.remove_labels,
+            vec!["tm:status/todo".to_string()]
+        );
+    }
+
+    #[test]
     fn transition_ticket_normalizes_the_target_through_the_provider() {
         let gh = gh_with_issue_10(&["tm:status/todo"]);
         let provider =
