@@ -2806,6 +2806,7 @@ mod tests {
             last_event_age_secs: Some(5),
             awaiting_input: false,
             checklist: None,
+            scope: String::new(),
         }
     }
 

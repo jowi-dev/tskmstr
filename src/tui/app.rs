@@ -223,6 +223,12 @@ pub struct RunCard {
     /// The run's latest checklist snapshot (see
     /// [`crate::runs::latest_checklist`]), if it has emitted one.
     pub checklist: Option<crate::runs::ChecklistState>,
+    /// The ticket namespace the run was recorded under (see
+    /// [`crate::runs::StartRun::scope`]); `""` for legacy pre-scoping rows.
+    /// The watch screen resolves a card's tmux session name from this — its
+    /// run list is machine-wide, so the invoking repo's own slug would be
+    /// wrong for another repo's run.
+    pub scope: String,
 }
 
 /// One event in a [`RunDetail`]'s timeline, mirroring
@@ -4767,6 +4773,7 @@ mod tests {
             last_event_age_secs: None,
             awaiting_input: false,
             checklist: None,
+            scope: String::new(),
         }
     }
 

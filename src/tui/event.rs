@@ -956,6 +956,7 @@ fn run_summary_to_card(
         last_event_age_secs: summary.last_event_age_secs,
         awaiting_input: summary.awaiting_input,
         checklist,
+        scope: summary.scope,
     }
 }
 
