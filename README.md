@@ -109,7 +109,7 @@ tm auth status
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
-| `tm runs watch` | Live kanban board of lane runs, polling the local run db |
+| `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -181,6 +181,30 @@ non-interactive one-shot view.
 Both `tm runs show` and the watch detail window print the event timeline
 newest first — the most recent event is always the first line, so you don't
 have to scroll to see what a run just did.
+
+The watch screen is also a cockpit, not just a dashboard (GitHub issue
+#25). `s` attaches to the highlighted run's tmux session — `switch-client`
+when the watch itself runs inside tmux, blocking `attach-session`
+otherwise, the same inside/outside logic as the board's `s`. The session
+name is resolved from the *run's own* recorded scope (the watch lists every
+repo's runs, so the invoking repo's slug would be wrong for another repo's
+card); legacy unscoped rows fall back to the invoking repo. A run whose
+session no longer exists degrades to the tmux error on the status line with
+the screen fully restored.
+
+Before switching, the watch best-effort stamps the target session's
+`@root_session` tmux user option with the name of the session the watch
+client is in — the same producer contract as issue #19 (the external
+session picker's jump-back key reads that option; see
+jowi-dev/devtools#8), so one picker keypress returns from the run's
+session to wherever monitoring happens. Outside tmux nothing is stamped:
+detaching already lands back in the watch.
+
+At volume, `f` cycles a kind filter (each distinct kind among the loaded
+runs, then back to unfiltered) and `F` cycles a scope filter the same way;
+active filters are pinned as a `Filter: ...` prefix on the status line so
+a narrowed view is never mistaken for the whole. Filters only affect what
+is shown — nothing is reloaded or discarded.
 
 ### `Interrupted` vs. `Failed`, and recovering a run
 

@@ -216,7 +216,9 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
             "j/k move  Enter/Space grab-drop  r refresh  o browser  O jira  Esc back  ? help  q quit"
         }
         Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
-        Screen::Runs => "h/l/j/k: move  enter: detail  r: refresh  q: quit",
+        Screen::Runs => {
+            "h/l/j/k: move  enter: detail  s: attach  f/F: kind/scope filter  r: refresh  q: quit"
+        }
         Screen::Retro => {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
@@ -1361,6 +1363,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("A           assign ticket (board only)"),
         Line::from("p           priority (stack-rank) view (board only)"),
         Line::from("Enter/Space grab or drop a ticket (priority view only)"),
+        Line::from("s           attach to the selected run's session (runs watch only)"),
+        Line::from("f / F       cycle kind / scope view filter (runs watch only)"),
         Line::from("?           toggle this help"),
         Line::from(""),
         Line::from("press any key to close"),
