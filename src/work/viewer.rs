@@ -221,6 +221,12 @@ mod tests {
         fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
             Ok(Vec::new())
         }
+        fn set_session_option(&self, _: &str, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn current_session_name(&self) -> Result<Option<String>, TmuxError> {
+            Ok(None)
+        }
     }
 
     #[test]
