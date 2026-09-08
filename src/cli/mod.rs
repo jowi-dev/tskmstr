@@ -771,9 +771,11 @@ pub enum RunsCmd {
         #[arg(long)]
         detail: Option<String>,
     },
-    /// Marks abandoned runs (stale heartbeat, dead pid) as failed.
+    /// Marks abandoned runs as terminal: a dead recorded pid or killed tmux
+    /// session immediately, a stale heartbeat otherwise.
     Reap {
-        /// Minutes without a heartbeat before a run counts as stale.
+        /// Minutes without a heartbeat before a signal-less run counts as
+        /// stale.
         #[arg(long, default_value_t = 10)]
         stale_after: u64,
     },

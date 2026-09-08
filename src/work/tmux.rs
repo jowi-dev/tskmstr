@@ -508,6 +508,25 @@ fn parse_list_sessions_output(stdout: &str) -> Vec<TmuxSession> {
         .collect()
 }
 
+/// Builds the session-liveness probe [`crate::runs::RunStore::reap`] takes,
+/// from one [`TmuxOps::list_sessions`] snapshot.
+///
+/// A session is alive iff it appears in the snapshot. `list_sessions` is
+/// tolerant of a stopped tmux server (empty list, so every recorded session
+/// reads as gone — correct, killing the server kills its sessions), but a
+/// failure to run `tmux` at all proves nothing, so that case reports every
+/// session alive rather than reaping on ignorance.
+pub fn session_alive_probe(tmux: &dyn TmuxOps) -> Box<dyn Fn(&str) -> bool> {
+    match tmux.list_sessions() {
+        Ok(sessions) => {
+            let names: std::collections::HashSet<String> =
+                sessions.into_iter().map(|s| s.name).collect();
+            Box::new(move |name| names.contains(name))
+        }
+        Err(_) => Box::new(|_| true),
+    }
+}
+
 /// [`TmuxOps`] implementation that shells out to a real `tmux` binary. Used
 /// in production.
 #[derive(Debug, Default, Clone, Copy)]

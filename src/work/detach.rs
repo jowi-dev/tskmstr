@@ -112,8 +112,9 @@
 //! 6. Wait for the run to finish; confirm `tm runs show <ticket-or-lane>`
 //!    reaches `done`/`failed` and `tail -f <log>` shows the printed summary.
 //! 7. Repeat step 4 but `kill -9` the supervisor process mid-run instead of
-//!    letting it finish; confirm `tm runs reap` (after `stale_after_mins`
-//!    elapses) marks the row `failed` rather than leaving it `running`
+//!    letting it finish; confirm `tm runs reap` marks the row `interrupted`
+//!    immediately (a dead recorded pid is proof of death on its own, no
+//!    staleness window — GitHub issue #26) rather than leaving it `running`
 //!    forever.
 
 use std::io;

@@ -1418,10 +1418,13 @@ fn run_runs(
             tskmstr::cli::runs::event(&store, run_id, &kind, detail.as_deref(), &mut stdout)?;
         }
         Some(RunsCmd::Reap { stale_after }) => {
+            let session_alive =
+                tskmstr::work::tmux::session_alive_probe(&tskmstr::work::tmux::ShellTmuxOps);
             tskmstr::cli::runs::reap(
                 &store,
                 stale_after,
                 &tskmstr::runs::pid::pid_alive,
+                &session_alive,
                 &mut stdout,
             )?;
         }

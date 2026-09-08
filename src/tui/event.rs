@@ -41,7 +41,7 @@ use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
 use crate::work::audit::AUDIT_WINDOW_NAME;
 use crate::work::bugbot::CLEANUP_WINDOW_NAME;
-use crate::work::tmux::{AttachOutcome, TmuxOps};
+use crate::work::tmux::{AttachOutcome, TmuxOps, session_alive_probe};
 
 /// How long to wait for a key press between redraws.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1070,10 +1070,19 @@ fn run_model_usage(
     None
 }
 
-/// Run `Cmd::ReapRuns`: mark abandoned runs as failed, using the same
-/// staleness threshold as `tm runs reap`'s default (10 minutes).
+/// Run `Cmd::ReapRuns` on the watch screen: mark abandoned runs as terminal,
+/// using the same staleness threshold as `tm runs reap`'s default (10
+/// minutes) and a real tmux snapshot for the session-liveness probe (see
+/// [`crate::runs::RunStore::reap`]). `WatchDeps` carries no tmux seam, so
+/// unlike the board's [`reap_lane_runs`] this probe is not fakeable —
+/// [`session_alive_probe`]'s tolerant fallback (no `tmux` binary reports
+/// every session alive) keeps tests deterministic anyway.
 fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
-    match deps.store.reap(10, &crate::runs::pid::pid_alive) {
+    let session_alive = session_alive_probe(&crate::work::tmux::ShellTmuxOps);
+    match deps
+        .store
+        .reap(10, &crate::runs::pid::pid_alive, &session_alive)
+    {
         Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
     }

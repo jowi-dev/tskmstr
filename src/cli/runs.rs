@@ -16,17 +16,20 @@ use crate::runs::{
     FinishRun, Run, RunEvent, RunStatus, RunStore, RunStoreError, RunSummary, StartRun,
 };
 
-/// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
+/// `tm runs reap`: mark abandoned runs (dead pid, killed tmux session,
+/// stale heartbeat) as terminal — see [`RunStore::reap`] for the exact
+/// rules.
 ///
-/// Prints `Reaped run {id} ({ticket})` for each reaped run, or
+/// Prints `Reaped run {id} ({ticket}): {reason}` for each reaped run, or
 /// `Nothing to reap.` when none qualified.
 pub fn reap(
     store: &RunStore,
     stale_after_mins: u64,
     pid_alive: &dyn Fn(u32) -> bool,
+    session_alive: &dyn Fn(&str) -> bool,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
-    let reaped = store.reap(stale_after_mins, pid_alive)?;
+    let reaped = store.reap(stale_after_mins, pid_alive, session_alive)?;
 
     if reaped.is_empty() {
         writeln!(out, "Nothing to reap.")?;
@@ -34,7 +37,13 @@ pub fn reap(
     }
 
     for run in &reaped {
-        writeln!(out, "Reaped run {} ({})", run.id, run.ticket)?;
+        writeln!(
+            out,
+            "Reaped run {} ({}): {}",
+            run.id,
+            run.ticket,
+            run.reason.as_str()
+        )?;
     }
     Ok(())
 }
@@ -1830,6 +1839,10 @@ mod tests {
         false
     }
 
+    fn session_alive(_name: &str) -> bool {
+        true
+    }
+
     #[test]
     fn reap_prints_nothing_to_reap_when_none_qualify() {
         let dir = tempdir().unwrap();
@@ -1837,7 +1850,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        reap(&store, 10, &always_alive, &mut out).expect("should succeed");
+        reap(&store, 10, &always_alive, &session_alive, &mut out).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "Nothing to reap.\n");
     }
@@ -1855,11 +1868,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut out = Vec::new();
 
-        reap(&store, 0, &always_dead, &mut out).expect("should succeed");
+        reap(&store, 0, &always_dead, &session_alive, &mut out).expect("should succeed");
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("Reaped run {id} (PROJ-1)\n")
+            format!("Reaped run {id} (PROJ-1): stale\n")
         );
     }
 
