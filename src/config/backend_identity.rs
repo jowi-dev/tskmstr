@@ -87,17 +87,45 @@ impl BackendIdentity {
             BackendIdentity::Jira { project_key, .. } => project_key.as_str(),
             BackendIdentity::Github { repo } => repo.as_str(),
         };
-        raw.to_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
+        slugify(raw)
     }
+}
+
+/// [`BackendIdentity::session_slug`]'s character mapping over a raw scope
+/// component: lowercased, everything outside `[a-z0-9-]` mapped to `-`.
+fn slugify(raw: &str) -> String {
+    raw.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Recovers the [`BackendIdentity::session_slug`] a stored
+/// [`BackendIdentity::scope`] string implies, without reconstructing the
+/// full identity — the inverse the kill-safety classifier needs to map run
+/// rows (which record only `scope`) onto tmux session names (GitHub issue
+/// #26).
+///
+/// `jira:<base_url>:<project_key>` takes the project key after the *last*
+/// colon (base URLs contain colons of their own; project keys never do),
+/// `github:<repo>` takes everything after the prefix. Legacy-unscoped (`""`)
+/// and unrecognized scopes return `None` — such rows simply can't be mapped
+/// to a session by recomputation.
+pub fn session_slug_from_scope(scope: &str) -> Option<String> {
+    if let Some(rest) = scope.strip_prefix("jira:") {
+        let (_, project_key) = rest.rsplit_once(':')?;
+        return Some(slugify(project_key));
+    }
+    if let Some(repo) = scope.strip_prefix("github:") {
+        return Some(slugify(repo));
+    }
+    None
 }
 
 impl std::fmt::Display for BackendIdentity {
@@ -291,6 +319,41 @@ mod tests {
     #[test]
     fn session_slug_for_jira_is_the_lowercased_project_key() {
         assert_eq!(jira("https://x.atlassian.net", "AX").session_slug(), "ax");
+    }
+
+    /// The kill-safety classifier (GitHub issue #26) recovers a session slug
+    /// from the scope string stored on run rows; both backends must
+    /// round-trip exactly.
+    #[test]
+    fn session_slug_from_scope_round_trips_both_backends() {
+        for identity in [
+            jira("https://x.atlassian.net", "PROJ"),
+            github("jowi-dev/tskmstr"),
+            github("Some_Org/repo.name"),
+        ] {
+            assert_eq!(
+                session_slug_from_scope(&identity.scope()),
+                Some(identity.session_slug()),
+                "scope {} must recover its own slug",
+                identity.scope()
+            );
+        }
+    }
+
+    /// Jira base URLs contain colons of their own; the project key is
+    /// everything after the *last* colon.
+    #[test]
+    fn session_slug_from_scope_takes_the_jira_key_after_the_last_colon() {
+        assert_eq!(
+            session_slug_from_scope("jira:https://x.atlassian.net:AX"),
+            Some("ax".to_string())
+        );
+    }
+
+    #[test]
+    fn session_slug_from_scope_rejects_legacy_and_unknown_scopes() {
+        assert_eq!(session_slug_from_scope(""), None);
+        assert_eq!(session_slug_from_scope("gitlab:some/repo"), None);
     }
 
     #[test]

@@ -1417,6 +1417,16 @@ fn run_runs(
         }) => {
             tskmstr::cli::runs::event(&store, run_id, &kind, detail.as_deref(), &mut stdout)?;
         }
+        Some(RunsCmd::KillSafety { session }) => {
+            tskmstr::cli::runs::kill_safety(
+                &store,
+                &tskmstr::work::tmux::ShellTmuxOps,
+                &ShellGhCli::new(),
+                &tskmstr::runs::pid::pid_alive,
+                &session,
+                &mut stdout,
+            )?;
+        }
         Some(RunsCmd::Reap { stale_after }) => {
             let session_alive =
                 tskmstr::work::tmux::session_alive_probe(&tskmstr::work::tmux::ShellTmuxOps);

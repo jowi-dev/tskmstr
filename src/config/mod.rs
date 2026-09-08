@@ -35,6 +35,7 @@ mod backend_identity;
 pub use backend_identity::{
     BackendIdentity, BackendIdentityResolver, FakeBackendIdentityResolver,
     FsBackendIdentityResolver, compatible_lane_names, resolve_audit_host_dir,
+    session_slug_from_scope,
 };
 
 /// Raw, partially-specified configuration as parsed directly from TOML.

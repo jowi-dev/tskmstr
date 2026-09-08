@@ -2084,6 +2084,28 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Every recorded run, across every scope and kind, newest first (by
+    /// `started_at`, breaking ties by `id`, both descending).
+    ///
+    /// Exists for the kill-safety classifier (GitHub issue #26), which maps
+    /// an arbitrary tmux session name onto whatever runs it may host — it
+    /// cannot pre-filter by ticket or scope because the session name is the
+    /// input, not the row key.
+    pub fn all_runs(&self) -> Result<Vec<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             ORDER BY started_at DESC, id DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], Self::row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<Run>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns the run with id `run_id`, or `None` if no such row exists.
     ///
     /// Used by `tm runs watch`'s detail window, which navigates by row id
@@ -3767,6 +3789,44 @@ mod tests {
             RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
             other => panic!("expected RunNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn all_runs_returns_every_scope_newest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let first = store
+            .start_run(&StartRun {
+                scope: "github:a/b".to_string(),
+                ticket: "GH-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let second = store
+            .start_run(&StartRun {
+                scope: "github:c/d".to_string(),
+                ticket: "GH-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let runs = store.all_runs().unwrap();
+
+        assert_eq!(
+            runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![second, first],
+            "every scope and kind, newest first"
+        );
     }
 
     #[test]

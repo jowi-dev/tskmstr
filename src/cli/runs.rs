@@ -16,6 +16,29 @@ use crate::runs::{
     FinishRun, Run, RunEvent, RunStatus, RunStore, RunStoreError, RunSummary, StartRun,
 };
 
+/// `tm runs kill-safety <SESSION>`: classify how dangerous killing tmux
+/// session `session` would be, for the session picker's kill confirmation
+/// (GitHub issue #26, consumed by devtools#15).
+///
+/// Output contract (pinned in
+/// `docs/decisions/0005-kill-safety-classification.md`): the first stdout
+/// line is exactly one of `live-run`, `root-session`, `safe`, or `unknown`;
+/// the second is a human-readable reason. A non-zero exit (a broken runs
+/// DB) means the caller should treat the session as `unknown`.
+pub fn kill_safety(
+    store: &RunStore,
+    tmux: &dyn crate::work::tmux::TmuxOps,
+    gh: &dyn crate::github::gh_cli::GhCli,
+    pid_alive: &dyn Fn(u32) -> bool,
+    session: &str,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let verdict = crate::work::kill_safety::classify_session(session, store, tmux, gh, pid_alive)?;
+    writeln!(out, "{}", verdict.tier.as_str())?;
+    writeln!(out, "{}", verdict.detail)?;
+    Ok(())
+}
+
 /// `tm runs reap`: mark abandoned runs (dead pid, killed tmux session,
 /// stale heartbeat) as terminal — see [`RunStore::reap`] for the exact
 /// rules.
@@ -1841,6 +1864,40 @@ mod tests {
 
     fn session_alive(_name: &str) -> bool {
         true
+    }
+
+    /// The picker contract: line 1 is the machine token, line 2 the reason.
+    #[test]
+    fn kill_safety_prints_the_tier_token_first_then_the_reason() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_tmux_session(id, "tm-x-proj-1").unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let mut out = Vec::new();
+
+        kill_safety(&store, &tmux, &gh, &always_alive, "tm-x-proj-1", &mut out)
+            .expect("should succeed");
+
+        let printed = String::from_utf8(out).unwrap();
+        let mut lines = printed.lines();
+        assert_eq!(lines.next(), Some("live-run"));
+        assert!(lines.next().unwrap_or_default().contains("PROJ-1"));
+    }
+
+    #[test]
+    fn kill_safety_prints_unknown_for_a_foreign_session() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let mut out = Vec::new();
+
+        kill_safety(&store, &tmux, &gh, &always_alive, "scratch", &mut out)
+            .expect("should succeed");
+
+        assert!(String::from_utf8(out).unwrap().starts_with("unknown\n"));
     }
 
     #[test]
