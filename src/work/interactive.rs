@@ -159,8 +159,9 @@ pub fn resolve_action_window(
 /// front of them, so the instruction is stated outright.
 ///
 /// Adoption is telemetry, not the work: if the session skips this line, the
-/// run still happens and the row is eventually reaped stale rather than
-/// finished.
+/// run still happens and the row is eventually reaped rather than finished —
+/// stale once its heartbeat ages out, or immediately if its recorded tmux
+/// session is killed (GitHub issue #26).
 pub fn registration_preamble(kind: &str, ticket: &str) -> String {
     format!(
         "First, before anything else, run this exact command to register this \

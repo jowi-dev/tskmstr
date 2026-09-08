@@ -285,6 +285,10 @@ pub fn fix(
         let target = target
             .as_ref()
             .expect("an interactive dispatch always resolves a window");
+        // Same post-`start_run` stamp as `tm work run`'s interactive path:
+        // a killed ticket session reaps this row immediately (issue #26).
+        deps.run_store
+            .update_tmux_session(prepared.run_id, &target.session_name)?;
         let prompt_path = paths.state_dir.join(format!(
             "{}-{}.prompt.md",
             prepared.wt_name, prepared.timestamp
@@ -781,6 +785,12 @@ mod tests {
                 "TSKMSTR_SESSION_RUN_ID".to_string(),
                 review_fix_run.id.to_string()
             )]
+        );
+        // The hosting session is stamped on the row so the reaper can treat
+        // a killed session as proof of death (GitHub issue #26).
+        assert_eq!(
+            review_fix_run.tmux_session,
+            Some("tm-proj-proj-1".to_string())
         );
 
         let printed = String::from_utf8(out).unwrap();

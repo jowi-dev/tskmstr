@@ -566,6 +566,14 @@ fn run_interactive(
     let prepared =
         crate::work::run::prepare_run_lane(run_deps, ctx.config, paths, lane, request, None, out)?;
 
+    // Stamp the hosting session a beat after `start_run` (which has no
+    // tmux_session field — most of its callers have no tmux host), so a
+    // kill of the ticket's session reaps this row immediately instead of
+    // waiting out the staleness window (GitHub issue #26).
+    run_deps
+        .run_store
+        .update_tmux_session(prepared.run_id, &target.session_name)?;
+
     let prompt_path = paths.state_dir.join(format!(
         "{}-{}.prompt.md",
         prepared.wt_name, prepared.timestamp
@@ -2377,6 +2385,9 @@ mod tests {
              and TSKMSTR_RUN_ID would gate it off"
         );
         assert_eq!(run_row.pid, None);
+        // The hosting session is stamped on the row so the reaper can treat
+        // a killed session as proof of death (GitHub issue #26).
+        assert_eq!(run_row.tmux_session, Some("tm-proj-proj-1".to_string()));
 
         // The prompt reaches `claude` through a file, not through the
         // command string tmux hands to `$SHELL -c`.
