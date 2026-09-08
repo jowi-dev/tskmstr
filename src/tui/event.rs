@@ -285,6 +285,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         app,
         vec![
             Cmd::FetchTickets { query },
+            Cmd::ReapRuns,
             Cmd::LoadAuditStatus,
             Cmd::LoadLaneRunStatus,
             Cmd::LoadBotWatchStatus,
@@ -1102,6 +1103,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::OpenUrl(url) => open_url(&url),
         Cmd::FetchRankTickets { query } => fetch_rank_tickets(deps, &query),
         Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
+        Cmd::ReapRuns => reap_lane_runs(deps),
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
@@ -1128,11 +1130,12 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // module docs), so they're unreachable here in practice.
         //
         // The Jira board never enters `Screen::Runs`, so `update` can never
-        // produce one of the `Load*`/`Reap*` run-store `Cmd`s for
-        // `run`/`execute` to handle either.
+        // produce `Cmd::LoadRuns`/`Cmd::LoadRunDetail` for `run`/`execute`
+        // to handle either. (`Cmd::ReapRuns` *is* a board cmd since GitHub
+        // issue #26 — the board reaps dead runs on its own poll — so it's
+        // handled above.)
         other @ (Cmd::LoadRuns
         | Cmd::LoadRunDetail { .. }
-        | Cmd::ReapRuns
         | Cmd::AttachSession { .. }
         | Cmd::LaunchCreate
         | Cmd::EnsureManualSession { .. }
@@ -1225,6 +1228,27 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
 /// reducer-side instead, by `Msg::LaneRunStatusLoaded` in `app.rs`, since
 /// this function only sees `TuiDeps` and has no access to
 /// `App::pending_lane_launches`.
+/// Run `Cmd::ReapRuns` on the board: mark runs whose process or tmux session
+/// died as terminal, so the status loads that follow on the same poll report
+/// their lanes relaunchable (GitHub issue #26). Same staleness threshold as
+/// `tm runs reap`'s default; the session probe comes from the board's own
+/// tmux seam, so tests drive it with a [`crate::work::tmux::FakeTmuxOps`].
+///
+/// Lenient like every other run-store consumer on the board: no store, no
+/// reap. A reap *error* is reported through the same [`Msg::RunsFailed`]
+/// path the watch screen uses.
+fn reap_lane_runs(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return Vec::new();
+    };
+
+    let session_alive = session_alive_probe(deps.tmux.as_ref());
+    match store.reap(10, &crate::runs::pid::pid_alive, &session_alive) {
+        Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
+        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
 fn load_lane_run_status(deps: &TuiDeps) -> Vec<Msg> {
     let Some(store) = &deps.store else {
         return vec![Msg::LaneRunStatusLoaded(HashMap::new())];
@@ -4066,6 +4090,49 @@ mod tests {
         deps.store = None;
         let msgs = load_lane_run_status(&deps);
         assert_eq!(msgs, vec![Msg::LaneRunStatusLoaded(HashMap::new())]);
+    }
+
+    /// GitHub issue #26's regression case: a run row left `running` whose
+    /// tmux session has been killed must not keep blocking the lane guard.
+    /// The board's periodic `Cmd::ReapRuns` marks it terminal from the same
+    /// tmux snapshot seam the rest of the board uses, so the very next
+    /// `Cmd::LoadLaneRunStatus` reports the lane relaunchable.
+    #[test]
+    fn board_reap_clears_a_lane_run_whose_session_died() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = Some(store);
+        // deps.tmux is a fresh FakeTmuxOps: it lists no sessions, so the
+        // recorded session reads as killed.
+
+        let msgs = execute(&deps, Cmd::ReapRuns);
+        assert_eq!(msgs, vec![Msg::RunsReaped(1)]);
+
+        let msgs = execute(&deps, Cmd::LoadLaneRunStatus);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Interrupted),
+                    "a reaped run must surface as terminal, not Running/Waiting"
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn board_reap_without_a_store_is_a_noop() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.store = None;
+
+        let msgs = execute(&deps, Cmd::ReapRuns);
+
+        assert!(msgs.is_empty());
     }
 
     #[test]
