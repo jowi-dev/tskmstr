@@ -1106,6 +1106,11 @@ pub enum Msg {
     /// ticket's session holds the configured `[work.manual]` window layout,
     /// then attach. See [`manual_session_action`].
     ManualSessionAction,
+    /// The `s` key was pressed on [`Screen::Runs`]: attach to the
+    /// highlighted run card's ticket session, resolving the session slug
+    /// from the run's own recorded scope (GitHub issue #25). See
+    /// [`run_session_action`].
+    RunSessionAction,
     /// The outcome of [`Cmd::AttachSession`] when it came from
     /// [`Msg::SessionAction`], as a ready-to-display status line.
     SessionAttachResult(String),
@@ -1740,6 +1745,7 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::AuditAction => audit_action(app),
         Msg::SessionAction => session_action(app),
         Msg::ManualSessionAction => manual_session_action(app),
+        Msg::RunSessionAction => run_session_action(app),
         Msg::SessionAttachResult(message) => {
             app.status_line = message;
             (app, Vec::new())
@@ -2138,6 +2144,38 @@ fn session_action(app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     let session_name = crate::work::naming::ticket_session_name(&app.session_slug, &ticket.key);
+    (app, vec![Cmd::AttachSession { session_name }])
+}
+
+/// Handle [`Msg::RunSessionAction`]: attach to the highlighted run card's
+/// `tm-<slug>-<key>` session on [`Screen::Runs`] (GitHub issue #25). A no-op
+/// when no card is highlighted.
+///
+/// Unconditional like [`session_action`] (no liveness pre-check: a dead or
+/// never-created session surfaces as the `tmux` failure in the status line,
+/// which cannot go stale between poll and keypress). The slug comes from the
+/// *run's own* recorded scope via
+/// [`crate::config::BackendIdentity::session_slug_for_scope`] — the watch
+/// list is machine-wide, so `app.session_slug` (the invoking repo's slug)
+/// would name the wrong session for another repo's run. Legacy unscoped rows
+/// fall back to `app.session_slug`; when that is empty too (no repo config
+/// loaded), the status line explains and no attach is attempted.
+fn run_session_action(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(card) = app.selected_run_card() else {
+        return (app, Vec::new());
+    };
+    let ticket = card.ticket.clone();
+    let scope = card.scope.clone();
+    let slug = match crate::config::BackendIdentity::session_slug_for_scope(&scope) {
+        Some(slug) => slug,
+        None if !app.session_slug.is_empty() => app.session_slug.clone(),
+        None => {
+            app.status_line =
+                format!("cannot resolve a session for {ticket}: run has no recorded scope");
+            return (app, Vec::new());
+        }
+    };
+    let session_name = crate::work::naming::ticket_session_name(&slug, &ticket);
     (app, vec![Cmd::AttachSession { session_name }])
 }
 
@@ -4785,6 +4823,69 @@ mod tests {
             runs_selected_row: row,
             ..App::new()
         }
+    }
+
+    /// GitHub issue #25: `s` on the watch screen attaches to the highlighted
+    /// run card's ticket session, resolving the session slug from the run's
+    /// own recorded scope — the watch list is machine-wide, so the invoking
+    /// repo's slug would be wrong for another repo's run.
+    #[test]
+    fn run_session_action_attaches_using_the_cards_own_scope() {
+        let mut card = run_card(1, "GH-25", crate::runs::RunStatus::Running);
+        card.scope = "github:jowi-dev/tskmstr".to_string();
+        let app = runs_app(vec![card], 1, 0);
+
+        let (_app, cmds) = update(app, Msg::RunSessionAction);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachSession {
+                session_name: "tm-jowi-dev-tskmstr-gh-25".to_string()
+            }]
+        );
+    }
+
+    /// Legacy rows recorded before scoping (issue #10) have `scope = ""`;
+    /// they fall back to the invoking repo's own slug, matching
+    /// `list_runs_filtered`'s stance that unscoped rows belong to everyone.
+    #[test]
+    fn run_session_action_falls_back_to_the_invoking_repos_slug_for_legacy_rows() {
+        let card = run_card(1, "PROJ-1", crate::runs::RunStatus::Running);
+        let mut app = runs_app(vec![card], 1, 0);
+        app.session_slug = "proj".to_string();
+
+        let (_app, cmds) = update(app, Msg::RunSessionAction);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-proj-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn run_session_action_degrades_to_the_status_line_when_no_slug_resolves() {
+        let card = run_card(1, "PROJ-1", crate::runs::RunStatus::Running);
+        let app = runs_app(vec![card], 1, 0);
+
+        let (app, cmds) = update(app, Msg::RunSessionAction);
+
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line.contains("PROJ-1"),
+            "status line should name the ticket: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn run_session_action_is_a_no_op_with_no_card_selected() {
+        let app = runs_app(Vec::new(), 1, 0);
+
+        let (_app, cmds) = update(app, Msg::RunSessionAction);
+
+        assert!(cmds.is_empty());
     }
 
     #[test]

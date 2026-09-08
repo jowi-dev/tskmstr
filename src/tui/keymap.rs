@@ -214,6 +214,7 @@ pub fn map_key(
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('s') if *screen == Screen::Board => Some(Msg::SessionAction),
+        KeyCode::Char('s') if *screen == Screen::Runs => Some(Msg::RunSessionAction),
         KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
@@ -876,6 +877,46 @@ mod tests {
         }
     }
 
+    /// GitHub issue #25: `s` on the watch screen attaches to the highlighted
+    /// run card's session, mirroring the board's `s`.
+    #[test]
+    fn s_triggers_run_session_action_on_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('s')
+            ),
+            Some(Msg::RunSessionAction)
+        );
+    }
+
+    #[test]
+    fn s_is_inert_while_the_run_detail_overlay_is_open() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                RetroOverlay::None,
+                KeyCode::Char('s')
+            ),
+            None
+        );
+    }
+
     #[test]
     fn m_triggers_manual_session_action_on_board() {
         assert_eq!(
@@ -940,14 +981,11 @@ mod tests {
         );
     }
 
+    /// `s` is bound on [`Screen::Board`] (session attach) and, since GitHub
+    /// issue #25, on [`Screen::Runs`] (run-card attach) — nowhere else.
     #[test]
-    fn s_is_unbound_off_the_board_screen() {
-        for screen in [
-            Screen::Detail,
-            Screen::TransitionMenu,
-            Screen::Rank,
-            Screen::Runs,
-        ] {
+    fn s_is_unbound_off_the_board_and_runs_screens() {
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(
                     &screen,
