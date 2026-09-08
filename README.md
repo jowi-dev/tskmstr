@@ -104,7 +104,8 @@ tm auth status
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
 | `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>] [--findings-count <N>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown and/or the number of unresolved bot review findings (`0` for measured-clean; omit to leave it unmeasured) |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
-| `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs (stale heartbeat, dead pid) as failed |
+| `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs as terminal: a dead recorded pid or killed tmux session immediately (as `interrupted`), a stale signal-less heartbeat otherwise (as `failed`) |
+| `tm runs kill-safety <SESSION>` | Classify how dangerous killing a tmux session would be (`live-run`/`root-session`/`safe`/`unknown` on line 1, reason on line 2), for the session picker's kill confirmation — see `docs/decisions/0005-kill-safety-classification.md` |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
@@ -142,10 +143,15 @@ tm runs finish "$run_id" --status done --session-id sess-abc --cost-usd 1.23 --n
 ```
 
 `tm runs reap` (also run automatically on `tm runs watch` startup and every
-~30s while it's open) marks a run `failed` if its status is `running`, its
-last heartbeat is older than `--stale-after` minutes (default 10), and its
-recorded pid is no longer alive — a crashed runner otherwise leaves a row
-reading `running` forever.
+~30s while it's open, and on the board's status poll) marks a `running` run
+terminal. A recorded liveness signal decides immediately: a dead recorded
+pid, or a recorded-but-vanished hosting tmux session, marks the run
+`interrupted` on the spot — so a ticket session killed from the session
+picker frees its lane right away instead of blocking the board's `w` key
+for the staleness window. A row with no such signal falls back to the old
+rule: `failed` once its last heartbeat is older than `--stale-after`
+minutes (default 10). An alive recorded pid always protects a run, however
+stale.
 
 ### The `checklist` event convention
 
