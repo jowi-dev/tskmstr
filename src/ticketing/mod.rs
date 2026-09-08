@@ -1506,10 +1506,7 @@ mod tests {
             edits[0].2.add_labels,
             vec!["tm:status/in-review".to_string()]
         );
-        assert_eq!(
-            edits[0].2.remove_labels,
-            vec!["tm:status/todo".to_string()]
-        );
+        assert_eq!(edits[0].2.remove_labels, vec!["tm:status/todo".to_string()]);
     }
 
     #[test]
