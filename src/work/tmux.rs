@@ -111,6 +111,14 @@ pub struct TmuxWindow {
     pub dead: bool,
 }
 
+/// The per-session tmux user option naming the session to jump back to,
+/// shared contract with the external session picker (GitHub issues
+/// #19/#25, jowi-dev/devtools#8): tm writes it, the picker's jump-back key
+/// reads it, neither repo imports the other. The watch screen stamps it on
+/// a run's session at attach time so "back" returns to wherever monitoring
+/// happens.
+pub const ROOT_SESSION_OPTION: &str = "@root_session";
+
 /// Behavior tskmstr needs from `tmux` to provision and manage lane/worktree
 /// sessions.
 pub trait TmuxOps {

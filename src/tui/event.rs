@@ -822,6 +822,15 @@ pub struct WatchDeps {
     /// [`TuiDeps::runner`]. Not a Jira/token dependency, so it doesn't
     /// violate this struct's "local-only" stance above.
     pub runner: &'static dyn crate::agent::AgentRunner,
+    /// Used by the `s` (attach) key (GitHub issue #25) to reach the tmux
+    /// session behind the highlighted run card. Local-only, like `runner`.
+    pub tmux: Box<dyn TmuxOps>,
+    /// The invoking repo's [`crate::config::BackendIdentity::session_slug`],
+    /// or `""` when no config loads (`tm runs watch` stays lenient, like the
+    /// rest of `tm runs`). Only the fallback for legacy unscoped run rows —
+    /// scoped rows resolve their slug from their own recorded scope; see
+    /// [`crate::tui::app::Msg::RunSessionAction`].
+    pub session_slug: String,
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -842,9 +851,15 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
 
     let mut app = App {
         screen: crate::tui::app::Screen::Runs,
+        session_slug: deps.session_slug.clone(),
         ..App::new()
     };
-    app = run_watch_cmds(app, vec![Cmd::ReapRuns, Cmd::LoadRuns], &deps);
+    app = run_watch_cmds(
+        app,
+        vec![Cmd::ReapRuns, Cmd::LoadRuns],
+        &deps,
+        &mut terminal,
+    );
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
@@ -866,23 +881,58 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                 )
             {
                 let (next_app, cmds) = update(app, msg);
-                app = run_watch_cmds(next_app, cmds, &deps);
+                app = run_watch_cmds(next_app, cmds, &deps, &mut terminal);
             }
         } else {
             let (next_app, cmds) = update(app, Msg::Tick);
-            app = run_watch_cmds(next_app, cmds, &deps);
+            app = run_watch_cmds(next_app, cmds, &deps, &mut terminal);
         }
     }
 
     Ok(())
 }
 
+/// Best-effort producer side of the jump-back contract (GitHub issue #25,
+/// riding #19/devtools#8's `@root_session` option): before the watch screen
+/// switches the client into a run's session, point that session's
+/// [`crate::work::tmux::ROOT_SESSION_OPTION`] back at the session the watch
+/// client is currently in, so the external picker's jump-back key returns
+/// to the watch in one motion. Outside tmux there is no client session to
+/// record (and no need — detaching from `tmux attach-session` lands back in
+/// the watch's own terminal), and every failure is swallowed: a stamp must
+/// never block the attach itself.
+fn stamp_root_session(tmux: &dyn TmuxOps, session_name: &str) {
+    if let Ok(Some(host)) = tmux.current_session_name() {
+        let _ = tmux.set_session_option(
+            session_name,
+            crate::work::tmux::ROOT_SESSION_OPTION,
+            &host,
+        );
+    }
+}
+
 /// Execute every `Cmd` in `cmds` against [`WatchDeps`], feeding each
 /// resulting `Msg` back through `update` (which may itself produce further
-/// `Cmd`s). Mirrors [`run_cmds`].
-fn run_watch_cmds(mut app: App, cmds: Vec<Cmd>, deps: &WatchDeps) -> App {
+/// `Cmd`s). Mirrors [`run_cmds`], including its [`Cmd::AttachSession`]
+/// interception (the attach needs `&mut Terminal` to suspend/restore around
+/// the blocking call — see the module docs); the watch additionally stamps
+/// the jump-back option first, see [`stamp_root_session`].
+fn run_watch_cmds<B: Backend>(
+    mut app: App,
+    cmds: Vec<Cmd>,
+    deps: &WatchDeps,
+    terminal: &mut Terminal<B>,
+) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
+        if let Cmd::AttachSession { session_name } = cmd {
+            stamp_root_session(deps.tmux.as_ref(), &session_name);
+            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
         for msg in execute_watch(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -2751,7 +2801,77 @@ mod tests {
         WatchDeps {
             store,
             runner: &crate::agent::claude::ClaudeRunner,
+            tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
+            session_slug: String::new(),
         }
+    }
+
+    /// GitHub issue #25 swap-back: attaching from the watch screen stamps
+    /// `@root_session` on the target session with the watch client's own
+    /// session name, so the external session picker (the #19/devtools#8
+    /// contract) can jump back to the watch in one key.
+    #[test]
+    fn stamp_root_session_points_the_target_back_at_the_watch_session() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new()
+            .with_current_session_name(Ok(Some("monitoring".to_string())));
+
+        stamp_root_session(&tmux, "tm-proj-proj-1");
+
+        assert!(
+            tmux.calls()
+                .contains(&crate::work::tmux::TmuxCall::SetSessionOption {
+                    name: "tm-proj-proj-1".to_string(),
+                    option: crate::work::tmux::ROOT_SESSION_OPTION.to_string(),
+                    value: "monitoring".to_string(),
+                }),
+            "expected a @root_session stamp, got {:?}",
+            tmux.calls()
+        );
+    }
+
+    /// Outside tmux there is no client session to point back at (and no
+    /// need: detaching from `tmux attach-session` lands back in the watch's
+    /// own terminal), so nothing is stamped.
+    #[test]
+    fn stamp_root_session_is_a_no_op_outside_tmux() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+
+        stamp_root_session(&tmux, "tm-proj-proj-1");
+
+        assert!(
+            !tmux.calls().iter().any(|call| matches!(
+                call,
+                crate::work::tmux::TmuxCall::SetSessionOption { .. }
+            )),
+            "expected no stamp outside tmux, got {:?}",
+            tmux.calls()
+        );
+    }
+
+    /// The watch loop intercepts [`Cmd::AttachSession`] exactly like the
+    /// board loop (it needs `&mut Terminal`); the attach outcome becomes the
+    /// status line via [`Msg::SessionAttachResult`].
+    #[test]
+    fn run_watch_cmds_routes_attach_session_to_the_status_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let deps = watch_deps(store);
+        let mut terminal = test_terminal();
+        let app = App {
+            screen: crate::tui::app::Screen::Runs,
+            ..App::new()
+        };
+
+        let app = run_watch_cmds(
+            app,
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-proj-1".to_string(),
+            }],
+            &deps,
+            &mut terminal,
+        );
+
+        assert_eq!(app.status_line, "detached from tm-proj-proj-1");
     }
 
     fn start_params(ticket: &str) -> crate::runs::StartRun {
