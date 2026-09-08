@@ -132,6 +132,14 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE ticket_rank;
     ALTER TABLE ticket_rank_scoped RENAME TO ticket_rank;
     "#,
+    // GitHub issue #26: runs whose agent lives in a tmux window record the
+    // hosting session's name, so liveness sweeps can treat a killed session
+    // as terminal without waiting out the staleness window. NULL for runs
+    // with no tmux host (headless supervisors, `--fg`), and for rows
+    // predating this column.
+    r#"
+    ALTER TABLE runs ADD COLUMN tmux_session TEXT;
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -521,6 +529,12 @@ pub struct Run {
     /// [`StartRun::scope`]); `""` for legacy rows recorded before scoping
     /// existed or by a config-less caller.
     pub scope: String,
+    /// Name of the tmux session hosting this run's agent process, if the
+    /// launcher recorded one (see [`RunStore::update_tmux_session`]). `None`
+    /// for headless runs and rows predating the column. A recorded session
+    /// that no longer exists is treated as proof of death by
+    /// [`RunStore::reap`].
+    pub tmux_session: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1622,6 +1636,35 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records the name of the tmux session hosting `run_id`'s agent
+    /// process, without touching status, heartbeat, or any other column.
+    ///
+    /// Exists for tmux-hosted interactive launches (GitHub issue #26):
+    /// [`StartRun`] has no `tmux_session` field because most callers have no
+    /// tmux host, but an interactive work/fix launch knows its
+    /// [`crate::work::interactive::ActionWindow`] before it spawns anything,
+    /// so this stamps the session name onto the row [`start_run`] just
+    /// created. A recorded session that later disappears lets
+    /// [`RunStore::reap`] declare the run dead immediately instead of
+    /// waiting out the staleness window.
+    ///
+    /// [`start_run`]: RunStore::start_run
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_tmux_session(&self, run_id: i64, session: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET tmux_session = ?1 WHERE id = ?2",
+            params![session, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Appends an event to a run and bumps the run's heartbeat, atomically.
     ///
     /// `detail` is stored as-is; validating it (e.g. as JSON) is the CLI
@@ -1903,7 +1946,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
@@ -1927,7 +1970,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
@@ -1960,7 +2003,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
@@ -1983,7 +2026,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE id = ?1";
@@ -1997,7 +2040,8 @@ impl RunStore {
     /// Maps one row of the `id, ticket, lane, kind, status, session_id,
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
-    /// model_usage, log_path, findings_count, scope, age_secs` projection (shared
+    /// model_usage, log_path, findings_count, scope, tmux_session, age_secs`
+    /// projection (shared
     /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
     /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -2028,7 +2072,8 @@ impl RunStore {
             log_path: row.get(19)?,
             findings_count: row.get(20)?,
             scope: row.get(21)?,
-            age_secs: row.get(22)?,
+            tmux_session: row.get(22)?,
+            age_secs: row.get(23)?,
         })
     }
 
@@ -2534,7 +2579,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_9() {
+    fn open_migrates_a_fresh_db_to_user_version_10() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -2542,7 +2587,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -3649,6 +3694,51 @@ mod tests {
 
         let err = store
             .update_session_id(999, "sess-abc")
+            .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_tmux_session_records_the_hosting_session_and_leaves_other_columns_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let before = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(before.tmux_session, None);
+
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.tmux_session, Some("tm-proj-proj-1".to_string()));
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.pid, None);
+    }
+
+    #[test]
+    fn update_tmux_session_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .update_tmux_session(999, "tm-proj-proj-1")
             .expect_err("expected RunNotFound");
 
         match err {
