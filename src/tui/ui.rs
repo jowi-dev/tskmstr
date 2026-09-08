@@ -149,13 +149,28 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
     }
 }
 
-/// The status bar's left-hand text: the active assignee filter (when it
-/// isn't `Me`) prefixed onto `app.status_line`.
+/// The status bar's left-hand text: the active filter — the board's
+/// assignee filter (when it isn't `Me`), or the watch screen's kind/scope
+/// view filters (GitHub issue #25) — prefixed onto `app.status_line`.
 fn status_line_text(app: &App) -> String {
-    if app.screen == Screen::Rank || app.filter == AssigneeFilter::Me {
-        return app.status_line.clone();
-    }
-    let filter_text = format!("Filter: {}", app.filter.label());
+    let filter_text = if app.screen == Screen::Runs {
+        let mut parts = Vec::new();
+        if let Some(kind) = &app.runs_kind_filter {
+            parts.push(format!("kind {kind}"));
+        }
+        if let Some(scope) = &app.runs_scope_filter {
+            parts.push(format!("scope {scope}"));
+        }
+        if parts.is_empty() {
+            return app.status_line.clone();
+        }
+        format!("Filter: {}", parts.join(", "))
+    } else {
+        if app.screen == Screen::Rank || app.filter == AssigneeFilter::Me {
+            return app.status_line.clone();
+        }
+        format!("Filter: {}", app.filter.label())
+    };
     if app.status_line.is_empty() {
         filter_text
     } else {
@@ -2816,6 +2831,30 @@ mod tests {
             runs: cards,
             ..App::new()
         }
+    }
+
+    /// GitHub issue #25 view controls: active kind/scope filters stay
+    /// visible as a status-bar prefix, mirroring the board's assignee-filter
+    /// prefix, so the operator never mistakes a filtered view for the whole.
+    #[test]
+    fn status_line_prefixes_active_run_view_filters_on_the_runs_screen() {
+        let mut app = runs_app(vec![]);
+        app.status_line = "Reaped 1 dead run(s)".to_string();
+        app.runs_kind_filter = Some("lane".to_string());
+        app.runs_scope_filter = Some("github:a/b".to_string());
+
+        assert_eq!(
+            status_line_text(&app),
+            "Filter: kind lane, scope github:a/b  |  Reaped 1 dead run(s)"
+        );
+    }
+
+    #[test]
+    fn status_line_is_unprefixed_with_no_run_view_filters() {
+        let mut app = runs_app(vec![]);
+        app.status_line = "Reaped 1 dead run(s)".to_string();
+
+        assert_eq!(status_line_text(&app), "Reaped 1 dead run(s)");
     }
 
     #[test]

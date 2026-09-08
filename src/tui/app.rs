@@ -696,6 +696,15 @@ pub struct App {
     /// Index into the selected run column's cards of the currently selected
     /// card. Always clamped into bounds (`0` when the column is empty).
     pub runs_selected_row: usize,
+    /// When `Some`, only run cards of this kind are shown on
+    /// [`Screen::Runs`]; cycled by the `f` key (GitHub issue #25). Applied
+    /// in [`App::runs_in_col`], so rendering, selection clamping, and column
+    /// counts all agree.
+    pub runs_kind_filter: Option<String>,
+    /// When `Some`, only run cards recorded under this scope (see
+    /// [`RunCard::scope`]) are shown on [`Screen::Runs`]; cycled by the `F`
+    /// key. Applied in [`App::runs_in_col`] like `runs_kind_filter`.
+    pub runs_scope_filter: Option<String>,
     /// Whether the run detail floating window is shown.
     pub show_run_detail: bool,
     /// Detail for the run shown in the floating window, `None` while it's
@@ -870,14 +879,28 @@ impl App {
         options
     }
 
-    /// The run cards in `self.runs` whose status is `RUN_COLUMNS[col]`,
+    /// The run cards in `self.runs` whose status is `RUN_COLUMNS[col]` and
+    /// which pass the active kind/scope view filters (GitHub issue #25),
     /// preserving `self.runs`' order. Empty (rather than panicking) if `col`
     /// is out of bounds.
     pub fn runs_in_col(&self, col: usize) -> Vec<&RunCard> {
         let Some(status) = RUN_COLUMNS.get(col) else {
             return Vec::new();
         };
-        self.runs.iter().filter(|c| c.status == *status).collect()
+        self.runs
+            .iter()
+            .filter(|c| c.status == *status)
+            .filter(|c| {
+                self.runs_kind_filter
+                    .as_deref()
+                    .is_none_or(|kind| c.kind == kind)
+            })
+            .filter(|c| {
+                self.runs_scope_filter
+                    .as_deref()
+                    .is_none_or(|scope| c.scope == scope)
+            })
+            .collect()
     }
 
     /// The currently highlighted run card on [`Screen::Runs`], if any.
@@ -1111,6 +1134,14 @@ pub enum Msg {
     /// from the run's own recorded scope (GitHub issue #25). See
     /// [`run_session_action`].
     RunSessionAction,
+    /// The `f` key was pressed on [`Screen::Runs`]: advance the kind view
+    /// filter to the next distinct kind among the loaded runs (then back to
+    /// unfiltered). See [`cycle_run_kind_filter`].
+    CycleRunKindFilter,
+    /// The `F` key was pressed on [`Screen::Runs`]: advance the scope view
+    /// filter, like [`Msg::CycleRunKindFilter`] but over recorded scopes.
+    /// See [`cycle_run_scope_filter`].
+    CycleRunScopeFilter,
     /// The outcome of [`Cmd::AttachSession`] when it came from
     /// [`Msg::SessionAction`], as a ready-to-display status line.
     SessionAttachResult(String),
@@ -1746,6 +1777,8 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::SessionAction => session_action(app),
         Msg::ManualSessionAction => manual_session_action(app),
         Msg::RunSessionAction => run_session_action(app),
+        Msg::CycleRunKindFilter => cycle_run_kind_filter(app),
+        Msg::CycleRunScopeFilter => cycle_run_scope_filter(app),
         Msg::SessionAttachResult(message) => {
             app.status_line = message;
             (app, Vec::new())
@@ -2177,6 +2210,65 @@ fn run_session_action(mut app: App) -> (App, Vec<Cmd>) {
     };
     let session_name = crate::work::naming::ticket_session_name(&slug, &ticket);
     (app, vec![Cmd::AttachSession { session_name }])
+}
+
+/// The value after `current` in a cycle over `values` plus "no filter":
+/// `None` steps to the first value, the last value steps back to `None`, and
+/// a `current` no longer present in `values` (its runs vanished between
+/// keypresses) restarts from the first value.
+fn next_cycle_value(values: &[String], current: Option<&str>) -> Option<String> {
+    match current {
+        None => values.first().cloned(),
+        Some(current) => match values.iter().position(|v| v == current) {
+            Some(index) => values.get(index + 1).cloned(),
+            None => values.first().cloned(),
+        },
+    }
+}
+
+/// The distinct non-empty values `field` takes across the loaded run cards,
+/// sorted — the cycle order for the watch screen's view filters.
+fn distinct_run_values(app: &App, field: impl Fn(&RunCard) -> &str) -> Vec<String> {
+    let mut values: Vec<String> = app
+        .runs
+        .iter()
+        .map(|card| field(card).to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// Handle [`Msg::CycleRunKindFilter`] (GitHub issue #25 view controls):
+/// advance `runs_kind_filter` through the distinct kinds among the loaded
+/// runs, then back to unfiltered, reporting the new state on the status
+/// line. The selection is re-clamped because the highlighted column may
+/// have just lost cards.
+fn cycle_run_kind_filter(mut app: App) -> (App, Vec<Cmd>) {
+    let kinds = distinct_run_values(&app, |card| &card.kind);
+    app.runs_kind_filter = next_cycle_value(&kinds, app.runs_kind_filter.as_deref());
+    app.status_line = match &app.runs_kind_filter {
+        Some(kind) => format!("showing kind: {kind}"),
+        None => "kind filter cleared".to_string(),
+    };
+    clamp_runs_row(&mut app);
+    (app, Vec::new())
+}
+
+/// Handle [`Msg::CycleRunScopeFilter`]: like [`cycle_run_kind_filter`], over
+/// the runs' recorded scopes. Legacy unscoped rows (`scope = ""`) are not a
+/// meaningful bucket, so `distinct_run_values` drops them from the cycle —
+/// they are visible only while no scope filter is active.
+fn cycle_run_scope_filter(mut app: App) -> (App, Vec<Cmd>) {
+    let scopes = distinct_run_values(&app, |card| &card.scope);
+    app.runs_scope_filter = next_cycle_value(&scopes, app.runs_scope_filter.as_deref());
+    app.status_line = match &app.runs_scope_filter {
+        Some(scope) => format!("showing scope: {scope}"),
+        None => "scope filter cleared".to_string(),
+    };
+    clamp_runs_row(&mut app);
+    (app, Vec::new())
 }
 
 /// Handle [`Msg::ManualSessionAction`]: ensure the selected board ticket's
@@ -4886,6 +4978,88 @@ mod tests {
         let (_app, cmds) = update(app, Msg::RunSessionAction);
 
         assert!(cmds.is_empty());
+    }
+
+    /// GitHub issue #25 view controls: `f`/`F` cycle a kind/scope filter so
+    /// a wall of cards stays readable. Filtering happens in `runs_in_col`,
+    /// the single point every render/selection path already flows through.
+    #[test]
+    fn runs_in_col_applies_the_kind_filter() {
+        let lane = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        let mut audit = run_card(2, "GH-2", crate::runs::RunStatus::Running);
+        audit.kind = "audit".to_string();
+        let mut app = runs_app(vec![lane, audit], 1, 0);
+        app.runs_kind_filter = Some("audit".to_string());
+
+        let cards = app.runs_in_col(1);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, 2);
+    }
+
+    #[test]
+    fn runs_in_col_applies_the_scope_filter() {
+        let mut here = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        here.scope = "github:a/b".to_string();
+        let mut there = run_card(2, "GH-2", crate::runs::RunStatus::Running);
+        there.scope = "github:c/d".to_string();
+        let mut app = runs_app(vec![here, there], 1, 0);
+        app.runs_scope_filter = Some("github:c/d".to_string());
+
+        let cards = app.runs_in_col(1);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, 2);
+    }
+
+    #[test]
+    fn cycle_run_kind_filter_walks_each_kind_then_clears() {
+        let lane = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        let mut audit = run_card(2, "GH-2", crate::runs::RunStatus::Running);
+        audit.kind = "audit".to_string();
+        let app = runs_app(vec![lane, audit], 1, 0);
+
+        let (app, _) = update(app, Msg::CycleRunKindFilter);
+        assert_eq!(app.runs_kind_filter.as_deref(), Some("audit"));
+        assert!(app.status_line.contains("audit"), "{}", app.status_line);
+
+        let (app, _) = update(app, Msg::CycleRunKindFilter);
+        assert_eq!(app.runs_kind_filter.as_deref(), Some("lane"));
+
+        let (app, _) = update(app, Msg::CycleRunKindFilter);
+        assert_eq!(app.runs_kind_filter, None);
+    }
+
+    /// Legacy pre-scoping rows have `scope = ""`; an empty scope is not a
+    /// meaningful bucket to filter on, so the cycle skips it — unscoped rows
+    /// are only visible with no scope filter active.
+    #[test]
+    fn cycle_run_scope_filter_skips_unscoped_rows() {
+        let legacy = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        let mut scoped = run_card(2, "GH-2", crate::runs::RunStatus::Running);
+        scoped.scope = "github:a/b".to_string();
+        let app = runs_app(vec![legacy, scoped], 1, 0);
+
+        let (app, _) = update(app, Msg::CycleRunScopeFilter);
+        assert_eq!(app.runs_scope_filter.as_deref(), Some("github:a/b"));
+
+        let (app, _) = update(app, Msg::CycleRunScopeFilter);
+        assert_eq!(app.runs_scope_filter, None);
+    }
+
+    #[test]
+    fn cycling_a_filter_reclamps_the_selection() {
+        let lane_a = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        let lane_b = run_card(2, "GH-2", crate::runs::RunStatus::Running);
+        let mut audit = run_card(3, "GH-3", crate::runs::RunStatus::Running);
+        audit.kind = "audit".to_string();
+        let app = runs_app(vec![lane_a, lane_b, audit], 1, 2);
+
+        // First cycle lands on "audit" (sorted first), leaving one card in
+        // the column; row 2 must clamp back into bounds.
+        let (app, _) = update(app, Msg::CycleRunKindFilter);
+        assert_eq!(app.runs_kind_filter.as_deref(), Some("audit"));
+        assert_eq!(app.runs_selected_row, 0);
     }
 
     #[test]

@@ -210,6 +210,8 @@ pub fn map_key(
         KeyCode::Char('O') => Some(Msg::OpenInBrowser),
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
+        KeyCode::Char('f') if *screen == Screen::Runs => Some(Msg::CycleRunKindFilter),
+        KeyCode::Char('F') if *screen == Screen::Runs => Some(Msg::CycleRunScopeFilter),
         KeyCode::Char('A') if *screen == Screen::Board => Some(Msg::OpenAssignPicker),
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
@@ -914,6 +916,46 @@ mod tests {
                 KeyCode::Char('s')
             ),
             None
+        );
+    }
+
+    /// GitHub issue #25 view controls: `f` cycles the kind filter and `F`
+    /// the scope filter on the watch screen.
+    #[test]
+    fn f_cycles_the_kind_filter_on_the_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('f')
+            ),
+            Some(Msg::CycleRunKindFilter)
+        );
+    }
+
+    #[test]
+    fn capital_f_cycles_the_scope_filter_on_the_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('F')
+            ),
+            Some(Msg::CycleRunScopeFilter)
         );
     }
 
@@ -2105,12 +2147,9 @@ mod tests {
             ),
             Some(Msg::ReviewFixAction)
         );
-        for screen in [
-            Screen::Detail,
-            Screen::TransitionMenu,
-            Screen::Rank,
-            Screen::Runs,
-        ] {
+        // `Screen::Runs` binds `F` too (the scope view filter, issue #25),
+        // so it is deliberately absent from this unbound sweep.
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(
                     &screen,
