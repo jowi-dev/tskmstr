@@ -487,6 +487,10 @@ pub fn create_ticket(
 /// matching transition, or the transition API call itself failing — is
 /// reported as a [`StatusTransition::Warning`], since the ticket has
 /// already been created (and, where applicable, linked) by this point.
+/// A no-match warning is actionable (GitHub issue #24): it lists the
+/// transitions the ticket does have (via [`format_transitions`]), points at
+/// the `status_on_pr`/`status_on_create` config keys the target came from,
+/// and names `tm ticket transition` as the manual recovery.
 fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
     let target = &jira.normalize_status_target(target);
     let transitions = match jira.transitions(key) {
@@ -500,7 +504,10 @@ fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -
 
     let Some(transition) = find_matching_transition(&transitions, target) else {
         return StatusTransition::Warning(format!(
-            "no transition to \"{target}\" found for {key}; leaving it in its initial status"
+            "no transition to \"{target}\" found for {key} ({}); check the configured \
+             status_on_pr/status_on_create, or move it manually with \
+             `tm ticket transition {key} \"<STATUS>\"`",
+            format_transitions(&transitions)
         ));
     };
 
@@ -1770,6 +1777,37 @@ mod tests {
         // The ticket was still created and linked.
         assert_eq!(outcome.issue_key, "PROJ-9");
         assert_eq!(jira.add_remote_link_calls().len(), 1);
+    }
+
+    #[test]
+    fn no_matching_transition_warning_names_available_transitions_and_recovery() {
+        // GitHub issue #24: the advisory warning must be actionable — state
+        // what statuses the ticket *can* move to and the command that
+        // recovers — instead of the bare "leaving it in its initial status".
+        let jira = FakeJiraClient::new().with_transitions(
+            "PROJ-9",
+            vec![transition("11", "Start Progress", "In Progress")],
+        );
+
+        let outcome = apply_status_transition(&jira, "PROJ-9", "In Review");
+
+        match outcome {
+            StatusTransition::Warning(msg) => {
+                assert!(
+                    msg.contains("available transitions: Start Progress -> In Progress"),
+                    "warning should list the available transitions: {msg}"
+                );
+                assert!(
+                    msg.contains("status_on_pr"),
+                    "warning should point at the configured status name: {msg}"
+                );
+                assert!(
+                    msg.contains("tm ticket transition PROJ-9"),
+                    "warning should name the recovery command: {msg}"
+                );
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
     }
 
     #[test]
