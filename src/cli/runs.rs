@@ -1767,6 +1767,7 @@ mod tests {
             last_event_kind: Some("tool_use".to_string()),
             last_event_age_secs: Some(45),
             awaiting_input: false,
+            scope: String::new(),
         };
 
         assert_eq!(last_event_column(&run), "tool_use 45s ago");
@@ -1785,6 +1786,7 @@ mod tests {
             last_event_kind: None,
             last_event_age_secs: None,
             awaiting_input: false,
+            scope: String::new(),
         };
 
         assert_eq!(last_event_column(&run), "-");

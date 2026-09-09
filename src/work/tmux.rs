@@ -111,6 +111,14 @@ pub struct TmuxWindow {
     pub dead: bool,
 }
 
+/// The per-session tmux user option naming the session to jump back to,
+/// shared contract with the external session picker (GitHub issues
+/// #19/#25, jowi-dev/devtools#8): tm writes it, the picker's jump-back key
+/// reads it, neither repo imports the other. The watch screen stamps it on
+/// a run's session at attach time so "back" returns to wherever monitoring
+/// happens.
+pub const ROOT_SESSION_OPTION: &str = "@root_session";
+
 /// Behavior tskmstr needs from `tmux` to provision and manage lane/worktree
 /// sessions.
 pub trait TmuxOps {
@@ -215,6 +223,19 @@ pub trait TmuxOps {
     /// server running yields `Ok(vec![])`, and malformed rows are dropped
     /// rather than erroring.
     fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError>;
+
+    /// Set a session option on session `name`
+    /// (`tmux set-option -t <name> <option> <value>`), e.g. the
+    /// `@root_session` per-session user option of the jump-back picker
+    /// contract (GitHub issues #19/#25: tm writes the option, the external
+    /// session picker reads it; neither repo imports the other).
+    fn set_session_option(&self, name: &str, option: &str, value: &str) -> Result<(), TmuxError>;
+
+    /// The name of the tmux session this process's client is currently in
+    /// (`tmux display-message -p '#{session_name}'`), or `Ok(None)` when not
+    /// running inside tmux at all (see [`is_inside_tmux`]) — outside tmux
+    /// there is no "current session" to name.
+    fn current_session_name(&self) -> Result<Option<String>, TmuxError>;
 }
 
 /// Given a lane/session's configured extra windows and primary window name,
@@ -429,6 +450,24 @@ fn attach_args(name: &str, inside_tmux: bool) -> Vec<String> {
         "attach-session"
     };
     vec![verb.to_string(), "-t".to_string(), name.to_string()]
+}
+
+fn set_session_option_args(name: &str, option: &str, value: &str) -> Vec<String> {
+    vec![
+        "set-option".to_string(),
+        "-t".to_string(),
+        name.to_string(),
+        option.to_string(),
+        value.to_string(),
+    ]
+}
+
+fn current_session_name_args() -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "#{session_name}".to_string(),
+    ]
 }
 
 fn kill_session_args(name: &str) -> Vec<String> {
@@ -657,6 +696,24 @@ impl TmuxOps for ShellTmuxOps {
             &output.stdout,
         )))
     }
+
+    fn set_session_option(&self, name: &str, option: &str, value: &str) -> Result<(), TmuxError> {
+        let output = run(
+            "tmux set-option",
+            &set_session_option_args(name, option, value),
+        )?;
+        require_success("tmux set-option", &output)
+    }
+
+    fn current_session_name(&self) -> Result<Option<String>, TmuxError> {
+        if !is_inside_tmux(std::env::var_os("TMUX").as_deref()) {
+            return Ok(None);
+        }
+        let output = run("tmux display-message", &current_session_name_args())?;
+        require_success("tmux display-message", &output)?;
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok((!name.is_empty()).then_some(name))
+    }
 }
 
 /// A [`TmuxOps`] test double: returns canned results and records every call
@@ -672,6 +729,7 @@ pub struct FakeTmuxOps {
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
     list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
     attach_outcome: std::cell::RefCell<AttachOutcome>,
+    current_session_name_result: std::cell::RefCell<Result<Option<String>, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -745,6 +803,17 @@ pub enum TmuxCall {
     ListSessions,
     /// `list_windows()`.
     ListWindows,
+    /// `set_session_option(name, option, value)`.
+    SetSessionOption {
+        /// Session name.
+        name: String,
+        /// Option name, e.g. `@root_session`.
+        option: String,
+        /// Option value.
+        value: String,
+    },
+    /// `current_session_name()`.
+    CurrentSessionName,
 }
 
 impl FakeTmuxOps {
@@ -757,6 +826,7 @@ impl FakeTmuxOps {
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
             list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
             attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
+            current_session_name_result: std::cell::RefCell::new(Ok(None)),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -782,6 +852,12 @@ impl FakeTmuxOps {
     /// Set the [`AttachOutcome`] a successful `attach` will report.
     pub fn with_attach_outcome(self, outcome: AttachOutcome) -> Self {
         *self.attach_outcome.borrow_mut() = outcome;
+        self
+    }
+
+    /// Set the result `current_session_name` will return.
+    pub fn with_current_session_name(self, result: Result<Option<String>, TmuxError>) -> Self {
+        *self.current_session_name_result.borrow_mut() = result;
         self
     }
 
@@ -887,6 +963,20 @@ impl TmuxOps for FakeTmuxOps {
     fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::ListWindows);
         self.list_windows_result.borrow().clone()
+    }
+
+    fn set_session_option(&self, name: &str, option: &str, value: &str) -> Result<(), TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::SetSessionOption {
+            name: name.to_string(),
+            option: option.to_string(),
+            value: value.to_string(),
+        });
+        Ok(())
+    }
+
+    fn current_session_name(&self) -> Result<Option<String>, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::CurrentSessionName);
+        self.current_session_name_result.borrow().clone()
     }
 }
 
@@ -1054,6 +1144,59 @@ mod tests {
         assert_eq!(
             attach_args("axiom-lane", true),
             vec!["switch-client", "-t", "axiom-lane"]
+        );
+    }
+
+    #[test]
+    fn set_session_option_args_target_the_session() {
+        assert_eq!(
+            set_session_option_args("tm-ax-ax-401", "@root_session", "monitoring"),
+            vec![
+                "set-option",
+                "-t",
+                "tm-ax-ax-401",
+                "@root_session",
+                "monitoring"
+            ]
+        );
+    }
+
+    #[test]
+    fn current_session_name_args_print_the_session_name() {
+        assert_eq!(
+            current_session_name_args(),
+            vec!["display-message", "-p", "#{session_name}"]
+        );
+    }
+
+    #[test]
+    fn fake_records_set_session_option() {
+        let fake = FakeTmuxOps::new();
+        fake.set_session_option("tm-ax-ax-401", "@root_session", "monitoring")
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![TmuxCall::SetSessionOption {
+                name: "tm-ax-ax-401".to_string(),
+                option: "@root_session".to_string(),
+                value: "monitoring".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn fake_current_session_name_defaults_to_none() {
+        let fake = FakeTmuxOps::new();
+        assert_eq!(fake.current_session_name().unwrap(), None);
+        assert_eq!(fake.calls(), vec![TmuxCall::CurrentSessionName]);
+    }
+
+    #[test]
+    fn fake_current_session_name_returns_configured_value() {
+        let fake = FakeTmuxOps::new().with_current_session_name(Ok(Some("monitoring".to_string())));
+        assert_eq!(
+            fake.current_session_name().unwrap(),
+            Some("monitoring".to_string())
         );
     }
 
