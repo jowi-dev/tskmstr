@@ -210,10 +210,13 @@ pub fn map_key(
         KeyCode::Char('O') => Some(Msg::OpenInBrowser),
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('f') if *screen == Screen::Board => Some(Msg::OpenFilterPicker),
+        KeyCode::Char('f') if *screen == Screen::Runs => Some(Msg::CycleRunKindFilter),
+        KeyCode::Char('F') if *screen == Screen::Runs => Some(Msg::CycleRunScopeFilter),
         KeyCode::Char('A') if *screen == Screen::Board => Some(Msg::OpenAssignPicker),
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('s') if *screen == Screen::Board => Some(Msg::SessionAction),
+        KeyCode::Char('s') if *screen == Screen::Runs => Some(Msg::RunSessionAction),
         KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
@@ -876,6 +879,86 @@ mod tests {
         }
     }
 
+    /// GitHub issue #25: `s` on the watch screen attaches to the highlighted
+    /// run card's session, mirroring the board's `s`.
+    #[test]
+    fn s_triggers_run_session_action_on_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('s')
+            ),
+            Some(Msg::RunSessionAction)
+        );
+    }
+
+    #[test]
+    fn s_is_inert_while_the_run_detail_overlay_is_open() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                RetroOverlay::None,
+                KeyCode::Char('s')
+            ),
+            None
+        );
+    }
+
+    /// GitHub issue #25 view controls: `f` cycles the kind filter and `F`
+    /// the scope filter on the watch screen.
+    #[test]
+    fn f_cycles_the_kind_filter_on_the_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('f')
+            ),
+            Some(Msg::CycleRunKindFilter)
+        );
+    }
+
+    #[test]
+    fn capital_f_cycles_the_scope_filter_on_the_runs_screen() {
+        assert_eq!(
+            map_key(
+                &Screen::Runs,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('F')
+            ),
+            Some(Msg::CycleRunScopeFilter)
+        );
+    }
+
     #[test]
     fn m_triggers_manual_session_action_on_board() {
         assert_eq!(
@@ -940,14 +1023,11 @@ mod tests {
         );
     }
 
+    /// `s` is bound on [`Screen::Board`] (session attach) and, since GitHub
+    /// issue #25, on [`Screen::Runs`] (run-card attach) — nowhere else.
     #[test]
-    fn s_is_unbound_off_the_board_screen() {
-        for screen in [
-            Screen::Detail,
-            Screen::TransitionMenu,
-            Screen::Rank,
-            Screen::Runs,
-        ] {
+    fn s_is_unbound_off_the_board_and_runs_screens() {
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(
                     &screen,
@@ -2067,12 +2147,9 @@ mod tests {
             ),
             Some(Msg::ReviewFixAction)
         );
-        for screen in [
-            Screen::Detail,
-            Screen::TransitionMenu,
-            Screen::Rank,
-            Screen::Runs,
-        ] {
+        // `Screen::Runs` binds `F` too (the scope view filter, issue #25),
+        // so it is deliberately absent from this unbound sweep.
+        for screen in [Screen::Detail, Screen::TransitionMenu, Screen::Rank] {
             assert_eq!(
                 map_key(
                     &screen,

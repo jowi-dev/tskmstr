@@ -1485,6 +1485,11 @@ fn run_runs(
             tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps {
                 store,
                 runner: agent_runner_or_default(full_config.as_ref()),
+                tmux: Box::new(tskmstr::work::tmux::ShellTmuxOps::new()),
+                session_slug: full_config
+                    .as_ref()
+                    .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).session_slug())
+                    .unwrap_or_default(),
             })?;
         }
         Some(RunsCmd::Logs {

@@ -453,6 +453,10 @@ pub struct RunSummary {
     /// Whether the run is currently awaiting user input; see
     /// [`is_awaiting_input`].
     pub awaiting_input: bool,
+    /// The ticket namespace the run was recorded under (see
+    /// [`StartRun::scope`]); `""` for legacy rows recorded before scoping
+    /// existed.
+    pub scope: String,
 }
 
 /// A run's bot-findings outcome bucket, as measured by `findings_count`; see
@@ -1772,7 +1776,8 @@ impl RunStore {
                 ELSE NULL END AS heartbeat_age_secs,
                 (SELECT e.kind FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_kind,
                 (SELECT CAST((julianday('now') - julianday(e.at)) * 86400 AS INTEGER)
-                    FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_age_secs
+                    FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_age_secs,
+                r.scope
              FROM runs r
              WHERE (?1 IS NULL OR r.kind = ?1)
                 AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
@@ -1800,6 +1805,7 @@ impl RunStore {
                 last_event_kind,
                 last_event_age_secs: row.get(8)?,
                 awaiting_input,
+                scope: row.get(9)?,
             })
         })?;
 
@@ -4037,6 +4043,43 @@ mod tests {
         let audit_run = runs.iter().find(|r| r.id == audit_id).unwrap();
         assert_eq!(lane_run.kind, "lane");
         assert_eq!(audit_run.kind, "audit");
+    }
+
+    #[test]
+    fn list_runs_surfaces_scope() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let scoped_id = store
+            .start_run(&StartRun {
+                scope: "github:jowi-dev/tskmstr".to_string(),
+                ticket: "GH-25".to_string(),
+                lane: "tskmstr".to_string(),
+                worktree: "/tmp/wt-gh25".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let legacy_id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt-legacy".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let runs = store.list_runs().unwrap();
+        let scoped = runs.iter().find(|r| r.id == scoped_id).unwrap();
+        let legacy = runs.iter().find(|r| r.id == legacy_id).unwrap();
+        assert_eq!(scoped.scope, "github:jowi-dev/tskmstr");
+        assert_eq!(legacy.scope, "");
     }
 
     #[test]

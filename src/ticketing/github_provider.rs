@@ -478,6 +478,29 @@ fn transition_edit_request(
     }
 }
 
+/// The label a failed `gh issue edit` reported as nonexistent, if that's
+/// what the failure was.
+///
+/// `gh issue edit --add-label X` against a repo that doesn't have label `X`
+/// fails with `failed to update <url>: 'X' not found` on stderr (captured
+/// live against gh 2.x for GitHub issue #24). Matching is anchored to the
+/// exact `'<label>' not found` fragment for each label the edit tried to
+/// add, so an unrelated failure whose stderr merely mentions "not found"
+/// (e.g. the issue itself missing) is never misclassified as a missing
+/// label.
+fn missing_label_in_error(
+    err: &crate::github::gh_cli::GhError,
+    add_labels: &[String],
+) -> Option<String> {
+    let crate::github::gh_cli::GhError::Command { stderr, .. } = err else {
+        return None;
+    };
+    add_labels
+        .iter()
+        .find(|label| stderr.contains(&format!("'{label}' not found")))
+        .cloned()
+}
+
 /// Classify a [`GhCli::issue_view`] failure for `key`: a [`GhError::Command`]
 /// (the process ran and `gh` itself reported failure -- typically the issue
 /// or repo doesn't exist or isn't visible) becomes
@@ -575,6 +598,12 @@ impl TicketProvider for GithubProvider<'_> {
         Ok(synthesize_transitions(closed, &info.labels))
     }
 
+    /// Applies a synthesized transition as a `tm:status/*` label swap. A
+    /// label-edit failure caused by the target label not existing in the
+    /// repo (the repo never ran `tm backend init-labels` — GitHub issue
+    /// #24's cheapest-to-hit failure mode) is reported with the missing
+    /// label, the repo, and the recovery command, instead of `gh`'s bare
+    /// `'<label>' not found`; see [`missing_label_in_error`].
     fn transition(&self, key: &str, transition_id: &str) -> Result<(), ProviderError> {
         let number = parse_issue_number(key)?;
         let info = self
@@ -587,9 +616,19 @@ impl TicketProvider for GithubProvider<'_> {
                 message: format!("unknown transition id {transition_id:?} for the github backend"),
             }
         })?;
-        self.gh
-            .issue_edit(&self.repo, number, &req)
-            .map_err(ProviderError::from)
+        self.gh.issue_edit(&self.repo, number, &req).map_err(|err| {
+            match missing_label_in_error(&err, &req.add_labels) {
+                Some(label) => ProviderError::Api {
+                    status: 0,
+                    message: format!(
+                        "the \"{label}\" label does not exist in {}; run `tm backend \
+                         init-labels` there to create tm's status labels ({err})",
+                        self.repo
+                    ),
+                },
+                None => ProviderError::from(err),
+            }
+        })
     }
 
     fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
@@ -1187,6 +1226,83 @@ mod tests {
 
         let calls = fake.issue_edit_calls();
         assert_eq!(calls[0].2.state, Some(IssueStateChange::Close));
+    }
+
+    #[test]
+    fn transition_missing_label_error_names_the_label_and_init_labels_recovery() {
+        // GitHub issue #24: a repo whose tm:status/* labels were never
+        // created (tm backend init-labels never ran) fails every label swap
+        // with gh's bare "'<label>' not found". That surfaced as an opaque
+        // advisory warning; it must instead name the missing label and the
+        // recovery command.
+        let fake = FakeGhCli::new()
+            .with_issue_view(
+                3,
+                Ok(issue_info(3, "T", IssueState::Open, &["tm:status/todo"])),
+            )
+            .with_issue_edit_result(Err(GhError::Command {
+                command: "gh issue edit".to_string(),
+                exit_code: Some(1),
+                stderr: "failed to update https://github.com/jowi-dev/tskmstr/issues/3: \
+                         'tm:status/in-review' not found\nfailed to update 1 issue"
+                    .to_string(),
+            }));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let err = provider
+            .transition("GH-3", "in-review")
+            .expect_err("should fail");
+
+        match err {
+            ProviderError::Api { message, .. } => {
+                assert!(
+                    message.contains("tm:status/in-review"),
+                    "error should name the missing label: {message}"
+                );
+                assert!(
+                    message.contains("jowi-dev/tskmstr"),
+                    "error should name the repo: {message}"
+                );
+                assert!(
+                    message.contains("tm backend init-labels"),
+                    "error should name the recovery command: {message}"
+                );
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_edit_failure_without_missing_label_passes_through_unchanged() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(
+                3,
+                Ok(issue_info(3, "T", IssueState::Open, &["tm:status/todo"])),
+            )
+            .with_issue_edit_result(Err(GhError::Command {
+                command: "gh issue edit".to_string(),
+                exit_code: Some(1),
+                stderr: "HTTP 502 bad gateway".to_string(),
+            }));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let err = provider
+            .transition("GH-3", "in-review")
+            .expect_err("should fail");
+
+        match err {
+            ProviderError::Api { message, .. } => {
+                assert!(
+                    !message.contains("init-labels"),
+                    "unrelated failures should not claim a missing label: {message}"
+                );
+                assert!(
+                    message.contains("502"),
+                    "gh's error should survive: {message}"
+                );
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
     }
 
     #[test]

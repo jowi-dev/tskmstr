@@ -89,6 +89,47 @@ impl BackendIdentity {
         };
         slugify(raw)
     }
+
+    /// The [`BackendIdentity::session_slug`] a stored scope string (see
+    /// [`BackendIdentity::scope`]) resolves to, or `None` for a legacy
+    /// unscoped (`""`) or unrecognized scope. The inverse the watch screen
+    /// needs: its run list is machine-wide, so the slug for a card's session
+    /// must come from the *run's own* recorded scope, not the invoking
+    /// repo's identity. Guaranteed (by the roundtrip test) to match
+    /// `session_slug()` for the identity whose `scope()` produced the
+    /// string.
+    pub fn session_slug_for_scope(scope: &str) -> Option<String> {
+        let raw = if let Some(repo) = scope.strip_prefix("github:") {
+            repo
+        } else {
+            // `jira:<base_url>:<project_key>` — the base URL contains `:`,
+            // so the project key is everything after the *last* colon.
+            scope
+                .strip_prefix("jira:")?
+                .rsplit(':')
+                .next()
+                .unwrap_or_default()
+        };
+        if raw.is_empty() {
+            return None;
+        }
+        Some(slugify(raw))
+    }
+}
+
+/// Lowercase `raw` and map every character outside `[a-z0-9-]` to `-`; see
+/// [`BackendIdentity::session_slug`] for why this shape is tmux-safe.
+fn slugify(raw: &str) -> String {
+    raw.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// [`BackendIdentity::session_slug`]'s character mapping over a raw scope
@@ -354,6 +395,47 @@ mod tests {
     fn session_slug_from_scope_rejects_legacy_and_unknown_scopes() {
         assert_eq!(session_slug_from_scope(""), None);
         assert_eq!(session_slug_from_scope("gitlab:some/repo"), None);
+    }
+
+    #[test]
+    fn session_slug_for_scope_parses_a_github_scope() {
+        assert_eq!(
+            BackendIdentity::session_slug_for_scope("github:jowi-dev/tskmstr"),
+            Some("jowi-dev-tskmstr".to_string())
+        );
+    }
+
+    #[test]
+    fn session_slug_for_scope_parses_a_jira_scope() {
+        assert_eq!(
+            BackendIdentity::session_slug_for_scope("jira:https://x.atlassian.net:AX"),
+            Some("ax".to_string())
+        );
+    }
+
+    #[test]
+    fn session_slug_for_scope_rejects_empty_and_unknown_scopes() {
+        assert_eq!(BackendIdentity::session_slug_for_scope(""), None);
+        assert_eq!(BackendIdentity::session_slug_for_scope("gitlab:x/y"), None);
+        assert_eq!(BackendIdentity::session_slug_for_scope("github:"), None);
+        assert_eq!(BackendIdentity::session_slug_for_scope("jira:"), None);
+    }
+
+    #[test]
+    fn session_slug_for_scope_roundtrips_session_slug() {
+        for identity in [
+            github("jowi-dev/tskmstr"),
+            github("Some_Org/repo.name"),
+            jira("https://x.atlassian.net", "AX"),
+            jira("https://b.atlassian.net", "PROJ"),
+        ] {
+            assert_eq!(
+                BackendIdentity::session_slug_for_scope(&identity.scope()),
+                Some(identity.session_slug()),
+                "scope {} did not roundtrip",
+                identity.scope()
+            );
+        }
     }
 
     #[test]
