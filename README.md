@@ -1207,8 +1207,10 @@ setting an auto-created ticket is left in the workflow's initial status
 transitions and applies the first one whose target status matches,
 case-insensitively; if none match, or the transition call itself fails,
 `tm` prints a warning and continues — the ticket is still created/linked
-either way. `tm ticket <KEY>` (plain association, no PR being created)
-never changes an existing ticket's status.
+either way. The warning is actionable: on no match it lists the ticket's
+available transitions and names `tm ticket transition <KEY> <STATUS>` as
+the manual recovery. `tm ticket <KEY>` (plain association, no PR being
+created) never changes an existing ticket's status.
 
 `status_on_create` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to right after `tm ticket create` makes it. It's matched the
@@ -1238,7 +1240,16 @@ In Review / Blocked / Done): common Jira names for the review status —
 a Jira-shaped `status_on_pr` inherited from a global config still moves the
 ticket rather than warning and leaving it in To Do. Any other name is
 matched as-is, and a repo-local `.tskmstr.toml` can always override
-`status_on_pr`/`status_on_create` outright.
+`status_on_pr`/`status_on_create` outright. Every status change under this
+backend is a `tm:status/*` label swap, so it fails in a repo whose labels
+were never created; that failure names the missing label and points at
+`tm backend init-labels` as the fix.
+
+Note that `tm`'s status under the GitHub backend is *label-scoped*: it
+lives entirely in the issue's `tm:status/*` labels, which `tm`'s own board
+and CLI read back. A GitHub Projects board's Status column is a separate
+project-owned field that labels never touch, so moving a ticket with `tm`
+(or editing its labels by hand) will not move a card on a Projects board.
 
 `board_column_order` lists workflow status names (case-insensitive match)
 in the order the board's columns should appear, e.g. `["To Do", "In
