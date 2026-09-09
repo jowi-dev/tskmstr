@@ -132,21 +132,6 @@ fn slugify(raw: &str) -> String {
         .collect()
 }
 
-/// [`BackendIdentity::session_slug`]'s character mapping over a raw scope
-/// component: lowercased, everything outside `[a-z0-9-]` mapped to `-`.
-fn slugify(raw: &str) -> String {
-    raw.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 /// Recovers the [`BackendIdentity::session_slug`] a stored
 /// [`BackendIdentity::scope`] string implies, without reconstructing the
 /// full identity — the inverse the kill-safety classifier needs to map run
