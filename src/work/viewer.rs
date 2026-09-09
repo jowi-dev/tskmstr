@@ -218,6 +218,9 @@ mod tests {
         fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
             Ok(Vec::new())
         }
+        fn root_session_targets(&self) -> Result<Vec<String>, TmuxError> {
+            Ok(Vec::new())
+        }
         fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
             Ok(Vec::new())
         }

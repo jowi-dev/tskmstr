@@ -252,6 +252,7 @@ mod tests {
             worktree: "/wt/proj-1".to_string(),
             branch: Some("jowi-dev/proj-1".to_string()),
             pid: None,
+            tmux_session: None,
             transcript: None,
             started_at: "2026-08-20 10:00:00".to_string(),
             heartbeat_at: None,

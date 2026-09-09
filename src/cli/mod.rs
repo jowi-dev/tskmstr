@@ -771,11 +771,22 @@ pub enum RunsCmd {
         #[arg(long)]
         detail: Option<String>,
     },
-    /// Marks abandoned runs (stale heartbeat, dead pid) as failed.
+    /// Marks abandoned runs as terminal: a dead recorded pid or killed tmux
+    /// session immediately, a stale heartbeat otherwise.
     Reap {
-        /// Minutes without a heartbeat before a run counts as stale.
+        /// Minutes without a heartbeat before a signal-less run counts as
+        /// stale.
         #[arg(long, default_value_t = 10)]
         stale_after: u64,
+    },
+    /// Classify how dangerous killing a tmux session would be, for the
+    /// session picker's kill confirmation (GitHub issue #26). Prints one of
+    /// `live-run`, `root-session`, `safe`, or `unknown` on the first line,
+    /// then a human-readable reason; see
+    /// `docs/decisions/0005-kill-safety-classification.md`.
+    KillSafety {
+        /// tmux session name, e.g. `tm-jowi-dev-tskmstr-gh-26`.
+        session: String,
     },
     /// Event timeline for the latest run of a ticket.
     Show {
@@ -2140,6 +2151,21 @@ mod tests {
                 assert_eq!(detail, None);
             }
             other => panic!("expected Runs Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_kill_safety_with_a_session_name() {
+        let cli = Cli::try_parse_from(["tm", "runs", "kill-safety", "tm-proj-proj-1"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::KillSafety { session }),
+                ..
+            }) => {
+                assert_eq!(session, "tm-proj-proj-1");
+            }
+            other => panic!("expected Runs KillSafety, got {other:?}"),
         }
     }
 

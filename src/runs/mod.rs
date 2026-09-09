@@ -132,6 +132,14 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE ticket_rank;
     ALTER TABLE ticket_rank_scoped RENAME TO ticket_rank;
     "#,
+    // GitHub issue #26: runs whose agent lives in a tmux window record the
+    // hosting session's name, so liveness sweeps can treat a killed session
+    // as terminal without waiting out the staleness window. NULL for runs
+    // with no tmux host (headless supervisors, `--fg`), and for rows
+    // predating this column.
+    r#"
+    ALTER TABLE runs ADD COLUMN tmux_session TEXT;
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -373,7 +381,41 @@ pub struct ReopenedRun {
     pub new_status: RunStatus,
 }
 
-/// A run marked failed by [`RunStore::reap`].
+/// Why [`RunStore::reap`] declared a run dead. Determines the terminal
+/// status the row is moved to: positive proof of death (a killed process or
+/// a killed tmux session) reads as an interruption from outside, while a
+/// mere lack of heartbeats keeps the pre-issue-#26 `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapReason {
+    /// The recorded pid is no longer alive.
+    PidDead,
+    /// The recorded tmux session no longer exists.
+    SessionGone,
+    /// No liveness signal was recorded and the heartbeat went stale.
+    Stale,
+}
+
+impl ReapReason {
+    /// The lowercase token stored in the `reaped` event's detail JSON and
+    /// printed by `tm runs reap`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReapReason::PidDead => "pid-dead",
+            ReapReason::SessionGone => "session-gone",
+            ReapReason::Stale => "stale",
+        }
+    }
+
+    /// The terminal status a run reaped for this reason is moved to.
+    fn status(self) -> RunStatus {
+        match self {
+            ReapReason::PidDead | ReapReason::SessionGone => RunStatus::Interrupted,
+            ReapReason::Stale => RunStatus::Failed,
+        }
+    }
+}
+
+/// A run marked terminal by [`RunStore::reap`].
 #[derive(Debug, Clone)]
 pub struct ReapedRun {
     /// Row id.
@@ -382,6 +424,8 @@ pub struct ReapedRun {
     pub ticket: String,
     /// PID recorded for the run, if any.
     pub pid: Option<u32>,
+    /// Why the run was declared dead.
+    pub reason: ReapReason,
 }
 
 /// A single row from [`RunStore::list_runs`], with ages precomputed in SQL.
@@ -525,6 +569,12 @@ pub struct Run {
     /// [`StartRun::scope`]); `""` for legacy rows recorded before scoping
     /// existed or by a config-less caller.
     pub scope: String,
+    /// Name of the tmux session hosting this run's agent process, if the
+    /// launcher recorded one (see [`RunStore::update_tmux_session`]). `None`
+    /// for headless runs and rows predating the column. A recorded session
+    /// that no longer exists is treated as proof of death by
+    /// [`RunStore::reap`].
+    pub tmux_session: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1626,6 +1676,35 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records the name of the tmux session hosting `run_id`'s agent
+    /// process, without touching status, heartbeat, or any other column.
+    ///
+    /// Exists for tmux-hosted interactive launches (GitHub issue #26):
+    /// [`StartRun`] has no `tmux_session` field because most callers have no
+    /// tmux host, but an interactive work/fix launch knows its
+    /// [`crate::work::interactive::ActionWindow`] before it spawns anything,
+    /// so this stamps the session name onto the row [`start_run`] just
+    /// created. A recorded session that later disappears lets
+    /// [`RunStore::reap`] declare the run dead immediately instead of
+    /// waiting out the staleness window.
+    ///
+    /// [`start_run`]: RunStore::start_run
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_tmux_session(&self, run_id: i64, session: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET tmux_session = ?1 WHERE id = ?2",
+            params![session, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Appends an event to a run and bumps the run's heartbeat, atomically.
     ///
     /// `detail` is stored as-is; validating it (e.g. as JSON) is the CLI
@@ -1809,14 +1888,26 @@ impl RunStore {
         .collect())
     }
 
-    /// Marks abandoned runs as failed.
+    /// Marks abandoned runs as terminal.
     ///
-    /// A run is reaped when its status is `running`, its last heartbeat
-    /// (falling back to `started_at`) is older than `stale_after_mins`, and
-    /// its recorded pid is no longer alive (per `pid_alive`); rows with no
-    /// recorded pid are reaped on staleness alone, since there's nothing to
-    /// probe. Each reaped run gets `ended_at` set and a `reaped` event
-    /// appended.
+    /// Every `running` row is a candidate. A recorded liveness signal
+    /// governs absolutely, no staleness window applied (GitHub issue #26 —
+    /// a killed ticket session must not block its lane for 10 minutes):
+    ///
+    /// - A recorded pid that is alive (per `pid_alive`) keeps the run, even
+    ///   when stale; a dead one reaps it as [`RunStatus::Interrupted`]
+    ///   immediately.
+    /// - Failing that, a recorded tmux session (see
+    ///   [`RunStore::update_tmux_session`]) that no longer exists (per
+    ///   `session_alive`) reaps the run as [`RunStatus::Interrupted`]
+    ///   immediately. Session *presence* proves nothing — the session holds
+    ///   the ticket's whole action history — so it never protects a row.
+    /// - Rows with no signal telling either way are reaped as
+    ///   [`RunStatus::Failed`] once their last heartbeat (falling back to
+    ///   `started_at`) is older than `stale_after_mins`.
+    ///
+    /// Each reaped run gets `ended_at` set and a `reaped` event appended
+    /// whose detail records the [`ReapReason`].
     ///
     /// Deliberately does not go through [`RunStore::add_event`]: that bumps
     /// `heartbeat_at`, which would be wrong to do for a run just declared
@@ -1825,20 +1916,30 @@ impl RunStore {
         &self,
         stale_after_mins: u64,
         pid_alive: &dyn Fn(u32) -> bool,
+        session_alive: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<ReapedRun>, RunStoreError> {
         // stale_after_mins is a plain integer, not user-supplied text, so
         // it's safe to format directly into the modifier string rather than
         // trying to bind it inside strftime's modifier argument.
         let modifier = format!("-{stale_after_mins} minutes");
 
-        let candidates: Vec<(i64, String, Option<u32>)> = {
+        type Candidate = (i64, String, Option<u32>, Option<String>, bool);
+        let candidates: Vec<Candidate> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, ticket, pid FROM runs
-                 WHERE status = 'running'
-                   AND COALESCE(heartbeat_at, started_at) < strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)",
+                "SELECT id, ticket, pid, tmux_session,
+                        COALESCE(heartbeat_at, started_at)
+                          < strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) AS stale
+                 FROM runs
+                 WHERE status = 'running'",
             )?;
             let rows = stmt.query_map(params![modifier], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?;
             let mut out = Vec::new();
             for row in rows {
@@ -1848,27 +1949,36 @@ impl RunStore {
         };
 
         let mut reaped = Vec::new();
-        for (id, ticket, pid) in candidates {
-            if let Some(p) = pid
-                && pid_alive(p)
-            {
-                continue;
-            }
+        for (id, ticket, pid, tmux_session, stale) in candidates {
+            let reason = match pid {
+                Some(p) if pid_alive(p) => continue,
+                Some(_) => ReapReason::PidDead,
+                None => match tmux_session {
+                    Some(ref session) if !session_alive(session) => ReapReason::SessionGone,
+                    _ if stale => ReapReason::Stale,
+                    _ => continue,
+                },
+            };
 
             let tx = self.conn.unchecked_transaction()?;
             tx.execute(
-                &format!("UPDATE runs SET status = 'failed', ended_at = {NOW_SQL} WHERE id = ?1"),
-                params![id],
+                &format!("UPDATE runs SET status = ?2, ended_at = {NOW_SQL} WHERE id = ?1"),
+                params![id, reason.status().as_str()],
             )?;
             tx.execute(
                 &format!(
-                    "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, 'reaped', NULL)"
+                    "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, 'reaped', ?2)"
                 ),
-                params![id],
+                params![id, format!(r#"{{"reason":"{}"}}"#, reason.as_str())],
             )?;
             tx.commit()?;
 
-            reaped.push(ReapedRun { id, ticket, pid });
+            reaped.push(ReapedRun {
+                id,
+                ticket,
+                pid,
+                reason,
+            });
         }
 
         Ok(reaped)
@@ -1909,7 +2019,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
@@ -1933,7 +2043,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
@@ -1966,7 +2076,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
@@ -1980,6 +2090,28 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Every recorded run, across every scope and kind, newest first (by
+    /// `started_at`, breaking ties by `id`, both descending).
+    ///
+    /// Exists for the kill-safety classifier (GitHub issue #26), which maps
+    /// an arbitrary tmux session name onto whatever runs it may host — it
+    /// cannot pre-filter by ticket or scope because the session name is the
+    /// input, not the row key.
+    pub fn all_runs(&self) -> Result<Vec<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+             FROM runs
+             ORDER BY started_at DESC, id DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], Self::row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<Run>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns the run with id `run_id`, or `None` if no such row exists.
     ///
     /// Used by `tm runs watch`'s detail window, which navigates by row id
@@ -1989,7 +2121,7 @@ impl RunStore {
         let sql = "SELECT
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
-                blocker, pr_url, model_usage, log_path, findings_count, scope,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
              FROM runs
              WHERE id = ?1";
@@ -2003,7 +2135,8 @@ impl RunStore {
     /// Maps one row of the `id, ticket, lane, kind, status, session_id,
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
-    /// model_usage, log_path, findings_count, scope, age_secs` projection (shared
+    /// model_usage, log_path, findings_count, scope, tmux_session, age_secs`
+    /// projection (shared
     /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
     /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -2034,7 +2167,8 @@ impl RunStore {
             log_path: row.get(19)?,
             findings_count: row.get(20)?,
             scope: row.get(21)?,
-            age_secs: row.get(22)?,
+            tmux_session: row.get(22)?,
+            age_secs: row.get(23)?,
         })
     }
 
@@ -2540,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_9() {
+    fn open_migrates_a_fresh_db_to_user_version_10() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -2548,7 +2682,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -3664,6 +3798,89 @@ mod tests {
     }
 
     #[test]
+    fn all_runs_returns_every_scope_newest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let first = store
+            .start_run(&StartRun {
+                scope: "github:a/b".to_string(),
+                ticket: "GH-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let second = store
+            .start_run(&StartRun {
+                scope: "github:c/d".to_string(),
+                ticket: "GH-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt2".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let runs = store.all_runs().unwrap();
+
+        assert_eq!(
+            runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![second, first],
+            "every scope and kind, newest first"
+        );
+    }
+
+    #[test]
+    fn update_tmux_session_records_the_hosting_session_and_leaves_other_columns_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let before = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(before.tmux_session, None);
+
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+
+        let run = store.run_by_id(id).unwrap().expect("expected a run");
+        assert_eq!(run.tmux_session, Some("tm-proj-proj-1".to_string()));
+        assert_eq!(run.ticket, "PROJ-1");
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.pid, None);
+    }
+
+    #[test]
+    fn update_tmux_session_unknown_id_returns_run_not_found() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store
+            .update_tmux_session(999, "tm-proj-proj-1")
+            .expect_err("expected RunNotFound");
+
+        match err {
+            RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected RunNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn list_runs_orders_active_before_terminal_then_by_started_at_desc() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -4398,8 +4615,18 @@ mod tests {
         false
     }
 
+    fn session_alive(_name: &str) -> bool {
+        true
+    }
+
+    fn session_gone(_name: &str) -> bool {
+        false
+    }
+
+    /// A killed process is proof of death on its own: no staleness window
+    /// applies when the recorded pid is gone (GitHub issue #26).
     #[test]
-    fn reap_marks_stale_run_with_dead_pid_as_failed() {
+    fn reap_marks_fresh_run_with_dead_pid_interrupted() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -4415,14 +4642,14 @@ mod tests {
                 log_path: None,
             })
             .unwrap();
-        backdate_heartbeat(&store, id, 20);
 
-        let reaped = store.reap(10, &always_dead).unwrap();
+        let reaped = store.reap(10, &always_dead, &session_alive).unwrap();
 
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].id, id);
         assert_eq!(reaped[0].ticket, "PROJ-1");
         assert_eq!(reaped[0].pid, Some(4242));
+        assert_eq!(reaped[0].reason, ReapReason::PidDead);
 
         let (status, ended_at): (String, Option<String>) = store
             .conn
@@ -4432,18 +4659,170 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status, "failed");
+        assert_eq!(status, "interrupted");
         assert!(ended_at.is_some());
 
-        let event_kind: String = store
+        let (event_kind, detail): (String, Option<String>) = store
             .conn
             .query_row(
-                "SELECT kind FROM run_events WHERE run_id = ?1",
+                "SELECT kind, detail FROM run_events WHERE run_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_kind, "reaped");
+        assert_eq!(detail.as_deref(), Some(r#"{"reason":"pid-dead"}"#));
+    }
+
+    /// A run whose recorded tmux session no longer exists was killed from
+    /// outside (e.g. the session picker); reap it immediately rather than
+    /// waiting out the staleness window (GitHub issue #26).
+    #[test]
+    fn reap_marks_fresh_run_with_dead_tmux_session_interrupted() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+
+        let reaped = store.reap(10, &always_alive, &session_gone).unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].id, id);
+        assert_eq!(reaped[0].reason, ReapReason::SessionGone);
+
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
                 params![id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(event_kind, "reaped");
+        assert_eq!(status, "interrupted");
+
+        let detail: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT detail FROM run_events WHERE run_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail.as_deref(), Some(r#"{"reason":"session-gone"}"#));
+    }
+
+    /// Session *presence* proves nothing (the session holds the ticket's
+    /// whole action history), so a fresh pid-less row rides on staleness
+    /// exactly as before.
+    #[test]
+    fn reap_leaves_fresh_pidless_run_with_live_tmux_session_untouched() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+
+        let reaped = store.reap(10, &always_alive, &session_alive).unwrap();
+
+        assert!(reaped.is_empty());
+    }
+
+    /// The staleness fallback still applies to a pid-less row whose recorded
+    /// session is alive: an abandoned pre-adoption row must not ride a
+    /// long-lived ticket session forever.
+    #[test]
+    fn reap_marks_stale_pidless_run_failed_even_when_its_session_is_alive() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+        backdate_heartbeat(&store, id, 20);
+
+        let reaped = store.reap(10, &always_alive, &session_alive).unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].reason, ReapReason::Stale);
+
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+    }
+
+    /// An alive recorded pid outranks every other signal, including a
+    /// missing tmux session: never reap a process that is still running.
+    #[test]
+    fn reap_leaves_run_with_alive_pid_untouched_even_when_its_session_is_gone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let id = store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt1".to_string(),
+                branch: None,
+                pid: Some(4242),
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+        backdate_heartbeat(&store, id, 20);
+
+        let reaped = store.reap(10, &always_alive, &session_gone).unwrap();
+
+        assert!(reaped.is_empty());
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
     }
 
     #[test]
@@ -4465,39 +4844,7 @@ mod tests {
             .unwrap();
         backdate_heartbeat(&store, id, 20);
 
-        let reaped = store.reap(10, &always_alive).unwrap();
-
-        assert!(reaped.is_empty());
-        let status: String = store
-            .conn
-            .query_row(
-                "SELECT status FROM runs WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "running");
-    }
-
-    #[test]
-    fn reap_leaves_fresh_run_with_dead_pid_untouched() {
-        let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-
-        let id = store
-            .start_run(&StartRun {
-                scope: String::new(),
-                ticket: "PROJ-1".to_string(),
-                lane: "backend".to_string(),
-                worktree: "/tmp/wt1".to_string(),
-                branch: None,
-                pid: Some(4242),
-                kind: "lane".to_string(),
-                log_path: None,
-            })
-            .unwrap();
-
-        let reaped = store.reap(10, &always_dead).unwrap();
+        let reaped = store.reap(10, &always_alive, &session_alive).unwrap();
 
         assert!(reaped.is_empty());
         let status: String = store
@@ -4530,7 +4877,7 @@ mod tests {
             .unwrap();
         backdate_heartbeat(&store, id, 20);
 
-        let reaped = store.reap(10, &always_alive).unwrap();
+        let reaped = store.reap(10, &always_alive, &session_alive).unwrap();
 
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].pid, None);
@@ -4596,7 +4943,7 @@ mod tests {
             .unwrap();
         backdate_heartbeat(&store, done_id, 20);
 
-        let reaped = store.reap(10, &always_dead).unwrap();
+        let reaped = store.reap(10, &always_dead, &session_alive).unwrap();
 
         assert!(reaped.is_empty());
     }

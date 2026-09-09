@@ -209,6 +209,16 @@ pub trait TmuxOps {
     /// inspecting the child's exit status.
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError>;
 
+    /// The distinct values of the `@root_session` user option across all
+    /// sessions (`tmux list-sessions -F '#{@root_session}'`) — i.e. the set
+    /// of sessions some other session points back to as its project root
+    /// (the jump-back contract of GitHub issue #19 / devtools#8). Sessions
+    /// without the option expand it to the empty string and are skipped.
+    ///
+    /// Tolerant like [`TmuxOps::list_sessions`]: no server running yields
+    /// `Ok(vec![])`.
+    fn root_session_targets(&self) -> Result<Vec<String>, TmuxError>;
+
     /// List every window of every running session
     /// (`tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}'`).
     ///
@@ -547,6 +557,40 @@ fn parse_list_sessions_output(stdout: &str) -> Vec<TmuxSession> {
         .collect()
 }
 
+/// Parse `tmux list-sessions -F '#{@root_session}'` output for
+/// [`TmuxOps::root_session_targets`]: one line per session holding that
+/// session's `@root_session` value, empty (the option is unset) for most.
+/// Deduplicates while preserving first-seen order.
+fn parse_root_session_targets_output(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| seen.insert(line.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Builds the session-liveness probe [`crate::runs::RunStore::reap`] takes,
+/// from one [`TmuxOps::list_sessions`] snapshot.
+///
+/// A session is alive iff it appears in the snapshot. `list_sessions` is
+/// tolerant of a stopped tmux server (empty list, so every recorded session
+/// reads as gone — correct, killing the server kills its sessions), but a
+/// failure to run `tmux` at all proves nothing, so that case reports every
+/// session alive rather than reaping on ignorance.
+pub fn session_alive_probe(tmux: &dyn TmuxOps) -> Box<dyn Fn(&str) -> bool> {
+    match tmux.list_sessions() {
+        Ok(sessions) => {
+            let names: std::collections::HashSet<String> =
+                sessions.into_iter().map(|s| s.name).collect();
+            Box::new(move |name| names.contains(name))
+        }
+        Err(_) => Box::new(|_| true),
+    }
+}
+
 /// [`TmuxOps`] implementation that shells out to a real `tmux` binary. Used
 /// in production.
 #[derive(Debug, Default, Clone, Copy)]
@@ -687,6 +731,21 @@ impl TmuxOps for ShellTmuxOps {
         )))
     }
 
+    fn root_session_targets(&self) -> Result<Vec<String>, TmuxError> {
+        // Same no-server tolerance as `list_sessions` above.
+        let output = run(
+            "tmux list-sessions",
+            &[
+                "list-sessions".to_string(),
+                "-F".to_string(),
+                "#{@root_session}".to_string(),
+            ],
+        )?;
+        Ok(parse_root_session_targets_output(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
     fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
         // Same no-server tolerance as `list_sessions`: `tmux list-windows -a`
         // exits non-zero with no server running, which is "no windows", not a
@@ -727,6 +786,7 @@ impl TmuxOps for ShellTmuxOps {
 pub struct FakeTmuxOps {
     has_session_result: std::cell::RefCell<Result<bool, TmuxError>>,
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
+    root_session_targets_result: std::cell::RefCell<Result<Vec<String>, TmuxError>>,
     list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
     attach_outcome: std::cell::RefCell<AttachOutcome>,
     current_session_name_result: std::cell::RefCell<Result<Option<String>, TmuxError>>,
@@ -801,6 +861,8 @@ pub enum TmuxCall {
     KillSession(String),
     /// `list_sessions()`.
     ListSessions,
+    /// `root_session_targets()`.
+    RootSessionTargets,
     /// `list_windows()`.
     ListWindows,
     /// `set_session_option(name, option, value)`.
@@ -824,6 +886,7 @@ impl FakeTmuxOps {
         Self {
             has_session_result: std::cell::RefCell::new(Ok(false)),
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
+            root_session_targets_result: std::cell::RefCell::new(Ok(Vec::new())),
             list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
             attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
             current_session_name_result: std::cell::RefCell::new(Ok(None)),
@@ -840,6 +903,12 @@ impl FakeTmuxOps {
     /// Set the result `list_sessions` will return.
     pub fn with_list_sessions(self, result: Result<Vec<TmuxSession>, TmuxError>) -> Self {
         *self.list_sessions_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `root_session_targets` will return.
+    pub fn with_root_session_targets(self, result: Result<Vec<String>, TmuxError>) -> Self {
+        *self.root_session_targets_result.borrow_mut() = result;
         self
     }
 
@@ -958,6 +1027,11 @@ impl TmuxOps for FakeTmuxOps {
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::ListSessions);
         self.list_sessions_result.borrow().clone()
+    }
+
+    fn root_session_targets(&self) -> Result<Vec<String>, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::RootSessionTargets);
+        self.root_session_targets_result.borrow().clone()
     }
 
     fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {

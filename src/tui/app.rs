@@ -2440,6 +2440,11 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             app.watch_tick += 1;
             let mut cmds = Vec::new();
             if app.watch_tick.is_multiple_of(8) {
+                // Reap before the status loads so a run whose process or
+                // tmux session died surfaces as terminal on this very poll,
+                // unblocking the lane guard without a staleness wait
+                // (GitHub issue #26).
+                cmds.push(Cmd::ReapRuns);
                 cmds.push(Cmd::LoadAuditStatus);
                 cmds.push(Cmd::LoadLaneRunStatus);
                 cmds.push(Cmd::LoadBotWatchStatus);
@@ -6264,6 +6269,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
+                Cmd::ReapRuns,
                 Cmd::LoadAuditStatus,
                 Cmd::LoadLaneRunStatus,
                 Cmd::LoadBotWatchStatus,

@@ -16,17 +16,43 @@ use crate::runs::{
     FinishRun, Run, RunEvent, RunStatus, RunStore, RunStoreError, RunSummary, StartRun,
 };
 
-/// `tm runs reap`: mark abandoned runs (stale heartbeat, dead pid) as failed.
+/// `tm runs kill-safety <SESSION>`: classify how dangerous killing tmux
+/// session `session` would be, for the session picker's kill confirmation
+/// (GitHub issue #26, consumed by devtools#15).
 ///
-/// Prints `Reaped run {id} ({ticket})` for each reaped run, or
+/// Output contract (pinned in
+/// `docs/decisions/0005-kill-safety-classification.md`): the first stdout
+/// line is exactly one of `live-run`, `root-session`, `safe`, or `unknown`;
+/// the second is a human-readable reason. A non-zero exit (a broken runs
+/// DB) means the caller should treat the session as `unknown`.
+pub fn kill_safety(
+    store: &RunStore,
+    tmux: &dyn crate::work::tmux::TmuxOps,
+    gh: &dyn crate::github::gh_cli::GhCli,
+    pid_alive: &dyn Fn(u32) -> bool,
+    session: &str,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let verdict = crate::work::kill_safety::classify_session(session, store, tmux, gh, pid_alive)?;
+    writeln!(out, "{}", verdict.tier.as_str())?;
+    writeln!(out, "{}", verdict.detail)?;
+    Ok(())
+}
+
+/// `tm runs reap`: mark abandoned runs (dead pid, killed tmux session,
+/// stale heartbeat) as terminal — see [`RunStore::reap`] for the exact
+/// rules.
+///
+/// Prints `Reaped run {id} ({ticket}): {reason}` for each reaped run, or
 /// `Nothing to reap.` when none qualified.
 pub fn reap(
     store: &RunStore,
     stale_after_mins: u64,
     pid_alive: &dyn Fn(u32) -> bool,
+    session_alive: &dyn Fn(&str) -> bool,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
-    let reaped = store.reap(stale_after_mins, pid_alive)?;
+    let reaped = store.reap(stale_after_mins, pid_alive, session_alive)?;
 
     if reaped.is_empty() {
         writeln!(out, "Nothing to reap.")?;
@@ -34,7 +60,13 @@ pub fn reap(
     }
 
     for run in &reaped {
-        writeln!(out, "Reaped run {} ({})", run.id, run.ticket)?;
+        writeln!(
+            out,
+            "Reaped run {} ({}): {}",
+            run.id,
+            run.ticket,
+            run.reason.as_str()
+        )?;
     }
     Ok(())
 }
@@ -1832,6 +1864,44 @@ mod tests {
         false
     }
 
+    fn session_alive(_name: &str) -> bool {
+        true
+    }
+
+    /// The picker contract: line 1 is the machine token, line 2 the reason.
+    #[test]
+    fn kill_safety_prints_the_tier_token_first_then_the_reason() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_tmux_session(id, "tm-x-proj-1").unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let mut out = Vec::new();
+
+        kill_safety(&store, &tmux, &gh, &always_alive, "tm-x-proj-1", &mut out)
+            .expect("should succeed");
+
+        let printed = String::from_utf8(out).unwrap();
+        let mut lines = printed.lines();
+        assert_eq!(lines.next(), Some("live-run"));
+        assert!(lines.next().unwrap_or_default().contains("PROJ-1"));
+    }
+
+    #[test]
+    fn kill_safety_prints_unknown_for_a_foreign_session() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let gh = crate::github::gh_cli::FakeGhCli::new();
+        let mut out = Vec::new();
+
+        kill_safety(&store, &tmux, &gh, &always_alive, "scratch", &mut out)
+            .expect("should succeed");
+
+        assert!(String::from_utf8(out).unwrap().starts_with("unknown\n"));
+    }
+
     #[test]
     fn reap_prints_nothing_to_reap_when_none_qualify() {
         let dir = tempdir().unwrap();
@@ -1839,7 +1909,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        reap(&store, 10, &always_alive, &mut out).expect("should succeed");
+        reap(&store, 10, &always_alive, &session_alive, &mut out).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "Nothing to reap.\n");
     }
@@ -1857,11 +1927,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut out = Vec::new();
 
-        reap(&store, 0, &always_dead, &mut out).expect("should succeed");
+        reap(&store, 0, &always_dead, &session_alive, &mut out).expect("should succeed");
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("Reaped run {id} (PROJ-1)\n")
+            format!("Reaped run {id} (PROJ-1): stale\n")
         );
     }
 
