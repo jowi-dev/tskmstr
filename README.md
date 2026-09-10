@@ -521,7 +521,12 @@ one Claude Code session per lane, tracked in `tm runs`
 Each lane is configured under `[work.lanes.<name>]` in `config.toml`
 (`repo` is required; `prompt_file`, `base_branch`, `model`, `max_turns`,
 `permission_mode` fall back to the `[work]`-level defaults, then to
-built-in defaults). `tm work run <lane>` provisions the lane's worktree if
+built-in defaults). The built-in `permission_mode` default is
+`bypassPermissions` (full-auto): a lane run executes in an isolated
+worktree on a fresh branch, and that isolation is what makes full-auto
+reasonable as a default. Dial an individual lane back with its own
+`permission_mode` or with `[work] default_permission_mode`. `tm work run
+<lane>` provisions the lane's worktree if
 missing, cuts a fresh timestamped branch off the resolved base for this
 run, and invokes `claude` with the lane's prompt. That prompt is the lane's
 `prompt_file`, resolved against the lane's repo root when it is a relative
