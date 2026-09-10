@@ -3468,6 +3468,111 @@ mod tests {
     }
 
     #[test]
+    fn prepare_run_lane_with_no_permission_mode_configured_defaults_to_bypass_permissions() {
+        // Issue #29: an unconfigured lane run is autonomous, and the
+        // containment that makes full-auto reasonable is the isolated
+        // worktree on a fresh branch, not the operator's machine-local
+        // allowlist — so the built-in default is `bypassPermissions`, not
+        // `acceptEdits`.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest::default();
+        let mut out = Vec::new();
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        let flag_index = prepared
+            .invocation
+            .args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .expect("--permission-mode must always be present in argv");
+        assert_eq!(
+            prepared.invocation.args[flag_index + 1],
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_permission_mode_prefers_lane_config_over_work_default() {
+        // The override chain is request > lane `permission_mode` > `[work]
+        // default_permission_mode` > built-in default. This pins the
+        // middle two: a lane-configured value must win over a configured
+        // work-level default.
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.permission_mode = Some("plan".to_string());
+        let mut config = config_with_lane("mylane", lane, &worktree_root);
+        config.default_permission_mode = Some("acceptEdits".to_string());
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest::default();
+        let mut out = Vec::new();
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        let flag_index = prepared
+            .invocation
+            .args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .expect("--permission-mode must always be present in argv");
+        assert_eq!(prepared.invocation.args[flag_index + 1], "plan");
+    }
+
+    #[test]
     fn prepare_run_lane_with_a_pid_records_it_on_the_run_row() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(

@@ -35,9 +35,11 @@
 //! `run_lane` substitutes a hardcoded default and still passes the flag —
 //! it never falls back to omitting a flag and trusting `claude`'s own
 //! default. This module ports that: absent `model`/`max_turns`/
-//! `permission_mode` resolve to the same defaults (`"fable"`, `"200"`,
-//! `"acceptEdits"`) rather than being left out of argv. `--settings` is the
-//! one exception, since phase 5 of GitHub issue #17
+//! `permission_mode` resolve to hardcoded defaults (`"fable"`, `"200"`,
+//! `"bypassPermissions"`) rather than being left out of argv. The
+//! permission-mode default deliberately diverges from `work.ml`'s
+//! `"acceptEdits"` — see [`DEFAULT_PERMISSION_MODE`] (issue #29). `--settings`
+//! is the one exception, since phase 5 of GitHub issue #17
 //! (`docs/plans/agent-runner.md`) made [`InvocationInputs::settings_path`]
 //! an `Option`, for a future telemetry-less runner's sake — `claude`'s own
 //! [`ClaudeRunner::deploy_telemetry`] always returns `Some`, so every
@@ -134,9 +136,19 @@ const DEFAULT_MODEL: &str = "fable";
 /// opts.max_turns with Some t -> t | None -> "200"`.
 const DEFAULT_MAX_TURNS: &str = "200";
 
-/// `--permission-mode` default, mirroring `run_lane`'s `let permission_mode
-/// = match opts.permission_mode with Some m -> m | None -> "acceptEdits"`.
-const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
+/// `--permission-mode` default when no lane/run option, `[work]
+/// default_permission_mode`, or `--permission-mode` override supplies one.
+///
+/// This deliberately diverges from `work.ml`'s `"acceptEdits"` default
+/// (issue #29): `acceptEdits` only auto-approves file edits, so every other
+/// tool call fell back to the operator's machine-local allowlist, and
+/// headless lane autonomy ended up depending on personal settings. A lane
+/// run executes in an isolated worktree on a fresh branch — that isolation
+/// is the containment that makes full-auto (`bypassPermissions`)
+/// reasonable as the built-in default. A lane's `permission_mode`, `[work]
+/// default_permission_mode`, or a `--permission-mode` override can still
+/// dial an individual lane back.
+const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 
 /// The `claude` CLI [`AgentRunner`] implementation. Zero-sized: it holds no
 /// state of its own, so a single `&'static ClaudeRunner` (or, in production,
@@ -596,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_model_and_max_turns_and_permission_mode_fall_back_to_work_ml_defaults() {
+    fn absent_model_and_max_turns_and_permission_mode_fall_back_to_built_in_defaults() {
         let inputs = InvocationInputs {
             model: None,
             max_turns: None,
@@ -607,7 +619,10 @@ mod tests {
         let invocation = ClaudeRunner.build_invocation(inputs);
 
         // work.ml never omits these flags when the option is absent — it
-        // substitutes a hardcoded default and still passes the flag.
+        // substitutes a hardcoded default and still passes the flag. That
+        // never-omit convention still holds for all three; the
+        // permission-mode *value* deliberately diverges from work.ml per
+        // issue #29 (see `DEFAULT_PERMISSION_MODE`).
         assert!(invocation.args.contains(&"--model".to_string()));
         assert_eq!(
             invocation.args[invocation.args.iter().position(|a| a == "--model").unwrap() + 1],
@@ -631,7 +646,7 @@ mod tests {
                 .position(|a| a == "--permission-mode")
                 .unwrap()
                 + 1],
-            "acceptEdits"
+            "bypassPermissions"
         );
     }
 
