@@ -140,6 +140,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_browser_picker(frame, app);
     }
 
+    if app.merge_confirm.is_some() {
+        draw_merge_confirm(frame, app);
+    }
+
     if app.show_retro_severity_picker {
         draw_retro_severity_picker(frame, app);
     }
@@ -208,7 +212,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  R retro  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  R retro  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -1573,6 +1577,45 @@ fn draw_browser_picker(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A centered floating window asking to confirm the pending merge
+/// ([`crate::tui::app::MergeConfirm`], the board's `M` key -- GitHub issue
+/// #32). A paragraph rather than a list: there is nothing to select, only
+/// confirm or cancel, and the window's whole job is naming exactly what
+/// confirming will do -- the PR (number and title) and the ticket's
+/// post-merge status, or "merge only" when `status_on_merge` is unset.
+fn draw_merge_confirm(frame: &mut Frame, app: &App) {
+    let Some(confirm) = &app.merge_confirm else {
+        return;
+    };
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let target_line = match &confirm.target_status {
+        Some(status) => format!("then move {} to {status}", confirm.key),
+        None => format!(
+            "merge only -- no status_on_merge configured, {} stays put",
+            confirm.key
+        ),
+    };
+    let lines = vec![
+        Line::from(format!(
+            "Merge PR #{} for {}?",
+            confirm.pr_number, confirm.key
+        )),
+        Line::from(confirm.pr_title.clone()),
+        Line::from(""),
+        Line::from(target_line),
+        Line::from(""),
+        Line::from("y/Enter merge   n/Esc cancel"),
+    ];
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title("Merge PR")),
+    );
+    frame.render_widget(paragraph, area);
+}
+
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` percent of its
 /// width/height.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2501,6 +2544,43 @@ mod tests {
         assert!(text.contains("Open in browser"));
         assert!(text.contains("Jira (PROJ-1)"));
         assert!(text.contains("GitHub (#42)"));
+    }
+
+    #[test]
+    fn draws_merge_confirm_overlay_with_pr_and_target_status() {
+        let app = App {
+            merge_confirm: Some(crate::tui::app::MergeConfirm {
+                key: "PROJ-1".to_string(),
+                pr_number: 42,
+                pr_title: "[PROJ-1] Fix the thing".to_string(),
+                repo_root: std::path::PathBuf::from("/repo"),
+                target_status: Some("Done".to_string()),
+            }),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Merge PR"));
+        assert!(text.contains("Merge PR #42 for PROJ-1?"));
+        assert!(text.contains("[PROJ-1] Fix the thing"));
+        assert!(text.contains("then move PROJ-1 to Done"));
+        assert!(text.contains("y/Enter merge"));
+    }
+
+    #[test]
+    fn draws_merge_confirm_overlay_merge_only_without_target_status() {
+        let app = App {
+            merge_confirm: Some(crate::tui::app::MergeConfirm {
+                key: "PROJ-1".to_string(),
+                pr_number: 42,
+                pr_title: "[PROJ-1] Fix the thing".to_string(),
+                repo_root: std::path::PathBuf::from("/repo"),
+                target_status: None,
+            }),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("merge only"));
+        assert!(text.contains("no status_on_merge configured"));
     }
 
     #[test]
