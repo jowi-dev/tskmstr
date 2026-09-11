@@ -907,9 +907,7 @@ impl TicketProvider for GithubProvider<'_> {
         token
             .strip_prefix(&self.key_prefix)
             .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|number| {
-                !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
-            })
+            .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
     }
 }
 

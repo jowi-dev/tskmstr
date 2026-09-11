@@ -1,5 +1,13 @@
-//! Pure PR title/body/branch parsing: recovering a Jira issue key from a
+//! Pure PR title/body/branch parsing: recovering a ticket key from a
 //! GitHub pull request, and prefixing a PR title with one.
+//!
+//! Every extraction takes an `accept` predicate (in practice
+//! `TicketProvider::is_ticket_key`) deciding which key-shaped tokens count
+//! as ticket keys for the configured backend: `ADR-0006` in a PR body is
+//! key-shaped but is a doc label, not a ticket, and scraping it associated
+//! a PR with the wrong issue (GitHub issue #35). Rejected tokens are
+//! skipped, not fatal — the scan moves on to the next token and then the
+//! next source.
 //!
 //! No I/O lives here; [`crate::github::gh_cli`] is responsible for actually
 //! fetching a [`PrInfo`] from `gh`.
@@ -25,7 +33,7 @@ pub struct PrInfo {
 }
 
 /// Which part of a pull request an issue key resolved by
-/// [`find_issue_key_with_source`] came from.
+/// [`issue_key_candidates`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     /// Found in the PR title (bracketed prefix or bare token).
@@ -36,43 +44,59 @@ pub enum KeySource {
     Branch,
 }
 
-/// Find the Jira issue key (e.g. `PROJ-372`) associated with a pull request.
-///
-/// Checks, in order, stopping at the first match:
-///
-/// 1. A `[KEY-123]` prefix on the title.
-/// 2. A bare `KEY-123` token anywhere else in the title.
-/// 3. A `KEY-123` token anywhere in the body.
-/// 4. The branch name, matched case-insensitively against a
-///    `key-123`-shaped segment (e.g. `proj-372-desc` or
-///    `feature/proj-372-desc`) and normalized to uppercase.
-///
-/// Returns `None` if no key is found by any of these means.
-pub fn find_issue_key(pr: &PrInfo) -> Option<String> {
-    find_issue_key_with_source(pr).map(|(key, _)| key)
+/// Find the ticket key (e.g. `PROJ-372`) associated with a pull request:
+/// the first entry of [`issue_key_candidates`], or `None` if no source
+/// yields an accepted key.
+pub fn find_issue_key(pr: &PrInfo, accept: &dyn Fn(&str) -> bool) -> Option<String> {
+    issue_key_candidates(pr, accept)
+        .into_iter()
+        .next()
+        .map(|(key, _)| key)
 }
 
-/// Like [`find_issue_key`], but also reports which of the four sources the
-/// key was found in.
+/// Collect the accepted ticket-key candidate from each part of a pull
+/// request, in precedence order (at most one entry per source):
 ///
-/// Callers that want to trust title/body keys outright but validate a
-/// branch-derived key against Jira before relying on it (branch names are
-/// inferred, not authored) need to know which case they're in; this is the
-/// only way to distinguish them, since [`find_issue_key`] collapses the
-/// result to a bare key.
-pub fn find_issue_key_with_source(pr: &PrInfo) -> Option<(String, KeySource)> {
-    if let Some(key) = title_prefix_key(&pr.title).or_else(|| first_key_match(&pr.title)) {
-        return Some((key, KeySource::Title));
+/// 1. [`KeySource::Title`]: a `[KEY-123]` prefix, or failing that a bare
+///    `KEY-123` token anywhere in the title.
+/// 2. [`KeySource::Branch`]: the branch name, matched case-insensitively
+///    against a `key-123`-shaped segment (e.g. `proj-372-desc` or
+///    `feature/proj-372-desc`) and normalized to uppercase.
+/// 3. [`KeySource::Body`]: a `KEY-123` token anywhere in the body.
+///
+/// The branch outranks the body deliberately: a branch is named for the
+/// ticket it was cut for, while body prose freely quotes other tickets and
+/// doc labels (GitHub issue #35). Tokens `accept` rejects are skipped in
+/// favor of the next token in the same source.
+///
+/// Callers that trust title/body keys outright but validate a
+/// branch-derived key against the ticket backend before relying on it
+/// (branch names are inferred, not authored — see
+/// [`crate::ticketing::resolve_existing_key`]) walk this list; callers
+/// that just need "the" key take the first entry via [`find_issue_key`].
+pub fn issue_key_candidates(
+    pr: &PrInfo,
+    accept: &dyn Fn(&str) -> bool,
+) -> Vec<(String, KeySource)> {
+    let mut candidates = Vec::new();
+    if let Some(key) = title_prefix_key(&pr.title)
+        .filter(|key| accept(key))
+        .or_else(|| first_key_match(&pr.title, accept))
+    {
+        candidates.push((key, KeySource::Title));
     }
-    if let Some(key) = first_key_match(&pr.body) {
-        return Some((key, KeySource::Body));
+    if let Some(key) = branch_key(&pr.head_ref_name, accept) {
+        candidates.push((key, KeySource::Branch));
     }
-    branch_key(&pr.head_ref_name).map(|key| (key, KeySource::Branch))
+    if let Some(key) = first_key_match(&pr.body, accept) {
+        candidates.push((key, KeySource::Body));
+    }
+    candidates
 }
 
 /// Find the first pull request (by ascending PR number, for determinism)
-/// resolving to Jira issue key `key`, per [`find_issue_key_with_source`]'s
-/// title/body/branch precedence.
+/// resolving to ticket key `key`, per [`issue_key_candidates`]'s
+/// title/branch/body precedence.
 ///
 /// `key` is compared case-insensitively (both sides uppercased), so callers
 /// don't need to normalize a ticket key's case before calling this. Returns
@@ -80,15 +104,19 @@ pub fn find_issue_key_with_source(pr: &PrInfo) -> Option<(String, KeySource)> {
 ///
 /// Known gap, documented not "fixed": a PR opened by hand with no key in its
 /// title or body and a branch name that doesn't match the `key-123` shape
-/// won't resolve, the same limitation [`find_issue_key_with_source`] already
+/// won't resolve, the same limitation [`issue_key_candidates`] already
 /// has everywhere else it's used.
-pub fn find_pr_for_ticket<'a>(prs: &'a [PrInfo], key: &str) -> Option<&'a PrInfo> {
+pub fn find_pr_for_ticket<'a>(
+    prs: &'a [PrInfo],
+    key: &str,
+    accept: &dyn Fn(&str) -> bool,
+) -> Option<&'a PrInfo> {
     let key = key.to_uppercase();
     let mut matches: Vec<&PrInfo> = prs
         .iter()
         .filter(|pr| {
-            find_issue_key_with_source(pr)
-                .map(|(found, _)| found.to_uppercase())
+            find_issue_key(pr, accept)
+                .map(|found| found.to_uppercase())
                 .as_deref()
                 == Some(key.as_str())
         })
@@ -115,23 +143,35 @@ pub fn with_issue_key_prefix(title: &str, key: &str) -> String {
     format!("[{key}] {rest}")
 }
 
-/// Match a `[KEY-123]` prefix at the very start of `title`.
+/// Match a `[KEY-123]` prefix at the very start of `title`. Shape-only, no
+/// `accept` filtering: [`with_issue_key_prefix`] strips *any* key-shaped
+/// prefix (a stale one is exactly what needs replacing);
+/// [`issue_key_candidates`] applies its own `accept` on top.
 fn title_prefix_key(title: &str) -> Option<String> {
     let re = Regex::new(r"^\[([A-Z][A-Z0-9]+-\d+)\]").expect("static regex is valid");
     re.captures(title).map(|caps| caps[1].to_string())
 }
 
-/// Find the first `KEY-123`-shaped token in `text`.
-fn first_key_match(text: &str) -> Option<String> {
+/// Find the first `KEY-123`-shaped token in `text` that `accept` allows,
+/// skipping rejected tokens (e.g. an `ADR-0006` doc label ahead of the
+/// real key).
+fn first_key_match(text: &str, accept: &dyn Fn(&str) -> bool) -> Option<String> {
     let re = Regex::new(r"\b([A-Z][A-Z0-9]+-\d+)\b").expect("static regex is valid");
-    re.captures(text).map(|caps| caps[1].to_string())
+    re.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .find(|key| accept(key))
 }
 
-/// Find a `key-123`-shaped segment in a branch name (e.g. `proj-372-desc` or
-/// `feature/proj-372-desc`), case-insensitively, normalized to uppercase.
-fn branch_key(branch: &str) -> Option<String> {
+/// Find the first `key-123`-shaped segment in a branch name (e.g.
+/// `proj-372-desc` or `feature/proj-372-desc`) that `accept` allows,
+/// matched case-insensitively and normalized to uppercase before the
+/// `accept` check (so `jowi-dev/gh-30-lane` yields `GH-30`, skipping any
+/// earlier segment `accept` rejects).
+fn branch_key(branch: &str, accept: &dyn Fn(&str) -> bool) -> Option<String> {
     let re = Regex::new(r"(?i)\b([a-z][a-z0-9]+-\d+)\b").expect("static regex is valid");
-    re.captures(branch).map(|caps| caps[1].to_uppercase())
+    re.find_iter(branch)
+        .map(|m| m.as_str().to_uppercase())
+        .find(|key| accept(key))
 }
 
 #[cfg(test)]
@@ -148,6 +188,17 @@ mod tests {
         }
     }
 
+    /// Accept every key-shaped token — the loosest possible backend.
+    fn any(_key: &str) -> bool {
+        true
+    }
+
+    /// The github backend's key scheme: `GH-<number>` only.
+    fn gh_only(key: &str) -> bool {
+        key.strip_prefix("GH-")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    }
+
     /// (title, body, branch, expected)
     const CASES: &[(&str, &str, &str, Option<&str>)] = &[
         // Precedence 1: bracketed prefix in title wins over everything else.
@@ -157,32 +208,39 @@ mod tests {
             "cx-2-desc",
             Some("PROJ-372"),
         ),
-        // Precedence 2: bare token in title wins over body/branch.
+        // Precedence 2: bare token in title wins over branch/body.
         (
             "Fix the thing PROJ-372",
             "mentions BX-1",
             "cx-2-desc",
             Some("PROJ-372"),
         ),
-        // Precedence 3: token in body wins over branch.
+        // Precedence 3: branch outranks body prose (GitHub issue #35).
         (
             "Fix the thing",
             "Resolves PROJ-372",
             "cx-2-desc",
-            Some("PROJ-372"),
+            Some("CX-2"),
         ),
-        // Precedence 4: plain branch name, lowercase, normalized to uppercase.
+        // Precedence 3: plain branch name, lowercase, normalized to uppercase.
         (
             "Fix the thing",
             "no key here",
             "proj-372-desc",
             Some("PROJ-372"),
         ),
-        // Precedence 4: branch name with a prefix path segment.
+        // Precedence 3: branch name with a prefix path segment.
         (
             "Fix the thing",
             "no key here",
             "feature/proj-372-desc",
+            Some("PROJ-372"),
+        ),
+        // Precedence 4: body is the last resort.
+        (
+            "Fix the thing",
+            "Resolves PROJ-372",
+            "some-branch-name",
             Some("PROJ-372"),
         ),
         // No match anywhere.
@@ -201,61 +259,73 @@ mod tests {
         for (title, body, branch, expected) in CASES {
             let pr = pr(title, body, branch);
             assert_eq!(
-                find_issue_key(&pr),
+                find_issue_key(&pr, &any),
                 expected.map(str::to_string),
                 "title={title:?} body={body:?} branch={branch:?}"
             );
         }
     }
 
-    /// (title, body, branch, expected (key, source))
-    type SourceCase<'a> = (&'a str, &'a str, &'a str, Option<(&'a str, KeySource)>);
-
+    /// The GitHub issue #35 repro: a PR body mentioning `ADR-0006` must not
+    /// outrank the `gh-30` branch under the github backend's key scheme.
     #[test]
-    fn find_issue_key_with_source_table() {
-        let cases: &[SourceCase] = &[
-            (
-                "[PROJ-372] Fix the thing",
-                "mentions BX-1 too",
-                "cx-2-desc",
-                Some(("PROJ-372", KeySource::Title)),
-            ),
-            (
-                "Fix the thing",
-                "Resolves PROJ-372",
-                "cx-2-desc",
-                Some(("PROJ-372", KeySource::Body)),
-            ),
-            (
-                "Fix the thing",
-                "no key here",
-                "proj-372-desc",
-                Some(("PROJ-372", KeySource::Branch)),
-            ),
-            ("Fix the thing", "no key here", "some-branch-name", None),
-        ];
-
-        for (title, body, branch, expected) in cases {
-            let pr = pr(title, body, branch);
-            assert_eq!(
-                find_issue_key_with_source(&pr),
-                expected.map(|(key, source)| (key.to_string(), source)),
-                "title={title:?} body={body:?} branch={branch:?}"
-            );
-        }
+    fn find_issue_key_skips_doc_labels_the_backend_rejects() {
+        let pr = pr(
+            "Offer agent-assisted lane setup from tm init",
+            "Closes #30.\n\nRecorded as ADR-0006.",
+            "jowi-dev/gh-30-tm-init-lane",
+        );
+        assert_eq!(find_issue_key(&pr, &gh_only), Some("GH-30".to_string()));
     }
 
     #[test]
-    fn find_pr_for_ticket_matches_by_title_body_or_branch() {
+    fn find_issue_key_skips_rejected_tokens_within_one_source() {
+        // ADR-0006 comes first in the body, but the scan moves on to GH-30
+        // rather than stopping at the rejected token.
+        let pr = pr(
+            "Fix the thing",
+            "Per ADR-0006 this closes GH-30.",
+            "some-branch-name",
+        );
+        assert_eq!(find_issue_key(&pr, &gh_only), Some("GH-30".to_string()));
+    }
+
+    #[test]
+    fn find_issue_key_rejected_title_prefix_falls_back_to_bare_title_token() {
+        let pr = pr("[ADR-0006] Fix GH-30 thing", "", "some-branch-name");
+        assert_eq!(find_issue_key(&pr, &gh_only), Some("GH-30".to_string()));
+    }
+
+    #[test]
+    fn issue_key_candidates_orders_title_branch_body() {
+        let pr = pr("[PROJ-372] Fix the thing", "mentions BX-1 too", "cx-2-desc");
+        assert_eq!(
+            issue_key_candidates(&pr, &any),
+            vec![
+                ("PROJ-372".to_string(), KeySource::Title),
+                ("CX-2".to_string(), KeySource::Branch),
+                ("BX-1".to_string(), KeySource::Body),
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_key_candidates_empty_when_nothing_matches() {
+        let pr = pr("Fix the thing", "no key here", "some-branch-name");
+        assert_eq!(issue_key_candidates(&pr, &any), vec![]);
+    }
+
+    #[test]
+    fn find_pr_for_ticket_matches_by_title_branch_or_body() {
         let prs = vec![pr("[PROJ-372] Fix the thing", "", "fix-branch")];
-        let found = find_pr_for_ticket(&prs, "PROJ-372").expect("expected a match");
+        let found = find_pr_for_ticket(&prs, "PROJ-372", &any).expect("expected a match");
         assert_eq!(found.number, 1);
     }
 
     #[test]
     fn find_pr_for_ticket_no_match_is_none() {
         let prs = vec![pr("Fix the thing", "no key here", "some-branch-name")];
-        assert_eq!(find_pr_for_ticket(&prs, "PROJ-372"), None);
+        assert_eq!(find_pr_for_ticket(&prs, "PROJ-372", &any), None);
     }
 
     #[test]
@@ -265,14 +335,27 @@ mod tests {
         let mut first = pr("[PROJ-372] First attempt", "", "proj-372-fix");
         first.number = 3;
         let prs = vec![second, first];
-        let found = find_pr_for_ticket(&prs, "PROJ-372").expect("expected a match");
+        let found = find_pr_for_ticket(&prs, "PROJ-372", &any).expect("expected a match");
         assert_eq!(found.number, 3);
     }
 
     #[test]
     fn find_pr_for_ticket_compares_key_case_insensitively() {
         let prs = vec![pr("[PROJ-372] Fix the thing", "", "fix-branch")];
-        let found = find_pr_for_ticket(&prs, "proj-372").expect("expected a match");
+        let found = find_pr_for_ticket(&prs, "proj-372", &any).expect("expected a match");
+        assert_eq!(found.number, 1);
+    }
+
+    #[test]
+    fn find_pr_for_ticket_is_not_masked_by_a_rejected_body_token() {
+        // Body mentions ADR-0006 ahead of anything else; the branch still
+        // resolves the PR for GH-30 under the github key scheme.
+        let prs = vec![pr(
+            "Offer agent-assisted lane setup",
+            "See ADR-0006.",
+            "jowi-dev/gh-30-tm-init-lane",
+        )];
+        let found = find_pr_for_ticket(&prs, "GH-30", &gh_only).expect("expected a match");
         assert_eq!(found.number, 1);
     }
 

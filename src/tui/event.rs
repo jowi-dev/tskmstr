@@ -1842,7 +1842,10 @@ fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<M
 
     match deps.gh.pr_list_bounded(&repo_root, PR_LOOKUP_TIMEOUT) {
         Ok(prs) => {
-            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key).cloned();
+            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key, &|token| {
+                deps.jira.is_ticket_key(token)
+            })
+            .cloned();
             vec![Msg::BrowserOptionsResolved {
                 key,
                 jira_url,

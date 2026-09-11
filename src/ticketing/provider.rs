@@ -253,7 +253,10 @@ pub trait TicketProvider {
             return false;
         };
         prefix.len() >= 2
-            && prefix.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && prefix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
             && prefix
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
