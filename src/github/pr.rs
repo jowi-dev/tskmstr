@@ -97,19 +97,22 @@ pub fn find_pr_for_ticket<'a>(prs: &'a [PrInfo], key: &str) -> Option<&'a PrInfo
     matches.into_iter().next()
 }
 
-/// Prefix `title` with `[KEY]` unless it is already prefixed with that exact
-/// key.
+/// Prefix `title` with `[KEY]`, replacing any existing key-shaped `[...]`
+/// prefixes rather than stacking a second one: re-associating a PR with a
+/// different ticket (`tm ticket <KEY>` after a wrong scrape, see GitHub
+/// issue #35) must not leave `[GH-30] [ADR-0006] ...` behind. Non-key
+/// brackets (`[WIP]`) are left alone.
 ///
 /// Idempotent: calling this again on its own output is a no-op. If the key
 /// appears elsewhere in the title (not as the prefix), the prefix is still
 /// added; the title is never scanned for an existing *unprefixed* occurrence
 /// of the key.
 pub fn with_issue_key_prefix(title: &str, key: &str) -> String {
-    let bracketed = format!("[{key}]");
-    if title.starts_with(&bracketed) {
-        return title.to_string();
+    let mut rest = title;
+    while let Some(prefix_key) = title_prefix_key(rest) {
+        rest = rest[prefix_key.len() + 2..].trim_start();
     }
-    format!("{bracketed} {title}")
+    format!("[{key}] {rest}")
 }
 
 /// Match a `[KEY-123]` prefix at the very start of `title`.
@@ -286,6 +289,30 @@ mod tests {
         let once = with_issue_key_prefix("Fix the thing", "PROJ-372");
         let twice = with_issue_key_prefix(&once, "PROJ-372");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn with_issue_key_prefix_replaces_stale_key_prefix() {
+        assert_eq!(
+            with_issue_key_prefix("[ADR-0006] Fix the thing", "GH-30"),
+            "[GH-30] Fix the thing"
+        );
+    }
+
+    #[test]
+    fn with_issue_key_prefix_collapses_stacked_key_prefixes() {
+        assert_eq!(
+            with_issue_key_prefix("[GH-30] [ADR-0006] Fix the thing", "GH-30"),
+            "[GH-30] Fix the thing"
+        );
+    }
+
+    #[test]
+    fn with_issue_key_prefix_keeps_non_key_brackets() {
+        assert_eq!(
+            with_issue_key_prefix("[WIP] Fix the thing", "PROJ-372"),
+            "[PROJ-372] [WIP] Fix the thing"
+        );
     }
 
     #[test]
