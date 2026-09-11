@@ -76,6 +76,14 @@ fn retro_overlay_for(app: &App) -> RetroOverlay {
 /// single-digit number of seconds rather than indefinitely.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long each of [`merge_pr`]'s underlying `gh` calls
+/// ([`crate::github::gh_cli::GhCli::pr_merge`]) may run before being killed.
+/// More generous than [`PR_LOOKUP_TIMEOUT`] -- a merge is a write GitHub
+/// may legitimately take longer to answer than a list, and the user just
+/// confirmed a prompt so a longer visible wait is expected -- while still
+/// bounding how long a dead network can freeze the board.
+const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run `kind` of a `tm pr watch` poll loop, filtered on by
 /// [`load_bot_watch_status`].
 const REVIEW_WATCH_KIND: &str = "review-watch";
@@ -199,6 +207,11 @@ pub struct TuiDeps {
     /// (Claude today; see [`crate::agent::AgentRunner`] and GitHub issue
     /// #17), selected by `config.agent` via `main.rs`'s `agent_runner_for`.
     pub runner: &'static dyn crate::agent::AgentRunner,
+    /// The configured post-merge status target
+    /// ([`crate::config::Config::status_on_merge`]), applied advisorily by
+    /// [`merge_pr`] after a successful board merge. `None` means merge
+    /// only, no transition (GitHub issue #32).
+    pub status_on_merge: Option<String>,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
@@ -279,7 +292,8 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
         ..App::new()
     }
     .with_lane_names(deps.lane_names.clone())
-    .with_hidden_lane_count(deps.hidden_lane_count);
+    .with_hidden_lane_count(deps.hidden_lane_count)
+    .with_status_on_merge(deps.status_on_merge.clone());
     let query = query_for_filter(&app.filter, &app.project_key);
     app = run_cmds(
         app,
@@ -311,6 +325,7 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
+                    app.merge_confirm.is_some(),
                     retro_overlay_for(&app),
                     key_event.code,
                 )
@@ -481,6 +496,37 @@ fn run_cmds<B: Backend>(
             // before this fix, even though the wait is now bounded.
             let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
             for msg in resolve_pr_for_ticket(deps, key, jira_url) {
+                let (next_app, more_cmds) = update(app, msg);
+                app = next_app;
+                pending.extend(more_cmds);
+            }
+            continue;
+        }
+        if let Cmd::ResolvePrForMerge { key } = cmd {
+            // Same forced pre-draw as `Cmd::ResolvePrForTicket` above, for
+            // the same reason: the `resolving PR for <key>...` status line
+            // must reach the screen before the blocking (bounded) `gh pr
+            // list` call starts.
+            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
+            for msg in resolve_pr_for_merge(deps, key) {
+                let (next_app, more_cmds) = update(app, msg);
+                app = next_app;
+                pending.extend(more_cmds);
+            }
+            continue;
+        }
+        if let Cmd::MergePr {
+            key,
+            number,
+            repo_root,
+        } = cmd
+        {
+            // Same forced pre-draw again: the merge is the longest blocking
+            // call the board makes (two bounded `gh` calls, see
+            // `MERGE_TIMEOUT`), and it must run behind the `merging PR
+            // #N...` status line, not behind a stale frame.
+            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
+            for msg in merge_pr(deps, &key, number, &repo_root) {
                 let (next_app, more_cmds) = update(app, msg);
                 app = next_app;
                 pending.extend(more_cmds);
@@ -877,6 +923,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
+                    app.merge_confirm.is_some(),
                     RetroOverlay::None,
                     key_event.code,
                 )
@@ -1171,8 +1218,9 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // `tmux attach`/`vdiff`, respectively); `Cmd::LaunchLaneRun`/
         // `Cmd::LaunchBotWatch`/`Cmd::LaunchReviewFix` need `&mut
         // Vec<PendingLaunch>` (the in-flight launcher registry);
-        // `Cmd::ResolvePrForTicket` needs `&mut Terminal` too, to force a
-        // redraw before its blocking (bounded) `gh pr list` call runs -- none
+        // `Cmd::ResolvePrForTicket`/`Cmd::ResolvePrForMerge`/`Cmd::MergePr`
+        // need `&mut Terminal` too, to force a redraw before their blocking
+        // (bounded) `gh` calls run -- none
         // of which this function's signature has access to; `run_cmds`
         // always intercepts all of these before calling `execute` (see the
         // module docs), so they're unreachable here in practice.
@@ -1192,7 +1240,9 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::ViewLogs { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
-        | Cmd::ResolvePrForTicket { .. }) => {
+        | Cmd::ResolvePrForTicket { .. }
+        | Cmd::ResolvePrForMerge { .. }
+        | Cmd::MergePr { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -1903,6 +1953,103 @@ fn resolve_repo_root_for_pr_lookup(deps: &TuiDeps, key: &str) -> Option<std::pat
     }
 }
 
+/// Run `Cmd::ResolvePrForMerge`: look up `key`'s open GitHub PR (if any)
+/// ahead of the merge confirmation overlay, reporting the result as
+/// [`Msg::MergePrResolved`]. The same single bounded `gh pr list` call --
+/// and the same leniency stance -- as [`resolve_pr_for_ticket`], sharing
+/// [`resolve_repo_root_for_pr_lookup`] and
+/// [`crate::github::pr::find_pr_for_ticket`]; only the reported `Msg`
+/// differs, because here "no PR" means "nothing to merge" (a status-line
+/// message) rather than "open Jira instead". Because the lookup lists open
+/// PRs only, an already-merged or closed PR resolves to `None` too, which
+/// is exactly the inert behavior GitHub issue #32's acceptance criteria
+/// ask for.
+fn resolve_pr_for_merge(deps: &TuiDeps, key: String) -> Vec<Msg> {
+    let Some(repo_root) = resolve_repo_root_for_pr_lookup(deps, &key) else {
+        return vec![Msg::MergePrResolved {
+            key,
+            pr: None,
+            repo_root: None,
+            note: None,
+        }];
+    };
+
+    match deps.gh.pr_list_bounded(&repo_root, PR_LOOKUP_TIMEOUT) {
+        Ok(prs) => {
+            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key).cloned();
+            let repo_root = pr.is_some().then_some(repo_root);
+            vec![Msg::MergePrResolved {
+                key,
+                pr,
+                repo_root,
+                note: None,
+            }]
+        }
+        Err(crate::github::gh_cli::GhError::Timeout { .. }) => {
+            let note = format!(
+                "PR lookup for {key} timed out after {}s; nothing merged",
+                PR_LOOKUP_TIMEOUT.as_secs()
+            );
+            vec![Msg::MergePrResolved {
+                key,
+                pr: None,
+                repo_root: None,
+                note: Some(note),
+            }]
+        }
+        Err(err) => {
+            let note = format!("PR lookup for {key} failed: {err}");
+            vec![Msg::MergePrResolved {
+                key,
+                pr: None,
+                repo_root: None,
+                note: Some(note),
+            }]
+        }
+    }
+}
+
+/// Run `Cmd::MergePr`: merge the confirmed PR
+/// ([`crate::github::gh_cli::GhCli::pr_merge`], bounded by
+/// [`MERGE_TIMEOUT`]), then advisorily apply the configured
+/// `status_on_merge` transition, per GitHub issue #32's acceptance
+/// criteria:
+///
+/// - a failed merge reports the error and attempts no transition;
+/// - a successful merge with `status_on_merge` unset reports the merge and
+///   attempts no transition ("merge only");
+/// - a successful merge with it set applies
+///   [`crate::ticketing::apply_status_on_merge`], appending either the
+///   resulting status or the advisory warning (unmatched status, API
+///   error) to the merge message -- a transition problem never un-reports
+///   the merge itself, which by then has already happened.
+fn merge_pr(deps: &TuiDeps, key: &str, number: u64, repo_root: &std::path::Path) -> Vec<Msg> {
+    if let Err(err) = deps.gh.pr_merge(repo_root, number, MERGE_TIMEOUT) {
+        return vec![Msg::MergePrResult {
+            merged: false,
+            message: format!("merge of PR #{number} for {key} failed: {err}"),
+        }];
+    }
+
+    let message = match deps.status_on_merge.as_deref() {
+        None => format!("merged PR #{number} for {key}"),
+        Some(target) => {
+            match crate::ticketing::apply_status_on_merge(deps.jira.as_ref(), key, target) {
+                crate::ticketing::StatusTransition::Applied(status) => {
+                    format!("merged PR #{number} for {key}; moved to {status}")
+                }
+                crate::ticketing::StatusTransition::Warning(warning) => {
+                    format!("merged PR #{number} for {key}; warning: {warning}")
+                }
+            }
+        }
+    };
+    vec![Msg::MergePrResult {
+        merged: true,
+        message,
+    }]
+}
+
 /// Best-effort open `url` in the user's default browser via the `open`
 /// command. Failures are not surfaced as a dedicated message (the fixed `Msg`
 /// set has no `OpenUrlFailed` variant); [`Msg::TicketsFailed`] is reused
@@ -2004,6 +2151,7 @@ mod tests {
                 project_key: "PROJ".to_string(),
             },
             runner: &crate::agent::claude::ClaudeRunner,
+            status_on_merge: None,
         }
     }
 
@@ -2349,6 +2497,197 @@ mod tests {
                 );
             }
             other => panic!("expected BrowserOptionsResolved with a timeout note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_pr_for_merge_finds_open_pr_and_carries_repo_root() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
+                42,
+                "[PROJ-1] Fix the thing",
+                "proj-1-fix",
+            )])),
+        );
+        let msgs = resolve_pr_for_merge(&deps, "PROJ-1".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: Some(pr(42, "[PROJ-1] Fix the thing", "proj-1-fix")),
+                repo_root: Some(std::path::PathBuf::from("/repo")),
+                note: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pr_for_merge_with_no_matching_pr_resolves_none() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
+                7,
+                "[OTHER-9] Unrelated",
+                "other-9",
+            )])),
+        );
+        let msgs = resolve_pr_for_merge(&deps, "PROJ-1".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: None,
+                repo_root: None,
+                note: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_pr_for_merge_on_timeout_reports_nothing_merged() {
+        let mut deps = deps(FakeJiraClient::new());
+        deps.git = Box::new(
+            crate::work::git::FakeGitOps::new()
+                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
+        );
+        deps.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_list_bounded(Err(
+                crate::github::gh_cli::GhError::Timeout {
+                    command: "gh pr list".to_string(),
+                    seconds: PR_LOOKUP_TIMEOUT.as_secs(),
+                },
+            )),
+        );
+        let msgs = resolve_pr_for_merge(&deps, "PROJ-1".to_string());
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: None,
+                repo_root: None,
+                note: Some("PR lookup for PROJ-1 timed out after 8s; nothing merged".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_pr_failure_reports_error_and_attempts_no_transition() {
+        // `status_on_merge` is set, but the merge failing must be the whole
+        // story: no transition attempt, no "moved to" in the message.
+        let mut d = deps(FakeJiraClient::new());
+        d.status_on_merge = Some("Done".to_string());
+        d.gh = Box::new(
+            crate::github::gh_cli::FakeGhCli::new().with_pr_merge_result(Err(
+                crate::github::gh_cli::GhError::Command {
+                    command: "gh pr merge".to_string(),
+                    exit_code: Some(1),
+                    stderr: "Pull request is not mergeable".to_string(),
+                },
+            )),
+        );
+        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
+        match msgs.as_slice() {
+            [
+                Msg::MergePrResult {
+                    merged: false,
+                    message,
+                },
+            ] => {
+                assert!(
+                    message.contains("merge of PR #42 for PROJ-1 failed"),
+                    "message should report the failed merge: {message}"
+                );
+                assert!(
+                    message.contains("not mergeable"),
+                    "message should carry gh's error: {message}"
+                );
+                assert!(
+                    !message.contains("moved to"),
+                    "a failed merge must not report a transition: {message}"
+                );
+            }
+            other => panic!("expected a failed MergePrResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_pr_success_without_status_on_merge_merges_only() {
+        // Absent key = merge only: the exact message pins that no advisory
+        // transition outcome (applied or warning) was appended.
+        let d = deps(FakeJiraClient::new());
+        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResult {
+                merged: true,
+                message: "merged PR #42 for PROJ-1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_pr_success_applies_configured_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1", "In Review"))
+            .with_transitions(
+                "PROJ-1",
+                vec![crate::ticketing::types::Transition {
+                    id: "31".to_string(),
+                    name: "Ship it".to_string(),
+                    to: Status {
+                        name: "Done".to_string(),
+                        status_category: StatusCategory {
+                            key: "done".to_string(),
+                        },
+                    },
+                }],
+            );
+        let mut d = deps(jira);
+        d.status_on_merge = Some("Done".to_string());
+        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResult {
+                merged: true,
+                message: "merged PR #42 for PROJ-1; moved to Done".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_pr_success_with_unmatched_status_appends_advisory_warning() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1", "In Review"))
+            .with_transitions("PROJ-1", vec![]);
+        let mut d = deps(jira);
+        d.status_on_merge = Some("Shipped".to_string());
+        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
+        match msgs.as_slice() {
+            [
+                Msg::MergePrResult {
+                    merged: true,
+                    message,
+                },
+            ] => {
+                assert!(
+                    message.starts_with("merged PR #42 for PROJ-1; warning: "),
+                    "the merge itself must still be reported: {message}"
+                );
+                assert!(
+                    message.contains("no transition to \"Shipped\""),
+                    "the advisory warning should follow: {message}"
+                );
+            }
+            other => panic!("expected a merged-with-warning MergePrResult, got {other:?}"),
         }
     }
 

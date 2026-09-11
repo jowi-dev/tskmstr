@@ -67,6 +67,12 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// `j`/`k`/arrows/`Enter`/`Esc`/`q` shape applies again, routed to
 /// `BrowserPicker*` (see [`Msg::OpenBrowserAction`]).
 ///
+/// While the merge confirmation overlay is shown (`show_merge_confirm`,
+/// see [`Msg::MergePrAction`]), only `y`/`Y`/`Enter` (confirm the merge) and
+/// `n`/`N`/`Esc`/`q` (cancel) are bound; every other key is inert, so
+/// nothing irreversible can happen from a stray keystroke while the prompt
+/// is up.
+///
 /// While a ticket is grabbed on [`Screen::Rank`] (`rank_grabbed`), `r` is
 /// inert: refreshing would silently discard the pending, undropped reorder.
 /// `rank_grabbed` is ignored on every other screen.
@@ -108,6 +114,7 @@ pub fn map_key(
     show_browser_picker: bool,
     rank_grabbed: bool,
     show_run_detail: bool,
+    show_merge_confirm: bool,
     retro_overlay: RetroOverlay,
     key: KeyCode,
 ) -> Option<Msg> {
@@ -154,6 +161,16 @@ pub fn map_key(
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::BrowserPickerUp),
             KeyCode::Enter => Some(Msg::BrowserPickerSelect),
             KeyCode::Esc | KeyCode::Char('q') => Some(Msg::BrowserPickerClose),
+            _ => None,
+        };
+    }
+
+    if show_merge_confirm {
+        return match key {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Msg::MergeConfirm),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                Some(Msg::MergeCancel)
+            }
             _ => None,
         };
     }
@@ -224,6 +241,7 @@ pub fn map_key(
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
         KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
         KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
+        KeyCode::Char('M') if *screen == Screen::Board => Some(Msg::MergePrAction),
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
@@ -248,6 +266,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &Screen::Board,
+                    false,
                     false,
                     false,
                     false,
@@ -283,6 +302,7 @@ mod tests {
                         false,
                         false,
                         false,
+                        false,
                         RetroOverlay::None,
                         key
                     ),
@@ -298,6 +318,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -326,6 +347,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Esc
                 ),
@@ -334,6 +356,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -361,6 +384,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('r')
             ),
@@ -373,6 +397,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -398,6 +423,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -433,6 +459,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('O')
                 ),
@@ -461,6 +488,7 @@ mod tests {
                     true,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -479,6 +507,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 RetroOverlay::None,
@@ -500,6 +529,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -513,6 +543,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 RetroOverlay::None,
@@ -545,6 +576,7 @@ mod tests {
                     true,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -558,6 +590,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -584,6 +617,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('z')
             ),
@@ -592,6 +626,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -618,6 +653,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('z')
             ),
@@ -633,6 +669,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Enter
             ),
@@ -642,6 +679,7 @@ mod tests {
             map_key(
                 &Screen::Board,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -667,6 +705,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('q')
             ),
@@ -679,6 +718,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -699,6 +739,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -733,6 +774,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -748,6 +790,7 @@ mod tests {
                 &Screen::Board,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -772,6 +815,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -782,6 +826,7 @@ mod tests {
                 &Screen::Board,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -799,6 +844,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -826,6 +872,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('p')
                 ),
@@ -839,6 +886,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -871,6 +919,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('a')
                 ),
@@ -886,6 +935,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -912,6 +962,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('s')
             ),
@@ -926,6 +977,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -952,6 +1004,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('F')
             ),
@@ -964,6 +1017,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -996,6 +1050,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('m')
                 ),
@@ -1009,6 +1064,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -1038,6 +1094,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('s')
                 ),
@@ -1051,6 +1108,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -1083,6 +1141,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('w')
                 ),
@@ -1096,6 +1155,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -1121,6 +1181,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -1155,6 +1216,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1172,6 +1234,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1194,6 +1257,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -1206,6 +1270,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1238,6 +1303,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1258,6 +1324,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Enter
             ),
@@ -1266,6 +1333,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1293,6 +1361,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char(' ')
                 ),
@@ -1306,6 +1375,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1328,6 +1398,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('k')
             ),
@@ -1336,6 +1407,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1358,6 +1430,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('q')
             ),
@@ -1366,6 +1439,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1388,6 +1462,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('o')
             ),
@@ -1396,6 +1471,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1422,6 +1498,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('r')
             ),
@@ -1434,6 +1511,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Rank,
+                false,
                 false,
                 false,
                 false,
@@ -1472,11 +1550,13 @@ mod tests {
                     false,
                     true,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
                 map_key(
                     &Screen::Rank,
+                    false,
                     false,
                     false,
                     false,
@@ -1504,6 +1584,7 @@ mod tests {
                     false,
                     false,
                     true,
+                    false,
                     false,
                     RetroOverlay::None,
                     KeyCode::Char('r')
@@ -1534,6 +1615,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1554,6 +1636,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('A')
             ),
@@ -1567,6 +1650,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -1601,6 +1685,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1617,6 +1702,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1640,6 +1726,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -1651,6 +1738,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1684,6 +1772,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1697,6 +1786,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1719,6 +1809,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('l')
             ),
@@ -1727,6 +1818,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1749,6 +1841,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('k')
             ),
@@ -1757,6 +1850,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1779,6 +1873,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('r')
             ),
@@ -1794,6 +1889,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -1802,6 +1898,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Runs,
+                false,
                 false,
                 false,
                 false,
@@ -1828,6 +1925,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('j')
             ),
@@ -1843,6 +1941,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Down
             ),
@@ -1858,6 +1957,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('k')
             ),
@@ -1873,6 +1973,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Up
             ),
@@ -1888,6 +1989,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Esc
             ),
@@ -1903,6 +2005,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('q')
             ),
@@ -1918,6 +2021,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('r')
             ),
@@ -1945,6 +2049,7 @@ mod tests {
                     false,
                     false,
                     true,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -1966,6 +2071,7 @@ mod tests {
                     false,
                     false,
                     true,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('r')
                 ),
@@ -1979,6 +2085,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2007,6 +2114,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('v')
                 ),
@@ -2020,6 +2128,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2041,6 +2150,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &screen,
+                    false,
                     false,
                     false,
                     false,
@@ -2081,6 +2191,7 @@ mod tests {
                     false,
                     false,
                     true,
+                    false,
                     RetroOverlay::None,
                     key
                 ),
@@ -2094,6 +2205,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2122,6 +2234,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('V')
                 ),
@@ -2135,6 +2248,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2160,6 +2274,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('F')
                 ),
@@ -2169,10 +2284,129 @@ mod tests {
     }
 
     #[test]
+    fn capital_m_maps_to_merge_pr_action_on_board_only() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char('M')
+            ),
+            Some(Msg::MergePrAction)
+        );
+        for screen in [
+            Screen::Detail,
+            Screen::TransitionMenu,
+            Screen::Rank,
+            Screen::Runs,
+        ] {
+            assert_eq!(
+                map_key(
+                    &screen,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    RetroOverlay::None,
+                    KeyCode::Char('M')
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn merge_confirm_overlay_binds_confirm_cancel_and_nothing_else() {
+        let confirm_keys = [KeyCode::Char('y'), KeyCode::Char('Y'), KeyCode::Enter];
+        for key in confirm_keys {
+            assert_eq!(
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    RetroOverlay::None,
+                    key
+                ),
+                Some(Msg::MergeConfirm),
+                "{key:?} should confirm the merge"
+            );
+        }
+        let cancel_keys = [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+        ];
+        for key in cancel_keys {
+            assert_eq!(
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    RetroOverlay::None,
+                    key
+                ),
+                Some(Msg::MergeCancel),
+                "{key:?} should cancel the merge"
+            );
+        }
+        // Everything else is inert while the prompt is up -- including the
+        // keys that would otherwise merge, navigate, or quit.
+        for key in [
+            KeyCode::Char('M'),
+            KeyCode::Char('j'),
+            KeyCode::Char('r'),
+            KeyCode::Char('?'),
+        ] {
+            assert_eq!(
+                map_key(
+                    &Screen::Board,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    RetroOverlay::None,
+                    key
+                ),
+                None,
+                "{key:?} should be inert while the merge prompt is up"
+            );
+        }
+    }
+
+    #[test]
     fn capital_r_opens_retro_board_on_board_only() {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2202,6 +2436,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('R')
                 ),
@@ -2215,6 +2450,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Board,
+                false,
                 false,
                 false,
                 false,
@@ -2249,6 +2485,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::None,
                     KeyCode::Char('c')
                 ),
@@ -2269,6 +2506,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('d')
             ),
@@ -2277,6 +2515,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Retro,
+                false,
                 false,
                 false,
                 false,
@@ -2312,6 +2551,7 @@ mod tests {
                         false,
                         false,
                         false,
+                        false,
                         RetroOverlay::None,
                         key
                     ),
@@ -2334,6 +2574,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('j')
             ),
@@ -2349,6 +2590,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::None,
                 KeyCode::Char('r')
             ),
@@ -2357,6 +2599,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Retro,
+                false,
                 false,
                 false,
                 false,
@@ -2390,6 +2633,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::SeverityPicker,
                     key
                 ),
@@ -2410,6 +2654,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::SeverityPicker,
                 KeyCode::Enter
             ),
@@ -2419,6 +2664,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &Screen::Retro,
+                    false,
                     false,
                     false,
                     false,
@@ -2454,6 +2700,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    false,
                     RetroOverlay::SeverityPicker,
                     key
                 ),
@@ -2468,6 +2715,7 @@ mod tests {
             assert_eq!(
                 map_key(
                     &Screen::Retro,
+                    false,
                     false,
                     false,
                     false,
@@ -2496,6 +2744,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::NoteEntry,
                 KeyCode::Backspace
             ),
@@ -2511,6 +2760,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 RetroOverlay::NoteEntry,
                 KeyCode::Enter
             ),
@@ -2519,6 +2769,7 @@ mod tests {
         assert_eq!(
             map_key(
                 &Screen::Retro,
+                false,
                 false,
                 false,
                 false,

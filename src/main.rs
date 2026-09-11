@@ -595,6 +595,7 @@ fn run_board(
         lanes,
         backend_identity: current_backend_identity,
         runner,
+        status_on_merge: config.status_on_merge,
     })?;
     Ok(())
 }

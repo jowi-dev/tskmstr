@@ -505,6 +505,26 @@ pub fn bot_watch_indicator(run: Option<RunStatus>) -> Option<BotWatchIndicator> 
     }
 }
 
+/// The pending merge the confirmation overlay ([`Msg::MergePrAction`],
+/// GitHub issue #32) is asking about, captured whole at resolution time
+/// ([`merge_pr_resolved`]) rather than re-read off the selection at confirm
+/// time, so the merge still targets the right PR even if the selection or
+/// board contents change while the overlay is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConfirm {
+    /// Ticket key whose PR is pending merge.
+    pub key: String,
+    /// The resolved open PR's number.
+    pub pr_number: u64,
+    /// The resolved open PR's title, shown in the prompt.
+    pub pr_title: String,
+    /// Repo root the PR resolution ran against; the merge runs there too.
+    pub repo_root: std::path::PathBuf,
+    /// The configured `status_on_merge` target the ticket will advisorily
+    /// move to after the merge, or `None` for "merge only".
+    pub target_status: Option<String>,
+}
+
 /// One choice in the floating picker [`Msg::OpenBrowserAction`] opens when
 /// the selected ticket has both a Jira issue and an open GitHub pull request.
 /// Built once, in [`browser_options_resolved`], from the ticket's own `url`
@@ -780,6 +800,19 @@ pub struct App {
     /// -- built by [`browser_options_resolved`] once [`Cmd::ResolvePrForTicket`]
     /// reports a PR was found. Empty whenever the picker is closed.
     pub browser_picker_options: Vec<BrowserPickerOption>,
+    /// The merge confirmation overlay's pending merge (the `M` key, GitHub
+    /// issue #32), or `None` when the overlay is closed. A single `Option`
+    /// rather than the `show_*` bool + data pair the pickers use: unlike a
+    /// picker's option list, there is no meaningful "data without overlay"
+    /// state here -- the overlay being open and a merge being pending are
+    /// the same fact.
+    pub merge_confirm: Option<MergeConfirm>,
+    /// The configured `status_on_merge` target (see
+    /// [`crate::config::Config::status_on_merge`]), threaded in at
+    /// construction via [`App::with_status_on_merge`] so
+    /// [`merge_pr_resolved`] can show the confirmation's post-merge status
+    /// (or "merge only") without the reducer touching config I/O.
+    pub status_on_merge: Option<String>,
     /// [`Screen::Retro`]'s ticket list: shipped tickets awaiting a retro
     /// verdict, newest-resolved first. Kept entirely separate from
     /// `columns`/`rank_tickets`, same reasoning as those two.
@@ -828,6 +861,14 @@ impl App {
     /// into the board at construction, alongside [`Self::with_lane_names`].
     pub fn with_hidden_lane_count(mut self, hidden_lane_count: usize) -> Self {
         self.hidden_lane_count = hidden_lane_count;
+        self
+    }
+
+    /// Set `status_on_merge` (see that field's doc comment), for threading
+    /// the configured post-merge status target into the board at
+    /// construction, alongside [`Self::with_lane_names`].
+    pub fn with_status_on_merge(mut self, status_on_merge: Option<String>) -> Self {
+        self.status_on_merge = status_on_merge;
         self
     }
 
@@ -972,6 +1013,54 @@ pub enum Msg {
     BrowserPickerSelect,
     /// Close the browser picker without opening anything.
     BrowserPickerClose,
+    /// The `M` key on [`Screen::Board`] (GitHub issue #32): resolve the
+    /// selected ticket's open GitHub PR ([`Cmd::ResolvePrForMerge`]) ahead
+    /// of the merge confirmation overlay. Like [`Msg::OpenBrowserAction`],
+    /// never merges anything directly -- [`Msg::MergePrResolved`] decides
+    /// between the confirmation overlay and a status-line "no open PR"
+    /// message, and only [`Msg::MergeConfirm`] can start the merge itself.
+    /// A no-op when no ticket is selected. Deliberately ungated by
+    /// column/status, like the `a` audit key: the PR resolution itself is
+    /// the authority on whether there is anything to merge.
+    MergePrAction,
+    /// [`Cmd::ResolvePrForMerge`] finished: `pr`/`repo_root` are `Some`
+    /// when an open GitHub PR was found for `key` (the executor always
+    /// sets both or neither), `None` otherwise -- which covers "no PR
+    /// yet", "PR already merged or closed" (the lookup only lists open
+    /// PRs), and every `gh`/repo-resolution failure, all inert per the
+    /// issue's acceptance criteria. `Some` opens the confirmation
+    /// overlay; `None` is a status-line message only.
+    MergePrResolved {
+        /// Ticket key the lookup was for.
+        key: String,
+        /// The resolved open PR, if any.
+        pr: Option<crate::github::pr::PrInfo>,
+        /// The repo root the lookup ran against, carried into
+        /// [`MergeConfirm`] so the merge targets the same repository.
+        repo_root: Option<std::path::PathBuf>,
+        /// A status-line note when the lookup degraded in a way the user
+        /// should know about (the bounded `gh pr list` call timing out),
+        /// mirroring [`Msg::BrowserOptionsResolved`]'s `note`.
+        note: Option<String>,
+    },
+    /// Accept the merge confirmation overlay: close it and start the
+    /// merge ([`Cmd::MergePr`]). A no-op when no confirmation is pending.
+    MergeConfirm,
+    /// Close the merge confirmation overlay without merging; everything is
+    /// left untouched.
+    MergeCancel,
+    /// [`Cmd::MergePr`] finished, successfully or not; `message` carries
+    /// the full status-line outcome either way (merge + transition outcome,
+    /// or the merge error). `merged` additionally refetches the board's
+    /// tickets so a transitioned ticket moves column (or, on the GitHub
+    /// backend, a closed one leaves the board) without waiting for a manual
+    /// refresh.
+    MergePrResult {
+        /// Whether the merge itself succeeded.
+        merged: bool,
+        /// The status-line outcome text.
+        message: String,
+    },
     /// Toggle the help overlay.
     ToggleHelp,
     /// Quit the application.
@@ -1466,6 +1555,29 @@ pub enum Cmd {
         /// no PR is found without a second lookup.
         jira_url: String,
     },
+    /// Resolve whether `key` has an open GitHub pull request, for
+    /// [`Msg::MergePrAction`]'s confirmation prompt. Reports back as
+    /// [`Msg::MergePrResolved`]. Same single-`gh`-call, on-keypress-only
+    /// stance as [`Cmd::ResolvePrForTicket`], and intercepted by
+    /// `run_cmds` for the same status-line-redraw reason.
+    ResolvePrForMerge {
+        /// Ticket key to resolve a PR for.
+        key: String,
+    },
+    /// Merge pull request `number` for `key`, then advisorily apply the
+    /// configured `status_on_merge` transition (if any). Reports back as
+    /// [`Msg::MergePrResult`]. Only ever emitted by [`Msg::MergeConfirm`],
+    /// so a merge can never run without the confirmation overlay having
+    /// been accepted first.
+    MergePr {
+        /// Ticket key whose PR is being merged.
+        key: String,
+        /// The PR number to merge, from the confirmation's resolved PR.
+        number: u64,
+        /// Repo root the resolution ran against, threaded through so the
+        /// merge targets the same repository without a second resolution.
+        repo_root: std::path::PathBuf,
+    },
     /// Fetch shipped tickets matching `query` (always
     /// [`TicketQuery::ShippedAwaitingRetro`]), filter out any that already
     /// have a recorded retro verdict, and enrich the rest with their latest
@@ -1561,6 +1673,32 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 app.browser_picker_selected = (app.browser_picker_selected + 1).min(count - 1);
             }
             (app, Vec::new())
+        }
+        Msg::MergePrAction => merge_pr_action(app),
+        Msg::MergePrResolved {
+            key,
+            pr,
+            repo_root,
+            note,
+        } => merge_pr_resolved(app, key, pr, repo_root, note),
+        Msg::MergeConfirm => merge_confirm_accept(app),
+        Msg::MergeCancel => {
+            if let Some(confirm) = app.merge_confirm.take() {
+                app.status_line = format!(
+                    "merge of PR #{} for {} cancelled",
+                    confirm.pr_number, confirm.key
+                );
+            }
+            (app, Vec::new())
+        }
+        Msg::MergePrResult { merged, message } => {
+            app.status_line = message;
+            if merged {
+                let query = query_for_filter(&app.filter, &app.project_key);
+                (app, vec![Cmd::FetchTickets { query }])
+            } else {
+                (app, Vec::new())
+            }
         }
         Msg::BrowserPickerSelect => browser_picker_select(app),
         Msg::BrowserPickerClose => {
@@ -2005,6 +2143,79 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
     let url = option.url().to_string();
     app.show_browser_picker = false;
     (app, vec![Cmd::OpenUrl(url)])
+}
+
+/// Handle [`Msg::MergePrAction`]: the `M` key's merge entry point on
+/// [`Screen::Board`] (GitHub issue #32). A no-op when no ticket is selected
+/// or another merge confirmation is already open. Mirrors
+/// [`open_browser_action`]'s shape exactly -- including the explicit screen
+/// check and the status-line message [`crate::tui::event::run_cmds`] redraws
+/// before the blocking `gh pr list` lookup -- because it reuses the same
+/// resolution path; only the follow-up message differs.
+fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board || app.merge_confirm.is_some() {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    app.status_line = format!("resolving PR for {key}...");
+    (app, vec![Cmd::ResolvePrForMerge { key }])
+}
+
+/// Handle [`Msg::MergePrResolved`]: [`Cmd::ResolvePrForMerge`]'s result
+/// either opens the merge confirmation overlay (an open PR was found) or
+/// reports why nothing will happen. Per the issue's acceptance criteria,
+/// every no-PR case -- never opened, already merged or closed (the lookup
+/// only lists open PRs), or the lookup failing/timing out -- is inert: a
+/// status-line message, no merge and no transition attempt.
+///
+/// The overlay's `target_status` is captured from `app.status_on_merge`
+/// here, at open time, so the prompt always names exactly what confirming
+/// will do.
+fn merge_pr_resolved(
+    mut app: App,
+    key: String,
+    pr: Option<crate::github::pr::PrInfo>,
+    repo_root: Option<std::path::PathBuf>,
+    note: Option<String>,
+) -> (App, Vec<Cmd>) {
+    match (pr, repo_root) {
+        (Some(pr), Some(repo_root)) => {
+            app.status_line = String::new();
+            app.merge_confirm = Some(MergeConfirm {
+                key,
+                pr_number: pr.number,
+                pr_title: pr.title,
+                repo_root,
+                target_status: app.status_on_merge.clone(),
+            });
+        }
+        _ => {
+            app.status_line = note.unwrap_or_else(|| format!("no open PR found for {key}"));
+        }
+    }
+    (app, Vec::new())
+}
+
+/// Handle [`Msg::MergeConfirm`]: close the confirmation overlay and start
+/// the merge it was asking about. A no-op when no confirmation is pending,
+/// which [`crate::tui::keymap::map_key`]'s overlay gating makes unreachable
+/// in practice -- kept explicit like [`merge_pr_action`]'s screen check.
+fn merge_confirm_accept(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(confirm) = app.merge_confirm.take() else {
+        return (app, Vec::new());
+    };
+    app.status_line = format!("merging PR #{} for {}...", confirm.pr_number, confirm.key);
+    (
+        app,
+        vec![Cmd::MergePr {
+            key: confirm.key,
+            number: confirm.pr_number,
+            repo_root: confirm.repo_root,
+        }],
+    )
 }
 
 /// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm
@@ -3514,6 +3725,200 @@ mod tests {
             url: "https://github.com/example/repo/pull/42".to_string(),
         };
         assert_eq!(github.label(), "GitHub (#42)");
+    }
+
+    fn merge_confirm_fixture() -> MergeConfirm {
+        MergeConfirm {
+            key: "PROJ-1".to_string(),
+            pr_number: 42,
+            pr_title: "[PROJ-1] PR 42".to_string(),
+            repo_root: std::path::PathBuf::from("/repo"),
+            target_status: Some("Done".to_string()),
+        }
+    }
+
+    #[test]
+    fn merge_pr_action_emits_resolve_for_selected_ticket() {
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::ResolvePrForMerge {
+                key: "PROJ-2".to_string(),
+            }]
+        );
+        assert_eq!(app.status_line, "resolving PR for PROJ-2...");
+    }
+
+    #[test]
+    fn merge_pr_action_with_no_tickets_emits_nothing() {
+        let app = board_with(vec![], 0);
+        let (_, cmds) = update(app, Msg::MergePrAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_pr_action_off_board_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (_, cmds) = update(app, Msg::MergePrAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_pr_action_while_a_confirmation_is_open_is_a_noop() {
+        let app = App {
+            merge_confirm: Some(merge_confirm_fixture()),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert!(cmds.is_empty());
+        assert_eq!(app.merge_confirm, Some(merge_confirm_fixture()));
+    }
+
+    #[test]
+    fn merge_pr_resolved_with_pr_opens_confirmation_with_target_status() {
+        let app = App::new().with_status_on_merge(Some("Done".to_string()));
+        let (app, cmds) = update(
+            app,
+            Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: Some(pr_info(42, "https://github.com/example/repo/pull/42")),
+                repo_root: Some(std::path::PathBuf::from("/repo")),
+                note: None,
+            },
+        );
+        assert_eq!(app.merge_confirm, Some(merge_confirm_fixture()));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_pr_resolved_without_status_on_merge_confirmation_has_no_target() {
+        let app = App::new();
+        let (app, _) = update(
+            app,
+            Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: Some(pr_info(42, "https://github.com/example/repo/pull/42")),
+                repo_root: Some(std::path::PathBuf::from("/repo")),
+                note: None,
+            },
+        );
+        assert_eq!(
+            app.merge_confirm
+                .expect("confirmation should open")
+                .target_status,
+            None
+        );
+    }
+
+    #[test]
+    fn merge_pr_resolved_without_pr_reports_no_open_pr() {
+        let app = App::new();
+        let (app, cmds) = update(
+            app,
+            Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: None,
+                repo_root: None,
+                note: None,
+            },
+        );
+        assert_eq!(app.merge_confirm, None);
+        assert_eq!(app.status_line, "no open PR found for PROJ-1");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_pr_resolved_without_pr_prefers_the_note() {
+        let app = App::new();
+        let (app, _) = update(
+            app,
+            Msg::MergePrResolved {
+                key: "PROJ-1".to_string(),
+                pr: None,
+                repo_root: None,
+                note: Some("PR lookup for PROJ-1 timed out after 8s; nothing merged".to_string()),
+            },
+        );
+        assert_eq!(
+            app.status_line,
+            "PR lookup for PROJ-1 timed out after 8s; nothing merged"
+        );
+    }
+
+    #[test]
+    fn merge_confirm_emits_merge_pr_and_closes_the_overlay() {
+        let app = App {
+            merge_confirm: Some(merge_confirm_fixture()),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::MergeConfirm);
+        assert_eq!(app.merge_confirm, None);
+        assert_eq!(app.status_line, "merging PR #42 for PROJ-1...");
+        assert_eq!(
+            cmds,
+            vec![Cmd::MergePr {
+                key: "PROJ-1".to_string(),
+                number: 42,
+                repo_root: std::path::PathBuf::from("/repo"),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_confirm_with_nothing_pending_is_a_noop() {
+        let app = App::new();
+        let (app, cmds) = update(app, Msg::MergeConfirm);
+        assert_eq!(app.merge_confirm, None);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_cancel_closes_the_overlay_and_merges_nothing() {
+        let app = App {
+            merge_confirm: Some(merge_confirm_fixture()),
+            ..App::new()
+        };
+        let (app, cmds) = update(app, Msg::MergeCancel);
+        assert_eq!(app.merge_confirm, None);
+        assert_eq!(app.status_line, "merge of PR #42 for PROJ-1 cancelled");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn merge_pr_result_merged_sets_status_line_and_refetches_tickets() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::MergePrResult {
+                merged: true,
+                message: "merged PR #42 for PROJ-1; moved to Done".to_string(),
+            },
+        );
+        assert_eq!(app.status_line, "merged PR #42 for PROJ-1; moved to Done");
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: query_for_filter(&app.filter, &app.project_key),
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_pr_result_failed_sets_status_line_without_refetching() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::MergePrResult {
+                merged: false,
+                message: "merge of PR #42 for PROJ-1 failed: boom".to_string(),
+            },
+        );
+        assert_eq!(app.status_line, "merge of PR #42 for PROJ-1 failed: boom");
+        assert!(cmds.is_empty());
     }
 
     fn app_with_browser_picker(options: Vec<BrowserPickerOption>, selected: usize) -> App {
