@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentInvocation, AgentRunner, InvocationInputs, RunMode};
 use crate::config::{
     self, AgentKind, BackendKind, Config, ConfigError, ConfigPaths, GlobalConfigSeed,
 };
@@ -76,6 +76,10 @@ pub struct InitContext<'a> {
     /// default runner — see `main.rs`'s `run_init`, which mirrors
     /// `agent_runner_or_default`'s other no-config callers).
     pub runner: &'a dyn AgentRunner,
+    /// Launches the agent-assisted setup session in the foreground (from the
+    /// repo root) and waits for it to exit; `Err` is a display message.
+    /// Injected so the wizard is testable without spawning a real agent.
+    pub setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
 }
 
 /// `tm init`: inspect the repo, ask the questions the config files would
@@ -231,7 +235,7 @@ pub fn run_init(
     }
 
     let scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
-    session_step(
+    let audit_missing_skill = session_step(
         ctx,
         yes,
         &mut doc,
@@ -244,7 +248,7 @@ pub fn run_init(
             default_prompt: "/ticket-audit {key}",
         },
     )?;
-    session_step(
+    let review_watch_missing_skill = session_step(
         ctx,
         yes,
         &mut doc,
@@ -268,6 +272,14 @@ pub fn run_init(
             ),
             false,
         )?;
+
+    let tasks = SetupTasks {
+        lane_prompts: scaffolds.iter().map(|(path, _)| path.clone()).collect(),
+        missing_skills: [audit_missing_skill, review_watch_missing_skill]
+            .into_iter()
+            .flatten()
+            .collect(),
+    };
 
     // --- Writes ---
     ensure_global_exists(ctx, global_seed.as_ref(), out)?;
@@ -334,9 +346,118 @@ pub fn run_init(
         )?;
     }
 
+    offer_agent_setup(ctx, yes, &tasks, prompter, out)?;
+
     writeln!(out)?;
     writeln!(out, "Done. Run `tm board` to open the board.")?;
     Ok(())
+}
+
+/// Offer to launch an agent session that fills out this run's scaffolded
+/// assets (GitHub issue #30). Skipped under `--yes` (scripted setup keeps
+/// the static skeleton) and when there is nothing to set up. Declining
+/// keeps the static skeleton. A launch failure warns but never fails init.
+fn offer_agent_setup(
+    ctx: &InitContext,
+    yes: bool,
+    tasks: &SetupTasks,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<(), InitCliError> {
+    if yes || (tasks.lane_prompts.is_empty() && tasks.missing_skills.is_empty()) {
+        return Ok(());
+    }
+
+    let question = format!(
+        "Launch a {} session now to fill out the scaffolded assets with this repo's real gates?",
+        ctx.runner.display_name()
+    );
+    if !ask_confirm(false, prompter, &question, true)? {
+        writeln!(
+            out,
+            "Keeping the static starter assets; re-run `tm init` to fill them out with an agent later."
+        )?;
+        return Ok(());
+    }
+
+    let invocation = ctx.runner.build_invocation(InvocationInputs {
+        prompt: setup_session_prompt(tasks),
+        model: None,
+        max_turns: None,
+        permission_mode: None,
+        settings_path: None,
+        run_id: None,
+        mode: RunMode::Interactive,
+    });
+    if let Err(message) = (ctx.setup_launcher)(&invocation) {
+        writeln!(
+            out,
+            "warning: launching the setup session failed: {message}"
+        )?;
+    }
+    Ok(())
+}
+
+/// The tm-shipped "create work lane" setup prompt (GitHub issue #30):
+/// composed at launch time from this run's scaffolded lane prompts and
+/// missing session skills, so the session that reads it knows exactly what
+/// to fill in and where.
+fn setup_session_prompt(tasks: &SetupTasks) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("# tm repo setup\n\n");
+    prompt.push_str(
+        "You are setting up autonomous work-lane assets for the repository at the \
+         current working directory. Explore the repo first and ground every \
+         instruction you write in what is actually here — never invent a command \
+         or convention this repo doesn't have.\n\n",
+    );
+    prompt.push_str(
+        "- Find the real quality gates: the build, test, lint, and format commands \
+         that exist in this repo. Verify each command exists (locate its config or \
+         run it) before naming it; never write a placeholder.\n\
+         - Note branch and PR conventions (default branch, branch naming, how PRs \
+         open) and hazards an autonomous agent must not touch.\n\
+         - Ask the operator about anything the repo cannot answer (deploy rules, \
+         forbidden paths, review conventions) before writing it down.\n\
+         - Keep every generated asset inside the repository so a fresh clone gets \
+         a working lane.\n",
+    );
+
+    if !tasks.lane_prompts.is_empty() {
+        prompt.push_str("\n## Lane prompts\n\n");
+        for path in &tasks.lane_prompts {
+            prompt.push_str(&format!("- Fill out {} in place.\n", path.display()));
+        }
+        prompt.push_str(
+            "\nKeep the skeleton's shape — single-ticket scope, run `tm ready <KEY>` \
+             first and stop when blocked, test-driven changes, small imperative-mood \
+             commits — and replace the placeholder \"Before finishing\" comment with \
+             the verified gate commands in the order a run must leave them green.\n",
+        );
+    }
+
+    if !tasks.missing_skills.is_empty() {
+        prompt.push_str("\n## Session skills\n\n");
+        for skill in &tasks.missing_skills {
+            prompt.push_str(&format!(
+                "- Author the /{} skill at {} (invoked by the configured session prompt `{}`).\n",
+                skill.name,
+                skill.path.display(),
+                skill.session_prompt
+            ));
+        }
+        prompt.push_str(
+            "\nEach skill is a directory containing a SKILL.md describing what the \
+             session should do; ask the operator what the skill should cover where \
+             the repo cannot answer.\n",
+        );
+    }
+
+    prompt.push_str(
+        "\nWhen done, summarize what was written and remind the operator to review \
+         and commit the generated files.\n",
+    );
+    prompt
 }
 
 /// Detect the GitHub `owner/name` slug from `dir`'s `origin` remote, for
@@ -369,6 +490,29 @@ fn parse_origin_head(symref: &str) -> Option<&str> {
         .filter(|branch| !branch.is_empty())
 }
 
+/// Repo-local assets the agent-assisted setup session should author (GitHub
+/// issue #30): lane prompts scaffolded as static skeletons this run, and
+/// session skills the config references but that exist nowhere on disk.
+#[derive(Default)]
+struct SetupTasks {
+    /// Resolved paths of lane-prompt files written as skeletons this run.
+    lane_prompts: Vec<PathBuf>,
+    /// Session skills to author.
+    missing_skills: Vec<MissingSkill>,
+}
+
+/// One missing session skill: the `/name` token a session prompt leads with,
+/// nowhere on disk (neither repo-local nor user-level).
+struct MissingSkill {
+    /// The skill name (no leading slash).
+    name: String,
+    /// Repo-local directory the skill should be authored at (the session
+    /// dir's skills dir — where the session that invokes it will look).
+    path: PathBuf,
+    /// The configured session prompt that invokes it, for context.
+    session_prompt: String,
+}
+
 /// One of the optional `[work.audit]` / `[work.review_watch]` sections the
 /// wizard can fill in.
 struct SessionSection {
@@ -393,7 +537,7 @@ fn session_step(
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
     section: &SessionSection,
-) -> Result<(), InitCliError> {
+) -> Result<Option<MissingSkill>, InitCliError> {
     let repo_dir = repo_config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -404,7 +548,7 @@ fn session_step(
         .and_then(|work| work.get(section.table))
         .is_some();
     if !ask_confirm(yes, prompter, section.question, present)? {
-        return Ok(());
+        return Ok(None);
     }
 
     // review_watch's dir falls back to audit's at load time; offer the same
@@ -430,37 +574,42 @@ fn session_step(
         .unwrap_or(section.default_prompt)
         .to_string();
     let resolved_dir = resolve_repo_relative(&dir, &repo_dir, ctx.home);
-    warn_if_skill_missing(ctx, out, &prompt, &resolved_dir)?;
-    Ok(())
+    Ok(warn_if_skill_missing(ctx, out, &prompt, &resolved_dir)?)
 }
 
 /// Warn when the skill a session prompt invokes (its leading `/name` token)
 /// exists neither in the session directory's repo-local skills nor in the
-/// user-level ones.
+/// user-level ones. Returns the missing skill (for [`SetupTasks`]) when one
+/// was warned about.
 fn warn_if_skill_missing(
     ctx: &InitContext,
     out: &mut dyn Write,
     prompt: &str,
     dir: &Path,
-) -> io::Result<()> {
+) -> io::Result<Option<MissingSkill>> {
     let Some(skill) = prompt
         .split_whitespace()
         .next()
         .and_then(|first| first.strip_prefix('/'))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let repo_skill = ctx.runner.skills_dir(dir).join(skill);
     let home_skill = ctx.runner.skills_dir(ctx.home).join(skill);
     if repo_skill.exists() || home_skill.exists() {
-        return Ok(());
+        return Ok(None);
     }
     writeln!(
         out,
         "warning: the /{skill} skill is user-supplied (tm does not ship it); expected at {} or {}.",
         repo_skill.display(),
         home_skill.display()
-    )
+    )?;
+    Ok(Some(MissingSkill {
+        name: skill.to_string(),
+        path: repo_skill,
+        session_prompt: prompt.to_string(),
+    }))
 }
 
 /// Ask which ticket backend the repo uses, re-prompting until the answer
@@ -658,8 +807,7 @@ fn lane_step(
         prompter,
         out,
         "Lane prompt file",
-        &existing("prompt_file")
-            .unwrap_or_else(|| format!(".tskmstr/prompts/{name}-lane.md")),
+        &existing("prompt_file").unwrap_or_else(|| format!(".tskmstr/prompts/{name}-lane.md")),
         "the lane prompt file",
     )?;
 
@@ -994,6 +1142,14 @@ mod tests {
         panic!("hook installer should not be called in this test");
     }
 
+    fn noop_setup_launcher(_invocation: &AgentInvocation) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn panicking_setup_launcher(_invocation: &AgentInvocation) -> Result<(), String> {
+        panic!("setup launcher should not be called in this test");
+    }
+
     /// An `InitContext` for a GitHub-backed repo with an origin remote
     /// detected; hooks report installed so the hooks step stays quiet.
     fn github_ctx<'a>(
@@ -1013,6 +1169,7 @@ mod tests {
             hooks_installed: true,
             hook_installer: &no_hook_installer,
             runner: &ClaudeRunner,
+            setup_launcher: &noop_setup_launcher,
         }
     }
 
@@ -1168,6 +1325,7 @@ mod tests {
             hooks_installed: true,
             hook_installer: &no_hook_installer,
             runner: &ClaudeRunner,
+            setup_launcher: &noop_setup_launcher,
         }
     }
 
@@ -1867,5 +2025,216 @@ mod tests {
 
         let config = config::load(&env.paths).expect("written config should load");
         assert_eq!(config.github_repo.as_deref(), Some("someone-else/other"));
+    }
+
+    #[test]
+    fn setup_offer_accepted_launches_an_interactive_session_naming_the_scaffolded_prompt() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+
+        let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
+            std::cell::RefCell::new(Vec::new());
+        let repo_dir = env
+            .paths
+            .repo
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+            let scaffolded = repo_dir.join(".tskmstr/prompts/repo-lane.md");
+            assert!(
+                scaffolded.exists(),
+                "the scaffolded prompt must already be on disk when the setup session launches"
+            );
+            recorded.borrow_mut().push(invocation.clone());
+            Ok(())
+        };
+        ctx.setup_launcher = &launcher;
+
+        // All defaults: labels yes, lane yes, scaffold yes, audit no,
+        // review-watch no, hooks no, setup yes (default).
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let invocations = recorded.borrow();
+        assert_eq!(invocations.len(), 1, "exactly one invocation recorded");
+        let invocation = &invocations[0];
+        assert!(
+            invocation.args[0].contains(
+                &repo_dir
+                    .join(".tskmstr/prompts/repo-lane.md")
+                    .display()
+                    .to_string()
+            ),
+            "prompt should name the scaffolded path: {}",
+            invocation.args[0]
+        );
+        assert!(
+            invocation.args[0].contains("tm ready"),
+            "prompt should mention `tm ready`: {}",
+            invocation.args[0]
+        );
+        assert!(
+            !invocation.args.iter().any(|a| a == "-p"),
+            "interactive invocation must not carry -p: {:?}",
+            invocation.args
+        );
+        assert!(
+            !invocation.args.iter().any(|a| a == "--max-turns"),
+            "interactive invocation must not carry --max-turns: {:?}",
+            invocation.args
+        );
+        assert!(
+            invocation.env_set.is_empty(),
+            "untracked session carries no run id: {:?}",
+            invocation.env_set
+        );
+    }
+
+    #[test]
+    fn setup_offer_declined_keeps_the_static_skeleton() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.setup_launcher = &panicking_setup_launcher;
+
+        // Confirms pop in order: labels true, lane true, scaffold-prompt
+        // true, audit false, review-watch false, setup false.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        let template = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/repo-lane.md"))
+            .expect("skeleton scaffolded");
+        assert!(
+            template.contains("List the checks"),
+            "static skeleton unchanged: {template}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("Keeping the static starter assets"),
+            "decline notice in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn setup_offer_is_skipped_under_yes() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.setup_launcher = &panicking_setup_launcher;
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(prompter.messages.is_empty(), "no prompts under --yes");
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        assert!(
+            repo_dir.join(".tskmstr/prompts/repo-lane.md").exists(),
+            "static skeleton still scaffolded under --yes"
+        );
+    }
+
+    #[test]
+    fn setup_offer_not_made_when_nothing_was_scaffolded() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.setup_launcher = &panicking_setup_launcher;
+
+        // An already-configured lane whose prompt file already exists: the
+        // lane question defaults to "no update", and there is nothing to
+        // scaffold.
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(
+            !prompter.messages.iter().any(|m| m.contains("session now")),
+            "no setup offer when nothing was scaffolded: {:?}",
+            prompter.messages
+        );
+    }
+
+    #[test]
+    fn setup_prompt_lists_missing_session_skills() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+
+        let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
+            std::cell::RefCell::new(Vec::new());
+        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+            recorded.borrow_mut().push(invocation.clone());
+            Ok(())
+        };
+        ctx.setup_launcher = &launcher;
+
+        // Confirms: labels true, lane true (scaffold default true), audit
+        // true, review-watch false, setup true.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(true);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let invocations = recorded.borrow();
+        assert_eq!(invocations.len(), 1);
+        let prompt = &invocations[0].args[0];
+        assert!(prompt.contains("/ticket-audit"), "in: {prompt}");
+        assert!(
+            prompt.contains(".claude/skills/ticket-audit"),
+            "in: {prompt}"
+        );
+        assert!(prompt.contains("/ticket-audit {key}"), "in: {prompt}");
+    }
+
+    #[test]
+    fn setup_launch_failure_warns_but_init_completes() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        let launcher =
+            |_invocation: &AgentInvocation| -> Result<(), String> { Err("boom".to_string()) };
+        ctx.setup_launcher = &launcher;
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should still succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("warning") && rendered.contains("boom"),
+            "launch-failure warning in: {rendered}"
+        );
     }
 }

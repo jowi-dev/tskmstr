@@ -761,6 +761,29 @@ fn run_init(
         }
     };
 
+    let setup_repo_dir = repo_dir.clone();
+    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
+        let mut command = std::process::Command::new(&invocation.program);
+        command.args(&invocation.args);
+        for var in &invocation.env_remove {
+            command.env_remove(var);
+        }
+        for (key, value) in &invocation.env_set {
+            command.env(key, value);
+        }
+        if let Some(dir) = &setup_repo_dir {
+            command.current_dir(dir);
+        }
+        let status = command
+            .status()
+            .map_err(|err| format!("failed to launch {}: {err}", invocation.program))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{} exited with {status}", invocation.program))
+        }
+    };
+
     let ctx = tskmstr::cli::init::InitContext {
         paths,
         home: &home,
@@ -773,6 +796,7 @@ fn run_init(
         hooks_installed,
         hook_installer: &hook_installer,
         runner: init_runner,
+        setup_launcher: &setup_launcher,
     };
     let mut prompter = RealPrompter;
     let mut stdout = std::io::stdout();
