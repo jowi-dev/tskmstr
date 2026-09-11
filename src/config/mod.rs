@@ -69,6 +69,16 @@ pub struct RawConfig {
     /// setting a newly created ticket is left in the workflow's initial
     /// status.
     pub status_on_create: Option<String>,
+    /// Workflow status name to transition a ticket to after its PR is
+    /// merged from the board, e.g. `"Done"`.
+    ///
+    /// Applied advisorily after a successful merge, exactly like
+    /// `status_on_pr`. When unset, a merge moves no ticket: there is no
+    /// safe universal default (in some repos a merged PR means the work
+    /// shipped; in others the root branch is a staging branch and a human
+    /// moves the ticket when it actually ships), so absence means "merge
+    /// only".
+    pub status_on_merge: Option<String>,
     /// Override path for the run-state SQLite database used by `tm runs`.
     ///
     /// When unset, `tm runs` falls back to
@@ -503,6 +513,10 @@ pub struct Config {
     /// Workflow status name to transition a `tm ticket create`d ticket to,
     /// if configured. See [`RawConfig::status_on_create`] for semantics.
     pub status_on_create: Option<String>,
+    /// Workflow status name to transition a ticket to after its PR is
+    /// merged from the board, if configured. See
+    /// [`RawConfig::status_on_merge`] for semantics.
+    pub status_on_merge: Option<String>,
     /// Override path for the run-state SQLite database, if configured. See
     /// [`RawConfig::run_db_path`] for semantics.
     pub run_db_path: Option<String>,
@@ -932,6 +946,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         default_assignee_account_id: None,
         status_on_pr: None,
         status_on_create: None,
+        status_on_merge: None,
         run_db_path: None,
         review_bots: None,
         board_column_order: None,
@@ -1064,6 +1079,10 @@ fn merge_with_repo_dir(
         .status_on_create
         .clone()
         .or(global.status_on_create.clone());
+    let status_on_merge = repo
+        .status_on_merge
+        .clone()
+        .or(global.status_on_merge.clone());
     let run_db_path = repo.run_db_path.clone().or(global.run_db_path.clone());
     let review_bots = repo
         .review_bots
@@ -1097,6 +1116,7 @@ fn merge_with_repo_dir(
             default_assignee_account_id,
             status_on_pr,
             status_on_create,
+            status_on_merge,
             run_db_path,
             review_bots,
             board_column_order,
@@ -1131,6 +1151,7 @@ fn merge_with_repo_dir(
                 default_assignee_account_id,
                 status_on_pr,
                 status_on_create,
+                status_on_merge,
                 run_db_path,
                 review_bots,
                 board_column_order,
@@ -1584,6 +1605,7 @@ mod tests {
             default_assignee_account_id: Some("acct-global".into()),
             status_on_pr: Some("In Review".into()),
             status_on_create: Some("In Progress".into()),
+            status_on_merge: Some("Done".into()),
             run_db_path: Some("/global/runs.db".into()),
             review_bots: Some(vec!["cursor[bot]".into()]),
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
@@ -1611,6 +1633,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
+            status_on_merge: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1627,6 +1650,27 @@ mod tests {
         assert_eq!(cfg.default_assignee_account_id, Some("acct-global".into()));
         assert_eq!(cfg.status_on_pr, Some("In Review".into()));
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
+        assert_eq!(cfg.status_on_merge, Some("Done".into()));
+    }
+
+    #[test]
+    fn merge_repo_overrides_status_on_merge() {
+        let repo = RawConfig {
+            status_on_merge: Some("Ready to Ship".into()),
+            ..RawConfig::default()
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.status_on_merge, Some("Ready to Ship".into()));
+    }
+
+    #[test]
+    fn merge_status_on_merge_absent_from_both_is_none() {
+        let global = RawConfig {
+            status_on_merge: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.status_on_merge, None);
     }
 
     #[test]
@@ -1638,6 +1682,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: Some("Ready for Review".into()),
             status_on_create: None,
+            status_on_merge: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1668,6 +1713,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: Some("In Progress".into()),
+            status_on_merge: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1698,6 +1744,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
+            status_on_merge: None,
             run_db_path: Some("/repo/runs.db".into()),
             review_bots: None,
             board_column_order: None,
@@ -1728,6 +1775,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
+            status_on_merge: None,
             run_db_path: None,
             review_bots: Some(vec!["repo-bot[bot]".into()]),
             board_column_order: None,
@@ -1758,6 +1806,7 @@ mod tests {
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
+            status_on_merge: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: Some(vec!["Code Review".into()]),
@@ -1868,6 +1917,29 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.status_on_pr, Some("In Review".to_string()));
+    }
+
+    #[test]
+    fn load_global_with_status_on_merge_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            status_on_merge = "Done"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_merge, Some("Done".to_string()));
     }
 
     #[test]
