@@ -462,7 +462,7 @@ fn bot_finding_annotations(
 
     let mut warned = false;
     for issue in tickets {
-        let Some(number) = matching_pr_number(&prs, &issue.key) else {
+        let Some(number) = matching_pr_number(&prs, &issue.key, ctx.jira) else {
             continue;
         };
         match ctx.gh.pr_review_threads(&cwd, number) {
@@ -508,7 +508,7 @@ fn print_bot_finding_note(
         }
     };
 
-    let Some(number) = matching_pr_number(&prs, key) else {
+    let Some(number) = matching_pr_number(&prs, key, ctx.jira) else {
         return Ok(());
     };
 
@@ -538,11 +538,12 @@ fn print_bot_finding_note(
 }
 
 /// Find the number of the open PR (from `gh pr list`) resolving to `key`,
-/// reusing [`find_issue_key`] — the same title/body/branch extraction `tm pr
-/// status` uses — rather than re-implementing key parsing.
-fn matching_pr_number(prs: &[PrInfo], key: &str) -> Option<u64> {
+/// reusing [`find_issue_key`] — the same title/branch/body extraction `tm pr
+/// status` uses, keyed to `jira`'s notion of a valid ticket key — rather
+/// than re-implementing key parsing.
+fn matching_pr_number(prs: &[PrInfo], key: &str, jira: &dyn TicketProvider) -> Option<u64> {
     prs.iter()
-        .find(|pr| find_issue_key(pr).as_deref() == Some(key))
+        .find(|pr| find_issue_key(pr, &|token| jira.is_ticket_key(token)).as_deref() == Some(key))
         .map(|pr| pr.number)
 }
 

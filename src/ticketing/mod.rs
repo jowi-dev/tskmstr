@@ -104,7 +104,7 @@ pub mod types;
 
 use crate::config::{BackendKind, Config};
 use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
-use crate::github::pr::{KeySource, PrInfo, find_issue_key_with_source, with_issue_key_prefix};
+use crate::github::pr::{KeySource, PrInfo, issue_key_candidates, with_issue_key_prefix};
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
@@ -1188,33 +1188,38 @@ fn format_assignee_candidates(candidates: &[&JiraUser], all_users: &[JiraUser]) 
 
 /// Resolve an issue key already associated with `pr`, if any.
 ///
-/// Delegates to [`find_issue_key_with_source`] for the title/body/branch
-/// precedence, then treats the result differently depending on where it came
-/// from:
+/// Walks [`issue_key_candidates`] (title, then branch, then body; tokens
+/// [`TicketProvider::is_ticket_key`] rejects — doc labels like `ADR-0006`,
+/// keys from another backend — never become candidates at all, per GitHub
+/// issue #35), treating each candidate differently depending on where it
+/// came from:
 ///
 /// - [`KeySource::Title`] and [`KeySource::Body`] keys are trusted without
-///   contacting Jira: the user (or a prior `tm ticket`/`tm pr create` run)
-///   wrote them deliberately.
+///   contacting the backend: the user (or a prior `tm ticket`/`tm pr
+///   create` run) wrote them deliberately.
 /// - A [`KeySource::Branch`] key is inferred from a naming convention, not
 ///   authored, so it is validated with [`TicketProvider::get_issue`] first.
-///   [`ProviderError::NotFound`] is treated as "no key after all" (`Ok(None)`);
-///   any other Jira error propagates, since it means the check itself
-///   couldn't be completed.
+///   [`ProviderError::NotFound`] falls through to the next candidate (a
+///   branch named `feature-1/proj-372` shouldn't hide a real key in the
+///   body); any other backend error propagates, since it means the check
+///   itself couldn't be completed.
 ///
-/// Returns `Ok(None)` when no key is found by any means.
+/// Returns `Ok(None)` when no candidate resolves.
 pub fn resolve_existing_key(
     jira: &dyn TicketProvider,
     pr: &PrInfo,
 ) -> Result<Option<String>, TicketingError> {
-    match find_issue_key_with_source(pr) {
-        Some((key, KeySource::Title | KeySource::Body)) => Ok(Some(key)),
-        Some((key, KeySource::Branch)) => match jira.get_issue(&key) {
-            Ok(_) => Ok(Some(key)),
-            Err(ProviderError::NotFound { .. }) => Ok(None),
-            Err(other) => Err(other.into()),
-        },
-        None => Ok(None),
+    for (key, source) in issue_key_candidates(pr, &|token| jira.is_ticket_key(token)) {
+        match source {
+            KeySource::Title | KeySource::Body => return Ok(Some(key)),
+            KeySource::Branch => match jira.get_issue(&key) {
+                Ok(_) => return Ok(Some(key)),
+                Err(ProviderError::NotFound { .. }) => continue,
+                Err(other) => return Err(other.into()),
+            },
+        }
     }
+    Ok(None)
 }
 
 /// Associate `key` with `pr`: idempotently prefix the PR title, then post a
@@ -1419,6 +1424,38 @@ mod tests {
             outcome.issue_url,
             "https://github.com/jowi-dev/tskmstr/issues/10"
         );
+    }
+
+    #[test]
+    fn resolve_existing_key_under_the_github_provider_ignores_doc_labels() {
+        // GitHub issue #35 verbatim: PR #34's body mentioned ADR-0006, and
+        // the scrape resolved it as the ticket (issue #6) instead of the
+        // branch's GH-30.
+        let gh = FakeGhCli::new().with_issue_view(
+            30,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 30,
+                url: "https://github.com/jowi-dev/tskmstr/issues/30".to_string(),
+                title: "Offer agent-assisted lane setup".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            }),
+        );
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+        let pull_request = PrInfo {
+            number: 34,
+            url: "https://github.com/jowi-dev/tskmstr/pull/34".to_string(),
+            title: "Offer agent-assisted lane setup from tm init".to_string(),
+            body: "Closes #30.\n\nRecorded as ADR-0006.".to_string(),
+            head_ref_name: "jowi-dev/gh-30-tm-init-lane".to_string(),
+        };
+
+        let key = resolve_existing_key(&provider, &pull_request).expect("should succeed");
+
+        assert_eq!(key, Some("GH-30".to_string()));
     }
 
     /// A [`FakeGhCli`] serving `GH-10` as an open issue carrying `labels`,
@@ -2878,6 +2915,31 @@ mod tests {
         let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
 
         assert_eq!(key, None);
+    }
+
+    #[test]
+    fn resolve_existing_key_branch_key_not_found_falls_back_to_body_key() {
+        let jira = FakeJiraClient::new().with_issue_not_found("PROJ-372");
+        let mut pull_request = pr("Fix the thing");
+        pull_request.body = "Resolves PROJ-9".to_string();
+
+        let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
+
+        assert_eq!(key, Some("PROJ-9".to_string()));
+    }
+
+    #[test]
+    fn resolve_existing_key_never_resolves_a_doc_label() {
+        // The GitHub issue #35 shape: the body quotes an ADR number, which
+        // is key-shaped but not a ticket key. It must not become the
+        // associated ticket — the branch key is the right answer.
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let mut pull_request = pr("Fix the thing");
+        pull_request.body = "Recorded as ADR-0006.".to_string();
+
+        let key = resolve_existing_key(&jira, &pull_request).expect("should succeed");
+
+        assert_eq!(key, Some("PROJ-372".to_string()));
     }
 
     #[test]

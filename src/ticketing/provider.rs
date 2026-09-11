@@ -152,6 +152,12 @@ pub struct NewTicket {
     pub assignee_account_id: Option<String>,
 }
 
+/// Document-label prefixes that look like ticket keys but never are:
+/// `ADR-0006` in a PR body is an architecture-decision-record reference,
+/// not a ticket, and scraping it as one associated PR #34 with the wrong
+/// issue (GitHub issue #35).
+const NON_TICKET_KEY_PREFIXES: &[&str] = &["ADR", "RFC"];
+
 /// Backend-agnostic ticket operations. See the module doc comment for how
 /// this relates to [`JiraClient`] and [`JiraProvider`].
 pub trait TicketProvider {
@@ -230,6 +236,33 @@ pub trait TicketProvider {
     /// leaving it in To Do (GitHub issue #13).
     fn normalize_status_target(&self, target: &str) -> String {
         target.to_string()
+    }
+
+    /// Whether `token` is plausibly a ticket key in this backend's key
+    /// scheme. Used by PR title/body/branch key scraping
+    /// ([`crate::ticketing::resolve_existing_key`] and every
+    /// [`crate::github::pr::find_pr_for_ticket`] caller) to skip tokens
+    /// that merely look key-shaped — `ADR-0006` in a PR body must not
+    /// resolve as a ticket (GitHub issue #35).
+    ///
+    /// The default accepts the Jira key shape (`[A-Z][A-Z0-9]+-\d+`) minus
+    /// [`NON_TICKET_KEY_PREFIXES`]; the github backend overrides this to
+    /// accept only its own `GH-<number>` keys.
+    fn is_ticket_key(&self, token: &str) -> bool {
+        let Some((prefix, number)) = token.split_once('-') else {
+            return false;
+        };
+        prefix.len() >= 2
+            && prefix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+            && !NON_TICKET_KEY_PREFIXES.contains(&prefix)
     }
 }
 
@@ -484,6 +517,32 @@ mod tests {
         let err = provider.get_issue("PROJ-1").expect_err("should fail");
 
         assert!(matches!(err, ProviderError::NotFound { key } if key == "PROJ-1"));
+    }
+
+    #[test]
+    fn default_is_ticket_key_accepts_jira_shaped_keys() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net");
+
+        assert!(provider.is_ticket_key("PROJ-372"));
+        assert!(provider.is_ticket_key("GH-30"));
+    }
+
+    #[test]
+    fn default_is_ticket_key_rejects_known_doc_label_prefixes() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net");
+
+        assert!(!provider.is_ticket_key("ADR-0006"));
+        assert!(!provider.is_ticket_key("RFC-2119"));
+    }
+
+    #[test]
+    fn default_is_ticket_key_rejects_non_key_shapes() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net");
+
+        assert!(!provider.is_ticket_key("proj-372"));
+        assert!(!provider.is_ticket_key("PROJ-"));
+        assert!(!provider.is_ticket_key("372"));
+        assert!(!provider.is_ticket_key(""));
     }
 
     #[test]

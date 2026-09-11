@@ -373,9 +373,12 @@ pub fn watch(
     )?;
 
     let prs = ctx.gh.pr_list(&repo_root)?;
-    let pr = find_pr_for_ticket(&prs, key).ok_or_else(|| PrCliError::NoPrForTicket {
-        key: key.to_string(),
-    })?;
+    let pr =
+        find_pr_for_ticket(&prs, key, &|token| ctx.jira.is_ticket_key(token)).ok_or_else(|| {
+            PrCliError::NoPrForTicket {
+                key: key.to_string(),
+            }
+        })?;
     let pr_number = pr.number;
 
     if let Some(existing) =

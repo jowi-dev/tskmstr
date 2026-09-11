@@ -525,8 +525,8 @@ clean". The two are never conflated.
 
 `--auto-ticket` skips the "create a ticket?" prompt and just creates one
 (in the configured default project, assigned to the configured default
-assignee) when no key can be resolved from the PR's title, body, or
-branch name.
+assignee) when no key can be resolved from the PR's title, branch name, or
+body.
 
 ## `tm work`
 
@@ -1516,7 +1516,7 @@ entirely, rather than counted as a `$0` run.
 `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` posts a comment to a Jira
 ticket. `<KEY>` is verified to exist first, same as `rank`/`link`; if it's
 omitted, it's inferred from the current branch's pull request the same way
-`tm pr create` infers an existing ticket (title, body, then branch name). If
+`tm pr create` infers an existing ticket (title, branch name, then body). If
 neither an explicit `<KEY>` nor a resolvable one is available — no pull
 request open for the branch at all, or one exists but carries no ticket key
 anywhere — it's a hard error naming the branch.
@@ -1659,22 +1659,31 @@ precedence over the keychain.
 
 `tm ticket <KEY>` and `tm pr create`/`tm pr status --auto-ticket` both
 converge on the same association step: prefix the PR title with
-`[KEY]` (idempotent — a no-op if it's already there) and post a Jira
-remote link pointing at the PR.
+`[KEY]` (idempotent — a no-op if it's already there, and any *stale*
+key-shaped prefix from a previous association is replaced rather than
+stacked) and post a Jira remote link pointing at the PR.
 
 Looking up an existing key on a PR checks, in order, stopping at the
 first match:
 
 1. A `[KEY-123]` prefix on the title, or a bare `KEY-123` token
    elsewhere in the title.
-2. A `KEY-123` token in the body.
-3. The branch name (e.g. `proj-123-fix` or `feature/proj-123-fix`),
+2. The branch name (e.g. `proj-123-fix` or `feature/proj-123-fix`),
    normalized to uppercase.
+3. A `KEY-123` token in the body.
+
+The branch outranks the body deliberately: a branch is named for the
+ticket it was cut for, while body prose freely quotes other tickets and
+doc labels. Key-shaped tokens that aren't ticket keys for the configured
+backend are skipped entirely — under the github backend only `GH-<n>`
+counts, and under Jira known doc-label prefixes (`ADR-`, `RFC-`) are
+ignored — so an `ADR-0006` reference in a PR body can't hijack the
+association (GitHub issue #35).
 
 Title and body matches are trusted outright — someone wrote them on
 purpose. A branch-derived key is only inferred, so it's validated with
-`GET /issue/<key>` first; if Jira 404s, it's treated as no key found at
-all rather than an error.
+a ticket lookup first; if the backend reports it not found, the scan
+falls through to the body instead of failing.
 
 ## Known limitations
 
