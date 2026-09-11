@@ -1979,7 +1979,10 @@ fn resolve_pr_for_merge(deps: &TuiDeps, key: String) -> Vec<Msg> {
 
     match deps.gh.pr_list_bounded(&repo_root, PR_LOOKUP_TIMEOUT) {
         Ok(prs) => {
-            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key).cloned();
+            let pr = crate::github::pr::find_pr_for_ticket(&prs, &key, &|token| {
+                deps.jira.is_ticket_key(token)
+            })
+            .cloned();
             let repo_root = pr.is_some().then_some(repo_root);
             vec![Msg::MergePrResolved {
                 key,
