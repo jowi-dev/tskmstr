@@ -898,6 +898,19 @@ impl TicketProvider for GithubProvider<'_> {
             _ => target.to_string(),
         }
     }
+
+    /// Only this provider's own `GH-<number>` keys count: any other
+    /// key-shaped token in a PR (`ADR-0006`, a Jira key quoted in prose)
+    /// is a reference to something else, and [`parse_issue_number`] would
+    /// happily read a bogus issue number out of it (GitHub issue #35).
+    fn is_ticket_key(&self, token: &str) -> bool {
+        token
+            .strip_prefix(&self.key_prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|number| {
+                !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+            })
+    }
 }
 
 #[cfg(test)]
@@ -921,6 +934,20 @@ mod tests {
     #[test]
     fn parse_issue_number_rejects_no_dash() {
         assert!(parse_issue_number("GH123").is_err());
+    }
+
+    #[test]
+    fn is_ticket_key_accepts_only_the_provider_prefix() {
+        let gh = FakeGhCli::new();
+        let provider = GithubProvider::new(&gh, "owner/repo".to_string());
+
+        assert!(provider.is_ticket_key("GH-30"));
+        assert!(provider.is_ticket_key("GH-1"));
+        assert!(!provider.is_ticket_key("ADR-0006"));
+        assert!(!provider.is_ticket_key("PROJ-372"));
+        assert!(!provider.is_ticket_key("gh-30"));
+        assert!(!provider.is_ticket_key("GH-"));
+        assert!(!provider.is_ticket_key("GH-30x"));
     }
 
     #[test]
