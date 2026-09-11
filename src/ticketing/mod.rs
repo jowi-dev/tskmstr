@@ -1877,6 +1877,37 @@ mod tests {
     }
 
     #[test]
+    fn apply_status_on_merge_tolerates_github_issue_auto_closed_by_the_merge() {
+        // End-to-end shape of GitHub issue #32's auto-close race: the PR's
+        // closing keyword closed issue 10 on merge, so it reads as Done and
+        // offers only Reopen. The advisory move to "Done" must short-circuit
+        // on the synthesized current status, not warn about Reopen being the
+        // only transition -- and must call no transition at all (a "done"
+        // transition would try to close the already-closed issue).
+        let gh = FakeGhCli::new().with_issue_view(
+            10,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 10,
+                url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Closed,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            }),
+        );
+        let provider = crate::ticketing::github_provider::GithubProvider::new(
+            &gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+
+        let outcome = apply_status_on_merge(&provider, "GH-10", "Done");
+
+        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+        assert!(gh.issue_edit_calls().is_empty());
+    }
+
+    #[test]
     fn apply_status_on_merge_status_read_failure_still_attempts_the_transition() {
         let jira = FakeJiraClient::new()
             .with_issue_not_found("PROJ-9")
