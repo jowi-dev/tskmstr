@@ -60,11 +60,12 @@ pub enum GhError {
 
     /// The command did not finish within its bounded wait and was killed.
     ///
-    /// Only ever produced by [`GhCli::pr_list_bounded`] (see its doc comment
-    /// for why that's the one method on this trait with a bound at all) --
-    /// every other method here shells out with an ordinary unbounded
-    /// `.output()` call, matching `tm`'s existing "a CLI command taking
-    /// longer than usual is annoying but not board-freezing" tolerance.
+    /// Only ever produced by the bounded methods, [`GhCli::pr_list_bounded`]
+    /// and [`GhCli::pr_merge`] (see their doc comments for why those are the
+    /// methods on this trait with a bound at all) -- every other method here
+    /// shells out with an ordinary unbounded `.output()` call, matching
+    /// `tm`'s existing "a CLI command taking longer than usual is annoying
+    /// but not board-freezing" tolerance.
     #[error("`{command}` did not finish within {seconds}s and was killed")]
     Timeout {
         /// The command that timed out, e.g. `gh pr list`.
@@ -188,7 +189,8 @@ const POLL_STEP: Duration = Duration::from_millis(25);
 /// `wait_with_output` on a spawned child is that `wait_with_output` has no
 /// bound and can't be interrupted once called.
 ///
-/// Used only by [`GhCli::pr_list_bounded`], but kept generic over `Command`
+/// Used only by [`GhCli::pr_list_bounded`] and [`GhCli::pr_merge`], but
+/// kept generic over `Command`
 /// (rather than hardcoded to build the `gh pr list` invocation itself) so it
 /// can be unit-tested directly against ordinary subprocesses (`sleep`,
 /// `echo`) without needing a real `gh` binary or network -- see this
@@ -445,6 +447,22 @@ pub trait GhCli {
     /// wrong repository — or fail outright with "not a git repository" —
     /// corrupting blocker resolution without any obviously-related error.
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError>;
+
+    /// Merge open pull request `number` (`gh pr merge <number>
+    /// --merge|--squash|--rebase`), run from `dir` like [`GhCli::pr_list`].
+    ///
+    /// Uses the repository's default merge method: `gh pr merge` refuses to
+    /// run non-interactively without an explicit strategy flag, so the
+    /// method is first derived from the repo's own allowed-method settings
+    /// (`gh repo view --json`, see [`REPO_MERGE_SETTINGS_JSON_FIELDS`]),
+    /// picking the first enabled of merge commit, squash, rebase -- the
+    /// order GitHub's own merge button uses. A per-repo strategy override
+    /// is deliberately out of scope (GitHub issue #32's NOTES).
+    ///
+    /// Each of the two underlying `gh` calls is bounded by `timeout`, for
+    /// the same board-freezing reason as [`GhCli::pr_list_bounded`]: the
+    /// board's merge key blocks the event loop while this runs.
+    fn pr_merge(&self, dir: &Path, number: u64, timeout: Duration) -> Result<(), GhError>;
 
     // --- Issue operations (phase 4 of the GitHub-Issues-as-a-backend work,
     // docs/plans/github-issues-backend.md) ---
@@ -766,6 +784,68 @@ const PR_STATE_JSON_FIELDS: &str = "state";
 /// deserialization stay in lockstep. Same `merged`-field pitfall as
 /// [`PR_STATE_JSON_FIELDS`] applies here.
 const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,state,updatedAt";
+
+/// Fields requested from `gh repo view --json` in [`GhCli::pr_merge`] to
+/// derive the repository's default merge method; shared so the flag and
+/// [`RawRepoMergeSettings`] deserialization stay in lockstep. The same
+/// invalid-field pitfall as [`PR_STATE_JSON_FIELDS`] applies: a field `gh
+/// repo view` doesn't recognize fails every call, forever.
+const REPO_MERGE_SETTINGS_JSON_FIELDS: &str =
+    "mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed";
+
+/// Which merge methods a repository allows, as reported by `gh repo view
+/// --json` (see [`REPO_MERGE_SETTINGS_JSON_FIELDS`]).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRepoMergeSettings {
+    merge_commit_allowed: bool,
+    squash_merge_allowed: bool,
+    rebase_merge_allowed: bool,
+}
+
+/// Interpret the result of a `gh repo view --json
+/// mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed` invocation.
+/// Pure over the exit code and captured stdout/stderr for the same
+/// testability reasons as [`interpret_pr_view_output`].
+fn interpret_repo_merge_settings_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<RawRepoMergeSettings, GhError> {
+    interpret_success_or_command_error("gh repo view", exit_code, stderr)?;
+    serde_json::from_str(stdout).map_err(|err| GhError::Parse {
+        command: "gh repo view".to_string(),
+        message: err.to_string(),
+    })
+}
+
+/// The `gh pr merge` strategy flag for the first repo-allowed merge method,
+/// in the order GitHub's own merge button offers them (merge commit, then
+/// squash, then rebase), or `None` when the repository allows none at all
+/// (only reachable through API-level settings drift; the web UI refuses to
+/// save that state).
+fn merge_method_flag(settings: &RawRepoMergeSettings) -> Option<&'static str> {
+    if settings.merge_commit_allowed {
+        Some("--merge")
+    } else if settings.squash_merge_allowed {
+        Some("--squash")
+    } else if settings.rebase_merge_allowed {
+        Some("--rebase")
+    } else {
+        None
+    }
+}
+
+/// The argv [`GhCli::pr_merge`] runs once a strategy flag has been derived:
+/// `gh pr merge <number> <method_flag>`.
+fn pr_merge_args(number: u64, method_flag: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        method_flag.to_string(),
+    ]
+}
 
 /// Fields requested from `gh issue view`/`gh issue list --json`; shared so
 /// the flag and [`RawIssueView`] deserialization stay in lockstep.
@@ -1302,6 +1382,35 @@ impl GhCli for ShellGhCli {
         interpret_pr_list_all_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_merge(&self, dir: &Path, number: u64, timeout: Duration) -> Result<(), GhError> {
+        let mut settings_command = Command::new("gh");
+        settings_command
+            .args(["repo", "view", "--json", REPO_MERGE_SETTINGS_JSON_FIELDS])
+            .current_dir(dir);
+        let output = spawn_with_timeout(settings_command, "gh repo view", timeout)?;
+        let settings = interpret_repo_merge_settings_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?;
+        let method_flag = merge_method_flag(&settings).ok_or_else(|| GhError::Command {
+            command: "gh pr merge".to_string(),
+            exit_code: None,
+            stderr: "the repository has no merge method enabled".to_string(),
+        })?;
+
+        let mut merge_command = Command::new("gh");
+        merge_command
+            .args(pr_merge_args(number, method_flag))
+            .current_dir(dir);
+        let output = spawn_with_timeout(merge_command, "gh pr merge", timeout)?;
+        interpret_success_or_command_error(
+            "gh pr merge",
+            output.status.code(),
             &String::from_utf8_lossy(&output.stderr),
         )
     }
@@ -2706,6 +2815,8 @@ pub struct FakeGhCli {
     pr_url_for_branch_calls: RefCell<Vec<String>>,
     pr_list_all_result: RefCell<Result<Vec<PrSummary>, GhError>>,
     pr_list_all_calls: RefCell<Vec<PathBuf>>,
+    pr_merge_result: RefCell<Result<(), GhError>>,
+    pr_merge_calls: RefCell<Vec<(PathBuf, u64)>>,
     issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
     issue_view_calls: RefCell<Vec<(String, u64)>>,
     issue_list_result: RefCell<Result<Vec<IssueInfo>, GhError>>,
@@ -2759,6 +2870,8 @@ impl Default for FakeGhCli {
             pr_list_result: RefCell::new(Ok(Vec::new())),
             pr_list_calls: RefCell::new(Vec::new()),
             pr_list_bounded_result: RefCell::new(None),
+            pr_merge_result: RefCell::new(Ok(())),
+            pr_merge_calls: RefCell::new(Vec::new()),
             pr_list_bounded_calls: RefCell::new(Vec::new()),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
@@ -2944,6 +3057,18 @@ impl FakeGhCli {
     pub fn with_pr_list_bounded(self, result: Result<Vec<PrInfo>, GhError>) -> Self {
         *self.pr_list_bounded_result.borrow_mut() = Some(result);
         self
+    }
+
+    /// Set the result `pr_merge` will return. Unconfigured, `pr_merge`
+    /// succeeds trivially.
+    pub fn with_pr_merge_result(self, result: Result<(), GhError>) -> Self {
+        *self.pr_merge_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(dir, number)` arguments passed to `pr_merge`, in call order.
+    pub fn pr_merge_calls(&self) -> Vec<(PathBuf, u64)> {
+        self.pr_merge_calls.borrow().clone()
     }
 
     /// The `dir` arguments passed to `pr_list_bounded`, in call order.
@@ -3212,6 +3337,13 @@ impl GhCli for FakeGhCli {
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
         self.pr_list_all_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_all_result.borrow().clone()
+    }
+
+    fn pr_merge(&self, dir: &Path, number: u64, _timeout: Duration) -> Result<(), GhError> {
+        self.pr_merge_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), number));
+        self.pr_merge_result.borrow().clone()
     }
 
     fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError> {
@@ -4581,6 +4713,91 @@ mod tests {
             fake.issue_create_calls(),
             vec![("jowi-dev/tskmstr".to_string(), req)]
         );
+    }
+
+    // --- pr_merge ---
+
+    #[test]
+    fn repo_merge_settings_json_fields_stay_valid() {
+        // Pinned like `PR_STATE_JSON_FIELDS`: `gh` silently has different
+        // `--json` field sets per subcommand, and an invalid field fails
+        // every call, forever. These three are validated against
+        // `gh repo view --json` (gh 2.x).
+        assert_eq!(
+            REPO_MERGE_SETTINGS_JSON_FIELDS,
+            "mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed"
+        );
+    }
+
+    #[test]
+    fn interpret_repo_merge_settings_output_parses_allowed_methods() {
+        let settings = interpret_repo_merge_settings_output(
+            Some(0),
+            r#"{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false}"#,
+            "",
+        )
+        .expect("should parse");
+        assert!(!settings.merge_commit_allowed);
+        assert!(settings.squash_merge_allowed);
+        assert!(!settings.rebase_merge_allowed);
+    }
+
+    #[test]
+    fn interpret_repo_merge_settings_output_nonzero_exit_is_command_error() {
+        let err = interpret_repo_merge_settings_output(Some(1), "", "boom").unwrap_err();
+        match err {
+            GhError::Command { command, .. } => assert_eq!(command, "gh repo view"),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_method_flag_prefers_merge_then_squash_then_rebase() {
+        let all = RawRepoMergeSettings {
+            merge_commit_allowed: true,
+            squash_merge_allowed: true,
+            rebase_merge_allowed: true,
+        };
+        assert_eq!(merge_method_flag(&all), Some("--merge"));
+
+        let squash_and_rebase = RawRepoMergeSettings {
+            merge_commit_allowed: false,
+            ..all
+        };
+        assert_eq!(merge_method_flag(&squash_and_rebase), Some("--squash"));
+
+        let rebase_only = RawRepoMergeSettings {
+            merge_commit_allowed: false,
+            squash_merge_allowed: false,
+            rebase_merge_allowed: true,
+        };
+        assert_eq!(merge_method_flag(&rebase_only), Some("--rebase"));
+    }
+
+    #[test]
+    fn merge_method_flag_none_when_no_method_enabled() {
+        let none = RawRepoMergeSettings {
+            merge_commit_allowed: false,
+            squash_merge_allowed: false,
+            rebase_merge_allowed: false,
+        };
+        assert_eq!(merge_method_flag(&none), None);
+    }
+
+    #[test]
+    fn pr_merge_args_pass_number_and_method_flag() {
+        assert_eq!(
+            pr_merge_args(42, "--squash"),
+            ["pr", "merge", "42", "--squash"]
+        );
+    }
+
+    #[test]
+    fn fake_pr_merge_records_dir_and_number() {
+        let fake = FakeGhCli::new();
+        fake.pr_merge(Path::new("/repo"), 7, Duration::from_secs(1))
+            .expect("default fake pr_merge succeeds");
+        assert_eq!(fake.pr_merge_calls(), vec![(PathBuf::from("/repo"), 7)]);
     }
 
     // --- issue_edit ---
