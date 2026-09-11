@@ -525,7 +525,7 @@ built-in defaults). `tm work run <lane>` provisions the lane's worktree if
 missing, cuts a fresh timestamped branch off the resolved base for this
 run, and invokes `claude` with the lane's prompt. That prompt is the lane's
 `prompt_file`, resolved against the lane's repo root when it is a relative
-path (so `prompt_file = "prompts/<lane>-lane.md"`, what `tm init`
+path (so `prompt_file = ".tskmstr/prompts/<lane>-lane.md"`, what `tm init`
 scaffolds, keeps the prompt versioned alongside the code it instructs), and
 falling back to `~/.claude/prompts/<lane>.md` when unset. In a repo-local
 `.tskmstr.toml`, `repo` may

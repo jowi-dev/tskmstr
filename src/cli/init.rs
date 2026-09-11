@@ -611,7 +611,8 @@ fn lane_step(
         prompter,
         out,
         "Lane prompt file",
-        &existing("prompt_file").unwrap_or_else(|| format!("prompts/{name}-lane.md")),
+        &existing("prompt_file")
+            .unwrap_or_else(|| format!(".tskmstr/prompts/{name}-lane.md")),
         "the lane prompt file",
     )?;
 
@@ -1284,10 +1285,14 @@ mod tests {
             .get("repo")
             .expect("lane scaffolded under the repo dir name");
         assert_eq!(lane.base_branch.as_deref(), Some("main"));
-        assert_eq!(lane.prompt_file.as_deref(), Some("prompts/repo-lane.md"));
+        assert_eq!(
+            lane.prompt_file.as_deref(),
+            Some(".tskmstr/prompts/repo-lane.md"),
+            "tm assets default into the committed .tskmstr/ directory"
+        );
 
         let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
-        let prompt_path = repo_dir.join("prompts/repo-lane.md");
+        let prompt_path = repo_dir.join(".tskmstr/prompts/repo-lane.md");
         let template = std::fs::read_to_string(&prompt_path).expect("starter prompt scaffolded");
         assert!(template.contains("work lane"), "template body: {template}");
     }
@@ -1307,7 +1312,7 @@ mod tests {
         let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
         assert!(!repo_text.contains("[work"), "no work section: {repo_text}");
         let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
-        assert!(!repo_dir.join("prompts").exists(), "no prompt scaffolded");
+        assert!(!repo_dir.join(".tskmstr").exists(), "no prompt scaffolded");
     }
 
     #[test]
@@ -1457,10 +1462,10 @@ mod tests {
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
 
         let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
-        assert!(!repo_dir.join("prompts/repo-lane.md").exists());
+        assert!(!repo_dir.join(".tskmstr/prompts/repo-lane.md").exists());
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(
-            rendered.contains("warning") && rendered.contains("prompts/repo-lane.md"),
+            rendered.contains("warning") && rendered.contains(".tskmstr/prompts/repo-lane.md"),
             "missing-prompt warning in: {rendered}"
         );
         let config = config::load(&env.paths).expect("config should load");
