@@ -14,7 +14,9 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::agent::AgentRunner;
-use crate::config::{self, BackendKind, Config, ConfigError, ConfigPaths, GlobalConfigSeed};
+use crate::config::{
+    self, AgentKind, BackendKind, Config, ConfigError, ConfigPaths, GlobalConfigSeed,
+};
 use crate::github::gh_cli::GhCli;
 use crate::keychain::{KeychainError, KeychainStore};
 use crate::ticketing::provider::TicketProvider;
@@ -255,6 +257,7 @@ pub fn run_init(
             default_prompt: "/bugbot-triage {key} {findings_file}",
         },
     )?;
+    ask_runner(yes, &mut doc, &repo_config_path, prompter, out)?;
     let install_hooks = !ctx.hooks_installed
         && ask_confirm(
             yes,
@@ -491,6 +494,50 @@ fn ask_backend(
             None => writeln!(out, "expected \"jira\" or \"github\"")?,
         }
     }
+}
+
+/// Ask which AI coding agent runner `tm` launches (`[agent] runner`),
+/// re-prompting until the answer names a runner [`AgentKind::parse`]
+/// recognizes. The default-named runner stays implicit: the key is written
+/// only when it is already present (so an answer can fix an invalid value in
+/// place) or the answer differs from the built-in default, keeping a
+/// default-accepting run free of an `[agent]` table. With `yes`, the current
+/// value is kept — unless it doesn't parse, which errors rather than
+/// silently persisting a runner no `tm` command would accept.
+///
+/// The answer takes effect on the next `tm` invocation: this wizard's own
+/// session-asset probes keep using the [`InitContext::runner`] resolved at
+/// startup.
+fn ask_runner(
+    yes: bool,
+    doc: &mut DocumentMut,
+    repo_config_path: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<(), InitCliError> {
+    let names = AgentKind::names().join(", ");
+    let current = str_at(doc, &["agent", "runner"]).map(str::to_string);
+    let default = current
+        .clone()
+        .unwrap_or_else(|| AgentKind::default().as_str().to_string());
+    let answer = if yes {
+        AgentKind::parse(&default)
+            .ok_or(ConfigError::InvalidRunner { value: default })?
+            .as_str()
+            .to_string()
+    } else {
+        loop {
+            let answer = prompter.prompt_line(&format!("AI agent runner ({names})"), &default)?;
+            match AgentKind::parse(answer.trim()) {
+                Some(kind) => break kind.as_str().to_string(),
+                None => writeln!(out, "expected one of: {names}")?,
+            }
+        }
+    };
+    if current.is_some() || answer != AgentKind::default().as_str() {
+        set_str(doc, &["agent"], "runner", &answer, repo_config_path)?;
+    }
+    Ok(())
 }
 
 /// Prompt for a required value, re-prompting while the answer is empty. With
@@ -1470,6 +1517,109 @@ mod tests {
         );
         let config = config::load(&env.paths).expect("config should load");
         assert!(config.work.lanes.contains_key("repo"), "lane still written");
+    }
+
+    #[test]
+    fn runner_question_default_answer_writes_no_agent_table() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(
+            prompter.messages.iter().any(|m| m.contains("agent runner")),
+            "runner question asked: {:?}",
+            prompter.messages
+        );
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            !repo_text.contains("[agent]"),
+            "the default runner stays implicit: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn runner_question_reprompts_on_unrecognized_runner() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Lines pop in question order: backend, slug, lane name/repo/branch/
+        // prompt file, then the runner question twice (invalid, then valid).
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("repo")
+            .with_line(".")
+            .with_line("main")
+            .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("gpt-agent")
+            .with_line("claude");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("expected one of: claude"),
+            "re-prompt notice in: {rendered}"
+        );
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.agent, crate::config::AgentKind::Claude);
+    }
+
+    #[test]
+    fn runner_question_rewrites_an_existing_agent_key() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // An [agent] table already naming an unrecognized runner: the answer
+        // must land in the file, fixing it.
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[agent]\nrunner = \"gpt\"\n";
+        std::fs::write(env.paths.repo.as_ref().unwrap(), original).expect("write repo config");
+
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("repo")
+            .with_line(".")
+            .with_line("main")
+            .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("claude");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("runner = \"claude\""),
+            "existing key rewritten with the answer: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn runner_question_yes_with_invalid_existing_runner_errors() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[agent]\nrunner = \"gpt\"\n";
+        std::fs::write(env.paths.repo.as_ref().unwrap(), original).expect("write repo config");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        let err = run_init(&ctx, true, &mut prompter, &mut out)
+            .expect_err("--yes cannot silently keep an unrecognized runner");
+        assert!(matches!(
+            err,
+            InitCliError::Config(ConfigError::InvalidRunner { .. })
+        ));
     }
 
     #[test]
