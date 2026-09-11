@@ -1,7 +1,10 @@
 //! `tm init`: interactive wizard that onboards the current repo — backend
 //! choice, repo-local `.tskmstr.toml`, work-lane scaffolding, status labels,
 //! and session assets — so `tm board` works immediately after (GitHub
-//! issue #8).
+//! issue #8). Scaffolded assets default into the committed `.tskmstr/`
+//! directory (`docs/decisions/0006-repo-local-assets.md`), and the wizard
+//! can finish by launching an agent-assisted setup session that fills them
+//! out with the repo's real gates (GitHub issue #30).
 //!
 //! The repo-local file is edited with `toml_edit` rather than re-serialized
 //! from a struct so a re-run preserves the user's comments and formatting;

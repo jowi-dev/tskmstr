@@ -31,18 +31,34 @@ tm init
 It asks for the ticket backend (defaulting to `github` when an `origin`
 remote is detected, with the slug pre-filled), writes the repo-local
 `.tskmstr.toml`, scaffolds a work lane (`repo = "."`, an explicit
-`base_branch`, and an optional starter prompt file), creates the GitHub
-backend's `tm:status/*` labels, optionally fills in `[work.audit]` /
-`[work.review_watch]`, and offers `tm work hooks install --user` when the
-session hooks are absent — everything `tm board` and the board's `w`/`a`
-keys need. Re-running it is a review pass: every question offers the
+`base_branch`, and an optional starter prompt file at
+`.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
+tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md`),
+creates the GitHub backend's `tm:status/*` labels, optionally fills in
+`[work.audit]` / `[work.review_watch]`, asks which AI agent runner tm
+launches (`[agent] runner`; the default stays implicit), and offers `tm
+work hooks install --user` when the session hooks are absent — everything
+`tm board` and the board's `w`/`a` keys need.
+
+The scaffolded lane prompt is a generic skeleton, so after everything is
+written the wizard offers to launch an agent-assisted setup session
+(GitHub issue #30): an interactive session, in the repo root, prompted to
+explore the repo, verify the build/test/lint/format gates that actually
+exist here, fill the scaffolded lane prompt out in place, and author any
+session skills the config references but that exist nowhere on disk —
+asking you the things the repo can't answer (deploy rules, forbidden
+paths, review conventions). Declining keeps the static skeleton; review
+and commit whatever the session writes.
+
+Re-running `tm init` is a review pass: every question offers the
 current value as its default, and nothing is overwritten without
 confirmation. A re-run also audits the lanes already in the config and
 offers to scaffold a starter prompt for any whose `prompt_file` (or
 `~/.claude/prompts/<lane>.md` fallback) is missing — that check runs
 whether or not you take up the "add or update a lane?" question, since a
 missing prompt is what fails a lane run's preflight. `tm init --yes`
-accepts every default for scripted setup.
+accepts every default for scripted setup: it scaffolds the static
+skeleton and never launches the setup session.
 
 Under the Jira backend, `tm init` hands off to `tm auth login` when no
 API token resolves; you can also bootstrap auth directly:
