@@ -648,6 +648,7 @@ to" windows.
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
 | `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
+| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status (board only); see "Merging from the board" below |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
@@ -1049,6 +1050,38 @@ captured comments launches the child, which resolves quickly (like every
 watched-child launch) and reports "no comments captured" (or similar) in the
 status line without leaving a `review-fix` run behind.
 
+### Merging from the board
+
+Merging is the one lifecycle step that used to force you out of the board:
+`tm ticket create` moves a ticket to `status_on_create`, `tm pr create` to
+`status_on_pr`, and the board launches everything in between — but the
+merge itself meant a browser or another terminal, plus a manual status
+move afterwards. Pressing `M` on a board ticket closes that gap.
+
+`M` first resolves the ticket's open PR — the same single bounded
+`gh pr list` lookup the `o` key uses, against the ticket's lane repo
+(falling back to the board's own repo). A ticket with no open PR — never
+opened, or already merged or closed — just sets a status-line message;
+nothing is merged and no status is touched. Ungated by column, like `a`:
+the PR resolution itself is the authority on whether there's anything to
+merge.
+
+When an open PR resolves, a confirmation window names exactly what
+confirming will do: the PR number and title, and the ticket's post-merge
+status (`status_on_merge`, or "merge only" when it's unset). `y`/`Enter`
+merges; `n`/`Esc`/`q` cancels and leaves everything untouched — every
+other key is inert while the prompt is up. The merge itself uses the
+repository's default merge method (the first enabled of merge commit,
+squash, rebase — the same order GitHub's own merge button uses); a merge
+GitHub rejects (conflicts, failing checks, branch protection) surfaces on
+the status line and moves no ticket.
+
+After a successful merge, the configured `status_on_merge` transition is
+applied advisorily (see its config docs below) and the board refetches, so
+a moved ticket changes column right away. Deliberately *not* included:
+deleting the branch, removing the worktree, or killing the ticket's tmux
+session — the merge key merges, nothing else.
+
 ### Retro board
 
 Pressing `R` on the board opens a full-screen "Retro" list: every ticket in
@@ -1109,6 +1142,7 @@ default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
+# status_on_merge = "Done"            # optional, see below
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 # board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
 
@@ -1124,8 +1158,8 @@ its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files whenever the Jira backend is selected, or `tm`
 refuses to run; `default_assignee_account_id`, `status_on_pr`,
-`status_on_create`, `review_bots`, `board_column_order`, and `[backend]`
-are optional.
+`status_on_create`, `status_on_merge`, `review_bots`, `board_column_order`,
+and `[backend]` are optional.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
@@ -1269,6 +1303,18 @@ same way as `status_on_pr` (available transitions, case-insensitive,
 warn-and-continue on no match or API failure) and is independent of it —
 set one, both, or neither depending on your workflow.
 
+`status_on_merge` names the workflow status (e.g. `"Done"`) to move a
+ticket to after its PR is merged from the board (the `M` key). It's
+matched the same way as its siblings (available transitions,
+case-insensitive, warn-and-continue on no match or API failure), applied
+only after the merge itself succeeds. When unset, merging moves nothing:
+there is no safe universal post-merge status — in a repo whose root branch
+deploys, merged means done; in a repo whose root branch is staging, a
+human moves the ticket when the work actually ships — so absence means
+"merge only". A ticket already sitting in the target status (on the
+GitHub backend, an issue the PR's closing keyword auto-closed reads as
+Done) is reported as moved rather than warned about.
+
 `tm ticket create` takes two flags to control this per invocation:
 `--status <STATUS>` transitions the new ticket to `<STATUS>` instead of
 `status_on_create`, with the same case-insensitive, warn-and-continue
@@ -1284,7 +1330,7 @@ If `<KEY>` is already in `<STATUS>`, it prints a message and exits 0
 without calling the transition API. Omit `<STATUS>` to list the ticket's
 current status and available transitions instead.
 
-Under the GitHub backend, all three of these paths first translate the
+Under the GitHub backend, all of these paths first translate the
 requested status into the backend's fixed vocabulary (To Do / In Progress /
 In Review / Blocked / Done): common Jira names for the review status —
 `"Code Review"`, `"Under Review"`, `"Review"` — map onto `"In Review"`, so
