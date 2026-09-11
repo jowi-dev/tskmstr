@@ -216,12 +216,13 @@ pub struct RawAgentConfig {
 
 /// Which AI coding agent a config selects.
 ///
-/// This is the one enum a new agent adapter extends: add a variant here, add
-/// its config validation as a new arm of the `match` in
-/// [`merge_with_repo_dir`] (mirroring how [`BackendKind`] is handled), add
-/// its `AgentRunner` implementation (see `docs/plans/agent-runner.md`, GitHub
-/// issue #17), and wire it into `agent_runner_for` in `main.rs`. Nothing else
-/// needs to change.
+/// This is the one enum a new agent adapter extends: add a variant here (and
+/// its name to [`AgentKind::names`]), add its config validation as a new arm
+/// of the `match` in [`merge_with_repo_dir`] (mirroring how [`BackendKind`]
+/// is handled), add its `AgentRunner` implementation (see
+/// `docs/plans/agent-runner.md`, GitHub issue #17), and wire it into
+/// `agent_runner_for` in `main.rs`. Nothing else needs to change — `tm
+/// init`'s runner question picks the new name up from [`AgentKind::names`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentKind {
     /// Claude Code, via the Claude agent adapter. The only implementation so
@@ -245,6 +246,15 @@ impl AgentKind {
             "claude" => Some(AgentKind::Claude),
             _ => None,
         }
+    }
+
+    /// Every recognized runner name, for `tm init`'s runner question and its
+    /// "expected one of" re-prompt (the wizard lives outside `src/agent/`,
+    /// where a literal runner name is off-limits — see
+    /// `no_agent_literals_outside_the_adapter_module`). Keep in sync with
+    /// [`AgentKind::parse`]: every entry must parse.
+    pub fn names() -> &'static [&'static str] {
+        &["claude"]
     }
 }
 
@@ -2737,6 +2747,17 @@ mod tests {
     #[test]
     fn agent_kind_default_is_claude() {
         assert_eq!(AgentKind::default(), AgentKind::Claude);
+    }
+
+    #[test]
+    fn agent_kind_names_every_entry_parses_and_includes_the_default() {
+        for name in AgentKind::names() {
+            assert!(
+                AgentKind::parse(name).is_some(),
+                "names() entry `{name}` must parse"
+            );
+        }
+        assert!(AgentKind::names().contains(&AgentKind::default().as_str()));
     }
 
     #[test]

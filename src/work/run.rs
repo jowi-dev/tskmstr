@@ -698,8 +698,9 @@ pub fn resolve_blocker_stacking(
 ///
 /// A relative lane `prompt_file` resolves against `repo_root`, not the
 /// process's cwd, so a lane prompt can live in the repo it instructs
-/// (`prompt_file = "prompts/<lane>-lane.md"`, which is what `tm init`
-/// scaffolds) and a run works regardless of where `tm` was invoked from. A
+/// (`prompt_file = ".tskmstr/prompts/<lane>-lane.md"`, which is what `tm
+/// init` scaffolds) and a run works regardless of where `tm` was invoked
+/// from. A
 /// relative `--prompt` override stays cwd-relative: it is a path the caller
 /// just typed at a shell, so shell-relative is the only reading that won't
 /// surprise them.
