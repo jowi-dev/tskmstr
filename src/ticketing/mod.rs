@@ -505,7 +505,7 @@ fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -
     let Some(transition) = find_matching_transition(&transitions, target) else {
         return StatusTransition::Warning(format!(
             "no transition to \"{target}\" found for {key} ({}); check the configured \
-             status_on_pr/status_on_create, or move it manually with \
+             status_on_pr/status_on_create/status_on_merge, or move it manually with \
              `tm ticket transition {key} \"<STATUS>\"`",
             format_transitions(&transitions)
         ));
@@ -517,6 +517,39 @@ fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -
             StatusTransition::Warning(format!("failed to transition {key} to \"{target}\": {err}"))
         }
     }
+}
+
+/// Advisorily move `key` to the configured `status_on_merge` target after
+/// its PR merged, tolerating a ticket that is already there.
+///
+/// Same contract as [`apply_status_transition`] (never propagates an error;
+/// every outcome is a [`StatusTransition`]), plus one tolerance that
+/// function's callers don't need: merging a PR whose body carries a closing
+/// keyword auto-closes its GitHub issue, so by the time this runs the
+/// ticket may already read as the target status (a closed issue
+/// synthesizes as `Done`) with no matching transition left (closed issues
+/// only offer `Reopen`). Checking the current status first turns that race
+/// into a clean [`StatusTransition::Applied`] -- carrying the ticket's own
+/// status name, since no transition picked a name to report -- instead of
+/// a spurious no-matching-transition warning. A failed status read falls
+/// through to the ordinary transition attempt rather than warning on its
+/// own; the read is only this tolerance's input, not a prerequisite.
+///
+/// `pub` (not just crate-visible) deliberately: this is the transition half
+/// of the merge plumbing GitHub issue #32's NOTES ask to keep reusable for
+/// a potential `tm pr merge` CLI subcommand later.
+pub fn apply_status_on_merge(
+    jira: &dyn TicketProvider,
+    key: &str,
+    target: &str,
+) -> StatusTransition {
+    let normalized = jira.normalize_status_target(target);
+    if let Ok(issue) = jira.get_issue(key)
+        && issue.fields.status.name.eq_ignore_ascii_case(&normalized)
+    {
+        return StatusTransition::Applied(issue.fields.status.name);
+    }
+    apply_status_transition(jira, key, target)
 }
 
 /// Find the transition (if any) among `transitions` that leads to `target`.
@@ -1796,8 +1829,8 @@ mod tests {
                     "warning should list the available transitions: {msg}"
                 );
                 assert!(
-                    msg.contains("status_on_pr"),
-                    "warning should point at the configured status name: {msg}"
+                    msg.contains("status_on_pr") && msg.contains("status_on_merge"),
+                    "warning should point at every advisory config key: {msg}"
                 );
                 assert!(
                     msg.contains("tm ticket transition PROJ-9"),
@@ -1806,6 +1839,52 @@ mod tests {
             }
             other => panic!("expected Warning, got {other:?}"),
         }
+    }
+
+    fn issue_with_status(key: &str, status_name: &str) -> Issue {
+        let mut issue = issue(key);
+        issue.fields.status.name = status_name.to_string();
+        issue
+    }
+
+    #[test]
+    fn apply_status_on_merge_already_in_target_short_circuits_without_transitioning() {
+        // GitHub issue #32: merging a PR whose body carries a closing
+        // keyword auto-closes the GitHub issue, which then reads as Done
+        // with only a Reopen transition left. The advisory post-merge move
+        // must treat that as success, not warn about a missing transition.
+        let jira = FakeJiraClient::new().with_issue("PROJ-9", issue_with_status("PROJ-9", "Done"));
+
+        let outcome = apply_status_on_merge(&jira, "PROJ-9", "done");
+
+        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn apply_status_on_merge_applies_matching_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-9", issue("PROJ-9"))
+            .with_transitions("PROJ-9", vec![transition("31", "Ship it", "Done")]);
+
+        let outcome = apply_status_on_merge(&jira, "PROJ-9", "Done");
+
+        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-9".to_string(), "31".to_string())]
+        );
+    }
+
+    #[test]
+    fn apply_status_on_merge_status_read_failure_still_attempts_the_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue_not_found("PROJ-9")
+            .with_transitions("PROJ-9", vec![transition("31", "Ship it", "Done")]);
+
+        let outcome = apply_status_on_merge(&jira, "PROJ-9", "Done");
+
+        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
     }
 
     #[test]
