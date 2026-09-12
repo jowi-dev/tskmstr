@@ -57,6 +57,10 @@ pub enum CreateLaunchError {
     /// Shelling out to `tmux` failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
+
+    /// `create_cfg.prompt_file` was set but could not be read.
+    #[error(transparent)]
+    PromptFile(#[from] crate::work::prompt::PromptFileError),
 }
 
 /// Successful outcome of [`launch_create`].
@@ -81,10 +85,14 @@ pub struct CreateLaunchOutcome {
 /// 3. Otherwise starts the runner's interactive CLI (with the model flag
 ///    when `create_cfg.model` is set — see
 ///    [`AgentRunner::interactive_shell_command`]) in that window, prompted
-///    with `create_cfg.prompt` or the runner's
+///    with `create_cfg.prompt_file`'s contents (read via
+///    [`crate::work::prompt::read_prompt_file`]), else `create_cfg.prompt`,
+///    else the runner's
 ///    [`default_create_prompt`](AgentRunner::default_create_prompt) —
 ///    unlike [`crate::work::audit`]'s template, no `{key}` substitution
-///    applies, as no ticket key exists yet. The session is created if this
+///    applies, as no ticket key exists yet. The prompt file is read after
+///    the checks above but before any tmux mutation, so a bad path errors
+///    out with no session or window created. The session is created if this
 ///    is the scope's first create launch, and the window appended to it
 ///    otherwise, taking a [`unique_window_name`] suffix if a dead
 ///    predecessor still holds the plain name. An appended window is also
@@ -125,9 +133,14 @@ pub fn launch_create(
     let existing_windows = session_window_names(&windows, &session_name);
     let window_name = unique_window_name(CREATE_WINDOW_NAME, &existing_windows);
 
-    let prompt = create_cfg
-        .prompt
+    let prompt_file_contents = create_cfg
+        .prompt_file
         .as_deref()
+        .map(|raw| crate::work::prompt::read_prompt_file(raw, home, "[work.create].prompt_file"))
+        .transpose()?;
+    let prompt = prompt_file_contents
+        .as_deref()
+        .or(create_cfg.prompt.as_deref())
         .unwrap_or_else(|| runner.default_create_prompt());
     let command = runner.interactive_shell_command(create_cfg.model.as_deref(), prompt);
 
@@ -311,6 +324,63 @@ mod tests {
         assert_eq!(
             command,
             Some("claude --model 'opus' '/my-create'".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_create_uses_prompt_file_contents_as_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("create-prompt.md");
+        std::fs::write(&prompt_path, "/my-file-prompt").unwrap();
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = CreateConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: Some("/should-not-be-used".to_string()),
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            model: None,
+        };
+
+        launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER).unwrap();
+
+        let command = tmux.calls().iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        });
+        assert_eq!(command, Some("claude '/my-file-prompt'".to_string()));
+    }
+
+    #[test]
+    fn launch_create_errors_when_prompt_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("missing-prompt.md");
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = CreateConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            model: None,
+        };
+
+        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
+            .expect_err("missing prompt file should error");
+
+        match &err {
+            CreateLaunchError::PromptFile(inner) => {
+                let message = inner.to_string();
+                assert!(message.contains("[work.create].prompt_file"));
+                assert!(message.contains(&prompt_path.to_string_lossy().to_string()));
+            }
+            other => panic!("expected PromptFile, got {other:?}"),
+        }
+        assert!(
+            tmux.calls().iter().all(|call| !matches!(
+                call,
+                TmuxCall::NewSessionWithCommand { .. } | TmuxCall::NewWindowWithCommand { .. }
+            )),
+            "no tmux session/window should have been created, got {:?}",
+            tmux.calls()
         );
     }
 }
