@@ -873,7 +873,7 @@ fn audit_existing_lane_prompts(
 ) -> Result<Vec<(PathBuf, String)>, InitCliError> {
     let mut scaffolds = Vec::new();
     for lane in lanes {
-        let resolved = existing_lane_prompt_path(ctx, doc, lane, repo_dir);
+        let resolved = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
         if resolved.exists() {
             continue;
         }
@@ -893,15 +893,22 @@ fn audit_existing_lane_prompts(
 /// `resolve_prompt_path` in `src/work/run.rs`: the lane's `prompt_file`
 /// (relative to the repo root), else the runner's own default lane-prompt
 /// path (`~/.claude/prompts/<lane>.md` for `claude`) the run would use.
-fn existing_lane_prompt_path(
-    ctx: &InitContext,
+///
+/// Takes `runner`/`home` rather than a whole [`InitContext`] so `tm check`
+/// (`src/cli/check.rs`) can resolve the same path without depending on
+/// init's wizard-specific dependencies — the two commands share this
+/// resolution logic so they cannot drift apart on what "the lane's prompt
+/// file" means.
+pub(crate) fn existing_lane_prompt_path(
+    runner: &dyn AgentRunner,
+    home: &Path,
     doc: &DocumentMut,
     lane: &str,
     repo_dir: &Path,
 ) -> PathBuf {
     match str_at(doc, &["work", "lanes", lane, "prompt_file"]) {
-        Some(value) => resolve_repo_relative(value, repo_dir, ctx.home),
-        None => ctx.runner.default_lane_prompt_path(ctx.home, lane),
+        Some(value) => resolve_repo_relative(value, repo_dir, home),
+        None => runner.default_lane_prompt_path(home, lane),
     }
 }
 
@@ -939,7 +946,10 @@ fn offer_lane_prompt(
 /// disk. Relative paths resolve against the repo root, matching how
 /// `resolve_prompt_path` (`src/work/run.rs`) resolves a lane `prompt_file`
 /// at run time.
-fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -> PathBuf {
+///
+/// `pub(crate)`: shared with `tm check` (`src/cli/check.rs`), which resolves
+/// the same lane/session path values for its presence checks.
+pub(crate) fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
         return home.join(rest);
     }
@@ -991,7 +1001,11 @@ fn ask_confirm(
 }
 
 /// Read the string at a dotted `path` in `doc`, if present.
-fn str_at<'a>(doc: &'a DocumentMut, path: &[&str]) -> Option<&'a str> {
+///
+/// `pub(crate)`: `tm check` (`src/cli/check.rs`) reads the same repo-local
+/// document shape and reuses this rather than re-implementing dotted-path
+/// lookup.
+pub(crate) fn str_at<'a>(doc: &'a DocumentMut, path: &[&str]) -> Option<&'a str> {
     let (first, rest) = path.split_first()?;
     let mut item: &Item = doc.get(first)?;
     for key in rest {

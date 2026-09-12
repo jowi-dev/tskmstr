@@ -65,6 +65,14 @@ fn main() -> ExitCode {
         return run_review_fix(key, Dispatch::from_flags(headless, fg));
     }
 
+    // `tm check` is special-cased the same way: it needs a three-way exit
+    // code (0 up to date, 1 drift found, 2 error) rather than dispatch's
+    // uniform 0/1, so a script can branch on "clean" vs. "drifted" vs.
+    // "something went wrong" without parsing stdout.
+    if let Command::Check { quiet } = command {
+        return run_check_cmd(quiet);
+    }
+
     match dispatch(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -186,6 +194,13 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Review { cmd } => run_review(cmd),
         Command::Backend { cmd } => run_backend(cmd, &paths),
         Command::Init { yes } => run_init(yes, &paths, &keychain, env_token),
+        // `tm check` needs its own three-way exit code and is fully
+        // special-cased in `main()` before `dispatch` is ever called (see
+        // the comment there); this arm exists only for `Command`'s match to
+        // stay exhaustive.
+        Command::Check { .. } => {
+            unreachable!("tm check is special-cased in main() before dispatch")
+        }
     }
 }
 
@@ -803,6 +818,41 @@ fn run_init(
     let mut stdout = std::io::stdout();
     tskmstr::cli::init::run_init(&ctx, yes, &mut prompter, &mut stdout)?;
     Ok(())
+}
+
+/// `tm check [--quiet]`: build real dependencies and run
+/// [`tskmstr::cli::check::run_check`], mapping its result to a three-way
+/// exit code (`0` up to date, `1` drift found, `2` error).
+///
+/// Loads the global config the same lenient way `tm work run`/`tm review
+/// fix` do (`config::load(&paths).ok()`): `tm check` must still run when the
+/// global config is absent or invalid, since the repo-local `.tskmstr.toml`
+/// alone drives the report — only the runner resolution (for lane/skill
+/// path defaults) benefits from a loaded config, and falls back to the
+/// default runner when there is none.
+fn run_check_cmd(quiet: bool) -> ExitCode {
+    let paths = default_config_paths();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let config = config::load(&paths).ok();
+    let runner = agent_runner_or_default(config.as_ref());
+
+    let ctx = tskmstr::cli::check::CheckContext {
+        paths: &paths,
+        home: &home,
+        runner,
+    };
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::cli::check::run_check(&ctx, quiet, &mut stdout) {
+        Ok(findings) if findings.is_empty() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// Load config and build a real ticket provider (Jira or GitHub, per

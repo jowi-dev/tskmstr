@@ -14,6 +14,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod auth;
 pub mod backend;
+pub mod check;
 pub mod init;
 pub mod pr;
 pub mod ready;
@@ -157,6 +158,23 @@ pub enum Command {
         /// Accept the default answer for every question (scripted setup).
         #[arg(long)]
         yes: bool,
+    },
+    /// Read-only drift report: is this repo's `.tskmstr.toml` up to date
+    /// with the running tskmstr's expected asset/config schema?
+    ///
+    /// Reports [`crate::config::manifest::CURRENT_SCHEMA_VERSION`] drift
+    /// (missing/stale/newer `schema_version` stamp) and the same structural
+    /// presence checks `tm init` runs on every re-run — a configured lane's
+    /// missing prompt file, a configured session's missing skill — without
+    /// writing anything. User-edited asset *content* (lane prompts, skill
+    /// bodies) is never compared; see `docs/decisions/0007-asset-schema-version.md`.
+    ///
+    /// Exit code: `0` up to date, `1` drift found, `2` error (e.g. the repo
+    /// was never onboarded).
+    Check {
+        /// Print a single summary line instead of one line per finding.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -1197,6 +1215,18 @@ mod tests {
     fn parses_init_yes() {
         let cli = Cli::try_parse_from(["tm", "init", "--yes"]).expect("should parse");
         assert!(matches!(cli.command, Some(Command::Init { yes: true })));
+    }
+
+    #[test]
+    fn parses_check() {
+        let cli = Cli::try_parse_from(["tm", "check"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Check { quiet: false })));
+    }
+
+    #[test]
+    fn parses_check_quiet() {
+        let cli = Cli::try_parse_from(["tm", "check", "--quiet"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Check { quiet: true })));
     }
 
     #[test]
