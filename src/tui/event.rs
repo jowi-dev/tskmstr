@@ -3720,6 +3720,7 @@ mod tests {
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         };
 
@@ -3746,6 +3747,7 @@ mod tests {
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/tskmstr".to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         };
         deps.audit_dir_fallback = true;
@@ -3790,6 +3792,7 @@ mod tests {
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         };
         deps.tmux = Box::new(
@@ -3943,6 +3946,7 @@ mod tests {
         d.create = crate::config::CreateConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         };
         d.tmux = Box::new(

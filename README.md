@@ -884,11 +884,18 @@ terminal to that session (the board suspends, tmux takes over; detach with
 [work.audit]
 dir = "~/Projects/axiom"            # required: where the session runs
 # prompt = "/ticket-audit {key}"    # optional; this is the default
+# prompt_file = ".tskmstr/prompts/audit.md"  # optional; see below
 # model = "fable"                   # optional; passed as `claude --model`
 ```
 
 `dir` is the repo whose `.claude/` provides the audit skill and telemetry
-hook settings; `{key}` in `prompt` is replaced with the ticket key. The
+hook settings; `{key}` in `prompt` (or in `prompt_file`'s contents) is
+replaced with the ticket key. `prompt_file` and `prompt` are mutually
+exclusive — setting both is a config error; a relative `prompt_file` is only
+legal in a repo-local `.tskmstr.toml`, resolved against that repo's root
+(`.tskmstr/prompts/` is a reasonable place to keep one). A missing or
+unreadable `prompt_file` at launch time is a status-line error, never an
+empty prompt. The
 launch pre-registers a `kind = "audit"` run, and the in-session
 `tm ticket audit <KEY>` adopts it (via `TSKMSTR_SESSION_RUN_ID`), so the
 whole conversation's telemetry lands on one run.
@@ -963,8 +970,14 @@ board; the new ticket shows up on the next `r` refresh. Launching requires:
 [work.create]
 dir = "~/Projects/axiom"     # required: where the session runs
 # prompt = "/ticket-create"  # optional; this is the default
+# prompt_file = ".tskmstr/prompts/create.md"  # optional; see [work.audit]'s prompt_file
 # model = "fable"            # optional; passed as `claude --model`
 ```
+
+`prompt_file`'s contents become the opening prompt, mutually exclusive with
+`prompt` (a config error if both are set) — no `{key}` substitution applies
+here, as no ticket key exists yet. See `[work.audit]`'s `prompt_file` above
+for path resolution and the missing-file behavior.
 
 `dir` is the repo whose `.claude/` provides the ticket-create skill and hook
 settings. Without the section (or `dir`), `c` reports a status-line message
@@ -1024,6 +1037,7 @@ Watching requires:
 [work.review_watch]
 dir = "~/Projects/axiom"          # optional; falls back to [work.audit].dir
 # prompt = "/bugbot-triage {key} {findings_file}"  # optional; this is the default
+# prompt_file = ".tskmstr/prompts/cleanup.md"      # optional; see [work.audit]'s prompt_file
 # model = "fable"                 # optional; falls back to [work.audit].model
 # poll_secs = 45                  # optional, default 45
 # max_wait_mins = 1440            # optional, default 1440 (24h)

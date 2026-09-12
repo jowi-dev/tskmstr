@@ -80,6 +80,12 @@ pub enum CleanupLaunchError {
     /// Shelling out to `tmux` failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
+
+    /// `req.cfg.prompt_file` was set but could not be read. Checked before
+    /// [`RunStore::start_run`], so a bad path leaves no orphaned run row —
+    /// same posture as [`crate::work::audit::AuditLaunchError::PromptFile`].
+    #[error(transparent)]
+    PromptFile(#[from] crate::work::prompt::PromptFileError),
 }
 
 /// Successful outcome of [`launch_cleanup`].
@@ -155,17 +161,22 @@ pub struct CleanupLaunchRequest<'a> {
 ///    named [`CLEANUP_WINDOW_NAME`] already exists in
 ///    the ticket's [`crate::work::naming::ticket_session_name`] session — no run row is created in this
 ///    case.
-/// 3. Otherwise pre-registers a run (`kind = "bugbot-cleanup"`, `lane =
-///    "bugbot-cleanup"`, `pid = None`) and starts the tmux session running
-///    `claude <prompt>`, with [`crate::work::audit::SESSION_RUN_ID_ENV`] set
-///    to the new run's id so the in-session `/bugbot-triage` skill's `tm
-///    runs register --kind bugbot-cleanup` step can adopt it.
+/// 3. Otherwise reads `req.cfg.prompt_file` (if set — see
+///    [`crate::work::prompt::read_prompt_file`]) *before* pre-registering a
+///    run, so a bad path leaves no orphaned run row, pre-registers a run
+///    (`kind = "bugbot-cleanup"`, `lane = "bugbot-cleanup"`, `pid = None`)
+///    and starts the tmux session running `claude <prompt>`, with
+///    [`crate::work::audit::SESSION_RUN_ID_ENV`] set to the new run's id so
+///    the in-session `/bugbot-triage` skill's `tm runs register --kind
+///    bugbot-cleanup` step can adopt it.
 ///
-/// The prompt's `{findings_file}` placeholder is filled from
-/// [`findings_file_path`] — the findings file itself already exists by the
-/// time a `tm pr watch` tick calls this (it wrote the file before finishing
-/// the run as `Review`), so this function only needs the path, never writes
-/// it.
+/// The prompt template is `req.cfg.prompt_file`'s contents, else
+/// `req.cfg.prompt`, else
+/// [`AgentRunner::default_cleanup_prompt_template`]; its `{findings_file}`
+/// placeholder is filled from [`findings_file_path`] — the findings file
+/// itself already exists by the time a `tm pr watch` tick calls this (it
+/// wrote the file before finishing the run as `Review`), so this function
+/// only needs the path, never writes it.
 pub fn launch_cleanup(
     deps: &CleanupLaunchDeps<'_>,
     req: &CleanupLaunchRequest<'_>,
@@ -191,6 +202,20 @@ pub fn launch_cleanup(
     let existing_windows = session_window_names(&windows, &session_name);
     let window_name = unique_window_name(CLEANUP_WINDOW_NAME, &existing_windows);
 
+    // Findings-file path computation and the prompt-file read are both pure
+    // (or read-only), so they run before `start_run` — a bad `prompt_file`
+    // path must leave no orphaned run row, the same posture as
+    // `crate::work::audit::launch_audit`.
+    let findings_file = findings_file_path(req.home, req.xdg_data_home, req.key);
+    let prompt_file_contents = req
+        .cfg
+        .prompt_file
+        .as_deref()
+        .map(|raw| {
+            crate::work::prompt::read_prompt_file(raw, req.home, "[work.review_watch].prompt_file")
+        })
+        .transpose()?;
+
     let run_id = deps.store.start_run(&StartRun {
         ticket: req.key.to_string(),
         scope: req.identity.scope(),
@@ -202,11 +227,9 @@ pub fn launch_cleanup(
         log_path: None,
     })?;
 
-    let findings_file = findings_file_path(req.home, req.xdg_data_home, req.key);
-    let template = req
-        .cfg
-        .prompt
+    let template = prompt_file_contents
         .as_deref()
+        .or(req.cfg.prompt.as_deref())
         .unwrap_or_else(|| deps.runner.default_cleanup_prompt_template());
     let prompt = cleanup_prompt(template, req.key, &findings_file);
     let command = deps
@@ -672,5 +695,101 @@ mod tests {
         launcher.launch_cleanup("PROJ-1");
 
         assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_cleanup_uses_prompt_file_contents_with_both_placeholders() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let prompt_dir = tempdir().unwrap();
+        let prompt_path = prompt_dir.path().join("cleanup-prompt.md");
+        std::fs::write(&prompt_path, "/custom-file {key} at {findings_file}").unwrap();
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: Some("/should-not-be-used".to_string()),
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            ..ReviewWatchConfig::default()
+        };
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+            runner: &ClaudeRunner,
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            identity: test_identity(),
+            key: "PROJ-9",
+        };
+
+        launch_cleanup(&deps, &req).unwrap();
+
+        let findings_file = findings_file_path(&home, None, "PROJ-9");
+        let calls = tmux.calls();
+        let command = calls.iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. }
+            | TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            command,
+            Some(format!(
+                "claude '/custom-file PROJ-9 at {}'",
+                findings_file.to_string_lossy()
+            ))
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_errors_and_creates_no_run_when_prompt_file_is_missing() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let prompt_dir = tempdir().unwrap();
+        let prompt_path = prompt_dir.path().join("missing-prompt.md");
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            ..ReviewWatchConfig::default()
+        };
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+            runner: &ClaudeRunner,
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            identity: test_identity(),
+            key: "PROJ-9",
+        };
+
+        let err = launch_cleanup(&deps, &req).expect_err("missing prompt file should error");
+
+        match &err {
+            CleanupLaunchError::PromptFile(inner) => {
+                let message = inner.to_string();
+                assert!(message.contains("[work.review_watch].prompt_file"));
+                assert!(message.contains(&prompt_path.to_string_lossy().to_string()));
+            }
+            other => panic!("expected PromptFile, got {other:?}"),
+        }
+        assert!(
+            store.list_runs().unwrap().is_empty(),
+            "must not pre-register a run when the prompt file is unreadable"
+        );
+        assert!(
+            tmux.calls().iter().all(|call| !matches!(
+                call,
+                TmuxCall::NewSessionWithCommand { .. } | TmuxCall::NewWindowWithCommand { .. }
+            )),
+            "no tmux session/window should have been created, got {:?}",
+            tmux.calls()
+        );
     }
 }

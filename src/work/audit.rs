@@ -88,6 +88,11 @@ pub enum AuditLaunchError {
     /// Shelling out to `tmux` failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
+
+    /// `audit_cfg.prompt_file` was set but could not be read. Checked before
+    /// [`RunStore::start_run`], so a bad path leaves no orphaned run row.
+    #[error(transparent)]
+    PromptFile(#[from] crate::work::prompt::PromptFileError),
 }
 
 /// Successful outcome of [`launch_audit`].
@@ -122,9 +127,13 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 ///    [`crate::work::naming::ticket_session_name`] session — no run row is created in this case, so a launch attempt
 ///    against an already-live audit never creates an orphaned
 ///    pre-registration.
-/// 3. Otherwise pre-registers a run (`kind = "audit"`, `lane = "audit"`,
-///    `pid = None`; see the module docs) and starts `claude <prompt>` (with
-///    `--model` when `audit_cfg.model` is set — see
+/// 3. Otherwise reads `audit_cfg.prompt_file` (if set — see
+///    [`crate::work::prompt::read_prompt_file`]) *before* pre-registering a
+///    run, so a bad path leaves no orphaned run row (same posture as
+///    [`crate::work::run::prepare_run_lane`]'s prompt preflight), pre-
+///    registers a run (`kind = "audit"`, `lane = "audit"`, `pid = None`; see
+///    the module docs) and starts `claude <prompt>` (with `--model` when
+///    `audit_cfg.model` is set — see
 ///    [`AgentRunner::interactive_shell_command`]) in
 ///    that window, with `SESSION_RUN_ID_ENV` set to the new run's id so the
 ///    in-session `tm ticket audit` can adopt it. The session (plus its
@@ -178,6 +187,12 @@ pub fn launch_audit(
     let existing_windows = session_window_names(&windows, &session_name);
     let window_name = unique_window_name(AUDIT_WINDOW_NAME, &existing_windows);
 
+    let prompt_file_contents = audit_cfg
+        .prompt_file
+        .as_deref()
+        .map(|raw| crate::work::prompt::read_prompt_file(raw, home, "[work.audit].prompt_file"))
+        .transpose()?;
+
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
         scope: identity.scope(),
@@ -189,9 +204,9 @@ pub fn launch_audit(
         log_path: None,
     })?;
 
-    let template = audit_cfg
-        .prompt
+    let template = prompt_file_contents
         .as_deref()
+        .or(audit_cfg.prompt.as_deref())
         .unwrap_or_else(|| runner.default_audit_prompt_template());
     let prompt = audit_prompt(template, key);
     let command = runner.interactive_shell_command(audit_cfg.model.as_deref(), &prompt);
@@ -232,6 +247,7 @@ mod tests {
         AuditConfig {
             dir: Some(dir.to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         }
     }
@@ -500,6 +516,7 @@ mod tests {
         let audit_cfg = AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: Some("/custom-audit {key}".to_string()),
+            prompt_file: None,
             model: None,
         };
 
@@ -529,6 +546,7 @@ mod tests {
         let audit_cfg = AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            prompt_file: None,
             model: Some("opus".to_string()),
         };
 
@@ -546,6 +564,87 @@ mod tests {
         assert_eq!(
             launched_command(&tmux),
             Some("claude --model 'opus' '/ticket-audit PROJ-9'".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_audit_uses_prompt_file_contents_with_key_substitution() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let prompt_dir = tempdir().unwrap();
+        let prompt_path = prompt_dir.path().join("audit-prompt.md");
+        std::fs::write(&prompt_path, "/custom-audit-file {key}").unwrap();
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: Some("/should-not-be-used".to_string()),
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            model: None,
+        };
+
+        launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-9",
+        )
+        .unwrap();
+
+        assert_eq!(
+            launched_command(&tmux),
+            Some("claude '/custom-audit-file PROJ-9'".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_audit_errors_and_creates_no_run_when_prompt_file_is_missing() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let prompt_dir = tempdir().unwrap();
+        let prompt_path = prompt_dir.path().join("missing-prompt.md");
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = AuditConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
+            model: None,
+        };
+
+        let err = launch_audit(
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            "PROJ-9",
+        )
+        .expect_err("missing prompt file should error");
+
+        match &err {
+            AuditLaunchError::PromptFile(inner) => {
+                let message = inner.to_string();
+                assert!(message.contains("[work.audit].prompt_file"));
+                assert!(message.contains(&prompt_path.to_string_lossy().to_string()));
+            }
+            other => panic!("expected PromptFile, got {other:?}"),
+        }
+        assert!(
+            store.list_runs().unwrap().is_empty(),
+            "must not pre-register a run when the prompt file is unreadable"
+        );
+        assert!(
+            tmux.calls().iter().all(|call| !matches!(
+                call,
+                TmuxCall::NewSessionWithCommand { .. } | TmuxCall::NewWindowWithCommand { .. }
+            )),
+            "no tmux session/window should have been created, got {:?}",
+            tmux.calls()
         );
     }
 }
