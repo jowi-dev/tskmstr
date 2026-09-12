@@ -150,18 +150,70 @@ impl std::fmt::Display for DriftFinding {
 /// between it and what the running `tm init` would expect, writing a
 /// human-readable report to `out`. Performs no filesystem writes.
 ///
-/// `quiet` collapses the report to exactly one line — a summary suitable for
-/// scripting — instead of one line per finding.
-///
 /// A missing or unparseable `.tskmstr.toml` is a [`CheckCliError`], not
 /// drift: this command only makes sense for a repo `tm init` already
 /// touched.
 pub fn run_check(
     ctx: &CheckContext,
-    quiet: bool,
     out: &mut dyn Write,
 ) -> Result<Vec<DriftFinding>, CheckCliError> {
-    let repo_config_path = ctx.paths.repo.clone().ok_or(CheckCliError::NoRepoDir)?;
+    let (doc, repo_config_path) = read_repo_doc(ctx.paths)?;
+    let repo_dir = repo_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    let findings = collect_findings(ctx, &doc, &repo_dir);
+    render(&findings, out)?;
+    Ok(findings)
+}
+
+/// `tm check --quiet`: the stamp-only fast path (GitHub issue #39), meant to
+/// run on every shell entry via direnv. Reads `.tskmstr.toml` and compares
+/// only its `schema_version` stamp against
+/// [`manifest::CURRENT_SCHEMA_VERSION`] — none of the full report's lane and
+/// skill scans, no global config, no runner resolution. Prints nothing when
+/// the stamp is current, and exactly one nudge line when it isn't.
+pub fn run_check_quiet(
+    paths: &ConfigPaths,
+    out: &mut dyn Write,
+) -> Result<Vec<DriftFinding>, CheckCliError> {
+    let (doc, _) = read_repo_doc(paths)?;
+    let finding = stamp_finding(&doc);
+    if let Some(finding) = &finding {
+        writeln!(out, "{}", quiet_nudge(finding))?;
+    }
+    Ok(finding.into_iter().collect())
+}
+
+/// The one-line nudge `tm check --quiet` prints for a stamp finding: what's
+/// off and the command that fixes it (`tm update` for a missing/stale stamp;
+/// a newer stamp means the running binary is the stale side, so the remedy
+/// is updating tskmstr itself). Non-stamp findings never reach the quiet
+/// path; their [`std::fmt::Display`] line is a serviceable fallback.
+fn quiet_nudge(finding: &DriftFinding) -> String {
+    match finding {
+        DriftFinding::StampMissing => {
+            "tskmstr assets may be stale (no schema_version stamp); run `tm update`".to_string()
+        }
+        DriftFinding::StampStale { found } => format!(
+            "tskmstr assets may be stale (schema_version {found}, expected {}); run `tm update`",
+            manifest::CURRENT_SCHEMA_VERSION
+        ),
+        DriftFinding::StampNewer { found } => format!(
+            "this repo was onboarded by a newer tskmstr (schema_version {found}, expected {}); update tskmstr",
+            manifest::CURRENT_SCHEMA_VERSION
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// Read and parse the repo-local `.tskmstr.toml`, shared by the full and
+/// quiet paths (and by `tm update`, which applies fixes to the same
+/// document). A missing or unparseable file is a [`CheckCliError`], not
+/// drift.
+pub(crate) fn read_repo_doc(paths: &ConfigPaths) -> Result<(DocumentMut, PathBuf), CheckCliError> {
+    let repo_config_path = paths.repo.clone().ok_or(CheckCliError::NoRepoDir)?;
     if !repo_config_path.exists() {
         return Err(CheckCliError::MissingRepoConfig {
             path: repo_config_path,
@@ -174,19 +226,22 @@ pub fn run_check(
             path: repo_config_path.clone(),
             source,
         })?;
+    Ok((doc, repo_config_path))
+}
 
-    let repo_dir = repo_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-
+/// Every [`DriftFinding`] between `doc` and what the running `tm init`
+/// would expect of it today, in report order: stamp, lanes, sessions.
+/// Shared with `tm update`, which applies the additive fixes and re-checks.
+pub(crate) fn collect_findings(
+    ctx: &CheckContext,
+    doc: &DocumentMut,
+    repo_dir: &Path,
+) -> Vec<DriftFinding> {
     let mut findings = Vec::new();
-    findings.extend(stamp_finding(&doc));
-    findings.extend(lane_findings(ctx, &doc, &repo_dir));
-    findings.extend(session_findings(ctx, &doc, &repo_dir));
-
-    render(&findings, quiet, out)?;
-    Ok(findings)
+    findings.extend(stamp_finding(doc));
+    findings.extend(lane_findings(ctx, doc, repo_dir));
+    findings.extend(session_findings(ctx, doc, repo_dir));
+    findings
 }
 
 /// The stamp half of the report: read the top-level `schema_version` key
@@ -314,27 +369,9 @@ fn session_finding(
     })
 }
 
-/// Render the report. Non-quiet: one line per finding, then a blank line and
-/// a closing hint when drift exists, or a single "up to date" line when
-/// clean. Quiet: exactly one summary line either way.
-fn render(findings: &[DriftFinding], quiet: bool, out: &mut dyn Write) -> io::Result<()> {
-    if quiet {
-        if findings.is_empty() {
-            writeln!(
-                out,
-                "up to date (schema_version {})",
-                manifest::CURRENT_SCHEMA_VERSION
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{} drift finding(s); run `tm check` for details",
-                findings.len()
-            )?;
-        }
-        return Ok(());
-    }
-
+/// Render the report: one line per finding, then a blank line and a closing
+/// hint when drift exists, or a single "up to date" line when clean.
+fn render(findings: &[DriftFinding], out: &mut dyn Write) -> io::Result<()> {
     if findings.is_empty() {
         writeln!(
             out,
@@ -419,7 +456,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert!(findings.is_empty(), "expected no findings: {findings:?}");
         let rendered = String::from_utf8(out).expect("utf8");
@@ -437,7 +474,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert_eq!(findings, vec![DriftFinding::StampMissing]);
         let rendered = String::from_utf8(out).expect("utf8");
@@ -456,7 +493,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert_eq!(findings, vec![DriftFinding::StampMissing]);
     }
@@ -469,7 +506,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert_eq!(findings, vec![DriftFinding::StampStale { found: 0 }]);
     }
@@ -482,7 +519,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert_eq!(findings, vec![DriftFinding::StampNewer { found: 999 }]);
     }
@@ -500,7 +537,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         let expected_path = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
         assert_eq!(
@@ -530,7 +567,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         let expected_path = env.home.join(".claude/prompts/widget.md");
         assert_eq!(
@@ -555,7 +592,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert_eq!(
             findings,
@@ -583,7 +620,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert!(findings.is_empty(), "expected no findings: {findings:?}");
     }
@@ -607,7 +644,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert!(
             findings.is_empty(),
@@ -623,7 +660,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        let findings = run_check(&ctx, false, &mut out).expect("check should succeed");
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert!(findings.is_empty());
     }
@@ -635,7 +672,7 @@ mod tests {
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
 
-        let err = run_check(&ctx, false, &mut out).expect_err("missing config should error");
+        let err = run_check(&ctx, &mut out).expect_err("missing config should error");
         assert!(matches!(err, CheckCliError::MissingRepoConfig { .. }));
     }
 
@@ -648,38 +685,91 @@ mod tests {
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
 
-        let err = run_check(&ctx, false, &mut out).expect_err("bad toml should error");
+        let err = run_check(&ctx, &mut out).expect_err("bad toml should error");
         assert!(matches!(err, CheckCliError::ParseRepoConfig { .. }));
     }
 
     #[test]
-    fn quiet_output_is_one_line_when_clean() {
+    fn quiet_check_is_silent_when_stamp_is_current_even_with_structural_drift() {
         let env = test_env();
-        write_repo_config(&env, "schema_version = 1\n");
+        // A lane whose prompt file is missing is real drift for the full
+        // report, but the quiet path reads only the stamp — it must neither
+        // scan for it nor mention it.
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
 
-        let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        run_check(&ctx, true, &mut out).expect("check should succeed");
+        let findings = run_check_quiet(&env.paths, &mut out).expect("quiet check should succeed");
 
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert_eq!(rendered.lines().count(), 1, "exactly one line: {rendered}");
-        assert!(rendered.contains("up to date"));
+        assert!(findings.is_empty(), "stamp is current: {findings:?}");
+        assert!(
+            out.is_empty(),
+            "quiet prints nothing when current: {}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[test]
-    fn quiet_output_is_one_line_when_drifted() {
+    fn quiet_check_nudges_once_when_stamp_is_missing() {
         let env = test_env();
         write_repo_config(&env, "");
 
-        let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        run_check(&ctx, true, &mut out).expect("check should succeed");
+        let findings = run_check_quiet(&env.paths, &mut out).expect("quiet check should succeed");
 
+        assert_eq!(findings, vec![DriftFinding::StampMissing]);
         let rendered = String::from_utf8(out).expect("utf8");
         assert_eq!(rendered.lines().count(), 1, "exactly one line: {rendered}");
-        assert!(rendered.contains("drift finding"));
+        assert!(rendered.contains("tm update"), "nudge in: {rendered}");
+    }
+
+    #[test]
+    fn quiet_check_nudges_once_when_stamp_is_stale() {
+        let env = test_env();
+        write_repo_config(&env, "schema_version = 0\n");
+
+        let mut out = Vec::new();
+        let findings = run_check_quiet(&env.paths, &mut out).expect("quiet check should succeed");
+
+        assert_eq!(findings, vec![DriftFinding::StampStale { found: 0 }]);
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert_eq!(rendered.lines().count(), 1, "exactly one line: {rendered}");
+        assert!(rendered.contains("tm update"), "nudge in: {rendered}");
+        assert!(rendered.contains('0'), "found stamp named in: {rendered}");
+    }
+
+    #[test]
+    fn quiet_check_says_update_tskmstr_when_stamp_is_newer() {
+        let env = test_env();
+        write_repo_config(&env, "schema_version = 999\n");
+
+        let mut out = Vec::new();
+        let findings = run_check_quiet(&env.paths, &mut out).expect("quiet check should succeed");
+
+        assert_eq!(findings, vec![DriftFinding::StampNewer { found: 999 }]);
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert_eq!(rendered.lines().count(), 1, "exactly one line: {rendered}");
+        assert!(
+            rendered.contains("update tskmstr"),
+            "binary-is-old remedy in: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tm update"),
+            "`tm update` cannot fix a newer stamp: {rendered}"
+        );
+    }
+
+    #[test]
+    fn quiet_check_missing_repo_config_is_an_error() {
+        let env = test_env();
+        let mut out = Vec::new();
+
+        let err = run_check_quiet(&env.paths, &mut out).expect_err("missing config should error");
+        assert!(matches!(err, CheckCliError::MissingRepoConfig { .. }));
     }
 
     #[test]
@@ -713,7 +803,7 @@ mod tests {
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
         let mut out = Vec::new();
-        run_check(&ctx, false, &mut out).expect("check should succeed");
+        run_check(&ctx, &mut out).expect("check should succeed");
 
         let after = snapshot(env.repo_dir.parent().unwrap());
         assert_eq!(before, after, "run_check must write no files");

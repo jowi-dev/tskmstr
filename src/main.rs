@@ -821,31 +821,40 @@ fn run_init(
 }
 
 /// `tm check [--quiet]`: build real dependencies and run
-/// [`tskmstr::cli::check::run_check`], mapping its result to a three-way
-/// exit code (`0` up to date, `1` drift found, `2` error).
+/// [`tskmstr::cli::check::run_check`] (or the stamp-only
+/// [`tskmstr::cli::check::run_check_quiet`]), mapping the result to a
+/// three-way exit code (`0` up to date, `1` drift found, `2` error).
 ///
-/// Loads the global config the same lenient way `tm work run`/`tm review
-/// fix` do (`config::load(&paths).ok()`): `tm check` must still run when the
-/// global config is absent or invalid, since the repo-local `.tskmstr.toml`
-/// alone drives the report — only the runner resolution (for lane/skill
-/// path defaults) benefits from a loaded config, and falls back to the
-/// default runner when there is none.
+/// The full report loads the global config the same lenient way `tm work
+/// run`/`tm review fix` do (`config::load(&paths).ok()`): `tm check` must
+/// still run when the global config is absent or invalid, since the
+/// repo-local `.tskmstr.toml` alone drives the report — only the runner
+/// resolution (for lane/skill path defaults) benefits from a loaded config,
+/// and falls back to the default runner when there is none. The quiet path
+/// reads nothing but the repo-local `.tskmstr.toml` at all — it runs on
+/// every shell entry under direnv, so it must stay cheap.
 fn run_check_cmd(quiet: bool) -> ExitCode {
     let paths = default_config_paths();
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    let config = config::load(&paths).ok();
-    let runner = agent_runner_or_default(config.as_ref());
-
-    let ctx = tskmstr::cli::check::CheckContext {
-        paths: &paths,
-        home: &home,
-        runner,
-    };
     let mut stdout = std::io::stdout();
 
-    match tskmstr::cli::check::run_check(&ctx, quiet, &mut stdout) {
+    let result = if quiet {
+        tskmstr::cli::check::run_check_quiet(&paths, &mut stdout)
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let config = config::load(&paths).ok();
+        let runner = agent_runner_or_default(config.as_ref());
+
+        let ctx = tskmstr::cli::check::CheckContext {
+            paths: &paths,
+            home: &home,
+            runner,
+        };
+        tskmstr::cli::check::run_check(&ctx, &mut stdout)
+    };
+
+    match result {
         Ok(findings) if findings.is_empty() => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(err) => {

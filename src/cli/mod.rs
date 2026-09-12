@@ -172,7 +172,10 @@ pub enum Command {
     /// Exit code: `0` up to date, `1` drift found, `2` error (e.g. the repo
     /// was never onboarded).
     Check {
-        /// Print a single summary line instead of one line per finding.
+        /// Stamp-only fast path, suitable for direnv: compare just the
+        /// `schema_version` stamp against this binary's expected revision,
+        /// skipping the lane/skill presence scans and all config loading.
+        /// Prints nothing when current, one nudge line when not.
         #[arg(long)]
         quiet: bool,
     },
