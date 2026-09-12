@@ -266,6 +266,10 @@ fn ticket_provider_for(
 fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
     match config.agent {
         AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
+        // TODO(GH-41): replaced when OpencodeRunner lands
+        AgentKind::Opencode => {
+            unimplemented!("opencode runner lands with src/agent/opencode/ (GH-41)")
+        }
     }
 }
 

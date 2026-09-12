@@ -218,9 +218,8 @@ impl BackendKind {
 /// Raw, partially-specified `[agent]` section as parsed directly from TOML.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawAgentConfig {
-    /// Which AI coding agent to use: `"claude"` (default, and currently the
-    /// only recognized value). An unrecognized value is
-    /// [`ConfigError::InvalidRunner`].
+    /// Which AI coding agent to use: `"claude"` (default) or `"opencode"`.
+    /// An unrecognized value is [`ConfigError::InvalidRunner`].
     pub runner: Option<String>,
 }
 
@@ -235,10 +234,12 @@ pub struct RawAgentConfig {
 /// init`'s runner question picks the new name up from [`AgentKind::names`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentKind {
-    /// Claude Code, via the Claude agent adapter. The only implementation so
-    /// far, and the default when `[agent]` is absent.
+    /// Claude Code, via the Claude agent adapter. The default when `[agent]`
+    /// is absent.
     #[default]
     Claude,
+    /// The opencode CLI, via the opencode agent adapter (GitHub issue #41).
+    Opencode,
 }
 
 impl AgentKind {
@@ -246,6 +247,7 @@ impl AgentKind {
     pub fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
+            AgentKind::Opencode => "opencode",
         }
     }
 
@@ -254,6 +256,7 @@ impl AgentKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "claude" => Some(AgentKind::Claude),
+            "opencode" => Some(AgentKind::Opencode),
             _ => None,
         }
     }
@@ -264,7 +267,7 @@ impl AgentKind {
     /// `no_agent_literals_outside_the_adapter_module`). Keep in sync with
     /// [`AgentKind::parse`]: every entry must parse.
     pub fn names() -> &'static [&'static str] {
-        &["claude"]
+        &["claude", "opencode"]
     }
 }
 
@@ -2812,8 +2815,10 @@ mod tests {
     #[test]
     fn agent_kind_parse_and_as_str_round_trip() {
         assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::parse("opencode"), Some(AgentKind::Opencode));
         assert_eq!(AgentKind::parse("nonsense"), None);
         assert_eq!(AgentKind::Claude.as_str(), "claude");
+        assert_eq!(AgentKind::Opencode.as_str(), "opencode");
     }
 
     #[test]
@@ -2848,6 +2853,18 @@ mod tests {
         };
         let cfg = merge(global, None).expect("should merge");
         assert_eq!(cfg.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_runner_opencode_explicit_succeeds() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("opencode".to_string()),
+            }),
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
     }
 
     #[test]

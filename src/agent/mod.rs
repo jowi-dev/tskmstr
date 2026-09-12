@@ -569,14 +569,14 @@ pub trait AgentRunner {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    /// Files allowed to carry a functional (non-test) `claude`/`anthropic`
-    /// literal outside `src/agent/`, per
+    /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
+    /// `opencode` literal outside `src/agent/`, per
     /// `no_agent_literals_outside_the_adapter_module`'s doc comment.
     const ALLOWLIST: &[&str] = &[
-        // `AgentKind::Claude` — ADR-0003's one-enum rule (mirrored by
-        // `docs/decisions/0004-agent-runners.md`) sanctions the discriminant
-        // living here, the same way `BackendKind::Jira`/`Github` live in
-        // this same file.
+        // `AgentKind::Claude`/`AgentKind::Opencode` — ADR-0003's one-enum
+        // rule (mirrored by `docs/decisions/0004-agent-runners.md`)
+        // sanctions the discriminants living here, the same way
+        // `BackendKind::Jira`/`Github` live in this same file.
         "src/config/mod.rs",
         // `agent_runner_for`'s one `match` on `AgentKind` — the one factory
         // dispatch site `docs/plans/agent-runner.md` calls for.
@@ -622,16 +622,17 @@ mod tests {
     }
 
     /// Grep-guard for `docs/plans/agent-runner.md`'s phase 7 acceptance
-    /// criterion: "no `claude`/`anthropic` literals outside the adapter
-    /// module, verifiable by grep". Walks every `.rs` file under `src/`
-    /// except `src/agent/**`, strips comments and trailing test modules (see
-    /// [`strip_comments_and_tests`]), and asserts no case-insensitive
-    /// `claude` or `anthropic` substring remains in the functional code —
-    /// test fixtures asserting claude-specific behavior stay legal (they
-    /// live in `#[cfg(test)]` blocks or inside `src/agent/`), but a
-    /// functional literal (a hardcoded `"claude"` program name, a
-    /// user-facing string naming Claude Code, an `ANTHROPIC_*` env var) does
-    /// not. See [`ALLOWLIST`] for the two sanctioned exceptions.
+    /// criterion: "no `claude`/`anthropic`/`opencode` literals outside the
+    /// adapter module, verifiable by grep". Walks every `.rs` file under
+    /// `src/` except `src/agent/**`, strips comments and trailing test
+    /// modules (see [`strip_comments_and_tests`]), and asserts no
+    /// case-insensitive `claude`, `anthropic`, or `opencode` substring
+    /// remains in the functional code — test fixtures asserting
+    /// agent-specific behavior stay legal (they live in `#[cfg(test)]`
+    /// blocks or inside `src/agent/`), but a functional literal (a hardcoded
+    /// `"claude"`/`"opencode"` program name, a user-facing string naming
+    /// Claude Code or opencode, an `ANTHROPIC_*` env var) does not. See
+    /// [`ALLOWLIST`] for the two sanctioned exceptions.
     #[test]
     fn no_agent_literals_outside_the_adapter_module() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -659,7 +660,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
             for (line_no, line) in strip_comments_and_tests(&contents) {
                 let lower = line.to_lowercase();
-                if lower.contains("claude") || lower.contains("anthropic") {
+                if lower.contains("claude")
+                    || lower.contains("anthropic")
+                    || lower.contains("opencode")
+                {
                     violations.push(format!("{rel}:{line_no}: {}", line.trim()));
                 }
             }
@@ -667,7 +671,7 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "found claude/anthropic literals outside src/agent/ (and outside the allowlist):\n{}",
+            "found claude/anthropic/opencode literals outside src/agent/ (and outside the allowlist):\n{}",
             violations.join("\n")
         );
     }
