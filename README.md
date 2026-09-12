@@ -1150,7 +1150,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # provider = "jira"
 
 # [agent]                              # optional, see below; "claude" is the default
-# runner = "claude"
+# runner = "claude"                    # or "opencode"
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
@@ -1382,24 +1382,51 @@ before.
 
 ```toml
 # [agent]                              # optional, see below; "claude" is the default
-# runner = "claude"
+# runner = "claude"                    # or "opencode"
 ```
 
-`"claude"` (Claude Code) is the only implemented runner today. Everything
-this README describes as `claude`/Claude Code behavior — the `-p`/argv
-shape, the `--settings`-deployed telemetry hooks, the price table behind
-per-model cost estimates, the `claude --resume <id>` hint, the
-`~/.claude/prompts/<lane>.md`/`~/.claude/skills/` conventions — is sourced
-from that one adapter behind an internal `AgentRunner` trait, not
-hardcoded at each call site; a second adapter would plug in the same way
-`GithubProvider` did for `[backend]` (see
+Two runners are implemented: `"claude"` (Claude Code) and `"opencode"`
+(the opencode CLI). Everything this README describes as `claude`/Claude
+Code behavior — the `-p`/argv shape, the `--settings`-deployed telemetry
+hooks, the price table behind per-model cost estimates, the `claude
+--resume <id>` hint, the `~/.claude/prompts/<lane>.md`/`~/.claude/skills/`
+conventions — is sourced from that adapter behind an internal
+`AgentRunner` trait, not hardcoded at each call site; `opencode` plugs in
+the same way `GithubProvider` did for `[backend]` (see
 `docs/decisions/0004-agent-runners.md`), without changing anything else in
 config, the TUI, or any `tm work`/`tm review`/`tm ticket` command. `[work].
 default_model`/`default_max_turns`/`default_permission_mode` (see "`tm
 work`" above) stay runner-neutral concepts — model, turn budget, and
 permission posture are meaningful for any agentic CLI — with each adapter
-mapping them onto its own flags; today that means `claude`'s
-`--model`/`--max-turns`/`--permission-mode`.
+mapping them onto its own flags.
+
+With `runner = "opencode"`, headless lane runs go through `opencode run
+--format json` and interactive sessions through the opencode TUI's
+`--prompt` flag; lane prompts default to `~/.config/opencode/prompts/
+<lane>.md` and the resume hint becomes `opencode --session <id>`. The
+runner-neutral `[work]` keys map as follows: `default_model` passes
+through as `--model` in opencode's `provider/model` spelling (e.g.
+`anthropic/claude-sonnet-4-5`), and when unset the flag is omitted so
+opencode's own configured default model applies; `default_permission_mode
+= "bypassPermissions"` (and the unset default) maps to opencode's
+`--auto`, while any other value passes no flag at all — opencode's own
+`permission` config governs, and a headless run auto-rejects (never hangs
+on) any permission it isn't configured to allow; `default_max_turns` is
+**ignored** — opencode has no CLI turn budget (its per-agent `steps`
+config is the closest analog, and it belongs to your opencode config, not
+tm). opencode deploys no tm telemetry hooks (run start/finish recording,
+authoritative per-run cost, and turn counts still land in `runs.db`,
+parsed from the JSON event stream; per-model token breakdowns and the
+SessionEnd-triggered interactive finish are claude-only until an opencode
+plugin exists — interactive opencode runs are finished by the liveness
+reap instead). Slash-command prompt defaults like `/ticket-audit {key}`
+work unchanged: opencode interprets a `--prompt` starting with `/` as a
+custom command, discovers commands in `.opencode/command/` and
+`~/.config/opencode/command/`, and auto-registers skills — including
+Claude-format `.claude/skills/**/SKILL.md` — as slash commands, so an
+existing tm skill set works as-is. See
+`docs/plans/gh-41-opencode-runner.md` for the full CLI contract this
+adapter binds to.
 
 ### Ranking
 
