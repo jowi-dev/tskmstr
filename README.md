@@ -60,6 +60,19 @@ missing prompt is what fails a lane run's preflight. `tm init --yes`
 accepts every default for scripted setup: it scaffolds the static
 skeleton and never launches the setup session.
 
+Every `tm init` run also stamps `.tskmstr.toml`'s top-level `schema_version`
+with the running tskmstr's expected asset/config revision. `tm check
+[--quiet]` is the read-only counterpart: it reports whether a repo already
+onboarded by `tm init` is still up to date, checking the stamp (missing,
+stale, or newer than this binary expects) and the same structural presence
+checks `tm init` re-runs on every visit — a configured lane's missing
+prompt file, a configured session's missing skill. It never writes
+anything and never diffs a scaffolded asset's *content*: lane prompts and
+skills are meant to be edited after `tm init` writes them, so only their
+presence is checked (see `docs/decisions/0007-asset-schema-version.md`).
+Exit code `0` means up to date, `1` means drift was found, `2` means an
+error (e.g. the repo was never onboarded).
+
 Under the Jira backend, `tm init` hands off to `tm auth login` when no
 API token resolves; you can also bootstrap auth directly:
 
@@ -86,6 +99,7 @@ tm auth status
 | Command | What it does |
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
+| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. Exits `0` up to date, `1` drift found, `2` error |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
