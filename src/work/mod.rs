@@ -13,6 +13,7 @@ pub mod interactive;
 pub mod kill_safety;
 pub mod manual;
 pub mod naming;
+pub mod prompt;
 pub mod review_watch;
 pub mod run;
 pub mod runner;
