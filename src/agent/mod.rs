@@ -54,6 +54,7 @@ use crate::runs::ModelUsageMap;
 use crate::runs::pricing::ModelPrice;
 
 pub mod claude;
+pub mod opencode;
 
 /// Quotes `s` as a single POSIX shell word: wraps it in single quotes,
 /// escaping any embedded single quote as `'\''`. Needed because
