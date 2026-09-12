@@ -232,6 +232,7 @@ mod tests {
         AuditConfig {
             dir: Some(dir.to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         }
     }
@@ -500,6 +501,7 @@ mod tests {
         let audit_cfg = AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: Some("/custom-audit {key}".to_string()),
+            prompt_file: None,
             model: None,
         };
 
@@ -529,6 +531,7 @@ mod tests {
         let audit_cfg = AuditConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
+            prompt_file: None,
             model: Some("opus".to_string()),
         };
 

@@ -369,6 +369,18 @@ pub struct RawAuditConfig {
     /// anything tskmstr configures. Set this to launch audits on a specific
     /// model regardless of that pin.
     pub model: Option<String>,
+    /// Path to a prompt file whose contents become the session's opening
+    /// prompt in place of [`RawAuditConfig::prompt`], with the same `{key}`
+    /// substitution applied to the file contents that the string form gets.
+    /// Setting both `prompt` and `prompt_file` in the merged section is a
+    /// [`ConfigError::PromptSourceConflict`] — no silent precedence between
+    /// the two.
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`] (so relative values are only
+    /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
+    /// path passes through unchanged, matching [`RawAuditConfig::dir`].
+    pub prompt_file: Option<String>,
 }
 
 /// Raw, partially-specified `[work.create]` subsection as parsed directly
@@ -398,6 +410,17 @@ pub struct RawCreateConfig {
     /// model choice is worth setting independently of the lane default, and
     /// an explicit `--model` is what escapes an enterprise-managed pin.
     pub model: Option<String>,
+    /// Path to a prompt file whose contents become the session's opening
+    /// prompt in place of [`RawCreateConfig::prompt`]. Setting both `prompt`
+    /// and `prompt_file` in the merged section is a
+    /// [`ConfigError::PromptSourceConflict`] — no silent precedence between
+    /// the two.
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`] (so relative values are only
+    /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
+    /// path passes through unchanged, matching [`RawCreateConfig::dir`].
+    pub prompt_file: Option<String>,
 }
 
 /// Raw, partially-specified `[work.manual]` subsection as parsed directly
@@ -443,6 +466,19 @@ pub struct RawReviewWatchConfig {
     /// `{key}` and `{findings_file}` replaced. Defaults to
     /// `/bugbot-triage {key} {findings_file}` when unset.
     pub prompt: Option<String>,
+    /// Path to a prompt file whose contents become the cleanup session's
+    /// opening prompt in place of [`RawReviewWatchConfig::prompt`], with the
+    /// same `{key}`/`{findings_file}` substitution applied to the file
+    /// contents that the string form gets. Setting both `prompt` and
+    /// `prompt_file` in the merged section is a
+    /// [`ConfigError::PromptSourceConflict`] — no silent precedence between
+    /// the two.
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`] (so relative values are only
+    /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
+    /// path passes through unchanged, matching [`RawReviewWatchConfig::dir`].
+    pub prompt_file: Option<String>,
     /// Model alias passed to the launched cleanup session as
     /// `claude --model <model>`. When unset, falls back to
     /// [`RawAuditConfig::model`] (applied in [`merge_work`], not here — see
@@ -605,6 +641,8 @@ pub struct AuditConfig {
     pub dir: Option<String>,
     /// See [`RawAuditConfig::prompt`].
     pub prompt: Option<String>,
+    /// See [`RawAuditConfig::prompt_file`].
+    pub prompt_file: Option<String>,
     /// See [`RawAuditConfig::model`].
     pub model: Option<String>,
 }
@@ -622,6 +660,8 @@ pub struct CreateConfig {
     pub dir: Option<String>,
     /// See [`RawCreateConfig::prompt`].
     pub prompt: Option<String>,
+    /// See [`RawCreateConfig::prompt_file`].
+    pub prompt_file: Option<String>,
     /// See [`RawCreateConfig::model`].
     pub model: Option<String>,
 }
@@ -667,6 +707,8 @@ pub struct ReviewWatchConfig {
     pub dir: Option<String>,
     /// See [`RawReviewWatchConfig::prompt`].
     pub prompt: Option<String>,
+    /// See [`RawReviewWatchConfig::prompt_file`].
+    pub prompt_file: Option<String>,
     /// See [`RawReviewWatchConfig::model`]; falls back to
     /// [`AuditConfig::model`] when unset in both global and repo
     /// `[work.review_watch]`.
@@ -685,6 +727,7 @@ impl Default for ReviewWatchConfig {
         ReviewWatchConfig {
             dir: None,
             prompt: None,
+            prompt_file: None,
             model: None,
             poll_secs: 45,
             max_wait_mins: 1440,
@@ -889,6 +932,15 @@ pub enum ConfigError {
         field: String,
         /// The relative path as written in config.
         value: String,
+    },
+
+    /// A `[work.*]` session section sets both `prompt` and `prompt_file`
+    /// after merging global and repo config. No silent precedence: the
+    /// operator must keep exactly one.
+    #[error("[{section}] sets both `prompt` and `prompt_file`; remove one of them")]
+    PromptSourceConflict {
+        /// The section, e.g. `work.create`.
+        section: &'static str,
     },
 }
 
@@ -1258,7 +1310,7 @@ fn merge_work(
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
-    let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch)?;
+    let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
     // field, within their own section; only `dir` and `model` reach across
@@ -1368,10 +1420,12 @@ fn merge_manual(
 /// keyed collection, so there's no "which entry" ambiguity for whole-section
 /// replacement to resolve.
 ///
-/// `repo_dir` is the defining directory `dir` resolves a relative path
-/// against, but only when `dir` itself actually came from `repo` (not a
-/// fallback to `global`) — see [`merge_work`]'s doc comment and
-/// [`resolve_repo_path`].
+/// `repo_dir` is the defining directory `dir` (and `prompt_file`) resolves a
+/// relative path against, but only when the value itself actually came from
+/// `repo` (not a fallback to `global`) — see [`merge_work`]'s doc comment and
+/// [`resolve_repo_path`]. When the merged section ends up with both `prompt`
+/// and `prompt_file` set, returns [`ConfigError::PromptSourceConflict`] — no
+/// silent precedence between the two.
 fn merge_audit(
     global: Option<RawAuditConfig>,
     repo: Option<RawAuditConfig>,
@@ -1389,17 +1443,40 @@ fn merge_audit(
         None => None,
     };
 
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.audit.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.audit",
+        });
+    }
+
     Ok(AuditConfig {
         dir,
-        prompt: repo.prompt.or(global.prompt),
+        prompt,
+        prompt_file,
         model: repo.model.or(global.model),
     })
 }
 
 /// Merge a repo-local `[work.create]` section on top of a global one, field
 /// by field, exactly like [`merge_audit`] — same "single section, no
-/// whole-vs-field ambiguity" rationale, and the same `repo_dir` relative-path
-/// resolution rule for `dir`.
+/// whole-vs-field ambiguity" rationale, the same `repo_dir` relative-path
+/// resolution rule for `dir` and `prompt_file`, and the same
+/// [`ConfigError::PromptSourceConflict`] check when both `prompt` and
+/// `prompt_file` end up set.
 fn merge_create(
     global: Option<RawCreateConfig>,
     repo: Option<RawCreateConfig>,
@@ -1417,25 +1494,51 @@ fn merge_create(
         None => None,
     };
 
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.create.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.create",
+        });
+    }
+
     Ok(CreateConfig {
         dir,
-        prompt: repo.prompt.or(global.prompt),
+        prompt,
+        prompt_file,
         model: repo.model.or(global.model),
     })
 }
 
 /// Merge a repo-local `[work.review_watch]` section on top of a global one,
 /// field by field, exactly like [`merge_audit`] — same "single section, no
-/// whole-vs-field ambiguity" rationale. Unlike `merge_audit`, this can fail:
-/// an unrecognized `on_bots_done` value is a [`ConfigError`], not a silent
-/// default, matching other enum-shaped config values' validation posture.
+/// whole-vs-field ambiguity" rationale, and the same `repo_dir`
+/// relative-path resolution rule and [`ConfigError::PromptSourceConflict`]
+/// check for `prompt`/`prompt_file`. Unlike `merge_audit`, this can also
+/// fail on an unrecognized `on_bots_done` value, which is a [`ConfigError`],
+/// not a silent default, matching other enum-shaped config values'
+/// validation posture.
 ///
-/// Does not apply the `dir`/`model`-fall-back-to-`[work.audit]` rules; see
-/// [`ReviewWatchConfig::dir`], [`ReviewWatchConfig::model`], and
-/// [`merge_work`], which applies them once after both subsections are merged.
+/// Does not apply the `dir`/`model`-fall-back-to-`[work.audit]` rules (nor
+/// any such fallback for `prompt_file`); see [`ReviewWatchConfig::dir`],
+/// [`ReviewWatchConfig::model`], and [`merge_work`], which applies them once
+/// after both subsections are merged.
 fn merge_review_watch(
     global: Option<RawReviewWatchConfig>,
     repo: Option<RawReviewWatchConfig>,
+    repo_dir: Option<&Path>,
 ) -> Result<ReviewWatchConfig, ConfigError> {
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
@@ -1447,9 +1550,30 @@ fn merge_review_watch(
         None => OnBotsDone::default(),
     };
 
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.review_watch.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.review_watch",
+        });
+    }
+
     Ok(ReviewWatchConfig {
         dir: repo.dir.or(global.dir),
-        prompt: repo.prompt.or(global.prompt),
+        prompt,
+        prompt_file,
         model: repo.model.or(global.model),
         poll_secs: repo
             .poll_secs
@@ -3254,6 +3378,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: Some("/global-audit {key}".to_string()),
+                prompt_file: None,
                 model: Some("opus".to_string()),
             }),
             ..Default::default()
@@ -3262,6 +3387,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("/repo-local/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
             }),
             ..Default::default()
@@ -3402,6 +3528,7 @@ mod tests {
             review_watch: Some(RawReviewWatchConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: Some("/global-bugbot-triage {key} {findings_file}".to_string()),
+                prompt_file: None,
                 model: Some("fable".to_string()),
                 poll_secs: Some(30),
                 max_wait_mins: Some(600),
@@ -3413,6 +3540,7 @@ mod tests {
             review_watch: Some(RawReviewWatchConfig {
                 dir: Some("/repo-local/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
                 poll_secs: None,
                 max_wait_mins: Some(120),
@@ -3446,6 +3574,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
             }),
             ..Default::default()
@@ -3464,6 +3593,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
             }),
             review_watch: Some(RawReviewWatchConfig {
@@ -3482,6 +3612,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: Some("fable".to_string()),
             }),
             ..Default::default()
@@ -3500,6 +3631,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: Some("fable".to_string()),
             }),
             review_watch: Some(RawReviewWatchConfig {
@@ -3518,6 +3650,7 @@ mod tests {
             create: Some(RawCreateConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: Some("/global-ticket-create".to_string()),
+                prompt_file: None,
                 model: Some("opus".to_string()),
             }),
             ..Default::default()
@@ -3526,6 +3659,7 @@ mod tests {
             create: Some(RawCreateConfig {
                 dir: Some("/repo-local/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
             }),
             ..Default::default()
@@ -3552,6 +3686,7 @@ mod tests {
             audit: Some(RawAuditConfig {
                 dir: Some("~/Projects/axiom".to_string()),
                 prompt: None,
+                prompt_file: None,
                 model: None,
             }),
             ..Default::default()
@@ -3642,6 +3777,266 @@ mod tests {
         assert_eq!(cfg.work.create.dir, Some("~/Projects/axiom".to_string()));
         assert_eq!(cfg.work.create.prompt, Some("/ticket-create".to_string()));
         assert_eq!(cfg.work.create.model, Some("opus".to_string()));
+    }
+
+    // --- `prompt_file` (GitHub issue #42) ---
+
+    #[test]
+    fn load_repo_local_relative_create_prompt_file_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.create]
+            prompt_file = "prompts/create.md"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.create.prompt_file,
+            Some(
+                dir.path()
+                    .join("prompts/create.md")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn load_repo_local_relative_review_watch_prompt_file_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.review_watch]
+            prompt_file = "prompts/review_watch.md"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.review_watch.prompt_file,
+            Some(
+                dir.path()
+                    .join("prompts/review_watch.md")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn load_repo_local_relative_audit_prompt_file_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.audit]
+            prompt_file = "prompts/audit.md"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.audit.prompt_file,
+            Some(
+                dir.path()
+                    .join("prompts/audit.md")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn merge_work_relative_create_prompt_file_from_global_only_is_a_config_error() {
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                prompt_file: Some("prompts/create.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject relative path");
+        match err {
+            ConfigError::RelativePathRequiresRepoConfig { field, value } => {
+                assert_eq!(field, "work.create.prompt_file");
+                assert_eq!(value, "prompts/create.md");
+            }
+            other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_file_tilde_and_absolute_paths_pass_through_unchanged() {
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                prompt_file: Some("~/.claude/prompts/create.md".to_string()),
+                ..Default::default()
+            }),
+            audit: Some(RawAuditConfig {
+                prompt_file: Some("/abs/prompts/audit.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
+        assert_eq!(
+            cfg.create.prompt_file,
+            Some("~/.claude/prompts/create.md".to_string())
+        );
+        assert_eq!(
+            cfg.audit.prompt_file,
+            Some("/abs/prompts/audit.md".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_work_create_prompt_and_prompt_file_both_set_is_a_config_error() {
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                prompt: Some("/ticket-create".to_string()),
+                prompt_file: Some("/abs/prompts/create.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.create");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("prompt"));
+        assert!(msg.contains("prompt_file"));
+        assert!(msg.contains("work.create"));
+    }
+
+    #[test]
+    fn merge_work_audit_prompt_and_prompt_file_both_set_is_a_config_error() {
+        let global = RawWorkConfig {
+            audit: Some(RawAuditConfig {
+                prompt: Some("/ticket-audit {key}".to_string()),
+                prompt_file: Some("/abs/prompts/audit.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.audit");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_work_review_watch_prompt_and_prompt_file_both_set_is_a_config_error() {
+        let global = RawWorkConfig {
+            review_watch: Some(RawReviewWatchConfig {
+                prompt: Some("/bugbot-triage {key} {findings_file}".to_string()),
+                prompt_file: Some("/abs/prompts/review_watch.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.review_watch");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_work_create_cross_file_prompt_conflict_is_a_config_error() {
+        // Global sets `prompt`, repo sets `prompt_file`: no silent
+        // precedence between the two, even across files.
+        let global = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                prompt: Some("/ticket-create".to_string()),
+                prompt_file: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            create: Some(RawCreateConfig {
+                prompt_file: Some("/abs/prompts/create.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), Some(repo), None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.create");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
     }
 
     #[test]

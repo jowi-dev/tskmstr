@@ -154,6 +154,7 @@ mod tests {
         CreateConfig {
             dir: Some(dir.to_string()),
             prompt: None,
+            prompt_file: None,
             model: None,
         }
     }
@@ -297,6 +298,7 @@ mod tests {
         let cfg = CreateConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: Some("/my-create".to_string()),
+            prompt_file: None,
             model: Some("opus".to_string()),
         };
 
