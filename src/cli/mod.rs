@@ -150,7 +150,9 @@ pub enum Command {
     /// Interactively onboard the current repo: choose a ticket backend,
     /// write `.tskmstr.toml`, scaffold a work lane, create the GitHub
     /// backend's status labels, and set up session assets so `tm board`
-    /// works immediately after.
+    /// works immediately after. Also stamps `.tskmstr.toml`'s top-level
+    /// `schema_version` with [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]
+    /// so a later `tm check` can tell whether the repo is up to date.
     Init {
         /// Accept the default answer for every question (scripted setup).
         #[arg(long)]

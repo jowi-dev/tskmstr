@@ -9,6 +9,11 @@
 //! The repo-local file is edited with `toml_edit` rather than re-serialized
 //! from a struct so a re-run preserves the user's comments and formatting;
 //! values the wizard leaves unchanged are never rewritten.
+//!
+//! Every run also stamps the top-level `schema_version` key with
+//! [`config::manifest::CURRENT_SCHEMA_VERSION`] (GitHub issue #38), so a
+//! later `tm check` can tell whether a repo was onboarded by a tskmstr new
+//! enough to have written today's expected assets.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -265,6 +270,13 @@ pub fn run_init(
         },
     )?;
     ask_runner(yes, &mut doc, &repo_config_path, prompter, out)?;
+    set_i64(
+        &mut doc,
+        &[],
+        "schema_version",
+        config::manifest::CURRENT_SCHEMA_VERSION,
+        &repo_config_path,
+    )?;
     let install_hooks = !ctx.hooks_installed
         && ask_confirm(
             yes,
@@ -1005,6 +1017,24 @@ fn set_str(
     Ok(())
 }
 
+/// Set `key = val` in the table at `path`, creating intermediate tables as
+/// needed. Leaves the document untouched when the value is already `val`,
+/// mirroring [`set_str`] — a re-run of an already-stamped file writes
+/// nothing, preserving comments and formatting.
+fn set_i64(
+    doc: &mut DocumentMut,
+    path: &[&str],
+    key: &str,
+    val: i64,
+    file: &Path,
+) -> Result<(), InitCliError> {
+    let table = table_at(doc, path, file)?;
+    if table.get(key).and_then(Item::as_integer) != Some(val) {
+        table.insert(key, value(val));
+    }
+    Ok(())
+}
+
 /// Descend to (creating as needed) the table at `path`. Created intermediate
 /// tables stay implicit so `[work.lanes.name]`-style headers render without a
 /// bare `[work]` above them; the final table gets an explicit header.
@@ -1530,7 +1560,7 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
@@ -1538,7 +1568,8 @@ mod tests {
         std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
 
         // Accept every default: existing lanes mean the lane question
-        // defaults to "no", so a plain re-run must change nothing.
+        // defaults to "no", so a plain re-run must change nothing — the
+        // schema_version stamp is already current, too.
         let mut prompter = FakePrompter::new();
         let mut out = Vec::new();
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
@@ -1561,7 +1592,7 @@ mod tests {
 
         // Same as the no-op re-run above, except the configured prompt file
         // was never written — the case a plain re-run used to walk past.
-        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
 
@@ -1616,7 +1647,7 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
@@ -2000,6 +2031,99 @@ mod tests {
             after.contains("# my notes"),
             "existing comments preserved: {after}"
         );
+    }
+
+    #[test]
+    fn fresh_run_stamps_the_current_schema_version() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        let contents = std::fs::read_to_string(repo_config).expect("read");
+        assert!(
+            contents.contains("schema_version = 1"),
+            "stamp written in: {contents}"
+        );
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.github_repo.as_deref(), Some("jowi-dev/widget"));
+    }
+
+    #[test]
+    fn schema_version_stamp_renders_before_subtables_and_reparses() {
+        // `set_i64`'s empty-path write inserts a top-level scalar into a doc
+        // that already has [backend]/[work.*] tables from earlier steps in
+        // the same run; toml_edit must still render it as a root key-value,
+        // ahead of any table header, or the file wouldn't parse back at all.
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        let contents = std::fs::read_to_string(repo_config).expect("read");
+        assert!(
+            contents.contains("[work.lanes."),
+            "sanity: doc has a subtable by the time the stamp is set: {contents}"
+        );
+        let schema_line = contents
+            .lines()
+            .position(|l| l == "schema_version = 1")
+            .expect("schema_version present");
+        let backend_line = contents
+            .lines()
+            .position(|l| l == "[backend]")
+            .expect("[backend] present");
+        assert!(
+            schema_line < backend_line,
+            "schema_version must render before [backend]: {contents}"
+        );
+
+        let parsed: toml_edit::DocumentMut = contents.parse().expect("written file must reparse");
+        assert_eq!(
+            parsed["schema_version"].as_integer(),
+            Some(1),
+            "schema_version reads back as 1: {contents}"
+        );
+    }
+
+    #[test]
+    fn rerun_adds_only_the_missing_stamp_to_an_unstamped_config() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Fully onboarded already, just predates schema_version stamping.
+        let original = "# keep me\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n";
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(repo_config, original).expect("write repo config");
+
+        // Confirms pop in order: labels yes (its default), lane no (decline
+        // the default-true lane scaffold so the only diff is the stamp).
+        // Every other question, including write_repo_file's preview/confirm,
+        // takes its default.
+        let mut prompter = FakePrompter::new().with_confirm(true).with_confirm(false);
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let after = std::fs::read_to_string(repo_config).expect("read");
+        assert_eq!(
+            after,
+            format!("schema_version = 1\n{original}"),
+            "only the stamp is added: {after}"
+        );
+        assert!(after.contains("# keep me"), "comment survives: {after}");
     }
 
     #[test]
