@@ -10,6 +10,7 @@ use clap::Parser;
 
 use tskmstr::agent::AgentRunner;
 use tskmstr::agent::claude::ClaudeRunner;
+use tskmstr::agent::opencode::OpencodeRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
@@ -291,6 +292,7 @@ fn ticket_provider_for(
 fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
     match config.agent {
         AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
+        AgentKind::Opencode => Box::leak(Box::new(OpencodeRunner)),
     }
 }
 
