@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod backend_identity;
+pub mod manifest;
 pub use backend_identity::{
     BackendIdentity, BackendIdentityResolver, FakeBackendIdentityResolver,
     FsBackendIdentityResolver, compatible_lane_names, resolve_audit_host_dir,
@@ -123,6 +124,18 @@ pub struct RawConfig {
     /// at all keeps working unchanged. See GitHub issue #17 and
     /// `docs/plans/agent-runner.md`.
     pub agent: Option<RawAgentConfig>,
+    /// The asset/config schema revision this file was last stamped with by
+    /// `tm init`, i.e. what [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]
+    /// was when `tm init` last wrote this file.
+    ///
+    /// Repo-local metadata only: it describes *this file's* provenance, not
+    /// a setting either the global or repo config contributes to running
+    /// behavior, so [`merge`] never reads it and [`Config`] doesn't carry it
+    /// forward. `tm init` writes it (see `src/cli/init.rs`); `tm check`
+    /// (added separately) reads it via
+    /// [`crate::config::manifest::stamp_status`] to decide whether a repo is
+    /// up to date with the tskmstr binary running against it.
+    pub schema_version: Option<i64>,
 }
 
 /// Raw, partially-specified `[backend]` section as parsed directly from
@@ -953,6 +966,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         work: None,
         backend: None,
         agent: None,
+        schema_version: None,
     }
 }
 
@@ -1612,6 +1626,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         }
     }
 
@@ -1640,6 +1655,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         // Overridden field wins.
@@ -1689,6 +1705,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_pr, Some("Ready for Review".into()));
@@ -1720,6 +1737,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
@@ -1751,6 +1769,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.run_db_path, Some("/repo/runs.db".into()));
@@ -1782,6 +1801,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.review_bots, vec!["repo-bot[bot]".to_string()]);
@@ -1813,6 +1833,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
         assert_eq!(cfg.board_column_order, vec!["Code Review".to_string()]);
@@ -1868,6 +1889,50 @@ mod tests {
         assert_eq!(cfg.jira_base_url, "https://only-global.atlassian.net");
         assert_eq!(cfg.default_project_key, "ONLY");
         assert_eq!(cfg.default_assignee_account_id, None);
+    }
+
+    #[test]
+    fn schema_version_present_parses_and_is_repo_local_metadata_only() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, "schema_version = 1\n").unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path.clone(),
+            repo: Some(repo_path.clone()),
+        };
+        // The raw file parses with the stamp present...
+        let raw = parse_raw_config(&repo_path, &fs::read_to_string(&repo_path).unwrap())
+            .expect("schema_version should parse");
+        assert_eq!(raw.schema_version, Some(1));
+
+        // ...and `load`/`merge` succeed exactly as without it: merge doesn't
+        // need it, and `Config` carries no such field for it to land in.
+        load(&paths).expect("should load with schema_version present");
+    }
+
+    #[test]
+    fn schema_version_absent_still_parses() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            jira_base_url = "https://example.atlassian.net"
+            jira_email = "person@example.com"
+            default_project_key = "KEY"
+            "#,
+        )
+        .expect("config without schema_version should parse");
+        assert_eq!(raw.schema_version, None);
     }
 
     #[test]
