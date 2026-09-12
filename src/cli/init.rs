@@ -355,7 +355,15 @@ pub fn run_init(
         )?;
     }
 
-    offer_agent_setup(ctx, yes, &tasks, prompter, out)?;
+    offer_agent_setup(
+        ctx.runner,
+        ctx.setup_launcher,
+        "tm init",
+        yes,
+        &tasks,
+        prompter,
+        out,
+    )?;
 
     writeln!(out)?;
     writeln!(out, "Done. Run `tm board` to open the board.")?;
@@ -363,33 +371,41 @@ pub fn run_init(
 }
 
 /// Offer to launch an agent session that fills out this run's scaffolded
-/// assets (GitHub issue #30). Skipped under `--yes` (scripted setup keeps
+/// assets (GitHub issue #30). Skipped under `yes` (scripted setup keeps
 /// the static skeleton) and when there is nothing to set up. Declining
-/// keeps the static skeleton. A launch failure warns but never fails init.
-fn offer_agent_setup(
-    ctx: &InitContext,
+/// keeps the static skeleton, naming `rerun_hint` (the calling command) as
+/// the way to get the offer again. A launch failure warns but never fails
+/// the caller.
+///
+/// Takes `runner`/`setup_launcher` rather than a whole [`InitContext`]:
+/// `tm update` (`src/cli/update.rs`) makes the same offer for the assets
+/// *it* scaffolds, so the two commands share one setup-session flow.
+pub(crate) fn offer_agent_setup(
+    runner: &dyn AgentRunner,
+    setup_launcher: &dyn Fn(&AgentInvocation) -> Result<(), String>,
+    rerun_hint: &str,
     yes: bool,
     tasks: &SetupTasks,
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
-) -> Result<(), InitCliError> {
+) -> io::Result<()> {
     if yes || (tasks.lane_prompts.is_empty() && tasks.missing_skills.is_empty()) {
         return Ok(());
     }
 
     let question = format!(
         "Launch a {} session now to fill out the scaffolded assets with this repo's real gates?",
-        ctx.runner.display_name()
+        runner.display_name()
     );
     if !ask_confirm(false, prompter, &question, true)? {
         writeln!(
             out,
-            "Keeping the static starter assets; re-run `tm init` to fill them out with an agent later."
+            "Keeping the static starter assets; re-run `{rerun_hint}` to fill them out with an agent later."
         )?;
         return Ok(());
     }
 
-    let invocation = ctx.runner.build_invocation(InvocationInputs {
+    let invocation = runner.build_invocation(InvocationInputs {
         prompt: setup_session_prompt(tasks),
         model: None,
         max_turns: None,
@@ -398,7 +414,7 @@ fn offer_agent_setup(
         run_id: None,
         mode: RunMode::Interactive,
     });
-    if let Err(message) = (ctx.setup_launcher)(&invocation) {
+    if let Err(message) = setup_launcher(&invocation) {
         writeln!(
             out,
             "warning: launching the setup session failed: {message}"
@@ -502,24 +518,27 @@ fn parse_origin_head(symref: &str) -> Option<&str> {
 /// Repo-local assets the agent-assisted setup session should author (GitHub
 /// issue #30): lane prompts scaffolded as static skeletons this run, and
 /// session skills the config references but that exist nowhere on disk.
+///
+/// `pub(crate)`: `tm update` (`src/cli/update.rs`) builds the same task list
+/// from the drift findings it fixes and feeds it to [`offer_agent_setup`].
 #[derive(Default)]
-struct SetupTasks {
+pub(crate) struct SetupTasks {
     /// Resolved paths of lane-prompt files written as skeletons this run.
-    lane_prompts: Vec<PathBuf>,
+    pub(crate) lane_prompts: Vec<PathBuf>,
     /// Session skills to author.
-    missing_skills: Vec<MissingSkill>,
+    pub(crate) missing_skills: Vec<MissingSkill>,
 }
 
 /// One missing session skill: the `/name` token a session prompt leads with,
 /// nowhere on disk (neither repo-local nor user-level).
-struct MissingSkill {
+pub(crate) struct MissingSkill {
     /// The skill name (no leading slash).
-    name: String,
+    pub(crate) name: String,
     /// Repo-local directory the skill should be authored at (the session
     /// dir's skills dir — where the session that invokes it will look).
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// The configured session prompt that invokes it, for context.
-    session_prompt: String,
+    pub(crate) session_prompt: String,
 }
 
 /// One of the optional `[work.audit]` / `[work.review_watch]` sections the

@@ -22,14 +22,17 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentInvocation, AgentRunner};
 use crate::config::ConfigPaths;
 use crate::config::manifest;
 
+use super::Prompter;
 use super::check::{self, CheckCliError, CheckContext, DriftFinding};
 
-/// Dependencies for [`run_update`]: `tm check`'s read-only trio, since the
-/// fix pass starts from the same findings.
+/// Dependencies for [`run_update`]: `tm check`'s read-only trio, plus the
+/// launcher for the optional agent-assisted setup session (the GitHub
+/// issue #30 machinery `tm init` uses, offered here for only the assets
+/// this run introduced).
 pub struct UpdateContext<'a> {
     /// Where the repo-local `.tskmstr.toml` lives.
     pub paths: &'a ConfigPaths,
@@ -40,15 +43,23 @@ pub struct UpdateContext<'a> {
     /// when unconfigured) — resolves default session prompts and skill
     /// directories the same way `tm init` does.
     pub runner: &'a dyn AgentRunner,
+    /// Launches the agent-assisted setup session in the foreground (from
+    /// the repo root) and waits for it to exit; `Err` is a display message.
+    /// Injected so the command is testable without spawning a real agent.
+    pub setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
 }
 
 /// `tm update`: compute `tm check`'s findings, apply every additive fix,
-/// and return the drift that remains (empty when the repo is now up to
-/// date). Errors mirror `tm check`'s: a repo that was never onboarded is a
+/// offer the agent-assisted setup session for only the assets this run
+/// introduced (skipped under `yes`, like `tm init --yes`), and return the
+/// drift that remains (empty when the repo is now up to date). Errors
+/// mirror `tm check`'s: a repo that was never onboarded is a
 /// [`CheckCliError::MissingRepoConfig`], not something to "update" into
 /// existence — that's `tm init`'s job.
 pub fn run_update(
     ctx: &UpdateContext,
+    yes: bool,
+    prompter: &mut dyn Prompter,
     out: &mut dyn Write,
 ) -> Result<Vec<DriftFinding>, CheckCliError> {
     let (mut doc, repo_config_path) = check::read_repo_doc(ctx.paths)?;
@@ -74,6 +85,7 @@ pub fn run_update(
     }
 
     let mut newer_stamp = false;
+    let mut tasks = super::init::SetupTasks::default();
     for finding in &findings {
         match finding {
             DriftFinding::MissingLanePrompt { lane, path } => {
@@ -82,6 +94,7 @@ pub fn run_update(
                 }
                 std::fs::write(path, super::init::lane_prompt_template(lane))?;
                 writeln!(out, "Wrote {}", path.display())?;
+                tasks.lane_prompts.push(path.clone());
             }
             // Bumping a newer stamp would be a downgrade: the repo already
             // has (or expects) assets this binary doesn't know about, so the
@@ -90,8 +103,18 @@ pub fn run_update(
             // Stamped below, outside the loop, so it happens exactly once.
             DriftFinding::StampMissing | DriftFinding::StampStale { .. } => {}
             // Skill content is user-supplied (tm never ships or authors it);
-            // reported as remaining drift instead.
-            DriftFinding::MissingSkill { .. } => {}
+            // handed to the setup session, and otherwise reported as
+            // remaining drift.
+            DriftFinding::MissingSkill {
+                name,
+                repo_path,
+                prompt,
+                ..
+            } => tasks.missing_skills.push(super::init::MissingSkill {
+                name: name.clone(),
+                path: repo_path.clone(),
+                session_prompt: prompt.clone(),
+            }),
         }
     }
 
@@ -108,9 +131,20 @@ pub fn run_update(
         )?;
     }
 
+    super::init::offer_agent_setup(
+        ctx.runner,
+        ctx.setup_launcher,
+        "tm update",
+        yes,
+        &tasks,
+        prompter,
+        out,
+    )?;
+
     // Re-check against what's on disk now: scaffolds cleared their lane
-    // findings, the stamp is current unless it was newer, and whatever is
-    // left is drift this command cannot fix additively.
+    // findings, a session may have authored the missing skills, the stamp
+    // is current unless it was newer, and whatever is left is drift this
+    // command cannot fix additively.
     let remaining = check::collect_findings(&check_ctx, &doc, &repo_dir);
     if remaining.is_empty() {
         writeln!(
@@ -132,7 +166,9 @@ pub fn run_update(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
+    use crate::cli::FakePrompter;
     use crate::config::ConfigPaths;
+    use std::cell::RefCell;
     use std::path::PathBuf;
     use tempfile::{TempDir, tempdir};
 
@@ -163,12 +199,22 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(env: &'a TestEnv, runner: &'a dyn AgentRunner) -> UpdateContext<'a> {
+    fn ctx<'a>(
+        env: &'a TestEnv,
+        runner: &'a dyn AgentRunner,
+        setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
+    ) -> UpdateContext<'a> {
         UpdateContext {
             paths: &env.paths,
             home: &env.home,
             runner,
+            setup_launcher,
         }
+    }
+
+    /// A launcher for tests whose path must never reach the setup session.
+    fn no_launcher(invocation: &AgentInvocation) -> Result<(), String> {
+        panic!("setup session must not launch: {invocation:?}");
     }
 
     fn write_repo_config(env: &TestEnv, contents: &str) {
@@ -189,9 +235,10 @@ mod tests {
         );
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        let remaining = run_update(&ctx, &mut out).expect("update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
 
         assert!(remaining.is_empty(), "all drift fixable: {remaining:?}");
         let prompt_path = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
@@ -227,9 +274,10 @@ mod tests {
         write_repo_config(&env, config);
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        let remaining = run_update(&ctx, &mut out).expect("update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
 
         assert!(remaining.is_empty());
         assert_eq!(read_repo_config(&env), config, "config byte-identical");
@@ -259,9 +307,10 @@ mod tests {
         );
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        let remaining = run_update(&ctx, &mut out).expect("update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
 
         assert!(remaining.is_empty());
         assert_eq!(
@@ -283,9 +332,9 @@ mod tests {
         );
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        run_update(&ctx, &mut out).expect("update should succeed");
+        run_update(&ctx, true, &mut FakePrompter::new(), &mut out).expect("update should succeed");
 
         let written = read_repo_config(&env);
         assert!(
@@ -309,9 +358,10 @@ mod tests {
         write_repo_config(&env, config);
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        let remaining = run_update(&ctx, &mut out).expect("update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
 
         assert_eq!(remaining, vec![DriftFinding::StampNewer { found: 999 }]);
         assert_eq!(
@@ -336,9 +386,10 @@ mod tests {
         );
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
-        let remaining = run_update(&ctx, &mut out).expect("update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
 
         assert_eq!(remaining.len(), 1, "skill gap remains: {remaining:?}");
         assert!(matches!(remaining[0], DriftFinding::MissingSkill { .. }));
@@ -362,15 +413,17 @@ mod tests {
         );
 
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut first_out = Vec::new();
-        run_update(&ctx, &mut first_out).expect("first update should succeed");
+        run_update(&ctx, true, &mut FakePrompter::new(), &mut first_out)
+            .expect("first update should succeed");
         let config_after_first = read_repo_config(&env);
         let prompt_path = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
         let prompt_after_first = std::fs::read_to_string(&prompt_path).expect("read prompt");
 
         let mut second_out = Vec::new();
-        let remaining = run_update(&ctx, &mut second_out).expect("second update should succeed");
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut second_out)
+            .expect("second update should succeed");
 
         assert!(remaining.is_empty());
         assert_eq!(read_repo_config(&env), config_after_first);
@@ -386,13 +439,133 @@ mod tests {
     }
 
     #[test]
+    fn offers_agent_setup_for_only_the_new_assets() {
+        let env = test_env();
+        // One scaffoldable lane prompt plus one user-supplied skill gap:
+        // both should reach the setup session; nothing else should.
+        write_repo_config(
+            &env,
+            "[work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             [work.audit]\n\
+             dir = \".\"\n",
+        );
+
+        let launched: RefCell<Vec<AgentInvocation>> = RefCell::new(Vec::new());
+        let launcher = |invocation: &AgentInvocation| {
+            launched.borrow_mut().push(invocation.clone());
+            Ok(())
+        };
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &launcher);
+        let mut prompter = FakePrompter::new().with_confirm(true);
+        let mut out = Vec::new();
+        run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        let launched = launched.borrow();
+        assert_eq!(launched.len(), 1, "exactly one setup session");
+        let args = launched[0].args.join(" ");
+        assert!(
+            args.contains("widget-lane.md"),
+            "scaffolded lane prompt named in setup prompt: {args}"
+        );
+        assert!(
+            args.contains("ticket-audit"),
+            "missing skill named in setup prompt: {args}"
+        );
+    }
+
+    #[test]
+    fn declining_the_offer_keeps_the_static_skeleton() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "[work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut prompter = FakePrompter::new().with_confirm(false);
+        let mut out = Vec::new();
+        let remaining =
+            run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        assert!(remaining.is_empty());
+        assert!(
+            env.repo_dir
+                .join(".tskmstr/prompts/widget-lane.md")
+                .exists(),
+            "declining the session keeps the scaffold"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("tm update"),
+            "decline message names how to fill assets out later: {rendered}"
+        );
+    }
+
+    #[test]
+    fn yes_skips_the_agent_setup_offer() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "[work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_update(&ctx, true, &mut prompter, &mut out).expect("update should succeed");
+
+        assert!(
+            prompter.messages.is_empty(),
+            "--yes asks nothing: {:?}",
+            prompter.messages
+        );
+    }
+
+    #[test]
+    fn skill_authored_by_the_setup_session_clears_remaining_drift() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.audit]\n\
+             dir = \".\"\n",
+        );
+
+        // A setup session that actually authors the missing skill: the
+        // post-session re-check must see it and report the repo clean.
+        let skill_dir = env.repo_dir.join(".claude/skills/ticket-audit");
+        let launcher = |_: &AgentInvocation| {
+            std::fs::create_dir_all(&skill_dir).expect("author skill");
+            Ok(())
+        };
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &launcher);
+        let mut prompter = FakePrompter::new().with_confirm(true);
+        let mut out = Vec::new();
+        let remaining =
+            run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        assert!(
+            remaining.is_empty(),
+            "session-authored skill counts: {remaining:?}"
+        );
+    }
+
+    #[test]
     fn missing_repo_config_is_an_error() {
         let env = test_env();
         let runner = ClaudeRunner;
-        let ctx = ctx(&env, &runner);
+        let ctx = ctx(&env, &runner, &no_launcher);
         let mut out = Vec::new();
 
-        let err = run_update(&ctx, &mut out).expect_err("missing config should error");
+        let err = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect_err("missing config should error");
         assert!(matches!(err, CheckCliError::MissingRepoConfig { .. }));
     }
 }

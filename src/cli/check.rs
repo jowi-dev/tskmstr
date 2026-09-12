@@ -104,6 +104,11 @@ pub enum DriftFinding {
         session: String,
         repo_path: PathBuf,
         home_path: PathBuf,
+        /// The configured (or default) session prompt whose leading `/skill`
+        /// is missing — not rendered, but carried so `tm update` can hand
+        /// the skill to the agent-assisted setup session with the context
+        /// `tm init`'s `SetupTasks` records for it.
+        prompt: String,
     },
 }
 
@@ -136,6 +141,7 @@ impl std::fmt::Display for DriftFinding {
                 session,
                 repo_path,
                 home_path,
+                ..
             } => write!(
                 f,
                 "[{session}]'s /{name} skill exists neither at {} nor {}",
@@ -366,6 +372,7 @@ fn session_finding(
         session: format!("work.{}", section.table),
         repo_path,
         home_path,
+        prompt: prompt.to_string(),
     })
 }
 
@@ -601,6 +608,7 @@ mod tests {
                 session: "work.audit".to_string(),
                 repo_path: env.repo_dir.join(".claude/skills/ticket-audit"),
                 home_path: env.home.join(".claude/skills/ticket-audit"),
+                prompt: "/ticket-audit {key}".to_string(),
             }]
         );
     }
