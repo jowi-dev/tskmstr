@@ -270,13 +270,7 @@ pub fn run_init(
         },
     )?;
     ask_runner(yes, &mut doc, &repo_config_path, prompter, out)?;
-    set_i64(
-        &mut doc,
-        &[],
-        "schema_version",
-        config::manifest::CURRENT_SCHEMA_VERSION,
-        &repo_config_path,
-    )?;
+    stamp_schema_version(&mut doc);
     let install_hooks = !ctx.hooks_installed
         && ask_confirm(
             yes,
@@ -962,7 +956,11 @@ pub(crate) fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -
 }
 
 /// Starter contents for a scaffolded lane prompt file.
-fn lane_prompt_template(lane: &str) -> String {
+///
+/// `pub(crate)`: shared with `tm update` (`src/cli/update.rs`), which
+/// scaffolds the same skeleton for a configured lane whose prompt file is
+/// missing.
+pub(crate) fn lane_prompt_template(lane: &str) -> String {
     format!(
         "# {lane} work lane\n\
          \n\
@@ -1031,22 +1029,33 @@ fn set_str(
     Ok(())
 }
 
-/// Set `key = val` in the table at `path`, creating intermediate tables as
-/// needed. Leaves the document untouched when the value is already `val`,
-/// mirroring [`set_str`] — a re-run of an already-stamped file writes
-/// nothing, preserving comments and formatting.
-fn set_i64(
-    doc: &mut DocumentMut,
-    path: &[&str],
-    key: &str,
-    val: i64,
-    file: &Path,
-) -> Result<(), InitCliError> {
-    let table = table_at(doc, path, file)?;
-    if table.get(key).and_then(Item::as_integer) != Some(val) {
-        table.insert(key, value(val));
+/// Stamp the top-level `schema_version` key with
+/// [`config::manifest::CURRENT_SCHEMA_VERSION`]. Leaves the document
+/// untouched when the stamp is already current, mirroring [`set_str`] — a
+/// re-run of an already-stamped file writes nothing, preserving comments
+/// and formatting.
+///
+/// `pub(crate)`: shared with `tm update` (`src/cli/update.rs`), which bumps
+/// the same stamp when catching a repo up, so the two commands cannot drift
+/// on what "stamped" means.
+pub(crate) fn stamp_schema_version(doc: &mut DocumentMut) {
+    let current = config::manifest::CURRENT_SCHEMA_VERSION;
+    let root = doc.as_table_mut();
+    if root.get("schema_version").and_then(Item::as_integer) == Some(current) {
+        return;
     }
-    Ok(())
+    match root.get_mut("schema_version").and_then(Item::as_value_mut) {
+        // Replace the value in place: a plain `insert` would also replace
+        // the key, dropping any comment the user attached to the old stamp.
+        Some(existing) => {
+            let decor = existing.decor().clone();
+            *existing = toml_edit::Value::from(current);
+            *existing.decor_mut() = decor;
+        }
+        None => {
+            root.insert("schema_version", value(current));
+        }
+    }
 }
 
 /// Descend to (creating as needed) the table at `path`. Created intermediate

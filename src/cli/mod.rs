@@ -21,6 +21,7 @@ pub mod ready;
 pub mod review;
 pub mod runs;
 pub mod ticket;
+pub mod update;
 pub mod work;
 
 use crate::ticketing::StatusTransition;
