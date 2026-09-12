@@ -180,6 +180,23 @@ pub enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// Apply the additive fixes for `tm check`'s drift findings: scaffold
+    /// the assets the running tskmstr expects but this onboarded repo lacks
+    /// (a configured lane's missing prompt file), bump the `schema_version`
+    /// stamp, and offer the agent-assisted setup session for only those new
+    /// assets. Never overwrites an existing file or config value — drift it
+    /// cannot fix additively (a user-supplied skill that exists nowhere, a
+    /// stamp newer than this binary) is reported instead.
+    ///
+    /// Exit code: `0` up to date after the fixes, `1` drift remains, `2`
+    /// error (e.g. the repo was never onboarded — run `tm init` first).
+    Update {
+        /// Apply the fixes without offering the agent setup session
+        /// (scripted update keeps the static skeletons, like `tm init
+        /// --yes`).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `tm backend` subcommands.
@@ -1231,6 +1248,18 @@ mod tests {
     fn parses_check_quiet() {
         let cli = Cli::try_parse_from(["tm", "check", "--quiet"]).expect("should parse");
         assert!(matches!(cli.command, Some(Command::Check { quiet: true })));
+    }
+
+    #[test]
+    fn parses_update() {
+        let cli = Cli::try_parse_from(["tm", "update"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Update { yes: false })));
+    }
+
+    #[test]
+    fn parses_update_yes() {
+        let cli = Cli::try_parse_from(["tm", "update", "--yes"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Update { yes: true })));
     }
 
     #[test]

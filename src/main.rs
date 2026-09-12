@@ -3,7 +3,7 @@
 //! HTTP API), and dispatches to `tskmstr::cli`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -71,6 +71,13 @@ fn main() -> ExitCode {
     // "something went wrong" without parsing stdout.
     if let Command::Check { quiet } = command {
         return run_check_cmd(quiet);
+    }
+
+    // `tm update` mirrors `tm check`'s special-casing and exit codes: 0 when
+    // the repo is up to date after its additive fixes, 1 when drift it
+    // cannot fix remains, 2 on error.
+    if let Command::Update { yes } = command {
+        return run_update_cmd(yes);
     }
 
     match dispatch(command) {
@@ -200,6 +207,9 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         // stay exhaustive.
         Command::Check { .. } => {
             unreachable!("tm check is special-cased in main() before dispatch")
+        }
+        Command::Update { .. } => {
+            unreachable!("tm update is special-cased in main() before dispatch")
         }
     }
 }
@@ -779,25 +789,7 @@ fn run_init(
 
     let setup_repo_dir = repo_dir.clone();
     let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        let mut command = std::process::Command::new(&invocation.program);
-        command.args(&invocation.args);
-        for var in &invocation.env_remove {
-            command.env_remove(var);
-        }
-        for (key, value) in &invocation.env_set {
-            command.env(key, value);
-        }
-        if let Some(dir) = &setup_repo_dir {
-            command.current_dir(dir);
-        }
-        let status = command
-            .status()
-            .map_err(|err| format!("failed to launch {}: {err}", invocation.program))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{} exited with {status}", invocation.program))
-        }
+        launch_setup_session(invocation, setup_repo_dir.as_deref())
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -818,6 +810,73 @@ fn run_init(
     let mut stdout = std::io::stdout();
     tskmstr::cli::init::run_init(&ctx, yes, &mut prompter, &mut stdout)?;
     Ok(())
+}
+
+/// Run an agent invocation in the foreground from `dir` (when known) and
+/// wait for it to exit — the real setup-session launcher behind `tm init`'s
+/// and `tm update`'s agent-assisted asset setup.
+fn launch_setup_session(
+    invocation: &tskmstr::agent::AgentInvocation,
+    dir: Option<&Path>,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new(&invocation.program);
+    command.args(&invocation.args);
+    for var in &invocation.env_remove {
+        command.env_remove(var);
+    }
+    for (key, value) in &invocation.env_set {
+        command.env(key, value);
+    }
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to launch {}: {err}", invocation.program))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{} exited with {status}", invocation.program))
+    }
+}
+
+/// `tm update [--yes]`: build real dependencies and run
+/// [`tskmstr::cli::update::run_update`], mapping its result to `tm check`'s
+/// three-way exit code (`0` up to date after the fixes, `1` drift remains,
+/// `2` error). Config loads leniently for the same reason as
+/// [`run_check_cmd`]'s full path: only the runner resolution needs it.
+fn run_update_cmd(yes: bool) -> ExitCode {
+    let paths = default_config_paths();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let config = config::load(&paths).ok();
+    let runner = agent_runner_or_default(config.as_ref());
+    let repo_dir = paths
+        .repo
+        .as_deref()
+        .and_then(|repo_config| repo_config.parent().map(PathBuf::from));
+    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
+        launch_setup_session(invocation, repo_dir.as_deref())
+    };
+
+    let ctx = tskmstr::cli::update::UpdateContext {
+        paths: &paths,
+        home: &home,
+        runner,
+        setup_launcher: &setup_launcher,
+    };
+    let mut prompter = RealPrompter;
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::cli::update::run_update(&ctx, yes, &mut prompter, &mut stdout) {
+        Ok(remaining) if remaining.is_empty() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `tm check [--quiet]`: build real dependencies and run
