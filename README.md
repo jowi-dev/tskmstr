@@ -61,17 +61,43 @@ accepts every default for scripted setup: it scaffolds the static
 skeleton and never launches the setup session.
 
 Every `tm init` run also stamps `.tskmstr.toml`'s top-level `schema_version`
-with the running tskmstr's expected asset/config revision. `tm check
-[--quiet]` is the read-only counterpart: it reports whether a repo already
-onboarded by `tm init` is still up to date, checking the stamp (missing,
-stale, or newer than this binary expects) and the same structural presence
-checks `tm init` re-runs on every visit — a configured lane's missing
-prompt file, a configured session's missing skill. It never writes
-anything and never diffs a scaffolded asset's *content*: lane prompts and
-skills are meant to be edited after `tm init` writes them, so only their
-presence is checked (see `docs/decisions/0007-asset-schema-version.md`).
+with the running tskmstr's expected asset/config revision. `tm check` is
+the read-only counterpart: it reports whether a repo already onboarded by
+`tm init` is still up to date, checking the stamp (missing, stale, or
+newer than this binary expects) and the same structural presence checks
+`tm init` re-runs on every visit — a configured lane's missing prompt
+file, a configured session's missing skill. It never writes anything and
+never diffs a scaffolded asset's *content*: lane prompts and skills are
+meant to be edited after `tm init` writes them, so only their presence is
+checked (see `docs/decisions/0007-asset-schema-version.md`).
 Exit code `0` means up to date, `1` means drift was found, `2` means an
 error (e.g. the repo was never onboarded).
+
+`tm update` applies the additive fixes for what `tm check` reports: it
+scaffolds a starter prompt for any configured lane whose prompt file is
+missing, bumps the `schema_version` stamp, and makes the same
+agent-assisted setup offer `tm init` does — for only the new assets
+(`--yes` skips the offer and keeps the static skeletons). It never
+overwrites an existing file or config value, so hand-edited assets are
+safe. Drift it cannot fix additively is reported instead, with `tm
+check`'s exit codes: a user-supplied session skill that exists nowhere
+(tm doesn't ship skill content), and a stamp *newer* than the running
+binary (bumping that would be a downgrade — update tskmstr instead).
+
+`tm check --quiet` is the cheap staleness nudge for shell entry: it
+compares only the `schema_version` stamp — no lane/skill scans, no config
+loading — prints nothing when current, and prints a single line naming
+the remedy when the repo is behind. With direnv, add this to an onboarded
+repo's `.envrc`:
+
+```
+tm check --quiet || true
+```
+
+The `|| true` keeps a stale repo from failing the `.envrc` under direnv's
+strict shell; the nudge line still prints. The full asset scan stays
+behind on-demand `tm check`/`tm update`, so the per-`cd` cost is one
+small file read.
 
 Under the Jira backend, `tm init` hands off to `tm auth login` when no
 API token resolves; you can also bootstrap auth directly:
@@ -99,7 +125,8 @@ tm auth status
 | Command | What it does |
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
-| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. Exits `0` up to date, `1` drift found, `2` error |
+| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-only fast path for direnv: silent when current, one nudge line when not. Exits `0` up to date, `1` drift found, `2` error |
+| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |

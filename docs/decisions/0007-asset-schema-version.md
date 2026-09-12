@@ -66,8 +66,14 @@ Structural presence and the stamp together are the *entire* definition of
   `tm check` against a repo with no `.tskmstr.toml` is an error naming the
   path and suggesting `tm init`, not a `StampMissing` finding — there is
   nothing to report drift against.
-- **Fixing drift is still `tm init`'s job.** `tm check` never writes; every
-  finding's remediation is "run `tm init`." A dedicated `tm update` (or a
-  direnv-style nudge to run `tm check` automatically on shell entry) is
-  useful future work but out of scope here — this ADR only covers the
-  stamp and the read-only report.
+- **Fixing drift is `tm update`'s job (GitHub issue #39).** `tm check`
+  never writes; `tm update` applies the *additive* fixes — scaffolding a
+  configured lane's missing prompt file, bumping the stamp, offering the
+  agent-assisted setup session (issue #30's machinery) for only the new
+  assets — and never overwrites an existing file or config value, for the
+  same reason content is never diffed. Drift that isn't additively fixable
+  (a user-supplied skill that exists nowhere, a stamp newer than the
+  running binary) stays a report. `tm check --quiet` doubles as the
+  direnv-style shell-entry nudge: it compares only the stamp, so it stays
+  cheap enough to run on every `cd`, and the full scan stays behind
+  on-demand `tm check`/`tm update`.

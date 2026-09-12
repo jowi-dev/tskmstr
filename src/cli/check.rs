@@ -117,12 +117,12 @@ impl std::fmt::Display for DriftFinding {
         match self {
             DriftFinding::StampMissing => write!(
                 f,
-                "no schema_version stamp (onboarded before stamping existed); run `tm init` to stamp it"
+                "no schema_version stamp (onboarded before stamping existed); run `tm update` to stamp it"
             ),
             DriftFinding::StampStale { found } => write!(
                 f,
                 "schema_version stamp is {found}, older than this tskmstr's {} \
-                 (onboarded by an older tskmstr); re-run `tm init` to catch it up",
+                 (onboarded by an older tskmstr); run `tm update` to catch it up",
                 manifest::CURRENT_SCHEMA_VERSION
             ),
             DriftFinding::StampNewer { found } => write!(
@@ -392,7 +392,7 @@ fn render(findings: &[DriftFinding], out: &mut dyn Write) -> io::Result<()> {
         writeln!(out, "{finding}")?;
     }
     writeln!(out)?;
-    writeln!(out, "Run `tm init` to address the drift above.")?;
+    writeln!(out, "Run `tm update` to apply the additive fixes.")?;
     Ok(())
 }
 
@@ -489,7 +489,10 @@ mod tests {
             rendered.contains("no schema_version stamp"),
             "missing-stamp line in: {rendered}"
         );
-        assert!(rendered.contains("tm init"), "closing hint in: {rendered}");
+        assert!(
+            rendered.contains("tm update"),
+            "closing hint in: {rendered}"
+        );
     }
 
     #[test]

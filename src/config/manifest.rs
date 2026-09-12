@@ -48,8 +48,8 @@ pub enum StampStatus {
     Missing,
     /// The stamp is older than [`CURRENT_SCHEMA_VERSION`] (the wrapped value
     /// is the stamp that was found): an older tskmstr wrote this file, and a
-    /// newer one now expects assets this repo may not have. Re-run
-    /// `tm init` to catch it up.
+    /// newer one now expects assets this repo may not have. Run
+    /// `tm update` to catch it up.
     Stale(i64),
     /// The stamp is newer than [`CURRENT_SCHEMA_VERSION`] (the wrapped value
     /// is the stamp that was found): this repo was stamped by a tskmstr
