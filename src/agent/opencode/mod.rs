@@ -574,6 +574,32 @@ impl AgentRunner for OpencodeRunner {
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str {
         model.split_once('/').map(|(_, m)| m).unwrap_or(model)
     }
+
+    /// opencode wants the full `provider/model` spelling. There is no safe
+    /// universal default across providers, so `--yes` leaves `model` unset
+    /// (`yes_default: None`) and `tm init` prints that the run will fall
+    /// back to opencode's own default model. See
+    /// [`crate::agent::LaneModelPrompt`].
+    fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
+        crate::agent::LaneModelPrompt {
+            help: "provider/model, e.g. venice/z-ai-glm-5-3",
+            yes_default: None,
+        }
+    }
+
+    /// Requires a `provider/model` spelling: a non-empty provider and model
+    /// separated by `/` (a provider-scoped model may itself carry further
+    /// slashes, e.g. `openrouter/meta/llama-3`, mirroring
+    /// [`OpencodeRunner::display_model_name`]). A bare name with no slash is
+    /// rejected, since opencode resolves models by provider.
+    fn validate_lane_model(&self, model: &str) -> Result<(), String> {
+        match model.split_once('/') {
+            Some((provider, rest)) if !provider.is_empty() && !rest.is_empty() => Ok(()),
+            _ => Err(format!(
+                "`{model}` isn't a provider/model spelling; opencode wants e.g. `venice/z-ai-glm-5-3`"
+            )),
+        }
+    }
 }
 
 /// Raw shape of one NDJSON event line from `opencode run --format json`,
@@ -1118,5 +1144,27 @@ mod tests {
             OpencodeRunner.tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));
 
         assert!(command.contains(r#""$(cat '/state/o'\''brien.prompt.md')""#));
+    }
+
+    // --- lane_model_prompt / validate_lane_model (GitHub issue #51) ---
+
+    #[test]
+    fn lane_model_prompt_has_no_yes_default() {
+        // No safe universal default across providers: `--yes` leaves the key
+        // unset and `tm init` prints the consequence.
+        assert_eq!(OpencodeRunner.lane_model_prompt().yes_default, None);
+    }
+
+    #[test]
+    fn validate_lane_model_requires_a_provider_model_spelling() {
+        assert!(OpencodeRunner.validate_lane_model("venice/z-ai-glm-5-3").is_ok());
+        // A provider-scoped model may carry further slashes.
+        assert!(OpencodeRunner.validate_lane_model("openrouter/meta/llama-3").is_ok());
+        let err = OpencodeRunner
+            .validate_lane_model("fable")
+            .expect_err("a bare name is not opencode's spelling");
+        assert!(err.contains("provider/model"), "reason: {err}");
+        assert!(OpencodeRunner.validate_lane_model("venice/").is_err());
+        assert!(OpencodeRunner.validate_lane_model("/model").is_err());
     }
 }
