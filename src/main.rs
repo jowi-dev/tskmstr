@@ -450,6 +450,9 @@ fn run_work(
                 current_backend_identity: &current_backend_identity,
                 backend_identity_resolver: &backend_identity_resolver,
                 runner: agent_runner_or_default(full_config.as_ref()),
+                status_on_run_start: full_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.status_on_run_start.as_deref()),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,

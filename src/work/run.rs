@@ -342,6 +342,16 @@ pub struct RunLaneDeps<'a> {
     /// today; see [`crate::agent::AgentRunner`] and GitHub issue #17),
     /// selected by `config.agent` via `main.rs`'s `agent_runner_for`.
     pub runner: &'a dyn AgentRunner,
+    /// The configured `status_on_run_start` workflow status (see
+    /// [`crate::config::Config::status_on_run_start`]), or `None` when unset.
+    /// When set and this run has a ticket, [`prepare_run_lane`] advisorily
+    /// moves the ticket there around the moment its run row is created — the
+    /// same best-effort stance as blocker stacking: a provider failure warns
+    /// (on `out` and the durable run log) but never sinks the run, and a
+    /// ticket already in the target status is a silent no-op. Uses
+    /// [`RunLaneDeps::ticket_provider`]; absent that, the transition is
+    /// skipped exactly like the branch-name slug lookup.
+    pub status_on_run_start: Option<&'a str>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -1064,6 +1074,37 @@ pub fn prepare_run_lane(
         log_path: None,
     })?;
 
+    // Step 9b (GitHub issue #49): now that the run row exists — the moment tm
+    // knows work is beginning — advisorily move the ticket to the configured
+    // `status_on_run_start`. Best-effort, mirroring `resolve_blocker_stacking`'s
+    // transient tolerance: a provider failure (offline, rate-limited, missing
+    // labels, no matching transition) warns on `out` and to the durable run
+    // log but never sinks the run; a ticket already in the target status is a
+    // silent no-op (no warning spam on re-runs); a lane-only (ticketless) run
+    // has nothing to move, so the `Some(ticket)` guard skips it. Both the
+    // interactive and detached headless paths reach here, so this one
+    // placement covers every run shape.
+    if let (Some(target), Some(provider), Some(ticket)) = (
+        deps.status_on_run_start,
+        deps.ticket_provider,
+        request.ticket.as_deref(),
+    ) {
+        match crate::ticketing::transition_ticket(provider, ticket, target) {
+            Ok(crate::ticketing::TransitionOutcome::Applied(status)) => {
+                let line = format!("moved {ticket} to {status}");
+                writeln!(out, "{line}")?;
+                append_log_line(&log_path, &line);
+            }
+            Ok(crate::ticketing::TransitionOutcome::AlreadyInStatus(_)) => {}
+            Err(err) => {
+                let line =
+                    format!("warning: could not move {ticket} to \"{target}\" at run start: {err}");
+                writeln!(out, "{line}")?;
+                append_log_line(&log_path, &line);
+            }
+        }
+    }
+
     // Build the claude invocation (still part of step 9's "safe to do in the
     // foreground" work: pure argv construction, no spawning yet).
     let model = request
@@ -1463,7 +1504,7 @@ mod tests {
     use crate::runs::RunStore;
     use crate::ticketing::types::{
         Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, Status,
-        StatusCategory,
+        StatusCategory, Transition,
     };
     use crate::work::git::FakeGitOps;
     use crate::work::runner::FakeProcessSpawner;
@@ -1752,6 +1793,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1820,6 +1863,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1873,6 +1918,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1925,6 +1972,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -1976,6 +2025,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2029,6 +2080,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2085,6 +2138,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2170,6 +2225,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2248,6 +2305,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2325,6 +2384,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2374,6 +2435,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2436,6 +2499,8 @@ mod tests {
             current_backend_identity: &current_identity,
             backend_identity_resolver: &resolver,
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2496,6 +2561,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2544,6 +2611,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2598,6 +2667,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2649,6 +2720,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2700,6 +2773,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2749,6 +2824,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2819,6 +2896,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2875,6 +2954,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2920,6 +3001,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2968,6 +3051,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -2988,6 +3073,301 @@ mod tests {
         .unwrap();
 
         assert_eq!(prepared.branch, "claude/mylane-20260806-090503");
+    }
+
+    // --- status_on_run_start (GitHub issue #49): a tracked run advisorily
+    // moves its ticket to the configured status around run-row creation.
+    // Best-effort, exactly like resolve_blocker_stacking: a provider failure
+    // warns and the run proceeds; an already-in-status ticket is silent; a
+    // ticketless run does nothing; no config moves nothing. ---
+
+    /// An [`Issue`] fixture in an arbitrary workflow `status`, for the
+    /// status_on_run_start tests (the shared [`issue`] helper is fixed to
+    /// "To Do").
+    fn issue_in_status(key: &str, summary: &str, status: &str) -> Issue {
+        let mut issue = issue(key, summary);
+        issue.fields.status.name = status.to_string();
+        issue
+    }
+
+    /// The one transition these tests seed: from wherever the ticket is to
+    /// "In Progress".
+    fn to_in_progress() -> Transition {
+        Transition {
+            id: "t-1".to_string(),
+            name: "Start work".to_string(),
+            to: Status {
+                name: "In Progress".to_string(),
+                status_category: StatusCategory {
+                    key: "indeterminate".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn prepare_run_lane_moves_ticket_to_status_on_run_start_when_configured() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![to_in_progress()]);
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: Some("In Progress"),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("ABC-123".to_string(), "t-1".to_string())],
+        );
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("moved ABC-123 to In Progress"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_status_on_run_start_already_in_status_is_silent() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira = FakeJiraClient::new()
+            .with_issue(
+                "ABC-123",
+                issue_in_status("ABC-123", "Delete bid connector", "In Progress"),
+            )
+            .with_transitions("ABC-123", vec![to_in_progress()]);
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: Some("In Progress"),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert!(jira.transition_calls().is_empty());
+        let printed = String::from_utf8(out).unwrap();
+        assert!(!printed.contains("moved"), "{printed}");
+        assert!(!printed.contains("warning"), "{printed}");
+    }
+
+    #[test]
+    fn prepare_run_lane_status_on_run_start_provider_failure_warns_and_proceeds() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        // get_issue succeeds (so blocker/slug resolution is unaffected) but
+        // fetching transitions fails — the transient failure the hook must
+        // tolerate.
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions_error("ABC-123", 503, "service unavailable");
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: Some("In Progress"),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        // The run is still prepared despite the transition failure.
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        assert!(run_store.run_by_id(prepared.run_id).unwrap().is_some());
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("warning: could not move ABC-123 to \"In Progress\" at run start"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_status_on_run_start_skipped_for_ticketless_run() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        // Seeded so a bug that transitions anyway would have something to move.
+        let jira = FakeJiraClient::new()
+            .with_issue("mylane", issue("mylane", "not a ticket"))
+            .with_transitions("mylane", vec![to_in_progress()]);
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: Some("In Progress"),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        // No ticket: a lane-only run has nothing to move.
+        prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn prepare_run_lane_does_not_transition_when_status_on_run_start_unset() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![to_in_progress()]);
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        assert!(jira.transition_calls().is_empty());
     }
 
     #[test]
@@ -3016,6 +3396,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3063,6 +3445,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3115,6 +3499,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3165,6 +3551,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3220,6 +3608,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3272,6 +3662,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3326,6 +3718,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3380,6 +3774,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3446,6 +3842,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3499,6 +3897,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3552,6 +3952,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3599,6 +4001,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3653,6 +4057,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3705,6 +4111,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3760,6 +4168,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -3836,6 +4246,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -4115,6 +4527,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -4183,6 +4597,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4248,6 +4664,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4312,6 +4730,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
@@ -4364,6 +4784,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = RunLanePaths {
             home,
