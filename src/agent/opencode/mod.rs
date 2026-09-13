@@ -748,7 +748,7 @@ mod tests {
     // --- build_invocation ---
 
     #[test]
-    fn headless_exact_argv_with_model_and_auto() {
+    fn headless_exact_argv_with_model_and_bypass_flag() {
         let invocation = OpencodeRunner.build_invocation(base_inputs());
 
         assert_eq!(invocation.program, "opencode");
@@ -760,7 +760,7 @@ mod tests {
                 "json",
                 "--model",
                 "anthropic/claude-sonnet-4-5",
-                "--auto",
+                "--dangerously-skip-permissions",
                 "--",
                 "do the thing",
             ]
@@ -768,12 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_exact_argv_with_model_and_auto() {
+    fn interactive_exact_argv_with_model_and_no_permission_flag() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             mode: RunMode::Interactive,
             ..base_inputs()
         });
 
+        // The 1.15.13 TUI has no CLI permission flag at all — opencode's
+        // own `permission` config governs an interactive session.
         assert_eq!(
             invocation.args,
             vec![
@@ -781,7 +783,6 @@ mod tests {
                 "do the thing",
                 "--model",
                 "anthropic/claude-sonnet-4-5",
-                "--auto",
             ]
         );
     }
@@ -803,32 +804,69 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_none_maps_to_auto() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+    fn permission_mode_none_maps_to_the_bypass_flag_headless_only() {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: None,
             ..base_inputs()
         });
-        assert!(invocation.args.iter().any(|a| a == "--auto"));
+        assert!(headless
+            .args
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+
+        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
+            permission_mode: None,
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+        assert!(
+            !interactive
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto"),
+            "the TUI has no CLI permission flag; passing one would make the \
+             window's opencode exit before rendering anything"
+        );
     }
 
     #[test]
-    fn permission_mode_bypass_permissions_maps_to_auto() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+    fn permission_mode_bypass_permissions_maps_to_the_bypass_flag_headless_only() {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: Some("bypassPermissions".to_string()),
             ..base_inputs()
         });
-        assert!(invocation.args.iter().any(|a| a == "--auto"));
+        assert!(headless
+            .args
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+
+        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
+            permission_mode: Some("bypassPermissions".to_string()),
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+        assert!(
+            !interactive
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto")
+        );
     }
 
     #[test]
     fn permission_mode_accept_edits_maps_to_no_flag_at_all() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: Some("acceptEdits".to_string()),
             ..base_inputs()
         });
-        assert!(!invocation.args.iter().any(|a| a == "--auto"));
+        assert!(
+            !headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
         // No other permission-mode flag exists for opencode at all.
-        assert!(!invocation.args.iter().any(|a| a.contains("acceptEdits")));
+        assert!(!headless.args.iter().any(|a| a.contains("acceptEdits")));
     }
 
     #[test]
@@ -1041,7 +1079,7 @@ mod tests {
         assert_eq!(
             command,
             "opencode '--prompt' \"$(cat '/state/proj-1.prompt.md')\" \
-             '--model' 'anthropic/claude-sonnet-4-5' '--auto'"
+             '--model' 'anthropic/claude-sonnet-4-5'"
         );
         assert!(
             !command.contains("do the thing"),
