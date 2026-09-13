@@ -1157,9 +1157,17 @@ mod tests {
 
     #[test]
     fn validate_lane_model_requires_a_provider_model_spelling() {
-        assert!(OpencodeRunner.validate_lane_model("venice/z-ai-glm-5-3").is_ok());
+        assert!(
+            OpencodeRunner
+                .validate_lane_model("venice/z-ai-glm-5-3")
+                .is_ok()
+        );
         // A provider-scoped model may carry further slashes.
-        assert!(OpencodeRunner.validate_lane_model("openrouter/meta/llama-3").is_ok());
+        assert!(
+            OpencodeRunner
+                .validate_lane_model("openrouter/meta/llama-3")
+                .is_ok()
+        );
         let err = OpencodeRunner
             .validate_lane_model("fable")
             .expect_err("a bare name is not opencode's spelling");
