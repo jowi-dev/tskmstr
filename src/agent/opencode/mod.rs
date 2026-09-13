@@ -37,11 +37,18 @@
 //!   `ANTHROPIC_*`/`CLAUDECODE` for subscription-billing safety; opencode's
 //!   provider credentials are explicit config or env keys the user intends
 //!   as credentials, so stripping anything would break legitimate setups.
-//! - **No telemetry.** [`OpencodeRunner::deploy_telemetry`] and
-//!   [`OpencodeRunner::install_user_hooks`] return `Ok(None)` — per
-//!   ADR-0004 point 3, run start/finish recording never depends on `Some`.
-//!   opencode-plugin telemetry (model-usage attribution, interactive
-//!   SessionEnd-equivalent finish) is deferred to a follow-up issue.
+//! - **Telemetry via a plugin, not a per-run `--settings` file.**
+//!   [`OpencodeRunner::deploy_telemetry`] stays `Ok(None)`: opencode
+//!   auto-discovers the globally-installed plugin with no per-run flag, so
+//!   there is nothing to deploy into a lane worktree. [`OpencodeRunner::install_user_hooks`]
+//!   writes the embedded `tm-telemetry.js` plugin into opencode's
+//!   discovery dir (`$OPENCODE_CONFIG_DIR/plugin/` or
+//!   `~/.config/opencode/plugin/`) — the opencode analog of claude's
+//!   user-hooks install. The plugin (GH-43,
+//!   `docs/plans/gh-43-opencode-telemetry.md`) restores model-usage
+//!   attribution, session-id export, and interactive SessionEnd-equivalent
+//!   finish. Per ADR-0004 point 3, run start/finish recording never depends
+//!   on `deploy_telemetry` returning `Some`.
 //!
 //! # Model pricing and roles reference
 //!
@@ -81,6 +88,31 @@ use crate::agent::{
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
+
+/// The opencode telemetry plugin, embedded via [`include_str!`] and written
+/// to opencode's plugin discovery dir by [`OpencodeRunner::install_user_hooks`].
+/// Same distribution model as claude's hook scripts
+/// ([`crate::agent::claude::hooks::hook_scripts`]): baked into the `tm`
+/// binary and rewritten on install, so it upgrades in lockstep with `tm`
+/// with no npm publish or separate version. `(filename, contents)`.
+const TELEMETRY_PLUGIN: (&str, &str) = (
+    "tm-telemetry.js",
+    include_str!("../../../hooks/opencode/tm-telemetry.js"),
+);
+
+/// opencode's plugin auto-discovery directory: `$OPENCODE_CONFIG_DIR/plugin/`
+/// when that env var is set, else `<home>/.config/opencode/plugin/`. Mirrors
+/// the discovery precedence pinned in `docs/plans/gh-43-opencode-telemetry.md`
+/// (and how claude reads `CLAUDE_CONFIG_DIR` in
+/// [`crate::agent::claude::ClaudeRunner::install_user_hooks`]). The global
+/// config dir — not the repo — is deliberate: it is auto-discovered by both
+/// lane and interactive sessions and never touches the user's project.
+fn plugin_dir(home: &Path) -> PathBuf {
+    match std::env::var_os("OPENCODE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir).join("plugin"),
+        None => expand_tilde("~/.config/opencode/plugin", home),
+    }
+}
 
 /// Price table for venice-routed models, sourced from `opencode models
 /// --verbose venice` on 2026-09-13. Add an entry here for any new model that
@@ -507,33 +539,74 @@ impl AgentRunner for OpencodeRunner {
         expand_tilde(&format!("~/.config/opencode/prompts/{lane}.md"), home)
     }
 
-    /// Always `Ok(None)`: opencode has no telemetry artifacts to deploy in
-    /// this phase. Per ADR-0004 point 3, run start/finish recording never
-    /// depends on this returning `Some` — only the telemetry-driven extras
-    /// (session-usage cost beyond `parse_outcome`'s own `cost_usd`,
-    /// checklist/task events, an interactive SessionEnd-equivalent finish)
-    /// are lost. The opencode-plugin telemetry follow-up is where this
-    /// changes.
+    /// Always `Ok(None)`: opencode auto-discovers the globally-installed
+    /// telemetry plugin with no per-run flag, so — unlike claude's per-run
+    /// `--settings` file — there is nothing to deploy into a lane worktree.
+    /// The plugin is installed once via [`OpencodeRunner::install_user_hooks`].
+    /// Per ADR-0004 point 3, run start/finish recording never depends on this
+    /// returning `Some`.
     fn deploy_telemetry(&self, _deploy_dir: &Path) -> Result<Option<PathBuf>, AgentError> {
         Ok(None)
     }
 
-    /// Always `Ok(None)`: no user-level telemetry hooks exist for this
-    /// runner yet. See [`OpencodeRunner::deploy_telemetry`]'s doc comment.
+    /// Installs the embedded [`TELEMETRY_PLUGIN`] into opencode's plugin
+    /// discovery dir ([`plugin_dir`]) — the opencode analog of claude's
+    /// `tm work hooks install --user`. Idempotent copy-if-missing-or-stale:
+    /// a byte-identical copy already on disk is left untouched
+    /// (`scripts_already_present`); a missing or stale copy is written
+    /// (`scripts_copied`), backing up any stale copy first
+    /// (`<name>.bak-<suffix>`). `xdg_data_home` is ignored — opencode uses
+    /// its XDG *config* dir, not the data dir claude's hooks live under.
+    /// Always returns `Some`; a dry run reports the same plan without
+    /// touching disk.
     fn install_user_hooks(
         &self,
-        _home: &Path,
+        home: &Path,
         _xdg_data_home: Option<&Path>,
-        _backup_suffix: &str,
-        _dry_run: bool,
+        backup_suffix: &str,
+        dry_run: bool,
     ) -> Result<Option<InstallReport>, AgentError> {
-        Ok(None)
+        let (name, contents) = TELEMETRY_PLUGIN;
+        let dir = plugin_dir(home);
+        let dest = dir.join(name);
+
+        let existing = std::fs::read(&dest).ok();
+        let mut report = InstallReport {
+            dry_run,
+            ..Default::default()
+        };
+
+        if existing.as_deref() == Some(contents.as_bytes()) {
+            report.scripts_already_present.push(name.to_string());
+            return Ok(Some(report));
+        }
+
+        // Missing or stale: this is a write. Record it either way so a dry
+        // run reports the plan.
+        report.scripts_copied.push(name.to_string());
+        if dry_run {
+            return Ok(Some(report));
+        }
+
+        std::fs::create_dir_all(&dir)?;
+        if existing.is_some() {
+            let backup = dir.join(format!("{name}.bak-{backup_suffix}"));
+            std::fs::copy(&dest, &backup)?;
+            report.backup_path = Some(backup);
+        }
+        std::fs::write(&dest, contents)?;
+
+        Ok(Some(report))
     }
 
-    /// Always `false`: there is nothing to install yet. See
-    /// [`OpencodeRunner::deploy_telemetry`]'s doc comment.
-    fn user_hooks_installed(&self, _home: &Path, _xdg_data_home: Option<&Path>) -> bool {
-        false
+    /// `true` when the embedded plugin is present and byte-identical on disk
+    /// — mirrors claude's dry-run-reports-nothing-to-do semantics via the
+    /// same [`OpencodeRunner::install_user_hooks`] machinery, so a stale copy
+    /// counts as not-installed (it still needs rewriting).
+    fn user_hooks_installed(&self, home: &Path, xdg_data_home: Option<&Path>) -> bool {
+        self.install_user_hooks(home, xdg_data_home, "tm-init-probe", true)
+            .map(|report| report.map(|r| r.scripts_copied.is_empty()).unwrap_or(false))
+            .unwrap_or(false)
     }
 
     /// `OPENCODE_SESSION_ID`/`OPENCODE_PID`. Verified against the v1.18.11
@@ -675,6 +748,9 @@ mod tests {
 
     #[test]
     fn deploy_telemetry_always_returns_none() {
+        // opencode discovers the globally-installed plugin with no per-run
+        // flag, so there is nothing to deploy into a lane worktree — unlike
+        // claude, whose `--settings` file is per-run.
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(
             OpencodeRunner
@@ -684,25 +760,118 @@ mod tests {
         );
     }
 
+    /// The plugin file this adapter installs, under `home`.
+    fn plugin_path(home: &Path) -> PathBuf {
+        home.join(".config/opencode/plugin/tm-telemetry.js")
+    }
+
     #[test]
-    fn install_user_hooks_always_returns_none() {
+    fn install_user_hooks_writes_the_embedded_plugin() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("should succeed")
+            .expect("opencode installs a telemetry plugin");
+
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
+        assert!(report.scripts_already_present.is_empty());
+        assert!(report.backup_path.is_none());
+        assert!(!report.dry_run);
+
+        let written = std::fs::read_to_string(plugin_path(&home)).expect("plugin written");
+        assert_eq!(written, TELEMETRY_PLUGIN.1);
+    }
+
+    #[test]
+    fn install_user_hooks_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("first install succeeds");
+        let second = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000001", false)
+            .expect("second install succeeds")
+            .expect("still Some");
+
+        assert!(second.scripts_copied.is_empty());
+        assert_eq!(
+            second.scripts_already_present,
+            vec!["tm-telemetry.js".to_string()]
+        );
+        assert!(second.backup_path.is_none());
+    }
+
+    #[test]
+    fn install_user_hooks_dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", true)
+            .expect("should succeed")
+            .expect("still Some");
+
+        assert!(report.dry_run);
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
         assert!(
-            OpencodeRunner
-                .install_user_hooks(&home, None, "20260101-000000", false)
-                .expect("should succeed")
-                .is_none()
+            !plugin_path(&home).exists(),
+            "dry run must not touch the disk"
         );
     }
 
     #[test]
-    fn user_hooks_installed_is_always_false() {
+    fn install_user_hooks_backs_up_a_stale_plugin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let plugin = plugin_path(&home);
+        std::fs::create_dir_all(plugin.parent().unwrap()).expect("mkdir plugin dir");
+        std::fs::write(&plugin, "// stale contents\n").expect("seed stale plugin");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-093000", false)
+            .expect("should succeed")
+            .expect("still Some");
+
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
+        let backup = report.backup_path.expect("stale copy is backed up");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup readable"),
+            "// stale contents\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plugin).expect("plugin rewritten"),
+            TELEMETRY_PLUGIN.1
+        );
+    }
+
+    #[test]
+    fn user_hooks_installed_tracks_the_plugin_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("mkdir home");
+
         assert!(!OpencodeRunner.user_hooks_installed(&home, None));
+        OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("install succeeds");
+        assert!(OpencodeRunner.user_hooks_installed(&home, None));
+    }
+
+    #[test]
+    fn embedded_plugin_matches_the_tracked_file() {
+        let tracked = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/hooks/opencode/tm-telemetry.js"
+        ))
+        .expect("tracked plugin file readable");
+        assert_eq!(TELEMETRY_PLUGIN.1, tracked);
     }
 
     #[test]
