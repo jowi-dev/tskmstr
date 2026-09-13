@@ -36,6 +36,36 @@
 //!   ADR-0004 point 3, run start/finish recording never depends on `Some`.
 //!   opencode-plugin telemetry (model-usage attribution, interactive
 //!   SessionEnd-equivalent finish) is deferred to a follow-up issue.
+//!
+//! # Model pricing and roles reference
+//!
+//! Sourced from `opencode models --verbose venice` on 2026-09-13. Prices are
+//! per-million tokens. The "role" column maps to Claude's fable/sonnet tier
+//! split — see the lane's `model` config for the active reasoning model and
+//! the lane prompt for the subagent model.
+//!
+//! | Model | Role | Input/M | Output/M | Cache Read/M | Cache Write/M |
+//! |---|---|---|---|---|---|
+//! | `venice/claude-fable-5` | Heavy reasoning (claude equivalent) | $12.00 | $60.00 | $1.20 | $15.00 |
+//! | `venice/claude-opus-5` | Heavy reasoning | $6.00 | $30.00 | $0.60 | $7.50 |
+//! | `venice/claude-sonnet-5` | Fast workhorse (claude equivalent) | $3.00 | $15.00 | $0.30 | $3.75 |
+//! | `venice/z-ai-glm-5-3` | **Reasoning default for pckr** | $0.50 | $2.00 | $0.05 | $0.00 |
+//! | `venice/z-ai-glm-5-3-flash` | **Subagent default for pckr** | $0.05 | $0.20 | $0.005 | $0.00 |
+//! | `venice/deepseek-v4-pro-0813` | Heavy reasoning alternative | $1.65 | $4.95 | $0.165 | $0.00 |
+//! | `venice/deepseek-v4-flash` | Cheap subagent alternative | $0.138 | $0.275 | $0.028 | $0.00 |
+//! | `venice/qwen-3-7-max` | Heavy reasoning alternative | $2.70 | $10.80 | $0.27 | $0.00 |
+//! | `venice/qwen-3-7-plus` | Mid-tier alternative | $0.50 | $2.00 | $0.05 | $0.00 |
+//! | `venice/grok-4-6` | Heavy reasoning alternative | $2.27 | $11.35 | $0.23 | $0.00 |
+//! | `venice/kimi-k3` | Heavy reasoning alternative | $3.75 | $15.00 | $0.375 | $0.00 |
+//! | `venice/openai-gpt-55` | Heavy reasoning alternative | $6.25 | $25.00 | $0.625 | $0.00 |
+//!
+//! **Cost comparison for the glm-5-3 + glm-5-3-flash stack vs claude:**
+//!
+//! | Stack | Reasoning (in/out) | Subagent (in/out) | Reasoning cost vs fable |
+//! |---|---|---|---|
+//! | claude fable + sonnet | $12/$60 | $3/$15 | 1x (baseline) |
+//! | glm-5-3 + glm-5-3-flash | $0.50/$2.00 | $0.05/$0.20 | **24x cheaper** |
+//! | deepseek-v4-pro + v4-flash | $1.65/$4.95 | $0.138/$0.275 | **7x cheaper** |
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +75,127 @@ use crate::agent::{
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
+
+/// Price table for venice-routed models, sourced from `opencode models
+/// --verbose venice` on 2026-09-13. Add an entry here for any new model that
+/// shows up in interactive session usage and needs estimated-cost support.
+/// Keys are the full `provider/model` string. See the module doc comment for
+/// the full pricing/roles reference table.
+///
+/// Headless lane runs get authoritative cost from `parse_outcome`'s
+/// `cost_usd` (opencode computes cost natively per step), so this table
+/// only matters for interactive sessions where `estimate_missing_costs`
+/// fills in estimated costs.
+const PRICE_TABLE: &[(&str, ModelPrice)] = &[
+    (
+        "venice/claude-sonnet-5",
+        ModelPrice {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+            cache_read_per_million: 0.30,
+            cache_write_per_million: 3.75,
+        },
+    ),
+    (
+        "venice/claude-opus-5",
+        ModelPrice {
+            input_per_million: 6.00,
+            output_per_million: 30.00,
+            cache_read_per_million: 0.60,
+            cache_write_per_million: 7.50,
+        },
+    ),
+    (
+        "venice/claude-fable-5",
+        ModelPrice {
+            input_per_million: 12.00,
+            output_per_million: 60.00,
+            cache_read_per_million: 1.20,
+            cache_write_per_million: 15.00,
+        },
+    ),
+    (
+        "venice/claude-sonnet-4-5",
+        ModelPrice {
+            input_per_million: 3.75,
+            output_per_million: 18.75,
+            cache_read_per_million: 0.375,
+            cache_write_per_million: 4.69,
+        },
+    ),
+    (
+        "venice/claude-sonnet-4-6",
+        ModelPrice {
+            input_per_million: 3.60,
+            output_per_million: 18.00,
+            cache_read_per_million: 0.36,
+            cache_write_per_million: 4.50,
+        },
+    ),
+    (
+        "venice/claude-opus-4-5",
+        ModelPrice {
+            input_per_million: 6.00,
+            output_per_million: 30.00,
+            cache_read_per_million: 0.60,
+            cache_write_per_million: 7.50,
+        },
+    ),
+    (
+        "venice/z-ai-glm-5-3",
+        ModelPrice {
+            input_per_million: 0.50,
+            output_per_million: 2.00,
+            cache_read_per_million: 0.05,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/z-ai-glm-5-3-flash",
+        ModelPrice {
+            input_per_million: 0.05,
+            output_per_million: 0.20,
+            cache_read_per_million: 0.005,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/deepseek-v4-flash",
+        ModelPrice {
+            input_per_million: 0.138,
+            output_per_million: 0.275,
+            cache_read_per_million: 0.028,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/deepseek-v4-pro-0813",
+        ModelPrice {
+            input_per_million: 1.65,
+            output_per_million: 4.95,
+            cache_read_per_million: 0.165,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/grok-4-6",
+        ModelPrice {
+            input_per_million: 2.27,
+            output_per_million: 11.35,
+            cache_read_per_million: 0.23,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/qwen-3-7-max",
+        ModelPrice {
+            input_per_million: 2.70,
+            output_per_million: 10.80,
+            cache_read_per_million: 0.27,
+            cache_write_per_million: 0.00,
+        },
+    ),
+];
 
 /// The `opencode` CLI [`AgentRunner`] implementation. Zero-sized, mirroring
 /// [`crate::agent::claude::ClaudeRunner`]: a single `&'static OpencodeRunner`
@@ -378,11 +529,17 @@ impl AgentRunner for OpencodeRunner {
         }
     }
 
-    /// Always `None`: opencode is multi-provider, so a static per-model
-    /// price table is a poor fit, and headless cost is already
-    /// authoritative straight from `parse_outcome`'s `cost_usd`.
-    fn price_for_model(&self, _model: &str) -> Option<ModelPrice> {
-        None
+    /// Looks up `model`'s [`ModelPrice`] in [`PRICE_TABLE`] by exact name
+    /// match. `None` for any model not yet priced here. Headless lane runs
+    /// already get authoritative cost from `parse_outcome`'s `cost_usd`
+    /// (opencode computes cost natively per step); this table only matters
+    /// for interactive sessions where `estimate_missing_costs` fills in
+    /// estimated costs.
+    fn price_for_model(&self, model: &str) -> Option<ModelPrice> {
+        PRICE_TABLE
+            .iter()
+            .find(|(name, _)| *name == model)
+            .map(|(_, price)| *price)
     }
 
     /// Strips a leading `provider/` prefix by splitting on the *first*
@@ -533,7 +690,26 @@ mod tests {
     }
 
     #[test]
-    fn price_for_model_is_always_none() {
+    fn price_for_model_finds_known_venice_models() {
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/claude-sonnet-5")
+                .is_some()
+        );
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/z-ai-glm-5-3")
+                .is_some()
+        );
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/deepseek-v4-flash")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn price_for_model_returns_none_for_unknown_model() {
         assert_eq!(
             OpencodeRunner.price_for_model("anthropic/claude-sonnet-4-5"),
             None

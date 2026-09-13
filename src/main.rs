@@ -1774,6 +1774,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_runner_for_opencode_returns_the_opencode_runner() {
+        let mut config = jira_config();
+        config.agent = AgentKind::Opencode;
+
+        let runner = agent_runner_for(&config);
+
+        assert_eq!(runner.name(), "opencode");
+    }
+
+    #[test]
     fn run_ticket_provider_github_backend_does_not_need_a_jira_token() {
         // `ticket_provider_for`'s github arm opens a `RunStore` at
         // `config.run_db_path`, defaulting to `$HOME/.local/share/tskmstr/

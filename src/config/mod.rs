@@ -884,7 +884,7 @@ pub enum ConfigError {
 
     /// `[agent].runner` was set to a value that isn't a recognized agent
     /// runner name, mirroring [`ConfigError::InvalidProvider`].
-    #[error("invalid [agent] runner `{value}`; expected \"claude\"")]
+    #[error("invalid [agent] runner `{value}`; expected \"claude\" or \"opencode\"")]
     InvalidRunner {
         /// The unrecognized value as written in config.
         value: String,
