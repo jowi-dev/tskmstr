@@ -863,6 +863,19 @@ mod tests {
     }
 
     #[test]
+    fn interactive_prompt_returns_the_prompt_value_not_the_flag() {
+        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        assert_eq!(
+            OpencodeRunner.interactive_prompt(&invocation),
+            Some("do the thing")
+        );
+    }
+
+    #[test]
     fn absent_run_id_sets_no_env_vars() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             run_id: None,

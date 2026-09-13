@@ -758,6 +758,19 @@ mod tests {
     }
 
     #[test]
+    fn interactive_prompt_returns_the_positional_prompt() {
+        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        assert_eq!(
+            ClaudeRunner.interactive_prompt(&invocation),
+            Some("do the thing")
+        );
+    }
+
+    #[test]
     fn interactive_mode_passes_the_prompt_positionally_and_drops_max_turns() {
         let invocation = ClaudeRunner.build_invocation(InvocationInputs {
             mode: RunMode::Interactive,
