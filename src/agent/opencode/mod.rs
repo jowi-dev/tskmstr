@@ -816,10 +816,12 @@ mod tests {
             permission_mode: None,
             ..base_inputs()
         });
-        assert!(headless
-            .args
-            .iter()
-            .any(|a| a == "--dangerously-skip-permissions"));
+        assert!(
+            headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
 
         let interactive = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: None,
@@ -842,10 +844,12 @@ mod tests {
             permission_mode: Some("bypassPermissions".to_string()),
             ..base_inputs()
         });
-        assert!(headless
-            .args
-            .iter()
-            .any(|a| a == "--dangerously-skip-permissions"));
+        assert!(
+            headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
 
         let interactive = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: Some("bypassPermissions".to_string()),
