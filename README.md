@@ -34,11 +34,13 @@ remote is detected, with the slug pre-filled), writes the repo-local
 `base_branch`, and an optional starter prompt file at
 `.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
 tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md`),
-creates the GitHub backend's `tm:status/*` labels, optionally fills in
-`[work.audit]` / `[work.review_watch]`, asks which AI agent runner tm
-launches (`[agent] runner`; the default stays implicit), and offers `tm
-work hooks install --user` when the session hooks are absent — everything
-`tm board` and the board's `w`/`a` keys need.
+creates the GitHub backend's `tm:status/*` labels, offers to wire
+`status_on_pr` (the status a ticket moves to when `tm pr create` opens its
+PR — defaulting to `"In Review"` under the GitHub backend, the label init
+just created), optionally fills in `[work.audit]` / `[work.review_watch]`,
+asks which AI agent runner tm launches (`[agent] runner`; the default stays
+implicit), and offers `tm work hooks install --user` when the session hooks
+are absent — everything `tm board` and the board's `w`/`a` keys need.
 
 The scaffolded lane prompt is a generic skeleton, so after everything is
 written the wizard offers to launch an agent-assisted setup session
@@ -1350,7 +1352,11 @@ case-insensitively; if none match, or the transition call itself fails,
 either way. The warning is actionable: on no match it lists the ticket's
 available transitions and names `tm ticket transition <KEY> <STATUS>` as
 the manual recovery. `tm ticket <KEY>` (plain association, no PR being
-created) never changes an existing ticket's status.
+created) never changes an existing ticket's status. `tm init` offers to
+wire this key when onboarding a repo (GitHub defaults it to `"In Review"`),
+so a fresh repo's board moves on PR-open without your having to know the
+key exists; when unset, `tm pr create` leaves every ticket in its current
+status.
 
 `status_on_create` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to right after `tm ticket create` makes it. It's matched the
