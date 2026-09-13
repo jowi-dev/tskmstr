@@ -432,6 +432,22 @@ impl AgentRunner for OpencodeRunner {
         }
     }
 
+    /// Overrides the default: opencode's interactive prompt is the value
+    /// *after* `"--prompt"` (`args[0] == "--prompt"`, `args[1] == prompt`,
+    /// per `build_invocation`), not a bare positional at `args[0]` like
+    /// claude's. Without this override, a prompt-file writer following the
+    /// default convention writes the literal flag string into the file
+    /// instead of the prompt text.
+    fn interactive_prompt<'a>(&self, invocation: &'a AgentInvocation) -> Option<&'a str> {
+        if invocation.args.first().map(String::as_str) == Some("--prompt") {
+            invocation.args.get(1).map(String::as_str)
+        } else {
+            // Not an interactive invocation (the headless argv starts
+            // with "run"); there is no interactive prompt to extract.
+            None
+        }
+    }
+
     /// Overrides the default impl: opencode's interactive prompt is the
     /// value *after* `"--prompt"` (`args[0] == "--prompt"`, `args[1] ==
     /// prompt`, per `build_invocation`), not a bare positional at `args[0]`

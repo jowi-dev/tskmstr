@@ -179,8 +179,11 @@ pub fn interactive_prompt(kind: &str, ticket: &str, body: &str) -> String {
 /// Launch `prepared`'s agent process in `target`, rooted in the run's
 /// worktree.
 ///
-/// Writes `prepared.invocation`'s prompt (its positional first argument) to
-/// `prompt_path` and starts a window running
+/// Writes the invocation's interactive prompt (via
+/// [`runner.interactive_prompt`](crate::agent::AgentRunner::interactive_prompt)
+/// — runner-aware, since claude carries it positionally at `args[0]` while
+/// opencode keeps it behind a `--prompt` flag) to `prompt_path` and starts
+/// a window running
 /// [`runner.tmux_command_line`](crate::agent::AgentRunner::tmux_command_line)
 /// against that file, with `SESSION_RUN_ID_ENV` carrying the pre-registered
 /// run id for the session to adopt.
@@ -196,11 +199,8 @@ pub fn launch_interactive_run(
     prompt_path: &Path,
     runner: &dyn AgentRunner,
 ) -> Result<(), InteractiveLaunchError> {
-    let prompt = prepared
-        .invocation
-        .args
-        .first()
-        .cloned()
+    let prompt = runner
+        .interactive_prompt(&prepared.invocation)
         .unwrap_or_default();
     if let Some(parent) = prompt_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| InteractiveLaunchError::PromptFile {

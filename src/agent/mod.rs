@@ -448,6 +448,25 @@ pub trait AgentRunner {
     /// positional argument. Replaces `work::audit::claude_command`.
     fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String;
 
+    /// The prompt text of an [`AgentInvocation`] built for
+    /// [`RunMode::Interactive`] — the string a caller like
+    /// `crate::work::interactive::launch_interactive_run` writes to the
+    /// prompt file a tmux window reads back, as opposed to the command
+    /// line itself ([`AgentRunner::tmux_command_line`], which reads the
+    /// same file).
+    ///
+    /// The default returns `invocation.args.first()` — the positional
+    /// prompt at `args[0]` that the interactive contract documents on
+    /// [`AgentRunner::tmux_command_line`]. An adapter whose interactive
+    /// prompt is a flag value instead (opencode's `--prompt <prompt>`,
+    /// where `args[0]` is the literal flag) overrides this to return the
+    /// value, so the flag string itself never gets mistaken for the
+    /// prompt. `None` when the invocation carries no interactive prompt
+    /// (e.g. it was built for [`RunMode::Headless`]).
+    fn interactive_prompt<'a>(&self, invocation: &'a AgentInvocation) -> Option<&'a str> {
+        invocation.args.first().map(String::as_str)
+    }
+
     /// Render `invocation` into the shell command line a tmux window runs,
     /// reading the prompt back from `prompt_file` rather than embedding it
     /// directly (a fix prompt has no length bound, and `ARG_MAX` is a real
