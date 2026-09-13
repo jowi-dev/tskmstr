@@ -664,6 +664,128 @@ mod tests {
     }
 
     #[test]
+    fn create_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.create]\n\
+             prompt_file = \".tskmstr/prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/create.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.create].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn audit_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        // Present the audit skill so only the missing prompt_file is drift.
+        std::fs::create_dir_all(env.home.join(".claude/skills/ticket-audit"))
+            .expect("mkdir home skill");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.audit]\n\
+             dir = \".\"\n\
+             prompt_file = \".tskmstr/prompts/audit.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/audit.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.audit].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn review_watch_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        // Present the cleanup skill so only the missing prompt_file is drift.
+        std::fs::create_dir_all(env.home.join(".claude/skills/bugbot-triage"))
+            .expect("mkdir home skill");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.review_watch]\n\
+             prompt_file = \".tskmstr/prompts/review-watch.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/review-watch.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.review_watch].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn session_without_prompt_file_key_is_silent() {
+        let env = test_env();
+        // A create section carrying no prompt_file has nothing to resolve and
+        // no skill to probe: it must produce no finding at all.
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.create]\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
+    }
+
+    #[test]
+    fn session_with_present_prompt_file_is_clean() {
+        let env = test_env();
+        let prompt = env.repo_dir.join(".tskmstr/prompts/create.md");
+        std::fs::create_dir_all(prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&prompt, "/create-something").expect("write prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.create]\n\
+             prompt_file = \".tskmstr/prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
+    }
+
+    #[test]
     fn no_work_table_and_current_stamp_is_clean() {
         let env = test_env();
         write_repo_config(&env, "schema_version = 1\n");
