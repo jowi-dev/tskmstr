@@ -11,14 +11,20 @@
 //! Headless (`RunMode::Headless`):
 //!
 //! ```text
-//! opencode run --format json [--model <provider/model>] [--auto] -- <prompt>
+//! opencode run --format json [--model <provider/model>]
+//!     [--dangerously-skip-permissions] -- <prompt>
 //! ```
 //!
 //! Interactive (`RunMode::Interactive`, the default `opencode` TUI command):
 //!
 //! ```text
-//! opencode [--model <provider/model>] [--auto] --prompt <prompt>
+//! opencode [--model <provider/model>] --prompt <prompt>
 //! ```
+//!
+//! The TUI takes no permission flag at all: opencode 1.15.13 rejects
+//! unknown options before rendering, so the tmux-hosted window would die
+//! instantly. Headless bypass uses `--dangerously-skip-permissions`,
+//! 1.15.13's only CLI-level bypass.
 //!
 //! # Three deliberate divergences from `claude`
 //!
@@ -228,13 +234,16 @@ impl AgentRunner for OpencodeRunner {
     /// for the full contract; the permission-mode mapping, `max_turns`
     /// handling, and `settings_path` handling are documented inline below.
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
-        // Permission mapping (both modes): `None` or `Some("bypassPermissions")`
-        // is the only CLI-level bypass opencode has, so both map to `--auto`.
-        // Any other value is documented-ignored — opencode has no
-        // plan/acceptEdits analog; its own `permission` config governs, and a
-        // headless run auto-rejects any ask it isn't configured to allow
-        // rather than hanging.
-        let auto = matches!(
+        // Permission mapping: `None` or `Some("bypassPermissions")` is a
+        // bypass. Headless (`opencode run`) maps it to
+        // `--dangerously-skip-permissions` (1.15.13's only CLI-level
+        // bypass). Interactive maps it to *no flag at all*: the 1.15.13
+        // TUI has no permission flag, and an unknown one makes opencode
+        // exit before rendering — the tmux window just dies. Any other
+        // value is documented-ignored in both modes; opencode's own
+        // `permission` config governs, and a headless run auto-rejects
+        // any ask it isn't configured to allow rather than hanging.
+        let bypass = matches!(
             inputs.permission_mode.as_deref(),
             None | Some("bypassPermissions")
         );
@@ -249,8 +258,8 @@ impl AgentRunner for OpencodeRunner {
                     args.push("--model".to_string());
                     args.push(model);
                 }
-                if auto {
-                    args.push("--auto".to_string());
+                if bypass {
+                    args.push("--dangerously-skip-permissions".to_string());
                 }
                 args.push("--".to_string());
                 args.push(inputs.prompt);
@@ -259,16 +268,14 @@ impl AgentRunner for OpencodeRunner {
                 // Kept at args[0]/args[1] ("--prompt", prompt) rather than a
                 // bare positional prompt: opencode's interactive prompt is a
                 // flag value, not positional like claude's, which is exactly
-                // why this adapter overrides `tmux_command_line` instead of
-                // relying on the default impl's `args[0]` convention.
+                // why this adapter overrides `tmux_command_line` and
+                // `interactive_prompt` instead of relying on the default
+                // impls' `args[0]` convention.
                 args.push("--prompt".to_string());
                 args.push(inputs.prompt);
                 if let Some(model) = inputs.model {
                     args.push("--model".to_string());
                     args.push(model);
-                }
-                if auto {
-                    args.push("--auto".to_string());
                 }
             }
         }
