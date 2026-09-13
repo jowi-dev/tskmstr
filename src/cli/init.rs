@@ -2406,4 +2406,232 @@ mod tests {
             "launch-failure warning in: {rendered}"
         );
     }
+
+    // --- GH-47: thatch session prompt scaffolding ---
+
+    #[test]
+    fn fresh_yes_init_scaffolds_all_three_thatch_prompts_and_wires_prompt_file() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        // All three files must exist on disk.
+        for name in ["create", "review", "audit"] {
+            let path = repo_dir.join(format!(".tskmstr/prompts/{name}.md"));
+            assert!(
+                path.exists(),
+                ".tskmstr/prompts/{name}.md must be scaffolded, out: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+
+        // Config must wire prompt_file for all three sections.
+        let config = config::load(&env.paths).expect("written config should load");
+        assert!(
+            config.work.create.prompt_file.is_some(),
+            "[work.create].prompt_file must be set"
+        );
+        assert!(
+            config.work.audit.prompt_file.is_some(),
+            "[work.audit].prompt_file must be set"
+        );
+        assert!(
+            config.work.review_watch.prompt_file.is_some(),
+            "[work.review_watch].prompt_file must be set"
+        );
+
+        // Verify the prompt_file values reference the correct relative paths.
+        assert!(
+            config
+                .work
+                .create
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("create"),
+            "create prompt_file should reference create.md"
+        );
+        assert!(
+            config
+                .work
+                .review_watch
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("review"),
+            "review_watch prompt_file should reference review.md"
+        );
+        assert!(
+            config
+                .work
+                .audit
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("audit"),
+            "audit prompt_file should reference audit.md"
+        );
+    }
+
+    #[test]
+    fn scaffolded_thatch_files_contain_expected_content() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        // create.md: thatch memory recall + write-back + thatch-ticket-description skill
+        let create = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/create.md"))
+            .expect("create.md scaffolded");
+        assert!(
+            create.contains("thatch memory"),
+            "create.md must mention thatch memory: {create}"
+        );
+        assert!(
+            create.contains("thatch-ticket-description"),
+            "create.md must name the skill: {create}"
+        );
+        assert!(
+            create.contains("## Repo-specific context"),
+            "create.md must have the context marker: {create}"
+        );
+
+        // audit.md: thatch memory recall + write-back + thatch-ticket-description skill
+        let audit = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/audit.md"))
+            .expect("audit.md scaffolded");
+        assert!(
+            audit.contains("thatch memory"),
+            "audit.md must mention thatch memory: {audit}"
+        );
+        assert!(
+            audit.contains("thatch-ticket-description"),
+            "audit.md must name the skill: {audit}"
+        );
+        assert!(
+            audit.contains("## Repo-specific context"),
+            "audit.md must have the context marker: {audit}"
+        );
+
+        // review.md: thatch memory recall + write-back + thatch-review-* skills
+        let review = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/review.md"))
+            .expect("review.md scaffolded");
+        assert!(
+            review.contains("thatch memory"),
+            "review.md must mention thatch memory: {review}"
+        );
+        assert!(
+            review.contains("thatch-review-"),
+            "review.md must name a thatch-review-* skill: {review}"
+        );
+        assert!(
+            review.contains("## Repo-specific context"),
+            "review.md must have the context marker: {review}"
+        );
+    }
+
+    #[test]
+    fn existing_audit_prompt_is_left_alone_no_prompt_file_written() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Pre-write a config with [work.audit].prompt already set.
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(
+            repo_config,
+            "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.repo]\nrepo = \".\"\nbase_branch = \"main\"\nprompt_file = \".tskmstr/prompts/repo-lane.md\"\n\n[work.audit]\ndir = \".\"\nprompt = \"/custom-audit\"\n",
+        )
+        .expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        // Also write the lane prompt so the config is loadable.
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(
+            repo_dir.join(".tskmstr/prompts/repo-lane.md"),
+            "# lane\n",
+        )
+        .expect("write lane prompt");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        // [work.audit] must NOT have prompt_file added (no double-set).
+        let config = config::load(&env.paths).expect("config should load");
+        assert!(
+            config.work.audit.prompt_file.is_none(),
+            "[work.audit].prompt_file must not be set when prompt is already configured"
+        );
+
+        // The thatch audit prompt file must NOT be written.
+        let thatch_audit = repo_dir.join(".tskmstr/prompts/audit.md");
+        assert!(
+            !thatch_audit.exists(),
+            ".tskmstr/prompts/audit.md must not be scaffolded when prompt is already set"
+        );
+    }
+
+    #[test]
+    fn existing_review_watch_prompt_file_is_preserved_unchanged() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Pre-write a config with [work.review_watch].prompt_file already set.
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(
+            repo_config,
+            "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.repo]\nrepo = \".\"\nbase_branch = \"main\"\nprompt_file = \".tskmstr/prompts/repo-lane.md\"\n\n[work.review_watch]\ndir = \".\"\nprompt_file = \"custom-review.md\"\n",
+        )
+        .expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(
+            repo_dir.join(".tskmstr/prompts/repo-lane.md"),
+            "# lane\n",
+        )
+        .expect("write lane prompt");
+        // Write the custom review prompt file so config::load succeeds.
+        std::fs::write(repo_dir.join("custom-review.md"), "# custom review\n")
+            .expect("write custom review");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        // The existing prompt_file value must be preserved.
+        let config = config::load(&env.paths).expect("config should load");
+        assert_eq!(
+            config
+                .work
+                .review_watch
+                .prompt_file
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+            repo_dir.join("custom-review.md").to_string_lossy().to_string(),
+            "[work.review_watch].prompt_file must not be overwritten"
+        );
+
+        // The thatch review prompt file must NOT be written.
+        let thatch_review = repo_dir.join(".tskmstr/prompts/review.md");
+        assert!(
+            !thatch_review.exists(),
+            ".tskmstr/prompts/review.md must not be scaffolded when prompt_file is already set"
+        );
+    }
 }
