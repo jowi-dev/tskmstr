@@ -9,16 +9,19 @@ variant, one factory arm in `main.rs`'s `agent_runner_for`, a new
 
 ## The opencode CLI contract this adapter binds to
 
-Everything below was verified against opencode **v1.18.11** — the installed
-binary's embedded bundle and the `v1.18.11` tag of github.com/sst/opencode
-(`packages/opencode/src/cli/cmd/run.ts` is the whole JSON formatter; the
-docs site documents neither the event stream nor exit codes). Treat the
-event set as unstable across opencode versions.
+Everything below was verified against opencode **v1.15.13** — the version
+currently installed from nixpkgs and the one the adapter now targets.
+(The original verification pass ran against v1.18.11; a nix rebuild
+silently downgraded the binary to 1.15.13, whose CLI rejects `--auto`
+outright — opencode exited before rendering, so the tmux-hosted work
+window died instantly with its error output nowhere visible. That
+mismatch is why the contract below now pins the installed version.)
+Treat the event set as unstable across opencode versions.
 
 ### Headless (`RunMode::Headless`)
 
 ```text
-opencode run --format json [--model <provider/model>] [--auto] -- <prompt>
+opencode run --format json [--model <provider/model>] [--dangerously-skip-permissions] -- <prompt>
 ```
 
 - The prompt is positional; `--` guards against prompts starting with `-`
@@ -40,7 +43,7 @@ opencode run --format json [--model <provider/model>] [--auto] -- <prompt>
 ### Interactive (`RunMode::Interactive`)
 
 ```text
-opencode [--model <provider/model>] [--auto] --prompt <prompt>
+opencode [--model <provider/model>] --prompt <prompt>
 ```
 
 The default `opencode` command *is* the TUI; `--prompt` is placed in the
@@ -56,8 +59,9 @@ discovers Claude-format skills** (`.claude/skills/**/SKILL.md`, project and
 home) natively, so an existing tm skill set works unchanged.
 
 Because `--prompt` is a flag (not positional like claude's interactive
-prompt), the adapter overrides `AgentRunner::tmux_command_line` rather than
-relying on the default impl's prompt-at-`args[0]` convention.
+prompt), the adapter overrides `AgentRunner::tmux_command_line` and
+`AgentRunner::interactive_prompt` rather than relying on the default impls'
+prompt-at-`args[0]` convention.
 
 Resume: `opencode --session <id>` (`resume_command`).
 
@@ -66,7 +70,7 @@ Resume: `opencode --session <id>` (`resume_command`).
 | key | opencode mapping |
 |---|---|
 | `default_model` | `--model`, passed through verbatim in opencode's `provider/model` spelling (e.g. `anthropic/claude-sonnet-4-5`). **Absent means the flag is omitted** and opencode's own default-model resolution applies (config `model` key, then most-recently-used) — unlike claude's always-pass-`fable` convention, because a multi-provider CLI's default belongs to its own config. |
-| `permission_mode` | `bypassPermissions` (and absent, matching the issue #29 lane default) map to `--auto`, the only CLI-level bypass opencode has. **Any other value is documented-ignored**: no flag is passed, opencode's own `permission` config (or `OPENCODE_PERMISSION` env JSON) governs, and a headless run auto-REJECTS every permission ask it isn't configured to allow — it never hangs. There is no plan/acceptEdits analog. |
+| `permission_mode` | `bypassPermissions` (and absent, matching the issue #29 lane default) map to `--dangerously-skip-permissions` on **headless** `opencode run` only — the TUI has no permission flag at all, so interactive argv carries none (passing an unknown flag makes the TUI exit before rendering, killing a tmux-hosted window instantly). **Any other value is documented-ignored**: no flag is passed, opencode's own `permission` config (or `OPENCODE_PERMISSION` env JSON) governs, and a headless run auto-REJECTS every permission ask it isn't configured to allow — it never hangs. There is no plan/acceptEdits analog. |
 | `max_turns` | **Documented-ignored.** opencode has no CLI turn budget; the only equivalent is per-agent `steps` in the user's own opencode config (`agent.<name>.steps` + `--agent`), which tm doesn't own. |
 
 ### Telemetry (deferred parts)
@@ -98,9 +102,9 @@ Deliberately absent, tracked by the follow-up telemetry issue:
 ### Session identity
 
 `session_env_vars` names `OPENCODE_SESSION_ID` / `OPENCODE_PID`. opencode
-1.18.11 exports `OPENCODE=1` and `OPENCODE_PID` into its own process env at
-startup (inherited by tool subprocesses) but **no session-id variable** —
-verified against the full source tree. `SessionEnv::from_process_env`
+exports `OPENCODE=1` and `OPENCODE_PID` into its own process env at
+startup (verified against the 1.18.11 source tree; not re-verified on
+1.15.13) but **no session-id variable** — `SessionEnv::from_process_env`
 degrades absent vars to `None` by design, so the session-id name is a
 forward-compatible placeholder that starts working if opencode ever sets
 it. `env_remove` is empty: claude's billing-safety strip exists because

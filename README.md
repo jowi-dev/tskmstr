@@ -1463,10 +1463,12 @@ runner-neutral `[work]` keys map as follows: `default_model` passes
 through as `--model` in opencode's `provider/model` spelling (e.g.
 `anthropic/claude-sonnet-4-5`), and when unset the flag is omitted so
 opencode's own configured default model applies; `default_permission_mode
-= "bypassPermissions"` (and the unset default) maps to opencode's
-`--auto`, while any other value passes no flag at all — opencode's own
-`permission` config governs, and a headless run auto-rejects (never hangs
-on) any permission it isn't configured to allow; `default_max_turns` is
+= "bypassPermissions"` (and the unset default) maps to
+`--dangerously-skip-permissions` on headless `opencode run` runs only —
+the TUI accepts no permission flag at all, so interactive sessions pass
+none — while any other value passes no flag in either mode; opencode's
+own `permission` config governs, and a headless run auto-rejects (never
+hangs on) any permission it isn't configured to allow; `default_max_turns` is
 **ignored** — opencode has no CLI turn budget (its per-agent `steps`
 config is the closest analog, and it belongs to your opencode config, not
 tm). opencode deploys no tm telemetry hooks (run start/finish recording,
