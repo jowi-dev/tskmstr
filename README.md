@@ -31,14 +31,23 @@ tm init
 It asks for the ticket backend (defaulting to `github` when an `origin`
 remote is detected, with the slug pre-filled), writes the repo-local
 `.tskmstr.toml`, scaffolds a work lane (`repo = "."`, an explicit
-`base_branch`, and an optional starter prompt file at
+`base_branch`, an optional starter prompt file at
 `.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
-tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md`),
+tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md` — and
+the lane's `model`, runner-spelled, so a run doesn't silently fall back to
+the agent CLI's own default model; see `docs/plans/gh-51-lane-model.md`),
 creates the GitHub backend's `tm:status/*` labels, optionally fills in
 `[work.audit]` / `[work.review_watch]`, asks which AI agent runner tm
 launches (`[agent] runner`; the default stays implicit), and offers `tm
 work hooks install --user` when the session hooks are absent — everything
 `tm board` and the board's `w`/`a` keys need.
+
+The model question adapts to the selected runner: `claude` takes a bare
+model name and `--yes` writes its always-passed default (`fable`), while
+`opencode` takes a `provider/model` spelling (e.g. `venice/z-ai-glm-5-3`)
+and, having no safe universal default across providers, leaves `model`
+unset under `--yes` and prints that the run will use opencode's own default
+model. An empty interactive answer likewise leaves the key unset.
 
 The scaffolded lane prompt is a generic skeleton, so after everything is
 written the wizard offers to launch an agent-assisted setup session
