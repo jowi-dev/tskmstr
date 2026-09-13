@@ -34,18 +34,23 @@ remote is detected, with the slug pre-filled), writes the repo-local
 `base_branch`, and an optional starter prompt file at
 `.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
 tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md`),
-creates the GitHub backend's `tm:status/*` labels, optionally fills in
-`[work.audit]` / `[work.review_watch]`, asks which AI agent runner tm
+creates the GitHub backend's `tm:status/*` labels, offers to configure the
+board's `[work.create]` / `[work.review_watch]` / `[work.audit]` sessions
+— scaffolding a thatch prompt file at `.tskmstr/prompts/{create,review,audit}.md`
+and wiring each section's `prompt_file` at it, so those sessions default to
+the thatch skill + memory workflow (a section that already sets its own
+`prompt` or `prompt_file` is left untouched) — asks which AI agent runner tm
 launches (`[agent] runner`; the default stays implicit), and offers `tm
 work hooks install --user` when the session hooks are absent — everything
-`tm board` and the board's `w`/`a` keys need.
+`tm board` and the board's `w`/`c`/`a` keys need.
 
 The scaffolded lane prompt is a generic skeleton, so after everything is
 written the wizard offers to launch an agent-assisted setup session
 (GitHub issue #30): an interactive session, in the repo root, prompted to
 explore the repo, verify the build/test/lint/format gates that actually
-exist here, fill the scaffolded lane prompt out in place, and author any
-session skills the config references but that exist nowhere on disk —
+exist here, fill the scaffolded lane and thatch session prompts out in
+place, and author any session skills the config references but that exist
+nowhere on disk —
 asking you the things the repo can't answer (deploy rules, forbidden
 paths, review conventions). Declining keeps the static skeleton; review
 and commit whatever the session writes.
