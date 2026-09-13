@@ -170,6 +170,28 @@ impl AgentRunner for ClaudeRunner {
         base.join(".claude/skills")
     }
 
+    /// `<base>/.claude/agents/<name>.md` — claude discovers subagent
+    /// definitions under `.claude/agents/`.
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
+        base.join(".claude/agents").join(format!("{name}.md"))
+    }
+
+    /// A `.claude/agents/<name>.md` definition: claude's frontmatter carries
+    /// `name`, `description`, and `model`, then the shared delegation body.
+    fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String {
+        let model = model.unwrap_or(crate::agent::SUBAGENT_MODEL_PLACEHOLDER);
+        format!(
+            "---\n\
+             name: {name}\n\
+             description: Implementation subagent for delegated coding, test-writing, and mechanical edits.\n\
+             model: {model}\n\
+             ---\n\
+             \n\
+             {}",
+            crate::agent::SUBAGENT_DEFINITION_BODY
+        )
+    }
+
     /// Build the [`AgentInvocation`] for one run from already-resolved
     /// [`InvocationInputs`], applying the same model/max-turns/
     /// permission-mode defaults `work.ml`'s `run_lane` applies when a
@@ -487,6 +509,37 @@ mod tests {
     #[test]
     fn claude_runner_name_is_claude() {
         assert_eq!(ClaudeRunner.name(), "claude");
+    }
+
+    #[test]
+    fn agent_definition_path_is_dot_claude_agents() {
+        assert_eq!(
+            ClaudeRunner.agent_definition_path(Path::new("/repo"), "impl"),
+            PathBuf::from("/repo/.claude/agents/impl.md")
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_declares_name_and_model_frontmatter() {
+        let def = ClaudeRunner.agent_definition_template("impl", Some("claude-haiku-4-5"));
+        assert!(def.contains("name: impl"), "name frontmatter: {def}");
+        assert!(
+            def.contains("model: claude-haiku-4-5"),
+            "model frontmatter: {def}"
+        );
+        assert!(
+            def.contains("Do not create commits"),
+            "house delegation constraint in body: {def}"
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_uses_a_placeholder_when_model_is_none() {
+        let def = ClaudeRunner.agent_definition_template("impl", None);
+        assert!(
+            def.contains("model: TODO-set-the-subagent-model"),
+            "placeholder model: {def}"
+        );
     }
 
     #[test]
