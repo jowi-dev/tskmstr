@@ -248,7 +248,7 @@ mod tests {
             "starter template: {prompt}"
         );
         assert!(
-            read_repo_config(&env).contains("schema_version = 1"),
+            read_repo_config(&env).contains("schema_version = 2"),
             "stamp bumped: {}",
             read_repo_config(&env)
         );
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn up_to_date_repo_writes_nothing() {
         let env = test_env();
-        let config = "schema_version = 1\n";
+        let config = "schema_version = 2\n";
         write_repo_config(&env, config);
 
         let runner = ClaudeRunner;
@@ -338,7 +338,7 @@ mod tests {
 
         let written = read_repo_config(&env);
         assert!(
-            written.contains("schema_version = 1"),
+            written.contains("schema_version = 2"),
             "stamp bumped: {written}"
         );
         assert!(
@@ -398,7 +398,7 @@ mod tests {
             "tm never authors user-supplied skill content"
         );
         assert!(
-            read_repo_config(&env).contains("schema_version = 1"),
+            read_repo_config(&env).contains("schema_version = 2"),
             "the stamp gap is independent of the skill gap"
         );
     }
