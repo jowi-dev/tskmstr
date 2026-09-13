@@ -102,6 +102,11 @@ pub fn run_update(
             DriftFinding::StampNewer { .. } => newer_stamp = true,
             // Stamped below, outside the loop, so it happens exactly once.
             DriftFinding::StampMissing | DriftFinding::StampStale { .. } => {}
+            // A session's `prompt_file` points at a file the operator
+            // authors (the #42 "bring your own prompt" feature); tm never
+            // scaffolds its content, so this is reported as remaining drift
+            // rather than fixed additively.
+            DriftFinding::MissingSessionPrompt { .. } => {}
             // Skill content is user-supplied (tm never ships or authors it);
             // handed to the setup session, and otherwise reported as
             // remaining drift.

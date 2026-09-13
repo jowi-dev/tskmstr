@@ -7,8 +7,9 @@
 //!   one, or a newer one?
 //! - **The same structural presence checks `tm init` runs and discards**:
 //!   does every configured lane have a prompt file where a run would look
-//!   for it, and does every configured session's leading `/skill` exist
-//!   somewhere this binary would find it?
+//!   for it, does every configured session's `prompt_file` (when set) exist
+//!   where its launcher would read it, and does every configured session's
+//!   leading `/skill` exist somewhere this binary would find it?
 //!
 //! Both checks are presence-only. `tm check` never opens a scaffolded
 //! asset's *contents* — lane prompts and skills are meant to be edited after
@@ -96,6 +97,12 @@ pub enum DriftFinding {
     /// `audit_existing_lane_prompts` runs on every re-run, but reported
     /// instead of offered a scaffold.
     MissingLanePrompt { lane: String, path: PathBuf },
+    /// A configured session's `prompt_file` doesn't exist where its launcher
+    /// would read it — the same missing file `tm work`'s audit/create/
+    /// review_watch launchers turn into a launch-time error (GitHub issue
+    /// #42, PR #46), reported ahead of the launch instead. `session` names
+    /// which `[work.*]` section it came from (e.g. `"work.create"`).
+    MissingSessionPrompt { session: String, path: PathBuf },
     /// A configured session's prompt leads with a `/skill` invocation that
     /// exists neither repo-locally nor at the user level. `session` names
     /// which `[work.*]` section it came from (e.g. `"work.audit"`).
@@ -134,6 +141,12 @@ impl std::fmt::Display for DriftFinding {
             DriftFinding::MissingLanePrompt { lane, path } => write!(
                 f,
                 "lane `{lane}` has no prompt file at {} (a lane run fails preflight without it)",
+                path.display()
+            ),
+            DriftFinding::MissingSessionPrompt { session, path } => write!(
+                f,
+                "[{session}].prompt_file points at {}, which doesn't exist \
+                 (the session fails to launch without it)",
                 path.display()
             ),
             DriftFinding::MissingSkill {
@@ -246,6 +259,7 @@ pub(crate) fn collect_findings(
     let mut findings = Vec::new();
     findings.extend(stamp_finding(doc));
     findings.extend(lane_findings(ctx, doc, repo_dir));
+    findings.extend(session_prompt_findings(ctx, doc, repo_dir));
     findings.extend(session_findings(ctx, doc, repo_dir));
     findings
 }
@@ -292,6 +306,39 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
             } else {
                 Some(DriftFinding::MissingLanePrompt {
                     lane: lane.to_string(),
+                    path: resolved,
+                })
+            }
+        })
+        .collect()
+}
+
+/// The three `[work.*]` session sections that carry a `prompt_file`: audit,
+/// create, and review_watch. PR #46 (GitHub issue #42) made a missing file
+/// here a launch-time error for each; `tm check` reports it ahead of that.
+const SESSION_PROMPT_TABLES: [&str; 3] = ["audit", "create", "review_watch"];
+
+/// The session-prompt half of the report: for each of `[work.audit]`,
+/// `[work.create]`, and `[work.review_watch]` that sets a `prompt_file`,
+/// resolve it against the repo the same way merge-time resolution and the
+/// lane prompt-file check do ([`resolve_repo_relative`]) and flag a path
+/// that doesn't exist. A section without the key resolves nothing and is
+/// silent. Sections are visited in `SESSION_PROMPT_TABLES` order.
+fn session_prompt_findings(
+    ctx: &CheckContext,
+    doc: &DocumentMut,
+    repo_dir: &Path,
+) -> Vec<DriftFinding> {
+    SESSION_PROMPT_TABLES
+        .iter()
+        .filter_map(|table| {
+            let raw = str_at(doc, &["work", table, "prompt_file"])?;
+            let resolved = resolve_repo_relative(raw, repo_dir, ctx.home);
+            if resolved.exists() {
+                None
+            } else {
+                Some(DriftFinding::MissingSessionPrompt {
+                    session: format!("work.{table}"),
                     path: resolved,
                 })
             }
