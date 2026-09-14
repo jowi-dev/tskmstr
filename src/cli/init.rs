@@ -242,7 +242,7 @@ pub fn run_init(
         }
     }
 
-    let scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
+    let lane_scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
     let audit_missing_skill = session_step(
         ctx,
         yes,
@@ -283,10 +283,19 @@ pub fn run_init(
         )?;
 
     let tasks = SetupTasks {
-        lane_prompts: scaffolds.iter().map(|(path, _)| path.clone()).collect(),
+        lane_prompts: lane_scaffolds
+            .prompts
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect(),
         missing_skills: [audit_missing_skill, review_watch_missing_skill]
             .into_iter()
             .flatten()
+            .collect(),
+        subagent_defs: lane_scaffolds
+            .subagent_defs
+            .iter()
+            .map(|(path, _)| path.clone())
             .collect(),
     };
 
@@ -305,7 +314,11 @@ pub fn run_init(
         return Ok(());
     }
 
-    for (path, contents) in scaffolds {
+    for (path, contents) in lane_scaffolds
+        .prompts
+        .into_iter()
+        .chain(lane_scaffolds.subagent_defs)
+    {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -389,7 +402,11 @@ pub(crate) fn offer_agent_setup(
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    if yes || (tasks.lane_prompts.is_empty() && tasks.missing_skills.is_empty()) {
+    if yes
+        || (tasks.lane_prompts.is_empty()
+            && tasks.missing_skills.is_empty()
+            && tasks.subagent_defs.is_empty())
+    {
         return Ok(());
     }
 
@@ -478,6 +495,22 @@ fn setup_session_prompt(tasks: &SetupTasks) -> String {
         );
     }
 
+    if !tasks.subagent_defs.is_empty() {
+        prompt.push_str("\n## Subagent definitions\n\n");
+        for path in &tasks.subagent_defs {
+            prompt.push_str(&format!(
+                "- Confirm/fill out {} in place.\n",
+                path.display()
+            ));
+        }
+        prompt.push_str(
+            "\nSet the `model` frontmatter to the model delegated work should run as \
+             (replace any placeholder), keep the house delegation constraints (no \
+             further sub-agents, no commits), and make sure the lane prompt delegates \
+             to this agent by name.\n",
+        );
+    }
+
     prompt.push_str(
         "\nWhen done, summarize what was written and remind the operator to review \
          and commit the generated files.\n",
@@ -527,6 +560,10 @@ pub(crate) struct SetupTasks {
     pub(crate) lane_prompts: Vec<PathBuf>,
     /// Session skills to author.
     pub(crate) missing_skills: Vec<MissingSkill>,
+    /// Resolved paths of subagent definition files scaffolded this run
+    /// (GitHub issue #52) — the setup session confirms/fills their `model`
+    /// frontmatter and delegation body against the repo's real conventions.
+    pub(crate) subagent_defs: Vec<PathBuf>,
 }
 
 /// One missing session skill: the `/name` token a session prompt leads with,
@@ -743,12 +780,22 @@ fn ask_required(
     }
 }
 
+/// The starter assets a [`lane_step`] run produces: lane-prompt skeletons
+/// (a newly configured lane's, plus any already-configured lane whose prompt
+/// file is missing — see [`audit_existing_lane_prompts`]) and subagent
+/// definition files (GitHub issue #52). Each is a `(path, contents)` pair
+/// [`run_init`] writes after the config is committed.
+#[derive(Default)]
+struct LaneScaffolds {
+    prompts: Vec<(PathBuf, String)>,
+    subagent_defs: Vec<(PathBuf, String)>,
+}
+
 /// Ask about a work lane and write it into `doc`: `repo = "."` by default,
 /// an explicit `base_branch` (the `origin/HEAD` fallback fails on clones
-/// where that ref was never set), and a `prompt_file`. Returns the starter
-/// prompts to scaffold — one for a newly configured lane, plus one for each
-/// already-configured lane whose prompt file is missing (see
-/// [`audit_existing_lane_prompts`]).
+/// where that ref was never set), a `prompt_file`, and an optional
+/// delegation `subagent` (GitHub issue #52). Returns the starter assets to
+/// scaffold — see [`LaneScaffolds`].
 fn lane_step(
     ctx: &InitContext,
     yes: bool,
@@ -756,7 +803,7 @@ fn lane_step(
     repo_config_path: &Path,
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
-) -> Result<Vec<(PathBuf, String)>, InitCliError> {
+) -> Result<LaneScaffolds, InitCliError> {
     let repo_dir = repo_config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -769,7 +816,7 @@ fn lane_step(
         .map(|lanes| lanes.iter().map(|(name, _)| name.to_string()).collect())
         .unwrap_or_default();
 
-    let mut scaffolds = Vec::new();
+    let mut scaffolds = LaneScaffolds::default();
     let wanted = if existing_lanes.is_empty() {
         ask_confirm(
             yes,
@@ -781,7 +828,7 @@ fn lane_step(
         writeln!(out, "Existing lanes: {}", existing_lanes.join(", "))?;
         // Before the add/update question, since declining it is the common
         // re-run answer and must not skip the check.
-        scaffolds.extend(audit_existing_lane_prompts(
+        scaffolds.prompts.extend(audit_existing_lane_prompts(
             ctx,
             yes,
             doc,
@@ -857,12 +904,150 @@ fn lane_step(
     )?;
 
     let resolved = resolve_repo_relative(&prompt_file, &repo_dir, ctx.home);
-    if !resolved.exists() {
-        scaffolds.extend(offer_lane_prompt(
-            yes, prompter, out, &name, &resolved, false,
-        )?);
+    let mut new_prompt = if !resolved.exists() {
+        offer_lane_prompt(yes, prompter, out, &name, &resolved, false)?
+    } else {
+        None
+    };
+
+    // Delegation subagent (GitHub issue #52). When configured, the model
+    // lives in the scaffolded definition's frontmatter (an owned asset), the
+    // lane records only the agent's name, and the freshly scaffolded lane
+    // prompt gains a delegation section pointing at it by name.
+    if let Some(choice) = offer_subagent(
+        ctx,
+        yes,
+        doc,
+        &repo_dir,
+        &name,
+        repo_config_path,
+        prompter,
+        out,
+    )? {
+        if let Some((_, contents)) = new_prompt.as_mut() {
+            contents.push_str(&lane_delegation_section(&choice.agent_name));
+        }
+        if let Some(def) = choice.scaffold {
+            scaffolds.subagent_defs.push(def);
+        }
     }
+
+    scaffolds.prompts.extend(new_prompt);
     Ok(scaffolds)
+}
+
+/// The outcome of [`offer_subagent`] when the operator opts into a delegation
+/// subagent for a lane.
+struct SubagentChoice {
+    /// The agent's name (e.g. `impl`), for the lane prompt's delegation
+    /// section. Recorded in the lane's `subagent` config key.
+    agent_name: String,
+    /// The `(path, contents)` definition to scaffold, or `None` when a
+    /// definition already exists at that path (never overwritten).
+    scaffold: Option<(PathBuf, String)>,
+}
+
+/// Offer to configure a delegation subagent for the just-configured lane
+/// (GitHub issue #52): ask for the agent name and its model, record the
+/// name in the lane's `subagent` key, and scaffold the runner's subagent
+/// definition (opencode's `.opencode/agent/<name>.md` or claude's
+/// `.claude/agents/<name>.md`) with the declared model in its `model`
+/// frontmatter.
+///
+/// Skipped under `yes`: a scripted run has no way to declare a model, and a
+/// model string is the one thing the definition can't sensibly default. An
+/// existing definition file is never overwritten — the name is still
+/// recorded, but no scaffold is returned.
+#[allow(clippy::too_many_arguments)]
+fn offer_subagent(
+    ctx: &InitContext,
+    yes: bool,
+    doc: &mut DocumentMut,
+    repo_dir: &Path,
+    lane: &str,
+    repo_config_path: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<Option<SubagentChoice>, InitCliError> {
+    if yes {
+        return Ok(None);
+    }
+    let existing = str_at(doc, &["work", "lanes", lane, "subagent"]).map(str::to_string);
+    if !ask_confirm(
+        yes,
+        prompter,
+        "Configure a delegation subagent for this lane (scaffolds an agent definition)?",
+        existing.is_some(),
+    )? {
+        return Ok(None);
+    }
+
+    let agent_name = ask_required(
+        yes,
+        prompter,
+        out,
+        "Subagent name",
+        &existing.unwrap_or_else(|| "impl".to_string()),
+        "the subagent name",
+    )?;
+    let model = ask_required(
+        yes,
+        prompter,
+        out,
+        &format!(
+            "Subagent model (the model {} runs delegated work as)",
+            ctx.runner.display_name()
+        ),
+        "",
+        "the subagent model",
+    )?;
+
+    set_str(
+        doc,
+        &["work", "lanes", lane],
+        "subagent",
+        &agent_name,
+        repo_config_path,
+    )?;
+
+    let def_path = ctx.runner.agent_definition_path(repo_dir, &agent_name);
+    let scaffold = if def_path.exists() {
+        writeln!(
+            out,
+            "subagent definition already exists at {}; left unchanged.",
+            def_path.display()
+        )?;
+        None
+    } else {
+        Some((
+            def_path,
+            ctx.runner
+                .agent_definition_template(&agent_name, Some(&model)),
+        ))
+    };
+    Ok(Some(SubagentChoice {
+        agent_name,
+        scaffold,
+    }))
+}
+
+/// The delegation section appended to a scaffolded lane prompt when a
+/// subagent is configured (GitHub issue #52): delegates the mechanical work
+/// to the named agent, keeping the model and policy together in the owned
+/// definition rather than naming a model string in prose.
+///
+/// `pub(crate)`: shared with `tm update` (`src/cli/update.rs`), which appends
+/// the same section when it scaffolds a missing lane prompt for a lane that
+/// already declares a subagent.
+pub(crate) fn lane_delegation_section(agent: &str) -> String {
+    format!(
+        "\n## Delegation\n\
+         \n\
+         Delegate implementation, test-writing, and mechanical edits to the `{agent}`\n\
+         subagent (defined in this repo's agent directory, with its own `model`). Keep\n\
+         planning, review, and commits in this session; the subagent must not commit or\n\
+         spawn further agents.\n"
+    )
 }
 
 /// Check every already-configured lane for a missing prompt file and offer to
@@ -1271,6 +1456,81 @@ mod tests {
         assert!(env.paths.global.exists(), "placeholder global config");
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("tm board"), "board hint in: {rendered}");
+    }
+
+    #[test]
+    fn github_flow_configures_subagent_and_scaffolds_definition() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        let mut prompter = FakePrompter::new()
+            .with_line("github") // backend
+            .with_line("jowi-dev/widget") // slug
+            .with_line("widget") // lane name
+            .with_line(".") // lane repo
+            .with_line("main") // base branch
+            .with_line(".tskmstr/prompts/widget-lane.md") // prompt_file
+            .with_line("impl") // subagent name
+            .with_line("claude-haiku-4-5") // subagent model
+            .with_confirm(true) // create labels
+            .with_confirm(true) // configure work lane
+            .with_confirm(true) // scaffold lane prompt
+            .with_confirm(true) // configure subagent
+            .with_confirm(false) // audit
+            .with_confirm(false) // review_watch
+            .with_confirm(false); // decline agent setup session
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let def = repo_dir.join(".claude/agents/impl.md");
+        let contents = std::fs::read_to_string(&def).expect("subagent def written");
+        assert!(
+            contents.contains("model: claude-haiku-4-5"),
+            "declared model in frontmatter: {contents}"
+        );
+        assert!(
+            contents.contains("name: impl"),
+            "name frontmatter: {contents}"
+        );
+
+        let prompt = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/widget-lane.md"))
+            .expect("lane prompt scaffolded");
+        assert!(
+            prompt.contains("Delegation") && prompt.contains("`impl`"),
+            "delegation section names the agent: {prompt}"
+        );
+
+        let cfg = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("config");
+        assert!(
+            cfg.contains("subagent = \"impl\""),
+            "lane records the subagent reference: {cfg}"
+        );
+    }
+
+    #[test]
+    fn github_flow_yes_scaffolds_no_subagent() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(
+            !repo_dir.join(".claude/agents/impl.md").exists(),
+            "--yes declares no model, so no subagent is scaffolded"
+        );
+        let cfg = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("config");
+        assert!(
+            !cfg.contains("subagent"),
+            "--yes writes no subagent key: {cfg}"
+        );
     }
 
     #[test]
@@ -2274,11 +2534,12 @@ mod tests {
         ctx.setup_launcher = &panicking_setup_launcher;
 
         // Confirms pop in order: labels true, lane true, scaffold-prompt
-        // true, audit false, review-watch false, setup false.
+        // true, subagent false, audit false, review-watch false, setup false.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false);
@@ -2363,12 +2624,13 @@ mod tests {
         };
         ctx.setup_launcher = &launcher;
 
-        // Confirms: labels true, lane true (scaffold default true), audit
-        // true, review-watch false, setup true.
+        // Confirms: labels true, lane true (scaffold default true), subagent
+        // false, audit true, review-watch false, setup true.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(true)
             .with_confirm(false)
             .with_confirm(true);

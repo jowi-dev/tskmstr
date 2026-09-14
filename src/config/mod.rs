@@ -524,6 +524,15 @@ pub struct RawLaneConfig {
     /// Permission mode for this lane's driver process, overriding
     /// [`RawWorkConfig::default_permission_mode`].
     pub permission_mode: Option<String>,
+    /// Name of the delegation subagent this lane's prompt delegates to
+    /// (GitHub issue #52). A reference to a scaffolded agent *definition*
+    /// (opencode's `.opencode/agent/<name>.md` or claude's
+    /// `.claude/agents/<name>.md`, which carries the subagent's own `model`),
+    /// not a runtime driver setting — it is consumed by `tm init`/`tm
+    /// check`/`tm update` reading the raw config document to detect and
+    /// additively fix a missing definition, and intentionally not surfaced
+    /// on [`LaneConfig`].
+    pub subagent: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
