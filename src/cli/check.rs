@@ -96,6 +96,16 @@ pub enum DriftFinding {
     /// `audit_existing_lane_prompts` runs on every re-run, but reported
     /// instead of offered a scaffold.
     MissingLanePrompt { lane: String, path: PathBuf },
+    /// A lane declares a delegation `subagent` (GitHub issue #52) but the
+    /// runner's agent-definition file that name points at doesn't exist —
+    /// the delegation section in its prompt names an agent nothing defines.
+    /// Structural, like [`DriftFinding::MissingLanePrompt`]: reported only
+    /// for a lane that opted into a subagent, never for one that didn't.
+    MissingSubagentDef {
+        lane: String,
+        agent: String,
+        path: PathBuf,
+    },
     /// A configured session's prompt leads with a `/skill` invocation that
     /// exists neither repo-locally nor at the user level. `session` names
     /// which `[work.*]` section it came from (e.g. `"work.audit"`).
@@ -134,6 +144,12 @@ impl std::fmt::Display for DriftFinding {
             DriftFinding::MissingLanePrompt { lane, path } => write!(
                 f,
                 "lane `{lane}` has no prompt file at {} (a lane run fails preflight without it)",
+                path.display()
+            ),
+            DriftFinding::MissingSubagentDef { lane, agent, path } => write!(
+                f,
+                "lane `{lane}` delegates to subagent `{agent}` but has no definition at {} \
+                 (delegation resolves to no declared model)",
                 path.display()
             ),
             DriftFinding::MissingSkill {
@@ -285,16 +301,28 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
 
     lanes
         .iter()
-        .filter_map(|(lane, _)| {
+        .flat_map(|(lane, _)| {
+            let mut findings = Vec::new();
             let resolved = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
-            if resolved.exists() {
-                None
-            } else {
-                Some(DriftFinding::MissingLanePrompt {
+            if !resolved.exists() {
+                findings.push(DriftFinding::MissingLanePrompt {
                     lane: lane.to_string(),
                     path: resolved,
-                })
+                });
             }
+            // A lane that opted into a delegation subagent (GitHub issue #52)
+            // must have the runner's agent-definition file the name points at.
+            if let Some(agent) = str_at(doc, &["work", "lanes", lane, "subagent"]) {
+                let def = ctx.runner.agent_definition_path(repo_dir, agent);
+                if !def.exists() {
+                    findings.push(DriftFinding::MissingSubagentDef {
+                        lane: lane.to_string(),
+                        agent: agent.to_string(),
+                        path: def,
+                    });
+                }
+            }
+            findings
         })
         .collect()
 }
@@ -586,6 +614,71 @@ mod tests {
                 lane: "widget".to_string(),
                 path: expected_path,
             }]
+        );
+    }
+
+    #[test]
+    fn lane_with_subagent_key_but_missing_definition_is_reported() {
+        let env = test_env();
+        // The lane's prompt file exists, so the only drift is the missing
+        // subagent definition the `subagent` key points at.
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".claude/agents/impl.md");
+        assert_eq!(
+            findings,
+            vec![DriftFinding::MissingSubagentDef {
+                lane: "widget".to_string(),
+                agent: "impl".to_string(),
+                path: expected_path.clone(),
+            }]
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("impl") && rendered.contains(&expected_path.display().to_string()),
+            "subagent finding in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_with_subagent_key_and_present_definition_is_clean() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        let def = env.repo_dir.join(".claude/agents/impl.md");
+        std::fs::create_dir_all(def.parent().unwrap()).expect("mkdir agents");
+        std::fs::write(&def, "---\nname: impl\n---\n").expect("write def");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(
+            findings.is_empty(),
+            "definition present, no drift: {findings:?}"
         );
     }
 
