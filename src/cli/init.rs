@@ -245,6 +245,8 @@ pub fn run_init(
     let mut scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
     let lane_prompt_paths: Vec<PathBuf> = scaffolds.iter().map(|(path, _)| path.clone()).collect();
 
+    status_on_pr_step(backend, yes, &mut doc, &repo_config_path, prompter, out)?;
+
     let sections = [
         SessionSection {
             table: "create",
@@ -939,6 +941,78 @@ fn ask_runner(
     Ok(())
 }
 
+/// The GitHub-backend default for `status_on_pr`: the "In Review" workflow
+/// status whose `tm:status/in-review` label `tm init` just created, so the
+/// value names a status the board already has.
+const GITHUB_STATUS_ON_PR_DEFAULT: &str = "In Review";
+
+/// Ask whether to wire `status_on_pr` — the workflow status a ticket moves to
+/// when `tm pr create` opens its PR — into the repo-local config (GitHub issue
+/// #50). Without it a freshly onboarded repo opens PRs that associate tickets
+/// correctly yet leave the board unmoved, because
+/// [`config::Config::status_on_pr`] defaults to "leave the ticket alone".
+///
+/// GitHub offers "In Review" (the label init just created) as the default;
+/// other backends prompt for a free-text status name with no default. Under
+/// `--yes`, GitHub writes the default non-interactively and other backends are
+/// skipped — there is no safe status name to assume for them. An already-set
+/// value is offered as the default and never silently overwritten.
+fn status_on_pr_step(
+    backend: BackendKind,
+    yes: bool,
+    doc: &mut DocumentMut,
+    repo_config_path: &Path,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> Result<(), InitCliError> {
+    let existing = str_at(doc, &["status_on_pr"]).map(str::to_string);
+    let is_github = matches!(backend, BackendKind::Github);
+
+    if yes {
+        // Scripted setup takes the GitHub default and skips other backends,
+        // which have no safe status name to assume. An already-set value is
+        // left as-is.
+        if is_github && existing.is_none() {
+            set_str(
+                doc,
+                &[],
+                "status_on_pr",
+                GITHUB_STATUS_ON_PR_DEFAULT,
+                repo_config_path,
+            )?;
+        }
+        return Ok(());
+    }
+
+    let default_confirm = existing.is_some() || is_github;
+    if !ask_confirm(
+        false,
+        prompter,
+        "Wire status_on_pr, so tickets move to this status when `tm pr create` opens their PR?",
+        default_confirm,
+    )? {
+        return Ok(());
+    }
+
+    let default_status = existing.unwrap_or_else(|| {
+        if is_github {
+            GITHUB_STATUS_ON_PR_DEFAULT.to_string()
+        } else {
+            String::new()
+        }
+    });
+    let status = ask_required(
+        false,
+        prompter,
+        out,
+        "Status to move a ticket to when its PR opens",
+        &default_status,
+        "the status_on_pr status",
+    )?;
+    set_str(doc, &[], "status_on_pr", &status, repo_config_path)?;
+    Ok(())
+}
+
 /// Prompt for a required value, re-prompting while the answer is empty. With
 /// `yes`, take `default` — or fail if there is no default to take.
 fn ask_required(
@@ -1590,6 +1664,129 @@ mod tests {
             "label warning in: {rendered}"
         );
         config::load(&env.paths).expect("config written despite label failure");
+    }
+
+    #[test]
+    fn github_flow_wires_status_on_pr_in_review_by_default() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // No queued answers: the status_on_pr question takes its GitHub
+        // default of "In Review" (the label init just created).
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.status_on_pr.as_deref(), Some("In Review"));
+    }
+
+    #[test]
+    fn github_flow_yes_wires_status_on_pr_in_review() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        assert!(prompter.messages.is_empty(), "no prompts under --yes");
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.status_on_pr.as_deref(), Some("In Review"));
+    }
+
+    #[test]
+    fn github_flow_custom_status_on_pr_is_written() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Decline the lane so the prompt_line queue is just backend, slug, and
+        // the status_on_pr status.
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("Ready for Review")
+            .with_confirm(true) // create labels
+            .with_confirm(false) // configure a work lane
+            .with_confirm(true); // wire status_on_pr
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.status_on_pr.as_deref(), Some("Ready for Review"));
+    }
+
+    #[test]
+    fn github_flow_declining_status_on_pr_leaves_it_unset() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true) // create labels
+            .with_confirm(false) // configure a work lane
+            .with_confirm(false); // decline wiring status_on_pr
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.status_on_pr, None);
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            !repo_text.contains("status_on_pr"),
+            "declined key stays unset: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn jira_flow_yes_skips_status_on_pr() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = jira_ctx(&env, &gh, &keychain);
+        write_jira_global(&env.paths.global);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            !repo_text.contains("status_on_pr"),
+            "no scriptable default for Jira under --yes: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn jira_flow_free_text_status_on_pr_is_written() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::with_token("existing-token");
+        let ctx = jira_ctx(&env, &gh, &keychain);
+        write_jira_global(&env.paths.global);
+
+        // Decline the lane so the only prompt_line after the Jira fields is the
+        // status_on_pr free-text status.
+        let mut prompter = FakePrompter::new()
+            .with_line("jira")
+            .with_line("https://example.atlassian.net")
+            .with_line("dev@example.com")
+            .with_line("PROJ")
+            .with_line("Code Review")
+            .with_confirm(false) // configure a work lane
+            .with_confirm(true); // wire status_on_pr
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.status_on_pr.as_deref(), Some("Code Review"));
     }
 
     fn ok_jira_factory(_cfg: &Config, _token: &str) -> Box<dyn TicketProvider> {
