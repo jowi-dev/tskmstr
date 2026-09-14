@@ -715,7 +715,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.create]\n\
              prompt_file = \".tskmstr/prompts/create.md\"\n",
         );
@@ -743,7 +743,7 @@ mod tests {
             .expect("mkdir home skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \".\"\n\
              prompt_file = \".tskmstr/prompts/audit.md\"\n",
@@ -772,7 +772,7 @@ mod tests {
             .expect("mkdir home skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.review_watch]\n\
              prompt_file = \".tskmstr/prompts/review-watch.md\"\n",
         );
@@ -799,7 +799,7 @@ mod tests {
         // no skill to probe: it must produce no finding at all.
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.create]\n",
         );
 
@@ -819,7 +819,7 @@ mod tests {
         std::fs::write(&prompt, "/create-something").expect("write prompt");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.create]\n\
              prompt_file = \".tskmstr/prompts/create.md\"\n",
         );

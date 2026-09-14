@@ -242,10 +242,19 @@ pub fn run_init(
         }
     }
 
+    let fresh = !file_existed;
     let mut scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
     let lane_prompt_paths: Vec<PathBuf> = scaffolds.iter().map(|(path, _)| path.clone()).collect();
 
-    status_on_pr_step(backend, yes, &mut doc, &repo_config_path, prompter, out)?;
+    status_on_pr_step(
+        backend,
+        yes,
+        fresh,
+        &mut doc,
+        &repo_config_path,
+        prompter,
+        out,
+    )?;
 
     let sections = [
         SessionSection {
@@ -273,7 +282,6 @@ pub fn run_init(
             dir_fallback_to_audit: false,
         },
     ];
-    let fresh = !file_existed;
     let mut session_prompt_paths = Vec::new();
     let mut session_missing_skills = Vec::new();
     for section in &sections {
@@ -952,14 +960,18 @@ const GITHUB_STATUS_ON_PR_DEFAULT: &str = "In Review";
 /// correctly yet leave the board unmoved, because
 /// [`config::Config::status_on_pr`] defaults to "leave the ticket alone".
 ///
-/// GitHub offers "In Review" (the label init just created) as the default;
-/// other backends prompt for a free-text status name with no default. Under
-/// `--yes`, GitHub writes the default non-interactively and other backends are
-/// skipped — there is no safe status name to assume for them. An already-set
-/// value is offered as the default and never silently overwritten.
+/// On a `fresh` onboarding, GitHub offers "In Review" (the label init just
+/// created) as the default; other backends prompt for a free-text status name
+/// with no default. On a re-run of a repo that has no `status_on_pr` set the
+/// prompt defaults to "no" — a review pass never injects the key without
+/// explicit confirmation. Under `--yes`, a fresh GitHub onboarding writes the
+/// default non-interactively; other backends, and every re-run, are skipped —
+/// there is no safe status name to assume for them. An already-set value is
+/// offered as the default and never silently overwritten.
 fn status_on_pr_step(
     backend: BackendKind,
     yes: bool,
+    fresh: bool,
     doc: &mut DocumentMut,
     repo_config_path: &Path,
     prompter: &mut dyn Prompter,
@@ -969,10 +981,10 @@ fn status_on_pr_step(
     let is_github = matches!(backend, BackendKind::Github);
 
     if yes {
-        // Scripted setup takes the GitHub default and skips other backends,
-        // which have no safe status name to assume. An already-set value is
-        // left as-is.
-        if is_github && existing.is_none() {
+        // Scripted setup takes the GitHub default on a fresh onboarding and
+        // skips other backends and re-runs, which have no safe status name to
+        // assume. An already-set value is left as-is.
+        if is_github && fresh && existing.is_none() {
             set_str(
                 doc,
                 &[],
@@ -984,7 +996,7 @@ fn status_on_pr_step(
         return Ok(());
     }
 
-    let default_confirm = existing.is_some() || is_github;
+    let default_confirm = existing.is_some() || (is_github && fresh);
     if !ask_confirm(
         false,
         prompter,
@@ -1037,6 +1049,59 @@ fn ask_required(
         }
         writeln!(out, "This field is required.")?;
     }
+}
+
+/// Ask for the lane's `model`, runner-aware (GitHub issue #51). Returns the
+/// value to write into the lane, or `None` to leave `model` unset. The
+/// spelling and defaults come from the runner's
+/// [`AgentRunner::lane_model_prompt`]: claude offers its always-passed
+/// default (`fable`), opencode has none and leaves the key unset with a
+/// printed consequence. With `yes`, takes the existing value, else the
+/// runner's `--yes` default (which may itself be `None`). An empty
+/// interactive answer also leaves the key unset.
+fn ask_lane_model(
+    runner: &dyn AgentRunner,
+    yes: bool,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+    existing: Option<&str>,
+) -> Result<Option<String>, InitCliError> {
+    let guidance = runner.lane_model_prompt();
+    let default = existing
+        .map(str::to_string)
+        .or_else(|| guidance.yes_default.map(str::to_string));
+    if yes {
+        if default.is_none() {
+            print_model_unset_consequence(runner, out)?;
+        }
+        return Ok(default);
+    }
+    loop {
+        let answer = prompter.prompt_line(
+            &format!("Lane model ({}); blank to leave unset", guidance.help),
+            default.as_deref().unwrap_or(""),
+        )?;
+        let trimmed = answer.trim();
+        if trimmed.is_empty() {
+            print_model_unset_consequence(runner, out)?;
+            return Ok(None);
+        }
+        match runner.validate_lane_model(trimmed) {
+            Ok(()) => return Ok(Some(trimmed.to_string())),
+            Err(reason) => writeln!(out, "{reason}")?,
+        }
+    }
+}
+
+/// Print the consequence of leaving a lane's `model` unset (GitHub issue
+/// #51's silent-fallback hazard): the run uses the agent CLI's own default
+/// model.
+fn print_model_unset_consequence(runner: &dyn AgentRunner, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "Leaving [work.lanes] `model` unset; runs will use {}'s own default model.",
+        runner.display_name()
+    )
 }
 
 /// Ask about a work lane and write it into `doc`: `repo = "."` by default,
@@ -1135,6 +1200,9 @@ fn lane_step(
         "the lane prompt file",
     )?;
 
+    // Read the existing model before the mutable `set_str` calls below, so
+    // the immutable `existing` borrow is released first.
+    let existing_model = existing("model");
     let lane_path = ["work", "lanes", name.as_str()];
     set_str(doc, &lane_path, "repo", &repo, repo_config_path)?;
     set_str(
@@ -1151,6 +1219,11 @@ fn lane_step(
         &prompt_file,
         repo_config_path,
     )?;
+
+    if let Some(model) = ask_lane_model(ctx.runner, yes, prompter, out, existing_model.as_deref())?
+    {
+        set_str(doc, &lane_path, "model", &model, repo_config_path)?;
+    }
 
     let resolved = resolve_repo_relative(&prompt_file, &repo_dir, ctx.home);
     if !resolved.exists() {
@@ -1475,6 +1548,7 @@ fn write_repo_file(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
+    use crate::agent::opencode::OpencodeRunner;
     use crate::cli::FakePrompter;
     use crate::github::gh_cli::{FakeGhCli, GhError};
     use crate::keychain::InMemoryKeychain;
@@ -2003,11 +2077,12 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms pop in order: labels yes, lane no, then each session
-        // (create/review_watch/audit) declined — a fresh repo defaults them on,
-        // so writing no work section means declining all of them.
+        // Confirms pop in order: labels yes, lane no, status_on_pr no, then
+        // each session (create/review_watch/audit) declined — a fresh repo
+        // defaults them on, so writing no work section means declining all.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2123,13 +2198,18 @@ mod tests {
         std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
 
         // Update the lane but keep every value: lines pop in question order
-        // (backend, slug, lane name), and only the lane name diverges from
-        // its default; repo/base_branch/prompt_file fall back to the current
-        // values as defaults.
+        // (backend, slug, lane name, repo, base_branch, prompt_file, model).
+        // Feed the current values back verbatim — including a blank model, so
+        // the lane's absent `model` stays absent — so keeping them rewrites
+        // nothing.
         let mut prompter = FakePrompter::new()
             .with_line("github")
             .with_line("jowi-dev/widget")
             .with_line("mylane")
+            .with_line(".")
+            .with_line("develop")
+            .with_line("prompts/custom.md")
+            .with_line("") // leave model unset — keeps the file byte-identical
             .with_confirm(true) // labels
             .with_confirm(true); // update lane
         let mut out = Vec::new();
@@ -2210,9 +2290,10 @@ mod tests {
         let ctx = github_ctx(&env, &gh, &keychain);
 
         // Lines pop in question order: backend, slug, lane name/repo/branch/
-        // prompt file, the three session dirs (create/review_watch/audit,
-        // defaulted on for a fresh repo), then the runner question twice
-        // (invalid, then valid).
+        // prompt file/model, status_on_pr (defaulted on for a fresh GitHub
+        // repo), the three session dirs (create/review_watch/audit, defaulted
+        // on for a fresh repo), then the runner question twice (invalid, then
+        // valid).
         let mut prompter = FakePrompter::new()
             .with_line("github")
             .with_line("jowi-dev/widget")
@@ -2220,6 +2301,8 @@ mod tests {
             .with_line(".")
             .with_line("main")
             .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("fable") // lane model
+            .with_line("In Review") // status_on_pr
             .with_line(".")
             .with_line(".")
             .with_line(".")
@@ -2256,6 +2339,7 @@ mod tests {
             .with_line(".")
             .with_line("main")
             .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("fable") // lane model
             .with_line("claude");
         let mut out = Vec::new();
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
@@ -2294,12 +2378,13 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms pop in order: labels yes, lane no, create no, review no,
-        // audit yes, audit thatch-scaffold no. Declining the thatch scaffold
-        // makes audit fall back to its string `/ticket-audit` prompt, whose
-        // missing skill is what this test asserts a warning about.
+        // Confirms pop in order: labels yes, lane no, status_on_pr no, create
+        // no, review no, audit yes, audit thatch-scaffold no. Declining the
+        // thatch scaffold makes audit fall back to its string `/ticket-audit`
+        // prompt, whose missing skill is what this test asserts a warning about.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2352,12 +2437,13 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms: labels yes, lane no, create no, review-watch yes,
-        // review-watch thatch-scaffold no, audit no. Declining the scaffold
-        // makes review-watch fall back to its `/bugbot-triage` prompt, whose
-        // missing skill is what this test asserts a warning about.
+        // Confirms: labels yes, lane no, status_on_pr no, create no,
+        // review-watch yes, review-watch thatch-scaffold no, audit no.
+        // Declining the scaffold makes review-watch fall back to its
+        // `/bugbot-triage` prompt, whose missing skill this test asserts on.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(true)
@@ -2390,10 +2476,11 @@ mod tests {
         };
         ctx.hook_installer = &installer;
 
-        // Confirms: labels yes, lane no, create no, review-watch no, audit no,
-        // hooks yes.
+        // Confirms: labels yes, lane no, status_on_pr no, create no,
+        // review-watch no, audit no, hooks yes.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2436,9 +2523,11 @@ mod tests {
         let installer = |_out: &mut dyn Write| -> Result<(), String> { Err("boom".to_string()) };
         ctx.hook_installer = &installer;
 
-        // labels yes, lane no, create no, review-watch no, audit no, hooks yes.
+        // labels yes, lane no, status_on_pr no, create no, review-watch no,
+        // audit no, hooks yes.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2467,13 +2556,15 @@ mod tests {
         std::fs::write(repo_config, original).expect("write repo config");
 
         // Change the slug, then decline the write. This is a re-run of an
-        // existing file, so each absent session section is offered (enable
-        // default off on a re-run) and declined. Confirms pop in order:
-        // labels yes, lane no, create no, review-watch no, audit no, write no.
+        // existing file, so status_on_pr and each absent session section are
+        // offered (enable default off on a re-run) and declined. Confirms pop
+        // in order: labels yes, lane no, status_on_pr no, create no,
+        // review-watch no, audit no, write no.
         let mut prompter = FakePrompter::new()
             .with_line("github")
             .with_line("someone-else/other")
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2723,13 +2814,14 @@ mod tests {
         ctx.setup_launcher = &panicking_setup_launcher;
 
         // Confirms pop in order: labels true, lane true, lane scaffold-prompt
-        // true, create false, review-watch false, audit false, setup false.
-        // Only the lane is scaffolded, so the setup offer still fires — and is
-        // declined here.
+        // true, status_on_pr false, create false, review-watch false, audit
+        // false, setup false. Only the lane is scaffolded, so the setup offer
+        // still fires — and is declined here.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2815,15 +2907,16 @@ mod tests {
         };
         ctx.setup_launcher = &launcher;
 
-        // Confirms: labels true, lane true (scaffold default true), create
-        // false, review-watch false, audit true, audit thatch-scaffold false,
-        // setup true. Declining audit's thatch scaffold makes it fall back to
-        // its `/ticket-audit` string prompt, whose missing skill is what the
-        // setup prompt must list.
+        // Confirms: labels true, lane true (scaffold default true),
+        // status_on_pr false, create false, review-watch false, audit true,
+        // audit thatch-scaffold false, setup true. Declining audit's thatch
+        // scaffold makes it fall back to its `/ticket-audit` string prompt,
+        // whose missing skill is what the setup prompt must list.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(true)
@@ -3086,6 +3179,108 @@ mod tests {
         assert!(
             !thatch_review.exists(),
             ".tskmstr/prompts/review.md must not be scaffolded when prompt_file is already set"
+        );
+    }
+
+    // --- lane model question (GitHub issue #51) ---
+
+    #[test]
+    fn lane_model_question_writes_the_claude_default_under_yes() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain); // ClaudeRunner
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("model = \"fable\""),
+            "claude --yes writes the always-passed default: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn lane_model_question_opencode_yes_leaves_model_unset_and_prints_consequence() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.runner = &OpencodeRunner;
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            !repo_text.contains("model ="),
+            "opencode --yes leaves the lane model unset: {repo_text}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("own default model"),
+            "the unset consequence is printed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_model_question_opencode_writes_the_entered_glm_model() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.runner = &OpencodeRunner;
+        // Interactive line order: backend, slug, lane name, repo, base,
+        // prompt_file, model. Confirms take their defaults.
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("repo")
+            .with_line(".")
+            .with_line("main")
+            .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("venice/z-ai-glm-5-3");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("model = \"venice/z-ai-glm-5-3\""),
+            "the entered glm model is written so a run resolves it: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn lane_model_question_reprompts_on_a_mis_spelled_model() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        ctx.runner = &OpencodeRunner;
+        // A bare name is not opencode's provider/model spelling; the wizard
+        // re-prompts, then accepts the corrected answer.
+        let mut prompter = FakePrompter::new()
+            .with_line("github")
+            .with_line("jowi-dev/widget")
+            .with_line("repo")
+            .with_line(".")
+            .with_line("main")
+            .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line("fable")
+            .with_line("venice/z-ai-glm-5-3");
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("provider/model"),
+            "mis-spelled model re-prompt in: {rendered}"
+        );
+        let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
+        assert!(
+            repo_text.contains("model = \"venice/z-ai-glm-5-3\""),
+            "corrected model written: {repo_text}"
         );
     }
 }

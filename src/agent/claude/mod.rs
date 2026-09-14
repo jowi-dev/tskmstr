@@ -432,6 +432,28 @@ impl AgentRunner for ClaudeRunner {
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str {
         model.strip_prefix("claude-").unwrap_or(model)
     }
+
+    /// Claude wants a bare model name (`fable`, `sonnet`); `--yes` writes
+    /// [`DEFAULT_MODEL`], matching this adapter's always-pass-`fable`
+    /// convention. See [`crate::agent::LaneModelPrompt`].
+    fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
+        crate::agent::LaneModelPrompt {
+            help: "bare model name, e.g. fable or sonnet",
+            yes_default: Some(DEFAULT_MODEL),
+        }
+    }
+
+    /// Rejects a `provider/model` spelling: claude passes the bare name
+    /// straight to `claude --model`, so a `/` is opencode's spelling landing
+    /// on the wrong runner.
+    fn validate_lane_model(&self, model: &str) -> Result<(), String> {
+        if model.contains('/') {
+            return Err(format!(
+                "`{model}` looks like a provider/model spelling; claude wants a bare model name like `fable` or `sonnet`"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Raw shape of the `claude -p --output-format json` result, deserialized
@@ -1038,5 +1060,23 @@ mod tests {
             ClaudeRunner.display_model_name("some-other-model"),
             "some-other-model"
         );
+    }
+
+    // --- lane_model_prompt / validate_lane_model (GitHub issue #51) ---
+
+    #[test]
+    fn lane_model_prompt_defaults_to_the_always_passed_model() {
+        let prompt = ClaudeRunner.lane_model_prompt();
+        assert_eq!(prompt.yes_default, Some(DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn validate_lane_model_accepts_bare_names_and_rejects_provider_spelling() {
+        assert!(ClaudeRunner.validate_lane_model("fable").is_ok());
+        assert!(ClaudeRunner.validate_lane_model("sonnet").is_ok());
+        let err = ClaudeRunner
+            .validate_lane_model("venice/z-ai-glm-5-3")
+            .expect_err("a provider/model spelling is not claude's");
+        assert!(err.contains("bare model name"), "reason: {err}");
     }
 }

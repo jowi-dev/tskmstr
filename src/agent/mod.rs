@@ -399,6 +399,23 @@ pub struct SessionEnvVars {
     pub pid: &'static str,
 }
 
+/// Runner-specific guidance for `tm init`'s lane-scaffold model question
+/// (GitHub issue #51). The lane scaffold asks for the lane's `model` so a
+/// run doesn't silently fall back to the agent CLI's own default model, and
+/// the spelling is runner-specific — this carries what the question shows
+/// and what `--yes` writes. See [`AgentRunner::lane_model_prompt`].
+#[derive(Debug, Clone, Copy)]
+pub struct LaneModelPrompt {
+    /// Accepted-spelling help shown alongside the prompt, e.g.
+    /// `"provider/model, e.g. venice/z-ai-glm-5-3"`.
+    pub help: &'static str,
+    /// The value `--yes` writes for the lane's `model`, or `None` to leave
+    /// `model` unset (and print that the run will use the agent CLI's own
+    /// default). opencode has no safe universal default across providers, so
+    /// it returns `None`; claude returns its always-passed default.
+    pub yes_default: Option<&'static str>,
+}
+
 /// Backend-agnostic AI coding agent operations. See the module doc comment
 /// for how this relates to [`crate::agent::claude::ClaudeRunner`] and
 /// `main.rs`'s `agent_runner_for`.
@@ -583,6 +600,18 @@ pub trait AgentRunner {
     /// leading `"claude-"` prefix; an adapter whose model names carry no
     /// such prefix returns `model` unchanged.
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str;
+
+    /// Runner-appropriate guidance for `tm init`'s lane-scaffold model
+    /// question (GitHub issue #51): the accepted-spelling help to show and
+    /// the `--yes` default. See [`LaneModelPrompt`].
+    fn lane_model_prompt(&self) -> LaneModelPrompt;
+
+    /// Validate a lane `model` spelling a user entered for this runner,
+    /// returning a human-readable reason when it's rejected so an
+    /// interactive `tm init` re-prompts instead of writing an unusable
+    /// value. `Ok(())` accepts. `model` is already trimmed and non-empty
+    /// (an empty answer means "leave `model` unset", handled by the caller).
+    fn validate_lane_model(&self, model: &str) -> Result<(), String>;
 }
 
 #[cfg(test)]
