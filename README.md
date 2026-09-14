@@ -1203,6 +1203,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
 # status_on_merge = "Done"            # optional, see below
+# status_on_run_start = "In Progress" # optional, see below
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 # board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
 
@@ -1218,8 +1219,8 @@ its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files whenever the Jira backend is selected, or `tm`
 refuses to run; `default_assignee_account_id`, `status_on_pr`,
-`status_on_create`, `status_on_merge`, `review_bots`, `board_column_order`,
-and `[backend]` are optional.
+`status_on_create`, `status_on_merge`, `status_on_run_start`, `review_bots`,
+`board_column_order`, and `[backend]` are optional.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
@@ -1374,6 +1375,19 @@ human moves the ticket when the work actually ships — so absence means
 "merge only". A ticket already sitting in the target status (on the
 GitHub backend, an issue the PR's closing keyword auto-closed reads as
 Done) is reported as moved rather than warned about.
+
+`status_on_run_start` names the workflow status (e.g. `"In Progress"`) to
+move a ticket to when a tracked `tm work run` starts against it — the
+moment `tm` knows work is beginning, so pressing `w` on the board moves the
+ticket before the session even boots, with no agent action required. It
+covers every run shape (interactive and detached/headless run through the
+same path) and is matched the same way as its siblings (available
+transitions, case-insensitive, warn-and-continue on no match or API
+failure): a provider hiccup warns and the run proceeds rather than sinking
+it. A ticket already in the target status is a silent no-op, so re-running a
+lane doesn't spam warnings, and a lane-only (ticketless) run has nothing to
+move and does nothing. When unset, a run starts without touching its
+ticket's status.
 
 `tm ticket create` takes two flags to control this per invocation:
 `--status <STATUS>` transitions the new ticket to `<STATUS>` instead of
