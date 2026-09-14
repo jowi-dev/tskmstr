@@ -671,7 +671,8 @@ mod tests {
 
     #[test]
     fn agent_definition_template_declares_mode_and_model_frontmatter() {
-        let def = OpencodeRunner.agent_definition_template("impl", Some("venice/z-ai-glm-5-3-flash"));
+        let def =
+            OpencodeRunner.agent_definition_template("impl", Some("venice/z-ai-glm-5-3-flash"));
         assert!(def.contains("mode: subagent"), "mode frontmatter: {def}");
         assert!(
             def.contains("model: venice/z-ai-glm-5-3-flash"),
