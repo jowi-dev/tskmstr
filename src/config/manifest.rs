@@ -32,7 +32,7 @@
 /// purpose), so a content diff would treat normal customization as drift.
 /// Bumping this constant is a decision that a *structural* gap exists, not
 /// that any file's content changed.
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 /// What a found (or missing) `schema_version` stamp means for a repo,
 /// relative to [`CURRENT_SCHEMA_VERSION`].

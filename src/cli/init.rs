@@ -242,33 +242,57 @@ pub fn run_init(
         }
     }
 
-    let scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
-    let audit_missing_skill = session_step(
-        ctx,
-        yes,
-        &mut doc,
-        &repo_config_path,
-        prompter,
-        out,
-        &SessionSection {
-            table: "audit",
-            question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
-            default_prompt: "/ticket-audit {key}",
+    let mut scaffolds = lane_step(ctx, yes, &mut doc, &repo_config_path, prompter, out)?;
+    let lane_prompt_paths: Vec<PathBuf> = scaffolds.iter().map(|(path, _)| path.clone()).collect();
+
+    let sections = [
+        SessionSection {
+            table: "create",
+            question: "Configure ticket create sessions ([work.create], the board's `c` key)?",
+            default_prompt: "/ticket-create",
+            prompt_file_name: "create",
+            thatch_template: CREATE_THATCH_TEMPLATE,
+            dir_fallback_to_audit: false,
         },
-    )?;
-    let review_watch_missing_skill = session_step(
-        ctx,
-        yes,
-        &mut doc,
-        &repo_config_path,
-        prompter,
-        out,
-        &SessionSection {
+        SessionSection {
             table: "review_watch",
             question: "Configure review-watch sessions ([work.review_watch])?",
             default_prompt: "/bugbot-triage {key} {findings_file}",
+            prompt_file_name: "review",
+            thatch_template: REVIEW_THATCH_TEMPLATE,
+            dir_fallback_to_audit: true,
         },
-    )?;
+        SessionSection {
+            table: "audit",
+            question: "Configure ticket audit sessions ([work.audit], the board's `a` key)?",
+            default_prompt: "/ticket-audit {key}",
+            prompt_file_name: "audit",
+            thatch_template: AUDIT_THATCH_TEMPLATE,
+            dir_fallback_to_audit: false,
+        },
+    ];
+    let fresh = !file_existed;
+    let mut session_prompt_paths = Vec::new();
+    let mut session_missing_skills = Vec::new();
+    for section in &sections {
+        let outcome = session_step(
+            ctx,
+            yes,
+            &mut doc,
+            &repo_config_path,
+            prompter,
+            out,
+            section,
+            fresh,
+        )?;
+        if let Some((path, contents)) = outcome.scaffold {
+            session_prompt_paths.push(path.clone());
+            scaffolds.push((path, contents));
+        }
+        if let Some(missing) = outcome.missing_skill {
+            session_missing_skills.push(missing);
+        }
+    }
     ask_runner(yes, &mut doc, &repo_config_path, prompter, out)?;
     stamp_schema_version(&mut doc);
     let install_hooks = !ctx.hooks_installed
@@ -283,11 +307,9 @@ pub fn run_init(
         )?;
 
     let tasks = SetupTasks {
-        lane_prompts: scaffolds.iter().map(|(path, _)| path.clone()).collect(),
-        missing_skills: [audit_missing_skill, review_watch_missing_skill]
-            .into_iter()
-            .flatten()
-            .collect(),
+        lane_prompts: lane_prompt_paths,
+        session_prompts: session_prompt_paths,
+        missing_skills: session_missing_skills,
     };
 
     // --- Writes ---
@@ -389,7 +411,11 @@ pub(crate) fn offer_agent_setup(
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    if yes || (tasks.lane_prompts.is_empty() && tasks.missing_skills.is_empty()) {
+    if yes
+        || (tasks.lane_prompts.is_empty()
+            && tasks.session_prompts.is_empty()
+            && tasks.missing_skills.is_empty())
+    {
         return Ok(());
     }
 
@@ -461,6 +487,19 @@ fn setup_session_prompt(tasks: &SetupTasks) -> String {
         );
     }
 
+    if !tasks.session_prompts.is_empty() {
+        prompt.push_str("\n## Session prompts\n\n");
+        for path in &tasks.session_prompts {
+            prompt.push_str(&format!("- Fill out {} in place.\n", path.display()));
+        }
+        prompt.push_str(
+            "\nEach is a thatch session prompt: keep its shape — recall thatch memory \
+             before acting, invoke the named thatch skill(s), and write the detailed \
+             plan or review material back to thatch memory — and replace the \
+             \"Repo-specific context\" placeholder with this repo's real conventions.\n",
+        );
+    }
+
     if !tasks.missing_skills.is_empty() {
         prompt.push_str("\n## Session skills\n\n");
         for skill in &tasks.missing_skills {
@@ -525,6 +564,9 @@ fn parse_origin_head(symref: &str) -> Option<&str> {
 pub(crate) struct SetupTasks {
     /// Resolved paths of lane-prompt files written as skeletons this run.
     pub(crate) lane_prompts: Vec<PathBuf>,
+    /// Resolved paths of thatch session-prompt files (create/review/audit)
+    /// scaffolded this run, for the setup session to tailor per repo.
+    pub(crate) session_prompts: Vec<PathBuf>,
     /// Session skills to author.
     pub(crate) missing_skills: Vec<MissingSkill>,
 }
@@ -541,8 +583,103 @@ pub(crate) struct MissingSkill {
     pub(crate) session_prompt: String,
 }
 
-/// One of the optional `[work.audit]` / `[work.review_watch]` sections the
-/// wizard can fill in.
+/// Thatch scaffold for `[work.create]`: recall memory, draft with the
+/// `thatch-ticket-description` skill, write the plan back, leave repo context.
+const CREATE_THATCH_TEMPLATE: &str = "\
+# Create a ticket
+
+Draft a new ticket for this repository. Keep the ticket body human-readable;
+put the detailed plan in thatch memory, not the ticket.
+
+## Recall thatch memory first
+
+Before drafting, search thatch memory for context relevant to this repo and the
+work you are about to describe — prior plans, conventions, and decisions — so
+the ticket agrees with what the project already knows.
+
+## Draft with the thatch skill
+
+Use the `thatch-ticket-description` skill to draft the ticket: clear sections,
+bold/italic emphasis for scanning, and no invented requirements.
+
+## Write the plan back to thatch memory
+
+Record the detailed plan and background you gathered in thatch memory so a later
+session can recall it. Keep the ticket body itself concise and readable.
+
+## Repo-specific context
+
+<!-- TODO: fill in this repo's ticket conventions, labels, templates, and any
+     project-specific detail the create session should know. -->
+";
+
+/// Thatch scaffold for `[work.audit]`: recall memory for `{key}`, audit with
+/// the `thatch-ticket-description` skill, write findings back, leave repo
+/// context. `{key}` is substituted at launch.
+const AUDIT_THATCH_TEMPLATE: &str = "\
+# Audit ticket {key}
+
+Audit ticket {key}: check that its description still matches reality and is
+actionable. Keep the ticket body human-readable; keep detailed findings in
+thatch memory.
+
+## Recall thatch memory first
+
+Search thatch memory for context on {key} and this repo before auditing — prior
+plans, decisions, and related tickets — so the audit is grounded in what the
+project already knows. The `thatch-code-archaeology` skill helps when the ticket
+touches unfamiliar code.
+
+## Audit with the thatch skill
+
+Use the `thatch-ticket-description` skill to judge the description against
+reality and rewrite it where it has drifted, without inventing requirements.
+
+## Write findings back to thatch memory
+
+Record the detailed audit notes and any re-plan in thatch memory. Keep the
+ticket body concise.
+
+## Repo-specific context
+
+<!-- TODO: fill in this repo's audit conventions and the signals that mean a
+     ticket needs rework. -->
+";
+
+/// Thatch scaffold for `[work.review_watch]`: recall memory for `{key}`, apply
+/// the thatch review specialists to the `{findings_file}`, write the outcome
+/// back, leave repo context. `{key}` and `{findings_file}` are substituted at
+/// launch.
+const REVIEW_THATCH_TEMPLATE: &str = "\
+# Respond to review on {key}
+
+Work through the review findings in {findings_file} for ticket {key}. Keep the
+PR conversation human-readable; keep detailed analysis in thatch memory.
+
+## Recall thatch memory first
+
+Search thatch memory for context on {key} and this repo before responding, so
+your fixes agree with prior decisions and plans.
+
+## Review with the thatch specialist skills
+
+Apply the thatch review specialists as they fit the findings —
+`thatch-review-pedantic`, `thatch-review-acceptance`, `thatch-review-state-flow`,
+and `thatch-review-economy` — and use `thatch-review-synthesizer` to reconcile
+them into one deduplicated pass before you act.
+
+## Write the review outcome back to thatch memory
+
+Record the detailed review reasoning and any follow-up plan in thatch memory.
+
+## Repo-specific context
+
+<!-- TODO: fill in this repo's review conventions and any checks the review
+     session must always run. -->
+";
+
+/// One of the optional `[work.create]` / `[work.review_watch]` /
+/// `[work.audit]` sections the wizard can fill in.
 struct SessionSection {
     /// Table name under `[work]`.
     table: &'static str,
@@ -551,11 +688,39 @@ struct SessionSection {
     /// The prompt the section runs when none is configured, whose leading
     /// `/skill` is checked for existence.
     default_prompt: &'static str,
+    /// Stem of the thatch prompt file scaffolded under `.tskmstr/prompts/`
+    /// (e.g. `"create"`, `"review"`, `"audit"`).
+    prompt_file_name: &'static str,
+    /// Full body of the thatch prompt scaffolded when the section has neither
+    /// a `prompt` nor a `prompt_file` of its own.
+    thatch_template: &'static str,
+    /// Whether an unset `dir` should default to `[work.audit]`'s — true only
+    /// for `review_watch`, which falls back to audit's dir at load time.
+    dir_fallback_to_audit: bool,
 }
 
-/// Ask about an optional session section and write its `dir`. The prompt's
-/// skill is user-supplied, not shipped with tm, so a missing one warns with
-/// the expected paths instead of failing.
+/// What a [`session_step`] produced: an optional thatch prompt file to write
+/// (and wire via `prompt_file`) and/or a missing user-supplied skill to warn
+/// about. Both empty means the section was declined or left untouched.
+#[derive(Default)]
+struct SessionOutcome {
+    /// `(path, contents)` of a thatch prompt file to scaffold this run.
+    scaffold: Option<(PathBuf, String)>,
+    /// A skill the section's string prompt invokes but that exists nowhere.
+    missing_skill: Option<MissingSkill>,
+}
+
+/// Ask about an optional session section, write its `dir`, and — when the
+/// section has neither its own `prompt` nor `prompt_file` — offer to scaffold
+/// a thatch prompt file and wire it via `prompt_file` (GitHub issue #47). A
+/// section that already sets `prompt` or `prompt_file` is left untouched, so a
+/// repo that hand-configured one keeps it (no conflicting double-set). When
+/// the thatch scaffold is declined the section falls back to its string
+/// `default_prompt`, whose user-supplied `/skill` is warned about if missing.
+///
+/// `fresh` (a first-ever onboarding of this repo) flips the enable default to
+/// yes so a plain `tm init` leans on the thatch workflow; a re-run keeps the
+/// old presence-based default so it stays a no-op.
 #[allow(clippy::too_many_arguments)]
 fn session_step(
     ctx: &InitContext,
@@ -565,7 +730,8 @@ fn session_step(
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
     section: &SessionSection,
-) -> Result<Option<MissingSkill>, InitCliError> {
+    fresh: bool,
+) -> Result<SessionOutcome, InitCliError> {
     let repo_dir = repo_config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -575,14 +741,17 @@ fn session_step(
         .and_then(Item::as_table_like)
         .and_then(|work| work.get(section.table))
         .is_some();
-    if !ask_confirm(yes, prompter, section.question, present)? {
-        return Ok(None);
+    if !ask_confirm(yes, prompter, section.question, present || fresh)? {
+        return Ok(SessionOutcome::default());
     }
 
-    // review_watch's dir falls back to audit's at load time; offer the same
-    // fallback as the default here.
     let dir_default = str_at(doc, &["work", section.table, "dir"])
-        .or_else(|| str_at(doc, &["work", "audit", "dir"]))
+        .or_else(|| {
+            section
+                .dir_fallback_to_audit
+                .then(|| str_at(doc, &["work", "audit", "dir"]))
+                .flatten()
+        })
         .unwrap_or(".")
         .to_string();
     let dir = ask_required(
@@ -598,11 +767,64 @@ fn session_step(
     )?;
     set_str(doc, &["work", section.table], "dir", &dir, repo_config_path)?;
 
-    let prompt = str_at(doc, &["work", section.table, "prompt"])
-        .unwrap_or(section.default_prompt)
-        .to_string();
+    // A section that already carries its own prompt source is left alone:
+    // scaffolding a `prompt_file` next to an existing `prompt` would be a
+    // config-rejecting double-set, and an existing `prompt_file` is the
+    // owner's deliberate choice (GitHub issue #47).
+    let has_prompt = str_at(doc, &["work", section.table, "prompt"]).is_some();
+    let has_prompt_file = str_at(doc, &["work", section.table, "prompt_file"]).is_some();
     let resolved_dir = resolve_repo_relative(&dir, &repo_dir, ctx.home);
-    Ok(warn_if_skill_missing(ctx, out, &prompt, &resolved_dir)?)
+    if has_prompt {
+        let prompt = str_at(doc, &["work", section.table, "prompt"])
+            .unwrap_or(section.default_prompt)
+            .to_string();
+        return Ok(SessionOutcome {
+            scaffold: None,
+            missing_skill: warn_if_skill_missing(ctx, out, &prompt, &resolved_dir)?,
+        });
+    }
+    if has_prompt_file {
+        return Ok(SessionOutcome::default());
+    }
+
+    // Neither set: wire a thatch prompt file, scaffolding it if absent.
+    let rel = format!(".tskmstr/prompts/{}.md", section.prompt_file_name);
+    let resolved = resolve_repo_relative(&rel, &repo_dir, ctx.home);
+    if resolved.exists() {
+        set_str(
+            doc,
+            &["work", section.table],
+            "prompt_file",
+            &rel,
+            repo_config_path,
+        )?;
+        return Ok(SessionOutcome::default());
+    }
+    if ask_confirm(
+        yes,
+        prompter,
+        &format!("Scaffold a thatch prompt at {}?", resolved.display()),
+        true,
+    )? {
+        set_str(
+            doc,
+            &["work", section.table],
+            "prompt_file",
+            &rel,
+            repo_config_path,
+        )?;
+        return Ok(SessionOutcome {
+            scaffold: Some((resolved, section.thatch_template.to_string())),
+            missing_skill: None,
+        });
+    }
+
+    // Declined the scaffold: the section keeps its string default, so warn
+    // about that prompt's skill the way it always has.
+    Ok(SessionOutcome {
+        scaffold: None,
+        missing_skill: warn_if_skill_missing(ctx, out, section.default_prompt, &resolved_dir)?,
+    })
 }
 
 /// Warn when the skill a session prompt invokes (its leading `/name` token)
@@ -1584,8 +1806,15 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms pop in order: labels yes, lane no.
-        let mut prompter = FakePrompter::new().with_confirm(true).with_confirm(false);
+        // Confirms pop in order: labels yes, lane no, then each session
+        // (create/review_watch/audit) declined — a fresh repo defaults them on,
+        // so writing no work section means declining all of them.
+        let mut prompter = FakePrompter::new()
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(false);
         let mut out = Vec::new();
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
 
@@ -1602,7 +1831,7 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
@@ -1634,7 +1863,7 @@ mod tests {
 
         // Same as the no-op re-run above, except the configured prompt file
         // was never written — the case a plain re-run used to walk past.
-        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
 
@@ -1689,7 +1918,7 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "schema_version = 1\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
@@ -1784,7 +2013,9 @@ mod tests {
         let ctx = github_ctx(&env, &gh, &keychain);
 
         // Lines pop in question order: backend, slug, lane name/repo/branch/
-        // prompt file, then the runner question twice (invalid, then valid).
+        // prompt file, the three session dirs (create/review_watch/audit,
+        // defaulted on for a fresh repo), then the runner question twice
+        // (invalid, then valid).
         let mut prompter = FakePrompter::new()
             .with_line("github")
             .with_line("jowi-dev/widget")
@@ -1792,6 +2023,9 @@ mod tests {
             .with_line(".")
             .with_line("main")
             .with_line(".tskmstr/prompts/repo-lane.md")
+            .with_line(".")
+            .with_line(".")
+            .with_line(".")
             .with_line("gpt-agent")
             .with_line("claude");
         let mut out = Vec::new();
@@ -1863,11 +2097,17 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms pop in order: labels yes, lane no, audit yes.
+        // Confirms pop in order: labels yes, lane no, create no, review no,
+        // audit yes, audit thatch-scaffold no. Declining the thatch scaffold
+        // makes audit fall back to its string `/ticket-audit` prompt, whose
+        // missing skill is what this test asserts a warning about.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(false)
-            .with_confirm(true);
+            .with_confirm(false)
+            .with_confirm(false)
+            .with_confirm(true)
+            .with_confirm(false);
         let mut out = Vec::new();
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
 
@@ -1915,12 +2155,17 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        // Confirms: labels yes, lane no, audit no, review-watch yes.
+        // Confirms: labels yes, lane no, create no, review-watch yes,
+        // review-watch thatch-scaffold no, audit no. Declining the scaffold
+        // makes review-watch fall back to its `/bugbot-triage` prompt, whose
+        // missing skill is what this test asserts a warning about.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(false)
             .with_confirm(false)
-            .with_confirm(true);
+            .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false);
         let mut out = Vec::new();
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
 
@@ -1948,9 +2193,11 @@ mod tests {
         };
         ctx.hook_installer = &installer;
 
-        // Confirms: labels yes, lane no, audit no, review-watch no, hooks yes.
+        // Confirms: labels yes, lane no, create no, review-watch no, audit no,
+        // hooks yes.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -1992,8 +2239,10 @@ mod tests {
         let installer = |_out: &mut dyn Write| -> Result<(), String> { Err("boom".to_string()) };
         ctx.hook_installer = &installer;
 
+        // labels yes, lane no, create no, review-watch no, audit no, hooks yes.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2020,12 +2269,15 @@ mod tests {
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
 
-        // Change the slug, then decline the write. Confirms pop in order:
-        // labels yes, lane no, audit no, review-watch no, write no.
+        // Change the slug, then decline the write. This is a re-run of an
+        // existing file, so each absent session section is offered (enable
+        // default off on a re-run) and declined. Confirms pop in order:
+        // labels yes, lane no, create no, review-watch no, audit no, write no.
         let mut prompter = FakePrompter::new()
             .with_line("github")
             .with_line("someone-else/other")
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
@@ -2089,7 +2341,7 @@ mod tests {
         let repo_config = env.paths.repo.as_ref().unwrap();
         let contents = std::fs::read_to_string(repo_config).expect("read");
         assert!(
-            contents.contains("schema_version = 1"),
+            contents.contains("schema_version = 2"),
             "stamp written in: {contents}"
         );
 
@@ -2120,7 +2372,7 @@ mod tests {
         );
         let schema_line = contents
             .lines()
-            .position(|l| l == "schema_version = 1")
+            .position(|l| l == "schema_version = 2")
             .expect("schema_version present");
         let backend_line = contents
             .lines()
@@ -2134,8 +2386,8 @@ mod tests {
         let parsed: toml_edit::DocumentMut = contents.parse().expect("written file must reparse");
         assert_eq!(
             parsed["schema_version"].as_integer(),
-            Some(1),
-            "schema_version reads back as 1: {contents}"
+            Some(2),
+            "schema_version reads back as 2: {contents}"
         );
     }
 
@@ -2162,7 +2414,7 @@ mod tests {
         let after = std::fs::read_to_string(repo_config).expect("read");
         assert_eq!(
             after,
-            format!("schema_version = 1\n{original}"),
+            format!("schema_version = 2\n{original}"),
             "only the stamp is added: {after}"
         );
         assert!(after.contains("# keep me"), "comment survives: {after}");
@@ -2273,12 +2525,15 @@ mod tests {
         let mut ctx = github_ctx(&env, &gh, &keychain);
         ctx.setup_launcher = &panicking_setup_launcher;
 
-        // Confirms pop in order: labels true, lane true, scaffold-prompt
-        // true, audit false, review-watch false, setup false.
+        // Confirms pop in order: labels true, lane true, lane scaffold-prompt
+        // true, create false, review-watch false, audit false, setup false.
+        // Only the lane is scaffolded, so the setup offer still fires — and is
+        // declined here.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false)
             .with_confirm(false);
@@ -2363,12 +2618,17 @@ mod tests {
         };
         ctx.setup_launcher = &launcher;
 
-        // Confirms: labels true, lane true (scaffold default true), audit
-        // true, review-watch false, setup true.
+        // Confirms: labels true, lane true (scaffold default true), create
+        // false, review-watch false, audit true, audit thatch-scaffold false,
+        // setup true. Declining audit's thatch scaffold makes it fall back to
+        // its `/ticket-audit` string prompt, whose missing skill is what the
+        // setup prompt must list.
         let mut prompter = FakePrompter::new()
             .with_confirm(true)
             .with_confirm(true)
             .with_confirm(true)
+            .with_confirm(false)
+            .with_confirm(false)
             .with_confirm(true)
             .with_confirm(false)
             .with_confirm(true);
@@ -2404,6 +2664,231 @@ mod tests {
         assert!(
             rendered.contains("warning") && rendered.contains("boom"),
             "launch-failure warning in: {rendered}"
+        );
+    }
+
+    // --- GH-47: thatch session prompt scaffolding ---
+
+    #[test]
+    fn fresh_yes_init_scaffolds_all_three_thatch_prompts_and_wires_prompt_file() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        // All three files must exist on disk.
+        for name in ["create", "review", "audit"] {
+            let path = repo_dir.join(format!(".tskmstr/prompts/{name}.md"));
+            assert!(
+                path.exists(),
+                ".tskmstr/prompts/{name}.md must be scaffolded, out: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+
+        // Config must wire prompt_file for all three sections.
+        let config = config::load(&env.paths).expect("written config should load");
+        assert!(
+            config.work.create.prompt_file.is_some(),
+            "[work.create].prompt_file must be set"
+        );
+        assert!(
+            config.work.audit.prompt_file.is_some(),
+            "[work.audit].prompt_file must be set"
+        );
+        assert!(
+            config.work.review_watch.prompt_file.is_some(),
+            "[work.review_watch].prompt_file must be set"
+        );
+
+        // Verify the prompt_file values reference the correct relative paths.
+        assert!(
+            config
+                .work
+                .create
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("create"),
+            "create prompt_file should reference create.md"
+        );
+        assert!(
+            config
+                .work
+                .review_watch
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("review"),
+            "review_watch prompt_file should reference review.md"
+        );
+        assert!(
+            config
+                .work
+                .audit
+                .prompt_file
+                .as_deref()
+                .unwrap()
+                .contains("audit"),
+            "audit prompt_file should reference audit.md"
+        );
+    }
+
+    #[test]
+    fn scaffolded_thatch_files_contain_expected_content() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+
+        // create.md: thatch memory recall + write-back + thatch-ticket-description skill
+        let create = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/create.md"))
+            .expect("create.md scaffolded");
+        assert!(
+            create.contains("thatch memory"),
+            "create.md must mention thatch memory: {create}"
+        );
+        assert!(
+            create.contains("thatch-ticket-description"),
+            "create.md must name the skill: {create}"
+        );
+        assert!(
+            create.contains("## Repo-specific context"),
+            "create.md must have the context marker: {create}"
+        );
+
+        // audit.md: thatch memory recall + write-back + thatch-ticket-description skill
+        let audit = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/audit.md"))
+            .expect("audit.md scaffolded");
+        assert!(
+            audit.contains("thatch memory"),
+            "audit.md must mention thatch memory: {audit}"
+        );
+        assert!(
+            audit.contains("thatch-ticket-description"),
+            "audit.md must name the skill: {audit}"
+        );
+        assert!(
+            audit.contains("## Repo-specific context"),
+            "audit.md must have the context marker: {audit}"
+        );
+
+        // review.md: thatch memory recall + write-back + thatch-review-* skills
+        let review = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/review.md"))
+            .expect("review.md scaffolded");
+        assert!(
+            review.contains("thatch memory"),
+            "review.md must mention thatch memory: {review}"
+        );
+        assert!(
+            review.contains("thatch-review-"),
+            "review.md must name a thatch-review-* skill: {review}"
+        );
+        assert!(
+            review.contains("## Repo-specific context"),
+            "review.md must have the context marker: {review}"
+        );
+    }
+
+    #[test]
+    fn existing_audit_prompt_is_left_alone_no_prompt_file_written() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Pre-write a config with [work.audit].prompt already set.
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(
+            repo_config,
+            "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.repo]\nrepo = \".\"\nbase_branch = \"main\"\nprompt_file = \".tskmstr/prompts/repo-lane.md\"\n\n[work.audit]\ndir = \".\"\nprompt = \"/custom-audit\"\n",
+        )
+        .expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        // Also write the lane prompt so the config is loadable.
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join(".tskmstr/prompts/repo-lane.md"), "# lane\n")
+            .expect("write lane prompt");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        // [work.audit] must NOT have prompt_file added (no double-set).
+        let config = config::load(&env.paths).expect("config should load");
+        assert!(
+            config.work.audit.prompt_file.is_none(),
+            "[work.audit].prompt_file must not be set when prompt is already configured"
+        );
+
+        // The thatch audit prompt file must NOT be written.
+        let thatch_audit = repo_dir.join(".tskmstr/prompts/audit.md");
+        assert!(
+            !thatch_audit.exists(),
+            ".tskmstr/prompts/audit.md must not be scaffolded when prompt is already set"
+        );
+    }
+
+    #[test]
+    fn existing_review_watch_prompt_file_is_preserved_unchanged() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        // Pre-write a config with [work.review_watch].prompt_file already set.
+        let repo_config = env.paths.repo.as_ref().unwrap();
+        std::fs::write(
+            repo_config,
+            "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.repo]\nrepo = \".\"\nbase_branch = \"main\"\nprompt_file = \".tskmstr/prompts/repo-lane.md\"\n\n[work.review_watch]\ndir = \".\"\nprompt_file = \"custom-review.md\"\n",
+        )
+        .expect("write repo config");
+        let repo_dir = repo_config.parent().unwrap();
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join(".tskmstr/prompts/repo-lane.md"), "# lane\n")
+            .expect("write lane prompt");
+        // Write the custom review prompt file so config::load succeeds.
+        std::fs::write(repo_dir.join("custom-review.md"), "# custom review\n")
+            .expect("write custom review");
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        // The existing prompt_file value must be preserved.
+        let config = config::load(&env.paths).expect("config should load");
+        assert_eq!(
+            config
+                .work
+                .review_watch
+                .prompt_file
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+            repo_dir
+                .join("custom-review.md")
+                .to_string_lossy()
+                .to_string(),
+            "[work.review_watch].prompt_file must not be overwritten"
+        );
+
+        // The thatch review prompt file must NOT be written.
+        let thatch_review = repo_dir.join(".tskmstr/prompts/review.md");
+        assert!(
+            !thatch_review.exists(),
+            ".tskmstr/prompts/review.md must not be scaffolded when prompt_file is already set"
         );
     }
 }

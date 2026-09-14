@@ -453,7 +453,7 @@ mod tests {
 
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
              [work.audit]\n\
@@ -468,7 +468,7 @@ mod tests {
         assert!(findings.is_empty(), "expected no findings: {findings:?}");
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(
-            rendered.contains("up to date (schema_version 1)"),
+            rendered.contains("up to date (schema_version 2)"),
             "clean report in: {rendered}"
         );
     }
@@ -539,7 +539,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
         );
@@ -569,7 +569,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              repo = \".\"\n",
         );
@@ -594,7 +594,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \".\"\n",
         );
@@ -623,7 +623,7 @@ mod tests {
             .expect("mkdir home skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \".\"\n",
         );
@@ -646,7 +646,7 @@ mod tests {
             .expect("mkdir sub audit skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \"sub\"\n\
              [work.review_watch]\n",
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn no_work_table_and_current_stamp_is_clean() {
         let env = test_env();
-        write_repo_config(&env, "schema_version = 1\n");
+        write_repo_config(&env, "schema_version = 2\n");
 
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
@@ -708,7 +708,7 @@ mod tests {
         // scan for it nor mention it.
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
         );
