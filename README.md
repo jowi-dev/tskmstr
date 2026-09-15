@@ -67,6 +67,20 @@ asking you the things the repo can't answer (deploy rules, forbidden
 paths, review conventions). Declining keeps the static skeleton; review
 and commit whatever the session writes.
 
+When you configure a lane, `tm init` also offers to set up a **delegation
+subagent** for it: name the agent (e.g. `impl`) and the model its delegated
+work should run as, and tm scaffolds the runner's agent *definition* — a
+`.claude/agents/<name>.md` (claude) or `.opencode/agent/<name>.md`
+(opencode) file whose `model` frontmatter carries that model — plus a
+`## Delegation` section in the lane prompt that hands implementation,
+test-writing, and mechanical edits to the agent *by name*. This keeps the
+model and the delegation policy together in one owned, committed asset,
+instead of a lane prompt naming a model string in prose that nothing backs
+(so delegation can no longer silently resolve to the wrong model). The
+lane records only the agent's name in its `subagent` key; an existing
+definition file is never overwritten. `tm init --yes` scaffolds no
+subagent — a scripted run has no model to declare.
+
 Re-running `tm init` is a review pass: every question offers the
 current value as its default, and nothing is overwritten without
 confirmation. A re-run also audits the lanes already in the config and
@@ -83,7 +97,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 `tm init` is still up to date, checking the stamp (missing, stale, or
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
-file, a configured session's missing skill. It never writes anything and
+file, a lane whose `subagent` key names a definition that doesn't exist,
+a configured session's missing skill. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
 checked (see `docs/decisions/0007-asset-schema-version.md`).
@@ -92,7 +107,10 @@ error (e.g. the repo was never onboarded).
 
 `tm update` applies the additive fixes for what `tm check` reports: it
 scaffolds a starter prompt for any configured lane whose prompt file is
-missing, bumps the `schema_version` stamp, and makes the same
+missing, scaffolds a missing subagent definition for any lane that
+declares one (with a placeholder `model` for you to fill, since `tm
+update` has no model to declare — that's `tm init`'s interactive
+question), bumps the `schema_version` stamp, and makes the same
 agent-assisted setup offer `tm init` does — for only the new assets
 (`--yes` skips the offer and keeps the static skeletons). It never
 overwrites an existing file or config value, so hand-edited assets are
@@ -143,7 +161,7 @@ tm auth status
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
 | `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-only fast path for direnv: silent when current, one nudge line when not. Exits `0` up to date, `1` drift found, `2` error |
-| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
+| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
@@ -610,6 +628,13 @@ falling back to `~/.claude/prompts/<lane>.md` when unset. In a repo-local
 `.tskmstr.toml`, `repo` may
 also be a relative path — see "Relative `repo`/`dir` paths in a repo-local
 config" below.
+
+An optional `subagent` key names the lane's delegation subagent (see
+"Setup"): it is a reference to a scaffolded agent *definition*
+(`.claude/agents/<name>.md` or `.opencode/agent/<name>.md`, which carries
+the subagent's own `model`), not a runtime driver setting. It is consumed
+by `tm init`/`tm check`/`tm update` to detect and additively fix a missing
+definition; the lane's own model/turn/permission keys are unaffected.
 
 `tm work run <lane> [ticket]` and the board's `w` key (see "Board-launched
 lane runs" below) both refuse a lane whose `repo` resolves to a different
@@ -1519,6 +1544,14 @@ Claude-format `.claude/skills/**/SKILL.md` — as slash commands, so an
 existing tm skill set works as-is. See
 `docs/plans/gh-41-opencode-runner.md` for the full CLI contract this
 adapter binds to.
+
+The delegation-subagent asset (see "Setup" above) is runner-aware the same
+way: `tm init` scaffolds a claude definition at `.claude/agents/<name>.md`
+and an opencode one at `.opencode/agent/<name>.md` (with `mode: subagent`),
+each carrying the declared `model` in its frontmatter. Both runners
+discover these files for any session run in the repo, so the lane prompt's
+`## Delegation` section can name the agent and trust it resolves to the
+declared model.
 
 ### Ranking
 

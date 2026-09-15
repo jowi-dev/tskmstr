@@ -96,6 +96,18 @@ pub fn run_update(
                 writeln!(out, "Wrote {}", path.display())?;
                 tasks.lane_prompts.push(path.clone());
             }
+            // Scaffold the runner's agent definition with a placeholder model
+            // (GitHub issue #52): `tm update` has no model to declare — that's
+            // `tm init`'s interactive question — so it writes the template and
+            // hands it to the setup session to fill, never a guessed model.
+            DriftFinding::MissingSubagentDef { agent, path, .. } => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, ctx.runner.agent_definition_template(agent, None))?;
+                writeln!(out, "Wrote {}", path.display())?;
+                tasks.subagent_defs.push(path.clone());
+            }
             // Bumping a newer stamp would be a downgrade: the repo already
             // has (or expects) assets this binary doesn't know about, so the
             // stale side here is the binary, not the repo.
@@ -269,6 +281,77 @@ mod tests {
         assert!(
             rendered.contains("up to date"),
             "clean close in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn scaffolds_missing_subagent_definition_additively() {
+        let env = test_env();
+        // Lane prompt already present, so the only fixable drift is the
+        // missing subagent definition the `subagent` key names.
+        let prompt_path = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(prompt_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&prompt_path, "# widget lane").expect("write prompt");
+        write_repo_config(
+            &env,
+            "[work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
+
+        assert!(remaining.is_empty(), "all drift fixable: {remaining:?}");
+        let def_path = env.repo_dir.join(".claude/agents/impl.md");
+        let def = std::fs::read_to_string(&def_path).expect("definition scaffolded");
+        assert!(def.contains("name: impl"), "name frontmatter: {def}");
+        // tm update has no model to declare (that's init's interactive
+        // question), so it scaffolds the placeholder for the setup session
+        // to fill — never a wrong model.
+        assert!(
+            def.contains("model: TODO-set-the-subagent-model"),
+            "placeholder model awaiting the operator: {def}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains(&def_path.display().to_string()),
+            "scaffold named in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn existing_subagent_definition_is_never_overwritten() {
+        let env = test_env();
+        let prompt_path = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(prompt_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&prompt_path, "# widget lane").expect("write prompt");
+        let def_path = env.repo_dir.join(".claude/agents/impl.md");
+        std::fs::create_dir_all(def_path.parent().unwrap()).expect("mkdir agents");
+        let customized = "---\nname: impl\nmodel: my/hand-picked-model\n---\ncustom body\n";
+        std::fs::write(&def_path, customized).expect("write def");
+        write_repo_config(
+            &env,
+            "schema_version = 1\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
+
+        assert!(remaining.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&def_path).expect("read def"),
+            customized,
+            "user-customized definition untouched"
         );
     }
 

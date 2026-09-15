@@ -261,6 +261,31 @@ impl AgentRunner for OpencodeRunner {
         base.join(".opencode/skills")
     }
 
+    /// `<base>/.opencode/agent/<name>.md` — opencode discovers subagent
+    /// definitions under `.opencode/agent/` (singular `agent`, per the
+    /// `opencode agent create` CLI path).
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
+        base.join(".opencode/agent").join(format!("{name}.md"))
+    }
+
+    /// A `.opencode/agent/<name>.md` definition: opencode's frontmatter
+    /// carries `description`, `mode: subagent`, and `model`, then the shared
+    /// delegation body. opencode keys the definition by its filename rather
+    /// than a `name` frontmatter field, so none is emitted.
+    fn agent_definition_template(&self, _name: &str, model: Option<&str>) -> String {
+        let model = model.unwrap_or(crate::agent::SUBAGENT_MODEL_PLACEHOLDER);
+        format!(
+            "---\n\
+             description: Implementation subagent for delegated coding, test-writing, and mechanical edits.\n\
+             mode: subagent\n\
+             model: {model}\n\
+             ---\n\
+             \n\
+             {}",
+            crate::agent::SUBAGENT_DEFINITION_BODY
+        )
+    }
+
     /// Build the [`AgentInvocation`] for one run. See the module doc
     /// comment for the two argv shapes and `docs/plans/gh-41-opencode-runner.md`
     /// for the full contract; the permission-mode mapping, `max_turns`
@@ -732,6 +757,38 @@ mod tests {
         assert_eq!(
             OpencodeRunner.skills_dir(Path::new("/repo")),
             PathBuf::from("/repo/.opencode/skills")
+        );
+    }
+
+    #[test]
+    fn agent_definition_path_is_dot_opencode_agent() {
+        assert_eq!(
+            OpencodeRunner.agent_definition_path(Path::new("/repo"), "impl"),
+            PathBuf::from("/repo/.opencode/agent/impl.md")
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_declares_mode_and_model_frontmatter() {
+        let def =
+            OpencodeRunner.agent_definition_template("impl", Some("venice/z-ai-glm-5-3-flash"));
+        assert!(def.contains("mode: subagent"), "mode frontmatter: {def}");
+        assert!(
+            def.contains("model: venice/z-ai-glm-5-3-flash"),
+            "model frontmatter: {def}"
+        );
+        assert!(
+            def.contains("Do not create commits"),
+            "house delegation constraint in body: {def}"
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_uses_a_placeholder_when_model_is_none() {
+        let def = OpencodeRunner.agent_definition_template("impl", None);
+        assert!(
+            def.contains("model: TODO-set-the-subagent-model"),
+            "placeholder model: {def}"
         );
     }
 

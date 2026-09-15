@@ -74,6 +74,28 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The house delegation constraints every scaffolded subagent definition
+/// carries in its body, regardless of runner (GitHub issue #52). Shared by
+/// each adapter's [`AgentRunner::agent_definition_template`] so the two
+/// runners' definitions differ only in frontmatter shape, never in the
+/// policy an operator reads. Kept runner-agnostic — it names no CLI — so it
+/// lives here beside [`shell_quote`] rather than in either adapter.
+pub(crate) const SUBAGENT_DEFINITION_BODY: &str = "You are an implementation subagent. Do exactly \
+    the unit of work delegated to you\nand report back — never expand the scope you were handed.\n\
+    \nConstraints:\n\n\
+    - Do not spawn further sub-agents.\n\
+    - Do not create commits; leave every commit to the lane session that delegated to you.\n\
+    - Keep changes minimal and grounded in the surrounding code.\n";
+
+/// The `model` frontmatter value a scaffolded subagent definition carries
+/// when no model was declared — a `tm update` catch-up scaffold for a lane
+/// configured before its model was ever recorded. `tm init` always has the
+/// operator's declared model and passes `Some`, so this placeholder only
+/// surfaces on the catch-up path, where it flags what the setup session (or
+/// operator) must fill in. Runner-agnostic, so it lives here beside
+/// [`SUBAGENT_DEFINITION_BODY`].
+pub(crate) const SUBAGENT_MODEL_PLACEHOLDER: &str = "TODO-set-the-subagent-model";
+
 /// Environment variable holding the tracked run id, exported for the
 /// `TSKMSTR_RUN_ID`-gated hooks (see `src/agent/claude/hooks.rs`, not yet
 /// moved) to pick up. Mirrors the detached wrapper's `export
@@ -439,6 +461,25 @@ pub trait AgentRunner {
     /// `tm init`'s "does the skill this lane's prompt invokes exist"
     /// probes, once against the repo dir and once against `home`.
     fn skills_dir(&self, base: &Path) -> PathBuf;
+
+    /// Where this runner discovers a named subagent *definition* under a
+    /// repo checkout (or a home directory), e.g.
+    /// `<base>/.opencode/agent/<name>.md` for opencode or
+    /// `<base>/.claude/agents/<name>.md` for claude. `tm init` scaffolds the
+    /// delegation target here, and `tm check`/`tm update` detect and
+    /// additively fix a configured lane whose definition is missing (GitHub
+    /// issue #52). The `.opencode`/`.claude` directory is the runner's own,
+    /// so this path is adapter-owned rather than a shared constant — the
+    /// same reasoning as [`AgentRunner::skills_dir`].
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf;
+
+    /// Render a starter subagent definition for `name`, declaring `model` in
+    /// its `model` frontmatter (or [`SUBAGENT_MODEL_PLACEHOLDER`] when `None`
+    /// — the `tm update` catch-up scaffold has no declared model). The body
+    /// carries the shared house delegation constraints
+    /// ([`SUBAGENT_DEFINITION_BODY`]); only the frontmatter shape is
+    /// runner-specific, which is why this is adapter-owned.
+    fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String;
 
     /// Build one run's argv/env (headless or interactive).
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation;
