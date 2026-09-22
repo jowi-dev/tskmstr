@@ -383,6 +383,7 @@ mod tests {
                 env_remove: vec!["ANTHROPIC_API_KEY".to_string()],
             },
             out_json_path: PathBuf::from("/state/abc-123-20260101-120000.json"),
+            fallbacks: Vec::new(),
         }
     }
 

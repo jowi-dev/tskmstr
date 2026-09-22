@@ -500,6 +500,40 @@ pub struct PreparedRun {
     /// Where the spawned `claude` process's stdout (its result JSON) is
     /// written, and later read back from.
     pub out_json_path: PathBuf,
+    /// Remaining priority-routing attempts beyond [`PreparedRun::invocation`]
+    /// (GitHub issue #54): one [`PlannedFallback`] per agent
+    /// `crate::agent::routing::plan_attempts` says to try next if the
+    /// active attempt's outcome classifies as a usage-limit hit. Empty in
+    /// single-runner mode.
+    ///
+    /// `#[serde(default)]`: a state file written by a pre-#54 `tm` binary
+    /// (or by prepare with no `fallback_runners` configured) has no
+    /// `fallbacks` key at all — this field's absence must still deserialize
+    /// cleanly, since [`PreparedRun`] round-trips through the detached
+    /// supervisor's JSON state file (see this struct's doc comment).
+    #[serde(default)]
+    pub fallbacks: Vec<PlannedFallback>,
+}
+
+/// One not-yet-attempted priority-routing fallback, carried on
+/// [`PreparedRun::fallbacks`] for [`run_agent_and_finish`] to retry through
+/// on a rate-limit outcome. See GitHub issue #54,
+/// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run fallback"
+/// section.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlannedFallback {
+    /// [`crate::agent::AgentRunner::name`] of the runner this attempt uses,
+    /// e.g. `"opencode"` — resolved back to a live runner via
+    /// [`crate::config::AgentKind::parse`] +
+    /// [`crate::agent::routing::runner_for`] when the attempt is taken (see
+    /// [`run_agent_and_finish`]'s doc comment on why: an unparseable value
+    /// here, which should never happen from code `tm` itself writes, is
+    /// skipped with a warning rather than treated as fatal).
+    pub agent: String,
+    /// This attempt's fully resolved invocation, built the same way as
+    /// [`PreparedRun::invocation`] except `model` is always `None` — see
+    /// the plan doc's "model only for the configured preferred agent" rule.
+    pub invocation: crate::agent::AgentInvocation,
 }
 
 /// The result of one completed `tm work run --fg` invocation.
@@ -1221,6 +1255,7 @@ pub fn prepare_run_lane(
         branch,
         invocation,
         out_json_path,
+        fallbacks: Vec::new(),
     })
 }
 
@@ -1369,6 +1404,7 @@ pub fn prepare_review_fix(
         branch: branch.to_string(),
         invocation,
         out_json_path,
+        fallbacks: Vec::new(),
     })
 }
 
