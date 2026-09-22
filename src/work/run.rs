@@ -1586,6 +1586,7 @@ mod tests {
             lanes,
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),
+            merge: crate::config::MergeConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             manual: crate::config::ManualConfig::default(),
         }

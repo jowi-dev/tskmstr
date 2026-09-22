@@ -335,6 +335,12 @@ pub struct RawWorkConfig {
     /// is disabled (GitHub issue #15): [`CreateConfig::dir`] is required for
     /// [`crate::work::create::launch_create`] to do anything.
     pub create: Option<RawCreateConfig>,
+    /// `[work.merge]` settings for the agent conflict-resolution session
+    /// `tm merge` opens on a rebase conflict. See [`RawMergeConfig`].
+    ///
+    /// When unset in both global and repo config, `tm merge` falls back to
+    /// its built-in conflict prompt and the runner's default model.
+    pub merge: Option<RawMergeConfig>,
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
@@ -424,6 +430,34 @@ pub struct RawCreateConfig {
     /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
     /// path passes through unchanged, matching [`RawCreateConfig::dir`].
     pub prompt_file: Option<String>,
+}
+
+/// Raw, partially-specified `[work.merge]` subsection as parsed directly
+/// from TOML. Mirrors [`RawCreateConfig`]'s shape (GitHub issue #55):
+/// configures the agent conflict-resolution session that `tm merge` opens
+/// when a rebase hits conflicts.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawMergeConfig {
+    /// Prompt fed to the launched conflict-resolution session. Defaults to
+    /// a built-in conflict prompt when unset. Supports `{key}`, `{branch}`,
+    /// and `{base}` placeholders, substituted with the ticket key, the
+    /// branch being merged, and the branch it's being merged onto.
+    pub prompt: Option<String>,
+    /// Path to a prompt file whose contents become the session's opening
+    /// prompt in place of [`RawMergeConfig::prompt`]. Setting both `prompt`
+    /// and `prompt_file` in the merged section is a
+    /// [`ConfigError::PromptSourceConflict`] — no silent precedence between
+    /// the two.
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`] (so relative values are only
+    /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
+    /// path passes through unchanged, matching [`RawCreateConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// Model alias passed to the launched conflict-resolution session,
+    /// overriding the runner's default model. Same rationale as
+    /// [`RawCreateConfig::model`].
+    pub model: Option<String>,
 }
 
 /// Raw, partially-specified `[work.manual]` subsection as parsed directly
@@ -622,6 +656,10 @@ pub struct WorkConfig {
     /// `dir` set, launching disabled) when the `[work.create]` section is
     /// absent from both global and repo config.
     pub create: CreateConfig,
+    /// Validated `[work.merge]` settings. See [`MergeConfig`]; falls back to
+    /// the built-in conflict prompt and the runner's default model when the
+    /// `[work.merge]` section is absent from both global and repo config.
+    pub merge: MergeConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
     /// Validated `[work.manual]` settings. See [`ManualConfig`]; empty (no
@@ -666,6 +704,25 @@ pub struct CreateConfig {
     /// See [`RawCreateConfig::prompt_file`].
     pub prompt_file: Option<String>,
     /// See [`RawCreateConfig::model`].
+    pub model: Option<String>,
+}
+
+/// Fully validated `[work.merge]` subsection.
+///
+/// Configures the agent conflict-resolution session that `tm merge` opens
+/// when a rebase hits conflicts. `prompt`/`prompt_file` override the
+/// built-in conflict prompt — the prompt text supports `{key}` (the ticket
+/// key), `{branch}` (the branch being merged), and `{base}` (the branch it's
+/// being merged onto) placeholders. `model` overrides the runner's default
+/// model for that session. All fields are optional: an absent section falls
+/// back to the built-in prompt and the runner's default model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeConfig {
+    /// See [`RawMergeConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawMergeConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// See [`RawMergeConfig::model`].
     pub model: Option<String>,
 }
 
@@ -1312,6 +1369,7 @@ fn merge_work(
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
+    let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
@@ -1375,6 +1433,7 @@ fn merge_work(
         lanes,
         audit,
         create,
+        merge,
         review_watch,
         manual,
     })
@@ -1519,6 +1578,49 @@ fn merge_create(
 
     Ok(CreateConfig {
         dir,
+        prompt,
+        prompt_file,
+        model: repo.model.or(global.model),
+    })
+}
+
+/// Merge a repo-local `[work.merge]` section on top of a global one, field
+/// by field, exactly like [`merge_create`] minus `dir` (there is no
+/// launch-directory concept for `tm merge`'s conflict-resolution session —
+/// it runs in the lane's existing worktree) — same "single section, no
+/// whole-vs-field ambiguity" rationale, the same `repo_dir` relative-path
+/// resolution rule for `prompt_file`, and the same
+/// [`ConfigError::PromptSourceConflict`] check when both `prompt` and
+/// `prompt_file` end up set.
+fn merge_merge_section(
+    global: Option<RawMergeConfig>,
+    repo: Option<RawMergeConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<MergeConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.merge.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.merge",
+        });
+    }
+
+    Ok(MergeConfig {
         prompt,
         prompt_file,
         model: repo.model.or(global.model),
@@ -3362,6 +3464,7 @@ mod tests {
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
+            merge: None,
             review_watch: None,
             manual: None,
         };
@@ -3375,6 +3478,7 @@ mod tests {
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
+            merge: None,
             review_watch: None,
             manual: None,
         };
@@ -4053,6 +4157,185 @@ mod tests {
                 assert_eq!(section, "work.create");
             }
             other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+    }
+
+    // --- `[work.merge]` (GitHub issue #55) ---
+
+    #[test]
+    fn merge_work_merge_absent_from_both_is_default() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.merge, MergeConfig::default());
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_merge_section_field_by_field() {
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt: Some("/merge-conflict {key} {branch} {base}".to_string()),
+                prompt_file: None,
+                model: Some("opus".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt: None,
+                prompt_file: None,
+                model: Some("sonnet".to_string()),
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        // Overridden field wins.
+        assert_eq!(cfg.merge.model, Some("sonnet".to_string()));
+        // Non-overridden fields fall back to global.
+        assert_eq!(
+            cfg.merge.prompt,
+            Some("/merge-conflict {key} {branch} {base}".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_work_merge_prompt_and_prompt_file_both_set_is_a_config_error() {
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt: Some("/merge-conflict {key}".to_string()),
+                prompt_file: Some("/abs/prompts/merge.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.merge");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("prompt"));
+        assert!(msg.contains("prompt_file"));
+        assert!(msg.contains("work.merge"));
+    }
+
+    #[test]
+    fn merge_work_merge_cross_file_prompt_conflict_is_a_config_error() {
+        // Global sets `prompt`, repo sets `prompt_file`: no silent
+        // precedence between the two, even across files.
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt: Some("/merge-conflict {key}".to_string()),
+                prompt_file: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt_file: Some("/abs/prompts/merge.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), Some(repo), None).expect_err("should reject conflict");
+        match err {
+            ConfigError::PromptSourceConflict { section } => {
+                assert_eq!(section, "work.merge");
+            }
+            other => panic!("expected PromptSourceConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_work_merge_section_parses_fields() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.merge]
+            prompt = "/merge-conflict {key} {branch} {base}"
+            model = "opus"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.merge.prompt,
+            Some("/merge-conflict {key} {branch} {base}".to_string())
+        );
+        assert_eq!(cfg.work.merge.model, Some("opus".to_string()));
+    }
+
+    #[test]
+    fn load_repo_local_relative_merge_prompt_file_resolves_against_repo_dir() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            "#,
+        )
+        .unwrap();
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(
+            &repo_path,
+            r#"
+            [work.merge]
+            prompt_file = "prompts/merge.md"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.merge.prompt_file,
+            Some(
+                dir.path()
+                    .join("prompts/merge.md")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn merge_work_relative_merge_prompt_file_from_global_only_is_a_config_error() {
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt_file: Some("relative/merge.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = merge_work(Some(global), None, None).expect_err("should reject relative path");
+        match err {
+            ConfigError::RelativePathRequiresRepoConfig { field, value } => {
+                assert_eq!(field, "work.merge.prompt_file");
+                assert_eq!(value, "relative/merge.md");
+            }
+            other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
         }
     }
 
