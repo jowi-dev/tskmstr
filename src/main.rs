@@ -1572,6 +1572,9 @@ fn run_merge_cmd(key: String) -> ExitCode {
     match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
         Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
         Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
+            eprintln!(
+                "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
+            );
             ExitCode::from(MERGE_EXIT_CONFLICTS)
         }
         Err(err) => {
