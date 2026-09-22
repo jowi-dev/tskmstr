@@ -788,6 +788,15 @@ pub struct FakeTmuxOps {
     list_sessions_result: std::cell::RefCell<Result<Vec<TmuxSession>, TmuxError>>,
     root_session_targets_result: std::cell::RefCell<Result<Vec<String>, TmuxError>>,
     list_windows_result: std::cell::RefCell<Result<Vec<TmuxWindow>, TmuxError>>,
+    /// Sequenced answers for `list_windows`, consumed one per call when
+    /// non-empty; the last entry repeats once exhausted. Takes priority over
+    /// `list_windows_result` when set — lets a test model a window snapshot
+    /// changing across a caller's several `list_windows` calls (e.g.
+    /// `crate::work::merge`'s conflict poll loop, whose window doesn't exist
+    /// in the pre-launch snapshot but does once its own launch call has
+    /// run). See [`Self::with_list_windows_sequence`].
+    list_windows_sequence: std::cell::RefCell<Vec<Result<Vec<TmuxWindow>, TmuxError>>>,
+    list_windows_index: std::cell::RefCell<usize>,
     attach_outcome: std::cell::RefCell<AttachOutcome>,
     current_session_name_result: std::cell::RefCell<Result<Option<String>, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
@@ -888,6 +897,8 @@ impl FakeTmuxOps {
             list_sessions_result: std::cell::RefCell::new(Ok(Vec::new())),
             root_session_targets_result: std::cell::RefCell::new(Ok(Vec::new())),
             list_windows_result: std::cell::RefCell::new(Ok(Vec::new())),
+            list_windows_sequence: std::cell::RefCell::new(Vec::new()),
+            list_windows_index: std::cell::RefCell::new(0),
             attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
             current_session_name_result: std::cell::RefCell::new(Ok(None)),
             calls: std::cell::RefCell::new(Vec::new()),
@@ -915,6 +926,19 @@ impl FakeTmuxOps {
     /// Set the result `list_windows` will return.
     pub fn with_list_windows(self, result: Result<Vec<TmuxWindow>, TmuxError>) -> Self {
         *self.list_windows_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set a sequence of results `list_windows` will return, one per call
+    /// (repeating the last entry once exhausted); takes priority over
+    /// [`Self::with_list_windows`]. See
+    /// [`Self::list_windows_sequence`]'s doc comment.
+    pub fn with_list_windows_sequence(
+        self,
+        sequence: Vec<Result<Vec<TmuxWindow>, TmuxError>>,
+    ) -> Self {
+        *self.list_windows_sequence.borrow_mut() = sequence;
+        *self.list_windows_index.borrow_mut() = 0;
         self
     }
 
@@ -1036,7 +1060,16 @@ impl TmuxOps for FakeTmuxOps {
 
     fn list_windows(&self) -> Result<Vec<TmuxWindow>, TmuxError> {
         self.calls.borrow_mut().push(TmuxCall::ListWindows);
-        self.list_windows_result.borrow().clone()
+        let sequence = self.list_windows_sequence.borrow();
+        if sequence.is_empty() {
+            return self.list_windows_result.borrow().clone();
+        }
+        let mut index = self.list_windows_index.borrow_mut();
+        let result = sequence[(*index).min(sequence.len() - 1)].clone();
+        if *index + 1 < sequence.len() {
+            *index += 1;
+        }
+        result
     }
 
     fn set_session_option(&self, name: &str, option: &str, value: &str) -> Result<(), TmuxError> {
