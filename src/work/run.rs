@@ -258,6 +258,18 @@ impl std::fmt::Display for BackendMismatchInfo {
 pub trait Clock {
     /// `(year, month, day, hour, min, sec)`, `month` 1-12, in local time.
     fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32);
+
+    /// Seconds since the Unix epoch, UTC — the "now" GH-54's fallback
+    /// routing (`src/agent/routing.rs`'s `plan_attempts`) compares recorded
+    /// `agent_windows.exhausted_until` timestamps against. Deliberately a
+    /// separate method from [`Clock::now_parts`] (local-time components for
+    /// filename timestamps) rather than a derived conversion of it, so
+    /// [`SystemClock`] can answer with the real epoch directly instead of
+    /// round-tripping through a broken-down local time and a timezone-aware
+    /// reconstruction. Mirrors `crate::work::review_watch::Clock`'s
+    /// same-shaped method, kept a separate trait there because that trait
+    /// needs no broken-down local time at all — see its doc comment.
+    fn now_unix_secs(&self) -> i64;
 }
 
 /// Production [`Clock`] backed by `libc::time`/`libc::localtime`.
@@ -286,6 +298,16 @@ impl Clock for SystemClock {
             )
         }
     }
+
+    fn now_unix_secs(&self) -> i64 {
+        // SAFETY: `time(NULL)` is side-effect-free with respect to Rust's
+        // aliasing rules; `t` is a plain stack `time_t`.
+        let mut t: libc::time_t = 0;
+        unsafe {
+            libc::time(&mut t);
+        }
+        t as i64
+    }
 }
 
 /// A [`Clock`] test double returning a fixed, caller-supplied time.
@@ -296,6 +318,33 @@ impl Clock for FakeClock {
     fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32) {
         self.0
     }
+
+    fn now_unix_secs(&self) -> i64 {
+        let (year, month, day, hour, min, sec) = self.0;
+        civil_to_unix(year, month, day, hour, min, sec)
+    }
+}
+
+/// Converts a civil (Gregorian) date/time, treated as UTC, to seconds since
+/// the Unix epoch — Howard Hinnant's `days_from_civil` algorithm
+/// (<http://howardhinnant.github.io/date_algorithms.html>), valid across
+/// the full `i32` year range including proleptic Gregorian dates. Used only
+/// by [`FakeClock::now_unix_secs`]: a deterministic, pure conversion of its
+/// fixed test components, not a claim that local time equals UTC ([`SystemClock`]
+/// reads the real epoch directly instead — see its `now_unix_secs`).
+fn civil_to_unix(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (month as i64 + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
 }
 
 /// Dependencies [`run_lane_fg`] needs, gathered the same way
@@ -1511,6 +1560,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    #[test]
+    fn fake_clock_now_unix_secs_is_deterministic_and_matches_a_known_epoch() {
+        // 2026-08-06 09:05:03 UTC, cross-checked against `date -u -d
+        // '2026-08-06 09:05:03' +%s`.
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        assert_eq!(clock.now_unix_secs(), 1_786_007_103);
+    }
+
+    #[test]
+    fn fake_clock_now_unix_secs_advances_with_its_components() {
+        let earlier = FakeClock((2026, 8, 6, 9, 5, 3));
+        let later = FakeClock((2026, 8, 6, 9, 5, 4));
+        assert_eq!(later.now_unix_secs(), earlier.now_unix_secs() + 1);
+    }
 
     /// A [`BackendIdentityResolver`] test double that resolves every
     /// directory to the same, fixed identity, regardless of what's asked.
