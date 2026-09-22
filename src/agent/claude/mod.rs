@@ -487,6 +487,12 @@ impl AgentRunner for ClaudeRunner {
 /// shows up in ordinary balance-inquiry prose that is not a limit hit.
 const RATE_LIMIT_PATTERNS: &[&str] = &["usage limit reached", "out of extra usage", "rate limit"];
 
+/// Longest `result` text that can still classify as a limit response. Every
+/// observed limit shape is a one-liner well under this; the guard exists so
+/// pattern words appearing inside a genuine multi-sentence work summary
+/// never trigger classification (see `classify_rate_limit`).
+const RATE_LIMIT_MAX_RESULT_LEN: usize = 240;
+
 /// Classifies `result` (a finished run's free-text summary) as a
 /// usage-limit/rate-limit response, per [`RATE_LIMIT_PATTERNS`] plus the
 /// `"credit balance" + "too low"` pair. Returns `None` for any result text
@@ -497,7 +503,16 @@ const RATE_LIMIT_PATTERNS: &[&str] = &["usage limit reached", "out of extra usag
 /// its reset time after the last `|`; when that suffix parses as an `i64`
 /// unix-seconds timestamp it becomes [`RateLimitInfo::reset_at`], otherwise
 /// (no `|` at all, or a non-numeric suffix) `reset_at` stays `None`.
+///
+/// Only terse results classify: `result` is the agent's own closing prose
+/// on a normal run, so a successful run that merely *discusses* rate limits
+/// must not be mistaken for a limit hit. A real limit response replaces the
+/// whole result with a one-liner; anything over
+/// [`RATE_LIMIT_MAX_RESULT_LEN`] is a work summary and never classifies.
 fn classify_rate_limit(result: &str) -> Option<RateLimitInfo> {
+    if result.len() > RATE_LIMIT_MAX_RESULT_LEN {
+        return None;
+    }
     let lower = result.to_lowercase();
     let matched = RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
         || (lower.contains("credit balance") && lower.contains("too low"));
@@ -1159,6 +1174,23 @@ mod tests {
             r#"{"session_id": "sess-abc", "result": "Claude AI usage limit reached|not-a-number"}"#;
         let outcome = ClaudeRunner.parse_outcome(json).unwrap();
         assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_ignores_rate_limit_mentions_in_long_work_summaries() {
+        // `result` is the agent's own closing prose: a successful run that
+        // merely *discusses* rate limits (say, a lane run implementing
+        // rate-limit handling) must not classify as a limit hit. Real limit
+        // responses are terse one-liners; anything longer is a work summary.
+        let summary = "Implemented the rate limit classifier and its fallback \
+                       loop, extended the config parser with the new strategy \
+                       key, added twelve tests covering the rate limit window \
+                       persistence, and verified fmt, clippy, and the full \
+                       test suite all pass. PR is ready for review.";
+        let json =
+            format!(r#"{{"session_id": "sess-abc", "is_error": false, "result": "{summary}"}}"#);
+        let outcome = ClaudeRunner.parse_outcome(&json).unwrap();
+        assert_eq!(outcome.rate_limit, None);
     }
 
     // --- session identity ---
