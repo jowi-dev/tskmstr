@@ -22,7 +22,7 @@ use tskmstr::keychain::{KeychainStore, MacosKeychain, resolve_token};
 use tskmstr::ticketing::github_provider::GithubProvider;
 use tskmstr::ticketing::provider::{JiraProvider, TicketProvider};
 use tskmstr::ticketing::{CreateTicketContext, TicketingContext};
-use tskmstr::tui::event::{TuiDeps, run};
+use tskmstr::tui::event::{NetDeps, NetDepsBuilder, TuiDeps, run};
 use tskmstr::work::git::ShellGitOps;
 use tskmstr::work::tmux::ShellTmuxOps;
 
@@ -539,7 +539,6 @@ fn run_board(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let runner = agent_runner_for(&config);
-    let jira = ticket_provider_for(&config, keychain, env_token)?;
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
     let home = std::env::var_os("HOME")
@@ -561,6 +560,20 @@ fn run_board(
         &lanes,
         &backend_identity_resolver,
     );
+
+    // Built before the `config.work.*` moves below, while `config` is still
+    // whole enough to borrow.
+    let net = net_deps_builder(
+        &config,
+        keychain,
+        env_token,
+        NetDepsContext {
+            lanes,
+            cwd: cwd.clone(),
+            backend_identity: current_backend_identity.clone(),
+            runner,
+        },
+    )?;
 
     // Audit-dir fallback (GitHub issue #5 phase 2): fall back to the
     // current repo, rather than refuse, when the configured audit dir's
@@ -599,32 +612,116 @@ fn run_board(
     }
 
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    run(TuiDeps {
-        jira,
-        project_key: config.default_project_key,
-        board_column_order: config.board_column_order,
-        store,
-        tmux: Box::new(tmux),
-        audit,
-        create,
-        manual: config.work.manual,
-        review_watch: config.work.review_watch,
-        xdg_data_home,
-        home,
-        launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
-        lane_names,
-        hidden_lane_count,
-        audit_dir_fallback,
-        create_dir_fallback,
-        gh: Box::new(ShellGhCli::new()),
-        git: Box::new(ShellGitOps::new()),
-        cwd,
-        lanes,
-        backend_identity: current_backend_identity,
-        runner,
-        status_on_merge: config.status_on_merge,
-    })?;
+    run(
+        TuiDeps {
+            project_key: config.default_project_key,
+            board_column_order: config.board_column_order,
+            store,
+            tmux: Box::new(tmux),
+            audit,
+            create,
+            manual: config.work.manual,
+            review_watch: config.work.review_watch,
+            xdg_data_home,
+            home,
+            launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
+            lane_names,
+            hidden_lane_count,
+            audit_dir_fallback,
+            create_dir_fallback,
+            backend_identity: current_backend_identity,
+            runner,
+            status_on_merge: config.status_on_merge,
+        },
+        net,
+    )?;
     Ok(())
+}
+
+/// The already-resolved board context [`net_deps_builder`]'s closure
+/// captures verbatim into the worker's [`NetDeps`]: plain `Send` data the
+/// board's own setup computed anyway, bundled to keep the builder's arity
+/// in check.
+struct NetDepsContext {
+    lanes: std::collections::BTreeMap<String, tskmstr::config::LaneConfig>,
+    cwd: PathBuf,
+    backend_identity: tskmstr::config::BackendIdentity,
+    runner: &'static dyn AgentRunner,
+}
+
+/// Build the closure the board's network worker thread runs to construct
+/// its [`NetDeps`] in place (see that type's doc comment for why the deps
+/// are built on the worker rather than moved across: the GitHub provider
+/// borrows leaked non-`Sync` values and can never be `Send`).
+///
+/// Everything that can fail eagerly still fails here, on the main thread,
+/// before the board draws a single frame: keychain token resolution under
+/// [`BackendKind::Jira`], and the missing-`[backend.github].repo` check
+/// under [`BackendKind::Github`]. The closure itself captures only plain
+/// data (config strings, paths, the resolved token) and cannot fail --
+/// with one deliberate exception: the GitHub arm's rank-store
+/// [`tskmstr::runs::RunStore`] open happens inside the closure (a SQLite
+/// connection cannot cross threads), and an open failure there degrades
+/// the provider to no rank backing rather than aborting the board,
+/// matching [`TuiDeps::store`]'s leniency stance.
+fn net_deps_builder(
+    config: &Config,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+    ctx: NetDepsContext,
+) -> Result<NetDepsBuilder, Box<dyn std::error::Error>> {
+    let db_path = run_db_path_from_config(config);
+    let status_on_merge = config.status_on_merge.clone();
+    match config.backend {
+        BackendKind::Jira => {
+            let token = resolve_token(keychain, env_token)?;
+            let client_ctx = JiraClientContext {
+                base_url: config.jira_base_url.clone(),
+                email: config.jira_email.clone(),
+                token,
+            };
+            let base_url = config.jira_base_url.clone();
+            Ok(Box::new(move || NetDeps {
+                jira: Box::new(JiraProvider::new(HttpJiraClient::new(client_ctx), base_url)),
+                gh: Box::new(ShellGhCli::new()),
+                git: Box::new(ShellGitOps::new()),
+                store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                lanes: ctx.lanes,
+                cwd: ctx.cwd,
+                backend_identity: ctx.backend_identity,
+                status_on_merge,
+                runner: ctx.runner,
+            }))
+        }
+        BackendKind::Github => {
+            let repo = config
+                .github_repo
+                .clone()
+                .ok_or("github backend selected but no [backend.github].repo is configured")?;
+            Ok(Box::new(move || {
+                // Same leak-for-'static trade as `ticket_provider_for`, made
+                // on the worker thread because neither leaked value is
+                // `Sync` (see this function's doc comment).
+                let gh: &'static dyn GhCli = Box::leak(Box::new(ShellGhCli::new()));
+                let provider = GithubProvider::new(gh, repo);
+                let provider = match tskmstr::runs::RunStore::open(&db_path) {
+                    Ok(rank_store) => provider.with_rank_store(Box::leak(Box::new(rank_store))),
+                    Err(_) => provider,
+                };
+                NetDeps {
+                    jira: Box::new(provider),
+                    gh: Box::new(ShellGhCli::new()),
+                    git: Box::new(ShellGitOps::new()),
+                    store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                    lanes: ctx.lanes,
+                    cwd: ctx.cwd,
+                    backend_identity: ctx.backend_identity,
+                    status_on_merge,
+                    runner: ctx.runner,
+                }
+            }))
+        }
+    }
 }
 
 /// The invoking repo's own [`tskmstr::config::BackendIdentity`], or a
