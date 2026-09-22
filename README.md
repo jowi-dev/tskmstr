@@ -732,7 +732,7 @@ to" windows.
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
 | `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
-| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status (board only); see "Merging from the board" below |
+| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); see "Merging from the board" below |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
@@ -1167,29 +1167,37 @@ merge.
 When an open PR resolves, a confirmation window names exactly what
 confirming will do: the PR number and title, and the ticket's post-merge
 status (`status_on_merge`, or "merge only" when it's unset). `y`/`Enter`
-merges; `n`/`Esc`/`q` cancels and leaves everything untouched — every
-other key is inert while the prompt is up. The merge itself uses the
-repository's default merge method (the first enabled of merge commit,
-squash, rebase — the same order GitHub's own merge button uses); a merge
-GitHub rejects (conflicts, failing checks, branch protection) surfaces on
-the status line and moves no ticket.
+confirms; `n`/`Esc`/`q` cancels and leaves everything untouched — every
+other key is inert while the prompt is up.
 
-After a successful merge, the configured `status_on_merge` transition is
-applied advisorily (see its config docs below) and the board refetches, so
-a moved ticket changes column right away. Deliberately *not* included:
-deleting the branch, removing the worktree, or killing the ticket's tmux
-session — the merge key merges, nothing else.
+Confirming runs `tm merge <KEY>` itself, spawned as a detached, watched
+child process — the same launch-and-poll mechanism `w`/`b`/`F` use, so the
+board keeps redrawing and taking input while it runs rather than freezing
+for however long the merge takes. A "merging `<KEY>` via `tm merge`..."
+status line shows immediately; a second `M` press (or confirm) for the
+same ticket is refused with "merge for `<KEY>` already in flight" while
+it's out. That single command does everything "Merging a ticket's PR"
+below describes: rebase onto a moved base, an agent-assisted conflict
+window if the rebase can't complete cleanly, `gh pr merge`, a local
+base-branch sync, worktree/branch cleanup, and the advisory
+`status_on_merge` transition.
 
-`tm merge <KEY>` is the CLI equivalent of `M`, with local sync (auto-rebase
-onto a moved base) and worktree/branch cleanup on top — see "Merging a
-ticket's PR" below.
+A clean merge reports its outcome on the status line and refetches the
+board's tickets, so a moved ticket changes column (or, on the GitHub
+backend, a closed one leaves the board) right away. A rebase that hits
+conflicts is not a failure: it hands off to the merge tmux window for the
+agent (or you) to resolve, and the status line names that window and the
+`tm merge <KEY>` to rerun once it's resolved — the rebase itself is left
+in progress on disk in the meantime. Any other failure (no mergeable PR, a
+`gh`/`git` error) surfaces as its own status-line message; nothing is
+merged and no status is touched.
 
 ### Merging a ticket's PR
 
-`tm merge <KEY>` does everything the board's `M` key does, plus the local
-housekeeping `M` deliberately skips: catching a stale branch up to its PR's
-base, and cleaning up afterwards. It resolves `<KEY>`'s open PR (the same
-lookup `M`/`o` use), then runs through these stages:
+`tm merge <KEY>` is what the board's `M` key runs (see "Merging from the
+board" above) and works standalone from any shell the same way. It
+resolves `<KEY>`'s open PR (the same lookup `M`/`o` use), then runs through
+these stages:
 
 1. **Fetch and catch up.** `git fetch origin` in the ticket's local
    checkout (found the same way `tm work session` locates one: the newest
