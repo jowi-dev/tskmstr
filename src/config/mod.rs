@@ -1433,9 +1433,18 @@ fn agent_runner_names_list() -> String {
         .join(", ")
 }
 
-/// Merge a repo-local `[agent]` section on top of a global one, field by
-/// field (whole-key repo-over-global, like [`merge_backend`]), then validate
-/// and resolve the result into a preferred agent plus its fallback order.
+/// Merge a repo-local `[agent]` section on top of a global one by
+/// **whole-table replacement** (like lane maps in [`merge_work`], not like
+/// [`merge_backend`]'s per-key merge), then validate and resolve the result
+/// into a preferred agent plus its fallback order.
+///
+/// Whole-table replacement because the three keys form one mode
+/// declaration: merging them per key would let a global `runner` leak into
+/// a repo that only set `strategy`/`order` and trip the runner-vs-order
+/// conflict rule across layers — punishing exactly the common setup of a
+/// global single-runner default with one repo opted into priority routing.
+/// A repo `[agent]` table that sets any key is the sole source; a repo with
+/// no `[agent]` table inherits the global one untouched.
 ///
 /// Absence of `strategy` and `order` in both global and repo config is
 /// single-runner mode: `runner` behaves exactly as before issue #54, and
@@ -1454,9 +1463,13 @@ fn merge_agent(
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
 
-    let runner = repo.runner.or(global.runner);
-    let strategy = repo.strategy.or(global.strategy);
-    let order = repo.order.or(global.order);
+    let repo_declares_mode =
+        repo.runner.is_some() || repo.strategy.is_some() || repo.order.is_some();
+    let RawAgentConfig {
+        runner,
+        strategy,
+        order,
+    } = if repo_declares_mode { repo } else { global };
 
     match strategy {
         None => {
@@ -3618,9 +3631,9 @@ mod tests {
 
     #[test]
     fn merge_agent_repo_over_global_for_strategy_and_order() {
-        // Per-key repo-over-global precedence, same rule `runner` uses today
-        // (see `merge_agent`'s doc comment): global sets no `runner`, so
-        // repo's `strategy`/`order` merge in cleanly with no conflict.
+        // Whole-table repo-over-global precedence (see `merge_agent`'s doc
+        // comment): both layers declare priority mode, and the repo's order
+        // replaces the global one entirely.
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 strategy: Some("priority".to_string()),
@@ -3640,6 +3653,57 @@ mod tests {
         let cfg = merge(global, Some(repo)).expect("repo override should take effect");
         assert_eq!(cfg.agent, AgentKind::Claude);
         assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+    }
+
+    #[test]
+    fn merge_agent_repo_priority_wins_over_global_runner_without_conflict() {
+        // The common setup: a global config that names a single runner, and
+        // one repo opting into priority routing. The repo's `[agent]` table
+        // replaces the global one wholesale, so the global `runner` must not
+        // leak across layers and trip the same-file conflict rule.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo priority should win cleanly");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+    }
+
+    #[test]
+    fn merge_agent_repo_runner_opts_out_of_global_priority() {
+        // The inverse: global config declares priority routing, a repo pins
+        // a single runner. The repo table wins wholesale — single mode, no
+        // fallbacks, and no cross-layer conflict.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("opencode".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo single-runner should win cleanly");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, Vec::new());
     }
 
     #[test]

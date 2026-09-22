@@ -33,7 +33,11 @@ Rules (validated in `merge_agent`, `src/config/mod.rs`):
 - `order` present without `strategy = "priority"` is an error — the key
   must not be silently inert.
 - Any other `strategy` value is an error listing the accepted values.
-- Merge precedence stays whole-key repo-over-global, like `runner` today.
+- Merge precedence is **whole-table replacement**: a repo `[agent]` table
+  that sets any key is the sole source (the three keys form one mode
+  declaration), so a global `runner` never leaks into a repo that opted
+  into priority routing and trips the conflict rule across layers. A repo
+  with no `[agent]` table inherits the global one untouched.
 
 Config surface: `Config.agent: AgentKind` stays the **preferred** agent
 (`order[0]` in priority mode), so every existing call site — interactive
