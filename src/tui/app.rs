@@ -773,6 +773,13 @@ pub struct App {
     /// run row recorded yet). Populated by [`Msg::LaneRunAction`]/
     /// [`Msg::LanePickerSelect`], cleared by [`Msg::LaneRunLaunchResult`].
     pub pending_lane_launches: std::collections::HashSet<String>,
+    /// Ticket keys with a `tm merge` launcher child currently in flight.
+    /// Populated by [`Msg::MergeConfirm`]'s handler, cleared by
+    /// [`Msg::MergePrResult`]. Gates a second `M` press/confirm for the
+    /// same key the way `pending_lane_launches` gates a second `w` press,
+    /// now that the merge itself is a watched child rather than a tracked
+    /// [`InFlight`] network action (GitHub issue #61).
+    pub pending_merge_launches: std::collections::HashSet<String>,
     /// Per-ticket lane-run badge state for [`Screen::Board`], keyed by ticket
     /// key. Populated by [`Cmd::LoadLaneRunStatus`], polled every 8th
     /// [`Msg::Tick`] (~2s at the 250ms poll interval), same cadence as
@@ -1051,18 +1058,23 @@ pub enum Msg {
         note: Option<String>,
     },
     /// Accept the merge confirmation overlay: close it and start the
-    /// merge ([`Cmd::MergePr`]). A no-op when no confirmation is pending.
+    /// merge ([`Cmd::LaunchMerge`], `tm merge <key>` as a watched child --
+    /// GitHub issue #61). A no-op when no confirmation is pending.
     MergeConfirm,
     /// Close the merge confirmation overlay without merging; everything is
     /// left untouched.
     MergeCancel,
-    /// [`Cmd::MergePr`] finished, successfully or not; `message` carries
-    /// the full status-line outcome either way (merge + transition outcome,
-    /// or the merge error). `merged` additionally refetches the board's
-    /// tickets so a transitioned ticket moves column (or, on the GitHub
-    /// backend, a closed one leaves the board) without waiting for a manual
-    /// refresh.
+    /// [`Cmd::LaunchMerge`] finished, successfully or not; `message` carries
+    /// the full status-line outcome either way (`tm merge`'s own summary --
+    /// rebase, push, `gh pr merge`, `status_on_merge` -- on success, or its
+    /// stderr snippet on failure, e.g. a conflict handed back to the merge
+    /// tmux window). `merged` additionally refetches the board's tickets so
+    /// a transitioned ticket moves column (or, on the GitHub backend, a
+    /// closed one leaves the board) without waiting for a manual refresh.
+    /// Also clears `key` from [`App::pending_merge_launches`].
     MergePrResult {
+        /// Ticket key the merge was for.
+        key: String,
         /// Whether the merge itself succeeded.
         merged: bool,
         /// The status-line outcome text.
@@ -1550,6 +1562,20 @@ pub enum Cmd {
         /// Ticket key to dispatch a fix pass for.
         key: String,
     },
+    /// Merge `key`'s confirmed PR by running `tm merge <key>` (see `tm
+    /// merge`'s own rebase/agent-conflict-window/push/base-sync/cleanup
+    /// flow), spawned via `std::env::current_exe()` as a watched child
+    /// process through the same [`crate::tui::launcher::LaneLauncher`]
+    /// seam [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
+    /// [`Cmd::LaunchReviewFix`] use. Only ever emitted by
+    /// [`Msg::MergeConfirm`], so a merge can never run without the
+    /// confirmation overlay having been accepted first (GitHub issue #61).
+    /// `tm merge` re-resolves the PR itself, so unlike the direct-merge
+    /// path this replaced, no PR number rides along.
+    LaunchMerge {
+        /// Ticket key whose confirmed PR to merge.
+        key: String,
+    },
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::OpenBrowserAction`]'s picker-or-direct-open decision. Reports
     /// back as [`Msg::BrowserOptionsResolved`]. One `gh` call, made only on
@@ -1569,20 +1595,6 @@ pub enum Cmd {
     ResolvePrForMerge {
         /// Ticket key to resolve a PR for.
         key: String,
-    },
-    /// Merge pull request `number` for `key`, then advisorily apply the
-    /// configured `status_on_merge` transition (if any). Reports back as
-    /// [`Msg::MergePrResult`]. Only ever emitted by [`Msg::MergeConfirm`],
-    /// so a merge can never run without the confirmation overlay having
-    /// been accepted first.
-    MergePr {
-        /// Ticket key whose PR is being merged.
-        key: String,
-        /// The PR number to merge, from the confirmation's resolved PR.
-        number: u64,
-        /// Repo root the resolution ran against, threaded through so the
-        /// merge targets the same repository without a second resolution.
-        repo_root: std::path::PathBuf,
     },
     /// Fetch shipped tickets matching `query` (always
     /// [`TicketQuery::ShippedAwaitingRetro`]), filter out any that already
@@ -1635,8 +1647,6 @@ pub enum NetActionKind {
     ResolvePrForTicket,
     /// [`Cmd::ResolvePrForMerge`].
     ResolvePrForMerge,
-    /// [`Cmd::MergePr`].
-    MergePr,
 }
 
 /// One network action currently out on the worker thread, tracked in
@@ -1712,11 +1722,6 @@ fn net_action(cmd: &Cmd) -> Option<InFlight> {
             key.clone(),
             format!("resolving PR for {key}"),
         ),
-        Cmd::MergePr { key, number, .. } => entry(
-            NetActionKind::MergePr,
-            key.clone(),
-            format!("merging PR #{number} for {key}"),
-        ),
         _ => None,
     }
 }
@@ -1747,7 +1752,6 @@ fn cleared_kind(msg: &Msg) -> Option<NetActionKind> {
         }
         Msg::BrowserOptionsResolved { .. } => Some(NetActionKind::ResolvePrForTicket),
         Msg::MergePrResolved { .. } => Some(NetActionKind::ResolvePrForMerge),
-        Msg::MergePrResult { .. } => Some(NetActionKind::MergePr),
         _ => None,
     }
 }
@@ -1892,7 +1896,12 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             }
             (app, Vec::new())
         }
-        Msg::MergePrResult { merged, message } => {
+        Msg::MergePrResult {
+            key,
+            merged,
+            message,
+        } => {
+            app.pending_merge_launches.remove(&key);
             app.status_line = message;
             if merged {
                 let query = query_for_filter(&app.filter, &app.project_key);
@@ -2360,15 +2369,12 @@ fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     let key = ticket.key.clone();
-    // The in-flight dedup gate can't cover this on its own: the merge out on
-    // the worker is a `MergePr`, while a second `M` press starts a
+    // `pending_merge_launches`, not the `in_flight` net-action registry:
+    // the merge itself is a watched `tm merge` child (GitHub issue #61),
+    // not a tracked network `Cmd`, while a second `M` press starts a
     // `ResolvePrForMerge` -- a different kind -- whose resolution would
     // re-open the confirmation overlay over a PR that is mid-merge.
-    if app
-        .in_flight
-        .iter()
-        .any(|entry| entry.kind == NetActionKind::MergePr && entry.dedup == key)
-    {
+    if app.pending_merge_launches.contains(&key) {
         app.status_line = format!("merge for {key} already in flight");
         return (app, Vec::new());
     }
@@ -2412,22 +2418,19 @@ fn merge_pr_resolved(
 }
 
 /// Handle [`Msg::MergeConfirm`]: close the confirmation overlay and start
-/// the merge it was asking about. A no-op when no confirmation is pending,
-/// which [`crate::tui::keymap::map_key`]'s overlay gating makes unreachable
-/// in practice -- kept explicit like [`merge_pr_action`]'s screen check.
+/// the merge it was asking about, via [`Cmd::LaunchMerge`] (`tm merge
+/// <key>`, spawned as a watched child -- GitHub issue #61). A no-op when no
+/// confirmation is pending, which [`crate::tui::keymap::map_key`]'s overlay
+/// gating makes unreachable in practice -- kept explicit like
+/// [`merge_pr_action`]'s screen check.
 fn merge_confirm_accept(mut app: App) -> (App, Vec<Cmd>) {
     let Some(confirm) = app.merge_confirm.take() else {
         return (app, Vec::new());
     };
-    app.status_line = format!("merging PR #{} for {}...", confirm.pr_number, confirm.key);
-    (
-        app,
-        vec![Cmd::MergePr {
-            key: confirm.key,
-            number: confirm.pr_number,
-            repo_root: confirm.repo_root,
-        }],
-    )
+    let key = confirm.key;
+    app.status_line = format!("merging {key} via tm merge...");
+    app.pending_merge_launches.insert(key.clone());
+    (app, vec![Cmd::LaunchMerge { key }])
 }
 
 /// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm
@@ -4063,20 +4066,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_confirm_emits_merge_pr_and_closes_the_overlay() {
+    fn merge_confirm_emits_launch_merge_and_closes_the_overlay() {
         let app = App {
             merge_confirm: Some(merge_confirm_fixture()),
             ..App::new()
         };
         let (app, cmds) = update(app, Msg::MergeConfirm);
         assert_eq!(app.merge_confirm, None);
-        assert_eq!(app.status_line, "merging PR #42 for PROJ-1...");
+        assert_eq!(app.status_line, "merging PROJ-1 via tm merge...");
+        assert!(app.pending_merge_launches.contains("PROJ-1"));
         assert_eq!(
             cmds,
-            vec![Cmd::MergePr {
+            vec![Cmd::LaunchMerge {
                 key: "PROJ-1".to_string(),
-                number: 42,
-                repo_root: std::path::PathBuf::from("/repo"),
             }]
         );
     }
@@ -4103,15 +4105,18 @@ mod tests {
 
     #[test]
     fn merge_pr_result_merged_sets_status_line_and_refetches_tickets() {
-        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.pending_merge_launches.insert("PROJ-1".to_string());
         let (app, cmds) = update(
             app,
             Msg::MergePrResult {
+                key: "PROJ-1".to_string(),
                 merged: true,
-                message: "merged PR #42 for PROJ-1; moved to Done".to_string(),
+                message: "merged PROJ-1 via tm merge".to_string(),
             },
         );
-        assert_eq!(app.status_line, "merged PR #42 for PROJ-1; moved to Done");
+        assert_eq!(app.status_line, "merged PROJ-1 via tm merge");
+        assert!(!app.pending_merge_launches.contains("PROJ-1"));
         assert_eq!(
             cmds,
             vec![Cmd::FetchTickets {
@@ -4122,15 +4127,24 @@ mod tests {
 
     #[test]
     fn merge_pr_result_failed_sets_status_line_without_refetching() {
-        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.pending_merge_launches.insert("PROJ-1".to_string());
         let (app, cmds) = update(
             app,
             Msg::MergePrResult {
+                key: "PROJ-1".to_string(),
                 merged: false,
-                message: "merge of PR #42 for PROJ-1 failed: boom".to_string(),
+                message: "conflicts handed back for PROJ-1: resolve in the merge tmux window, \
+                          then rerun `tm merge PROJ-1`"
+                    .to_string(),
             },
         );
-        assert_eq!(app.status_line, "merge of PR #42 for PROJ-1 failed: boom");
+        assert_eq!(
+            app.status_line,
+            "conflicts handed back for PROJ-1: resolve in the merge tmux window, then rerun \
+             `tm merge PROJ-1`"
+        );
+        assert!(!app.pending_merge_launches.contains("PROJ-1"));
         assert!(cmds.is_empty());
     }
 
@@ -7652,17 +7666,6 @@ mod tests {
                     note: None,
                 },
             ),
-            (
-                Cmd::MergePr {
-                    key: "PROJ-1".to_string(),
-                    number: 7,
-                    repo_root: std::path::PathBuf::from("/repo"),
-                },
-                Msg::MergePrResult {
-                    merged: false,
-                    message: "x".to_string(),
-                },
-            ),
         ];
         for (cmd, result) in cases {
             let mut app = App::new();
@@ -7682,22 +7685,14 @@ mod tests {
         }
     }
 
-    /// A second `M` press while the confirmed merge itself is still out on
-    /// the worker must not start a fresh PR resolution: with the overlay
-    /// already closed, that lookup would re-open the confirmation over a PR
-    /// that is mid-merge, teeing up a double merge.
+    /// A second `M` press while the confirmed merge itself is still out as
+    /// a watched `tm merge` child must not start a fresh PR resolution:
+    /// with the overlay already closed, that lookup would re-open the
+    /// confirmation over a PR that is mid-merge, teeing up a double merge.
     #[test]
     fn merge_action_is_inert_while_a_merge_for_the_ticket_is_in_flight() {
         let mut app = board_with(vec![ticket("PROJ-1")], 0);
-        let admitted = admit_net_cmds(
-            &mut app,
-            vec![Cmd::MergePr {
-                key: "PROJ-1".to_string(),
-                number: 7,
-                repo_root: std::path::PathBuf::from("/repo"),
-            }],
-        );
-        assert_eq!(admitted.len(), 1);
+        app.pending_merge_launches.insert("PROJ-1".to_string());
 
         let (app, cmds) = update(app, Msg::MergePrAction);
         assert!(

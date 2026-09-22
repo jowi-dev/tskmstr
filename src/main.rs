@@ -685,7 +685,6 @@ fn net_deps_builder(
     ctx: NetDepsContext,
 ) -> Result<NetDepsBuilder, Box<dyn std::error::Error>> {
     let db_path = run_db_path_from_config(config);
-    let status_on_merge = config.status_on_merge.clone();
     match config.backend {
         BackendKind::Jira => {
             let token = resolve_token(keychain, env_token)?;
@@ -703,7 +702,6 @@ fn net_deps_builder(
                 lanes: ctx.lanes,
                 cwd: ctx.cwd,
                 backend_identity: ctx.backend_identity,
-                status_on_merge,
                 runner: ctx.runner,
             }))
         }
@@ -730,7 +728,6 @@ fn net_deps_builder(
                     lanes: ctx.lanes,
                     cwd: ctx.cwd,
                     backend_identity: ctx.backend_identity,
-                    status_on_merge,
                     runner: ctx.runner,
                 }
             }))

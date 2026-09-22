@@ -91,14 +91,6 @@ fn retro_overlay_for(app: &App) -> RetroOverlay {
 /// one-at-a-time queue and how long the user waits for the picker.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How long each of [`merge_pr`]'s underlying `gh` calls
-/// ([`crate::github::gh_cli::GhCli::pr_merge`]) may run before being killed.
-/// More generous than [`PR_LOOKUP_TIMEOUT`] -- a merge is a write GitHub
-/// may legitimately take longer to answer than a list, and the user just
-/// confirmed a prompt so a longer visible wait is expected -- while still
-/// bounding how long a dead network can occupy the worker's queue.
-const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Run `kind` of a `tm pr watch` poll loop, filtered on by
 /// [`load_bot_watch_status`].
 const REVIEW_WATCH_KIND: &str = "review-watch";
@@ -134,7 +126,9 @@ pub struct NetDeps {
     pub jira: Box<dyn TicketProvider>,
     /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`]/
     /// [`Cmd::ResolvePrForMerge`] to list a ticket's repo's open pull
-    /// requests, and by [`Cmd::MergePr`] to merge one.
+    /// requests. The merge itself now runs through `tm merge` as a watched
+    /// child ([`Cmd::LaunchMerge`], GitHub issue #61), not through this
+    /// worker.
     pub gh: Box<dyn crate::github::gh_cli::GhCli>,
     /// `git` operations used by [`resolve_repo_root_for_pr_lookup`]'s
     /// `resolve_watch_repo_root` fallback (`git rev-parse` the repo root of
@@ -160,12 +154,6 @@ pub struct NetDeps {
     /// rows [`resolve_repo_root_for_pr_lookup`] and [`fetch_retro_tickets`]
     /// read. A clone of [`TuiDeps::backend_identity`].
     pub backend_identity: crate::config::BackendIdentity,
-    /// The configured post-merge status target
-    /// ([`crate::config::Config::status_on_merge`]), applied advisorily by
-    /// [`merge_pr`] after a successful board merge. `None` means merge
-    /// only, no transition (GitHub issue #32). A clone of
-    /// [`TuiDeps::status_on_merge`].
-    pub status_on_merge: Option<String>,
     /// The AI coding agent, used by [`fetch_retro_tickets`] to shorten model
     /// names (see [`crate::runs::format_model_usage_compact`]). The same
     /// `&'static` value as [`TuiDeps::runner`]; sharing it across threads is
@@ -277,16 +265,18 @@ pub struct TuiDeps {
     /// ([`crate::config::Config::status_on_merge`]), threaded into
     /// [`crate::tui::app::App::with_status_on_merge`] so the merge
     /// confirmation overlay can describe the follow-up transition. The
-    /// merge itself reads [`NetDeps::status_on_merge`] on the worker
-    /// thread; both are set from the same config value.
+    /// merge itself now applies it via `tm merge`'s own flow
+    /// ([`crate::work::merge::run_merge`]), spawned as a watched child --
+    /// see [`Cmd::LaunchMerge`] (GitHub issue #61).
     pub status_on_merge: Option<String>,
 }
 
-/// One board-launched child (`tm work run`, `tm pr watch`, or `tm review
-/// fix`) that hasn't yet reported completion, tracked by [`run`]'s event loop
-/// between [`run_cmds`]'s [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
-/// [`Cmd::LaunchReviewFix`] interception (which creates the entry) and
-/// [`poll_pending_launches`] (which removes it once
+/// One board-launched child (`tm work run`, `tm pr watch`, `tm review fix`,
+/// or `tm merge`) that hasn't yet reported completion, tracked by [`run`]'s
+/// event loop between [`run_cmds`]'s [`Cmd::LaunchLaneRun`]/
+/// [`Cmd::LaunchBotWatch`]/[`Cmd::LaunchReviewFix`]/[`Cmd::LaunchMerge`]
+/// interception (which creates the entry) and [`poll_pending_launches`]
+/// (which removes it once
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] resolves).
 struct PendingLaunch {
     /// The ticket key the launch was for, echoed back in the result `Msg`.
@@ -309,6 +299,8 @@ enum PendingLaunchKind {
     BotWatch,
     /// `tm review fix <key>`; reports [`Msg::ReviewFixLaunchResult`].
     ReviewFix,
+    /// `tm merge <key>`; reports [`Msg::MergePrResult`] (GitHub issue #61).
+    Merge,
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -438,8 +430,9 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
 /// One worker, deliberately: commands execute in dispatch order, so a
 /// stale result can never land after a fresher one for the same action
 /// (e.g. two ticket fetches under a changed filter), and the existing
-/// per-call timeouts ([`PR_LOOKUP_TIMEOUT`], [`MERGE_TIMEOUT`]) bound how
-/// long any one command can occupy the queue.
+/// per-call timeout ([`PR_LOOKUP_TIMEOUT`]) bounds how long any one command
+/// can occupy the queue. The merge itself no longer runs here at all -- see
+/// [`Cmd::LaunchMerge`] (GitHub issue #61).
 ///
 /// The thread is detached rather than joined: on quit, [`run`] drops the
 /// returned sender, the worker's `for` loop ends after its current command
@@ -481,7 +474,6 @@ fn is_net_cmd(cmd: &Cmd) -> bool {
             | Cmd::FetchRetroTickets { .. }
             | Cmd::ResolvePrForTicket { .. }
             | Cmd::ResolvePrForMerge { .. }
-            | Cmd::MergePr { .. }
     )
 }
 
@@ -516,10 +508,6 @@ fn net_dispatch_failed(cmd: Cmd) -> Vec<Msg> {
             repo_root: None,
             note: Some(REASON.to_string()),
         }],
-        Cmd::MergePr { key, number, .. } => vec![Msg::MergePrResult {
-            merged: false,
-            message: format!("merge of PR #{number} for {key} failed: {REASON}"),
-        }],
         other => {
             debug_assert!(false, "net_dispatch_failed: not a network Cmd: {other:?}");
             Vec::new()
@@ -535,8 +523,9 @@ fn net_dispatch_failed(cmd: Cmd) -> Vec<Msg> {
 /// see the module docs. [`Cmd::EnsureManualSession`] is intercepted for the
 /// same reason (its ensure step ends in that very attach).
 /// [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
-/// [`Cmd::LaunchReviewFix`] are intercepted for the same kind of reason --
-/// they need mutable access to `launches`, the in-flight launcher registry,
+/// [`Cmd::LaunchReviewFix`]/[`Cmd::LaunchMerge`] are intercepted for the
+/// same kind of reason -- they need mutable access to `launches`, the
+/// in-flight launcher registry,
 /// which `execute`'s signature has no access to. A spawn failure feeds an
 /// immediate launch-result `Msg` error straight through `update`; a spawn
 /// success instead pushes a [`PendingLaunch`] onto `launches` for
@@ -677,6 +666,14 @@ fn run_cmds<B: Backend>(
             pending.extend(more_cmds);
             continue;
         }
+        if let Cmd::LaunchMerge { key } = cmd {
+            let argv = merge_argv(&key);
+            let (next_app, more_cmds) =
+                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::Merge, &argv);
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
         for msg in execute(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -717,6 +714,14 @@ fn review_fix_argv(key: &str) -> Vec<String> {
     vec!["review".to_string(), "fix".to_string(), key.to_string()]
 }
 
+/// The argv [`Cmd::LaunchMerge`] spawns through
+/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm merge <key>` (GitHub
+/// issue #61). `tm merge` re-resolves the PR itself, so unlike the old
+/// direct-merge `Cmd`, no PR number rides along.
+fn merge_argv(key: &str) -> Vec<String> {
+    vec!["merge".to_string(), key.to_string()]
+}
+
 /// Spawn `argv` as a watched child for `key`, registering it in `launches` on
 /// success. A spawn failure never reaches the registry: it feeds the matching
 /// launch-result `Msg` (an `Err`) straight back through `update`, returning
@@ -740,11 +745,34 @@ fn spawn_watched_child(
 }
 
 /// The result `Msg` a [`PendingLaunchKind`] reports its outcome as.
+///
+/// [`PendingLaunchKind::Merge`] doesn't fit the other three's plain
+/// `{ key, result }` shape: [`Msg::MergePrResult`] predates the watched-child
+/// seam (GitHub issue #32, before #61 moved the merge itself onto it) and
+/// carries `merged`/`message` instead, so its mapping is spelled out here
+/// rather than reusing `result` directly -- `Ok(())` reports a merge (`tm
+/// merge`'s own summary already printed to the terminal by the time this
+/// fires; the board's message is deliberately generic), `Err` carries
+/// [`crate::tui::launcher::LaunchHandle::try_finish`]'s stderr snippet,
+/// which is exactly the line `tm merge`'s `ConflictsHandedBack` exit prints
+/// (see `main.rs`'s `run_merge_cmd`) when the merge hands conflicts back.
 fn launch_result_msg(kind: PendingLaunchKind, key: String, result: Result<(), String>) -> Msg {
     match kind {
         PendingLaunchKind::LaneRun => Msg::LaneRunLaunchResult { key, result },
         PendingLaunchKind::BotWatch => Msg::BotWatchLaunchResult { key, result },
         PendingLaunchKind::ReviewFix => Msg::ReviewFixLaunchResult { key, result },
+        PendingLaunchKind::Merge => match result {
+            Ok(()) => Msg::MergePrResult {
+                message: format!("merged {key} via tm merge"),
+                key,
+                merged: true,
+            },
+            Err(message) => Msg::MergePrResult {
+                key,
+                merged: false,
+                message,
+            },
+        },
     }
 }
 
@@ -1375,6 +1403,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::EnsureManualSession { .. }
         | Cmd::LaunchLaneRun { .. }
         | Cmd::LaunchBotWatch { .. }
+        | Cmd::LaunchMerge { .. }
         | Cmd::ViewLogs { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
@@ -1387,8 +1416,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::FetchRankTickets { .. }
         | Cmd::FetchRetroTickets { .. }
         | Cmd::ResolvePrForTicket { .. }
-        | Cmd::ResolvePrForMerge { .. }
-        | Cmd::MergePr { .. }) => {
+        | Cmd::ResolvePrForMerge { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
@@ -1414,11 +1442,6 @@ fn execute_net(deps: &NetDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::FetchRetroTickets { query } => fetch_retro_tickets(deps, &query),
         Cmd::ResolvePrForTicket { key, jira_url } => resolve_pr_for_ticket(deps, key, jira_url),
         Cmd::ResolvePrForMerge { key } => resolve_pr_for_merge(deps, key),
-        Cmd::MergePr {
-            key,
-            number,
-            repo_root,
-        } => merge_pr(deps, &key, number, &repo_root),
         other => {
             debug_assert!(
                 false,
@@ -2185,47 +2208,6 @@ fn resolve_pr_for_merge(deps: &NetDeps, key: String) -> Vec<Msg> {
     }
 }
 
-/// Run `Cmd::MergePr`: merge the confirmed PR
-/// ([`crate::github::gh_cli::GhCli::pr_merge`], bounded by
-/// [`MERGE_TIMEOUT`]), then advisorily apply the configured
-/// `status_on_merge` transition, per GitHub issue #32's acceptance
-/// criteria:
-///
-/// - a failed merge reports the error and attempts no transition;
-/// - a successful merge with `status_on_merge` unset reports the merge and
-///   attempts no transition ("merge only");
-/// - a successful merge with it set applies
-///   [`crate::ticketing::apply_status_on_merge`], appending either the
-///   resulting status or the advisory warning (unmatched status, API
-///   error) to the merge message -- a transition problem never un-reports
-///   the merge itself, which by then has already happened.
-fn merge_pr(deps: &NetDeps, key: &str, number: u64, repo_root: &std::path::Path) -> Vec<Msg> {
-    if let Err(err) = deps.gh.pr_merge(repo_root, number, MERGE_TIMEOUT) {
-        return vec![Msg::MergePrResult {
-            merged: false,
-            message: format!("merge of PR #{number} for {key} failed: {err}"),
-        }];
-    }
-
-    let message = match deps.status_on_merge.as_deref() {
-        None => format!("merged PR #{number} for {key}"),
-        Some(target) => {
-            match crate::ticketing::apply_status_on_merge(deps.jira.as_ref(), key, target) {
-                crate::ticketing::StatusTransition::Applied(status) => {
-                    format!("merged PR #{number} for {key}; moved to {status}")
-                }
-                crate::ticketing::StatusTransition::Warning(warning) => {
-                    format!("merged PR #{number} for {key}; warning: {warning}")
-                }
-            }
-        }
-    };
-    vec![Msg::MergePrResult {
-        merged: true,
-        message,
-    }]
-}
-
 /// Best-effort open `url` in the user's default browser via the `open`
 /// command. Failures are not surfaced as a dedicated message (the fixed `Msg`
 /// set has no `OpenUrlFailed` variant); [`Msg::TicketsFailed`] is reused
@@ -2342,7 +2324,6 @@ mod tests {
                 base_url: "https://x.atlassian.net".to_string(),
                 project_key: "PROJ".to_string(),
             },
-            status_on_merge: None,
             runner: &crate::agent::claude::ClaudeRunner,
         }
     }
@@ -2793,118 +2774,6 @@ mod tests {
                 note: Some("PR lookup for PROJ-1 timed out after 8s; nothing merged".to_string()),
             }]
         );
-    }
-
-    #[test]
-    fn merge_pr_failure_reports_error_and_attempts_no_transition() {
-        // `status_on_merge` is set, but the merge failing must be the whole
-        // story: no transition attempt, no "moved to" in the message.
-        let mut d = net_deps(FakeJiraClient::new());
-        d.status_on_merge = Some("Done".to_string());
-        d.gh = Box::new(
-            crate::github::gh_cli::FakeGhCli::new().with_pr_merge_result(Err(
-                crate::github::gh_cli::GhError::Command {
-                    command: "gh pr merge".to_string(),
-                    exit_code: Some(1),
-                    stderr: "Pull request is not mergeable".to_string(),
-                },
-            )),
-        );
-        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
-        match msgs.as_slice() {
-            [
-                Msg::MergePrResult {
-                    merged: false,
-                    message,
-                },
-            ] => {
-                assert!(
-                    message.contains("merge of PR #42 for PROJ-1 failed"),
-                    "message should report the failed merge: {message}"
-                );
-                assert!(
-                    message.contains("not mergeable"),
-                    "message should carry gh's error: {message}"
-                );
-                assert!(
-                    !message.contains("moved to"),
-                    "a failed merge must not report a transition: {message}"
-                );
-            }
-            other => panic!("expected a failed MergePrResult, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn merge_pr_success_without_status_on_merge_merges_only() {
-        // Absent key = merge only: the exact message pins that no advisory
-        // transition outcome (applied or warning) was appended.
-        let d = net_deps(FakeJiraClient::new());
-        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
-        assert_eq!(
-            msgs,
-            vec![Msg::MergePrResult {
-                merged: true,
-                message: "merged PR #42 for PROJ-1".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn merge_pr_success_applies_configured_transition() {
-        let jira = FakeJiraClient::new()
-            .with_issue("PROJ-1", issue("PROJ-1", "In Review"))
-            .with_transitions(
-                "PROJ-1",
-                vec![crate::ticketing::types::Transition {
-                    id: "31".to_string(),
-                    name: "Ship it".to_string(),
-                    to: Status {
-                        name: "Done".to_string(),
-                        status_category: StatusCategory {
-                            key: "done".to_string(),
-                        },
-                    },
-                }],
-            );
-        let mut d = net_deps(jira);
-        d.status_on_merge = Some("Done".to_string());
-        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
-        assert_eq!(
-            msgs,
-            vec![Msg::MergePrResult {
-                merged: true,
-                message: "merged PR #42 for PROJ-1; moved to Done".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn merge_pr_success_with_unmatched_status_appends_advisory_warning() {
-        let jira = FakeJiraClient::new()
-            .with_issue("PROJ-1", issue("PROJ-1", "In Review"))
-            .with_transitions("PROJ-1", vec![]);
-        let mut d = net_deps(jira);
-        d.status_on_merge = Some("Shipped".to_string());
-        let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
-        match msgs.as_slice() {
-            [
-                Msg::MergePrResult {
-                    merged: true,
-                    message,
-                },
-            ] => {
-                assert!(
-                    message.starts_with("merged PR #42 for PROJ-1; warning: "),
-                    "the merge itself must still be reported: {message}"
-                );
-                assert!(
-                    message.contains("no transition to \"Shipped\""),
-                    "the advisory warning should follow: {message}"
-                );
-            }
-            other => panic!("expected a merged-with-warning MergePrResult, got {other:?}"),
-        }
     }
 
     #[test]
@@ -4624,6 +4493,121 @@ mod tests {
             vec![Msg::ReviewFixLaunchResult {
                 key: "PROJ-1".to_string(),
                 result: Err("no comments captured".to_string()),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    // --- Cmd::LaunchMerge routing (run_cmds intercepts it too, GitHub issue #61) ---
+
+    #[test]
+    fn run_cmds_launch_merge_spawns_merge_argv() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut d = deps();
+        d.launcher = Box::new(RecordingLauncher(calls.clone()));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        run_cmds_test(
+            App::new(),
+            vec![Cmd::LaunchMerge {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            calls.borrow().clone(),
+            vec![vec!["merge".to_string(), "PROJ-1".to_string()]]
+        );
+        assert_eq!(launches.len(), 1);
+    }
+
+    #[test]
+    fn run_cmds_launch_merge_success_registers_pending_launch() {
+        let d = deps();
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds_test(
+            App::new(),
+            vec![Cmd::LaunchMerge {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].key, "PROJ-1");
+        assert_eq!(app.status_line, "");
+    }
+
+    #[test]
+    fn run_cmds_launch_merge_spawn_failure_feeds_immediate_launch_result() {
+        let mut d = deps();
+        d.launcher = Box::new(
+            crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("current_exe failed"),
+        );
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let app = run_cmds_test(
+            App::new(),
+            vec![Cmd::LaunchMerge {
+                key: "PROJ-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert!(launches.is_empty());
+        assert_eq!(app.status_line, "current_exe failed");
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_a_successful_merge_entry_as_merged() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
+        let handle = launcher.spawn(&merge_argv("PROJ-1")).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::Merge,
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResult {
+                key: "PROJ-1".to_string(),
+                merged: true,
+                message: "merged PROJ-1 via tm merge".to_string(),
+            }]
+        );
+        assert!(launches.is_empty());
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_a_failed_merge_entry_with_its_stderr_snippet() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Err(
+                "conflicts handed back for PROJ-1: resolve in the merge tmux window, then \
+                 rerun `tm merge PROJ-1`"
+                    .to_string(),
+            ))]);
+        let handle = launcher.spawn(&merge_argv("PROJ-1")).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1".to_string(),
+            kind: PendingLaunchKind::Merge,
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResult {
+                key: "PROJ-1".to_string(),
+                merged: false,
+                message: "conflicts handed back for PROJ-1: resolve in the merge tmux window, \
+                          then rerun `tm merge PROJ-1`"
+                    .to_string(),
             }]
         );
         assert!(launches.is_empty());
