@@ -2362,6 +2362,18 @@ fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     let key = ticket.key.clone();
+    // The in-flight dedup gate can't cover this on its own: the merge out on
+    // the worker is a `MergePr`, while a second `M` press starts a
+    // `ResolvePrForMerge` -- a different kind -- whose resolution would
+    // re-open the confirmation overlay over a PR that is mid-merge.
+    if app
+        .in_flight
+        .iter()
+        .any(|entry| entry.kind == NetActionKind::MergePr && entry.dedup == key)
+    {
+        app.status_line = format!("merge for {key} already in flight");
+        return (app, Vec::new());
+    }
     app.status_line = format!("resolving PR for {key}...");
     (app, vec![Cmd::ResolvePrForMerge { key }])
 }
@@ -7669,6 +7681,31 @@ mod tests {
                 "{result:?} should clear {cmd:?}'s in-flight entry"
             );
         }
+    }
+
+    /// A second `M` press while the confirmed merge itself is still out on
+    /// the worker must not start a fresh PR resolution: with the overlay
+    /// already closed, that lookup would re-open the confirmation over a PR
+    /// that is mid-merge, teeing up a double merge.
+    #[test]
+    fn merge_action_is_inert_while_a_merge_for_the_ticket_is_in_flight() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        let admitted = admit_net_cmds(
+            &mut app,
+            vec![Cmd::MergePr {
+                key: "PROJ-1".to_string(),
+                number: 7,
+                repo_root: std::path::PathBuf::from("/repo"),
+            }],
+        );
+        assert_eq!(admitted.len(), 1);
+
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert!(
+            cmds.is_empty(),
+            "no PR resolution may start while the merge is out, got {cmds:?}"
+        );
+        assert_eq!(app.status_line, "merge for PROJ-1 already in flight");
     }
 
     #[test]
