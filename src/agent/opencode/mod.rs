@@ -84,7 +84,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RunMode, RunOutcome, SessionEnvVars, shell_quote,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, shell_quote,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -463,6 +463,11 @@ impl AgentRunner for OpencodeRunner {
             Some(texts.join("\n\n"))
         };
 
+        let rate_limit = events
+            .iter()
+            .find_map(|event| event.error.as_ref())
+            .and_then(classify_rate_limit_error);
+
         Ok(RunOutcome {
             session_id,
             cost_usd,
@@ -472,6 +477,7 @@ impl AgentRunner for OpencodeRunner {
             // The JSON stream never names the model; see this method's doc
             // comment.
             model_usage: None,
+            rate_limit,
         })
     }
 
@@ -712,6 +718,8 @@ struct RawEvent {
     session_id: Option<String>,
     #[serde(default)]
     part: Option<RawPart>,
+    #[serde(default)]
+    error: Option<RawErrorEvent>,
 }
 
 /// The `part` payload carried by `step_finish` (`cost`, `tokens` — tokens
@@ -722,6 +730,66 @@ struct RawPart {
     cost: Option<f64>,
     #[serde(default)]
     text: Option<String>,
+}
+
+/// The `error` payload carried by an `error`-type event, e.g.
+/// `{"type":"error","error":{"name":"APIError","data":{"message":"boom"}}}`.
+/// Both `name` and `data.message` are scanned by
+/// [`classify_rate_limit_error`] — a provider error can name the condition
+/// in either field depending on the upstream API.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawErrorEvent {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    data: Option<RawErrorData>,
+}
+
+/// See [`RawErrorEvent`].
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawErrorData {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Case-insensitive rate-limit/quota phrases, verified against opencode
+/// v1.18.11's error payloads and Venice's "insufficient credits"/"out of
+/// credits" wording (`docs/plans/gh-54-priority-routing.md`'s "Rate-limit
+/// classification" section). Matched against both `error.name` and
+/// `error.data.message` — an upstream API error can surface the condition
+/// in either field. Matched against a *normalized* (see
+/// [`normalize_for_rate_limit_match`]) form of each field, so `"rate
+/// limit"`/`"rate_limit"`/an error-name-cased `"RateLimitError"` all match
+/// the same `"ratelimit"` pattern without three separate spellings.
+const OPENCODE_RATE_LIMIT_PATTERNS: &[&str] = &["ratelimit", "429", "quota", "credit"];
+
+/// Lowercases `s` and strips spaces/underscores, so `"Rate Limit"`,
+/// `"rate_limit"`, and the error-name spelling `"RateLimitError"` all
+/// normalize to a comparable `"ratelimit..."` form for substring matching
+/// in [`classify_rate_limit_error`].
+fn normalize_for_rate_limit_match(s: &str) -> String {
+    s.to_lowercase().replace([' ', '_'], "")
+}
+
+/// Classifies one `error` event's payload as a rate-limit/quota response.
+/// `reset_at` is always `None` here — the opencode stream never carries a
+/// reset timestamp, unlike claude's legacy `usage limit reached|<epoch>`
+/// shape.
+fn classify_rate_limit_error(error: &RawErrorEvent) -> Option<RateLimitInfo> {
+    let name = normalize_for_rate_limit_match(error.name.as_deref().unwrap_or_default());
+    let message = normalize_for_rate_limit_match(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.message.as_deref())
+            .unwrap_or_default(),
+    );
+
+    let matched = OPENCODE_RATE_LIMIT_PATTERNS
+        .iter()
+        .any(|p| name.contains(p) || message.contains(p));
+
+    matched.then_some(RateLimitInfo { reset_at: None })
 }
 
 #[cfg(test)]
@@ -1254,6 +1322,42 @@ mod tests {
         assert_eq!(outcome.is_error, Some(true));
         assert_eq!(outcome.cost_usd, None);
         assert_eq!(outcome.num_turns, None);
+        // "boom" matches none of the rate-limit patterns.
+        assert_eq!(outcome.rate_limit, None);
+    }
+
+    // --- rate-limit classification ---
+
+    #[test]
+    fn parse_outcome_classifies_error_message_insufficient_credits() {
+        let raw = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"APIError","data":{"message":"insufficient credits"}}}"#;
+
+        let outcome = OpencodeRunner.parse_outcome(raw).expect("should parse");
+
+        assert_eq!(outcome.is_error, Some(true));
+        assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_classifies_error_name_rate_limit_error() {
+        let raw = r#"{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"name":"RateLimitError","data":{"message":"slow down"}}}"#;
+
+        let outcome = OpencodeRunner.parse_outcome(raw).expect("should parse");
+
+        assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_clean_stream_leaves_rate_limit_none() {
+        let raw = [
+            r#"{"type":"step_start","timestamp":1,"sessionID":"ses_z"}"#,
+            r#"{"type":"step_finish","timestamp":2,"sessionID":"ses_z","part":{"cost":0.05}}"#,
+        ]
+        .join("\n");
+
+        let outcome = OpencodeRunner.parse_outcome(&raw).expect("should parse");
+
+        assert_eq!(outcome.rate_limit, None);
     }
 
     #[test]
