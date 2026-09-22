@@ -16,4 +16,5 @@ base_branch = "main"
 # A relative prompt_file resolves against the lane's repo root (see
 # resolve_prompt_path in src/work/run.rs), so the prompt lives in the repo
 # it instructs and a run works no matter where `tm` was invoked from.
-prompt_file = "prompts/tskmstr-lane.md"
+# `.tskmstr/prompts/` is the canonical home for all prompt files (ADR-0006).
+prompt_file = ".tskmstr/prompts/tskmstr-lane.md"
