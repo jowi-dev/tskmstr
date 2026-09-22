@@ -48,4 +48,9 @@ Two deliberate boundaries:
   plus `.tskmstr/`.
 - Repos onboarded before this decision keep their `prompts/<lane>-lane.md`
   files untouched; the new default only applies when the wizard proposes a
-  path for a lane that doesn't have one.
+  path for a lane that doesn't have one. Since GitHub issue #53,
+  `.tskmstr/prompts/` is the *canonical* location for every repo-local
+  prompt file, and `tm check` reports a relative `prompt_file` pointing at
+  the legacy top-level `prompts/` directory as drift. The migration stays
+  manual (move the file, update the key): `tm update` is additive-only and
+  never rewrites config values or relocates files.

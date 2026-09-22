@@ -98,7 +98,9 @@ the read-only counterpart: it reports whether a repo already onboarded by
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
 file, a lane whose `subagent` key names a definition that doesn't exist,
-a configured session's missing skill. It never writes anything and
+a configured session's missing skill, a relative `prompt_file` still
+pointing at the legacy top-level `prompts/` directory instead of the
+canonical `.tskmstr/prompts/`. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
 checked (see `docs/decisions/0007-asset-schema-version.md`).
@@ -625,7 +627,15 @@ run, and invokes `claude` with the lane's prompt. That prompt is the lane's
 `prompt_file`, resolved against the lane's repo root when it is a relative
 path (so `prompt_file = ".tskmstr/prompts/<lane>-lane.md"`, what `tm init`
 scaffolds, keeps the prompt versioned alongside the code it instructs), and
-falling back to `~/.claude/prompts/<lane>.md` when unset. In a repo-local
+falling back to `~/.claude/prompts/<lane>.md` when unset.
+`.tskmstr/prompts/<name>.md` is the canonical home for every repo-local
+prompt file tm resolves — lane prompts and the optional `[work.audit]` /
+`[work.create]` / `[work.review_watch]` `prompt_file`s alike — so an
+onboarded repo carries exactly two top-level tm artifacts: `.tskmstr.toml`
+and `.tskmstr/`. A relative `prompt_file` still pointing at the legacy
+top-level `prompts/` directory keeps working (any path is honored), but
+`tm check` reports it as drift until the file moves under
+`.tskmstr/prompts/` (GitHub issue #53). In a repo-local
 `.tskmstr.toml`, `repo` may
 also be a relative path — see "Relative `repo`/`dir` paths in a repo-local
 config" below.
@@ -936,7 +946,8 @@ hook settings; `{key}` in `prompt` (or in `prompt_file`'s contents) is
 replaced with the ticket key. `prompt_file` and `prompt` are mutually
 exclusive — setting both is a config error; a relative `prompt_file` is only
 legal in a repo-local `.tskmstr.toml`, resolved against that repo's root
-(`.tskmstr/prompts/` is a reasonable place to keep one). A missing or
+(`.tskmstr/prompts/` is the canonical home for it, as for every prompt
+file tm resolves). A missing or
 unreadable `prompt_file` at launch time is a status-line error, never an
 empty prompt. The
 launch pre-registers a `kind = "audit"` run, and the in-session
