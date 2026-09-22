@@ -82,6 +82,20 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PrCmd,
     },
+    /// Rebase, merge, and sync a ticket's PR: fetch, auto-rebase onto the
+    /// PR's base when it moved (opening an agent-assisted conflict session
+    /// in tmux if the rebase can't finish cleanly), `gh pr merge`, fast-
+    /// forward the local base branch, and best-effort clean up the
+    /// worktree and branch.
+    ///
+    /// Exit code: `0` merged, `2` a conflict-resolution session never
+    /// resolved (the rebase is left in progress on disk — see the printed
+    /// attach/abort commands), `1` any other error.
+    Merge {
+        /// Jira issue key whose open pull request to merge, e.g.
+        /// `PROJ-372` (case-insensitive).
+        key: String,
+    },
     /// List tickets assigned to you that are ready to pick up, or check
     /// whether a specific ticket is ready.
     ///
@@ -1906,6 +1920,20 @@ mod tests {
             }) => assert!(!auto_ticket),
             other => panic!("expected Pr Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_merge_with_key() {
+        let cli = Cli::try_parse_from(["tm", "merge", "proj-20"]).expect("should parse");
+        match cli.command {
+            Some(Command::Merge { key }) => assert_eq!(key, "proj-20"),
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_merge_requires_key() {
+        Cli::try_parse_from(["tm", "merge"]).expect_err("key is required");
     }
 
     #[test]
