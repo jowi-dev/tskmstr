@@ -2375,12 +2375,13 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \".tskmstr/prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
-        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
-        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join(".tskmstr/prompts/custom.md"), "# custom\n")
+            .expect("write prompt");
 
         // Accept every default: existing lanes mean the lane question
         // defaults to "no", so a plain re-run must change nothing — the
@@ -2407,7 +2408,7 @@ mod tests {
 
         // Same as the no-op re-run above, except the configured prompt file
         // was never written — the case a plain re-run used to walk past.
-        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nprompt_file = \".tskmstr/prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
 
@@ -2418,7 +2419,7 @@ mod tests {
         run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
 
         let repo_dir = repo_config.parent().unwrap();
-        let template = std::fs::read_to_string(repo_dir.join("prompts/custom.md"))
+        let template = std::fs::read_to_string(repo_dir.join(".tskmstr/prompts/custom.md"))
             .expect("missing prompt scaffolded");
         assert!(template.contains("mylane work lane"), "body: {template}");
         assert_eq!(
@@ -2462,12 +2463,13 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let ctx = github_ctx(&env, &gh, &keychain);
 
-        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "schema_version = 2\n\n[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n# keep me\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \".tskmstr/prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
-        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
-        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join(".tskmstr/prompts/custom.md"), "# custom\n")
+            .expect("write prompt");
 
         // Update the lane but keep every value: lines pop in question order
         // (backend, slug, lane name, repo, base_branch, prompt_file, model).
@@ -3147,12 +3149,13 @@ mod tests {
         // An already-configured lane whose prompt file already exists: the
         // lane question defaults to "no update", and there is nothing to
         // scaffold.
-        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \"prompts/custom.md\"\n";
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[work.lanes.mylane]\nrepo = \".\"\nbase_branch = \"develop\"\nprompt_file = \".tskmstr/prompts/custom.md\"\n";
         let repo_config = env.paths.repo.as_ref().unwrap();
         std::fs::write(repo_config, original).expect("write repo config");
         let repo_dir = repo_config.parent().unwrap();
-        std::fs::create_dir_all(repo_dir.join("prompts")).expect("mkdir");
-        std::fs::write(repo_dir.join("prompts/custom.md"), "# custom\n").expect("write prompt");
+        std::fs::create_dir_all(repo_dir.join(".tskmstr/prompts")).expect("mkdir");
+        std::fs::write(repo_dir.join(".tskmstr/prompts/custom.md"), "# custom\n")
+            .expect("write prompt");
 
         let mut prompter = FakePrompter::new();
         let mut out = Vec::new();
