@@ -595,6 +595,7 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             head_ref_name: String::new(),
+            base_ref_name: "main".to_string(),
         }
     }
 

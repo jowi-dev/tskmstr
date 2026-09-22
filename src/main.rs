@@ -53,6 +53,14 @@ fn main() -> ExitCode {
         return run_ready_check(key);
     }
 
+    // `tm merge <KEY>` is special-cased the same way: it needs a three-way
+    // exit code (0 merged, 2 a conflict-resolution session never resolved,
+    // 1 any other error) rather than dispatch's uniform 0/1 — see
+    // `MERGE_EXIT_CONFLICTS`'s doc comment.
+    if let Command::Merge { key } = command {
+        return run_merge_cmd(key);
+    }
+
     // `tm review fix <KEY>` is special-cased the same way: it needs a
     // three-way exit code (0 dispatched, 1 error or a failed `--fg` run, 3
     // no comments captured) rather than dispatch's uniform 0/1 — see
@@ -211,6 +219,9 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Update { .. } => {
             unreachable!("tm update is special-cased in main() before dispatch")
+        }
+        Command::Merge { .. } => {
+            unreachable!("tm merge is special-cased in main() before dispatch")
         }
     }
 }
@@ -1380,6 +1391,90 @@ fn run_ready_check(key: String) -> ExitCode {
     match tskmstr::cli::ready::check(&ctx, &key, &mut stdout) {
         Ok(tskmstr::cli::ready::ReadyOutcome::Ready) => ExitCode::SUCCESS,
         Ok(tskmstr::cli::ready::ReadyOutcome::Stackable) => ExitCode::from(READY_EXIT_STACKABLE),
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Exit code for `tm merge <KEY>` reporting that a conflict-resolution
+/// session never resolved (see
+/// [`tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack`]): the
+/// rebase is left in progress on disk and the caller should attach to
+/// finish it by hand — distinct from `0` (merged) and `1` (any other
+/// error) so an autonomous agent can branch on "needs a human" without
+/// parsing stdout. Exit codes are scoped per-command: `tm pr watch` and `tm
+/// check` also use `2`, for their own distinct meanings unrelated to this
+/// one.
+const MERGE_EXIT_CONFLICTS: u8 = 2;
+
+/// `tm merge <KEY>`: build real dependencies and run
+/// [`tskmstr::work::merge::run_merge`], mapping its
+/// [`tskmstr::work::merge::MergeFlowOutcome`] to an exit code (`0` merged,
+/// `2` conflicts handed back — see [`MERGE_EXIT_CONFLICTS`]'s doc comment
+/// — `1` any other error) rather than `dispatch`'s uniform 0/1.
+fn run_merge_cmd(key: String) -> ExitCode {
+    let paths = default_config_paths();
+    let env_token = std::env::var("JIRA_API_TOKEN").ok();
+    let keychain = MacosKeychain::new();
+
+    let (config, jira, gh) = match build_ticketing_deps(&paths, &keychain, env_token) {
+        Ok(deps) => deps,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let run_db_path = run_db_path_from_config(&config);
+    let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+
+    let git = ShellGitOps::new();
+    let tmux = ShellTmuxOps::new();
+    let clock = tskmstr::work::review_watch::SystemClock;
+    let sleeper = tskmstr::work::review_watch::RealSleeper;
+    let identity = tskmstr::config::BackendIdentity::from_config(&config);
+
+    let deps = tskmstr::work::merge::MergeDeps {
+        git: &git,
+        gh: &gh,
+        tmux: &tmux,
+        jira: jira.as_ref(),
+        runner: agent_runner_for(&config),
+        run_store: Some(&run_store),
+        clock: &clock,
+        sleeper: &sleeper,
+        cwd: &cwd,
+        home: &home,
+        identity: &identity,
+        lanes: &config.work.lanes,
+        merge_cfg: &config.work.merge,
+        status_on_merge: config.status_on_merge.as_deref(),
+    };
+    let mut stdout = std::io::stdout();
+
+    match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
+        Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
+        Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
+            ExitCode::from(MERGE_EXIT_CONFLICTS)
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE

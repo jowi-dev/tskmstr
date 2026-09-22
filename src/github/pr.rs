@@ -16,7 +16,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 /// A GitHub pull request, as returned by
-/// `gh pr view --json number,url,title,body,headRefName`.
+/// `gh pr view --json number,url,title,body,headRefName,baseRefName`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrInfo {
@@ -30,6 +30,8 @@ pub struct PrInfo {
     pub body: String,
     /// Name of the branch the PR is opened from.
     pub head_ref_name: String,
+    /// Name of the branch the PR merges into.
+    pub base_ref_name: String,
 }
 
 /// Which part of a pull request an issue key resolved by
@@ -185,6 +187,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             head_ref_name: branch.to_string(),
+            base_ref_name: "main".to_string(),
         }
     }
 

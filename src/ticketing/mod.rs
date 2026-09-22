@@ -1295,6 +1295,7 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             head_ref_name: "proj-372-fix".to_string(),
+            base_ref_name: "main".to_string(),
         }
     }
 
@@ -1452,6 +1453,7 @@ mod tests {
             title: "Offer agent-assisted lane setup from tm init".to_string(),
             body: "Closes #30.\n\nRecorded as ADR-0006.".to_string(),
             head_ref_name: "jowi-dev/gh-30-tm-init-lane".to_string(),
+            base_ref_name: "main".to_string(),
         };
 
         let key = resolve_existing_key(&provider, &pull_request).expect("should succeed");

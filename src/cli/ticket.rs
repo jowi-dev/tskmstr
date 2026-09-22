@@ -871,6 +871,7 @@ mod tests {
             title: "Fix the thing".to_string(),
             body: String::new(),
             head_ref_name: "proj-372-fix".to_string(),
+            base_ref_name: "main".to_string(),
         }
     }
 

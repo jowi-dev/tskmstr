@@ -585,6 +585,28 @@ pub trait AgentRunner {
     /// `prompt_file` is given, e.g. `~/.claude/prompts/<lane>.md`.
     fn default_lane_prompt_path(&self, home: &Path, lane: &str) -> PathBuf;
 
+    /// Default prompt template used when `[work.merge].prompt`/`prompt_file`
+    /// are both unset, handed to the interactive agent session `tm merge`
+    /// opens when a rebase stops on conflicts. Placeholders `{key}` (the
+    /// ticket key), `{branch}` (the branch being rebased), and `{base}` (the
+    /// branch it's being rebased onto) are substituted by the caller
+    /// (`crate::work::merge`), not here.
+    ///
+    /// Provided with a runner-neutral default rather than required per
+    /// adapter: unlike the audit/cleanup/create templates (which invoke a
+    /// specific slash-command skill), a bounded conflict-resolution
+    /// instruction has no runner-specific shape, so every adapter is free to
+    /// inherit this verbatim. A runner can still override it if it ever
+    /// needs to.
+    fn default_merge_conflict_prompt_template(&self) -> &'static str {
+        "A git rebase of branch {branch} onto origin/{base} for ticket {key} has stopped on \
+         conflicts in this worktree. Your job is bounded: resolve only the merge conflicts. \
+         Inspect the conflicted files, resolve each conflict preserving the intent of both \
+         sides, `git add` the resolved files, and run `git rebase --continue` until the rebase \
+         completes. Do not push. Do not make unrelated changes. If a conflict cannot be \
+         resolved safely, run `git rebase --abort` and explain why."
+    }
+
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
     /// file, for `claude`) into `deploy_dir`, returning the settings path
     /// [`InvocationInputs::settings_path`] should carry, or `Ok(None)` for a
@@ -658,6 +680,27 @@ pub trait AgentRunner {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    use super::AgentRunner;
+    use crate::agent::claude::ClaudeRunner;
+    use crate::agent::opencode::OpencodeRunner;
+
+    /// Both adapters inherit [`AgentRunner::default_merge_conflict_prompt_template`]'s
+    /// provided default verbatim (neither overrides it), and the default
+    /// carries every placeholder the caller (`crate::work::merge`)
+    /// substitutes.
+    #[test]
+    fn both_runners_inherit_the_default_merge_conflict_prompt_template() {
+        let claude = ClaudeRunner.default_merge_conflict_prompt_template();
+        let opencode = OpencodeRunner.default_merge_conflict_prompt_template();
+        assert_eq!(claude, opencode);
+        for placeholder in ["{key}", "{branch}", "{base}"] {
+            assert!(
+                claude.contains(placeholder),
+                "expected {placeholder} in the default merge conflict prompt template, got: {claude:?}"
+            );
+        }
+    }
 
     /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
     /// `opencode` literal outside `src/agent/`, per

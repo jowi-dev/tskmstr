@@ -504,6 +504,7 @@ mod tests {
             title: title.to_string(),
             body: String::new(),
             head_ref_name: "some-branch".to_string(),
+            base_ref_name: "main".to_string(),
         }
     }
 

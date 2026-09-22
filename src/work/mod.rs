@@ -12,6 +12,7 @@ pub mod git;
 pub mod interactive;
 pub mod kill_safety;
 pub mod manual;
+pub mod merge;
 pub mod naming;
 pub mod prompt;
 pub mod review_watch;
