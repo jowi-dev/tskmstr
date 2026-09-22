@@ -3597,6 +3597,7 @@ mod tests {
             title: format!("[PROJ-1] PR {number}"),
             body: String::new(),
             head_ref_name: "proj-1-fix".to_string(),
+            base_ref_name: "main".to_string(),
         }
     }
 

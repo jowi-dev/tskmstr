@@ -373,7 +373,7 @@ pub trait GhCli {
 
     /// List open pull requests in the repository rooted at `dir`, fetching
     /// the same fields as [`GhCli::pr_view`] (`gh pr list --state open
-    /// --limit 200 --json number,url,title,body,headRefName`) so one
+    /// --limit 200 --json number,url,title,body,headRefName,baseRefName`) so one
     /// [`PrInfo`] parser serves both and callers like
     /// [`super::pr::find_pr_for_ticket`] have the title/body/branch data they
     /// need to resolve a ticket key without a second lookup.
@@ -770,7 +770,7 @@ pub struct IssueDependencies {
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
 /// [`PrInfo`] deserialization stay in lockstep.
-const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName";
+const PR_VIEW_JSON_FIELDS: &str = "number,url,title,body,headRefName,baseRefName";
 
 /// Fields requested from `gh pr view <number> --json` in [`GhCli::pr_state`];
 /// shared so the flag and [`RawPrState`] deserialization stay in lockstep.
@@ -2061,7 +2061,7 @@ fn interpret_pr_state_output(
 }
 
 /// Interpret the result of a `gh pr list --state open --json
-/// number,url,title,body,headRefName` invocation.
+/// number,url,title,body,headRefName,baseRefName` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
 /// testability reasons as [`interpret_pr_view_output`]. Shares [`PrInfo`]'s
@@ -2853,6 +2853,7 @@ impl Default for FakeGhCli {
                 title: String::new(),
                 body: String::new(),
                 head_ref_name: String::new(),
+                base_ref_name: "main".to_string(),
             })),
             pr_edit_result: RefCell::new(Ok(())),
             pr_comment_result: RefCell::new(Ok(())),
@@ -3614,12 +3615,26 @@ mod tests {
             "url": "https://github.com/example/repo/pull/42",
             "title": "Fix the thing",
             "body": "Resolves PROJ-372",
-            "headRefName": "proj-372-fix"
+            "headRefName": "proj-372-fix",
+            "baseRefName": "main"
         }"#;
         let result = interpret_pr_view_output(Some(0), stdout, "").unwrap();
         let pr = result.expect("expected a PR");
         assert_eq!(pr.number, 42);
         assert_eq!(pr.head_ref_name, "proj-372-fix");
+        assert_eq!(pr.base_ref_name, "main");
+    }
+
+    /// Pinned like [`PR_STATE_JSON_FIELDS`]: `gh` silently has different
+    /// `--json` field sets per subcommand, and an invalid field fails every
+    /// call, forever. `baseRefName` is validated against both `gh pr view
+    /// --json` and `gh pr list --json` (gh 2.x), which share this const.
+    #[test]
+    fn pr_view_json_fields_include_base_ref_name() {
+        assert_eq!(
+            PR_VIEW_JSON_FIELDS,
+            "number,url,title,body,headRefName,baseRefName"
+        );
     }
 
     #[test]
@@ -3736,6 +3751,7 @@ mod tests {
             title: "Fix the thing".to_string(),
             body: String::new(),
             head_ref_name: "proj-372-fix".to_string(),
+            base_ref_name: "main".to_string(),
         };
         let fake = FakeGhCli::new().with_pr_view(Ok(Some(pr.clone())));
 
@@ -4089,14 +4105,16 @@ mod tests {
                 "url": "https://github.com/example/repo/pull/1",
                 "title": "Fix the thing",
                 "body": "Resolves PROJ-372",
-                "headRefName": "proj-372-fix"
+                "headRefName": "proj-372-fix",
+                "baseRefName": "main"
             },
             {
                 "number": 2,
                 "url": "https://github.com/example/repo/pull/2",
                 "title": "Add the widget",
                 "body": "",
-                "headRefName": "add-widget"
+                "headRefName": "add-widget",
+                "baseRefName": "develop"
             }
         ]"#;
         let prs = interpret_pr_list_output(Some(0), stdout, "").unwrap();
@@ -4109,6 +4127,7 @@ mod tests {
                     title: "Fix the thing".to_string(),
                     body: "Resolves PROJ-372".to_string(),
                     head_ref_name: "proj-372-fix".to_string(),
+                    base_ref_name: "main".to_string(),
                 },
                 PrInfo {
                     number: 2,
@@ -4116,6 +4135,7 @@ mod tests {
                     title: "Add the widget".to_string(),
                     body: String::new(),
                     head_ref_name: "add-widget".to_string(),
+                    base_ref_name: "develop".to_string(),
                 },
             ]
         );
@@ -4344,6 +4364,7 @@ mod tests {
             title: "Fix the thing".to_string(),
             body: String::new(),
             head_ref_name: "proj-372-fix".to_string(),
+            base_ref_name: "main".to_string(),
         }];
         let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
         assert_eq!(fake.pr_list(Path::new("/repo")).unwrap(), prs);
@@ -4368,6 +4389,7 @@ mod tests {
             title: "Fix the thing".to_string(),
             body: String::new(),
             head_ref_name: "proj-372-fix".to_string(),
+            base_ref_name: "main".to_string(),
         }];
         let fake = FakeGhCli::new().with_pr_list(Ok(prs.clone()));
         assert_eq!(
