@@ -1151,11 +1151,45 @@ pub fn prepare_run_lane(
         None => prompt_text,
     };
 
-    // Step 8: deploy telemetry via the configured runner — `None` for a
-    // future telemetry-less runner (see `AgentRunner::deploy_telemetry`'s
-    // acceptance rule; run tracking below never depends on this being
-    // `Some`).
-    let settings_path = deps.runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
+    // Priority-routing attempt plan (GitHub issue #54,
+    // `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run
+    // fallback" section): with `fallback_runners` configured, the agent
+    // that actually drives this run's primary invocation may not be
+    // `deps.runner` (the configured *preferred* agent) if its usage window
+    // is still open — `plan_attempts` filters `[preferred] + fallbacks` down
+    // to the agents worth trying, preserving order. With no
+    // `fallback_runners` configured, skip the window lookups entirely and
+    // keep today's single-attempt behavior exactly: `deps.runner` is always
+    // the primary, unconditionally.
+    let preferred_kind = crate::config::AgentKind::parse(deps.runner.name()).unwrap_or_default();
+    let attempts: Vec<crate::config::AgentKind> = if deps.fallback_runners.is_empty() {
+        vec![preferred_kind]
+    } else {
+        let full_order: Vec<crate::config::AgentKind> = std::iter::once(preferred_kind)
+            .chain(
+                deps.fallback_runners
+                    .iter()
+                    .filter_map(|r| crate::config::AgentKind::parse(r.name())),
+            )
+            .collect();
+        crate::agent::routing::plan_attempts(
+            &full_order,
+            |agent| deps.run_store.agent_exhausted_until(agent).ok().flatten(),
+            deps.clock.now_unix_secs(),
+        )
+    };
+    let primary_kind = attempts[0];
+    let primary_runner: &dyn AgentRunner = if primary_kind == preferred_kind {
+        deps.runner
+    } else {
+        crate::agent::routing::runner_for(primary_kind)
+    };
+
+    // Step 8: deploy telemetry via the primary attempt's runner — `None`
+    // for a future telemetry-less runner (see
+    // `AgentRunner::deploy_telemetry`'s acceptance rule; run tracking below
+    // never depends on this being `Some`).
+    let settings_path = primary_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     // Step 9: start the tracked run. `pid` is `Some(current pid)` for --fg
     // (this process is the driver) and `None` for the detached path (the
@@ -1205,12 +1239,24 @@ pub fn prepare_run_lane(
     }
 
     // Build the claude invocation (still part of step 9's "safe to do in the
-    // foreground" work: pure argv construction, no spawning yet).
-    let model = request
-        .model
-        .clone()
-        .or_else(|| lane_config.model.clone())
-        .or_else(|| config.default_model.clone());
+    // foreground" work: pure argv construction, no spawning yet). `model`
+    // is only ever resolved for the *preferred* agent's own attempt —
+    // model strings are runner-specific ("fable" vs "provider/model"), so a
+    // fallback attempt always gets `None` and falls back to that runner's
+    // own default (see the plan doc's "model only for the configured
+    // preferred agent" rule). Since `preferred_kind` can only ever appear
+    // as `attempts[0]` (relative order is preserved, and it's always the
+    // first element of `full_order` above), this is equivalent to "only the
+    // primary attempt, and only when it wasn't a fallback substitution".
+    let model = if primary_kind == preferred_kind {
+        request
+            .model
+            .clone()
+            .or_else(|| lane_config.model.clone())
+            .or_else(|| config.default_model.clone())
+    } else {
+        None
+    };
     let max_turns = request
         .max_turns
         .clone()
@@ -1232,15 +1278,41 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let invocation = deps.runner.build_invocation(InvocationInputs {
-        prompt,
+    let invocation = primary_runner.build_invocation(InvocationInputs {
+        prompt: prompt.clone(),
         model,
-        max_turns,
-        permission_mode,
+        max_turns: max_turns.clone(),
+        permission_mode: permission_mode.clone(),
         settings_path,
         run_id: Some(run_id.to_string()),
         mode: request.mode,
     });
+
+    // Remaining priority-routing attempts (GitHub issue #54): one
+    // invocation per agent `plan_attempts` says to try next if the primary
+    // attempt's outcome classifies as a usage-limit hit. Same resolved
+    // prompt text, `permission_mode`/`max_turns` passed through, each
+    // attempt's own `deploy_telemetry` result as `settings_path`, and
+    // `model: None` always — see the model comment above; a fallback
+    // attempt is by definition never `preferred_kind`.
+    let mut fallbacks = Vec::with_capacity(attempts.len().saturating_sub(1));
+    for kind in attempts.iter().skip(1) {
+        let fallback_runner = crate::agent::routing::runner_for(*kind);
+        let fallback_settings_path = fallback_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
+        let fallback_invocation = fallback_runner.build_invocation(InvocationInputs {
+            prompt: prompt.clone(),
+            model: None,
+            max_turns: max_turns.clone(),
+            permission_mode: permission_mode.clone(),
+            settings_path: fallback_settings_path,
+            run_id: Some(run_id.to_string()),
+            mode: request.mode,
+        });
+        fallbacks.push(PlannedFallback {
+            agent: fallback_runner.name().to_string(),
+            invocation: fallback_invocation,
+        });
+    }
 
     std::fs::create_dir_all(&paths.state_dir)?;
     let out_json_path = paths.state_dir.join(format!("{wt_name}-{timestamp}.json"));
@@ -1255,7 +1327,7 @@ pub fn prepare_run_lane(
         branch,
         invocation,
         out_json_path,
-        fallbacks: Vec::new(),
+        fallbacks,
     })
 }
 
@@ -1598,6 +1670,7 @@ pub fn supervise_run(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
+    use crate::agent::opencode::OpencodeRunner;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
@@ -4298,6 +4371,202 @@ mod tests {
         assert_eq!(round_tripped.worktree, prepared.worktree);
         assert_eq!(round_tripped.invocation, prepared.invocation);
         assert_eq!(round_tripped.out_json_path, prepared.out_json_path);
+    }
+
+    #[test]
+    fn prepared_run_state_without_a_fallbacks_key_still_deserializes() {
+        // A pre-GH-54 supervisor state file (or single-runner-mode prepare)
+        // has no `fallbacks` key at all — `#[serde(default)]` must keep
+        // that compatible, since `PreparedRun` round-trips through the
+        // detached supervisor's JSON state file.
+        let json = r#"{
+            "run_id": 1,
+            "lane": "mylane",
+            "ticket": null,
+            "wt_name": "mylane",
+            "timestamp": "20260806-090503",
+            "worktree": "/Worktrees/axiom/mylane",
+            "branch": "jowi-dev/mylane-20260806-090503",
+            "invocation": {
+                "program": "claude",
+                "args": ["-p", "do the thing"],
+                "env_set": [],
+                "env_remove": []
+            },
+            "out_json_path": "/state/mylane-20260806-090503.json"
+        }"#;
+
+        let prepared: PreparedRun = serde_json::from_str(json).unwrap();
+
+        assert!(prepared.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn prepare_run_lane_with_no_fallback_runners_builds_no_fallbacks() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(prepared.fallbacks.is_empty());
+        assert_eq!(prepared.invocation.program, "claude");
+    }
+
+    #[test]
+    fn prepare_run_lane_with_fallback_runners_builds_one_planned_fallback_with_no_model() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.model = Some("fable".to_string());
+        let config = config_with_lane("mylane", lane, &worktree_root);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        // Preferred (claude) is not exhausted, so it drives the primary
+        // attempt and keeps its configured model.
+        assert_eq!(prepared.invocation.program, "claude");
+        assert!(prepared.invocation.args.iter().any(|a| a == "fable"));
+
+        assert_eq!(prepared.fallbacks.len(), 1);
+        let fallback = &prepared.fallbacks[0];
+        assert_eq!(fallback.agent, "opencode");
+        assert_eq!(fallback.invocation.program, "opencode");
+        // model is runner-specific and only ever set for the preferred
+        // agent's own attempt — the opencode fallback must never see
+        // "fable".
+        assert!(!fallback.invocation.args.iter().any(|a| a == "fable"));
+    }
+
+    #[test]
+    fn prepare_run_lane_uses_fallback_runner_as_primary_when_preferred_is_exhausted() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.model = Some("fable".to_string());
+        let config = config_with_lane("mylane", lane, &worktree_root);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        // claude's window is open (exhausted until far in the future,
+        // beyond the fake clock's "now").
+        run_store
+            .set_agent_exhausted_until("claude", 9_999_999_999)
+            .unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        // opencode drives the primary attempt since claude is exhausted,
+        // and there's no further fallback to plan beyond it.
+        assert_eq!(prepared.invocation.program, "opencode");
+        assert!(!prepared.invocation.args.iter().any(|a| a == "fable"));
+        assert!(prepared.fallbacks.is_empty());
     }
 
     #[test]
