@@ -389,7 +389,10 @@ pub struct RunLaneDeps<'a> {
     pub backend_identity_resolver: &'a dyn BackendIdentityResolver,
     /// The AI coding agent this run's invocation is built for (Claude
     /// today; see [`crate::agent::AgentRunner`] and GitHub issue #17),
-    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`. In
+    /// priority mode this is the *preferred* agent (`order[0]`), not
+    /// necessarily the one that ends up driving the primary attempt — see
+    /// [`fallback_runners`](Self::fallback_runners).
     pub runner: &'a dyn AgentRunner,
     /// The configured `status_on_run_start` workflow status (see
     /// [`crate::config::Config::status_on_run_start`]), or `None` when unset.
@@ -401,6 +404,19 @@ pub struct RunLaneDeps<'a> {
     /// [`RunLaneDeps::ticket_provider`]; absent that, the transition is
     /// skipped exactly like the branch-name slug lookup.
     pub status_on_run_start: Option<&'a str>,
+    /// The rest of `config.agent_fallbacks`' priority order, resolved to
+    /// live runners via `crate::agent::routing::runner_for`. Empty in
+    /// single-runner mode and everywhere but the lane-run path (`tm work
+    /// run`) — see GitHub issue #54,
+    /// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run
+    /// fallback" section. When non-empty, [`prepare_run_lane`] consults
+    /// `crate::agent::routing::plan_attempts` over `[runner] +
+    /// fallback_runners` to pick which agent actually drives the primary
+    /// invocation (it may not be `runner`, if `runner`'s usage window is
+    /// still open) and builds one extra invocation per remaining attempt,
+    /// carried on [`PreparedRun::fallbacks`] for
+    /// [`run_agent_and_finish`] to retry through on a rate-limit outcome.
+    pub fallback_runners: Vec<&'a dyn AgentRunner>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -1860,6 +1876,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1930,6 +1947,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -1985,6 +2003,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2039,6 +2058,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2092,6 +2112,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2147,6 +2168,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2205,6 +2227,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2292,6 +2315,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2372,6 +2396,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2451,6 +2476,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2502,6 +2528,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2566,6 +2593,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2628,6 +2656,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2678,6 +2707,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2734,6 +2764,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2787,6 +2818,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2840,6 +2872,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2891,6 +2924,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2963,6 +2997,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3021,6 +3056,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3068,6 +3104,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3118,6 +3155,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3199,6 +3237,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3257,6 +3296,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3310,6 +3350,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3365,6 +3406,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3417,6 +3459,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3463,6 +3506,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3512,6 +3556,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3566,6 +3611,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3618,6 +3664,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3675,6 +3722,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3729,6 +3777,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3785,6 +3834,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3841,6 +3891,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3909,6 +3960,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3964,6 +4016,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4019,6 +4072,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4068,6 +4122,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4124,6 +4179,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4178,6 +4234,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4235,6 +4292,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4313,6 +4371,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4594,6 +4653,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4664,6 +4724,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4731,6 +4792,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4797,6 +4859,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4851,6 +4914,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,

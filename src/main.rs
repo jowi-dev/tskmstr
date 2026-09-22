@@ -457,6 +457,7 @@ fn run_work(
                 status_on_run_start: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_run_start.as_deref()),
+                fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -752,6 +753,24 @@ fn agent_runner_or_default(config: Option<&Config>) -> &'static dyn AgentRunner 
     config
         .map(agent_runner_for)
         .unwrap_or_else(|| tskmstr::agent::routing::runner_for(AgentKind::default()))
+}
+
+/// `config.agent_fallbacks` resolved to live runners for
+/// [`tskmstr::work::run::RunLaneDeps::fallback_runners`] — the rest of a
+/// priority-mode `[agent]` order, empty in single-runner mode or when no
+/// config loaded. See GitHub issue #54,
+/// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run fallback"
+/// section: only the lane-run dispatch below populates this, mirroring
+/// [`agent_runner_or_default`]'s leniency for callers with no config.
+fn agent_fallback_runners_for(config: Option<&Config>) -> Vec<&'static dyn AgentRunner> {
+    config
+        .map(|cfg| {
+            cfg.agent_fallbacks
+                .iter()
+                .map(|kind| tskmstr::agent::routing::runner_for(*kind))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The default global/repo config paths for this machine and working
