@@ -127,6 +127,14 @@ pub enum DriftFinding {
         /// `tm init`'s `SetupTasks` records for it.
         prompt: String,
     },
+    /// A `prompt_file` value is a relative path whose first component is the
+    /// legacy top-level `prompts/` directory (GitHub issue #53), rather than
+    /// the canonical `.tskmstr/prompts/`. `key` is the full config key path
+    /// (e.g. `work.lanes.widget.prompt_file`, `work.audit.prompt_file`).
+    /// There is no additive fix: moving the file and rewriting the key is a
+    /// content decision, so this is reported as drift `tm update` cannot
+    /// clear on its own.
+    LegacyPromptDir { key: String, value: String },
 }
 
 impl std::fmt::Display for DriftFinding {
@@ -176,6 +184,11 @@ impl std::fmt::Display for DriftFinding {
                 "[{session}]'s /{name} skill exists neither at {} nor {}",
                 repo_path.display(),
                 home_path.display()
+            ),
+            DriftFinding::LegacyPromptDir { key, value } => write!(
+                f,
+                "`{key}` = \"{value}\" points at the legacy top-level prompts/ directory; \
+                 move the file under .tskmstr/prompts/ and update the key"
             ),
         }
     }
@@ -300,9 +313,27 @@ fn stamp_finding(doc: &DocumentMut) -> Option<DriftFinding> {
     }
 }
 
+/// `true` when `value` is a `prompt_file` pointing at the legacy top-level
+/// `prompts/` directory (GitHub issue #53): a relative path (not `~`-rooted,
+/// not absolute) whose first path component is literally `prompts`. This
+/// deliberately does not check filesystem existence — a dangling legacy
+/// path is still worth nudging toward migration, and `MissingLanePrompt`
+/// already covers the "nothing there at all" case separately.
+fn is_legacy_prompt_dir(value: &str) -> bool {
+    if value.starts_with('~') || Path::new(value).is_absolute() {
+        return false;
+    }
+    Path::new(value)
+        .components()
+        .next()
+        .is_some_and(|first| first.as_os_str() == "prompts")
+}
+
 /// The lane half of the report: for every `[work.lanes.<name>]`, resolve its
 /// prompt path exactly as `tm init`'s `existing_lane_prompt_path` does and
-/// flag any that's missing. Lanes are visited in the document's own order.
+/// flag any that's missing, plus flag any `prompt_file` still pointing at
+/// the legacy top-level `prompts/` directory. Lanes are visited in the
+/// document's own order.
 fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<DriftFinding> {
     let Some(lanes) = doc
         .get("work")
@@ -322,6 +353,14 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
                 findings.push(DriftFinding::MissingLanePrompt {
                     lane: lane.to_string(),
                     path: resolved,
+                });
+            }
+            if let Some(value) = str_at(doc, &["work", "lanes", lane, "prompt_file"])
+                && is_legacy_prompt_dir(value)
+            {
+                findings.push(DriftFinding::LegacyPromptDir {
+                    key: format!("work.lanes.{lane}.prompt_file"),
+                    value: value.to_string(),
                 });
             }
             // A lane that opted into a delegation subagent (GitHub issue #52)
@@ -386,7 +425,10 @@ struct Session {
 /// The session half of the report: for `[work.audit]` and
 /// `[work.review_watch]`, when present, resolve the configured (or default)
 /// session prompt's leading `/skill` and flag it when it exists nowhere
-/// this binary would look.
+/// this binary would look. Separately (and independently of the skill
+/// check), scan `[work.audit]`, `[work.create]`, and `[work.review_watch]`
+/// for a `prompt_file` still pointing at the legacy top-level `prompts/`
+/// directory.
 fn session_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<DriftFinding> {
     let sessions = [
         Session {
@@ -399,10 +441,34 @@ fn session_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> V
         },
     ];
 
-    sessions
+    let mut findings: Vec<DriftFinding> = sessions
         .iter()
         .filter_map(|section| session_finding(ctx, doc, repo_dir, section))
-        .collect()
+        .collect();
+
+    findings.extend(
+        ["audit", "create", "review_watch"]
+            .into_iter()
+            .filter_map(|table| session_prompt_file_finding(doc, table)),
+    );
+
+    findings
+}
+
+/// Flag `[work.<table>].prompt_file` when it's a relative path still
+/// pointing at the legacy top-level `prompts/` directory. Deliberately
+/// independent of [`session_finding`]'s `/skill` check — a session can have
+/// no `prompt` key (and thus never reach the skill scan) while still
+/// carrying a legacy `prompt_file`.
+fn session_prompt_file_finding(doc: &DocumentMut, table: &str) -> Option<DriftFinding> {
+    let value = str_at(doc, &["work", table, "prompt_file"])?;
+    if !is_legacy_prompt_dir(value) {
+        return None;
+    }
+    Some(DriftFinding::LegacyPromptDir {
+        key: format!("work.{table}.prompt_file"),
+        value: value.to_string(),
+    })
 }
 
 /// Check a single session section, returning `None` when the section is
@@ -936,6 +1002,135 @@ mod tests {
         let findings = run_check(&ctx, &mut out).expect("check should succeed");
 
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn lane_with_legacy_prompts_dir_is_reported() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join("prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \"prompts/widget-lane.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::LegacyPromptDir {
+                key: "work.lanes.widget.prompt_file".to_string(),
+                value: "prompts/widget-lane.md".to_string(),
+            }]
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("work.lanes.widget.prompt_file")
+                && rendered.contains("legacy top-level prompts/"),
+            "legacy prompt dir finding in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn work_create_with_legacy_prompts_dir_is_reported() {
+        let env = test_env();
+        let prompt = env.repo_dir.join("prompts/create.md");
+        std::fs::create_dir_all(prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&prompt, "create prompt").expect("write create prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.create]\n\
+             prompt_file = \"prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::LegacyPromptDir {
+                key: "work.create.prompt_file".to_string(),
+                value: "prompts/create.md".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lane_with_canonical_dot_tskmstr_prompts_dir_is_not_flagged() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
+    }
+
+    #[test]
+    fn home_rooted_and_absolute_prompt_file_paths_are_not_flagged() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.audit]\n\
+             prompt_file = \"~/.claude/prompts/x.md\"\n\
+             [work.create]\n\
+             prompt_file = \"/tmp/somewhere/prompts/x.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, DriftFinding::LegacyPromptDir { .. })),
+            "home-rooted and absolute paths must never be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn docs_prompts_subdir_is_not_flagged_as_legacy() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.create]\n\
+             prompt_file = \"docs/prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, DriftFinding::LegacyPromptDir { .. })),
+            "only a leading prompts/ component should fire: {findings:?}"
+        );
     }
 
     #[test]

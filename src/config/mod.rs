@@ -4034,7 +4034,7 @@ mod tests {
             &repo_path,
             r#"
             [work.create]
-            prompt_file = "prompts/create.md"
+            prompt_file = ".tskmstr/prompts/create.md"
             "#,
         )
         .unwrap();
@@ -4048,7 +4048,7 @@ mod tests {
             cfg.work.create.prompt_file,
             Some(
                 dir.path()
-                    .join("prompts/create.md")
+                    .join(".tskmstr/prompts/create.md")
                     .to_string_lossy()
                     .into_owned()
             )
@@ -4074,7 +4074,7 @@ mod tests {
             &repo_path,
             r#"
             [work.review_watch]
-            prompt_file = "prompts/review_watch.md"
+            prompt_file = ".tskmstr/prompts/review_watch.md"
             "#,
         )
         .unwrap();
@@ -4088,7 +4088,7 @@ mod tests {
             cfg.work.review_watch.prompt_file,
             Some(
                 dir.path()
-                    .join("prompts/review_watch.md")
+                    .join(".tskmstr/prompts/review_watch.md")
                     .to_string_lossy()
                     .into_owned()
             )
@@ -4114,7 +4114,7 @@ mod tests {
             &repo_path,
             r#"
             [work.audit]
-            prompt_file = "prompts/audit.md"
+            prompt_file = ".tskmstr/prompts/audit.md"
             "#,
         )
         .unwrap();
@@ -4128,7 +4128,7 @@ mod tests {
             cfg.work.audit.prompt_file,
             Some(
                 dir.path()
-                    .join("prompts/audit.md")
+                    .join(".tskmstr/prompts/audit.md")
                     .to_string_lossy()
                     .into_owned()
             )
@@ -4139,7 +4139,7 @@ mod tests {
     fn merge_work_relative_create_prompt_file_from_global_only_is_a_config_error() {
         let global = RawWorkConfig {
             create: Some(RawCreateConfig {
-                prompt_file: Some("prompts/create.md".to_string()),
+                prompt_file: Some(".tskmstr/prompts/create.md".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4149,7 +4149,7 @@ mod tests {
         match err {
             ConfigError::RelativePathRequiresRepoConfig { field, value } => {
                 assert_eq!(field, "work.create.prompt_file");
-                assert_eq!(value, "prompts/create.md");
+                assert_eq!(value, ".tskmstr/prompts/create.md");
             }
             other => panic!("expected RelativePathRequiresRepoConfig, got {other:?}"),
         }

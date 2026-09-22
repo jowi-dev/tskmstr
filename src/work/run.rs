@@ -1689,12 +1689,12 @@ mod tests {
             resolve_prompt_path(
                 "mylane",
                 None,
-                Some("prompts/mylane-lane.md"),
+                Some(".tskmstr/prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
                 &ClaudeRunner,
             ),
-            PathBuf::from("/repo/prompts/mylane-lane.md")
+            PathBuf::from("/repo/.tskmstr/prompts/mylane-lane.md")
         );
     }
 
@@ -1730,7 +1730,7 @@ mod tests {
             resolve_prompt_path(
                 "mylane",
                 Some("scratch.md"),
-                Some("prompts/mylane-lane.md"),
+                Some(".tskmstr/prompts/mylane-lane.md"),
                 Path::new("/repo"),
                 Path::new("/home/j"),
                 &ClaudeRunner,
