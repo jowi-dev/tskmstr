@@ -373,6 +373,10 @@ pub struct RunDeps<'a> {
     /// through to [`crate::work::run::RunLaneDeps::runner`]. See
     /// [`crate::agent::AgentRunner`] and GitHub issue #17.
     pub runner: &'a dyn AgentRunner,
+    /// The configured `status_on_run_start`, passed through to
+    /// [`crate::work::run::RunLaneDeps::status_on_run_start`]. `None` when
+    /// unset. See [`crate::config::Config::status_on_run_start`].
+    pub status_on_run_start: Option<&'a str>,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -425,6 +429,7 @@ pub fn run(
         current_backend_identity: deps.current_backend_identity,
         backend_identity_resolver: deps.backend_identity_resolver,
         runner: deps.runner,
+        status_on_run_start: deps.status_on_run_start,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -2333,6 +2338,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2452,6 +2459,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2519,6 +2528,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let mut out = Vec::new();
 
@@ -2674,6 +2685,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let mut out = Vec::new();
 
@@ -2747,6 +2760,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let mut out = Vec::new();
 
@@ -2806,6 +2821,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2915,6 +2932,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2975,6 +2994,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let mut out = Vec::new();
 
@@ -3027,6 +3048,8 @@ mod tests {
             current_backend_identity: compatible_test_identity(),
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
+
+            status_on_run_start: None,
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),

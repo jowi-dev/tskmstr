@@ -7,8 +7,9 @@
 //!   one, or a newer one?
 //! - **The same structural presence checks `tm init` runs and discards**:
 //!   does every configured lane have a prompt file where a run would look
-//!   for it, and does every configured session's leading `/skill` exist
-//!   somewhere this binary would find it?
+//!   for it, does every configured session's `prompt_file` (when set) exist
+//!   where its launcher would read it, and does every configured session's
+//!   leading `/skill` exist somewhere this binary would find it?
 //!
 //! Both checks are presence-only. `tm check` never opens a scaffolded
 //! asset's *contents* — lane prompts and skills are meant to be edited after
@@ -96,6 +97,22 @@ pub enum DriftFinding {
     /// `audit_existing_lane_prompts` runs on every re-run, but reported
     /// instead of offered a scaffold.
     MissingLanePrompt { lane: String, path: PathBuf },
+    /// A configured session's `prompt_file` doesn't exist where its launcher
+    /// would read it — the same missing file `tm work`'s audit/create/
+    /// review_watch launchers turn into a launch-time error (GitHub issue
+    /// #42, PR #46), reported ahead of the launch instead. `session` names
+    /// which `[work.*]` section it came from (e.g. `"work.create"`).
+    MissingSessionPrompt { session: String, path: PathBuf },
+    /// A lane declares a delegation `subagent` (GitHub issue #52) but the
+    /// runner's agent-definition file that name points at doesn't exist —
+    /// the delegation section in its prompt names an agent nothing defines.
+    /// Structural, like [`DriftFinding::MissingLanePrompt`]: reported only
+    /// for a lane that opted into a subagent, never for one that didn't.
+    MissingSubagentDef {
+        lane: String,
+        agent: String,
+        path: PathBuf,
+    },
     /// A configured session's prompt leads with a `/skill` invocation that
     /// exists neither repo-locally nor at the user level. `session` names
     /// which `[work.*]` section it came from (e.g. `"work.audit"`).
@@ -134,6 +151,18 @@ impl std::fmt::Display for DriftFinding {
             DriftFinding::MissingLanePrompt { lane, path } => write!(
                 f,
                 "lane `{lane}` has no prompt file at {} (a lane run fails preflight without it)",
+                path.display()
+            ),
+            DriftFinding::MissingSessionPrompt { session, path } => write!(
+                f,
+                "[{session}].prompt_file points at {}, which doesn't exist \
+                 (the session fails to launch without it)",
+                path.display()
+            ),
+            DriftFinding::MissingSubagentDef { lane, agent, path } => write!(
+                f,
+                "lane `{lane}` delegates to subagent `{agent}` but has no definition at {} \
+                 (delegation resolves to no declared model)",
                 path.display()
             ),
             DriftFinding::MissingSkill {
@@ -246,6 +275,7 @@ pub(crate) fn collect_findings(
     let mut findings = Vec::new();
     findings.extend(stamp_finding(doc));
     findings.extend(lane_findings(ctx, doc, repo_dir));
+    findings.extend(session_prompt_findings(ctx, doc, repo_dir));
     findings.extend(session_findings(ctx, doc, repo_dir));
     findings
 }
@@ -285,13 +315,58 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
 
     lanes
         .iter()
-        .filter_map(|(lane, _)| {
+        .flat_map(|(lane, _)| {
+            let mut findings = Vec::new();
             let resolved = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
+            if !resolved.exists() {
+                findings.push(DriftFinding::MissingLanePrompt {
+                    lane: lane.to_string(),
+                    path: resolved,
+                });
+            }
+            // A lane that opted into a delegation subagent (GitHub issue #52)
+            // must have the runner's agent-definition file the name points at.
+            if let Some(agent) = str_at(doc, &["work", "lanes", lane, "subagent"]) {
+                let def = ctx.runner.agent_definition_path(repo_dir, agent);
+                if !def.exists() {
+                    findings.push(DriftFinding::MissingSubagentDef {
+                        lane: lane.to_string(),
+                        agent: agent.to_string(),
+                        path: def,
+                    });
+                }
+            }
+            findings
+        })
+        .collect()
+}
+
+/// The three `[work.*]` session sections that carry a `prompt_file`: audit,
+/// create, and review_watch. PR #46 (GitHub issue #42) made a missing file
+/// here a launch-time error for each; `tm check` reports it ahead of that.
+const SESSION_PROMPT_TABLES: [&str; 3] = ["audit", "create", "review_watch"];
+
+/// The session-prompt half of the report: for each of `[work.audit]`,
+/// `[work.create]`, and `[work.review_watch]` that sets a `prompt_file`,
+/// resolve it against the repo the same way merge-time resolution and the
+/// lane prompt-file check do ([`resolve_repo_relative`]) and flag a path
+/// that doesn't exist. A section without the key resolves nothing and is
+/// silent. Sections are visited in `SESSION_PROMPT_TABLES` order.
+fn session_prompt_findings(
+    ctx: &CheckContext,
+    doc: &DocumentMut,
+    repo_dir: &Path,
+) -> Vec<DriftFinding> {
+    SESSION_PROMPT_TABLES
+        .iter()
+        .filter_map(|table| {
+            let raw = str_at(doc, &["work", table, "prompt_file"])?;
+            let resolved = resolve_repo_relative(raw, repo_dir, ctx.home);
             if resolved.exists() {
                 None
             } else {
-                Some(DriftFinding::MissingLanePrompt {
-                    lane: lane.to_string(),
+                Some(DriftFinding::MissingSessionPrompt {
+                    session: format!("work.{table}"),
                     path: resolved,
                 })
             }
@@ -453,7 +528,7 @@ mod tests {
 
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
              [work.audit]\n\
@@ -468,7 +543,7 @@ mod tests {
         assert!(findings.is_empty(), "expected no findings: {findings:?}");
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(
-            rendered.contains("up to date (schema_version 1)"),
+            rendered.contains("up to date (schema_version 2)"),
             "clean report in: {rendered}"
         );
     }
@@ -539,7 +614,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
         );
@@ -569,7 +644,7 @@ mod tests {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              repo = \".\"\n",
         );
@@ -590,11 +665,76 @@ mod tests {
     }
 
     #[test]
+    fn lane_with_subagent_key_but_missing_definition_is_reported() {
+        let env = test_env();
+        // The lane's prompt file exists, so the only drift is the missing
+        // subagent definition the `subagent` key points at.
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".claude/agents/impl.md");
+        assert_eq!(
+            findings,
+            vec![DriftFinding::MissingSubagentDef {
+                lane: "widget".to_string(),
+                agent: "impl".to_string(),
+                path: expected_path.clone(),
+            }]
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("impl") && rendered.contains(&expected_path.display().to_string()),
+            "subagent finding in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_with_subagent_key_and_present_definition_is_clean() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "lane prompt").expect("write lane prompt");
+        let def = env.repo_dir.join(".claude/agents/impl.md");
+        std::fs::create_dir_all(def.parent().unwrap()).expect("mkdir agents");
+        std::fs::write(&def, "---\nname: impl\n---\n").expect("write def");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             subagent = \"impl\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(
+            findings.is_empty(),
+            "definition present, no drift: {findings:?}"
+        );
+    }
+
+    #[test]
     fn audit_session_with_default_prompt_and_no_skill_anywhere_is_reported() {
         let env = test_env();
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \".\"\n",
         );
@@ -623,7 +763,7 @@ mod tests {
             .expect("mkdir home skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \".\"\n",
         );
@@ -646,7 +786,7 @@ mod tests {
             .expect("mkdir sub audit skill");
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.audit]\n\
              dir = \"sub\"\n\
              [work.review_watch]\n",
@@ -664,9 +804,131 @@ mod tests {
     }
 
     #[test]
+    fn create_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.create]\n\
+             prompt_file = \".tskmstr/prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/create.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.create].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn audit_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        // Present the audit skill so only the missing prompt_file is drift.
+        std::fs::create_dir_all(env.home.join(".claude/skills/ticket-audit"))
+            .expect("mkdir home skill");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.audit]\n\
+             dir = \".\"\n\
+             prompt_file = \".tskmstr/prompts/audit.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/audit.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.audit].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn review_watch_session_with_missing_prompt_file_is_reported() {
+        let env = test_env();
+        // Present the cleanup skill so only the missing prompt_file is drift.
+        std::fs::create_dir_all(env.home.join(".claude/skills/bugbot-triage"))
+            .expect("mkdir home skill");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.review_watch]\n\
+             prompt_file = \".tskmstr/prompts/review-watch.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        let expected_path = env.repo_dir.join(".tskmstr/prompts/review-watch.md");
+        assert_eq!(findings.len(), 1, "expected one finding: {findings:?}");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("[work.review_watch].prompt_file")
+                && rendered.contains(&expected_path.display().to_string()),
+            "session prompt finding naming key and path in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn session_without_prompt_file_key_is_silent() {
+        let env = test_env();
+        // A create section carrying no prompt_file has nothing to resolve and
+        // no skill to probe: it must produce no finding at all.
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.create]\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
+    }
+
+    #[test]
+    fn session_with_present_prompt_file_is_clean() {
+        let env = test_env();
+        let prompt = env.repo_dir.join(".tskmstr/prompts/create.md");
+        std::fs::create_dir_all(prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&prompt, "/create-something").expect("write prompt");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.create]\n\
+             prompt_file = \".tskmstr/prompts/create.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
+    }
+
+    #[test]
     fn no_work_table_and_current_stamp_is_clean() {
         let env = test_env();
-        write_repo_config(&env, "schema_version = 1\n");
+        write_repo_config(&env, "schema_version = 2\n");
 
         let runner = ClaudeRunner;
         let ctx = ctx(&env, &runner);
@@ -708,7 +970,7 @@ mod tests {
         // scan for it nor mention it.
         write_repo_config(
             &env,
-            "schema_version = 1\n\
+            "schema_version = 2\n\
              [work.lanes.widget]\n\
              prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
         );

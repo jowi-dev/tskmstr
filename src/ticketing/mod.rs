@@ -1310,6 +1310,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: vec!["cursor[bot]".to_string()],
             board_column_order: Vec::new(),

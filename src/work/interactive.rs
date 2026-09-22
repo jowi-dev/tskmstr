@@ -179,8 +179,11 @@ pub fn interactive_prompt(kind: &str, ticket: &str, body: &str) -> String {
 /// Launch `prepared`'s agent process in `target`, rooted in the run's
 /// worktree.
 ///
-/// Writes `prepared.invocation`'s prompt (its positional first argument) to
-/// `prompt_path` and starts a window running
+/// Writes the invocation's interactive prompt (via
+/// [`runner.interactive_prompt`](crate::agent::AgentRunner::interactive_prompt)
+/// — runner-aware, since claude carries it positionally at `args[0]` while
+/// opencode keeps it behind a `--prompt` flag) to `prompt_path` and starts
+/// a window running
 /// [`runner.tmux_command_line`](crate::agent::AgentRunner::tmux_command_line)
 /// against that file, with `SESSION_RUN_ID_ENV` carrying the pre-registered
 /// run id for the session to adopt.
@@ -196,11 +199,8 @@ pub fn launch_interactive_run(
     prompt_path: &Path,
     runner: &dyn AgentRunner,
 ) -> Result<(), InteractiveLaunchError> {
-    let prompt = prepared
-        .invocation
-        .args
-        .first()
-        .cloned()
+    let prompt = runner
+        .interactive_prompt(&prepared.invocation)
         .unwrap_or_default();
     if let Some(parent) = prompt_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| InteractiveLaunchError::PromptFile {
@@ -282,6 +282,28 @@ mod tests {
             branch: "jowi-dev/proj-1-slug".to_string(),
             invocation: interactive_invocation(prompt),
             out_json_path: PathBuf::from("/state/proj-1-20260820-120000.json"),
+        }
+    }
+
+    /// [`prepared`] for the opencode runner, whose interactive argv is
+    /// `["--prompt", prompt, ...]` rather than claude's positional
+    /// `[prompt, ...]` — the shape [`AgentRunner::interactive_prompt`]
+    /// exists to read without assuming either convention.
+    fn opencode_prepared(worktree: &Path, prompt: &str) -> PreparedRun {
+        let invocation = crate::agent::opencode::OpencodeRunner.build_invocation(
+            crate::agent::InvocationInputs {
+                prompt: prompt.to_string(),
+                model: None,
+                max_turns: None,
+                permission_mode: None,
+                settings_path: None,
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
+        PreparedRun {
+            invocation,
+            ..prepared(worktree, prompt)
         }
     }
 
@@ -416,6 +438,35 @@ mod tests {
             std::fs::read_to_string(&prompt_path).unwrap(),
             "do the thing"
         );
+    }
+
+    /// Regression for the opencode runner's argv shape: an interactive
+    /// opencode invocation is `["--prompt", <prompt>, ...]`, so a
+    /// prompt-file writer that grabbed `args[0]` (claude's positional
+    /// convention) wrote the literal flag string `--prompt` into the file —
+    /// observed in the wild as an 8-byte prompt file — instead of the
+    /// prompt text the lane run was launched with.
+    #[test]
+    fn launch_interactive_run_writes_the_opencode_prompt_body_not_the_flag() {
+        let tmp = tempdir().unwrap();
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+        let prompt_path = tmp.path().join("state/proj-1.prompt.md");
+        let prepared = opencode_prepared(&worktree, "do the lane thing");
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let tmux = FakeTmuxOps::new();
+
+        launch_interactive_run(
+            &tmux,
+            &target,
+            &prepared,
+            &prompt_path,
+            &crate::agent::opencode::OpencodeRunner,
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&prompt_path).unwrap();
+        assert_eq!(written, "do the lane thing");
+        assert_ne!(written, "--prompt");
     }
 
     #[test]

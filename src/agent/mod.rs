@@ -74,6 +74,28 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The house delegation constraints every scaffolded subagent definition
+/// carries in its body, regardless of runner (GitHub issue #52). Shared by
+/// each adapter's [`AgentRunner::agent_definition_template`] so the two
+/// runners' definitions differ only in frontmatter shape, never in the
+/// policy an operator reads. Kept runner-agnostic — it names no CLI — so it
+/// lives here beside [`shell_quote`] rather than in either adapter.
+pub(crate) const SUBAGENT_DEFINITION_BODY: &str = "You are an implementation subagent. Do exactly \
+    the unit of work delegated to you\nand report back — never expand the scope you were handed.\n\
+    \nConstraints:\n\n\
+    - Do not spawn further sub-agents.\n\
+    - Do not create commits; leave every commit to the lane session that delegated to you.\n\
+    - Keep changes minimal and grounded in the surrounding code.\n";
+
+/// The `model` frontmatter value a scaffolded subagent definition carries
+/// when no model was declared — a `tm update` catch-up scaffold for a lane
+/// configured before its model was ever recorded. `tm init` always has the
+/// operator's declared model and passes `Some`, so this placeholder only
+/// surfaces on the catch-up path, where it flags what the setup session (or
+/// operator) must fill in. Runner-agnostic, so it lives here beside
+/// [`SUBAGENT_DEFINITION_BODY`].
+pub(crate) const SUBAGENT_MODEL_PLACEHOLDER: &str = "TODO-set-the-subagent-model";
+
 /// Environment variable holding the tracked run id, exported for the
 /// `TSKMSTR_RUN_ID`-gated hooks (see `src/agent/claude/hooks.rs`, not yet
 /// moved) to pick up. Mirrors the detached wrapper's `export
@@ -399,6 +421,23 @@ pub struct SessionEnvVars {
     pub pid: &'static str,
 }
 
+/// Runner-specific guidance for `tm init`'s lane-scaffold model question
+/// (GitHub issue #51). The lane scaffold asks for the lane's `model` so a
+/// run doesn't silently fall back to the agent CLI's own default model, and
+/// the spelling is runner-specific — this carries what the question shows
+/// and what `--yes` writes. See [`AgentRunner::lane_model_prompt`].
+#[derive(Debug, Clone, Copy)]
+pub struct LaneModelPrompt {
+    /// Accepted-spelling help shown alongside the prompt, e.g.
+    /// `"provider/model, e.g. venice/z-ai-glm-5-3"`.
+    pub help: &'static str,
+    /// The value `--yes` writes for the lane's `model`, or `None` to leave
+    /// `model` unset (and print that the run will use the agent CLI's own
+    /// default). opencode has no safe universal default across providers, so
+    /// it returns `None`; claude returns its always-passed default.
+    pub yes_default: Option<&'static str>,
+}
+
 /// Backend-agnostic AI coding agent operations. See the module doc comment
 /// for how this relates to [`crate::agent::claude::ClaudeRunner`] and
 /// `main.rs`'s `agent_runner_for`.
@@ -422,6 +461,25 @@ pub trait AgentRunner {
     /// `tm init`'s "does the skill this lane's prompt invokes exist"
     /// probes, once against the repo dir and once against `home`.
     fn skills_dir(&self, base: &Path) -> PathBuf;
+
+    /// Where this runner discovers a named subagent *definition* under a
+    /// repo checkout (or a home directory), e.g.
+    /// `<base>/.opencode/agent/<name>.md` for opencode or
+    /// `<base>/.claude/agents/<name>.md` for claude. `tm init` scaffolds the
+    /// delegation target here, and `tm check`/`tm update` detect and
+    /// additively fix a configured lane whose definition is missing (GitHub
+    /// issue #52). The `.opencode`/`.claude` directory is the runner's own,
+    /// so this path is adapter-owned rather than a shared constant — the
+    /// same reasoning as [`AgentRunner::skills_dir`].
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf;
+
+    /// Render a starter subagent definition for `name`, declaring `model` in
+    /// its `model` frontmatter (or [`SUBAGENT_MODEL_PLACEHOLDER`] when `None`
+    /// — the `tm update` catch-up scaffold has no declared model). The body
+    /// carries the shared house delegation constraints
+    /// ([`SUBAGENT_DEFINITION_BODY`]); only the frontmatter shape is
+    /// runner-specific, which is why this is adapter-owned.
+    fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String;
 
     /// Build one run's argv/env (headless or interactive).
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation;
@@ -447,6 +505,25 @@ pub trait AgentRunner {
     /// adapter's CLI with an optional `--model` and `prompt` as its
     /// positional argument. Replaces `work::audit::claude_command`.
     fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String;
+
+    /// The prompt text of an [`AgentInvocation`] built for
+    /// [`RunMode::Interactive`] — the string a caller like
+    /// `crate::work::interactive::launch_interactive_run` writes to the
+    /// prompt file a tmux window reads back, as opposed to the command
+    /// line itself ([`AgentRunner::tmux_command_line`], which reads the
+    /// same file).
+    ///
+    /// The default returns `invocation.args.first()` — the positional
+    /// prompt at `args[0]` that the interactive contract documents on
+    /// [`AgentRunner::tmux_command_line`]. An adapter whose interactive
+    /// prompt is a flag value instead (opencode's `--prompt <prompt>`,
+    /// where `args[0]` is the literal flag) overrides this to return the
+    /// value, so the flag string itself never gets mistaken for the
+    /// prompt. `None` when the invocation carries no interactive prompt
+    /// (e.g. it was built for [`RunMode::Headless`]).
+    fn interactive_prompt<'a>(&self, invocation: &'a AgentInvocation) -> Option<&'a str> {
+        invocation.args.first().map(String::as_str)
+    }
 
     /// Render `invocation` into the shell command line a tmux window runs,
     /// reading the prompt back from `prompt_file` rather than embedding it
@@ -586,6 +663,18 @@ pub trait AgentRunner {
     /// leading `"claude-"` prefix; an adapter whose model names carry no
     /// such prefix returns `model` unchanged.
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str;
+
+    /// Runner-appropriate guidance for `tm init`'s lane-scaffold model
+    /// question (GitHub issue #51): the accepted-spelling help to show and
+    /// the `--yes` default. See [`LaneModelPrompt`].
+    fn lane_model_prompt(&self) -> LaneModelPrompt;
+
+    /// Validate a lane `model` spelling a user entered for this runner,
+    /// returning a human-readable reason when it's rejected so an
+    /// interactive `tm init` re-prompts instead of writing an unusable
+    /// value. `Ok(())` accepts. `model` is already trimmed and non-empty
+    /// (an empty answer means "leave `model` unset", handled by the caller).
+    fn validate_lane_model(&self, model: &str) -> Result<(), String>;
 }
 
 #[cfg(test)]

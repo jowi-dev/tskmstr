@@ -11,14 +11,20 @@
 //! Headless (`RunMode::Headless`):
 //!
 //! ```text
-//! opencode run --format json [--model <provider/model>] [--auto] -- <prompt>
+//! opencode run --format json [--model <provider/model>]
+//!     [--dangerously-skip-permissions] -- <prompt>
 //! ```
 //!
 //! Interactive (`RunMode::Interactive`, the default `opencode` TUI command):
 //!
 //! ```text
-//! opencode [--model <provider/model>] [--auto] --prompt <prompt>
+//! opencode [--model <provider/model>] --prompt <prompt>
 //! ```
+//!
+//! The TUI takes no permission flag at all: opencode 1.15.13 rejects
+//! unknown options before rendering, so the tmux-hosted window would die
+//! instantly. Headless bypass uses `--dangerously-skip-permissions`,
+//! 1.15.13's only CLI-level bypass.
 //!
 //! # Three deliberate divergences from `claude`
 //!
@@ -31,11 +37,48 @@
 //!   `ANTHROPIC_*`/`CLAUDECODE` for subscription-billing safety; opencode's
 //!   provider credentials are explicit config or env keys the user intends
 //!   as credentials, so stripping anything would break legitimate setups.
-//! - **No telemetry.** [`OpencodeRunner::deploy_telemetry`] and
-//!   [`OpencodeRunner::install_user_hooks`] return `Ok(None)` — per
-//!   ADR-0004 point 3, run start/finish recording never depends on `Some`.
-//!   opencode-plugin telemetry (model-usage attribution, interactive
-//!   SessionEnd-equivalent finish) is deferred to a follow-up issue.
+//! - **Telemetry via a plugin, not a per-run `--settings` file.**
+//!   [`OpencodeRunner::deploy_telemetry`] stays `Ok(None)`: opencode
+//!   auto-discovers the globally-installed plugin with no per-run flag, so
+//!   there is nothing to deploy into a lane worktree. [`OpencodeRunner::install_user_hooks`]
+//!   writes the embedded `tm-telemetry.js` plugin into opencode's
+//!   discovery dir (`$OPENCODE_CONFIG_DIR/plugin/` or
+//!   `~/.config/opencode/plugin/`) — the opencode analog of claude's
+//!   user-hooks install. The plugin (GH-43,
+//!   `docs/plans/gh-43-opencode-telemetry.md`) restores model-usage
+//!   attribution, session-id export, and interactive SessionEnd-equivalent
+//!   finish. Per ADR-0004 point 3, run start/finish recording never depends
+//!   on `deploy_telemetry` returning `Some`.
+//!
+//! # Model pricing and roles reference
+//!
+//! Sourced from `opencode models --verbose venice` on 2026-09-13. Prices are
+//! per-million tokens. The "role" column maps to Claude's fable/sonnet tier
+//! split — see the lane's `model` config for the active reasoning model and
+//! the lane prompt for the subagent model.
+//!
+//! | Model | Role | Input/M | Output/M | Cache Read/M | Cache Write/M |
+//! |---|---|---|---|---|---|
+//! | `venice/claude-fable-5` | Heavy reasoning (claude equivalent) | $12.00 | $60.00 | $1.20 | $15.00 |
+//! | `venice/claude-opus-5` | Heavy reasoning | $6.00 | $30.00 | $0.60 | $7.50 |
+//! | `venice/claude-sonnet-5` | Fast workhorse (claude equivalent) | $3.00 | $15.00 | $0.30 | $3.75 |
+//! | `venice/z-ai-glm-5-3` | **Reasoning default for pckr** | $0.50 | $2.00 | $0.05 | $0.00 |
+//! | `venice/z-ai-glm-5-3-flash` | **Subagent default for pckr** | $0.05 | $0.20 | $0.005 | $0.00 |
+//! | `venice/deepseek-v4-pro-0813` | Heavy reasoning alternative | $1.65 | $4.95 | $0.165 | $0.00 |
+//! | `venice/deepseek-v4-flash` | Cheap subagent alternative | $0.138 | $0.275 | $0.028 | $0.00 |
+//! | `venice/qwen-3-7-max` | Heavy reasoning alternative | $2.70 | $10.80 | $0.27 | $0.00 |
+//! | `venice/qwen-3-7-plus` | Mid-tier alternative | $0.50 | $2.00 | $0.05 | $0.00 |
+//! | `venice/grok-4-6` | Heavy reasoning alternative | $2.27 | $11.35 | $0.23 | $0.00 |
+//! | `venice/kimi-k3` | Heavy reasoning alternative | $3.75 | $15.00 | $0.375 | $0.00 |
+//! | `venice/openai-gpt-55` | Heavy reasoning alternative | $6.25 | $25.00 | $0.625 | $0.00 |
+//!
+//! **Cost comparison for the glm-5-3 + glm-5-3-flash stack vs claude:**
+//!
+//! | Stack | Reasoning (in/out) | Subagent (in/out) | Reasoning cost vs fable |
+//! |---|---|---|---|
+//! | claude fable + sonnet | $12/$60 | $3/$15 | 1x (baseline) |
+//! | glm-5-3 + glm-5-3-flash | $0.50/$2.00 | $0.05/$0.20 | **24x cheaper** |
+//! | deepseek-v4-pro + v4-flash | $1.65/$4.95 | $0.138/$0.275 | **7x cheaper** |
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +88,152 @@ use crate::agent::{
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
+
+/// The opencode telemetry plugin, embedded via [`include_str!`] and written
+/// to opencode's plugin discovery dir by [`OpencodeRunner::install_user_hooks`].
+/// Same distribution model as claude's hook scripts
+/// ([`crate::agent::claude::hooks::hook_scripts`]): baked into the `tm`
+/// binary and rewritten on install, so it upgrades in lockstep with `tm`
+/// with no npm publish or separate version. `(filename, contents)`.
+const TELEMETRY_PLUGIN: (&str, &str) = (
+    "tm-telemetry.js",
+    include_str!("../../../hooks/opencode/tm-telemetry.js"),
+);
+
+/// opencode's plugin auto-discovery directory: `$OPENCODE_CONFIG_DIR/plugin/`
+/// when that env var is set, else `<home>/.config/opencode/plugin/`. Mirrors
+/// the discovery precedence pinned in `docs/plans/gh-43-opencode-telemetry.md`
+/// (and how claude reads `CLAUDE_CONFIG_DIR` in
+/// [`crate::agent::claude::ClaudeRunner::install_user_hooks`]). The global
+/// config dir — not the repo — is deliberate: it is auto-discovered by both
+/// lane and interactive sessions and never touches the user's project.
+fn plugin_dir(home: &Path) -> PathBuf {
+    match std::env::var_os("OPENCODE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir).join("plugin"),
+        None => expand_tilde("~/.config/opencode/plugin", home),
+    }
+}
+
+/// Price table for venice-routed models, sourced from `opencode models
+/// --verbose venice` on 2026-09-13. Add an entry here for any new model that
+/// shows up in interactive session usage and needs estimated-cost support.
+/// Keys are the full `provider/model` string. See the module doc comment for
+/// the full pricing/roles reference table.
+///
+/// Headless lane runs get authoritative cost from `parse_outcome`'s
+/// `cost_usd` (opencode computes cost natively per step), so this table
+/// only matters for interactive sessions where `estimate_missing_costs`
+/// fills in estimated costs.
+const PRICE_TABLE: &[(&str, ModelPrice)] = &[
+    (
+        "venice/claude-sonnet-5",
+        ModelPrice {
+            input_per_million: 3.00,
+            output_per_million: 15.00,
+            cache_read_per_million: 0.30,
+            cache_write_per_million: 3.75,
+        },
+    ),
+    (
+        "venice/claude-opus-5",
+        ModelPrice {
+            input_per_million: 6.00,
+            output_per_million: 30.00,
+            cache_read_per_million: 0.60,
+            cache_write_per_million: 7.50,
+        },
+    ),
+    (
+        "venice/claude-fable-5",
+        ModelPrice {
+            input_per_million: 12.00,
+            output_per_million: 60.00,
+            cache_read_per_million: 1.20,
+            cache_write_per_million: 15.00,
+        },
+    ),
+    (
+        "venice/claude-sonnet-4-5",
+        ModelPrice {
+            input_per_million: 3.75,
+            output_per_million: 18.75,
+            cache_read_per_million: 0.375,
+            cache_write_per_million: 4.69,
+        },
+    ),
+    (
+        "venice/claude-sonnet-4-6",
+        ModelPrice {
+            input_per_million: 3.60,
+            output_per_million: 18.00,
+            cache_read_per_million: 0.36,
+            cache_write_per_million: 4.50,
+        },
+    ),
+    (
+        "venice/claude-opus-4-5",
+        ModelPrice {
+            input_per_million: 6.00,
+            output_per_million: 30.00,
+            cache_read_per_million: 0.60,
+            cache_write_per_million: 7.50,
+        },
+    ),
+    (
+        "venice/z-ai-glm-5-3",
+        ModelPrice {
+            input_per_million: 0.50,
+            output_per_million: 2.00,
+            cache_read_per_million: 0.05,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/z-ai-glm-5-3-flash",
+        ModelPrice {
+            input_per_million: 0.05,
+            output_per_million: 0.20,
+            cache_read_per_million: 0.005,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/deepseek-v4-flash",
+        ModelPrice {
+            input_per_million: 0.138,
+            output_per_million: 0.275,
+            cache_read_per_million: 0.028,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/deepseek-v4-pro-0813",
+        ModelPrice {
+            input_per_million: 1.65,
+            output_per_million: 4.95,
+            cache_read_per_million: 0.165,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/grok-4-6",
+        ModelPrice {
+            input_per_million: 2.27,
+            output_per_million: 11.35,
+            cache_read_per_million: 0.23,
+            cache_write_per_million: 0.00,
+        },
+    ),
+    (
+        "venice/qwen-3-7-max",
+        ModelPrice {
+            input_per_million: 2.70,
+            output_per_million: 10.80,
+            cache_read_per_million: 0.27,
+            cache_write_per_million: 0.00,
+        },
+    ),
+];
 
 /// The `opencode` CLI [`AgentRunner`] implementation. Zero-sized, mirroring
 /// [`crate::agent::claude::ClaudeRunner`]: a single `&'static OpencodeRunner`
@@ -72,18 +261,46 @@ impl AgentRunner for OpencodeRunner {
         base.join(".opencode/skills")
     }
 
+    /// `<base>/.opencode/agent/<name>.md` — opencode discovers subagent
+    /// definitions under `.opencode/agent/` (singular `agent`, per the
+    /// `opencode agent create` CLI path).
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
+        base.join(".opencode/agent").join(format!("{name}.md"))
+    }
+
+    /// A `.opencode/agent/<name>.md` definition: opencode's frontmatter
+    /// carries `description`, `mode: subagent`, and `model`, then the shared
+    /// delegation body. opencode keys the definition by its filename rather
+    /// than a `name` frontmatter field, so none is emitted.
+    fn agent_definition_template(&self, _name: &str, model: Option<&str>) -> String {
+        let model = model.unwrap_or(crate::agent::SUBAGENT_MODEL_PLACEHOLDER);
+        format!(
+            "---\n\
+             description: Implementation subagent for delegated coding, test-writing, and mechanical edits.\n\
+             mode: subagent\n\
+             model: {model}\n\
+             ---\n\
+             \n\
+             {}",
+            crate::agent::SUBAGENT_DEFINITION_BODY
+        )
+    }
+
     /// Build the [`AgentInvocation`] for one run. See the module doc
     /// comment for the two argv shapes and `docs/plans/gh-41-opencode-runner.md`
     /// for the full contract; the permission-mode mapping, `max_turns`
     /// handling, and `settings_path` handling are documented inline below.
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
-        // Permission mapping (both modes): `None` or `Some("bypassPermissions")`
-        // is the only CLI-level bypass opencode has, so both map to `--auto`.
-        // Any other value is documented-ignored — opencode has no
-        // plan/acceptEdits analog; its own `permission` config governs, and a
-        // headless run auto-rejects any ask it isn't configured to allow
-        // rather than hanging.
-        let auto = matches!(
+        // Permission mapping: `None` or `Some("bypassPermissions")` is a
+        // bypass. Headless (`opencode run`) maps it to
+        // `--dangerously-skip-permissions` (1.15.13's only CLI-level
+        // bypass). Interactive maps it to *no flag at all*: the 1.15.13
+        // TUI has no permission flag, and an unknown one makes opencode
+        // exit before rendering — the tmux window just dies. Any other
+        // value is documented-ignored in both modes; opencode's own
+        // `permission` config governs, and a headless run auto-rejects
+        // any ask it isn't configured to allow rather than hanging.
+        let bypass = matches!(
             inputs.permission_mode.as_deref(),
             None | Some("bypassPermissions")
         );
@@ -98,8 +315,8 @@ impl AgentRunner for OpencodeRunner {
                     args.push("--model".to_string());
                     args.push(model);
                 }
-                if auto {
-                    args.push("--auto".to_string());
+                if bypass {
+                    args.push("--dangerously-skip-permissions".to_string());
                 }
                 args.push("--".to_string());
                 args.push(inputs.prompt);
@@ -108,16 +325,14 @@ impl AgentRunner for OpencodeRunner {
                 // Kept at args[0]/args[1] ("--prompt", prompt) rather than a
                 // bare positional prompt: opencode's interactive prompt is a
                 // flag value, not positional like claude's, which is exactly
-                // why this adapter overrides `tmux_command_line` instead of
-                // relying on the default impl's `args[0]` convention.
+                // why this adapter overrides `tmux_command_line` and
+                // `interactive_prompt` instead of relying on the default
+                // impls' `args[0]` convention.
                 args.push("--prompt".to_string());
                 args.push(inputs.prompt);
                 if let Some(model) = inputs.model {
                     args.push("--model".to_string());
                     args.push(model);
-                }
-                if auto {
-                    args.push("--auto".to_string());
                 }
             }
         }
@@ -281,6 +496,22 @@ impl AgentRunner for OpencodeRunner {
         }
     }
 
+    /// Overrides the default: opencode's interactive prompt is the value
+    /// *after* `"--prompt"` (`args[0] == "--prompt"`, `args[1] == prompt`,
+    /// per `build_invocation`), not a bare positional at `args[0]` like
+    /// claude's. Without this override, a prompt-file writer following the
+    /// default convention writes the literal flag string into the file
+    /// instead of the prompt text.
+    fn interactive_prompt<'a>(&self, invocation: &'a AgentInvocation) -> Option<&'a str> {
+        if invocation.args.first().map(String::as_str) == Some("--prompt") {
+            invocation.args.get(1).map(String::as_str)
+        } else {
+            // Not an interactive invocation (the headless argv starts
+            // with "run"); there is no interactive prompt to extract.
+            None
+        }
+    }
+
     /// Overrides the default impl: opencode's interactive prompt is the
     /// value *after* `"--prompt"` (`args[0] == "--prompt"`, `args[1] ==
     /// prompt`, per `build_invocation`), not a bare positional at `args[0]`
@@ -333,33 +564,74 @@ impl AgentRunner for OpencodeRunner {
         expand_tilde(&format!("~/.config/opencode/prompts/{lane}.md"), home)
     }
 
-    /// Always `Ok(None)`: opencode has no telemetry artifacts to deploy in
-    /// this phase. Per ADR-0004 point 3, run start/finish recording never
-    /// depends on this returning `Some` — only the telemetry-driven extras
-    /// (session-usage cost beyond `parse_outcome`'s own `cost_usd`,
-    /// checklist/task events, an interactive SessionEnd-equivalent finish)
-    /// are lost. The opencode-plugin telemetry follow-up is where this
-    /// changes.
+    /// Always `Ok(None)`: opencode auto-discovers the globally-installed
+    /// telemetry plugin with no per-run flag, so — unlike claude's per-run
+    /// `--settings` file — there is nothing to deploy into a lane worktree.
+    /// The plugin is installed once via [`OpencodeRunner::install_user_hooks`].
+    /// Per ADR-0004 point 3, run start/finish recording never depends on this
+    /// returning `Some`.
     fn deploy_telemetry(&self, _deploy_dir: &Path) -> Result<Option<PathBuf>, AgentError> {
         Ok(None)
     }
 
-    /// Always `Ok(None)`: no user-level telemetry hooks exist for this
-    /// runner yet. See [`OpencodeRunner::deploy_telemetry`]'s doc comment.
+    /// Installs the embedded [`TELEMETRY_PLUGIN`] into opencode's plugin
+    /// discovery dir ([`plugin_dir`]) — the opencode analog of claude's
+    /// `tm work hooks install --user`. Idempotent copy-if-missing-or-stale:
+    /// a byte-identical copy already on disk is left untouched
+    /// (`scripts_already_present`); a missing or stale copy is written
+    /// (`scripts_copied`), backing up any stale copy first
+    /// (`<name>.bak-<suffix>`). `xdg_data_home` is ignored — opencode uses
+    /// its XDG *config* dir, not the data dir claude's hooks live under.
+    /// Always returns `Some`; a dry run reports the same plan without
+    /// touching disk.
     fn install_user_hooks(
         &self,
-        _home: &Path,
+        home: &Path,
         _xdg_data_home: Option<&Path>,
-        _backup_suffix: &str,
-        _dry_run: bool,
+        backup_suffix: &str,
+        dry_run: bool,
     ) -> Result<Option<InstallReport>, AgentError> {
-        Ok(None)
+        let (name, contents) = TELEMETRY_PLUGIN;
+        let dir = plugin_dir(home);
+        let dest = dir.join(name);
+
+        let existing = std::fs::read(&dest).ok();
+        let mut report = InstallReport {
+            dry_run,
+            ..Default::default()
+        };
+
+        if existing.as_deref() == Some(contents.as_bytes()) {
+            report.scripts_already_present.push(name.to_string());
+            return Ok(Some(report));
+        }
+
+        // Missing or stale: this is a write. Record it either way so a dry
+        // run reports the plan.
+        report.scripts_copied.push(name.to_string());
+        if dry_run {
+            return Ok(Some(report));
+        }
+
+        std::fs::create_dir_all(&dir)?;
+        if existing.is_some() {
+            let backup = dir.join(format!("{name}.bak-{backup_suffix}"));
+            std::fs::copy(&dest, &backup)?;
+            report.backup_path = Some(backup);
+        }
+        std::fs::write(&dest, contents)?;
+
+        Ok(Some(report))
     }
 
-    /// Always `false`: there is nothing to install yet. See
-    /// [`OpencodeRunner::deploy_telemetry`]'s doc comment.
-    fn user_hooks_installed(&self, _home: &Path, _xdg_data_home: Option<&Path>) -> bool {
-        false
+    /// `true` when the embedded plugin is present and byte-identical on disk
+    /// — mirrors claude's dry-run-reports-nothing-to-do semantics via the
+    /// same [`OpencodeRunner::install_user_hooks`] machinery, so a stale copy
+    /// counts as not-installed (it still needs rewriting).
+    fn user_hooks_installed(&self, home: &Path, xdg_data_home: Option<&Path>) -> bool {
+        self.install_user_hooks(home, xdg_data_home, "tm-init-probe", true)
+            .map(|report| report.map(|r| r.scripts_copied.is_empty()).unwrap_or(false))
+            .unwrap_or(false)
     }
 
     /// `OPENCODE_SESSION_ID`/`OPENCODE_PID`. Verified against the v1.18.11
@@ -378,11 +650,17 @@ impl AgentRunner for OpencodeRunner {
         }
     }
 
-    /// Always `None`: opencode is multi-provider, so a static per-model
-    /// price table is a poor fit, and headless cost is already
-    /// authoritative straight from `parse_outcome`'s `cost_usd`.
-    fn price_for_model(&self, _model: &str) -> Option<ModelPrice> {
-        None
+    /// Looks up `model`'s [`ModelPrice`] in [`PRICE_TABLE`] by exact name
+    /// match. `None` for any model not yet priced here. Headless lane runs
+    /// already get authoritative cost from `parse_outcome`'s `cost_usd`
+    /// (opencode computes cost natively per step); this table only matters
+    /// for interactive sessions where `estimate_missing_costs` fills in
+    /// estimated costs.
+    fn price_for_model(&self, model: &str) -> Option<ModelPrice> {
+        PRICE_TABLE
+            .iter()
+            .find(|(name, _)| *name == model)
+            .map(|(_, price)| *price)
     }
 
     /// Strips a leading `provider/` prefix by splitting on the *first*
@@ -393,6 +671,32 @@ impl AgentRunner for OpencodeRunner {
     /// (`meta/llama-3`); a name with no slash at all is returned unchanged.
     fn display_model_name<'a>(&self, model: &'a str) -> &'a str {
         model.split_once('/').map(|(_, m)| m).unwrap_or(model)
+    }
+
+    /// opencode wants the full `provider/model` spelling. There is no safe
+    /// universal default across providers, so `--yes` leaves `model` unset
+    /// (`yes_default: None`) and `tm init` prints that the run will fall
+    /// back to opencode's own default model. See
+    /// [`crate::agent::LaneModelPrompt`].
+    fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
+        crate::agent::LaneModelPrompt {
+            help: "provider/model, e.g. venice/z-ai-glm-5-3",
+            yes_default: None,
+        }
+    }
+
+    /// Requires a `provider/model` spelling: a non-empty provider and model
+    /// separated by `/` (a provider-scoped model may itself carry further
+    /// slashes, e.g. `openrouter/meta/llama-3`, mirroring
+    /// [`OpencodeRunner::display_model_name`]). A bare name with no slash is
+    /// rejected, since opencode resolves models by provider.
+    fn validate_lane_model(&self, model: &str) -> Result<(), String> {
+        match model.split_once('/') {
+            Some((provider, rest)) if !provider.is_empty() && !rest.is_empty() => Ok(()),
+            _ => Err(format!(
+                "`{model}` isn't a provider/model spelling; opencode wants e.g. `venice/z-ai-glm-5-3`"
+            )),
+        }
     }
 }
 
@@ -457,6 +761,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_definition_path_is_dot_opencode_agent() {
+        assert_eq!(
+            OpencodeRunner.agent_definition_path(Path::new("/repo"), "impl"),
+            PathBuf::from("/repo/.opencode/agent/impl.md")
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_declares_mode_and_model_frontmatter() {
+        let def =
+            OpencodeRunner.agent_definition_template("impl", Some("venice/z-ai-glm-5-3-flash"));
+        assert!(def.contains("mode: subagent"), "mode frontmatter: {def}");
+        assert!(
+            def.contains("model: venice/z-ai-glm-5-3-flash"),
+            "model frontmatter: {def}"
+        );
+        assert!(
+            def.contains("Do not create commits"),
+            "house delegation constraint in body: {def}"
+        );
+    }
+
+    #[test]
+    fn agent_definition_template_uses_a_placeholder_when_model_is_none() {
+        let def = OpencodeRunner.agent_definition_template("impl", None);
+        assert!(
+            def.contains("model: TODO-set-the-subagent-model"),
+            "placeholder model: {def}"
+        );
+    }
+
+    #[test]
     fn resume_command_names_the_opencode_cli() {
         assert_eq!(
             OpencodeRunner.resume_command("ses_123"),
@@ -495,6 +831,9 @@ mod tests {
 
     #[test]
     fn deploy_telemetry_always_returns_none() {
+        // opencode discovers the globally-installed plugin with no per-run
+        // flag, so there is nothing to deploy into a lane worktree — unlike
+        // claude, whose `--settings` file is per-run.
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(
             OpencodeRunner
@@ -504,25 +843,118 @@ mod tests {
         );
     }
 
+    /// The plugin file this adapter installs, under `home`.
+    fn plugin_path(home: &Path) -> PathBuf {
+        home.join(".config/opencode/plugin/tm-telemetry.js")
+    }
+
     #[test]
-    fn install_user_hooks_always_returns_none() {
+    fn install_user_hooks_writes_the_embedded_plugin() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("should succeed")
+            .expect("opencode installs a telemetry plugin");
+
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
+        assert!(report.scripts_already_present.is_empty());
+        assert!(report.backup_path.is_none());
+        assert!(!report.dry_run);
+
+        let written = std::fs::read_to_string(plugin_path(&home)).expect("plugin written");
+        assert_eq!(written, TELEMETRY_PLUGIN.1);
+    }
+
+    #[test]
+    fn install_user_hooks_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("first install succeeds");
+        let second = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000001", false)
+            .expect("second install succeeds")
+            .expect("still Some");
+
+        assert!(second.scripts_copied.is_empty());
+        assert_eq!(
+            second.scripts_already_present,
+            vec!["tm-telemetry.js".to_string()]
+        );
+        assert!(second.backup_path.is_none());
+    }
+
+    #[test]
+    fn install_user_hooks_dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", true)
+            .expect("should succeed")
+            .expect("still Some");
+
+        assert!(report.dry_run);
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
         assert!(
-            OpencodeRunner
-                .install_user_hooks(&home, None, "20260101-000000", false)
-                .expect("should succeed")
-                .is_none()
+            !plugin_path(&home).exists(),
+            "dry run must not touch the disk"
         );
     }
 
     #[test]
-    fn user_hooks_installed_is_always_false() {
+    fn install_user_hooks_backs_up_a_stale_plugin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let plugin = plugin_path(&home);
+        std::fs::create_dir_all(plugin.parent().unwrap()).expect("mkdir plugin dir");
+        std::fs::write(&plugin, "// stale contents\n").expect("seed stale plugin");
+
+        let report = OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-093000", false)
+            .expect("should succeed")
+            .expect("still Some");
+
+        assert_eq!(report.scripts_copied, vec!["tm-telemetry.js".to_string()]);
+        let backup = report.backup_path.expect("stale copy is backed up");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup readable"),
+            "// stale contents\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plugin).expect("plugin rewritten"),
+            TELEMETRY_PLUGIN.1
+        );
+    }
+
+    #[test]
+    fn user_hooks_installed_tracks_the_plugin_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("mkdir home");
+
         assert!(!OpencodeRunner.user_hooks_installed(&home, None));
+        OpencodeRunner
+            .install_user_hooks(&home, None, "20260101-000000", false)
+            .expect("install succeeds");
+        assert!(OpencodeRunner.user_hooks_installed(&home, None));
+    }
+
+    #[test]
+    fn embedded_plugin_matches_the_tracked_file() {
+        let tracked = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/hooks/opencode/tm-telemetry.js"
+        ))
+        .expect("tracked plugin file readable");
+        assert_eq!(TELEMETRY_PLUGIN.1, tracked);
     }
 
     #[test]
@@ -533,7 +965,26 @@ mod tests {
     }
 
     #[test]
-    fn price_for_model_is_always_none() {
+    fn price_for_model_finds_known_venice_models() {
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/claude-sonnet-5")
+                .is_some()
+        );
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/z-ai-glm-5-3")
+                .is_some()
+        );
+        assert!(
+            OpencodeRunner
+                .price_for_model("venice/deepseek-v4-flash")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn price_for_model_returns_none_for_unknown_model() {
         assert_eq!(
             OpencodeRunner.price_for_model("anthropic/claude-sonnet-4-5"),
             None
@@ -556,7 +1007,7 @@ mod tests {
     // --- build_invocation ---
 
     #[test]
-    fn headless_exact_argv_with_model_and_auto() {
+    fn headless_exact_argv_with_model_and_bypass_flag() {
         let invocation = OpencodeRunner.build_invocation(base_inputs());
 
         assert_eq!(invocation.program, "opencode");
@@ -568,7 +1019,7 @@ mod tests {
                 "json",
                 "--model",
                 "anthropic/claude-sonnet-4-5",
-                "--auto",
+                "--dangerously-skip-permissions",
                 "--",
                 "do the thing",
             ]
@@ -576,12 +1027,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_exact_argv_with_model_and_auto() {
+    fn interactive_exact_argv_with_model_and_no_permission_flag() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             mode: RunMode::Interactive,
             ..base_inputs()
         });
 
+        // The 1.15.13 TUI has no CLI permission flag at all — opencode's
+        // own `permission` config governs an interactive session.
         assert_eq!(
             invocation.args,
             vec![
@@ -589,7 +1042,6 @@ mod tests {
                 "do the thing",
                 "--model",
                 "anthropic/claude-sonnet-4-5",
-                "--auto",
             ]
         );
     }
@@ -611,32 +1063,73 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_none_maps_to_auto() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+    fn permission_mode_none_maps_to_the_bypass_flag_headless_only() {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: None,
             ..base_inputs()
         });
-        assert!(invocation.args.iter().any(|a| a == "--auto"));
+        assert!(
+            headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
+
+        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
+            permission_mode: None,
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+        assert!(
+            !interactive
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto"),
+            "the TUI has no CLI permission flag; passing one would make the \
+             window's opencode exit before rendering anything"
+        );
     }
 
     #[test]
-    fn permission_mode_bypass_permissions_maps_to_auto() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+    fn permission_mode_bypass_permissions_maps_to_the_bypass_flag_headless_only() {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: Some("bypassPermissions".to_string()),
             ..base_inputs()
         });
-        assert!(invocation.args.iter().any(|a| a == "--auto"));
+        assert!(
+            headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
+
+        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
+            permission_mode: Some("bypassPermissions".to_string()),
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+        assert!(
+            !interactive
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto")
+        );
     }
 
     #[test]
     fn permission_mode_accept_edits_maps_to_no_flag_at_all() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+        let headless = OpencodeRunner.build_invocation(InvocationInputs {
             permission_mode: Some("acceptEdits".to_string()),
             ..base_inputs()
         });
-        assert!(!invocation.args.iter().any(|a| a == "--auto"));
+        assert!(
+            !headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions")
+        );
         // No other permission-mode flag exists for opencode at all.
-        assert!(!invocation.args.iter().any(|a| a.contains("acceptEdits")));
+        assert!(!headless.args.iter().any(|a| a.contains("acceptEdits")));
     }
 
     #[test]
@@ -683,6 +1176,19 @@ mod tests {
         assert_eq!(
             interactive.env_set,
             vec![("TSKMSTR_SESSION_RUN_ID".to_string(), "run-123".to_string())]
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_returns_the_prompt_value_not_the_flag() {
+        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        assert_eq!(
+            OpencodeRunner.interactive_prompt(&invocation),
+            Some("do the thing")
         );
     }
 
@@ -836,7 +1342,7 @@ mod tests {
         assert_eq!(
             command,
             "opencode '--prompt' \"$(cat '/state/proj-1.prompt.md')\" \
-             '--model' 'anthropic/claude-sonnet-4-5' '--auto'"
+             '--model' 'anthropic/claude-sonnet-4-5'"
         );
         assert!(
             !command.contains("do the thing"),
@@ -864,5 +1370,35 @@ mod tests {
             OpencodeRunner.tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));
 
         assert!(command.contains(r#""$(cat '/state/o'\''brien.prompt.md')""#));
+    }
+
+    // --- lane_model_prompt / validate_lane_model (GitHub issue #51) ---
+
+    #[test]
+    fn lane_model_prompt_has_no_yes_default() {
+        // No safe universal default across providers: `--yes` leaves the key
+        // unset and `tm init` prints the consequence.
+        assert_eq!(OpencodeRunner.lane_model_prompt().yes_default, None);
+    }
+
+    #[test]
+    fn validate_lane_model_requires_a_provider_model_spelling() {
+        assert!(
+            OpencodeRunner
+                .validate_lane_model("venice/z-ai-glm-5-3")
+                .is_ok()
+        );
+        // A provider-scoped model may carry further slashes.
+        assert!(
+            OpencodeRunner
+                .validate_lane_model("openrouter/meta/llama-3")
+                .is_ok()
+        );
+        let err = OpencodeRunner
+            .validate_lane_model("fable")
+            .expect_err("a bare name is not opencode's spelling");
+        assert!(err.contains("provider/model"), "reason: {err}");
+        assert!(OpencodeRunner.validate_lane_model("venice/").is_err());
+        assert!(OpencodeRunner.validate_lane_model("/model").is_err());
     }
 }

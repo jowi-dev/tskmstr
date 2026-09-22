@@ -31,24 +31,55 @@ tm init
 It asks for the ticket backend (defaulting to `github` when an `origin`
 remote is detected, with the slug pre-filled), writes the repo-local
 `.tskmstr.toml`, scaffolds a work lane (`repo = "."`, an explicit
-`base_branch`, and an optional starter prompt file at
+`base_branch`, an optional starter prompt file at
 `.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
-tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md`),
-creates the GitHub backend's `tm:status/*` labels, optionally fills in
-`[work.audit]` / `[work.review_watch]`, asks which AI agent runner tm
-launches (`[agent] runner`; the default stays implicit), and offers `tm
+tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md` — and
+the lane's `model`, runner-spelled, so a run doesn't silently fall back to
+the agent CLI's own default model; see `docs/plans/gh-51-lane-model.md`),
+creates the GitHub backend's `tm:status/*` labels, offers to wire
+`status_on_pr` (the status a ticket moves to when `tm pr create` opens its
+PR — defaulting to `"In Review"` under the GitHub backend, the label init
+just created), offers to configure the board's `[work.create]` /
+`[work.review_watch]` / `[work.audit]` sessions — scaffolding a thatch
+prompt file at `.tskmstr/prompts/{create,review,audit}.md` and wiring each
+section's `prompt_file` at it, so those sessions default to the thatch
+skill + memory workflow (a section that already sets its own `prompt` or
+`prompt_file` is left untouched) — asks which AI agent runner tm launches
+(`[agent] runner`; the default stays implicit), and offers `tm
 work hooks install --user` when the session hooks are absent — everything
-`tm board` and the board's `w`/`a` keys need.
+`tm board` and the board's `w`/`c`/`a` keys need.
+
+The model question adapts to the selected runner: `claude` takes a bare
+model name and `--yes` writes its always-passed default (`fable`), while
+`opencode` takes a `provider/model` spelling (e.g. `venice/z-ai-glm-5-3`)
+and, having no safe universal default across providers, leaves `model`
+unset under `--yes` and prints that the run will use opencode's own default
+model. An empty interactive answer likewise leaves the key unset.
 
 The scaffolded lane prompt is a generic skeleton, so after everything is
 written the wizard offers to launch an agent-assisted setup session
 (GitHub issue #30): an interactive session, in the repo root, prompted to
 explore the repo, verify the build/test/lint/format gates that actually
-exist here, fill the scaffolded lane prompt out in place, and author any
-session skills the config references but that exist nowhere on disk —
+exist here, fill the scaffolded lane and thatch session prompts out in
+place, and author any session skills the config references but that exist
+nowhere on disk —
 asking you the things the repo can't answer (deploy rules, forbidden
 paths, review conventions). Declining keeps the static skeleton; review
 and commit whatever the session writes.
+
+When you configure a lane, `tm init` also offers to set up a **delegation
+subagent** for it: name the agent (e.g. `impl`) and the model its delegated
+work should run as, and tm scaffolds the runner's agent *definition* — a
+`.claude/agents/<name>.md` (claude) or `.opencode/agent/<name>.md`
+(opencode) file whose `model` frontmatter carries that model — plus a
+`## Delegation` section in the lane prompt that hands implementation,
+test-writing, and mechanical edits to the agent *by name*. This keeps the
+model and the delegation policy together in one owned, committed asset,
+instead of a lane prompt naming a model string in prose that nothing backs
+(so delegation can no longer silently resolve to the wrong model). The
+lane records only the agent's name in its `subagent` key; an existing
+definition file is never overwritten. `tm init --yes` scaffolds no
+subagent — a scripted run has no model to declare.
 
 Re-running `tm init` is a review pass: every question offers the
 current value as its default, and nothing is overwritten without
@@ -66,7 +97,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 `tm init` is still up to date, checking the stamp (missing, stale, or
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
-file, a configured session's missing skill. It never writes anything and
+file, a lane whose `subagent` key names a definition that doesn't exist,
+a configured session's missing skill. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
 checked (see `docs/decisions/0007-asset-schema-version.md`).
@@ -75,7 +107,10 @@ error (e.g. the repo was never onboarded).
 
 `tm update` applies the additive fixes for what `tm check` reports: it
 scaffolds a starter prompt for any configured lane whose prompt file is
-missing, bumps the `schema_version` stamp, and makes the same
+missing, scaffolds a missing subagent definition for any lane that
+declares one (with a placeholder `model` for you to fill, since `tm
+update` has no model to declare — that's `tm init`'s interactive
+question), bumps the `schema_version` stamp, and makes the same
 agent-assisted setup offer `tm init` does — for only the new assets
 (`--yes` skips the offer and keeps the static skeletons). It never
 overwrites an existing file or config value, so hand-edited assets are
@@ -126,7 +161,7 @@ tm auth status
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
 | `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-only fast path for direnv: silent when current, one nudge line when not. Exits `0` up to date, `1` drift found, `2` error |
-| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
+| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
@@ -594,6 +629,13 @@ falling back to `~/.claude/prompts/<lane>.md` when unset. In a repo-local
 `.tskmstr.toml`, `repo` may
 also be a relative path — see "Relative `repo`/`dir` paths in a repo-local
 config" below.
+
+An optional `subagent` key names the lane's delegation subagent (see
+"Setup"): it is a reference to a scaffolded agent *definition*
+(`.claude/agents/<name>.md` or `.opencode/agent/<name>.md`, which carries
+the subagent's own `model`), not a runtime driver setting. It is consumed
+by `tm init`/`tm check`/`tm update` to detect and additively fix a missing
+definition; the lane's own model/turn/permission keys are unaffected.
 
 `tm work run <lane> [ticket]` and the board's `w` key (see "Board-launched
 lane runs" below) both refuse a lane whose `repo` resolves to a different
@@ -1297,6 +1339,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
 # status_on_merge = "Done"            # optional, see below
+# status_on_run_start = "In Progress" # optional, see below
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 # board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
 
@@ -1312,8 +1355,8 @@ its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files whenever the Jira backend is selected, or `tm`
 refuses to run; `default_assignee_account_id`, `status_on_pr`,
-`status_on_create`, `status_on_merge`, `review_bots`, `board_column_order`,
-and `[backend]` are optional.
+`status_on_create`, `status_on_merge`, `status_on_run_start`, `review_bots`,
+`board_column_order`, and `[backend]` are optional.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
@@ -1449,7 +1492,11 @@ case-insensitively; if none match, or the transition call itself fails,
 either way. The warning is actionable: on no match it lists the ticket's
 available transitions and names `tm ticket transition <KEY> <STATUS>` as
 the manual recovery. `tm ticket <KEY>` (plain association, no PR being
-created) never changes an existing ticket's status.
+created) never changes an existing ticket's status. `tm init` offers to
+wire this key when onboarding a repo (GitHub defaults it to `"In Review"`),
+so a fresh repo's board moves on PR-open without your having to know the
+key exists; when unset, `tm pr create` leaves every ticket in its current
+status.
 
 `status_on_create` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to right after `tm ticket create` makes it. It's matched the
@@ -1468,6 +1515,19 @@ human moves the ticket when the work actually ships — so absence means
 "merge only". A ticket already sitting in the target status (on the
 GitHub backend, an issue the PR's closing keyword auto-closed reads as
 Done) is reported as moved rather than warned about.
+
+`status_on_run_start` names the workflow status (e.g. `"In Progress"`) to
+move a ticket to when a tracked `tm work run` starts against it — the
+moment `tm` knows work is beginning, so pressing `w` on the board moves the
+ticket before the session even boots, with no agent action required. It
+covers every run shape (interactive and detached/headless run through the
+same path) and is matched the same way as its siblings (available
+transitions, case-insensitive, warn-and-continue on no match or API
+failure): a provider hiccup warns and the run proceeds rather than sinking
+it. A ticket already in the target status is a silent no-op, so re-running a
+lane doesn't spam warnings, and a lane-only (ticketless) run has nothing to
+move and does nothing. When unset, a run starts without touching its
+ticket's status.
 
 `tm ticket create` takes two flags to control this per invocation:
 `--status <STATUS>` transitions the new ticket to `<STATUS>` instead of
@@ -1562,10 +1622,12 @@ runner-neutral `[work]` keys map as follows: `default_model` passes
 through as `--model` in opencode's `provider/model` spelling (e.g.
 `anthropic/claude-sonnet-4-5`), and when unset the flag is omitted so
 opencode's own configured default model applies; `default_permission_mode
-= "bypassPermissions"` (and the unset default) maps to opencode's
-`--auto`, while any other value passes no flag at all — opencode's own
-`permission` config governs, and a headless run auto-rejects (never hangs
-on) any permission it isn't configured to allow; `default_max_turns` is
+= "bypassPermissions"` (and the unset default) maps to
+`--dangerously-skip-permissions` on headless `opencode run` runs only —
+the TUI accepts no permission flag at all, so interactive sessions pass
+none — while any other value passes no flag in either mode; opencode's
+own `permission` config governs, and a headless run auto-rejects (never
+hangs on) any permission it isn't configured to allow; `default_max_turns` is
 **ignored** — opencode has no CLI turn budget (its per-agent `steps`
 config is the closest analog, and it belongs to your opencode config, not
 tm). opencode deploys no tm telemetry hooks (run start/finish recording,
@@ -1581,6 +1643,14 @@ Claude-format `.claude/skills/**/SKILL.md` — as slash commands, so an
 existing tm skill set works as-is. See
 `docs/plans/gh-41-opencode-runner.md` for the full CLI contract this
 adapter binds to.
+
+The delegation-subagent asset (see "Setup" above) is runner-aware the same
+way: `tm init` scaffolds a claude definition at `.claude/agents/<name>.md`
+and an opencode one at `.opencode/agent/<name>.md` (with `mode: subagent`),
+each carrying the declared `model` in its frontmatter. Both runners
+discover these files for any session run in the repo, so the lane prompt's
+`## Delegation` section can name the agent and trust it resolves to the
+declared model.
 
 ### Ranking
 

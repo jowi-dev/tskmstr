@@ -80,6 +80,17 @@ pub struct RawConfig {
     /// moves the ticket when it actually ships), so absence means "merge
     /// only".
     pub status_on_merge: Option<String>,
+    /// Workflow status name to transition a ticket to when a tracked run
+    /// starts against it, e.g. `"In Progress"`.
+    ///
+    /// Applied advisorily by `tm work run` (both the interactive and the
+    /// detached headless path) around the moment its run row is created —
+    /// the point tm *knows* work is beginning — exactly like `status_on_pr`:
+    /// a provider failure warns and the run proceeds, and a ticket already in
+    /// the target status is a silent no-op. A lane-only (ticketless) run has
+    /// nothing to move and skips it. When unset, a run starts without moving
+    /// its ticket (the pre-`status_on_run_start` behavior).
+    pub status_on_run_start: Option<String>,
     /// Override path for the run-state SQLite database used by `tm runs`.
     ///
     /// When unset, `tm runs` falls back to
@@ -558,6 +569,15 @@ pub struct RawLaneConfig {
     /// Permission mode for this lane's driver process, overriding
     /// [`RawWorkConfig::default_permission_mode`].
     pub permission_mode: Option<String>,
+    /// Name of the delegation subagent this lane's prompt delegates to
+    /// (GitHub issue #52). A reference to a scaffolded agent *definition*
+    /// (opencode's `.opencode/agent/<name>.md` or claude's
+    /// `.claude/agents/<name>.md`, which carries the subagent's own `model`),
+    /// not a runtime driver setting — it is consumed by `tm init`/`tm
+    /// check`/`tm update` reading the raw config document to detect and
+    /// additively fix a missing definition, and intentionally not surfaced
+    /// on [`LaneConfig`].
+    pub subagent: Option<String>,
 }
 
 /// Fully validated configuration ready for use by the rest of the
@@ -603,6 +623,10 @@ pub struct Config {
     /// merged from the board, if configured. See
     /// [`RawConfig::status_on_merge`] for semantics.
     pub status_on_merge: Option<String>,
+    /// Workflow status name to advisorily transition a ticket to when a
+    /// tracked `tm work run` starts against it, if configured. See
+    /// [`RawConfig::status_on_run_start`] for semantics.
+    pub status_on_run_start: Option<String>,
     /// Override path for the run-state SQLite database, if configured. See
     /// [`RawConfig::run_db_path`] for semantics.
     pub run_db_path: Option<String>,
@@ -941,7 +965,7 @@ pub enum ConfigError {
 
     /// `[agent].runner` was set to a value that isn't a recognized agent
     /// runner name, mirroring [`ConfigError::InvalidProvider`].
-    #[error("invalid [agent] runner `{value}`; expected \"claude\"")]
+    #[error("invalid [agent] runner `{value}`; expected \"claude\" or \"opencode\"")]
     InvalidRunner {
         /// The unrecognized value as written in config.
         value: String,
@@ -1072,6 +1096,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         status_on_pr: None,
         status_on_create: None,
         status_on_merge: None,
+        status_on_run_start: None,
         run_db_path: None,
         review_bots: None,
         board_column_order: None,
@@ -1209,6 +1234,10 @@ fn merge_with_repo_dir(
         .status_on_merge
         .clone()
         .or(global.status_on_merge.clone());
+    let status_on_run_start = repo
+        .status_on_run_start
+        .clone()
+        .or(global.status_on_run_start.clone());
     let run_db_path = repo.run_db_path.clone().or(global.run_db_path.clone());
     let review_bots = repo
         .review_bots
@@ -1243,6 +1272,7 @@ fn merge_with_repo_dir(
             status_on_pr,
             status_on_create,
             status_on_merge,
+            status_on_run_start,
             run_db_path,
             review_bots,
             board_column_order,
@@ -1278,6 +1308,7 @@ fn merge_with_repo_dir(
                 status_on_pr,
                 status_on_create,
                 status_on_merge,
+                status_on_run_start,
                 run_db_path,
                 review_bots,
                 board_column_order,
@@ -1849,6 +1880,7 @@ mod tests {
             status_on_pr: Some("In Review".into()),
             status_on_create: Some("In Progress".into()),
             status_on_merge: Some("Done".into()),
+            status_on_run_start: Some("In Progress".into()),
             run_db_path: Some("/global/runs.db".into()),
             review_bots: Some(vec!["cursor[bot]".into()]),
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
@@ -1878,6 +1910,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1919,6 +1952,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_repo_overrides_status_on_run_start() {
+        let repo = RawConfig {
+            status_on_run_start: Some("Doing".into()),
+            ..RawConfig::default()
+        };
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.status_on_run_start, Some("Doing".into()));
+    }
+
+    #[test]
+    fn merge_status_on_run_start_absent_from_both_is_none() {
+        let global = RawConfig {
+            status_on_run_start: None,
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("should merge");
+        assert_eq!(cfg.status_on_run_start, None);
+    }
+
+    #[test]
+    fn merge_global_status_on_run_start_used_when_repo_omits_it() {
+        let repo = RawConfig::default();
+        let cfg = merge(raw_full(), Some(repo)).expect("should merge");
+        assert_eq!(cfg.status_on_run_start, Some("In Progress".into()));
+    }
+
+    #[test]
     fn merge_repo_overrides_status_on_pr() {
         let repo = RawConfig {
             jira_base_url: None,
@@ -1928,6 +1988,7 @@ mod tests {
             status_on_pr: Some("Ready for Review".into()),
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1960,6 +2021,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: Some("In Progress".into()),
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
@@ -1992,6 +2054,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: Some("/repo/runs.db".into()),
             review_bots: None,
             board_column_order: None,
@@ -2024,6 +2087,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: Some(vec!["repo-bot[bot]".into()]),
             board_column_order: None,
@@ -2056,6 +2120,7 @@ mod tests {
             status_on_pr: None,
             status_on_create: None,
             status_on_merge: None,
+            status_on_run_start: None,
             run_db_path: None,
             review_bots: None,
             board_column_order: Some(vec!["Code Review".into()]),
@@ -2234,6 +2299,54 @@ mod tests {
         };
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.status_on_merge, Some("Done".to_string()));
+    }
+
+    #[test]
+    fn load_global_with_status_on_run_start_parses_field() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+            status_on_run_start = "In Progress"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_run_start, Some("In Progress".to_string()));
+    }
+
+    #[test]
+    fn load_repo_overrides_status_on_run_start() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            status_on_run_start = "In Progress"
+            "#,
+        )
+        .unwrap();
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"status_on_run_start = "Doing""#).unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(cfg.status_on_run_start, Some("Doing".to_string()));
     }
 
     #[test]
