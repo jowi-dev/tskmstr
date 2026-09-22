@@ -1052,9 +1052,8 @@ pub struct FakeGitOps {
     /// Per-(ancestor, descendant) overrides for `is_ancestor`, consulted
     /// before the blanket [`Self::is_ancestor_result`]. See
     /// [`Self::with_is_ancestor_for`].
-    is_ancestor_overrides: std::cell::RefCell<
-        std::collections::HashMap<(String, String), Result<bool, GitError>>,
-    >,
+    is_ancestor_overrides:
+        std::cell::RefCell<std::collections::HashMap<(String, String), Result<bool, GitError>>>,
     rebase_onto_result: std::cell::RefCell<Result<RebaseOutcome, GitError>>,
     /// Sequenced answers for `rebase_in_progress`, consumed one per call;
     /// the last entry repeats once exhausted. See
@@ -1604,12 +1603,7 @@ impl GitOps for FakeGitOps {
             })
     }
 
-    fn is_ancestor(
-        &self,
-        _dir: &Path,
-        ancestor: &str,
-        descendant: &str,
-    ) -> Result<bool, GitError> {
+    fn is_ancestor(&self, _dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
         if let Some(result) = self
             .is_ancestor_overrides
             .borrow()

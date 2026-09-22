@@ -279,6 +279,7 @@ fn run_conflict_session(
     branch: &str,
     base: &str,
     dir: &Path,
+    pre_rebase_rev: &str,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
     let template = match deps.merge_cfg.prompt_file.as_deref() {
@@ -324,17 +325,24 @@ fn run_conflict_session(
         writeln!(out, "attach: tmux attach -t {target}")?;
     }
 
-    poll_conflict_session(deps, dir, &target, &window, branch, out)
+    poll_conflict_session(deps, dir, &target, &window, branch, pre_rebase_rev, out)
 }
 
 /// The poll loop itself, split out from [`run_conflict_session`] so the
 /// window-open step above only ever runs once.
+///
+/// `pre_rebase_rev` is the branch tip captured before `rebase_onto` ran:
+/// `git rebase --abort` restores it exactly, while a completed rebase
+/// always rewrites it (a rebase only runs when the base moved), so it is
+/// what distinguishes "resolved" from "aborted" once the rebase state
+/// clears.
 fn poll_conflict_session(
     deps: &MergeDeps<'_>,
     dir: &Path,
     target: &str,
     window: &str,
     branch: &str,
+    pre_rebase_rev: &str,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
     let start = deps.clock.now_unix_secs();
@@ -342,6 +350,27 @@ fn poll_conflict_session(
     let mut last_heartbeat = start;
 
     loop {
+        // Resolution is checked before the timeout so a rebase that
+        // finished right at the deadline still counts as resolved.
+        if !deps.git.rebase_in_progress(dir)? {
+            let clean = deps.git.status_is_clean(dir)?;
+            let on_branch = deps.git.current_branch(dir).ok().as_deref() == Some(branch);
+            if clean && on_branch {
+                return match deps.git.rev_parse(dir, branch) {
+                    Ok(tip) if tip != pre_rebase_rev => {
+                        writeln!(out, "conflicts resolved; rebase complete")?;
+                        Ok(ConflictOutcome::Resolved)
+                    }
+                    _ => {
+                        writeln!(out, "rebase was aborted; handing back")?;
+                        Ok(ConflictOutcome::HandedBack)
+                    }
+                };
+            }
+            writeln!(out, "conflict session ended without completing the rebase")?;
+            return Ok(ConflictOutcome::HandedBack);
+        }
+
         let now = deps.clock.now_unix_secs();
         if now - start > CONFLICT_TIMEOUT_SECS {
             writeln!(
@@ -350,17 +379,6 @@ fn poll_conflict_session(
             )?;
             writeln!(out, "attach: tmux attach -t {target}")?;
             writeln!(out, "abort: git -C {} rebase --abort", dir.display())?;
-            return Ok(ConflictOutcome::HandedBack);
-        }
-
-        if !deps.git.rebase_in_progress(dir)? {
-            let clean = deps.git.status_is_clean(dir)?;
-            let on_branch = deps.git.current_branch(dir).ok().as_deref() == Some(branch);
-            if clean && on_branch {
-                writeln!(out, "conflicts resolved; rebase complete")?;
-                return Ok(ConflictOutcome::Resolved);
-            }
-            writeln!(out, "conflict session ended without completing the rebase")?;
             return Ok(ConflictOutcome::HandedBack);
         }
 
@@ -433,16 +451,40 @@ pub fn run_merge(
     match checkout_dir.as_deref() {
         Some(dir) => {
             let origin_branch_ref = format!("origin/{branch}");
+            let origin_base_ref = format!("origin/{base}");
             let local_rev = deps.git.rev_parse(dir, &branch)?;
             let remote_rev = deps.git.rev_parse(dir, &origin_branch_ref).map_err(|_| {
                 MergeError::RemoteBranchGone {
                     branch: branch.clone(),
                 }
             })?;
+            // Tracks whether the local tip must be published before the
+            // merge: set when local is authoritative (ahead of, or a rebase
+            // of, the remote tip) or when a rebase runs below. The pushed
+            // tip is what `gh pr merge` merges.
+            let mut needs_push = false;
+            let mut current_tip = local_rev.clone();
             if local_rev != remote_rev {
                 if deps.git.is_ancestor(dir, &branch, &origin_branch_ref)? {
                     deps.git.merge_ff_only(dir, &origin_branch_ref)?;
                     writeln!(out, "fast-forwarded {branch} to {origin_branch_ref}")?;
+                    current_tip = remote_rev.clone();
+                } else if deps.git.is_ancestor(dir, &origin_branch_ref, &branch)? {
+                    writeln!(
+                        out,
+                        "local {branch} is ahead of {origin_branch_ref}; will push before merging"
+                    )?;
+                    needs_push = true;
+                } else if deps.git.is_ancestor(dir, &origin_base_ref, &branch)? {
+                    // A rebase rewrote the local commits (e.g. a prior
+                    // handback finished by hand) — local is the rebased
+                    // truth and force-with-lease still guards against
+                    // anything pushed after our fetch.
+                    writeln!(
+                        out,
+                        "local {branch} diverged from {origin_branch_ref} but is already rebased onto {base}; will push before merging"
+                    )?;
+                    needs_push = true;
                 } else {
                     return Err(MergeError::BranchDiverged {
                         branch: branch.clone(),
@@ -450,9 +492,7 @@ pub fn run_merge(
                 }
             }
 
-            let origin_base_ref = format!("origin/{base}");
             let rebase_needed = !deps.git.is_ancestor(dir, &origin_base_ref, &branch)?;
-            let mut pushed = false;
             if !rebase_needed {
                 writeln!(out, "branch already up to date with {base}")?;
             } else {
@@ -465,11 +505,19 @@ pub fn run_merge(
                 match deps.git.rebase_onto(dir, &origin_base_ref)? {
                     RebaseOutcome::Completed => {
                         writeln!(out, "rebase complete")?;
-                        pushed = true;
+                        needs_push = true;
                     }
                     RebaseOutcome::Conflicted => {
-                        match run_conflict_session(deps, key, &branch, &base, dir, out)? {
-                            ConflictOutcome::Resolved => pushed = true,
+                        match run_conflict_session(
+                            deps,
+                            key,
+                            &branch,
+                            &base,
+                            dir,
+                            &current_tip,
+                            out,
+                        )? {
+                            ConflictOutcome::Resolved => needs_push = true,
                             ConflictOutcome::HandedBack => {
                                 return Ok(MergeFlowOutcome::ConflictsHandedBack);
                             }
@@ -478,7 +526,7 @@ pub fn run_merge(
                 }
             }
 
-            if pushed {
+            if needs_push {
                 writeln!(out, "pushing {branch} (force-with-lease)...")?;
                 deps.git.push_force_with_lease(dir, &branch)?;
             }
@@ -843,7 +891,12 @@ mod tests {
             .git
             .with_current_branch(Ok("proj-1-fix".to_string()))
             .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
-            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            // The completed rebase rewrites the tip: "aaa" before, "bbb"
+            // once the conflict session finishes.
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("bbb".to_string())],
+            )
             .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
             .with_is_ancestor_result(Ok(false))
             .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
@@ -920,7 +973,12 @@ mod tests {
             .git
             .with_current_branch(Ok("proj-1-fix".to_string()))
             .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
-            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            // The completed rebase rewrites the tip: "aaa" before, "bbb"
+            // once the conflict session finishes.
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("bbb".to_string())],
+            )
             .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
             .with_is_ancestor_result(Ok(false))
             .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
@@ -1056,6 +1114,117 @@ mod tests {
 
         assert!(matches!(result, Err(MergeError::BranchDiverged { .. })));
         assert!(fx.git.rebase_onto_calls().is_empty());
+    }
+
+    // --- local ahead of remote: unpushed local commits are authoritative ---
+
+    #[test]
+    fn local_ahead_of_remote_is_pushed_before_merging() {
+        let mut fx = Fixture::new();
+        let checkout = fx.register_checkout("proj-1-fix");
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("bbb".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            // remote is an ancestor of local: local is strictly ahead.
+            .with_is_ancestor_for("origin/proj-1-fix", "proj-1-fix", Ok(true))
+            // local already contains the latest base: no rebase needed.
+            .with_is_ancestor_for("origin/main", "proj-1-fix", Ok(true))
+            .with_branch_exists_local(Ok(false));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(
+            fx.git.rebase_onto_calls().is_empty(),
+            "up-to-date-with-base branch must not be rebased"
+        );
+        assert_eq!(
+            fx.git.push_force_with_lease_calls(),
+            vec![(checkout, "proj-1-fix".to_string())],
+            "the unpushed local commits must be published before the merge"
+        );
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+        assert!(out.contains("ahead of origin/proj-1-fix"));
+    }
+
+    // --- diverged, but local is already rebased onto the base ---
+    // (the state a handback or a manual `git rebase --continue` leaves
+    // behind — rerunning `tm merge` must pick it up, not dead-end)
+
+    #[test]
+    fn diverged_but_rebased_local_is_pushed_before_merging() {
+        let mut fx = Fixture::new();
+        let checkout = fx.register_checkout("proj-1-fix");
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("bbb".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            // Neither tip is an ancestor of the other (a rebase rewrote the
+            // local commits), but local already sits on the latest base.
+            .with_is_ancestor_for("origin/main", "proj-1-fix", Ok(true))
+            .with_branch_exists_local(Ok(false));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(fx.git.rebase_onto_calls().is_empty());
+        assert_eq!(
+            fx.git.push_force_with_lease_calls(),
+            vec![(checkout, "proj-1-fix".to_string())]
+        );
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+        assert!(out.contains("already rebased onto main"));
+    }
+
+    // --- conflict session aborted the rebase ---
+
+    #[test]
+    fn aborted_rebase_hands_back_without_pushing_or_merging() {
+        let mut fx = Fixture::new();
+        fx.register_checkout("proj-1-fix");
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("proj-1-fix".to_string()))
+            // `git rebase --abort` restores the pre-rebase tip exactly, so
+            // the branch rev never changes across the whole flow.
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(false)])
+            .with_branch_exists_local(Ok(false));
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows(Ok(vec![TmuxWindow {
+                session: "dev".to_string(),
+                name: "shell".to_string(),
+                dead: false,
+            }]));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        assert!(
+            out.contains("rebase was aborted"),
+            "an abort must not read as success; got: {out}"
+        );
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert!(fx.gh.pr_merge_calls().is_empty());
     }
 
     // --- local behind remote: catch-up then normal flow ---
