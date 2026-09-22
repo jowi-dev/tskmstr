@@ -132,6 +132,11 @@ pub fn run_update(
                 path: repo_path.clone(),
                 session_prompt: prompt.clone(),
             }),
+            // Moving a prompt file out of the legacy `prompts/` directory
+            // and rewriting the `prompt_file` key is a content decision, not
+            // an additive fix; reported as remaining drift only (GitHub
+            // issue #53).
+            DriftFinding::LegacyPromptDir { .. } => {}
         }
     }
 
@@ -642,6 +647,48 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "session-authored skill counts: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_prompt_dir_is_reported_not_fixed() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join("prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        let customized = "# my hand-tuned lane prompt\n";
+        std::fs::write(&lane_prompt, customized).expect("write lane prompt");
+        write_repo_config(
+            &env,
+            "[work.lanes.widget]\n\
+             prompt_file = \"prompts/widget-lane.md\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
+
+        assert_eq!(
+            remaining,
+            vec![DriftFinding::LegacyPromptDir {
+                key: "work.lanes.widget.prompt_file".to_string(),
+                value: "prompts/widget-lane.md".to_string(),
+            }]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lane_prompt).expect("read prompt"),
+            customized,
+            "the legacy prompt file must not be moved or touched"
+        );
+        assert!(
+            read_repo_config(&env).contains("prompt_file = \"prompts/widget-lane.md\""),
+            "the prompt_file key must not be rewritten: {}",
+            read_repo_config(&env)
+        );
+        assert!(
+            read_repo_config(&env).contains("schema_version = 1"),
+            "the stamp still bumps even though the legacy path remains drift"
         );
     }
 
