@@ -84,7 +84,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::agent::{AgentError, AgentRunner, InvocationInputs, RunMode};
+use crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS;
+use crate::agent::{AgentError, AgentInvocation, AgentRunner, InvocationInputs, RunMode};
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
@@ -1524,21 +1525,104 @@ pub fn run_agent_and_finish(
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
-    let invocation = &prepared.invocation;
+    // The attempt list (GitHub issue #54): the primary (`runner`,
+    // `prepared.invocation`) first, then each `prepared.fallbacks` entry
+    // resolved back to a live runner. A fallback whose `agent` string
+    // doesn't parse is skipped with a warning rather than treated as
+    // fatal — that should never happen from code `tm` itself writes (it's
+    // always `AgentRunner::name()`), but a stale/foreign state file isn't
+    // worth failing the run over.
+    struct Attempt<'a> {
+        runner: &'a dyn AgentRunner,
+        invocation: &'a AgentInvocation,
+    }
+    let mut attempts: Vec<Attempt<'_>> = vec![Attempt {
+        runner,
+        invocation: &prepared.invocation,
+    }];
+    for fallback in &prepared.fallbacks {
+        match crate::config::AgentKind::parse(&fallback.agent) {
+            Some(kind) => attempts.push(Attempt {
+                runner: crate::agent::routing::runner_for(kind),
+                invocation: &fallback.invocation,
+            }),
+            None => {
+                writeln!(
+                    out,
+                    "warning: skipping unrecognized fallback agent {:?}",
+                    fallback.agent
+                )?;
+            }
+        }
+    }
+    let last_attempt_index = attempts.len() - 1;
 
-    let status = spawner.spawn(SpawnRequest {
-        program: &invocation.program,
-        args: &invocation.args,
-        env_set: &invocation.env_set,
-        env_remove: &invocation.env_remove,
-        current_dir: &prepared.worktree,
-        stdout_path: &prepared.out_json_path,
-    })?;
+    // Spawn-wait-parse each attempt in turn. A rate-limited outcome with
+    // another attempt still to try persists that agent's usage window and
+    // falls through to the next attempt without finishing the run; every
+    // other outcome (including a rate limit on the *last* attempt) is
+    // terminal. See `docs/plans/gh-54-priority-routing.md`'s "Selection and
+    // in-run fallback" section.
+    let mut active_runner = runner;
+    let mut status = None;
+    let mut parsed = None;
+    let mut all_attempts_rate_limited = false;
+    for (index, attempt) in attempts.iter().enumerate() {
+        let attempt_status = spawner.spawn(SpawnRequest {
+            program: &attempt.invocation.program,
+            args: &attempt.invocation.args,
+            env_set: &attempt.invocation.env_set,
+            env_remove: &attempt.invocation.env_remove,
+            current_dir: &prepared.worktree,
+            stdout_path: &prepared.out_json_path,
+        })?;
+        let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
+        let attempt_parsed = attempt.runner.parse_outcome(&raw_result).ok();
+        let rate_limit = attempt_parsed.as_ref().and_then(|o| o.rate_limit.clone());
+
+        if let Some(rate_limit) = rate_limit {
+            let until = rate_limit
+                .reset_at
+                .unwrap_or_else(|| SystemClock.now_unix_secs() + DEFAULT_EXHAUSTED_HOLD_SECS);
+            run_store.set_agent_exhausted_until(attempt.runner.name(), until)?;
+            let detail = if index == last_attempt_index {
+                format!(
+                    "{} exhausted until {until}; no further agents to try",
+                    attempt.runner.name()
+                )
+            } else {
+                format!(
+                    "{} exhausted until {until}, falling back to {}",
+                    attempt.runner.name(),
+                    attempts[index + 1].runner.name()
+                )
+            };
+            run_store.add_event(prepared.run_id, "rate_limited", Some(&detail))?;
+            writeln!(out, "{detail}")?;
+
+            if index != last_attempt_index {
+                continue;
+            }
+            all_attempts_rate_limited = true;
+        }
+
+        active_runner = attempt.runner;
+        status = Some(attempt_status);
+        parsed = attempt_parsed;
+        break;
+    }
+    // `attempts` always has at least the primary attempt, and every
+    // iteration either `continue`s (only possible before the last index) or
+    // `break`s having set `status`, so this always ends up populated.
+    let status = status.expect("run_agent_and_finish attempted at least one agent");
+    let runner = active_runner;
 
     // Parse the outcome and classify the run's terminal status. A non-zero
     // exit is always Failed, regardless of what (if anything) the result
-    // says -- that's an unambiguous signal from the process itself.
-    // Otherwise:
+    // says -- that's an unambiguous signal from the process itself. Every
+    // attempt having hit its usage limit is also unambiguously Failed,
+    // overriding whatever `is_error` the last (still rate-limited) attempt
+    // happened to report. Otherwise:
     //
     // - Result parsed and `is_error` was explicit -> Failed/Done, exactly as
     //   before.
@@ -1552,9 +1636,7 @@ pub fn run_agent_and_finish(
     //   default straight to `Done` via `unwrap_or(false)`. See
     //   `RunStatus::Interrupted`'s doc comment and
     //   `AgentRunner::parse_outcome`'s tests for the exact contract.
-    let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
-    let parsed = runner.parse_outcome(&raw_result).ok();
-    let run_status = if !status.success() {
+    let run_status = if all_attempts_rate_limited || !status.success() {
         RunStatus::Failed
     } else {
         match parsed.as_ref().map(|o| o.is_error) {
@@ -1564,6 +1646,9 @@ pub fn run_agent_and_finish(
         }
     };
     let is_error = run_status != RunStatus::Done;
+    if run_status == RunStatus::Done {
+        run_store.clear_agent_window(runner.name())?;
+    }
 
     // Finish the tracked run.
     let model_usage_json = parsed
@@ -1614,10 +1699,18 @@ pub fn run_agent_and_finish(
         .and_then(|o| o.cost_usd)
         .map(|c| c.to_string())
         .unwrap_or_default();
-    let summary = parsed
-        .as_ref()
-        .and_then(|o| o.result.clone())
-        .unwrap_or_default();
+    let summary = if all_attempts_rate_limited {
+        format!(
+            "Every configured agent hit its usage limit ({} attempt{} tried); see the run's events for the fallback trail.",
+            attempts.len(),
+            if attempts.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        parsed
+            .as_ref()
+            .and_then(|o| o.result.clone())
+            .unwrap_or_default()
+    };
 
     writeln!(out)?;
     writeln!(out, "lane      {}", prepared.lane)?;
@@ -2554,6 +2647,262 @@ mod tests {
 
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Blocked);
+    }
+
+    // --- GH-54: in-run priority-routing fallback ---
+
+    fn claude_rate_limited_json_with_epoch() -> String {
+        r#"{"session_id":"sess-claude","is_error":false,"result":"Claude AI usage limit reached|1758600000"}"#.to_string()
+    }
+
+    fn claude_rate_limited_json_without_epoch() -> String {
+        r#"{"session_id":"sess-claude","is_error":true,"result":"You've hit your usage limit reached for this session, try again later."}"#.to_string()
+    }
+
+    fn opencode_success_json() -> String {
+        [
+            r#"{"type":"step_finish","timestamp":1,"sessionID":"ses-opencode","part":{"cost":0.2,"tokens":{"input":5,"output":5}}}"#,
+            r#"{"type":"text","timestamp":2,"sessionID":"ses-opencode","part":{"text":"done via opencode"}}"#,
+        ]
+        .join("\n")
+    }
+
+    fn opencode_rate_limited_json() -> String {
+        r#"{"type":"error","timestamp":1,"sessionID":"ses-opencode","error":{"name":"RateLimitError","data":{"message":"rate limit exceeded"}}}"#.to_string()
+    }
+
+    /// Prepares a lane run configured with `claude` preferred and
+    /// `opencode` as its sole fallback (GitHub issue #54), returning the
+    /// owned fixtures the caller's `run_agent_and_finish` call needs —
+    /// `TempDir` included, so it isn't dropped (and its directory removed)
+    /// before the test runs.
+    fn prepare_run_with_opencode_fallback() -> (TempDir, FakeGhCli, RunStore, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.fallbacks.len(),
+            1,
+            "sanity: one opencode fallback planned"
+        );
+
+        (tmp, gh, run_store, prepared)
+    }
+
+    #[test]
+    fn run_agent_and_finish_falls_back_to_opencode_when_claude_is_rate_limited() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_with_epoch(), 0),
+            (opencode_success_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Done);
+        assert_eq!(run.session_id.as_deref(), Some("ses-opencode"));
+
+        assert_eq!(
+            run_store.agent_exhausted_until("claude").unwrap(),
+            Some(1758600000)
+        );
+
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        assert!(events.iter().any(|e| {
+            e.kind == "rate_limited"
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("claude") && d.contains("opencode"))
+        }));
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.to_lowercase().contains("falling back"));
+        // The finished run's summary/resume must reflect the active
+        // (opencode) attempt, not the originally preferred claude.
+        assert!(output.contains("opencode --session ses-opencode"));
+    }
+
+    #[test]
+    fn run_agent_and_finish_rate_limit_without_reset_epoch_holds_for_the_default_window() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_without_epoch(), 0),
+            (opencode_success_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let before = SystemClock.now_unix_secs();
+        run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+        let after = SystemClock.now_unix_secs();
+
+        let until = run_store.agent_exhausted_until("claude").unwrap().unwrap();
+        assert!(
+            until >= before + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS
+                && until <= after + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS,
+            "expected `until` ({until}) within [{}, {}]",
+            before + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS,
+            after + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_all_attempts_rate_limited_marks_the_run_failed() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_with_epoch(), 0),
+            (opencode_rate_limited_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run_store.agent_exhausted_until("claude").unwrap(),
+            Some(1758600000)
+        );
+        assert!(
+            run_store
+                .agent_exhausted_until("opencode")
+                .unwrap()
+                .is_some()
+        );
+
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "rate_limited").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_ordinary_failure_does_not_retry_on_the_fallback() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        // An ordinary `is_error: true` with no rate-limit text -- must not
+        // trigger any fallback attempt.
+        let json = r#"{"session_id":"sess-claude","is_error":true,"result":"tool call failed"}"#;
+        let spawner = FakeProcessSpawner::sequence(vec![(json.to_string(), 0)]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(spawner.recorded.lock().unwrap().len(), 1);
+        assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
+        assert!(
+            run_store
+                .events_for_run(prepared.run_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_success_on_primary_clears_a_stale_window() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        // A stale window row from an earlier rate-limited run, now expired.
+        run_store.set_agent_exhausted_until("claude", 1).unwrap();
+
+        let spawner = FakeProcessSpawner::sequence(vec![(canned_json(), 0)]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
     }
 
     #[test]
