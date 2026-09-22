@@ -10,6 +10,16 @@
 //! and branch, and finally apply the configured `status_on_merge`
 //! transition.
 //!
+//! The conflict-resolution session is launched the same way an interactive
+//! lane run is: [`crate::agent::AgentRunner::build_invocation`] under
+//! [`crate::agent::RunMode::Interactive`], its prompt written to a file
+//! under [`MergeDeps::state_dir`], and
+//! [`crate::agent::AgentRunner::tmux_command_line`] rendering the command
+//! that reads it back — the same billing-safety `env -u` prefix and
+//! unattended default permissions (`bypassPermissions` for `ClaudeRunner`)
+//! every other agent session gets. The session itself stays deliberately
+//! untracked (no run row): see [`run_conflict_session`].
+//!
 //! A conflict session that never resolves is not a hard failure: the
 //! rebase is deliberately left in progress on disk and
 //! [`MergeFlowOutcome::ConflictsHandedBack`] is returned so the caller can
@@ -22,7 +32,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentRunner, InvocationInputs, RunMode};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
 use crate::github::gh_cli::{GhCli, GhError};
@@ -74,6 +84,18 @@ pub enum MergeError {
     /// A configured `[work.merge].prompt_file` could not be read.
     #[error(transparent)]
     PromptFile(#[from] PromptFileError),
+
+    /// The conflict session's rendered prompt could not be written to
+    /// `state_dir` — raised before any tmux call, so a bad `state_dir`
+    /// never leaves a half-opened session behind (same stance as a bad
+    /// `[work.merge].prompt_file`).
+    #[error("failed to write prompt file {path}: {source}")]
+    PromptWrite {
+        /// The prompt file that could not be written.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 
     /// [`resolve_watch_repo_root`] failed to resolve the ticket's repo root.
     #[error(transparent)]
@@ -172,6 +194,11 @@ pub struct MergeDeps<'a> {
     pub merge_cfg: &'a MergeConfig,
     /// Configured `status_on_merge` target status, if any.
     pub status_on_merge: Option<&'a str>,
+    /// Directory the conflict session's prompt file is written under
+    /// (`merge-<key>-<timestamp>.prompt.md`), the same run-state directory
+    /// `tm work run`/`tm review fix` use for their own interactive prompt
+    /// files. Created (via `create_dir_all`) if it doesn't exist yet.
+    pub state_dir: &'a Path,
 }
 
 /// Substitutes `{key}`, `{branch}`, and `{base}` in `template`, producing
@@ -270,9 +297,22 @@ fn format_ts(unix_secs: i64) -> String {
 /// out.
 ///
 /// Reads the prompt (`[work.merge].prompt_file` > `.prompt` > the runner's
-/// [`AgentRunner::default_merge_conflict_prompt_template`]) before making
-/// any tmux call, so a bad `prompt_file` path never leaves a half-opened
-/// session behind.
+/// [`AgentRunner::default_merge_conflict_prompt_template`]) and writes the
+/// rendered prompt file before making any tmux call, so a bad `prompt_file`
+/// path or a `state_dir` write failure never leaves a half-opened session
+/// behind.
+///
+/// The session is launched the same way an interactive lane run is
+/// ([`crate::work::interactive::launch_interactive_run`]'s command
+/// construction, inlined here since this session is deliberately
+/// untracked — no run row, no [`crate::work::run::PreparedRun`] to hand
+/// that helper): [`AgentRunner::build_invocation`] under
+/// [`RunMode::Interactive`] with `permission_mode: None` (so it resolves to
+/// the runner's own default, `bypassPermissions` for `ClaudeRunner` since
+/// issue #29 — never hardcoded here), then
+/// [`AgentRunner::tmux_command_line`] renders the command that reads the
+/// prompt back from disk. This is what makes the session run unattended
+/// instead of stalling on the first permission prompt.
 fn run_conflict_session(
     deps: &MergeDeps<'_>,
     key: &str,
@@ -293,9 +333,33 @@ fn run_conflict_session(
         },
     };
     let prompt = conflict_prompt(&template, key, branch, base);
-    let command = deps
+
+    let invocation = deps.runner.build_invocation(InvocationInputs {
+        prompt,
+        model: deps.merge_cfg.model.clone(),
+        max_turns: None,
+        permission_mode: None,
+        settings_path: None,
+        run_id: None,
+        mode: RunMode::Interactive,
+    });
+    let prompt_text = deps
         .runner
-        .interactive_shell_command(deps.merge_cfg.model.as_deref(), &prompt);
+        .interactive_prompt(&invocation)
+        .unwrap_or_default();
+    let prompt_path = deps.state_dir.join(format!(
+        "merge-{key}-{}.prompt.md",
+        deps.clock.now_unix_secs()
+    ));
+    std::fs::create_dir_all(deps.state_dir).map_err(|source| MergeError::PromptWrite {
+        path: deps.state_dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::write(&prompt_path, prompt_text).map_err(|source| MergeError::PromptWrite {
+        path: prompt_path.clone(),
+        source,
+    })?;
+    let command = deps.runner.tmux_command_line(&invocation, &prompt_path);
 
     let current_session = deps.tmux.current_session_name()?;
     let target = current_session
@@ -711,12 +775,16 @@ mod tests {
         merge_cfg: MergeConfig,
         status_on_merge: Option<String>,
         _worktree_dirs: Vec<tempfile::TempDir>,
+        _state_dir: tempfile::TempDir,
+        state_dir: PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
             let db_dir = tempdir().unwrap();
             let store = open_store(db_dir.path());
+            let state_tmp = tempdir().unwrap();
+            let state_dir = state_tmp.path().join("state");
             Fixture {
                 _db_dir: db_dir,
                 store,
@@ -740,6 +808,8 @@ mod tests {
                 merge_cfg: MergeConfig::default(),
                 status_on_merge: None,
                 _worktree_dirs: Vec::new(),
+                _state_dir: state_tmp,
+                state_dir,
             }
         }
 
@@ -786,6 +856,7 @@ mod tests {
                 lanes: &self.lanes,
                 merge_cfg: &self.merge_cfg,
                 status_on_merge: self.status_on_merge.as_deref(),
+                state_dir: &self.state_dir,
             }
         }
     }
@@ -1488,13 +1559,24 @@ mod tests {
         let _ = run(&fx.deps(), "PROJ-1");
 
         let calls = fx.tmux.calls();
-        let command = calls.iter().find_map(|c| match c {
-            TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
-            _ => None,
-        });
+        let command = calls
+            .iter()
+            .find_map(|c| match c {
+                TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .expect("a conflict window should have been opened");
+
+        let prompt_path = fx.state_dir.join("merge-PROJ-1-1000.prompt.md");
         assert!(
-            command.is_some_and(|c| c.contains("custom PROJ-1 proj-1-fix main prompt")),
-            "expected the prompt_file contents (substituted) in the launched command"
+            command.contains(&format!("\"$(cat '{}')\"", prompt_path.display())),
+            "expected the command to read the prompt back from {}, got: {command}",
+            prompt_path.display()
+        );
+        let written = std::fs::read_to_string(&prompt_path).expect("prompt file should exist");
+        assert_eq!(
+            written, "custom PROJ-1 proj-1-fix main prompt",
+            "expected the prompt_file contents (substituted) written to the prompt file"
         );
     }
 
@@ -1521,6 +1603,115 @@ mod tests {
         assert!(
             fx.tmux.calls().is_empty(),
             "a bad prompt_file must fail before any tmux call, got: {:?}",
+            fx.tmux.calls()
+        );
+    }
+
+    /// Sets up a fixture whose merge flow reaches a conflicted rebase for
+    /// `PROJ-1` on branch `proj-1-fix` (base `main`), matching the shared
+    /// preconditions `prompt_file_takes_precedence_over_prompt_and_default`
+    /// and the tests below need to reach [`run_conflict_session`].
+    fn conflicted_fixture() -> Fixture {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("proj-1-fix".to_string()))
+            .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(false)])
+            .with_branch_exists_local(Ok(false));
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows(Ok(vec![TmuxWindow {
+                session: "dev".to_string(),
+                name: "shell".to_string(),
+                dead: false,
+            }]));
+        fx
+    }
+
+    fn launched_command(fx: &Fixture) -> String {
+        fx.tmux
+            .calls()
+            .iter()
+            .find_map(|c| match c {
+                TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .expect("a conflict window should have been opened")
+    }
+
+    #[test]
+    fn conflict_session_defaults_to_bypass_permissions() {
+        let fx = conflicted_fixture();
+
+        let _ = run(&fx.deps(), "PROJ-1");
+
+        let command = launched_command(&fx);
+        assert!(
+            command.contains("'--permission-mode' 'bypassPermissions'"),
+            "expected an unattended default permission mode, got: {command}"
+        );
+    }
+
+    #[test]
+    fn conflict_session_strips_billing_env_vars() {
+        let fx = conflicted_fixture();
+
+        let _ = run(&fx.deps(), "PROJ-1");
+
+        let command = launched_command(&fx);
+        assert!(
+            command.starts_with(
+                "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDECODE claude "
+            ),
+            "expected the billing-safety env -u prefix, got: {command}"
+        );
+    }
+
+    #[test]
+    fn conflict_session_model_becomes_model_flag() {
+        let mut fx = conflicted_fixture();
+        fx.merge_cfg.model = Some("opus".to_string());
+
+        let _ = run(&fx.deps(), "PROJ-1");
+
+        let command = launched_command(&fx);
+        assert!(
+            command.contains("'--model' 'opus'"),
+            "expected [work.merge].model to land as --model, got: {command}"
+        );
+    }
+
+    #[test]
+    fn conflict_session_prompt_write_failure_creates_no_window() {
+        let fx = conflicted_fixture();
+        // A state_dir path that is itself an existing file can never be
+        // created as a directory, so writing the prompt file underneath it
+        // fails deterministically.
+        let blocked = fx.state_dir.clone();
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(
+            matches!(result, Err(MergeError::PromptWrite { .. })),
+            "expected a PromptWrite error, got: {result:?}"
+        );
+        assert!(
+            fx.tmux.calls().iter().all(|c| !matches!(
+                c,
+                TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+            )),
+            "a prompt-file write failure must create zero tmux windows, got: {:?}",
             fx.tmux.calls()
         );
     }

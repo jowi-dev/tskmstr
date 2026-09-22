@@ -1548,6 +1548,7 @@ fn run_merge_cmd(key: String) -> ExitCode {
     let clock = tskmstr::work::review_watch::SystemClock;
     let sleeper = tskmstr::work::review_watch::RealSleeper;
     let identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let state_dir = home.join(".local/state/tskmstr/work");
 
     let deps = tskmstr::work::merge::MergeDeps {
         git: &git,
@@ -1564,6 +1565,7 @@ fn run_merge_cmd(key: String) -> ExitCode {
         lanes: &config.work.lanes,
         merge_cfg: &config.work.merge,
         status_on_merge: config.status_on_merge.as_deref(),
+        state_dir: &state_dir,
     };
     let mut stdout = std::io::stdout();
 
