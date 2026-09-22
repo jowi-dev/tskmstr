@@ -404,6 +404,36 @@ pub struct RunOutcome {
     /// `tm runs finish --model-usage` (only passed by the caller when this
     /// is `Some`).
     pub model_usage: Option<ModelUsageMap>,
+    /// Set when the adapter classified this outcome as a usage-limit/rate-
+    /// limit response rather than an ordinary success or failure. See
+    /// [`RateLimitInfo`]'s doc comment for why this exists and how
+    /// `run_agent_and_finish` (`src/work/run.rs`) is meant to react to it.
+    pub rate_limit: Option<RateLimitInfo>,
+}
+
+/// Signals that an [`AgentRunner::parse_outcome`] call classified its raw
+/// result as a subscription usage-limit or pay-per-token rate-limit
+/// response, rather than an ordinary success or failure.
+///
+/// Routing between agent harnesses (GitHub issue #54,
+/// `docs/plans/gh-54-priority-routing.md`) is **reactive**: there is no
+/// stable API to query remaining subscription capacity ahead of time, only
+/// a classifiable response *after* a run hits the limit. So `tm` learns
+/// "this agent is exhausted" by hitting the limit once, records the window
+/// this carries, and skips that agent (falling back to the next one in
+/// `[agent].order`) until the window reopens — see
+/// `src/work/run.rs::run_agent_and_finish`'s fallback loop and the
+/// `agent_windows` table (`runs.db` migration v11) this eventually
+/// persists to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitInfo {
+    /// Unix-seconds timestamp the limit is expected to lift at, when the
+    /// adapter's raw result carried one (e.g. claude's legacy `Claude AI
+    /// usage limit reached|<epoch>` shape). `None` when the response
+    /// classified as a rate limit but named no reset time — the caller
+    /// falls back to a fixed hold (`DEFAULT_EXHAUSTED_HOLD_SECS`) in that
+    /// case rather than refusing to ever retry the agent.
+    pub reset_at: Option<i64>,
 }
 
 /// The env var names a live agent session exposes its identity through,
