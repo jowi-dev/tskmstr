@@ -154,6 +154,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
+| `tm merge <KEY>` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`). Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1136,6 +1137,104 @@ applied advisorily (see its config docs below) and the board refetches, so
 a moved ticket changes column right away. Deliberately *not* included:
 deleting the branch, removing the worktree, or killing the ticket's tmux
 session — the merge key merges, nothing else.
+
+`tm merge <KEY>` is the CLI equivalent of `M`, with local sync (auto-rebase
+onto a moved base) and worktree/branch cleanup on top — see "Merging a
+ticket's PR" below.
+
+### Merging a ticket's PR
+
+`tm merge <KEY>` does everything the board's `M` key does, plus the local
+housekeeping `M` deliberately skips: catching a stale branch up to its PR's
+base, and cleaning up afterwards. It resolves `<KEY>`'s open PR (the same
+lookup `M`/`o` use), then runs through these stages:
+
+1. **Fetch and catch up.** `git fetch origin` in the ticket's local
+   checkout (found the same way `tm work session` locates one: the newest
+   run row for `<KEY>` checked out on the PR's branch, falling back to
+   `cwd` or the repo root). If the local branch trails its own
+   `origin/<branch>`, it's fast-forwarded first. A branch that has
+   diverged from its own remote (neither side is an ancestor of the
+   other) is reported and left alone — reconcile it by hand.
+2. **Auto-rebase onto a moved base.** If `origin/<base>` (the PR's base
+   branch, e.g. `main`) isn't yet an ancestor of the PR branch, `tm merge`
+   rebases the branch onto it. A clean rebase is force-pushed
+   (`--force-with-lease`) automatically. A checkout with uncommitted
+   changes is refused rather than rebased out from under you.
+3. **Agent-assisted conflict resolution.** A rebase that stops on
+   conflicts opens a `merge` window running the configured agent with a
+   conflict-resolution prompt — on your *current* tmux session's window
+   when `tm merge` is itself run inside tmux, or a standalone
+   `tm-<scope>-<key>` ticket session otherwise (same session-targeting
+   `tm work session` uses). `tm merge` then polls until the rebase
+   completes, the window dies, or 15 minutes pass with no resolution. A
+   session that never resolves isn't a failure: the rebase is left
+   in-progress on disk, `tm merge` exits `2`, and it prints exactly how to
+   pick it back up — `tmux attach -t <target>` to keep resolving, or
+   `git -C <dir> rebase --abort` to bail out.
+4. **Merge.** `gh pr merge`, using the repository's default merge method —
+   the same "first enabled of merge commit, squash, rebase" order the
+   board's `M` key and GitHub's own merge button use. No per-invocation
+   override in v1.
+5. **Sync the local base.** `git fetch origin` again, then fast-forward the
+   repo root's checkout of the base branch if it's currently on that
+   branch and clean (or fetch it straight to the ref if the repo root is
+   checked out elsewhere) — best-effort; a dirty or diverged base is
+   reported with the manual command to run instead.
+6. **Clean up.** Best-effort removal of the ticket's worktree (if it's a
+   separate `git worktree`, not the repo root) and deletion of its local
+   branch (only once the local branch matches `origin/<branch>`).
+   Skipped, with a warning naming the manual follow-up command, when `cwd`
+   is inside the worktree being removed — you can't remove the worktree
+   you're standing in.
+7. **`status_on_merge`.** Same advisory transition the board's `M` key
+   applies (see its config docs below).
+
+Exit codes: `0` merged (steps 4-7 all attempted; cleanup/base-sync
+warnings don't change this), `2` a conflict session never resolved (step
+3), `1` any other error (no open PR, a diverged branch, a dirty worktree,
+a `gh`/`git` failure).
+
+V1 boundaries, matched to the board's `M` key and worth knowing before you
+rely on this:
+
+- **The conflict session is untracked.** It opens a tmux window and runs
+  the agent, but records no `tm runs` row — `tm runs`/`tm runs watch` won't
+  show it. Track it via the tmux window itself.
+- **No merge-strategy override.** Always the repo's configured default,
+  same as `M`.
+- **Cleanup is best-effort.** A failed worktree removal or branch deletion
+  never fails the command — it's reported with the exact manual command to
+  finish the job, and the PR is already merged by that point regardless.
+- **Cleanup is skipped from inside the worktree.** Running `tm merge` from
+  a shell whose `cwd` is inside the ticket's worktree can't remove that
+  worktree (you'd be removing your own cwd); the branch deletion that
+  depends on it is skipped too, with pointers to finish both once you `cd`
+  out.
+
+### `[work.merge]`: conflict-resolution session settings
+
+Both the board's `M` key and `tm merge <KEY>` share this section — it only
+configures the agent session a rebase conflict opens (stage 3 above); it
+never gates whether merging is available at all, unlike `[work.audit]`'s
+`dir`. Every field is optional:
+
+```toml
+[work.merge]
+# prompt = "..."                              # optional; ships a built-in default prompt
+# prompt_file = ".tskmstr/prompts/merge.md"    # optional; see [work.audit]'s prompt_file above
+# model = "fable"                              # optional; passed as `claude --model`
+```
+
+`prompt_file` and `prompt` are mutually exclusive — setting both is a
+config error, same as `[work.audit]`/`[work.create]`/`[work.review_watch]`.
+Leave both unset and tm ships a sensible default prompt itself,
+`{key}`/`{branch}`/`{base}`-substituted the same way `prompt`/`prompt_file`
+are — no config is required to get a working conflict-resolution session.
+`{key}` is the ticket key, `{branch}` is the PR's branch, and `{base}` is
+the PR's base branch (e.g. `main`). `model` overrides whatever `claude`
+defaults to (or an enterprise model pin), same semantics as
+`[work.audit].model`.
 
 ### Retro board
 
