@@ -1042,7 +1042,19 @@ pub struct FakeGitOps {
         std::cell::RefCell<std::collections::HashMap<PathBuf, Result<String, GitError>>>,
     rev_parse_results:
         std::cell::RefCell<std::collections::HashMap<String, Result<String, GitError>>>,
+    /// Sequenced per-rev answers for `rev_parse`, consumed one per call with
+    /// the last entry repeating; consulted before [`Self::rev_parse_results`].
+    /// See [`Self::with_rev_parse_sequence`].
+    rev_parse_sequences: std::cell::RefCell<
+        std::collections::HashMap<String, std::collections::VecDeque<Result<String, GitError>>>,
+    >,
     is_ancestor_result: std::cell::RefCell<Result<bool, GitError>>,
+    /// Per-(ancestor, descendant) overrides for `is_ancestor`, consulted
+    /// before the blanket [`Self::is_ancestor_result`]. See
+    /// [`Self::with_is_ancestor_for`].
+    is_ancestor_overrides: std::cell::RefCell<
+        std::collections::HashMap<(String, String), Result<bool, GitError>>,
+    >,
     rebase_onto_result: std::cell::RefCell<Result<RebaseOutcome, GitError>>,
     /// Sequenced answers for `rebase_in_progress`, consumed one per call;
     /// the last entry repeats once exhausted. See
@@ -1105,7 +1117,9 @@ impl Default for FakeGitOps {
             current_branch_result: std::cell::RefCell::new(Ok("main".to_string())),
             current_branch_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             rev_parse_results: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rev_parse_sequences: std::cell::RefCell::new(std::collections::HashMap::new()),
             is_ancestor_result: std::cell::RefCell::new(Ok(true)),
+            is_ancestor_overrides: std::cell::RefCell::new(std::collections::HashMap::new()),
             rebase_onto_result: std::cell::RefCell::new(Ok(RebaseOutcome::Completed)),
             rebase_in_progress_sequence: std::cell::RefCell::new(vec![Ok(false)]),
             rebase_in_progress_index: std::cell::RefCell::new(0),
@@ -1306,8 +1320,7 @@ impl FakeGitOps {
     /// Configure `rev_parse(_, rev)` to return `result` for that specific
     /// `rev` string. A `rev` with no configured result returns a
     /// [`GitError::Command`] (mirroring `git rev-parse --verify` failing on
-    /// an unknown rev), unless [`Self::with_rev_parse_default`] set a
-    /// fallback.
+    /// an unknown rev).
     pub fn with_rev_parse_result(
         self,
         rev: impl Into<String>,
@@ -1319,9 +1332,52 @@ impl FakeGitOps {
         self
     }
 
+    /// Configure `rev_parse(_, rev)` to return each element of `sequence`
+    /// in order for that specific `rev`; the last entry repeats once the
+    /// sequence is exhausted. Consulted before
+    /// [`Self::with_rev_parse_result`]'s static answer for the same rev.
+    /// Lets a test model a tip that changes mid-flow (e.g. a rebase
+    /// rewriting the branch head between two reads).
+    ///
+    /// # Panics
+    ///
+    /// Panics on an empty `sequence` — there is no sensible
+    /// "last element repeats" behavior for it.
+    pub fn with_rev_parse_sequence(
+        self,
+        rev: impl Into<String>,
+        sequence: Vec<Result<String, GitError>>,
+    ) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_rev_parse_sequence requires a non-empty sequence"
+        );
+        self.rev_parse_sequences
+            .borrow_mut()
+            .insert(rev.into(), sequence.into());
+        self
+    }
+
     /// Set the result `is_ancestor` will return.
     pub fn with_is_ancestor_result(self, result: Result<bool, GitError>) -> Self {
         *self.is_ancestor_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `is_ancestor(_, ancestor, descendant)` for one specific
+    /// (ancestor, descendant) pair, consulted before the blanket
+    /// [`Self::with_is_ancestor_result`] answer. Lets a test give
+    /// direction-dependent answers (e.g. "local is ahead of remote": false
+    /// one way, true the other).
+    pub fn with_is_ancestor_for(
+        self,
+        ancestor: impl Into<String>,
+        descendant: impl Into<String>,
+        result: Result<bool, GitError>,
+    ) -> Self {
+        self.is_ancestor_overrides
+            .borrow_mut()
+            .insert((ancestor.into(), descendant.into()), result);
         self
     }
 
@@ -1528,6 +1584,13 @@ impl GitOps for FakeGitOps {
     }
 
     fn rev_parse(&self, _dir: &Path, rev: &str) -> Result<String, GitError> {
+        if let Some(sequence) = self.rev_parse_sequences.borrow_mut().get_mut(rev) {
+            return if sequence.len() > 1 {
+                sequence.pop_front().expect("checked non-empty")
+            } else {
+                sequence.front().expect("sequences are never empty").clone()
+            };
+        }
         self.rev_parse_results
             .borrow()
             .get(rev)
@@ -1544,9 +1607,16 @@ impl GitOps for FakeGitOps {
     fn is_ancestor(
         &self,
         _dir: &Path,
-        _ancestor: &str,
-        _descendant: &str,
+        ancestor: &str,
+        descendant: &str,
     ) -> Result<bool, GitError> {
+        if let Some(result) = self
+            .is_ancestor_overrides
+            .borrow()
+            .get(&(ancestor.to_string(), descendant.to_string()))
+        {
+            return result.clone();
+        }
         self.is_ancestor_result.borrow().clone()
     }
 
@@ -2088,6 +2158,46 @@ mod tests {
                 .is_ancestor(Path::new("/wt"), "main", "feature")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn fake_git_ops_is_ancestor_pair_override_beats_the_blanket_answer() {
+        let fake = FakeGitOps::new()
+            .with_is_ancestor_result(Ok(false))
+            .with_is_ancestor_for("origin/feature", "feature", Ok(true));
+        assert!(
+            fake.is_ancestor(Path::new("/wt"), "origin/feature", "feature")
+                .unwrap()
+        );
+        // The reverse direction is not overridden, so the blanket answer wins.
+        assert!(
+            !fake
+                .is_ancestor(Path::new("/wt"), "feature", "origin/feature")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_rev_parse_sequence_consumes_in_order_and_repeats_last() {
+        let fake = FakeGitOps::new()
+            .with_rev_parse_sequence(
+                "feature",
+                vec![Ok("aaa".to_string()), Ok("bbb".to_string())],
+            )
+            .with_rev_parse_result("feature", Ok("static-loses".to_string()));
+        assert_eq!(fake.rev_parse(Path::new("/wt"), "feature").unwrap(), "aaa");
+        assert_eq!(fake.rev_parse(Path::new("/wt"), "feature").unwrap(), "bbb");
+        assert_eq!(
+            fake.rev_parse(Path::new("/wt"), "feature").unwrap(),
+            "bbb",
+            "last element should repeat once the sequence is exhausted"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn fake_git_ops_rev_parse_sequence_rejects_an_empty_sequence() {
+        let _ = FakeGitOps::new().with_rev_parse_sequence("feature", vec![]);
     }
 
     #[test]
