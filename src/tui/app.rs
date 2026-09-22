@@ -1565,8 +1565,7 @@ pub enum Cmd {
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::MergePrAction`]'s confirmation prompt. Reports back as
     /// [`Msg::MergePrResolved`]. Same single-`gh`-call, on-keypress-only
-    /// stance as [`Cmd::ResolvePrForTicket`], and intercepted by
-    /// `run_cmds` for the same status-line-redraw reason.
+    /// stance as [`Cmd::ResolvePrForTicket`].
     ResolvePrForMerge {
         /// Ticket key to resolve a PR for.
         key: String,
@@ -2263,11 +2262,9 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
 /// prefetches PR data for every card.
 ///
 /// Sets `status_line` to `resolving PR for <key>...` before returning the
-/// `Cmd` -- the lookup is a blocking `gh pr list` call (bounded, but still
-/// synchronous inside the event loop; see
-/// [`crate::tui::event::resolve_pr_for_ticket`]'s doc comment), and
-/// `crate::tui::event::run_cmds` forces a redraw with this message on screen
-/// before running it, so the board never just looks hung while it waits.
+/// `Cmd` -- the lookup runs on the network worker thread (GitHub issue
+/// #56), so this message is on screen for the whole (bounded) wait via the
+/// event loop's ordinary draws.
 fn open_browser_action(mut app: App) -> (App, Vec<Cmd>) {
     if app.screen != Screen::Board {
         return (app, Vec::new());
@@ -2351,9 +2348,10 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 /// [`Screen::Board`] (GitHub issue #32). A no-op when no ticket is selected
 /// or another merge confirmation is already open. Mirrors
 /// [`open_browser_action`]'s shape exactly -- including the explicit screen
-/// check and the status-line message [`crate::tui::event::run_cmds`] redraws
-/// before the blocking `gh pr list` lookup -- because it reuses the same
-/// resolution path; only the follow-up message differs.
+/// check and the `resolving PR for <key>...` status line shown while the
+/// lookup is out on the worker -- because it reuses the same resolution
+/// path; only the follow-up message differs. Additionally inert while a
+/// confirmed merge for the same ticket is still in flight (see below).
 fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
     if app.screen != Screen::Board || app.merge_confirm.is_some() {
         return (app, Vec::new());

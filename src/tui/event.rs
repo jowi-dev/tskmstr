@@ -84,9 +84,11 @@ fn retro_overlay_for(app: &App) -> RetroOverlay {
 /// 8s: comfortably above how long an ordinary `gh pr list` call takes against
 /// GitHub's API (a few hundred milliseconds to low seconds), so a healthy
 /// network never spuriously falls back to Jira; short enough that a dead
-/// network or expired `gh` auth -- which otherwise hangs forever, the defect
-/// this whole mechanism exists to fix -- can only ever freeze the board for a
-/// single-digit number of seconds rather than indefinitely.
+/// network or expired `gh` auth -- which otherwise hangs forever -- gives a
+/// timely answer. The lookup runs on the worker thread now (GitHub issue
+/// #56), so a hang no longer freezes the board either way; the bound's
+/// remaining job is capping how long the hung call occupies the worker's
+/// one-at-a-time queue and how long the user waits for the picker.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long each of [`merge_pr`]'s underlying `gh` calls
@@ -94,7 +96,7 @@ const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// More generous than [`PR_LOOKUP_TIMEOUT`] -- a merge is a write GitHub
 /// may legitimately take longer to answer than a list, and the user just
 /// confirmed a prompt so a longer visible wait is expected -- while still
-/// bounding how long a dead network can freeze the board.
+/// bounding how long a dead network can occupy the worker's queue.
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run `kind` of a `tm pr watch` poll loop, filtered on by
@@ -2038,23 +2040,16 @@ fn assign_ticket_cmd(deps: &NetDeps, key: &str, choice: &AssignChoice) -> Vec<Ms
 /// Jira directly rather than leaving the user stuck, per [`TuiDeps`]'s
 /// leniency stance.
 ///
-/// This is the one place `tui` calls a network-backed command synchronously
-/// on a keypress rather than deferring it to a background poll (contrast
-/// [`load_bot_watch_status`] et al., which only ever read the local runs DB).
-/// That's accepted here, not just tolerated, for the same reason
-/// [`TuiDeps::store`]'s doc comment and [`load_audit_status`]'s
-/// `.unwrap_or_default()` rationale accept their own leniency: a *bounded*
-/// block is a reasonable price for a feature that only fires on an explicit
-/// keypress (never prefetched for every card), and [`run_cmds`] makes sure
-/// the status line reflects that wait rather than leaving the board looking
-/// hung. The bound itself -- [`crate::github::gh_cli::GhCli::pr_list_bounded`]
-/// with [`PR_LOOKUP_TIMEOUT`] -- is what makes "reasonable" actually true:
-/// before it existed, `gh pr list` had no timeout at all, so a dead network
-/// or expired `gh` auth froze the *entire* board (no redraw, no key input,
-/// not even quit) for as long as the hang lasted, which is the defect this
-/// whole mechanism exists to close. On timeout specifically, `note` carries a
-/// status-line explanation (rather than silently landing on Jira looking
-/// like "no PR found") -- see [`crate::tui::app::browser_options_resolved`].
+/// The lookup fires only on an explicit keypress (never prefetched for
+/// every card on refresh), and -- like every network command since GitHub
+/// issue #56 -- runs on the worker thread, so even a hung `gh` can't freeze
+/// the board. The [`PR_LOOKUP_TIMEOUT`] bound on
+/// [`crate::github::gh_cli::GhCli::pr_list_bounded`] still matters: it caps
+/// how long the user waits for the picker and how long a dead call blocks
+/// the worker's one-at-a-time queue. On timeout specifically, `note`
+/// carries a status-line explanation (rather than silently landing on Jira
+/// looking like "no PR found") -- see
+/// [`crate::tui::app::browser_options_resolved`].
 fn resolve_pr_for_ticket(deps: &NetDeps, key: String, jira_url: String) -> Vec<Msg> {
     let Some(repo_root) = resolve_repo_root_for_pr_lookup(deps, &key) else {
         return vec![Msg::BrowserOptionsResolved {
