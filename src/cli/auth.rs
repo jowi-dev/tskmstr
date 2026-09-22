@@ -140,6 +140,7 @@ fn bootstrap_config(
         board_column_order: Vec::new(),
         work: config::WorkConfig::default(),
         agent: config::AgentKind::default(),
+        agent_fallbacks: Vec::new(),
     })
 }
 
