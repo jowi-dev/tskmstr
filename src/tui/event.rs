@@ -1,19 +1,32 @@
 //! Terminal wiring: the only module in `tui` that touches a real terminal or
 //! performs network/process I/O.
 //!
-//! [`run`] owns the event loop; [`execute`] is the thin translation from a
-//! [`Cmd`] to the [`Msg`] it produces, kept separate so it can be unit tested
-//! with [`crate::jira::fake::FakeJiraClient`] instead of a live Jira and a
-//! real terminal.
+//! [`run`] owns the event loop; [`execute`] (local I/O, on the loop's own
+//! thread) and [`execute_net`] (network I/O, on the worker thread -- see
+//! below) are the thin translations from a [`Cmd`] to the [`Msg`]s it
+//! produces, kept separate from the loop so they can be unit tested with
+//! [`crate::jira::fake::FakeJiraClient`] instead of a live Jira and a real
+//! terminal.
 //!
-//! [`Cmd::AttachSession`] is the one exception to that split: attaching needs
-//! `&mut Terminal` to suspend and restore the alternate screen around the
-//! blocking `tmux attach-session` call, which `execute`'s signature has no
-//! access to (and shouldn't grow one just for this). [`run_cmds`] intercepts
-//! it before it ever reaches `execute`, handles the suspend/restore itself
-//! (see [`attach_session`]), and feeds the result back through `update` as an
-//! ordinary [`Msg`] -- every other `Cmd` still flows through `execute`
-//! unchanged.
+//! Network-bound commands never run on the event loop (GitHub issue #56):
+//! a provider or `gh` round trip is routinely a second or more, and running
+//! one inline froze the board -- no redraws, no input -- for its duration.
+//! [`run_cmds`] dispatches them (see [`is_net_cmd`]) over a channel to a
+//! single worker thread ([`spawn_net_worker`]), which owns the network
+//! half of the dependencies ([`NetDeps`]) and sends each resulting [`Msg`]
+//! back for [`run`]'s poll loop to drain. The `Msg`/`Cmd` split already
+//! modeled request/response, so moving `execute_net` off-thread changes
+//! where it runs, not what it returns.
+//!
+//! [`Cmd::AttachSession`] is the one exception to the `execute` split:
+//! attaching needs `&mut Terminal` to suspend and restore the alternate
+//! screen around the blocking `tmux attach-session` call, which `execute`'s
+//! signature has no access to (and shouldn't grow one just for this).
+//! [`run_cmds`] intercepts it before it ever reaches `execute`, handles the
+//! suspend/restore itself (see [`attach_session`]), and feeds the result
+//! back through `update` as an ordinary [`Msg`] -- terminal-owning commands
+//! like this stay synchronous by design: they intentionally hand the
+//! terminal to another process, so there is no UI to keep alive.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -71,9 +84,11 @@ fn retro_overlay_for(app: &App) -> RetroOverlay {
 /// 8s: comfortably above how long an ordinary `gh pr list` call takes against
 /// GitHub's API (a few hundred milliseconds to low seconds), so a healthy
 /// network never spuriously falls back to Jira; short enough that a dead
-/// network or expired `gh` auth -- which otherwise hangs forever, the defect
-/// this whole mechanism exists to fix -- can only ever freeze the board for a
-/// single-digit number of seconds rather than indefinitely.
+/// network or expired `gh` auth -- which otherwise hangs forever -- gives a
+/// timely answer. The lookup runs on the worker thread now (GitHub issue
+/// #56), so a hang no longer freezes the board either way; the bound's
+/// remaining job is capping how long the hung call occupies the worker's
+/// one-at-a-time queue and how long the user waits for the picker.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long each of [`merge_pr`]'s underlying `gh` calls
@@ -81,7 +96,7 @@ const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// More generous than [`PR_LOOKUP_TIMEOUT`] -- a merge is a write GitHub
 /// may legitimately take longer to answer than a list, and the user just
 /// confirmed a prompt so a longer visible wait is expected -- while still
-/// bounding how long a dead network can freeze the board.
+/// bounding how long a dead network can occupy the worker's queue.
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run `kind` of a `tm pr watch` poll loop, filtered on by
@@ -101,14 +116,81 @@ pub enum TuiError {
     Io(#[from] std::io::Error),
 }
 
+/// The network-facing dependencies of the board, owned by the network
+/// worker thread rather than the event loop (GitHub issue #56): every
+/// provider/`gh` call these back can take a network round trip, and running
+/// one on the event loop freezes the board for its duration.
+///
+/// Kept separate from [`TuiDeps`] rather than borrowed out of it because the
+/// two halves live on different threads: [`run`] moves a [`NetDepsBuilder`]
+/// into the worker, which builds this struct *in place* there. Building
+/// in-thread (instead of moving a constructed `NetDeps` across) is what lets
+/// these fields keep their ordinary non-`Send` trait-object types --
+/// [`crate::ticketing::github_provider::GithubProvider`] borrows leaked
+/// `&'static` values (`dyn GhCli`, [`crate::runs::RunStore`]) that are not
+/// `Sync`, so a constructed provider can never cross a thread boundary.
+pub struct NetDeps {
+    /// Client used to fetch tickets, transitions, and apply transitions.
+    pub jira: Box<dyn TicketProvider>,
+    /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`]/
+    /// [`Cmd::ResolvePrForMerge`] to list a ticket's repo's open pull
+    /// requests, and by [`Cmd::MergePr`] to merge one.
+    pub gh: Box<dyn crate::github::gh_cli::GhCli>,
+    /// `git` operations used by [`resolve_repo_root_for_pr_lookup`]'s
+    /// `resolve_watch_repo_root` fallback (`git rev-parse` the repo root of
+    /// `cwd`) when a ticket has no lane run to resolve a repo from.
+    pub git: Box<dyn crate::work::git::GitOps>,
+    /// The worker's own run-store connection (a [`crate::runs::RunStore`]
+    /// wraps a single SQLite connection, so the event loop's
+    /// [`TuiDeps::store`] cannot be shared across threads), used by
+    /// [`resolve_repo_root_for_pr_lookup`] and [`fetch_retro_tickets`].
+    /// `None` when the runs DB failed to open, with the same leniency
+    /// stance as [`TuiDeps::store`].
+    pub store: Option<crate::runs::RunStore>,
+    /// `config.work.lanes`, kept in full so
+    /// [`resolve_repo_root_for_pr_lookup`] can look up a lane's `repo` the
+    /// same way `tm pr watch`'s `crate::cli::pr::resolve_watch_repo_root`
+    /// does.
+    pub lanes: std::collections::BTreeMap<String, crate::config::LaneConfig>,
+    /// The board process's working directory, passed to
+    /// [`resolve_repo_root_for_pr_lookup`] as the `cwd` a lane-less ticket's
+    /// PR lookup falls back to resolving a repo root from.
+    pub cwd: std::path::PathBuf,
+    /// The board's own repo's resolved backend identity, scoping the run
+    /// rows [`resolve_repo_root_for_pr_lookup`] and [`fetch_retro_tickets`]
+    /// read. A clone of [`TuiDeps::backend_identity`].
+    pub backend_identity: crate::config::BackendIdentity,
+    /// The configured post-merge status target
+    /// ([`crate::config::Config::status_on_merge`]), applied advisorily by
+    /// [`merge_pr`] after a successful board merge. `None` means merge
+    /// only, no transition (GitHub issue #32). A clone of
+    /// [`TuiDeps::status_on_merge`].
+    pub status_on_merge: Option<String>,
+    /// The AI coding agent, used by [`fetch_retro_tickets`] to shorten model
+    /// names (see [`crate::runs::format_model_usage_compact`]). The same
+    /// `&'static` value as [`TuiDeps::runner`]; sharing it across threads is
+    /// what [`crate::agent::AgentRunner`]'s `Sync` supertrait exists for.
+    pub runner: &'static dyn crate::agent::AgentRunner,
+}
+
+/// Builds the network worker thread's [`NetDeps`] in place on that thread --
+/// see [`NetDeps`]'s doc comment for why the deps are built there rather
+/// than moved across. `Send` is exactly the bound that makes the closure
+/// itself movable while its *product* doesn't have to be; in practice the
+/// closure captures only plain data (paths, config strings, a resolved
+/// token).
+pub type NetDepsBuilder = Box<dyn FnOnce() -> NetDeps + Send>;
+
 /// Dependencies the TUI needs to talk to the ticket backend and (per
 /// `docs/plans/board-audits.md`'s "Board integration" design) launch and
 /// attach to board-launched ticket-audit sessions. Browsable ticket URLs
 /// come from the provider itself ([`TicketProvider::issue_url`]), not a
 /// separate base-URL field.
+///
+/// Holds only what the event loop's own thread uses; everything a network
+/// round trip can hide behind lives in [`NetDeps`] on the worker thread
+/// instead (GitHub issue #56).
 pub struct TuiDeps {
-    /// Client used to fetch tickets, transitions, and apply transitions.
-    pub jira: Box<dyn TicketProvider>,
     /// The configured default Jira project key, used to scope every
     /// assignee filter other than `Me`.
     pub project_key: String,
@@ -180,22 +262,6 @@ pub struct TuiDeps {
     /// backend. [`launch_create_and_attach`] notes this in its status-line
     /// message when `true`.
     pub create_dir_fallback: bool,
-    /// `gh` CLI wrapper used by [`Cmd::ResolvePrForTicket`] to list a
-    /// ticket's repo's open pull requests.
-    pub gh: Box<dyn crate::github::gh_cli::GhCli>,
-    /// `git` operations used by [`resolve_repo_root_for_pr_lookup`]'s
-    /// `resolve_watch_repo_root` fallback (`git rev-parse` the repo root of
-    /// `cwd`) when a ticket has no lane run to resolve a repo from.
-    pub git: Box<dyn crate::work::git::GitOps>,
-    /// The board process's working directory, passed to
-    /// [`resolve_repo_root_for_pr_lookup`] as the `cwd` a lane-less ticket's
-    /// PR lookup falls back to resolving a repo root from.
-    pub cwd: std::path::PathBuf,
-    /// `config.work.lanes`, kept in full (not just names, unlike
-    /// `lane_names`) so [`resolve_repo_root_for_pr_lookup`] can look up a
-    /// lane's `repo` the same way `tm pr watch`'s
-    /// `crate::cli::pr::resolve_watch_repo_root` does.
-    pub lanes: std::collections::BTreeMap<String, crate::config::LaneConfig>,
     /// The board's own repo's resolved backend identity (the same value
     /// issue #5's lane-compatibility filtering derives `lane_names` from).
     /// Its [`session_slug`](crate::config::BackendIdentity::session_slug)
@@ -208,9 +274,11 @@ pub struct TuiDeps {
     /// #17), selected by `config.agent` via `main.rs`'s `agent_runner_for`.
     pub runner: &'static dyn crate::agent::AgentRunner,
     /// The configured post-merge status target
-    /// ([`crate::config::Config::status_on_merge`]), applied advisorily by
-    /// [`merge_pr`] after a successful board merge. `None` means merge
-    /// only, no transition (GitHub issue #32).
+    /// ([`crate::config::Config::status_on_merge`]), threaded into
+    /// [`crate::tui::app::App::with_status_on_merge`] so the merge
+    /// confirmation overlay can describe the follow-up transition. The
+    /// merge itself reads [`NetDeps::status_on_merge`] on the worker
+    /// thread; both are set from the same config value.
     pub status_on_merge: Option<String>,
 }
 
@@ -260,23 +328,28 @@ impl Drop for TerminalGuard {
 
 /// Run the interactive board until the user quits.
 ///
-/// Enters raw mode and the alternate screen, fetches the initial ticket list
-/// and every badge status, then loops: draw the current screen, wait up to
+/// Enters raw mode and the alternate screen, spawns the network worker
+/// thread (see [`spawn_net_worker`]), dispatches the initial ticket fetch
+/// and every badge load, then loops: draw the current screen, wait up to
 /// `POLL_INTERVAL` for a key press. A key press maps to a [`Msg`] which runs
 /// through [`crate::tui::app::update`], executing any resulting [`Cmd`]s; a
 /// timed-out poll feeds [`Msg::Tick`] through the same path (mirroring
 /// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic badge
 /// polling ([`Cmd::LoadAuditStatus`], [`Cmd::LoadLaneRunStatus`],
 /// [`Cmd::LoadBotWatchStatus`] and [`Cmd::LoadCleanupStatus`]). Every
-/// iteration also polls `launches` (the board-launched lane runs still in
-/// flight, per [`run_cmds`]'s [`Cmd::LaunchLaneRun`] interception) via
-/// [`poll_pending_launches`], feeding each completion's
-/// [`Msg::LaneRunLaunchResult`] through `update` the same way a key press or
-/// tick would. The terminal is always restored before returning, including
-/// on error.
+/// iteration also drains the worker's completed results (so a finished
+/// provider call lands within one poll interval) and polls `launches` (the
+/// board-launched lane runs still in flight, per [`run_cmds`]'s
+/// [`Cmd::LaunchLaneRun`] interception) via [`poll_pending_launches`],
+/// feeding each result through `update` the same way a key press or tick
+/// would. The terminal is always restored before returning, including on
+/// error.
+///
+/// `net` is consumed here: the builder moves into the worker thread, which
+/// is the only place [`NetDeps`] ever exists -- see its doc comment.
 ///
 /// [`Screen::Board`]: crate::tui::app::Screen::Board
-pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
+pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -284,6 +357,8 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut launches: Vec<PendingLaunch> = Vec::new();
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+    let net_tx = spawn_net_worker(net, msg_tx);
 
     let mut app = App {
         project_key: deps.project_key.clone(),
@@ -295,8 +370,11 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
     .with_hidden_lane_count(deps.hidden_lane_count)
     .with_status_on_merge(deps.status_on_merge.clone());
     let query = query_for_filter(&app.filter, &app.project_key);
-    app = run_cmds(
-        app,
+    // Registered through `admit_net_cmds` like every `update`-emitted
+    // command, so the initial fetch shows the pending indicator and can't
+    // be doubled by an early `r` press.
+    let initial = crate::tui::app::admit_net_cmds(
+        &mut app,
         vec![
             Cmd::FetchTickets { query },
             Cmd::ReapRuns,
@@ -305,10 +383,8 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
             Cmd::LoadBotWatchStatus,
             Cmd::LoadCleanupStatus,
         ],
-        &deps,
-        &mut terminal,
-        &mut launches,
     );
+    app = run_cmds(app, initial, &deps, &net_tx, &mut terminal, &mut launches);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
@@ -331,20 +407,124 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
                 )
             {
                 let (next_app, cmds) = update(app, msg);
-                app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+                app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
             }
         } else {
             let (next_app, cmds) = update(app, Msg::Tick);
-            app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+            app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
+        }
+
+        while let Ok(msg) = msg_rx.try_recv() {
+            let (next_app, cmds) = update(app, msg);
+            app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
         }
 
         for msg in poll_pending_launches(&mut launches) {
             let (next_app, cmds) = update(app, msg);
-            app = run_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+            app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
         }
     }
 
     Ok(())
+}
+
+/// Spawn the network worker thread: build its [`NetDeps`] in place (see
+/// that type's doc comment for why construction happens on the worker), then
+/// serve [`Cmd`]s off `cmd_rx` one at a time through [`execute_net`],
+/// sending each resulting [`Msg`] back over `msg_tx` for [`run`]'s poll loop
+/// to drain. Returns the sender [`run_cmds`] dispatches network commands
+/// into.
+///
+/// One worker, deliberately: commands execute in dispatch order, so a
+/// stale result can never land after a fresher one for the same action
+/// (e.g. two ticket fetches under a changed filter), and the existing
+/// per-call timeouts ([`PR_LOOKUP_TIMEOUT`], [`MERGE_TIMEOUT`]) bound how
+/// long any one command can occupy the queue.
+///
+/// The thread is detached rather than joined: on quit, [`run`] drops the
+/// returned sender, the worker's `for` loop ends after its current command
+/// (a mid-flight network call finishes into a closed `msg_tx`, which it
+/// ignores), and process exit reaps a call still hung inside a provider.
+/// Joining would make quitting the board wait on that hang, which is the
+/// exact defect this worker exists to remove.
+fn spawn_net_worker(
+    net: NetDepsBuilder,
+    msg_tx: std::sync::mpsc::Sender<Msg>,
+) -> std::sync::mpsc::Sender<Cmd> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
+    std::thread::spawn(move || {
+        let net = net();
+        for cmd in cmd_rx {
+            for msg in execute_net(&net, cmd) {
+                if msg_tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    cmd_tx
+}
+
+/// Whether `cmd` performs provider/`gh` network I/O and therefore runs on
+/// the worker thread (GitHub issue #56) instead of inline in [`run_cmds`].
+/// Exactly the [`Cmd`]s [`execute_net`] handles.
+fn is_net_cmd(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::FetchTickets { .. }
+            | Cmd::FetchAssignableUsers { .. }
+            | Cmd::FetchTransitions { .. }
+            | Cmd::ApplyTransition { .. }
+            | Cmd::AssignTicket { .. }
+            | Cmd::RankTicket { .. }
+            | Cmd::FetchRankTickets { .. }
+            | Cmd::FetchRetroTickets { .. }
+            | Cmd::ResolvePrForTicket { .. }
+            | Cmd::ResolvePrForMerge { .. }
+            | Cmd::MergePr { .. }
+    )
+}
+
+/// The failure [`Msg`]s a network `cmd` reports when it could not be
+/// dispatched to the worker at all (the worker thread died, so
+/// [`std::sync::mpsc::Sender::send`] returned the command back). Mapping to
+/// the same failure variant the command's own execution would produce keeps
+/// every downstream consumer -- the status line, and the reducer's
+/// in-flight bookkeeping -- on its ordinary path.
+fn net_dispatch_failed(cmd: Cmd) -> Vec<Msg> {
+    const REASON: &str = "network worker unavailable";
+    match cmd {
+        Cmd::FetchTickets { .. } => vec![Msg::TicketsFailed(REASON.to_string())],
+        Cmd::FetchAssignableUsers { .. } => vec![Msg::AssignableUsersFailed(REASON.to_string())],
+        Cmd::FetchTransitions { .. } => vec![Msg::TransitionsFailed(REASON.to_string())],
+        Cmd::ApplyTransition { .. } => vec![Msg::TransitionFailed(REASON.to_string())],
+        Cmd::AssignTicket { key, .. } => {
+            vec![Msg::AssignFailed(format!("assign {key} failed: {REASON}"))]
+        }
+        Cmd::RankTicket { .. } => vec![Msg::RankFailed(REASON.to_string())],
+        Cmd::FetchRankTickets { .. } => vec![Msg::RankTicketsFailed(REASON.to_string())],
+        Cmd::FetchRetroTickets { .. } => vec![Msg::RetroTicketsFailed(REASON.to_string())],
+        Cmd::ResolvePrForTicket { key, jira_url } => vec![Msg::BrowserOptionsResolved {
+            key,
+            jira_url,
+            pr: None,
+            note: Some(REASON.to_string()),
+        }],
+        Cmd::ResolvePrForMerge { key } => vec![Msg::MergePrResolved {
+            key,
+            pr: None,
+            repo_root: None,
+            note: Some(REASON.to_string()),
+        }],
+        Cmd::MergePr { key, number, .. } => vec![Msg::MergePrResult {
+            merged: false,
+            message: format!("merge of PR #{number} for {key} failed: {REASON}"),
+        }],
+        other => {
+            debug_assert!(false, "net_dispatch_failed: not a network Cmd: {other:?}");
+            Vec::new()
+        }
+    }
 }
 
 /// Execute every `Cmd` in `cmds`, feeding each resulting `Msg` back through
@@ -364,12 +544,17 @@ pub fn run(deps: TuiDeps) -> Result<(), TuiError> {
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] reports completion.
 /// [`Cmd::ViewDiff`] is intercepted like [`Cmd::AttachSession`] (needs `&mut
 /// Terminal` to suspend/restore around the blocking `vdiff` call -- see
-/// [`view_diff`]). [`Cmd::ResolvePrForTicket`] is intercepted for yet
-/// another reason: it needs `&mut Terminal` to force a status-line redraw
-/// before its blocking `gh pr list` call, so the "resolving PR for
-/// <key>..." message set by `update`'s `open_browser_action` is actually on
-/// screen for the (bounded) wait rather than only appearing after it -- see
-/// [`resolve_pr_for_ticket`].
+/// [`view_diff`]).
+///
+/// Network commands (see [`is_net_cmd`]) are not executed here at all:
+/// they're dispatched to the worker thread over `net_tx` and their result
+/// [`Msg`]s come back through [`run`]'s drain of the worker's channel, so
+/// the event loop keeps polling input and redrawing while a provider call
+/// is out (GitHub issue #56). This is also what retired the forced
+/// pre-draw workaround the PR-resolve and merge commands used to need: the
+/// "resolving PR for <key>..." status line now reaches the screen through
+/// the ordinary draw at the top of [`run`]'s loop, because the blocking
+/// call no longer stands between `update` setting it and that draw.
 ///
 /// Generic over the terminal backend (rather than fixed to
 /// [`CrosstermBackend`]) purely so tests can drive it with
@@ -378,11 +563,22 @@ fn run_cmds<B: Backend>(
     mut app: App,
     cmds: Vec<Cmd>,
     deps: &TuiDeps,
+    net_tx: &std::sync::mpsc::Sender<Cmd>,
     terminal: &mut Terminal<B>,
     launches: &mut Vec<PendingLaunch>,
 ) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
+        if is_net_cmd(&cmd) {
+            if let Err(std::sync::mpsc::SendError(cmd)) = net_tx.send(cmd) {
+                for msg in net_dispatch_failed(cmd) {
+                    let (next_app, more_cmds) = update(app, msg);
+                    app = next_app;
+                    pending.extend(more_cmds);
+                }
+            }
+            continue;
+        }
         if let Cmd::AttachSession { session_name } = cmd {
             // One result `Msg` for every key that attaches (`a`, `b`, `s`,
             // and `m`'s attach step): the Cmd is "attach to this ticket's
@@ -479,58 +675,6 @@ fn run_cmds<B: Backend>(
             );
             app = next_app;
             pending.extend(more_cmds);
-            continue;
-        }
-        if let Cmd::ResolvePrForTicket { key, jira_url } = cmd {
-            // Unlike every other `Cmd`, this one needs `&mut Terminal` for a
-            // reason none of the above do: not to suspend the alternate
-            // screen, but to force a redraw *before* the blocking `gh pr
-            // list` call runs. `update`'s `open_browser_action` already set
-            // `app.status_line` to `resolving PR for <key>...`, but this
-            // loop's ordinary structure only calls `terminal.draw` at the
-            // *top* of `run`'s `while` loop -- after every `Cmd` from the
-            // current keypress has finished executing (see `run`'s doc
-            // comment). Without this explicit draw here, that status-line
-            // message would never reach the screen before the lookup
-            // started, and the board would look just as hung as it did
-            // before this fix, even though the wait is now bounded.
-            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
-            for msg in resolve_pr_for_ticket(deps, key, jira_url) {
-                let (next_app, more_cmds) = update(app, msg);
-                app = next_app;
-                pending.extend(more_cmds);
-            }
-            continue;
-        }
-        if let Cmd::ResolvePrForMerge { key } = cmd {
-            // Same forced pre-draw as `Cmd::ResolvePrForTicket` above, for
-            // the same reason: the `resolving PR for <key>...` status line
-            // must reach the screen before the blocking (bounded) `gh pr
-            // list` call starts.
-            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
-            for msg in resolve_pr_for_merge(deps, key) {
-                let (next_app, more_cmds) = update(app, msg);
-                app = next_app;
-                pending.extend(more_cmds);
-            }
-            continue;
-        }
-        if let Cmd::MergePr {
-            key,
-            number,
-            repo_root,
-        } = cmd
-        {
-            // Same forced pre-draw again: the merge is the longest blocking
-            // call the board makes (two bounded `gh` calls, see
-            // `MERGE_TIMEOUT`), and it must run behind the `merging PR
-            // #N...` status line, not behind a stale frame.
-            let _ = terminal.draw(|frame| draw(frame, &app, deps.runner));
-            for msg in merge_pr(deps, &key, number, &repo_root) {
-                let (next_app, more_cmds) = update(app, msg);
-                app = next_app;
-                pending.extend(more_cmds);
-            }
             continue;
         }
         for msg in execute(deps, cmd) {
@@ -1184,20 +1328,16 @@ fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
     }
 }
 
-/// Translate a single [`Cmd`] into the [`Msg`]s it produces.
+/// Translate a single local (non-network) [`Cmd`] into the [`Msg`]s it
+/// produces, on the event loop's own thread.
 ///
-/// Performs the actual I/O (a Jira API call, or spawning the `open`
-/// process); everything else in `tui` stays pure and terminal-free.
+/// Performs local I/O only (the runs DB, tmux queries, spawning the `open`
+/// process); everything that can take a network round trip lives in
+/// [`execute_net`] on the worker thread instead (GitHub issue #56), and
+/// everything else in `tui` stays pure and terminal-free.
 fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
-        Cmd::FetchTickets { query } => fetch_tickets(deps, &query),
-        Cmd::FetchAssignableUsers { project } => fetch_assignable_users(deps, &project),
-        Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
-        Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
-        Cmd::AssignTicket { key, choice } => assign_ticket_cmd(deps, &key, &choice),
         Cmd::OpenUrl(url) => open_url(&url),
-        Cmd::FetchRankTickets { query } => fetch_rank_tickets(deps, &query),
-        Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
         Cmd::ReapRuns => reap_lane_runs(deps),
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
@@ -1206,7 +1346,6 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
-        Cmd::FetchRetroTickets { query } => fetch_retro_tickets(deps, &query),
         Cmd::RecordRetro {
             key,
             verdict,
@@ -1217,13 +1356,12 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // suspend/restore the alternate screen around a blocking call --
         // `tmux attach`/`vdiff`, respectively); `Cmd::LaunchLaneRun`/
         // `Cmd::LaunchBotWatch`/`Cmd::LaunchReviewFix` need `&mut
-        // Vec<PendingLaunch>` (the in-flight launcher registry);
-        // `Cmd::ResolvePrForTicket`/`Cmd::ResolvePrForMerge`/`Cmd::MergePr`
-        // need `&mut Terminal` too, to force a redraw before their blocking
-        // (bounded) `gh` calls run -- none
-        // of which this function's signature has access to; `run_cmds`
-        // always intercepts all of these before calling `execute` (see the
-        // module docs), so they're unreachable here in practice.
+        // Vec<PendingLaunch>` (the in-flight launcher registry) -- none of
+        // which this function's signature has access to; `run_cmds` always
+        // intercepts all of these before calling `execute` (see the module
+        // docs). Network commands (`is_net_cmd`) are dispatched to the
+        // worker thread before `execute` is reached, so they're unreachable
+        // here too.
         //
         // The Jira board never enters `Screen::Runs`, so `update` can never
         // produce `Cmd::LoadRuns`/`Cmd::LoadRunDetail` for `run`/`execute`
@@ -1240,12 +1378,51 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::ViewLogs { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
+        | Cmd::FetchTickets { .. }
+        | Cmd::FetchAssignableUsers { .. }
+        | Cmd::FetchTransitions { .. }
+        | Cmd::ApplyTransition { .. }
+        | Cmd::AssignTicket { .. }
+        | Cmd::RankTicket { .. }
+        | Cmd::FetchRankTickets { .. }
+        | Cmd::FetchRetroTickets { .. }
         | Cmd::ResolvePrForTicket { .. }
         | Cmd::ResolvePrForMerge { .. }
         | Cmd::MergePr { .. }) => {
             debug_assert!(
                 false,
                 "execute: unreachable Cmd on the Jira board: {other:?}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Translate a single network-bound [`Cmd`] into the [`Msg`]s it produces,
+/// on the worker thread (see [`spawn_net_worker`]). Exactly the [`Cmd`]s
+/// [`is_net_cmd`] matches; every other variant is unreachable because
+/// [`run_cmds`] only ever dispatches network commands here.
+fn execute_net(deps: &NetDeps, cmd: Cmd) -> Vec<Msg> {
+    match cmd {
+        Cmd::FetchTickets { query } => fetch_tickets(deps, &query),
+        Cmd::FetchAssignableUsers { project } => fetch_assignable_users(deps, &project),
+        Cmd::FetchTransitions { key } => fetch_transitions(deps, &key),
+        Cmd::ApplyTransition { key, transition_id } => apply_transition(deps, &key, &transition_id),
+        Cmd::AssignTicket { key, choice } => assign_ticket_cmd(deps, &key, &choice),
+        Cmd::FetchRankTickets { query } => fetch_rank_tickets(deps, &query),
+        Cmd::RankTicket { key, anchor } => rank_ticket(deps, &key, anchor),
+        Cmd::FetchRetroTickets { query } => fetch_retro_tickets(deps, &query),
+        Cmd::ResolvePrForTicket { key, jira_url } => resolve_pr_for_ticket(deps, key, jira_url),
+        Cmd::ResolvePrForMerge { key } => resolve_pr_for_merge(deps, key),
+        Cmd::MergePr {
+            key,
+            number,
+            repo_root,
+        } => merge_pr(deps, &key, number, &repo_root),
+        other => {
+            debug_assert!(
+                false,
+                "execute_net: unreachable Cmd on the network worker: {other:?}"
             );
             Vec::new()
         }
@@ -1622,7 +1799,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// [`crate::tui::app::TicketSummary`]s. Shared by `Cmd::FetchTickets` and
 /// `Cmd::FetchRankTickets`, which differ only in which `Msg` the result (or
 /// error) becomes.
-fn search_tickets(deps: &TuiDeps, query: &TicketQuery) -> Result<TicketPage, ProviderError> {
+fn search_tickets(deps: &NetDeps, query: &TicketQuery) -> Result<TicketPage, ProviderError> {
     let result = deps.jira.search(query)?;
     Ok(TicketPage {
         truncated: result.next_page_token.is_some(),
@@ -1654,7 +1831,7 @@ impl TicketPage {
 
 /// Run `Cmd::FetchTickets`: search for tickets matching `query` and map them
 /// to [`crate::tui::app::TicketSummary`]s.
-fn fetch_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
+fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     match search_tickets(deps, query) {
         Ok(page) => {
             let truncation = page.truncation_msg();
@@ -1668,7 +1845,7 @@ fn fetch_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
 
 /// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
 /// list for [`crate::tui::app::Screen::Rank`].
-fn fetch_rank_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
+fn fetch_rank_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     match search_tickets(deps, query) {
         Ok(page) => {
             let truncation = page.truncation_msg();
@@ -1692,7 +1869,7 @@ fn fetch_rank_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
 /// exist is filtering by recorded verdicts -- showing an unfiltered list
 /// would be actively misleading, not just less enriched. So a missing store
 /// fails the whole screen with a status-line message instead.
-pub fn fetch_retro_tickets(deps: &TuiDeps, query: &TicketQuery) -> Vec<Msg> {
+pub fn fetch_retro_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     // No truncation warning here, unlike the board and rank screens: this
     // list is filtered down again below (tickets with a recorded verdict drop
     // out), so a "showing first N" count taken from the fetch wouldn't match
@@ -1776,7 +1953,7 @@ pub fn record_retro(
 /// Run `Cmd::RankTicket`: move `key` to its new position relative to
 /// `anchor`, reporting a human-readable confirmation on success (e.g.
 /// `Ranked PROJ-3 above PROJ-7`).
-fn rank_ticket(deps: &TuiDeps, key: &str, anchor: RankAnchor) -> Vec<Msg> {
+fn rank_ticket(deps: &NetDeps, key: &str, anchor: RankAnchor) -> Vec<Msg> {
     let message = match &anchor {
         RankAnchor::Before(other) => format!("Ranked {key} above {other}"),
         RankAnchor::After(other) => format!("Ranked {key} below {other}"),
@@ -1789,7 +1966,7 @@ fn rank_ticket(deps: &TuiDeps, key: &str, anchor: RankAnchor) -> Vec<Msg> {
 
 /// Run `Cmd::FetchAssignableUsers`: list the users eligible for assignment in
 /// `project`, for the filter picker.
-fn fetch_assignable_users(deps: &TuiDeps, project: &str) -> Vec<Msg> {
+fn fetch_assignable_users(deps: &NetDeps, project: &str) -> Vec<Msg> {
     match deps.jira.assignable_users(project) {
         Ok(users) => vec![Msg::AssignableUsersLoaded(users)],
         Err(err) => vec![Msg::AssignableUsersFailed(err.to_string())],
@@ -1798,7 +1975,7 @@ fn fetch_assignable_users(deps: &TuiDeps, project: &str) -> Vec<Msg> {
 
 /// Run `Cmd::FetchTransitions`: list the workflow transitions available on
 /// `key`.
-fn fetch_transitions(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+fn fetch_transitions(deps: &NetDeps, key: &str) -> Vec<Msg> {
     match deps.jira.transitions(key) {
         Ok(transitions) => vec![Msg::TransitionsLoaded(transitions)],
         Err(err) => vec![Msg::TransitionsFailed(err.to_string())],
@@ -1808,7 +1985,7 @@ fn fetch_transitions(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// Run `Cmd::ApplyTransition`: apply the transition, then re-fetch the issue
 /// to learn its resulting status (the transition endpoint itself returns no
 /// body).
-fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> {
+fn apply_transition(deps: &NetDeps, key: &str, transition_id: &str) -> Vec<Msg> {
     if let Err(err) = deps.jira.transition(key, transition_id) {
         return vec![Msg::TransitionFailed(err.to_string())];
     }
@@ -1833,7 +2010,7 @@ fn apply_transition(deps: &TuiDeps, key: &str, transition_id: &str) -> Vec<Msg> 
 /// backend (its assignee is a login, not a Jira accountId). `myself()` is
 /// also the only source of a human-readable display name for the card, which
 /// a raw accountId/login lookup wouldn't give us for free.
-fn assign_ticket_cmd(deps: &TuiDeps, key: &str, choice: &AssignChoice) -> Vec<Msg> {
+fn assign_ticket_cmd(deps: &NetDeps, key: &str, choice: &AssignChoice) -> Vec<Msg> {
     let (account_id, display_name) = match choice {
         AssignChoice::Me => match deps.jira.myself() {
             Ok(myself) => (Some(myself.account_id), Some(myself.display_name)),
@@ -1863,24 +2040,17 @@ fn assign_ticket_cmd(deps: &TuiDeps, key: &str, choice: &AssignChoice) -> Vec<Ms
 /// Jira directly rather than leaving the user stuck, per [`TuiDeps`]'s
 /// leniency stance.
 ///
-/// This is the one place `tui` calls a network-backed command synchronously
-/// on a keypress rather than deferring it to a background poll (contrast
-/// [`load_bot_watch_status`] et al., which only ever read the local runs DB).
-/// That's accepted here, not just tolerated, for the same reason
-/// [`TuiDeps::store`]'s doc comment and [`load_audit_status`]'s
-/// `.unwrap_or_default()` rationale accept their own leniency: a *bounded*
-/// block is a reasonable price for a feature that only fires on an explicit
-/// keypress (never prefetched for every card), and [`run_cmds`] makes sure
-/// the status line reflects that wait rather than leaving the board looking
-/// hung. The bound itself -- [`crate::github::gh_cli::GhCli::pr_list_bounded`]
-/// with [`PR_LOOKUP_TIMEOUT`] -- is what makes "reasonable" actually true:
-/// before it existed, `gh pr list` had no timeout at all, so a dead network
-/// or expired `gh` auth froze the *entire* board (no redraw, no key input,
-/// not even quit) for as long as the hang lasted, which is the defect this
-/// whole mechanism exists to close. On timeout specifically, `note` carries a
-/// status-line explanation (rather than silently landing on Jira looking
-/// like "no PR found") -- see [`crate::tui::app::browser_options_resolved`].
-fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<Msg> {
+/// The lookup fires only on an explicit keypress (never prefetched for
+/// every card on refresh), and -- like every network command since GitHub
+/// issue #56 -- runs on the worker thread, so even a hung `gh` can't freeze
+/// the board. The [`PR_LOOKUP_TIMEOUT`] bound on
+/// [`crate::github::gh_cli::GhCli::pr_list_bounded`] still matters: it caps
+/// how long the user waits for the picker and how long a dead call blocks
+/// the worker's one-at-a-time queue. On timeout specifically, `note`
+/// carries a status-line explanation (rather than silently landing on Jira
+/// looking like "no PR found") -- see
+/// [`crate::tui::app::browser_options_resolved`].
+fn resolve_pr_for_ticket(deps: &NetDeps, key: String, jira_url: String) -> Vec<Msg> {
     let Some(repo_root) = resolve_repo_root_for_pr_lookup(deps, &key) else {
         return vec![Msg::BrowserOptionsResolved {
             key,
@@ -1941,7 +2111,7 @@ fn resolve_pr_for_ticket(deps: &TuiDeps, key: String, jira_url: String) -> Vec<M
 /// ticket's repo (the same caveat `resolve_watch_repo_root`'s doc comment
 /// already accepts for the lane-less/no-store case), which holds for the
 /// ordinary case of running `tm board` from inside the repo.
-fn resolve_repo_root_for_pr_lookup(deps: &TuiDeps, key: &str) -> Option<std::path::PathBuf> {
+fn resolve_repo_root_for_pr_lookup(deps: &NetDeps, key: &str) -> Option<std::path::PathBuf> {
     match &deps.store {
         Some(store) => crate::cli::pr::resolve_watch_repo_root(
             Some(&deps.backend_identity.scope()),
@@ -1967,7 +2137,7 @@ fn resolve_repo_root_for_pr_lookup(deps: &TuiDeps, key: &str) -> Option<std::pat
 /// PRs only, an already-merged or closed PR resolves to `None` too, which
 /// is exactly the inert behavior GitHub issue #32's acceptance criteria
 /// ask for.
-fn resolve_pr_for_merge(deps: &TuiDeps, key: String) -> Vec<Msg> {
+fn resolve_pr_for_merge(deps: &NetDeps, key: String) -> Vec<Msg> {
     let Some(repo_root) = resolve_repo_root_for_pr_lookup(deps, &key) else {
         return vec![Msg::MergePrResolved {
             key,
@@ -2029,7 +2199,7 @@ fn resolve_pr_for_merge(deps: &TuiDeps, key: String) -> Vec<Msg> {
 ///   resulting status or the advisory warning (unmatched status, API
 ///   error) to the merge message -- a transition problem never un-reports
 ///   the merge itself, which by then has already happened.
-fn merge_pr(deps: &TuiDeps, key: &str, number: u64, repo_root: &std::path::Path) -> Vec<Msg> {
+fn merge_pr(deps: &NetDeps, key: &str, number: u64, repo_root: &std::path::Path) -> Vec<Msg> {
     if let Err(err) = deps.gh.pr_merge(repo_root, number, MERGE_TIMEOUT) {
         return vec![Msg::MergePrResult {
             merged: false,
@@ -2130,9 +2300,8 @@ mod tests {
         Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal should build")
     }
 
-    fn deps(jira: FakeJiraClient) -> TuiDeps {
+    fn deps() -> TuiDeps {
         TuiDeps {
-            jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             project_key: "PROJ".to_string(),
             board_column_order: Vec::new(),
             store: None,
@@ -2148,10 +2317,6 @@ mod tests {
             hidden_lane_count: 0,
             audit_dir_fallback: false,
             create_dir_fallback: false,
-            gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
-            git: Box::new(crate::work::git::FakeGitOps::new()),
-            cwd: std::path::PathBuf::from("/repo"),
-            lanes: std::collections::BTreeMap::new(),
             backend_identity: crate::config::BackendIdentity::Jira {
                 base_url: "https://x.atlassian.net".to_string(),
                 project_key: "PROJ".to_string(),
@@ -2159,6 +2324,50 @@ mod tests {
             runner: &crate::agent::claude::ClaudeRunner,
             status_on_merge: None,
         }
+    }
+
+    /// The worker-thread half of the test dependencies, mirroring [`deps`]
+    /// the way production's `NetDeps` mirrors its `TuiDeps` (same fakes,
+    /// same identity/scope), for tests that drive [`execute_net`] and its
+    /// helpers directly.
+    fn net_deps(jira: FakeJiraClient) -> NetDeps {
+        NetDeps {
+            jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
+            gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
+            git: Box::new(crate::work::git::FakeGitOps::new()),
+            store: None,
+            lanes: std::collections::BTreeMap::new(),
+            cwd: std::path::PathBuf::from("/repo"),
+            backend_identity: crate::config::BackendIdentity::Jira {
+                base_url: "https://x.atlassian.net".to_string(),
+                project_key: "PROJ".to_string(),
+            },
+            status_on_merge: None,
+            runner: &crate::agent::claude::ClaudeRunner,
+        }
+    }
+
+    /// A connected network-command channel for [`run_cmds`] calls in tests:
+    /// the receiver is returned (rather than dropped) so dispatches succeed
+    /// and queue, and tests can assert what was routed to the worker.
+    fn net_channel() -> (std::sync::mpsc::Sender<Cmd>, std::sync::mpsc::Receiver<Cmd>) {
+        std::sync::mpsc::channel()
+    }
+
+    /// [`run_cmds`] with a throwaway connected network channel, for the many
+    /// tests that only exercise local commands: dispatches succeed (and are
+    /// discarded), so no spurious `net_dispatch_failed` messages appear.
+    /// Tests asserting on what gets routed to the worker call [`run_cmds`]
+    /// directly with their own [`net_channel`].
+    fn run_cmds_test<B: Backend>(
+        app: App,
+        cmds: Vec<Cmd>,
+        deps: &TuiDeps,
+        terminal: &mut Terminal<B>,
+        launches: &mut Vec<PendingLaunch>,
+    ) -> App {
+        let (net_tx, _net_rx) = net_channel();
+        run_cmds(app, cmds, deps, &net_tx, terminal, launches)
     }
 
     #[test]
@@ -2169,7 +2378,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
-        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
+        let msgs = fetch_tickets(&net_deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets)] => {
                 assert_eq!(tickets.len(), 1);
@@ -2188,7 +2397,7 @@ mod tests {
     #[test]
     fn fetch_tickets_with_empty_search_result_loads_empty_list() {
         let jira = FakeJiraClient::new();
-        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
+        let msgs = fetch_tickets(&net_deps(jira), &TicketQuery::MyOpen);
         assert_eq!(msgs, vec![Msg::TicketsLoaded(vec![])]);
     }
 
@@ -2200,7 +2409,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "To Do"), issue("PROJ-2", "To Do")],
             next_page_token: Some("more".to_string()),
         });
-        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
+        let msgs = fetch_tickets(&net_deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsLoaded(tickets), Msg::SearchTruncated { shown }] => {
                 assert_eq!(tickets.len(), 2);
@@ -2213,7 +2422,7 @@ mod tests {
     #[test]
     fn fetch_tickets_failure_emits_tickets_failed() {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
-        let msgs = fetch_tickets(&deps(jira), &TicketQuery::MyOpen);
+        let msgs = fetch_tickets(&net_deps(jira), &TicketQuery::MyOpen);
         match msgs.as_slice() {
             [Msg::TicketsFailed(message)] => {
                 assert_eq!(message, "ticket provider API error (500): boom")
@@ -2231,7 +2440,7 @@ mod tests {
                 display_name: "Jane Doe".to_string(),
             }],
         );
-        let msgs = fetch_assignable_users(&deps(jira), "PROJ");
+        let msgs = fetch_assignable_users(&net_deps(jira), "PROJ");
         assert_eq!(
             msgs,
             vec![Msg::AssignableUsersLoaded(vec![JiraUser {
@@ -2244,7 +2453,7 @@ mod tests {
     #[test]
     fn fetch_assignable_users_failure_emits_failed() {
         let jira = FakeJiraClient::new().with_assignable_users_error("PROJ", 500, "boom");
-        let msgs = fetch_assignable_users(&deps(jira), "PROJ");
+        let msgs = fetch_assignable_users(&net_deps(jira), "PROJ");
         match msgs.as_slice() {
             [Msg::AssignableUsersFailed(message)] => {
                 assert_eq!(message, "ticket provider API error (500): boom")
@@ -2256,14 +2465,14 @@ mod tests {
     #[test]
     fn fetch_transitions_success_emits_transitions_loaded() {
         let jira = FakeJiraClient::new();
-        let msgs = fetch_transitions(&deps(jira), "PROJ-1");
+        let msgs = fetch_transitions(&net_deps(jira), "PROJ-1");
         assert_eq!(msgs, vec![Msg::TransitionsLoaded(vec![])]);
     }
 
     #[test]
     fn apply_transition_success_refetches_issue_for_new_status() {
         let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1", "In Progress"));
-        let msgs = apply_transition(&deps(jira), "PROJ-1", "11");
+        let msgs = apply_transition(&net_deps(jira), "PROJ-1", "11");
         assert_eq!(
             msgs,
             vec![Msg::TransitionApplied {
@@ -2277,7 +2486,7 @@ mod tests {
     #[test]
     fn apply_transition_failure_to_refetch_emits_transition_failed() {
         let jira = FakeJiraClient::new().with_issue_not_found("PROJ-1");
-        let msgs = apply_transition(&deps(jira), "PROJ-1", "11");
+        let msgs = apply_transition(&net_deps(jira), "PROJ-1", "11");
         match msgs.as_slice() {
             [Msg::TransitionFailed(_)] => {}
             other => panic!("expected TransitionFailed, got {other:?}"),
@@ -2291,7 +2500,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
-        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &choice);
+        let msgs = assign_ticket_cmd(&net_deps(jira), "PROJ-1", &choice);
         assert_eq!(
             msgs,
             vec![Msg::AssignApplied {
@@ -2304,7 +2513,7 @@ mod tests {
     #[test]
     fn assign_ticket_unassign_emits_assign_applied_with_none() {
         let jira = FakeJiraClient::new();
-        let d = deps(jira);
+        let d = net_deps(jira);
         let msgs = assign_ticket_cmd(&d, "PROJ-1", &AssignChoice::Unassign);
         assert_eq!(
             msgs,
@@ -2322,7 +2531,7 @@ mod tests {
             display_name: "Ada Lovelace".to_string(),
             email_address: None,
         });
-        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &AssignChoice::Me);
+        let msgs = assign_ticket_cmd(&net_deps(jira), "PROJ-1", &AssignChoice::Me);
         assert_eq!(
             msgs,
             vec![Msg::AssignApplied {
@@ -2335,7 +2544,7 @@ mod tests {
     #[test]
     fn assign_ticket_me_myself_failure_emits_assign_failed_without_assigning() {
         let jira = FakeJiraClient::new().with_myself_unauthorized();
-        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &AssignChoice::Me);
+        let msgs = assign_ticket_cmd(&net_deps(jira), "PROJ-1", &AssignChoice::Me);
         match msgs.as_slice() {
             [Msg::AssignFailed(message)] => {
                 assert!(message.starts_with("assign PROJ-1 failed:"));
@@ -2351,7 +2560,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             display_name: "Jane Doe".to_string(),
         });
-        let msgs = assign_ticket_cmd(&deps(jira), "PROJ-1", &choice);
+        let msgs = assign_ticket_cmd(&net_deps(jira), "PROJ-1", &choice);
         match msgs.as_slice() {
             [Msg::AssignFailed(message)] => {
                 assert!(message.starts_with("assign PROJ-1 failed:"));
@@ -2373,7 +2582,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_ticket_finds_pr_via_git_fallback_when_no_runs_store() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2399,7 +2608,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_ticket_with_no_matching_pr_resolves_none() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2425,7 +2634,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_ticket_degrades_to_none_when_repo_root_fails() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(crate::work::git::FakeGitOps::new().with_repo_root(Err(
             crate::work::git::GitError::Command {
                 command: "git rev-parse".to_string(),
@@ -2447,7 +2656,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_ticket_degrades_to_none_when_gh_pr_list_fails() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2472,7 +2681,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_ticket_on_timeout_falls_back_to_jira_with_a_status_note() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2509,7 +2718,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_merge_finds_open_pr_and_carries_repo_root() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2535,7 +2744,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_merge_with_no_matching_pr_resolves_none() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2561,7 +2770,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_for_merge_on_timeout_reports_nothing_merged() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = net_deps(FakeJiraClient::new());
         deps.git = Box::new(
             crate::work::git::FakeGitOps::new()
                 .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
@@ -2590,7 +2799,7 @@ mod tests {
     fn merge_pr_failure_reports_error_and_attempts_no_transition() {
         // `status_on_merge` is set, but the merge failing must be the whole
         // story: no transition attempt, no "moved to" in the message.
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = net_deps(FakeJiraClient::new());
         d.status_on_merge = Some("Done".to_string());
         d.gh = Box::new(
             crate::github::gh_cli::FakeGhCli::new().with_pr_merge_result(Err(
@@ -2630,7 +2839,7 @@ mod tests {
     fn merge_pr_success_without_status_on_merge_merges_only() {
         // Absent key = merge only: the exact message pins that no advisory
         // transition outcome (applied or warning) was appended.
-        let d = deps(FakeJiraClient::new());
+        let d = net_deps(FakeJiraClient::new());
         let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
         assert_eq!(
             msgs,
@@ -2658,7 +2867,7 @@ mod tests {
                     },
                 }],
             );
-        let mut d = deps(jira);
+        let mut d = net_deps(jira);
         d.status_on_merge = Some("Done".to_string());
         let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
         assert_eq!(
@@ -2675,7 +2884,7 @@ mod tests {
         let jira = FakeJiraClient::new()
             .with_issue("PROJ-1", issue("PROJ-1", "In Review"))
             .with_transitions("PROJ-1", vec![]);
-        let mut d = deps(jira);
+        let mut d = net_deps(jira);
         d.status_on_merge = Some("Shipped".to_string());
         let msgs = merge_pr(&d, "PROJ-1", 42, std::path::Path::new("/repo"));
         match msgs.as_slice() {
@@ -2756,7 +2965,7 @@ mod tests {
             next_page_token: None,
         });
         let msgs = fetch_rank_tickets(
-            &deps(jira),
+            &net_deps(jira),
             &TicketQuery::Ranked {
                 project_key: "PROJ".to_string(),
             },
@@ -2774,7 +2983,7 @@ mod tests {
     fn fetch_rank_tickets_failure_emits_rank_tickets_failed() {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
         let msgs = fetch_rank_tickets(
-            &deps(jira),
+            &net_deps(jira),
             &TicketQuery::Ranked {
                 project_key: "PROJ".to_string(),
             },
@@ -2791,7 +3000,7 @@ mod tests {
     fn rank_ticket_before_emits_rank_applied_with_above_message() {
         let jira = FakeJiraClient::new();
         let msgs = rank_ticket(
-            &deps(jira),
+            &net_deps(jira),
             "PROJ-3",
             RankAnchor::Before("PROJ-7".to_string()),
         );
@@ -2805,7 +3014,7 @@ mod tests {
     fn rank_ticket_after_emits_rank_applied_with_below_message() {
         let jira = FakeJiraClient::new();
         let msgs = rank_ticket(
-            &deps(jira),
+            &net_deps(jira),
             "PROJ-3",
             RankAnchor::After("PROJ-7".to_string()),
         );
@@ -2819,7 +3028,7 @@ mod tests {
     fn rank_ticket_failure_emits_rank_failed() {
         let jira = FakeJiraClient::new().with_rank_error(500, "boom");
         let msgs = rank_ticket(
-            &deps(jira),
+            &net_deps(jira),
             "PROJ-3",
             RankAnchor::Before("PROJ-7".to_string()),
         );
@@ -2841,7 +3050,7 @@ mod tests {
             issues: vec![issue("PROJ-1", "Done")],
             next_page_token: None,
         });
-        let mut deps = deps(jira);
+        let mut deps = net_deps(jira);
         deps.store = None;
         let msgs = fetch_retro_tickets(
             &deps,
@@ -2862,7 +3071,7 @@ mod tests {
         let jira = FakeJiraClient::new().with_search_error(500, "boom");
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let mut deps = deps(jira);
+        let mut deps = net_deps(jira);
         deps.store = Some(store);
         let msgs = fetch_retro_tickets(
             &deps,
@@ -2891,7 +3100,7 @@ mod tests {
         store
             .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
-        let mut deps = deps(jira);
+        let mut deps = net_deps(jira);
         deps.store = Some(store);
 
         let msgs = fetch_retro_tickets(
@@ -2919,7 +3128,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let mut deps = deps(jira);
+        let mut deps = net_deps(jira);
         deps.store = Some(store);
 
         let msgs = fetch_retro_tickets(
@@ -2962,7 +3171,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut deps = deps(jira);
+        let mut deps = net_deps(jira);
         deps.store = Some(store);
 
         let msgs = fetch_retro_tickets(
@@ -2987,7 +3196,7 @@ mod tests {
     fn record_retro_clean_success_emits_retro_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = record_retro(
@@ -3010,7 +3219,7 @@ mod tests {
     fn record_retro_defect_with_severity_and_note_success() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = record_retro(
@@ -3045,7 +3254,7 @@ mod tests {
     fn record_retro_defect_with_no_severity_reports_the_store_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = record_retro(
@@ -3068,7 +3277,7 @@ mod tests {
 
     #[test]
     fn record_retro_with_no_store_reports_unavailable() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = record_retro(
             &deps,
@@ -3084,92 +3293,214 @@ mod tests {
     }
 
     #[test]
-    fn run_cmds_feeds_tickets_loaded_back_through_update() {
+    fn run_cmds_routes_network_cmds_to_the_worker_instead_of_executing() {
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        let (net_tx, net_rx) = net_channel();
+        let cmd = Cmd::FetchTickets {
+            query: TicketQuery::MyOpen,
+        };
+        let app = run_cmds(
+            App::new(),
+            vec![cmd.clone()],
+            &deps(),
+            &net_tx,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(net_rx.try_recv(), Ok(cmd));
+        // Nothing executed inline: the tickets arrive later, through `run`'s
+        // drain of the worker's result channel.
+        assert!(app.columns.is_empty());
+    }
+
+    #[test]
+    fn spawn_net_worker_executes_cmds_off_thread_and_reports_results() {
         use crate::ticketing::types::SearchResult;
 
         let jira = FakeJiraClient::new().with_search_result(SearchResult {
             issues: vec![issue("PROJ-1", "To Do")],
             next_page_token: None,
         });
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let net_tx = spawn_net_worker(Box::new(move || net_deps(jira)), msg_tx);
+
+        net_tx
+            .send(Cmd::FetchTickets {
+                query: TicketQuery::MyOpen,
+            })
+            .expect("worker should be alive");
+
+        let msg = msg_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker should report a result");
+        match msg {
+            Msg::TicketsLoaded(tickets) => assert_eq!(tickets[0].key, "PROJ-1"),
+            other => panic!("expected TicketsLoaded, got {other:?}"),
+        }
+    }
+
+    /// A [`TicketProvider`] whose `search` blocks until the test releases it
+    /// over a channel, standing in for a slow network. Every other method is
+    /// unreachable in the tests that use it.
+    struct BlockingProvider {
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl TicketProvider for BlockingProvider {
+        fn myself(&self) -> Result<crate::ticketing::types::Myself, ProviderError> {
+            unreachable!()
+        }
+        fn get_issue(&self, _key: &str) -> Result<Issue, ProviderError> {
+            unreachable!()
+        }
+        fn create_issue(
+            &self,
+            _req: &crate::ticketing::provider::NewTicket,
+        ) -> Result<Issue, ProviderError> {
+            unreachable!()
+        }
+        fn add_remote_link(
+            &self,
+            _key: &str,
+            _link: &crate::ticketing::types::RemoteLinkRequest,
+        ) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn transitions(
+            &self,
+            _key: &str,
+        ) -> Result<Vec<crate::ticketing::types::Transition>, ProviderError> {
+            unreachable!()
+        }
+        fn transition(&self, _key: &str, _transition_id: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn search(
+            &self,
+            _query: &TicketQuery,
+        ) -> Result<crate::ticketing::types::SearchResult, ProviderError> {
+            self.release
+                .recv()
+                .expect("test should release the blocked search");
+            Ok(crate::ticketing::types::SearchResult {
+                issues: vec![issue("PROJ-1", "To Do")],
+                next_page_token: None,
+            })
+        }
+        fn get_project(&self, _key: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn assignable_users(&self, _project: &str) -> Result<Vec<JiraUser>, ProviderError> {
+            unreachable!()
+        }
+        fn assign(&self, _key: &str, _account_id: Option<&str>) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn rank(&self, _keys: &[String], _anchor: RankAnchor) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn create_link(
+            &self,
+            _req: &crate::ticketing::types::CreateLinkRequest,
+        ) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn delete_link(&self, _link_id: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn update_description(&self, _key: &str, _description: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn add_comment(&self, _key: &str, _body: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        fn description_text(&self, _issue: &Issue) -> String {
+            // Reached while mapping the released search's issues to cards.
+            String::new()
+        }
+        fn issue_url(&self, key: &str) -> String {
+            format!("https://example.test/{key}")
+        }
+    }
+
+    /// GitHub issue #56's core acceptance shape: with a provider call
+    /// blocked mid-flight on the worker, the event loop's side of the
+    /// machinery (reducing a key press, dispatching further commands) keeps
+    /// working, and the blocked call's result arrives only after release.
+    #[test]
+    fn board_processes_input_while_a_provider_call_is_in_flight() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let net_tx = spawn_net_worker(
+            Box::new(move || NetDeps {
+                jira: Box::new(BlockingProvider {
+                    release: release_rx,
+                }),
+                ..net_deps(FakeJiraClient::new())
+            }),
+            msg_tx,
+        );
+
+        // Dispatch the fetch; the worker is now blocked inside `search`.
+        net_tx
+            .send(Cmd::FetchTickets {
+                query: TicketQuery::MyOpen,
+            })
+            .expect("worker should be alive");
+        assert!(
+            msg_rx.try_recv().is_err(),
+            "no result may land before the provider call finishes"
+        );
+
+        // A key press still reduces normally while the call is out: this is
+        // the same `update` + `run_cmds` path `run`'s loop takes, no longer
+        // serialized behind the provider call.
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
-            App::new(),
-            vec![Cmd::FetchTickets {
-                query: TicketQuery::MyOpen,
-            }],
-            &deps(jira),
+        let app = App {
+            status_line: String::new(),
+            ..App::new()
+        };
+        let (next_app, cmds) = update(app, Msg::ToggleHelp);
+        let next_app = run_cmds(
+            next_app,
+            cmds,
+            &deps(),
+            &net_tx,
             &mut terminal,
             &mut launches,
         );
-        assert_eq!(app.columns.len(), 1);
-        assert_eq!(app.selected_col, 0);
-        assert_eq!(app.selected_row, 0);
-    }
+        assert!(next_app.show_help, "input must be processed while blocked");
+        assert!(msg_rx.try_recv().is_err(), "still blocked");
 
-    /// Flatten a [`ratatui::backend::TestBackend`]'s buffer into one string,
-    /// for asserting a message is visible on screen. Mirrors `src/tui/ui.rs`'s
-    /// own private `buffer_text` test helper.
-    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
-        let mut out = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                out.push_str(buffer[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
+        release_tx.send(()).expect("worker should be waiting");
+        let msg = msg_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("released call should report its result");
+        assert!(matches!(msg, Msg::TicketsLoaded(_)));
     }
 
     #[test]
-    fn run_cmds_draws_the_resolving_status_line_before_the_blocking_pr_lookup() {
-        // `open_browser_action` (src/tui/app.rs) is what actually sets this
-        // status line on a real `o` keypress; this test starts from its
-        // output directly to isolate what's under test here: that
-        // `run_cmds` paints that message to the terminal *before* running
-        // `Cmd::ResolvePrForTicket`'s blocking `gh` call, rather than only on
-        // the event loop's next iteration (which -- per this fix's whole
-        // premise -- would happen only *after* the call already finished).
-        let app = App {
-            status_line: "resolving PR for PROJ-1...".to_string(),
-            ..App::new()
-        };
+    fn run_cmds_reports_a_failure_when_the_worker_is_gone() {
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let mut deps = deps(FakeJiraClient::new());
-        deps.git = Box::new(
-            crate::work::git::FakeGitOps::new()
-                .with_repo_root(Ok(std::path::PathBuf::from("/repo"))),
-        );
-        // Resolve to a matching PR (rather than the "no PR" default) so
-        // `browser_options_resolved` shows the picker and emits no further
-        // `Cmd` -- specifically not `Cmd::OpenUrl`, which would shell out to
-        // the real `open` command and could actually launch a browser during
-        // this test.
-        deps.gh = Box::new(
-            crate::github::gh_cli::FakeGhCli::new().with_pr_list(Ok(vec![pr(
-                42,
-                "[PROJ-1] Fix the thing",
-                "proj-1-fix",
-            )])),
-        );
-
-        run_cmds(
-            app,
-            vec![Cmd::ResolvePrForTicket {
+        let (net_tx, net_rx) = net_channel();
+        drop(net_rx);
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AssignTicket {
                 key: "PROJ-1".to_string(),
-                jira_url: "jira-url".to_string(),
+                choice: AssignChoice::Unassign,
             }],
-            &deps,
+            &deps(),
+            &net_tx,
             &mut terminal,
             &mut launches,
         );
-
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(
-            text.contains("resolving PR for PROJ-1..."),
-            "expected the resolving status line to have been drawn before the \
-             blocking lookup ran, got:\n{text}"
+        assert_eq!(
+            app.status_line,
+            "assign PROJ-1 failed: network worker unavailable"
         );
     }
 
@@ -3550,7 +3881,7 @@ mod tests {
 
     #[test]
     fn load_audit_status_with_no_store_yields_empty_map() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = load_audit_status(&deps);
         assert_eq!(msgs, vec![Msg::AuditStatusLoaded(HashMap::new())]);
@@ -3562,7 +3893,7 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store.start_run(&audit_start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
@@ -3590,7 +3921,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
@@ -3628,7 +3959,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         // No live `audit` window: `FakeTmuxOps::new()`'s default
         // `list_windows` is `Ok(vec![])`.
@@ -3641,7 +3972,7 @@ mod tests {
 
     #[test]
     fn load_ticket_run_detail_with_no_store_reports_unavailable() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = load_ticket_run_detail(&deps, "PROJ-1");
         assert_eq!(
@@ -3655,7 +3986,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_ticket_run_detail(&deps, "PROJ-1");
@@ -3672,7 +4003,7 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
         let latest_id = store.start_run(&start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_ticket_run_detail(&deps, "PROJ-1");
@@ -3688,7 +4019,7 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store.start_run(&audit_start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_ticket_run_detail(&deps, "PROJ-1");
@@ -3702,7 +4033,7 @@ mod tests {
 
     #[test]
     fn launch_audit_cmd_with_no_store_reports_unavailable() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = launch_audit_cmd(&deps, "PROJ-1");
         assert_eq!(
@@ -3716,7 +4047,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
@@ -3743,7 +4074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/tskmstr".to_string()),
@@ -3770,7 +4101,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         // `deps.audit` defaults to `AuditConfig::default()`: no `dir` set.
 
@@ -3788,7 +4119,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.audit = crate::config::AuditConfig {
             dir: Some("/repo/axiom".to_string()),
@@ -3819,10 +4150,10 @@ mod tests {
     /// gate on the status line and never touches the terminal or tmux.
     #[test]
     fn run_cmds_manual_session_not_configured_surfaces_error_text() {
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::EnsureManualSession {
                 key: "PROJ-1".to_string(),
@@ -3843,7 +4174,7 @@ mod tests {
     /// attach key.
     #[test]
     fn run_cmds_manual_session_creates_layout_and_attaches() {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.manual = crate::config::ManualConfig {
             dir: Some("/work/dir".to_string()),
             windows: vec![
@@ -3859,7 +4190,7 @@ mod tests {
         };
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::EnsureManualSession {
                 key: "PROJ-1".to_string(),
@@ -3878,10 +4209,10 @@ mod tests {
 
     #[test]
     fn run_cmds_intercepts_audit_attach_and_reports_status_line() {
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::AttachSession {
                 session_name: "tm-proj-proj-1".to_string(),
@@ -3898,10 +4229,10 @@ mod tests {
     /// same shape of status line.
     #[test]
     fn run_cmds_intercepts_attach_session_and_reports_status_line() {
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::AttachSession {
                 session_name: "tm-proj-proj-1".to_string(),
@@ -3918,14 +4249,14 @@ mod tests {
     /// line must not claim they detached (issue #6).
     #[test]
     fn run_cmds_attach_reports_switch_wording_when_client_switched() {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new()
                 .with_attach_outcome(crate::work::tmux::AttachOutcome::Switched),
         );
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::AttachSession {
                 session_name: "tm-proj-proj-1".to_string(),
@@ -3943,7 +4274,7 @@ mod tests {
     /// A `deps` whose `[work.create]` is configured and whose tmux fake
     /// reports `windows` (each `(session, window, dead)`).
     fn create_deps(windows: &[(&str, &str, bool)]) -> TuiDeps {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.create = crate::config::CreateConfig {
             dir: Some("/repo/axiom".to_string()),
             prompt: None,
@@ -3967,10 +4298,10 @@ mod tests {
     fn run_cmds_launch_create_unconfigured_reports_status_line_without_attaching() {
         // `deps()` leaves `create.dir` unset; the status line must be the
         // NotConfigured message, not an attach outcome.
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchCreate],
             &d,
@@ -3991,7 +4322,7 @@ mod tests {
         let d = create_deps(&[]);
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchCreate],
             &d,
@@ -4009,7 +4340,7 @@ mod tests {
         let d = create_deps(&[("tm-proj-create", "create", false)]);
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchCreate],
             &d,
@@ -4025,7 +4356,7 @@ mod tests {
         d.create_dir_fallback = true;
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchCreate],
             &d,
@@ -4043,10 +4374,10 @@ mod tests {
 
     #[test]
     fn run_cmds_launch_lane_run_success_registers_pending_launch() {
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchLaneRun {
                 lane: "backend".to_string(),
@@ -4065,13 +4396,13 @@ mod tests {
 
     #[test]
     fn run_cmds_launch_lane_run_spawn_failure_feeds_immediate_launch_result() {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher = Box::new(
             crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("no such lane"),
         );
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchLaneRun {
                 lane: "bogus".to_string(),
@@ -4110,11 +4441,11 @@ mod tests {
     #[test]
     fn run_cmds_launch_lane_run_spawns_work_run_argv() {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher = Box::new(RecordingLauncher(calls.clone()));
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        run_cmds(
+        run_cmds_test(
             App::new(),
             vec![Cmd::LaunchLaneRun {
                 lane: "backend".to_string(),
@@ -4140,11 +4471,11 @@ mod tests {
     #[test]
     fn run_cmds_launch_bot_watch_spawns_pr_watch_argv() {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher = Box::new(RecordingLauncher(calls.clone()));
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        run_cmds(
+        run_cmds_test(
             App::new(),
             vec![Cmd::LaunchBotWatch {
                 key: "PROJ-1".to_string(),
@@ -4166,12 +4497,12 @@ mod tests {
 
     #[test]
     fn run_cmds_launch_bot_watch_spawn_failure_feeds_immediate_launch_result() {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher =
             Box::new(crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("boom"));
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchBotWatch {
                 key: "PROJ-1".to_string(),
@@ -4210,11 +4541,11 @@ mod tests {
     #[test]
     fn run_cmds_launch_review_fix_spawns_review_fix_argv() {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher = Box::new(RecordingLauncher(calls.clone()));
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        run_cmds(
+        run_cmds_test(
             App::new(),
             vec![Cmd::LaunchReviewFix {
                 key: "PROJ-1".to_string(),
@@ -4236,10 +4567,10 @@ mod tests {
 
     #[test]
     fn run_cmds_launch_review_fix_success_registers_pending_launch() {
-        let d = deps(FakeJiraClient::new());
+        let d = deps();
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchReviewFix {
                 key: "PROJ-1".to_string(),
@@ -4255,13 +4586,13 @@ mod tests {
 
     #[test]
     fn run_cmds_launch_review_fix_spawn_failure_feeds_immediate_launch_result() {
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.launcher = Box::new(
             crate::tui::launcher::FakeLaneLauncher::new().with_spawn_error("current_exe failed"),
         );
         let mut terminal = test_terminal();
         let mut launches = Vec::new();
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchReviewFix {
                 key: "PROJ-1".to_string(),
@@ -4407,7 +4738,7 @@ mod tests {
 
     #[test]
     fn launch_cleanup_cmd_with_no_store_reports_unavailable() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
         assert_eq!(
@@ -4421,7 +4752,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.review_watch = crate::config::ReviewWatchConfig {
             dir: Some("/repo/axiom".to_string()),
@@ -4442,7 +4773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         // `deps.review_watch` defaults to no `dir`.
 
@@ -4460,7 +4791,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.review_watch = crate::config::ReviewWatchConfig {
             dir: Some("/repo/axiom".to_string()),
@@ -4554,7 +4885,7 @@ mod tests {
 
     #[test]
     fn load_lane_run_status_with_no_store_yields_empty_map() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = load_lane_run_status(&deps);
         assert_eq!(msgs, vec![Msg::LaneRunStatusLoaded(HashMap::new())]);
@@ -4572,7 +4903,7 @@ mod tests {
         let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
         store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         // deps.tmux is a fresh FakeTmuxOps: it lists no sessions, so the
         // recorded session reads as killed.
@@ -4595,7 +4926,7 @@ mod tests {
 
     #[test]
     fn board_reap_without_a_store_is_a_noop() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
 
         let msgs = execute(&deps, Cmd::ReapRuns);
@@ -4609,7 +4940,7 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store.start_run(&lane_start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);
@@ -4631,7 +4962,7 @@ mod tests {
         let run_id = store.start_run(&lane_start_params("PROJ-1")).unwrap();
         store.add_event(run_id, "await", None).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);
@@ -4661,7 +4992,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);
@@ -4691,7 +5022,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);
@@ -4721,7 +5052,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);
@@ -4770,7 +5101,7 @@ mod tests {
 
     #[test]
     fn load_bot_watch_status_with_no_store_yields_empty_map() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = load_bot_watch_status(&deps);
         assert_eq!(msgs, vec![Msg::BotWatchStatusLoaded(HashMap::new())]);
@@ -4784,7 +5115,7 @@ mod tests {
             .start_run(&review_watch_start_params("PROJ-1"))
             .unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_bot_watch_status(&deps);
@@ -4808,7 +5139,7 @@ mod tests {
             .unwrap();
         finish(&store, run_id, crate::runs::RunStatus::Review);
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_bot_watch_status(&deps);
@@ -4830,7 +5161,7 @@ mod tests {
         store.start_run(&lane_start_params("PROJ-1")).unwrap();
         store.start_run(&cleanup_start_params("PROJ-2")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_bot_watch_status(&deps);
@@ -4841,7 +5172,7 @@ mod tests {
 
     #[test]
     fn load_cleanup_status_with_no_store_yields_empty_map() {
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = None;
         let msgs = load_cleanup_status(&deps);
         assert_eq!(msgs, vec![Msg::CleanupStatusLoaded(HashMap::new())]);
@@ -4853,7 +5184,7 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store.start_run(&cleanup_start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
@@ -4881,7 +5212,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
@@ -4909,7 +5240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
         deps.tmux = Box::new(
             crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
@@ -4932,7 +5263,7 @@ mod tests {
         let run_id = store.start_run(&cleanup_start_params("PROJ-3")).unwrap();
         finish(&store, run_id, crate::runs::RunStatus::Done);
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_cleanup_status(&deps);
@@ -4945,7 +5276,7 @@ mod tests {
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         store.start_run(&audit_start_params("PROJ-1")).unwrap();
 
-        let mut deps = deps(FakeJiraClient::new());
+        let mut deps = deps();
         deps.store = Some(store);
 
         let msgs = load_lane_run_status(&deps);

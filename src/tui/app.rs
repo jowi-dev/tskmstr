@@ -649,6 +649,13 @@ pub struct App {
     pub detail_scroll: u16,
     /// Feedback from the last action or error, shown in the status bar.
     pub status_line: String,
+    /// The network actions currently out on the worker thread (GitHub issue
+    /// #56), in dispatch order. [`update`] registers an entry for every
+    /// network [`Cmd`] it emits (see [`admit_net_cmds`]), drops a duplicate
+    /// of an entry already here instead of dispatching it again, and clears
+    /// a kind's entries when its result [`Msg`] lands. Rendered as the
+    /// status bar's pending indicator while non-empty.
+    pub in_flight: Vec<InFlight>,
     /// Whether the help overlay is shown.
     pub show_help: bool,
     /// The configured default Jira project key, used to scope every
@@ -1558,8 +1565,7 @@ pub enum Cmd {
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::MergePrAction`]'s confirmation prompt. Reports back as
     /// [`Msg::MergePrResolved`]. Same single-`gh`-call, on-keypress-only
-    /// stance as [`Cmd::ResolvePrForTicket`], and intercepted by
-    /// `run_cmds` for the same status-line-redraw reason.
+    /// stance as [`Cmd::ResolvePrForTicket`].
     ResolvePrForMerge {
         /// Ticket key to resolve a PR for.
         key: String,
@@ -1601,12 +1607,207 @@ pub enum Cmd {
     },
 }
 
+/// Which class of network action an [`InFlight`] entry tracks: one variant
+/// per network [`Cmd`] (see `crate::tui::event`'s `is_net_cmd`). Result
+/// [`Msg`]s clear by kind alone -- several failure messages
+/// ([`Msg::AssignFailed`], [`Msg::TransitionFailed`], ...) carry no ticket
+/// key, so a kind's entries all clear together when any of its results
+/// lands. See [`clear_in_flight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetActionKind {
+    /// [`Cmd::FetchTickets`].
+    FetchTickets,
+    /// [`Cmd::FetchAssignableUsers`].
+    FetchAssignableUsers,
+    /// [`Cmd::FetchTransitions`].
+    FetchTransitions,
+    /// [`Cmd::ApplyTransition`].
+    ApplyTransition,
+    /// [`Cmd::AssignTicket`].
+    Assign,
+    /// [`Cmd::RankTicket`].
+    Rank,
+    /// [`Cmd::FetchRankTickets`].
+    FetchRankTickets,
+    /// [`Cmd::FetchRetroTickets`].
+    FetchRetroTickets,
+    /// [`Cmd::ResolvePrForTicket`].
+    ResolvePrForTicket,
+    /// [`Cmd::ResolvePrForMerge`].
+    ResolvePrForMerge,
+    /// [`Cmd::MergePr`].
+    MergePr,
+}
+
+/// One network action currently out on the worker thread, tracked in
+/// [`App::in_flight`] between [`admit_net_cmds`] (which registers it) and
+/// [`clear_in_flight`] (which removes it when the result [`Msg`] lands).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    /// Which action class this entry is, matched by result `Msg`s.
+    pub kind: NetActionKind,
+    /// What makes this dispatch distinct within its kind (the ticket key,
+    /// or the fetch's query): a new `Cmd` is a duplicate -- and is dropped --
+    /// only when both `kind` and `dedup` match an entry already here, so
+    /// assigning a *different* ticket, or refetching under a *changed*
+    /// filter, still dispatches while an earlier action is out.
+    pub dedup: String,
+    /// Human-readable description for the status bar's pending indicator,
+    /// e.g. `assigning PROJ-1`.
+    pub label: String,
+}
+
+/// The [`InFlight`] entry `cmd` would register, or `None` for local
+/// commands, which are never tracked: only network commands leave the event
+/// loop's thread, so only they can be "still out" when the next keypress
+/// arrives.
+fn net_action(cmd: &Cmd) -> Option<InFlight> {
+    let entry = |kind, dedup: String, label: String| Some(InFlight { kind, dedup, label });
+    match cmd {
+        Cmd::FetchTickets { query } => entry(
+            NetActionKind::FetchTickets,
+            format!("{query:?}"),
+            "refreshing tickets".to_string(),
+        ),
+        Cmd::FetchAssignableUsers { .. } => entry(
+            NetActionKind::FetchAssignableUsers,
+            String::new(),
+            "loading assignees".to_string(),
+        ),
+        Cmd::FetchTransitions { key } => entry(
+            NetActionKind::FetchTransitions,
+            key.clone(),
+            format!("loading transitions for {key}"),
+        ),
+        Cmd::ApplyTransition { key, .. } => entry(
+            NetActionKind::ApplyTransition,
+            key.clone(),
+            format!("moving {key}"),
+        ),
+        Cmd::AssignTicket { key, .. } => entry(
+            NetActionKind::Assign,
+            key.clone(),
+            format!("assigning {key}"),
+        ),
+        Cmd::RankTicket { key, .. } => {
+            entry(NetActionKind::Rank, key.clone(), format!("ranking {key}"))
+        }
+        Cmd::FetchRankTickets { .. } => entry(
+            NetActionKind::FetchRankTickets,
+            String::new(),
+            "loading rank list".to_string(),
+        ),
+        Cmd::FetchRetroTickets { .. } => entry(
+            NetActionKind::FetchRetroTickets,
+            String::new(),
+            "loading retro list".to_string(),
+        ),
+        Cmd::ResolvePrForTicket { key, .. } => entry(
+            NetActionKind::ResolvePrForTicket,
+            key.clone(),
+            format!("resolving PR for {key}"),
+        ),
+        Cmd::ResolvePrForMerge { key } => entry(
+            NetActionKind::ResolvePrForMerge,
+            key.clone(),
+            format!("resolving PR for {key}"),
+        ),
+        Cmd::MergePr { key, number, .. } => entry(
+            NetActionKind::MergePr,
+            key.clone(),
+            format!("merging PR #{number} for {key}"),
+        ),
+        _ => None,
+    }
+}
+
+/// The [`NetActionKind`] whose in-flight entries `msg` completes, or `None`
+/// for messages that aren't a network action's result. Both outcomes of each
+/// action clear it -- a failure ends the round trip just as finally as a
+/// success does.
+fn cleared_kind(msg: &Msg) -> Option<NetActionKind> {
+    match msg {
+        Msg::TicketsLoaded(_) | Msg::TicketsFailed(_) => Some(NetActionKind::FetchTickets),
+        Msg::AssignableUsersLoaded(_) | Msg::AssignableUsersFailed(_) => {
+            Some(NetActionKind::FetchAssignableUsers)
+        }
+        Msg::TransitionsLoaded(_) | Msg::TransitionsFailed(_) => {
+            Some(NetActionKind::FetchTransitions)
+        }
+        Msg::TransitionApplied { .. } | Msg::TransitionFailed(_) => {
+            Some(NetActionKind::ApplyTransition)
+        }
+        Msg::AssignApplied { .. } | Msg::AssignFailed(_) => Some(NetActionKind::Assign),
+        Msg::RankApplied(_) | Msg::RankFailed(_) => Some(NetActionKind::Rank),
+        Msg::RankTicketsLoaded(_) | Msg::RankTicketsFailed(_) => {
+            Some(NetActionKind::FetchRankTickets)
+        }
+        Msg::RetroTicketsLoaded(_) | Msg::RetroTicketsFailed(_) => {
+            Some(NetActionKind::FetchRetroTickets)
+        }
+        Msg::BrowserOptionsResolved { .. } => Some(NetActionKind::ResolvePrForTicket),
+        Msg::MergePrResolved { .. } => Some(NetActionKind::ResolvePrForMerge),
+        Msg::MergePrResult { .. } => Some(NetActionKind::MergePr),
+        _ => None,
+    }
+}
+
+/// Remove every [`App::in_flight`] entry of the kind `msg` completes (see
+/// [`cleared_kind`]); a no-op for non-result messages.
+fn clear_in_flight(app: &mut App, msg: &Msg) {
+    if let Some(kind) = cleared_kind(msg) {
+        app.in_flight.retain(|entry| entry.kind != kind);
+    }
+}
+
+/// Gate `cmds` through [`App::in_flight`]: register an entry for every
+/// network command admitted, and drop a command whose `kind` + `dedup`
+/// already has one out -- re-pressing an action key while that action is in
+/// flight must not dispatch a duplicate provider call (GitHub issue #56).
+/// Local commands pass through untracked.
+///
+/// Public (unlike the rest of the in-flight machinery, which [`update`]
+/// applies itself) for the event loop's startup dispatch, which builds its
+/// initial `Cmd`s directly rather than through `update`.
+pub fn admit_net_cmds(app: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
+    let mut admitted = cmds;
+    admitted.retain(|cmd| {
+        let Some(action) = net_action(cmd) else {
+            return true;
+        };
+        if app
+            .in_flight
+            .iter()
+            .any(|entry| entry.kind == action.kind && entry.dedup == action.dedup)
+        {
+            return false;
+        }
+        app.in_flight.push(action);
+        true
+    });
+    admitted
+}
+
 /// Advance `app` in response to `msg`, returning the new state and any
 /// commands the caller should execute.
 ///
 /// Pure: performs no I/O. All failure-mode messages (`*Failed`) set
 /// `status_line` rather than panicking.
+///
+/// Wraps [`update_inner`] (the per-`Msg` reducer arms) with the in-flight
+/// network-action bookkeeping: a result `Msg` first clears its action's
+/// entries ([`clear_in_flight`]), and every emitted network `Cmd` is gated
+/// and registered through [`admit_net_cmds`] on the way out.
 pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
+    clear_in_flight(&mut app, &msg);
+    let (mut app, cmds) = update_inner(app, msg);
+    let cmds = admit_net_cmds(&mut app, cmds);
+    (app, cmds)
+}
+
+/// The per-[`Msg`] reducer arms of [`update`], which see already-cleared
+/// in-flight state and whose emitted `Cmd`s the wrapper gates afterward.
+fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
     match msg {
         Msg::Up => {
             move_up(&mut app);
@@ -2061,11 +2262,9 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
 /// prefetches PR data for every card.
 ///
 /// Sets `status_line` to `resolving PR for <key>...` before returning the
-/// `Cmd` -- the lookup is a blocking `gh pr list` call (bounded, but still
-/// synchronous inside the event loop; see
-/// [`crate::tui::event::resolve_pr_for_ticket`]'s doc comment), and
-/// `crate::tui::event::run_cmds` forces a redraw with this message on screen
-/// before running it, so the board never just looks hung while it waits.
+/// `Cmd` -- the lookup runs on the network worker thread (GitHub issue
+/// #56), so this message is on screen for the whole (bounded) wait via the
+/// event loop's ordinary draws.
 fn open_browser_action(mut app: App) -> (App, Vec<Cmd>) {
     if app.screen != Screen::Board {
         return (app, Vec::new());
@@ -2149,9 +2348,10 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 /// [`Screen::Board`] (GitHub issue #32). A no-op when no ticket is selected
 /// or another merge confirmation is already open. Mirrors
 /// [`open_browser_action`]'s shape exactly -- including the explicit screen
-/// check and the status-line message [`crate::tui::event::run_cmds`] redraws
-/// before the blocking `gh pr list` lookup -- because it reuses the same
-/// resolution path; only the follow-up message differs.
+/// check and the `resolving PR for <key>...` status line shown while the
+/// lookup is out on the worker -- because it reuses the same resolution
+/// path; only the follow-up message differs. Additionally inert while a
+/// confirmed merge for the same ticket is still in flight (see below).
 fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
     if app.screen != Screen::Board || app.merge_confirm.is_some() {
         return (app, Vec::new());
@@ -2160,6 +2360,18 @@ fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     let key = ticket.key.clone();
+    // The in-flight dedup gate can't cover this on its own: the merge out on
+    // the worker is a `MergePr`, while a second `M` press starts a
+    // `ResolvePrForMerge` -- a different kind -- whose resolution would
+    // re-open the confirmation overlay over a PR that is mid-merge.
+    if app
+        .in_flight
+        .iter()
+        .any(|entry| entry.kind == NetActionKind::MergePr && entry.dedup == key)
+    {
+        app.status_line = format!("merge for {key} already in flight");
+        return (app, Vec::new());
+    }
     app.status_line = format!("resolving PR for {key}...");
     (app, vec![Cmd::ResolvePrForMerge { key }])
 }
@@ -7279,5 +7491,230 @@ mod tests {
         assert_eq!(app.status_line, "db locked");
         assert_eq!(app.retro_tickets, vec![retro_row("PROJ-1")]);
         assert!(cmds.is_empty());
+    }
+
+    // In-flight network-action tracking (GitHub issue #56): `update` registers
+    // every network `Cmd` it emits, drops duplicates while one is out, and
+    // clears the registration when the action's result `Msg` lands.
+
+    #[test]
+    fn update_registers_an_in_flight_entry_for_a_network_cmd() {
+        let (app, cmds) = update(App::new(), Msg::Refresh);
+        assert!(matches!(cmds.as_slice(), [Cmd::FetchTickets { .. }]));
+        assert_eq!(app.in_flight.len(), 1);
+        assert_eq!(app.in_flight[0].kind, NetActionKind::FetchTickets);
+        assert_eq!(app.in_flight[0].label, "refreshing tickets");
+    }
+
+    #[test]
+    fn duplicate_network_cmd_is_dropped_while_in_flight() {
+        let (app, first) = update(App::new(), Msg::Refresh);
+        assert_eq!(first.len(), 1);
+        let (app, second) = update(app, Msg::Refresh);
+        assert!(
+            second.is_empty(),
+            "an identical fetch must not dispatch twice, got {second:?}"
+        );
+        assert_eq!(app.in_flight.len(), 1);
+    }
+
+    #[test]
+    fn result_msg_clears_the_in_flight_entry_and_allows_redispatch() {
+        let (app, _) = update(App::new(), Msg::Refresh);
+        let (app, _) = update(app, Msg::TicketsLoaded(Vec::new()));
+        assert!(app.in_flight.is_empty());
+        let (app, cmds) = update(app, Msg::Refresh);
+        assert!(matches!(cmds.as_slice(), [Cmd::FetchTickets { .. }]));
+        assert_eq!(app.in_flight.len(), 1);
+    }
+
+    #[test]
+    fn failure_msg_clears_the_in_flight_entry_too() {
+        let (app, _) = update(App::new(), Msg::Refresh);
+        let (app, _) = update(app, Msg::TicketsFailed("boom".to_string()));
+        assert!(app.in_flight.is_empty());
+    }
+
+    #[test]
+    fn fetch_with_a_different_query_still_dispatches() {
+        let mut app = App::new();
+        let cmds = admit_net_cmds(
+            &mut app,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::MyOpen,
+            }],
+        );
+        assert_eq!(cmds.len(), 1);
+        let cmds = admit_net_cmds(
+            &mut app,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::Unassigned {
+                    project_key: "PROJ".to_string(),
+                },
+            }],
+        );
+        assert_eq!(
+            cmds.len(),
+            1,
+            "a fetch under a changed filter must not be deduplicated away"
+        );
+        assert_eq!(app.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn same_action_on_a_different_ticket_still_dispatches() {
+        let mut app = App::new();
+        let assign = |key: &str| Cmd::AssignTicket {
+            key: key.to_string(),
+            choice: AssignChoice::Unassign,
+        };
+        assert_eq!(admit_net_cmds(&mut app, vec![assign("PROJ-1")]).len(), 1);
+        assert!(admit_net_cmds(&mut app, vec![assign("PROJ-1")]).is_empty());
+        assert_eq!(
+            admit_net_cmds(&mut app, vec![assign("PROJ-2")]).len(),
+            1,
+            "a different ticket's assign is not a duplicate"
+        );
+        assert_eq!(app.in_flight.len(), 2);
+        assert_eq!(app.in_flight[0].label, "assigning PROJ-1");
+    }
+
+    #[test]
+    fn every_network_result_msg_clears_its_kind() {
+        let cases: Vec<(Cmd, Msg)> = vec![
+            (
+                Cmd::FetchAssignableUsers {
+                    project: "PROJ".to_string(),
+                },
+                Msg::AssignableUsersFailed("x".to_string()),
+            ),
+            (
+                Cmd::FetchTransitions {
+                    key: "PROJ-1".to_string(),
+                },
+                Msg::TransitionsLoaded(Vec::new()),
+            ),
+            (
+                Cmd::ApplyTransition {
+                    key: "PROJ-1".to_string(),
+                    transition_id: "2".to_string(),
+                },
+                Msg::TransitionFailed("x".to_string()),
+            ),
+            (
+                Cmd::AssignTicket {
+                    key: "PROJ-1".to_string(),
+                    choice: AssignChoice::Unassign,
+                },
+                Msg::AssignFailed("x".to_string()),
+            ),
+            (
+                Cmd::RankTicket {
+                    key: "PROJ-1".to_string(),
+                    anchor: RankAnchor::Before("PROJ-2".to_string()),
+                },
+                Msg::RankFailed("x".to_string()),
+            ),
+            (
+                Cmd::FetchRankTickets {
+                    query: TicketQuery::Ranked {
+                        project_key: "PROJ".to_string(),
+                    },
+                },
+                Msg::RankTicketsFailed("x".to_string()),
+            ),
+            (
+                Cmd::FetchRetroTickets {
+                    query: TicketQuery::MyOpen,
+                },
+                Msg::RetroTicketsFailed("x".to_string()),
+            ),
+            (
+                Cmd::ResolvePrForTicket {
+                    key: "PROJ-1".to_string(),
+                    jira_url: "url".to_string(),
+                },
+                Msg::BrowserOptionsResolved {
+                    key: "PROJ-1".to_string(),
+                    jira_url: "url".to_string(),
+                    pr: None,
+                    note: None,
+                },
+            ),
+            (
+                Cmd::ResolvePrForMerge {
+                    key: "PROJ-1".to_string(),
+                },
+                Msg::MergePrResolved {
+                    key: "PROJ-1".to_string(),
+                    pr: None,
+                    repo_root: None,
+                    note: None,
+                },
+            ),
+            (
+                Cmd::MergePr {
+                    key: "PROJ-1".to_string(),
+                    number: 7,
+                    repo_root: std::path::PathBuf::from("/repo"),
+                },
+                Msg::MergePrResult {
+                    merged: false,
+                    message: "x".to_string(),
+                },
+            ),
+        ];
+        for (cmd, result) in cases {
+            let mut app = App::new();
+            let admitted = admit_net_cmds(&mut app, vec![cmd.clone()]);
+            assert_eq!(admitted.len(), 1, "{cmd:?} should be a network cmd");
+            assert_eq!(app.in_flight.len(), 1, "{cmd:?} should register");
+            let kind = app.in_flight[0].kind;
+            let (app, _) = update(app, result.clone());
+            // Some result arms legitimately dispatch a *new* network action
+            // (e.g. `RankFailed` refetches the rank list to resync with the
+            // server), so assert the completed kind cleared rather than the
+            // registry being empty.
+            assert!(
+                app.in_flight.iter().all(|entry| entry.kind != kind),
+                "{result:?} should clear {cmd:?}'s in-flight entry"
+            );
+        }
+    }
+
+    /// A second `M` press while the confirmed merge itself is still out on
+    /// the worker must not start a fresh PR resolution: with the overlay
+    /// already closed, that lookup would re-open the confirmation over a PR
+    /// that is mid-merge, teeing up a double merge.
+    #[test]
+    fn merge_action_is_inert_while_a_merge_for_the_ticket_is_in_flight() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        let admitted = admit_net_cmds(
+            &mut app,
+            vec![Cmd::MergePr {
+                key: "PROJ-1".to_string(),
+                number: 7,
+                repo_root: std::path::PathBuf::from("/repo"),
+            }],
+        );
+        assert_eq!(admitted.len(), 1);
+
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert!(
+            cmds.is_empty(),
+            "no PR resolution may start while the merge is out, got {cmds:?}"
+        );
+        assert_eq!(app.status_line, "merge for PROJ-1 already in flight");
+    }
+
+    #[test]
+    fn local_cmds_are_never_tracked_or_deduplicated() {
+        let mut app = App::new();
+        let cmds = admit_net_cmds(
+            &mut app,
+            vec![Cmd::LoadAuditStatus, Cmd::OpenUrl("u".to_string())],
+        );
+        assert_eq!(cmds.len(), 2);
+        assert!(app.in_flight.is_empty());
     }
 }

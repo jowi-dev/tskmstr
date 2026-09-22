@@ -446,7 +446,12 @@ pub struct LaneModelPrompt {
 /// parsing and the resume hint. Later phases (interactive shell-string
 /// rendering, telemetry deployment, session identity, pricing) add more
 /// methods here — see `docs/plans/agent-runner.md`'s phase list.
-pub trait AgentRunner {
+///
+/// `Sync` is a supertrait so a `&'static dyn AgentRunner` (the shape
+/// `main.rs`'s `agent_runner_for` hands out) can be shared with the board's
+/// network worker thread (GitHub issue #56). Every implementation is a
+/// stateless unit struct, so this costs nothing.
+pub trait AgentRunner: Sync {
     /// Short name, e.g. `"claude"` — branch-owner fallback and display.
     fn name(&self) -> &'static str;
 
