@@ -9,8 +9,6 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use tskmstr::agent::AgentRunner;
-use tskmstr::agent::claude::ClaudeRunner;
-use tskmstr::agent::opencode::OpencodeRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
@@ -291,20 +289,15 @@ fn ticket_provider_for(
     }
 }
 
-/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]), mirroring
-/// [`ticket_provider_for`]: the one factory that turns [`AgentKind`] into a
-/// live implementation, so nothing else outside config parsing needs to
-/// `match` on it (see `docs/plans/agent-runner.md` and GitHub issue #17).
-///
-/// The [`AgentKind::Claude`] arm leaks a freshly constructed [`ClaudeRunner`]
-/// to get a `&'static dyn AgentRunner` — [`ClaudeRunner`] is a zero-sized
-/// unit struct and `tm` is a short-lived CLI process, so leaking one costs
-/// nothing, the same trade [`ticket_provider_for`] makes for `ShellGhCli`.
+/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]). Delegates
+/// to [`tskmstr::agent::routing::runner_for`], the one factory that turns
+/// [`AgentKind`] into a live implementation (moved there for GitHub issue
+/// #54 so it lives next to the adapters it dispatches to, alongside the
+/// fallback-order selection logic `src/work/run.rs`'s lane-run path
+/// consults) — kept as a thin wrapper so every existing call site here is
+/// unchanged.
 fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
-    match config.agent {
-        AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
-        AgentKind::Opencode => Box::leak(Box::new(OpencodeRunner)),
-    }
+    tskmstr::agent::routing::runner_for(config.agent)
 }
 
 /// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
@@ -758,7 +751,7 @@ fn backend_identity_or_placeholder(config: Option<&Config>) -> tskmstr::config::
 fn agent_runner_or_default(config: Option<&Config>) -> &'static dyn AgentRunner {
     config
         .map(agent_runner_for)
-        .unwrap_or_else(|| Box::leak(Box::new(ClaudeRunner)))
+        .unwrap_or_else(|| tskmstr::agent::routing::runner_for(AgentKind::default()))
 }
 
 /// The default global/repo config paths for this machine and working

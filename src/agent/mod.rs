@@ -55,6 +55,7 @@ use crate::runs::pricing::ModelPrice;
 
 pub mod claude;
 pub mod opencode;
+pub mod routing;
 
 /// Quotes `s` as a single POSIX shell word: wraps it in single quotes,
 /// escaping any embedded single quote as `'\''`. Needed because
@@ -740,15 +741,18 @@ mod tests {
     /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
     /// `opencode` literal outside `src/agent/`, per
     /// `no_agent_literals_outside_the_adapter_module`'s doc comment.
+    ///
+    /// `src/main.rs` was in this list until GitHub issue #54 moved the one
+    /// `match` on `AgentKind` (`agent_runner_for`) into
+    /// `src/agent/routing.rs`, where it belongs alongside the adapters it
+    /// dispatches to — `main.rs` now only delegates, with no runner literal
+    /// of its own.
     const ALLOWLIST: &[&str] = &[
         // `AgentKind::Claude`/`AgentKind::Opencode` — ADR-0003's one-enum
         // rule (mirrored by `docs/decisions/0004-agent-runners.md`)
         // sanctions the discriminants living here, the same way
         // `BackendKind::Jira`/`Github` live in this same file.
         "src/config/mod.rs",
-        // `agent_runner_for`'s one `match` on `AgentKind` — the one factory
-        // dispatch site `docs/plans/agent-runner.md` calls for.
-        "src/main.rs",
     ];
 
     /// Recursively collects every `.rs` file under `dir`.
