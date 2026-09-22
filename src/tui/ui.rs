@@ -155,8 +155,30 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
 
 /// The status bar's left-hand text: the active filter — the board's
 /// assignee filter (when it isn't `Me`), or the watch screen's kind/scope
-/// view filters (GitHub issue #25) — prefixed onto `app.status_line`.
+/// view filters (GitHub issue #25) — prefixed onto `app.status_line`, with
+/// the pending indicator for in-flight network actions (GitHub issue #56)
+/// appended after both.
 fn status_line_text(app: &App) -> String {
+    let base = status_line_with_filter(app);
+    if app.in_flight.is_empty() {
+        return base;
+    }
+    let labels: Vec<&str> = app
+        .in_flight
+        .iter()
+        .map(|entry| entry.label.as_str())
+        .collect();
+    let pending = format!("working: {}", labels.join(", "));
+    if base.is_empty() {
+        pending
+    } else {
+        format!("{base}  |  {pending}")
+    }
+}
+
+/// [`status_line_text`] without the pending indicator: the active view
+/// filter prefixed onto `app.status_line`.
+fn status_line_with_filter(app: &App) -> String {
     let filter_text = if app.screen == Screen::Runs {
         let mut parts = Vec::new();
         if let Some(kind) = &app.runs_kind_filter {
@@ -2918,6 +2940,46 @@ mod tests {
     }
 
     /// GitHub issue #25 view controls: active kind/scope filters stay
+    /// GitHub issue #56: while network actions are out on the worker
+    /// thread, the status bar shows a pending indicator naming each one, so
+    /// an in-flight assign/transition/refresh is visible rather than
+    /// looking like a dropped keypress. It clears with the in-flight
+    /// entries themselves (see `crate::tui::app::clear_in_flight`).
+    #[test]
+    fn status_line_appends_pending_indicator_while_actions_are_in_flight() {
+        let mut app = App::new();
+        app.status_line = "Refreshing...".to_string();
+        app.in_flight = vec![
+            crate::tui::app::InFlight {
+                kind: crate::tui::app::NetActionKind::FetchTickets,
+                dedup: String::new(),
+                label: "refreshing tickets".to_string(),
+            },
+            crate::tui::app::InFlight {
+                kind: crate::tui::app::NetActionKind::Assign,
+                dedup: "PROJ-1".to_string(),
+                label: "assigning PROJ-1".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            status_line_text(&app),
+            "Refreshing...  |  working: refreshing tickets, assigning PROJ-1"
+        );
+    }
+
+    #[test]
+    fn pending_indicator_stands_alone_when_the_status_line_is_empty() {
+        let mut app = App::new();
+        app.in_flight = vec![crate::tui::app::InFlight {
+            kind: crate::tui::app::NetActionKind::Assign,
+            dedup: "PROJ-1".to_string(),
+            label: "assigning PROJ-1".to_string(),
+        }];
+
+        assert_eq!(status_line_text(&app), "working: assigning PROJ-1");
+    }
+
     /// visible as a status-bar prefix, mirroring the board's assignee-filter
     /// prefix, so the operator never mistakes a filtered view for the whole.
     #[test]
