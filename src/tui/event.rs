@@ -368,8 +368,11 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
     .with_hidden_lane_count(deps.hidden_lane_count)
     .with_status_on_merge(deps.status_on_merge.clone());
     let query = query_for_filter(&app.filter, &app.project_key);
-    app = run_cmds(
-        app,
+    // Registered through `admit_net_cmds` like every `update`-emitted
+    // command, so the initial fetch shows the pending indicator and can't
+    // be doubled by an early `r` press.
+    let initial = crate::tui::app::admit_net_cmds(
+        &mut app,
         vec![
             Cmd::FetchTickets { query },
             Cmd::ReapRuns,
@@ -378,11 +381,8 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
             Cmd::LoadBotWatchStatus,
             Cmd::LoadCleanupStatus,
         ],
-        &deps,
-        &net_tx,
-        &mut terminal,
-        &mut launches,
     );
+    app = run_cmds(app, initial, &deps, &net_tx, &mut terminal, &mut launches);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
