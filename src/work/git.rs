@@ -1706,7 +1706,137 @@ mod tests {
         assert_eq!(fetch_origin_args(), vec!["fetch", "--quiet", "origin"]);
     }
 
+    #[test]
+    fn rev_parse_args_dereferences_to_commit() {
+        assert_eq!(
+            rev_parse_args("origin/staging"),
+            vec!["rev-parse", "--verify", "origin/staging^{commit}"]
+        );
+    }
+
+    #[test]
+    fn is_ancestor_args_orders_ancestor_then_descendant() {
+        assert_eq!(
+            is_ancestor_args("main", "feature"),
+            vec!["merge-base", "--is-ancestor", "main", "feature"]
+        );
+    }
+
+    #[test]
+    fn rebase_onto_args_match() {
+        assert_eq!(
+            rebase_onto_args("origin/staging"),
+            vec!["rebase", "origin/staging"]
+        );
+    }
+
+    #[test]
+    fn push_force_with_lease_args_match() {
+        assert_eq!(
+            push_force_with_lease_args("jowi-dev/lane-1"),
+            vec!["push", "--force-with-lease", "origin", "jowi-dev/lane-1"]
+        );
+    }
+
+    #[test]
+    fn merge_ff_only_args_match() {
+        assert_eq!(
+            merge_ff_only_args("origin/staging"),
+            vec!["merge", "--ff-only", "origin/staging"]
+        );
+    }
+
+    #[test]
+    fn fetch_branch_to_local_args_uses_colon_refspec() {
+        assert_eq!(
+            fetch_branch_to_local_args("jowi-dev/lane-1"),
+            vec![
+                "fetch",
+                "--quiet",
+                "origin",
+                "jowi-dev/lane-1:jowi-dev/lane-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_branch_args_uses_force_delete() {
+        assert_eq!(
+            delete_branch_args("jowi-dev/lane-1"),
+            vec!["branch", "-D", "jowi-dev/lane-1"]
+        );
+    }
+
     // --- output-interpretation tests ---
+
+    #[test]
+    fn current_branch_trims_and_returns_branch_name() {
+        let branch = interpret_current_branch_output(Some(0), "jowi-dev/lane-1\n", "").unwrap();
+        assert_eq!(branch, "jowi-dev/lane-1");
+    }
+
+    #[test]
+    fn current_branch_empty_output_on_success_is_detached_head_error() {
+        let err = interpret_current_branch_output(Some(0), "\n", "").unwrap_err();
+        match err {
+            GitError::Command { stderr, .. } => assert!(stderr.contains("detached HEAD")),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_branch_failure_is_a_command_error() {
+        let err = interpret_current_branch_output(Some(128), "", "fatal: not a git repository")
+            .unwrap_err();
+        match err {
+            GitError::Command { stderr, .. } => assert!(stderr.contains("not a git repository")),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_paths_exist_resolves_relative_paths_against_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/rebase-merge")).unwrap();
+        assert!(rebase_paths_exist(
+            tmp.path(),
+            ".git/rebase-merge\n.git/rebase-apply\n"
+        ));
+    }
+
+    #[test]
+    fn rebase_paths_exist_false_when_neither_path_exists() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!rebase_paths_exist(
+            tmp.path(),
+            ".git/rebase-merge\n.git/rebase-apply\n"
+        ));
+    }
+
+    #[test]
+    fn rebase_paths_exist_handles_absolute_paths() {
+        let tmp = TempDir::new().unwrap();
+        let abs = tmp.path().join("rebase-merge");
+        std::fs::create_dir_all(&abs).unwrap();
+        assert!(rebase_paths_exist(
+            Path::new("/nonexistent"),
+            &abs.display().to_string()
+        ));
+    }
+
+    #[test]
+    fn parse_conflicted_files_splits_and_trims_lines() {
+        assert_eq!(
+            parse_conflicted_files("src/foo.rs\nsrc/bar.rs\n"),
+            vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_conflicted_files_empty_output_is_empty_vec() {
+        assert_eq!(parse_conflicted_files(""), Vec::<String>::new());
+        assert_eq!(parse_conflicted_files("\n"), Vec::<String>::new());
+    }
 
     #[test]
     fn repo_root_strips_trailing_dot_git() {
@@ -1893,6 +2023,165 @@ mod tests {
 
         assert!(!linked);
         assert!(!wt_path.join(".env.local").exists());
+    }
+
+    #[test]
+    fn fake_git_ops_returns_configured_current_branch() {
+        let fake = FakeGitOps::new().with_current_branch(Ok("jowi-dev/lane-1".to_string()));
+        assert_eq!(
+            fake.current_branch(Path::new("/wt")).unwrap(),
+            "jowi-dev/lane-1"
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_rev_parse_returns_configured_result_per_rev() {
+        let fake = FakeGitOps::new()
+            .with_rev_parse_result("main", Ok("abc123".to_string()))
+            .with_rev_parse_result("origin/main", Ok("def456".to_string()));
+
+        assert_eq!(fake.rev_parse(Path::new("/wt"), "main").unwrap(), "abc123");
+        assert_eq!(
+            fake.rev_parse(Path::new("/wt"), "origin/main").unwrap(),
+            "def456"
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_rev_parse_unconfigured_rev_is_an_error() {
+        let fake = FakeGitOps::new();
+        assert!(fake.rev_parse(Path::new("/wt"), "unknown").is_err());
+    }
+
+    #[test]
+    fn fake_git_ops_returns_configured_is_ancestor() {
+        let fake = FakeGitOps::new().with_is_ancestor_result(Ok(false));
+        assert!(
+            !fake
+                .is_ancestor(Path::new("/wt"), "main", "feature")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_records_rebase_onto_calls_and_logs() {
+        let fake = FakeGitOps::new();
+        fake.rebase_onto(Path::new("/wt"), "origin/staging")
+            .unwrap();
+
+        assert_eq!(
+            fake.rebase_onto_calls(),
+            vec![(PathBuf::from("/wt"), "origin/staging".to_string())]
+        );
+        assert_eq!(fake.call_log(), vec!["rebase_onto"]);
+    }
+
+    #[test]
+    fn fake_git_ops_rebase_onto_returns_configured_outcome() {
+        let fake = FakeGitOps::new().with_rebase_onto_result(Ok(RebaseOutcome::Conflicted));
+        assert_eq!(
+            fake.rebase_onto(Path::new("/wt"), "origin/staging")
+                .unwrap(),
+            RebaseOutcome::Conflicted
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_rebase_in_progress_sequence_repeats_last_entry() {
+        let fake = FakeGitOps::new().with_rebase_in_progress_sequence(vec![Ok(true), Ok(false)]);
+
+        assert!(fake.rebase_in_progress(Path::new("/wt")).unwrap());
+        assert!(!fake.rebase_in_progress(Path::new("/wt")).unwrap());
+        // Sequence exhausted: last entry (false) repeats.
+        assert!(!fake.rebase_in_progress(Path::new("/wt")).unwrap());
+        assert!(!fake.rebase_in_progress(Path::new("/wt")).unwrap());
+    }
+
+    #[test]
+    fn fake_git_ops_conflicted_files_sequence_repeats_last_entry() {
+        let fake = FakeGitOps::new().with_conflicted_files_sequence(vec![
+            Ok(vec!["src/foo.rs".to_string()]),
+            Ok(Vec::new()),
+        ]);
+
+        assert_eq!(
+            fake.conflicted_files(Path::new("/wt")).unwrap(),
+            vec!["src/foo.rs".to_string()]
+        );
+        assert_eq!(
+            fake.conflicted_files(Path::new("/wt")).unwrap(),
+            Vec::<String>::new()
+        );
+        // Sequence exhausted: last entry (empty) repeats.
+        assert_eq!(
+            fake.conflicted_files(Path::new("/wt")).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_records_push_force_with_lease_calls_and_logs() {
+        let fake = FakeGitOps::new();
+        fake.push_force_with_lease(Path::new("/wt"), "jowi-dev/lane-1")
+            .unwrap();
+
+        assert_eq!(
+            fake.push_force_with_lease_calls(),
+            vec![(PathBuf::from("/wt"), "jowi-dev/lane-1".to_string())]
+        );
+        assert_eq!(fake.call_log(), vec!["push_force_with_lease"]);
+    }
+
+    #[test]
+    fn fake_git_ops_push_force_with_lease_returns_configured_error() {
+        let fake = FakeGitOps::new().with_push_force_with_lease_result(Err(GitError::Command {
+            command: "git push".to_string(),
+            exit_code: Some(1),
+            stderr: "stale info".to_string(),
+        }));
+        assert!(
+            fake.push_force_with_lease(Path::new("/wt"), "branch")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fake_git_ops_records_merge_ff_only_calls_and_logs() {
+        let fake = FakeGitOps::new();
+        fake.merge_ff_only(Path::new("/wt"), "origin/staging")
+            .unwrap();
+
+        assert_eq!(
+            fake.merge_ff_only_calls(),
+            vec![(PathBuf::from("/wt"), "origin/staging".to_string())]
+        );
+        assert_eq!(fake.call_log(), vec!["merge_ff_only"]);
+    }
+
+    #[test]
+    fn fake_git_ops_records_fetch_branch_to_local_calls_and_logs() {
+        let fake = FakeGitOps::new();
+        fake.fetch_branch_to_local(Path::new("/wt"), "jowi-dev/lane-1")
+            .unwrap();
+
+        assert_eq!(
+            fake.fetch_branch_to_local_calls(),
+            vec![(PathBuf::from("/wt"), "jowi-dev/lane-1".to_string())]
+        );
+        assert_eq!(fake.call_log(), vec!["fetch_branch_to_local"]);
+    }
+
+    #[test]
+    fn fake_git_ops_records_delete_branch_calls_and_logs() {
+        let fake = FakeGitOps::new();
+        fake.delete_branch(Path::new("/wt"), "jowi-dev/lane-1")
+            .unwrap();
+
+        assert_eq!(
+            fake.delete_branch_calls(),
+            vec![(PathBuf::from("/wt"), "jowi-dev/lane-1".to_string())]
+        );
+        assert_eq!(fake.call_log(), vec!["delete_branch"]);
     }
 
     // --- ShellGitOps integration tests against a real temp git repo ---
@@ -2199,5 +2488,356 @@ mod tests {
             !output.status.success(),
             "expected no upstream to be configured after switch_new_branch"
         );
+    }
+
+    fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["add", name])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-q", "-m", message])
+            .status()
+            .unwrap();
+    }
+
+    fn checkout_new_branch(dir: &Path, branch: &str) {
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["checkout", "-q", "-b", branch])
+            .status()
+            .unwrap();
+    }
+
+    #[test]
+    fn shell_git_ops_current_branch_returns_checked_out_branch() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        checkout_new_branch(tmp.path(), "feature-branch");
+
+        let ops = ShellGitOps::new();
+        assert_eq!(ops.current_branch(tmp.path()).unwrap(), "feature-branch");
+    }
+
+    #[test]
+    fn shell_git_ops_current_branch_errors_on_detached_head() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "--detach", "HEAD"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        let err = ops.current_branch(tmp.path()).unwrap_err();
+        match err {
+            GitError::Command { stderr, .. } => assert!(stderr.contains("detached HEAD")),
+            other => panic!("expected Command error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_git_ops_rev_parse_resolves_head_to_full_sha() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+
+        let ops = ShellGitOps::new();
+        let sha = ops.rev_parse(tmp.path(), "HEAD").unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn shell_git_ops_rev_parse_fails_on_unknown_rev() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+
+        let ops = ShellGitOps::new();
+        let err = ops.rev_parse(tmp.path(), "not-a-real-rev").unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_git_ops_is_ancestor_true_and_false() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let base_sha = StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8(base_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        checkout_new_branch(tmp.path(), "ahead-branch");
+        commit_file(tmp.path(), "extra.txt", "extra\n", "add extra");
+
+        let ops = ShellGitOps::new();
+        assert!(
+            ops.is_ancestor(tmp.path(), &base_sha, "ahead-branch")
+                .unwrap()
+        );
+        assert!(
+            !ops.is_ancestor(tmp.path(), "ahead-branch", &base_sha)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_delete_branch_removes_local_branch() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["branch", "removable"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        assert!(ops.branch_exists_local(tmp.path(), "removable").unwrap());
+        ops.delete_branch(tmp.path(), "removable").unwrap();
+        assert!(!ops.branch_exists_local(tmp.path(), "removable").unwrap());
+    }
+
+    #[test]
+    fn shell_git_ops_merge_ff_only_fast_forwards() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        checkout_new_branch(tmp.path(), "feature-branch");
+        commit_file(tmp.path(), "feature.txt", "feature\n", "add feature");
+
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "main"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        ops.merge_ff_only(tmp.path(), "feature-branch").unwrap();
+        assert!(tmp.path().join("feature.txt").exists());
+    }
+
+    #[test]
+    fn shell_git_ops_fetch_branch_to_local_updates_non_checked_out_branch() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_init(&origin);
+
+        let clone = tmp.path().join("clone");
+        StdCommand::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&clone)
+            .status()
+            .unwrap();
+        // Clone starts checked out on `main`; create a second local branch
+        // `main-copy` pointing at the same commit so we have a
+        // non-checked-out local branch whose *remote-tracking name* we
+        // control via an explicit refspec below.
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["branch", "side-branch"])
+            .status()
+            .unwrap();
+
+        commit_file(&origin, "upstream.txt", "upstream\n", "advance origin main");
+        // Push origin's advanced main onto a differently-named remote branch
+        // so we can fast-forward the clone's non-checked-out `side-branch`
+        // local ref to it by name.
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["branch", "-f", "side-branch", "main"])
+            .status()
+            .unwrap();
+
+        let before = StdCommand::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["rev-parse", "side-branch"])
+            .output()
+            .unwrap();
+        let before = String::from_utf8(before.stdout).unwrap().trim().to_string();
+
+        let ops = ShellGitOps::new();
+        ops.fetch_branch_to_local(&clone, "side-branch").unwrap();
+
+        let after = StdCommand::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["rev-parse", "side-branch"])
+            .output()
+            .unwrap();
+        let after = String::from_utf8(after.stdout).unwrap().trim().to_string();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn shell_git_ops_fetch_branch_to_local_fails_when_branch_is_checked_out() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_init(&origin);
+
+        let clone = tmp.path().join("clone");
+        StdCommand::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&clone)
+            .status()
+            .unwrap();
+
+        commit_file(&origin, "upstream.txt", "upstream\n", "advance origin main");
+
+        let ops = ShellGitOps::new();
+        // `main` is checked out in `clone`, so this must fail.
+        let err = ops.fetch_branch_to_local(&clone, "main").unwrap_err();
+        assert!(matches!(err, GitError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_git_ops_push_force_with_lease_updates_remote() {
+        let tmp = TempDir::new().unwrap();
+        let origin_bare = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin_bare).unwrap();
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(&origin_bare)
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .status()
+            .unwrap();
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_init(&work);
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["remote", "add", "origin"])
+            .arg(&origin_bare)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["push", "-q", "-u", "origin", "main"])
+            .status()
+            .unwrap();
+
+        commit_file(&work, "more.txt", "more\n", "add more");
+
+        let ops = ShellGitOps::new();
+        ops.push_force_with_lease(&work, "main").unwrap();
+
+        let remote_sha = StdCommand::new("git")
+            .arg("-C")
+            .arg(&origin_bare)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        let remote_sha = String::from_utf8(remote_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let local_sha = StdCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        let local_sha = String::from_utf8(local_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(remote_sha, local_sha);
+    }
+
+    #[test]
+    fn shell_git_ops_rebase_onto_completes_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        checkout_new_branch(tmp.path(), "feature-branch");
+        commit_file(tmp.path(), "feature.txt", "feature\n", "add feature");
+
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "main"])
+            .status()
+            .unwrap();
+        commit_file(tmp.path(), "main-extra.txt", "main extra\n", "advance main");
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "feature-branch"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        let outcome = ops.rebase_onto(tmp.path(), "main").unwrap();
+        assert_eq!(outcome, RebaseOutcome::Completed);
+        assert!(!ops.rebase_in_progress(tmp.path()).unwrap());
+        assert!(tmp.path().join("main-extra.txt").exists());
+        assert!(tmp.path().join("feature.txt").exists());
+    }
+
+    #[test]
+    fn shell_git_ops_rebase_onto_conflict_leaves_rebase_in_progress_with_conflicted_files() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        // Both branches edit README.md's first line differently from the
+        // same base, guaranteeing a conflict on rebase.
+        commit_file(tmp.path(), "README.md", "base\n", "base content");
+
+        checkout_new_branch(tmp.path(), "feature-branch");
+        commit_file(tmp.path(), "README.md", "feature change\n", "feature edit");
+
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "main"])
+            .status()
+            .unwrap();
+        commit_file(tmp.path(), "README.md", "main change\n", "main edit");
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "feature-branch"])
+            .status()
+            .unwrap();
+
+        let ops = ShellGitOps::new();
+        let outcome = ops.rebase_onto(tmp.path(), "main").unwrap();
+        assert_eq!(outcome, RebaseOutcome::Conflicted);
+        assert!(ops.rebase_in_progress(tmp.path()).unwrap());
+
+        let conflicted = ops.conflicted_files(tmp.path()).unwrap();
+        assert_eq!(conflicted, vec!["README.md".to_string()]);
+
+        // Abort and verify rebase_in_progress reports false again.
+        StdCommand::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["rebase", "--abort"])
+            .status()
+            .unwrap();
+        assert!(!ops.rebase_in_progress(tmp.path()).unwrap());
     }
 }
