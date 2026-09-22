@@ -1031,6 +1031,15 @@ pub struct FakeGitOps {
     remove_worktree_result: std::cell::RefCell<Result<(), GitError>>,
     fetch_origin_result: std::cell::RefCell<Result<(), GitError>>,
     current_branch_result: std::cell::RefCell<Result<String, GitError>>,
+    /// Per-`dir` overrides for `current_branch`, consulted before
+    /// `current_branch_result`'s single blanket answer — same rationale as
+    /// [`Self::is_worktree_by_path`]: `crate::work::merge`'s checkout
+    /// resolution probes several candidate directories in priority order,
+    /// and a fake that can only ever give one fixed answer for every path
+    /// cannot distinguish which candidate matched. See
+    /// [`Self::with_current_branch_for`].
+    current_branch_by_path:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<String, GitError>>>,
     rev_parse_results:
         std::cell::RefCell<std::collections::HashMap<String, Result<String, GitError>>>,
     is_ancestor_result: std::cell::RefCell<Result<bool, GitError>>,
@@ -1094,6 +1103,7 @@ impl Default for FakeGitOps {
             remove_worktree_result: std::cell::RefCell::new(Ok(())),
             fetch_origin_result: std::cell::RefCell::new(Ok(())),
             current_branch_result: std::cell::RefCell::new(Ok("main".to_string())),
+            current_branch_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             rev_parse_results: std::cell::RefCell::new(std::collections::HashMap::new()),
             is_ancestor_result: std::cell::RefCell::new(Ok(true)),
             rebase_onto_result: std::cell::RefCell::new(Ok(RebaseOutcome::Completed)),
@@ -1276,6 +1286,20 @@ impl FakeGitOps {
     /// Set the result `current_branch` will return.
     pub fn with_current_branch(self, result: Result<String, GitError>) -> Self {
         *self.current_branch_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `current_branch(dir)` to return `result` for that specific
+    /// `dir`, consulted before the blanket [`Self::with_current_branch`]
+    /// answer. See [`Self::current_branch_by_path`]'s doc comment.
+    pub fn with_current_branch_for(
+        self,
+        dir: impl Into<PathBuf>,
+        result: Result<String, GitError>,
+    ) -> Self {
+        self.current_branch_by_path
+            .borrow_mut()
+            .insert(dir.into(), result);
         self
     }
 
@@ -1496,7 +1520,10 @@ impl GitOps for FakeGitOps {
         self.fetch_origin_result.borrow().clone()
     }
 
-    fn current_branch(&self, _dir: &Path) -> Result<String, GitError> {
+    fn current_branch(&self, dir: &Path) -> Result<String, GitError> {
+        if let Some(result) = self.current_branch_by_path.borrow().get(dir) {
+            return result.clone();
+        }
         self.current_branch_result.borrow().clone()
     }
 
