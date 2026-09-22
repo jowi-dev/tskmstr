@@ -163,6 +163,107 @@ pub trait GitOps {
     /// decides to warn and continue rather than abort, matching `work.ml`'s
     /// tolerance but with a printed warning instead of silence.
     fn fetch_origin(&self, dir: &Path) -> Result<(), GitError>;
+
+    /// The branch currently checked out in the working tree at `dir`
+    /// (`git branch --show-current`), trimmed.
+    ///
+    /// A detached `HEAD` makes `git branch --show-current` succeed with
+    /// empty output; this method treats that as an error
+    /// (`GitError::Command` with `exit_code: Some(0)` and a stderr message
+    /// noting the detached `HEAD`) rather than returning an empty string,
+    /// since every caller of this method needs an actual branch name to act
+    /// on.
+    fn current_branch(&self, dir: &Path) -> Result<String, GitError>;
+
+    /// Resolve `rev` to the full SHA of the commit it names
+    /// (`git rev-parse --verify <rev>^{commit}`), trimmed. The `^{commit}`
+    /// suffix ensures a tag or other non-commit object dereferences to the
+    /// commit it points at, and makes an invalid/unknown `rev` fail loudly
+    /// instead of silently resolving to something unexpected.
+    fn rev_parse(&self, dir: &Path, rev: &str) -> Result<String, GitError>;
+
+    /// Whether `ancestor` is an ancestor of (or equal to) `descendant`
+    /// (`git merge-base --is-ancestor <ancestor> <descendant>`). Exit code 0
+    /// means yes, exit code 1 means no (and is `Ok(false)`, not an error —
+    /// same not-found-is-not-an-error convention as
+    /// [`GitOps::branch_exists_local`]); any other exit code is a
+    /// [`GitError::Command`].
+    fn is_ancestor(&self, dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError>;
+
+    /// Rebase the current branch in the working tree at `dir` onto `onto`
+    /// (`git rebase <onto>`).
+    ///
+    /// On a clean rebase, returns `Ok(RebaseOutcome::Completed)`. On a
+    /// non-zero exit, checks whether a rebase is now in progress on disk
+    /// (via the same detection [`GitOps::rebase_in_progress`] uses): if so,
+    /// returns `Ok(RebaseOutcome::Conflicted)` and **leaves the rebase in
+    /// progress on disk** — the caller is responsible for inspecting
+    /// [`GitOps::conflicted_files`] and eventually resolving, continuing, or
+    /// aborting the rebase. If no rebase is in progress despite the
+    /// non-zero exit (some other failure), returns the usual
+    /// [`GitError::Command`].
+    fn rebase_onto(&self, dir: &Path, onto: &str) -> Result<RebaseOutcome, GitError>;
+
+    /// Whether a rebase is currently in progress in the working tree at
+    /// `dir` (`git rev-parse --git-path rebase-merge --git-path
+    /// rebase-apply`, then checking whether either resulting path exists on
+    /// disk). Paths `git rev-parse --git-path` prints may be relative; this
+    /// method resolves them against `dir` when they are.
+    fn rebase_in_progress(&self, dir: &Path) -> Result<bool, GitError>;
+
+    /// The paths with unresolved merge conflicts in the working tree at
+    /// `dir` (`git diff --name-only --diff-filter=U`), one per line,
+    /// trimmed. Empty output is an empty vec, not an error.
+    fn conflicted_files(&self, dir: &Path) -> Result<Vec<String>, GitError>;
+
+    /// Force-push `branch` to `origin` with lease protection
+    /// (`git push --force-with-lease origin <branch>`), used after a
+    /// successful rebase to update the remote branch's history.
+    ///
+    /// Like [`GitOps::fetch_origin`], this has no timeout of its own and
+    /// blocks unboundedly on the network — see that method's doc comment
+    /// for why this trait does not invent a timeout mechanism.
+    fn push_force_with_lease(&self, dir: &Path, branch: &str) -> Result<(), GitError>;
+
+    /// Fast-forward-merge `reference` into the current branch in the
+    /// working tree at `dir` (`git merge --ff-only <reference>`). Fails
+    /// (as a [`GitError::Command`]) if the merge would not be a fast
+    /// forward.
+    fn merge_ff_only(&self, dir: &Path, reference: &str) -> Result<(), GitError>;
+
+    /// Fast-forward a *local* branch that is not checked out anywhere, to
+    /// match its remote counterpart (`git fetch --quiet origin
+    /// <branch>:<branch>`).
+    ///
+    /// This updates the *local* ref `branch` directly, without touching the
+    /// working tree — which is exactly why it only works when `branch` is
+    /// not currently checked out: git refuses to write to a checked-out
+    /// branch's ref this way, and that refusal surfaces as the usual
+    /// [`GitError::Command`].
+    fn fetch_branch_to_local(&self, dir: &Path, branch: &str) -> Result<(), GitError>;
+
+    /// Delete the local branch `branch` (`git branch -D <branch>`).
+    ///
+    /// **Caller contract:** only call this after verifying `branch`'s tip
+    /// is already pushed/merged to its remote counterpart — the merge flow
+    /// does this by checking `rev_parse(dir, branch) ==
+    /// rev_parse(dir, "origin/<branch>")` before deleting. This uses the
+    /// force form (`-D`) rather than `-d` because squash-merge and
+    /// merge-commit strategies leave the source branch's tip without a
+    /// fast-forward relationship to the target, which `-d` refuses to
+    /// delete even though the branch's work has been fully incorporated
+    /// upstream.
+    fn delete_branch(&self, dir: &Path, branch: &str) -> Result<(), GitError>;
+}
+
+/// The outcome of [`GitOps::rebase_onto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// The rebase completed cleanly.
+    Completed,
+    /// The rebase stopped on a conflict and is left in progress on disk;
+    /// see [`GitOps::rebase_onto`]'s doc comment.
+    Conflicted,
 }
 
 /// [`GitOps`] implementation that shells out to the real `git` binary.
@@ -424,6 +525,158 @@ impl GitOps for ShellGitOps {
             &output.stderr,
         )
     }
+
+    fn current_branch(&self, dir: &Path) -> Result<String, GitError> {
+        let output = run_git(
+            dir,
+            &["branch".to_string(), "--show-current".to_string()],
+            "git branch --show-current",
+        )?;
+
+        interpret_current_branch_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn rev_parse(&self, dir: &Path, rev: &str) -> Result<String, GitError> {
+        let output = run_git(dir, &rev_parse_args(rev), "git rev-parse --verify")?;
+
+        match output.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&output.stdout).trim().to_string()),
+            code => Err(GitError::Command {
+                command: "git rev-parse --verify".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn is_ancestor(&self, dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        let output = run_git(
+            dir,
+            &is_ancestor_args(ancestor, descendant),
+            "git merge-base --is-ancestor",
+        )?;
+
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(GitError::Command {
+                command: "git merge-base --is-ancestor".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn rebase_onto(&self, dir: &Path, onto: &str) -> Result<RebaseOutcome, GitError> {
+        let output = run_git(dir, &rebase_onto_args(onto), "git rebase")?;
+
+        if output.status.success() {
+            return Ok(RebaseOutcome::Completed);
+        }
+
+        if self.rebase_in_progress(dir)? {
+            return Ok(RebaseOutcome::Conflicted);
+        }
+
+        Err(GitError::Command {
+            command: "git rebase".to_string(),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn rebase_in_progress(&self, dir: &Path) -> Result<bool, GitError> {
+        let output = run_git(
+            dir,
+            &[
+                "rev-parse".to_string(),
+                "--git-path".to_string(),
+                "rebase-merge".to_string(),
+                "--git-path".to_string(),
+                "rebase-apply".to_string(),
+            ],
+            "git rev-parse --git-path",
+        )?;
+
+        match output.status.code() {
+            Some(0) => Ok(rebase_paths_exist(
+                dir,
+                &String::from_utf8_lossy(&output.stdout),
+            )),
+            code => Err(GitError::Command {
+                command: "git rev-parse --git-path".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn conflicted_files(&self, dir: &Path) -> Result<Vec<String>, GitError> {
+        let output = run_git(
+            dir,
+            &[
+                "diff".to_string(),
+                "--name-only".to_string(),
+                "--diff-filter=U".to_string(),
+            ],
+            "git diff --name-only --diff-filter=U",
+        )?;
+
+        match output.status.code() {
+            Some(0) => Ok(parse_conflicted_files(&String::from_utf8_lossy(
+                &output.stdout,
+            ))),
+            code => Err(GitError::Command {
+                command: "git diff --name-only --diff-filter=U".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn push_force_with_lease(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        let output = run_git(
+            dir,
+            &push_force_with_lease_args(branch),
+            "git push --force-with-lease origin",
+        )?;
+        interpret_success_or_command_error(
+            "git push --force-with-lease origin",
+            output.status.code(),
+            &output.stderr,
+        )
+    }
+
+    fn merge_ff_only(&self, dir: &Path, reference: &str) -> Result<(), GitError> {
+        let output = run_git(dir, &merge_ff_only_args(reference), "git merge --ff-only")?;
+        interpret_success_or_command_error(
+            "git merge --ff-only",
+            output.status.code(),
+            &output.stderr,
+        )
+    }
+
+    fn fetch_branch_to_local(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        let output = run_git(
+            dir,
+            &fetch_branch_to_local_args(branch),
+            "git fetch --quiet origin <branch>:<branch>",
+        )?;
+        interpret_success_or_command_error(
+            "git fetch --quiet origin <branch>:<branch>",
+            output.status.code(),
+            &output.stderr,
+        )
+    }
+
+    fn delete_branch(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        let output = run_git(dir, &delete_branch_args(branch), "git branch -D")?;
+        interpret_success_or_command_error("git branch -D", output.status.code(), &output.stderr)
+    }
 }
 
 /// Whether `toplevel` (the output of `git rev-parse --show-toplevel` run
@@ -581,6 +834,128 @@ fn interpret_repo_root_output(
     }
 }
 
+/// Build the argument list for `git rev-parse --verify <rev>^{commit}`.
+fn rev_parse_args(rev: &str) -> Vec<String> {
+    vec![
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        format!("{rev}^{{commit}}"),
+    ]
+}
+
+/// Build the argument list for `git merge-base --is-ancestor <ancestor>
+/// <descendant>`.
+fn is_ancestor_args(ancestor: &str, descendant: &str) -> Vec<String> {
+    vec![
+        "merge-base".to_string(),
+        "--is-ancestor".to_string(),
+        ancestor.to_string(),
+        descendant.to_string(),
+    ]
+}
+
+/// Build the argument list for `git rebase <onto>`.
+fn rebase_onto_args(onto: &str) -> Vec<String> {
+    vec!["rebase".to_string(), onto.to_string()]
+}
+
+/// Build the argument list for `git push --force-with-lease origin
+/// <branch>`.
+fn push_force_with_lease_args(branch: &str) -> Vec<String> {
+    vec![
+        "push".to_string(),
+        "--force-with-lease".to_string(),
+        "origin".to_string(),
+        branch.to_string(),
+    ]
+}
+
+/// Build the argument list for `git merge --ff-only <reference>`.
+fn merge_ff_only_args(reference: &str) -> Vec<String> {
+    vec![
+        "merge".to_string(),
+        "--ff-only".to_string(),
+        reference.to_string(),
+    ]
+}
+
+/// Build the argument list for `git fetch --quiet origin <branch>:<branch>`,
+/// which fast-forwards the local, non-checked-out `branch` ref directly.
+/// See [`GitOps::fetch_branch_to_local`].
+fn fetch_branch_to_local_args(branch: &str) -> Vec<String> {
+    vec![
+        "fetch".to_string(),
+        "--quiet".to_string(),
+        "origin".to_string(),
+        format!("{branch}:{branch}"),
+    ]
+}
+
+/// Build the argument list for `git branch -D <branch>`.
+fn delete_branch_args(branch: &str) -> Vec<String> {
+    vec!["branch".to_string(), "-D".to_string(), branch.to_string()]
+}
+
+/// Interpret the result of a `git branch --show-current` invocation. Empty
+/// stdout on a successful exit means a detached `HEAD`, which is treated as
+/// an error — see [`GitOps::current_branch`].
+fn interpret_current_branch_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String, GitError> {
+    match exit_code {
+        Some(0) => {
+            let branch = stdout.trim().to_string();
+            if branch.is_empty() {
+                Err(GitError::Command {
+                    command: "git branch --show-current".to_string(),
+                    exit_code: Some(0),
+                    stderr: "detached HEAD: no current branch".to_string(),
+                })
+            } else {
+                Ok(branch)
+            }
+        }
+        code => Err(GitError::Command {
+            command: "git branch --show-current".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Parse the output of `git rev-parse --git-path rebase-merge --git-path
+/// rebase-apply` (one path per line) and report whether either path exists
+/// on disk, resolving relative paths against `dir` — see
+/// [`GitOps::rebase_in_progress`].
+fn rebase_paths_exist(dir: &Path, stdout: &str) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .any(|line| {
+            let path = Path::new(line);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            };
+            resolved.exists()
+        })
+}
+
+/// Parse the output of `git diff --name-only --diff-filter=U` into a list of
+/// conflicted file paths, trimmed, dropping empty lines.
+fn parse_conflicted_files(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Shared success/failure interpretation for commands whose output carries
 /// no information beyond "it worked", mirroring the same helper in
 /// `crate::github::gh_cli`.
@@ -655,6 +1030,25 @@ pub struct FakeGitOps {
     default_base_result: std::cell::RefCell<Result<String, GitError>>,
     remove_worktree_result: std::cell::RefCell<Result<(), GitError>>,
     fetch_origin_result: std::cell::RefCell<Result<(), GitError>>,
+    current_branch_result: std::cell::RefCell<Result<String, GitError>>,
+    rev_parse_results:
+        std::cell::RefCell<std::collections::HashMap<String, Result<String, GitError>>>,
+    is_ancestor_result: std::cell::RefCell<Result<bool, GitError>>,
+    rebase_onto_result: std::cell::RefCell<Result<RebaseOutcome, GitError>>,
+    /// Sequenced answers for `rebase_in_progress`, consumed one per call;
+    /// the last entry repeats once exhausted. See
+    /// [`Self::with_rebase_in_progress_sequence`].
+    rebase_in_progress_sequence: std::cell::RefCell<Vec<Result<bool, GitError>>>,
+    rebase_in_progress_index: std::cell::RefCell<usize>,
+    /// Sequenced answers for `conflicted_files`, consumed one per call; the
+    /// last entry repeats once exhausted. See
+    /// [`Self::with_conflicted_files_sequence`].
+    conflicted_files_sequence: std::cell::RefCell<Vec<Result<Vec<String>, GitError>>>,
+    conflicted_files_index: std::cell::RefCell<usize>,
+    push_force_with_lease_result: std::cell::RefCell<Result<(), GitError>>,
+    merge_ff_only_result: std::cell::RefCell<Result<(), GitError>>,
+    fetch_branch_to_local_result: std::cell::RefCell<Result<(), GitError>>,
+    delete_branch_result: std::cell::RefCell<Result<(), GitError>>,
 
     branch_exists_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     branch_exists_remote_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
@@ -662,6 +1056,11 @@ pub struct FakeGitOps {
     switch_new_branch_calls: std::cell::RefCell<Vec<SwitchNewBranchCall>>,
     remove_worktree_calls: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
     fetch_origin_calls: std::cell::RefCell<Vec<PathBuf>>,
+    rebase_onto_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    push_force_with_lease_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    merge_ff_only_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    fetch_branch_to_local_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
+    delete_branch_calls: std::cell::RefCell<Vec<(PathBuf, String)>>,
     config_values: std::cell::RefCell<std::collections::HashMap<String, String>>,
     /// Branch names that report as existing (both `branch_exists_local` and
     /// `branch_exists_remote`) regardless of those methods' blanket
@@ -694,12 +1093,29 @@ impl Default for FakeGitOps {
             default_base_result: std::cell::RefCell::new(Ok("origin/main".to_string())),
             remove_worktree_result: std::cell::RefCell::new(Ok(())),
             fetch_origin_result: std::cell::RefCell::new(Ok(())),
+            current_branch_result: std::cell::RefCell::new(Ok("main".to_string())),
+            rev_parse_results: std::cell::RefCell::new(std::collections::HashMap::new()),
+            is_ancestor_result: std::cell::RefCell::new(Ok(true)),
+            rebase_onto_result: std::cell::RefCell::new(Ok(RebaseOutcome::Completed)),
+            rebase_in_progress_sequence: std::cell::RefCell::new(vec![Ok(false)]),
+            rebase_in_progress_index: std::cell::RefCell::new(0),
+            conflicted_files_sequence: std::cell::RefCell::new(vec![Ok(Vec::new())]),
+            conflicted_files_index: std::cell::RefCell::new(0),
+            push_force_with_lease_result: std::cell::RefCell::new(Ok(())),
+            merge_ff_only_result: std::cell::RefCell::new(Ok(())),
+            fetch_branch_to_local_result: std::cell::RefCell::new(Ok(())),
+            delete_branch_result: std::cell::RefCell::new(Ok(())),
             branch_exists_local_calls: std::cell::RefCell::new(Vec::new()),
             branch_exists_remote_calls: std::cell::RefCell::new(Vec::new()),
             provision_worktree_calls: std::cell::RefCell::new(Vec::new()),
             switch_new_branch_calls: std::cell::RefCell::new(Vec::new()),
             remove_worktree_calls: std::cell::RefCell::new(Vec::new()),
             fetch_origin_calls: std::cell::RefCell::new(Vec::new()),
+            rebase_onto_calls: std::cell::RefCell::new(Vec::new()),
+            push_force_with_lease_calls: std::cell::RefCell::new(Vec::new()),
+            merge_ff_only_calls: std::cell::RefCell::new(Vec::new()),
+            fetch_branch_to_local_calls: std::cell::RefCell::new(Vec::new()),
+            delete_branch_calls: std::cell::RefCell::new(Vec::new()),
             config_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             existing_branches: std::cell::RefCell::new(std::collections::HashSet::new()),
             call_log: std::cell::RefCell::new(Vec::new()),
@@ -856,6 +1272,128 @@ impl FakeGitOps {
             .insert(key.into(), value.into());
         self
     }
+
+    /// Set the result `current_branch` will return.
+    pub fn with_current_branch(self, result: Result<String, GitError>) -> Self {
+        *self.current_branch_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `rev_parse(_, rev)` to return `result` for that specific
+    /// `rev` string. A `rev` with no configured result returns a
+    /// [`GitError::Command`] (mirroring `git rev-parse --verify` failing on
+    /// an unknown rev), unless [`Self::with_rev_parse_default`] set a
+    /// fallback.
+    pub fn with_rev_parse_result(
+        self,
+        rev: impl Into<String>,
+        result: Result<String, GitError>,
+    ) -> Self {
+        self.rev_parse_results
+            .borrow_mut()
+            .insert(rev.into(), result);
+        self
+    }
+
+    /// Set the result `is_ancestor` will return.
+    pub fn with_is_ancestor_result(self, result: Result<bool, GitError>) -> Self {
+        *self.is_ancestor_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `rebase_onto` will return.
+    pub fn with_rebase_onto_result(self, result: Result<RebaseOutcome, GitError>) -> Self {
+        *self.rebase_onto_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `rebase_in_progress` to return each element of `sequence`
+    /// in order, one per call, repeating the last element once the sequence
+    /// is exhausted. Lets a test model a poll loop, e.g. `[Ok(true),
+    /// Ok(false)]` for "conflicted once, then resolved".
+    ///
+    /// Panics if `sequence` is empty — a fake with nothing to answer isn't
+    /// meaningfully configured.
+    pub fn with_rebase_in_progress_sequence(self, sequence: Vec<Result<bool, GitError>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_rebase_in_progress_sequence requires at least one entry"
+        );
+        *self.rebase_in_progress_sequence.borrow_mut() = sequence;
+        *self.rebase_in_progress_index.borrow_mut() = 0;
+        self
+    }
+
+    /// Configure `conflicted_files` to return each element of `sequence` in
+    /// order, one per call, repeating the last element once the sequence is
+    /// exhausted. See [`Self::with_rebase_in_progress_sequence`] for the
+    /// same pattern.
+    ///
+    /// Panics if `sequence` is empty.
+    pub fn with_conflicted_files_sequence(
+        self,
+        sequence: Vec<Result<Vec<String>, GitError>>,
+    ) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_conflicted_files_sequence requires at least one entry"
+        );
+        *self.conflicted_files_sequence.borrow_mut() = sequence;
+        *self.conflicted_files_index.borrow_mut() = 0;
+        self
+    }
+
+    /// Set the result `push_force_with_lease` will return.
+    pub fn with_push_force_with_lease_result(self, result: Result<(), GitError>) -> Self {
+        *self.push_force_with_lease_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `merge_ff_only` will return.
+    pub fn with_merge_ff_only_result(self, result: Result<(), GitError>) -> Self {
+        *self.merge_ff_only_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `fetch_branch_to_local` will return.
+    pub fn with_fetch_branch_to_local_result(self, result: Result<(), GitError>) -> Self {
+        *self.fetch_branch_to_local_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `delete_branch` will return.
+    pub fn with_delete_branch_result(self, result: Result<(), GitError>) -> Self {
+        *self.delete_branch_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(dir, onto)` pairs passed to `rebase_onto`, in call order.
+    pub fn rebase_onto_calls(&self) -> Vec<(PathBuf, String)> {
+        self.rebase_onto_calls.borrow().clone()
+    }
+
+    /// The `(dir, branch)` pairs passed to `push_force_with_lease`, in call
+    /// order.
+    pub fn push_force_with_lease_calls(&self) -> Vec<(PathBuf, String)> {
+        self.push_force_with_lease_calls.borrow().clone()
+    }
+
+    /// The `(dir, reference)` pairs passed to `merge_ff_only`, in call
+    /// order.
+    pub fn merge_ff_only_calls(&self) -> Vec<(PathBuf, String)> {
+        self.merge_ff_only_calls.borrow().clone()
+    }
+
+    /// The `(dir, branch)` pairs passed to `fetch_branch_to_local`, in call
+    /// order.
+    pub fn fetch_branch_to_local_calls(&self) -> Vec<(PathBuf, String)> {
+        self.fetch_branch_to_local_calls.borrow().clone()
+    }
+
+    /// The `(dir, branch)` pairs passed to `delete_branch`, in call order.
+    pub fn delete_branch_calls(&self) -> Vec<(PathBuf, String)> {
+        self.delete_branch_calls.borrow().clone()
+    }
 }
 
 impl GitOps for FakeGitOps {
@@ -957,6 +1495,103 @@ impl GitOps for FakeGitOps {
         self.fetch_origin_calls.borrow_mut().push(dir.to_path_buf());
         self.fetch_origin_result.borrow().clone()
     }
+
+    fn current_branch(&self, _dir: &Path) -> Result<String, GitError> {
+        self.current_branch_result.borrow().clone()
+    }
+
+    fn rev_parse(&self, _dir: &Path, rev: &str) -> Result<String, GitError> {
+        self.rev_parse_results
+            .borrow()
+            .get(rev)
+            .cloned()
+            .unwrap_or_else(|| {
+                Err(GitError::Command {
+                    command: "git rev-parse --verify".to_string(),
+                    exit_code: Some(128),
+                    stderr: format!("unknown revision or path not in the working tree: {rev}"),
+                })
+            })
+    }
+
+    fn is_ancestor(
+        &self,
+        _dir: &Path,
+        _ancestor: &str,
+        _descendant: &str,
+    ) -> Result<bool, GitError> {
+        self.is_ancestor_result.borrow().clone()
+    }
+
+    fn rebase_onto(&self, dir: &Path, onto: &str) -> Result<RebaseOutcome, GitError> {
+        self.call_log.borrow_mut().push("rebase_onto");
+        self.rebase_onto_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), onto.to_string()));
+        self.rebase_onto_result.borrow().clone()
+    }
+
+    fn rebase_in_progress(&self, _dir: &Path) -> Result<bool, GitError> {
+        next_from_sequence(
+            &self.rebase_in_progress_sequence,
+            &self.rebase_in_progress_index,
+        )
+    }
+
+    fn conflicted_files(&self, _dir: &Path) -> Result<Vec<String>, GitError> {
+        next_from_sequence(
+            &self.conflicted_files_sequence,
+            &self.conflicted_files_index,
+        )
+    }
+
+    fn push_force_with_lease(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("push_force_with_lease");
+        self.push_force_with_lease_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), branch.to_string()));
+        self.push_force_with_lease_result.borrow().clone()
+    }
+
+    fn merge_ff_only(&self, dir: &Path, reference: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("merge_ff_only");
+        self.merge_ff_only_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), reference.to_string()));
+        self.merge_ff_only_result.borrow().clone()
+    }
+
+    fn fetch_branch_to_local(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("fetch_branch_to_local");
+        self.fetch_branch_to_local_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), branch.to_string()));
+        self.fetch_branch_to_local_result.borrow().clone()
+    }
+
+    fn delete_branch(&self, dir: &Path, branch: &str) -> Result<(), GitError> {
+        self.call_log.borrow_mut().push("delete_branch");
+        self.delete_branch_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), branch.to_string()));
+        self.delete_branch_result.borrow().clone()
+    }
+}
+
+/// Consume the next entry from a sequenced fake-answer list (see
+/// [`FakeGitOps::with_rebase_in_progress_sequence`] and
+/// [`FakeGitOps::with_conflicted_files_sequence`]), advancing `index` and
+/// clamping it so the last entry repeats once the sequence is exhausted.
+fn next_from_sequence<T: Clone>(
+    sequence: &std::cell::RefCell<Vec<T>>,
+    index: &std::cell::RefCell<usize>,
+) -> T {
+    let seq = sequence.borrow();
+    let i = *index.borrow();
+    let clamped = i.min(seq.len() - 1);
+    let value = seq[clamped].clone();
+    *index.borrow_mut() = i + 1;
+    value
 }
 
 #[cfg(test)]
