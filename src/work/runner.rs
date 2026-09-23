@@ -162,6 +162,14 @@ pub struct FakeProcessSpawner {
     /// Every [`SpawnRequest`] passed to [`ProcessSpawner::spawn`], in call
     /// order.
     pub recorded: std::sync::Mutex<Vec<RecordedSpawn>>,
+    /// Queued `(json, exit_status)` responses, consumed one per [`spawn`]
+    /// call (GH-54's in-run fallback loop spawns more than once per run).
+    /// Empty for [`FakeProcessSpawner::success`]/[`FakeProcessSpawner::with_exit_code`],
+    /// whose every call instead falls back to `canned_json`/`exit_status`
+    /// below — see [`ProcessSpawner::spawn`]'s impl.
+    ///
+    /// [`spawn`]: ProcessSpawner::spawn
+    sequence: std::sync::Mutex<std::collections::VecDeque<(String, ExitStatus)>>,
 }
 
 impl FakeProcessSpawner {
@@ -171,6 +179,7 @@ impl FakeProcessSpawner {
             canned_json: canned_json.into(),
             exit_status: real_exit_status(0),
             recorded: std::sync::Mutex::new(Vec::new()),
+            sequence: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -180,6 +189,28 @@ impl FakeProcessSpawner {
             canned_json: canned_json.into(),
             exit_status: real_exit_status(code),
             recorded: std::sync::Mutex::new(Vec::new()),
+            sequence: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// A fake returning a distinct `(json, exit_code)` response for each
+    /// successive [`ProcessSpawner::spawn`] call, consumed in order — for
+    /// GH-54's in-run agent-fallback loop, which may spawn more than once
+    /// per run (primary attempt, then one per fallback). `responses` should
+    /// have at least as many entries as the test drives spawns: once
+    /// exhausted, further calls fall back to reporting success with an
+    /// empty JSON body, which is never what a fallback test wants — supply
+    /// enough entries rather than relying on that fallback.
+    pub fn sequence<S: Into<String>>(responses: Vec<(S, i32)>) -> Self {
+        let queue = responses
+            .into_iter()
+            .map(|(json, code)| (json.into(), real_exit_status(code)))
+            .collect();
+        Self {
+            canned_json: String::new(),
+            exit_status: real_exit_status(0),
+            recorded: std::sync::Mutex::new(Vec::new()),
+            sequence: std::sync::Mutex::new(queue),
         }
     }
 }
@@ -209,18 +240,29 @@ impl ProcessSpawner for FakeProcessSpawner {
                 stdout_path: request.stdout_path.to_path_buf(),
             });
 
+        let (json, status) = {
+            let mut sequence = self
+                .sequence
+                .lock()
+                .expect("FakeProcessSpawner sequence mutex poisoned");
+            match sequence.pop_front() {
+                Some(entry) => entry,
+                None => (self.canned_json.clone(), self.exit_status),
+            }
+        };
+
         let mut file =
             std::fs::File::create(request.stdout_path).map_err(|err| SpawnError::OutputFile {
                 path: request.stdout_path.to_path_buf(),
                 message: err.to_string(),
             })?;
-        file.write_all(self.canned_json.as_bytes())
+        file.write_all(json.as_bytes())
             .map_err(|err| SpawnError::OutputFile {
                 path: request.stdout_path.to_path_buf(),
                 message: err.to_string(),
             })?;
 
-        Ok(self.exit_status)
+        Ok(status)
     }
 }
 
@@ -411,6 +453,54 @@ mod tests {
         assert!(status.success());
         let written = std::fs::read_to_string(&out_path).unwrap();
         assert_eq!(written, r#"{"session_id":"absent"}"#);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sequenced_spawner_returns_a_distinct_response_per_call_in_order() {
+        let dir = std::env::temp_dir().join(format!("tm-runner-test-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_path = dir.join("first.json");
+        let second_path = dir.join("second.json");
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (r#"{"session_id":"sess-1"}"#, 0),
+            (r#"{"session_id":"sess-2"}"#, 7),
+        ]);
+
+        let first_status = spawner
+            .spawn(SpawnRequest {
+                program: "claude",
+                args: &[],
+                env_set: &[],
+                env_remove: &[],
+                current_dir: &dir,
+                stdout_path: &first_path,
+            })
+            .unwrap();
+        let second_status = spawner
+            .spawn(SpawnRequest {
+                program: "claude",
+                args: &[],
+                env_set: &[],
+                env_remove: &[],
+                current_dir: &dir,
+                stdout_path: &second_path,
+            })
+            .unwrap();
+
+        assert!(first_status.success());
+        assert_eq!(second_status.code(), Some(7));
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            r#"{"session_id":"sess-1"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            r#"{"session_id":"sess-2"}"#
+        );
+        assert_eq!(spawner.recorded.lock().unwrap().len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

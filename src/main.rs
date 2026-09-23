@@ -9,8 +9,6 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use tskmstr::agent::AgentRunner;
-use tskmstr::agent::claude::ClaudeRunner;
-use tskmstr::agent::opencode::OpencodeRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
     AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
@@ -291,20 +289,15 @@ fn ticket_provider_for(
     }
 }
 
-/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]), mirroring
-/// [`ticket_provider_for`]: the one factory that turns [`AgentKind`] into a
-/// live implementation, so nothing else outside config parsing needs to
-/// `match` on it (see `docs/plans/agent-runner.md` and GitHub issue #17).
-///
-/// The [`AgentKind::Claude`] arm leaks a freshly constructed [`ClaudeRunner`]
-/// to get a `&'static dyn AgentRunner` — [`ClaudeRunner`] is a zero-sized
-/// unit struct and `tm` is a short-lived CLI process, so leaking one costs
-/// nothing, the same trade [`ticket_provider_for`] makes for `ShellGhCli`.
+/// Build an [`AgentRunner`] for `config.agent` (see [`AgentKind`]). Delegates
+/// to [`tskmstr::agent::routing::runner_for`], the one factory that turns
+/// [`AgentKind`] into a live implementation (moved there for GitHub issue
+/// #54 so it lives next to the adapters it dispatches to, alongside the
+/// fallback-order selection logic `src/work/run.rs`'s lane-run path
+/// consults) — kept as a thin wrapper so every existing call site here is
+/// unchanged.
 fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
-    match config.agent {
-        AgentKind::Claude => Box::leak(Box::new(ClaudeRunner)),
-        AgentKind::Opencode => Box::leak(Box::new(OpencodeRunner)),
-    }
+    tskmstr::agent::routing::runner_for(config.agent)
 }
 
 /// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
@@ -464,6 +457,7 @@ fn run_work(
                 status_on_run_start: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_run_start.as_deref()),
+                fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -758,7 +752,25 @@ fn backend_identity_or_placeholder(config: Option<&Config>) -> tskmstr::config::
 fn agent_runner_or_default(config: Option<&Config>) -> &'static dyn AgentRunner {
     config
         .map(agent_runner_for)
-        .unwrap_or_else(|| Box::leak(Box::new(ClaudeRunner)))
+        .unwrap_or_else(|| tskmstr::agent::routing::runner_for(AgentKind::default()))
+}
+
+/// `config.agent_fallbacks` resolved to live runners for
+/// [`tskmstr::work::run::RunLaneDeps::fallback_runners`] — the rest of a
+/// priority-mode `[agent]` order, empty in single-runner mode or when no
+/// config loaded. See GitHub issue #54,
+/// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run fallback"
+/// section: only the lane-run dispatch below populates this, mirroring
+/// [`agent_runner_or_default`]'s leniency for callers with no config.
+fn agent_fallback_runners_for(config: Option<&Config>) -> Vec<&'static dyn AgentRunner> {
+    config
+        .map(|cfg| {
+            cfg.agent_fallbacks
+                .iter()
+                .map(|kind| tskmstr::agent::routing::runner_for(*kind))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The default global/repo config paths for this machine and working
@@ -1934,6 +1946,7 @@ mod tests {
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
             agent: tskmstr::config::AgentKind::Claude,
+            agent_fallbacks: Vec::new(),
         }
     }
 
@@ -1954,6 +1967,7 @@ mod tests {
             board_column_order: Vec::new(),
             work: tskmstr::config::WorkConfig::default(),
             agent: tskmstr::config::AgentKind::Claude,
+            agent_fallbacks: Vec::new(),
         }
     }
 

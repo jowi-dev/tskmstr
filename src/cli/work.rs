@@ -377,6 +377,10 @@ pub struct RunDeps<'a> {
     /// [`crate::work::run::RunLaneDeps::status_on_run_start`]. `None` when
     /// unset. See [`crate::config::Config::status_on_run_start`].
     pub status_on_run_start: Option<&'a str>,
+    /// The rest of the priority-routing order, passed through to
+    /// [`crate::work::run::RunLaneDeps::fallback_runners`]. Empty in
+    /// single-runner mode. See GitHub issue #54.
+    pub fallback_runners: Vec<&'a dyn AgentRunner>,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -430,6 +434,7 @@ pub fn run(
         backend_identity_resolver: deps.backend_identity_resolver,
         runner: deps.runner,
         status_on_run_start: deps.status_on_run_start,
+        fallback_runners: deps.fallback_runners.clone(),
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -2340,6 +2345,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2461,6 +2467,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2530,6 +2537,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let mut out = Vec::new();
 
@@ -2687,6 +2695,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let mut out = Vec::new();
 
@@ -2762,6 +2771,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let mut out = Vec::new();
 
@@ -2823,6 +2833,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2934,6 +2945,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2996,6 +3008,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let mut out = Vec::new();
 
@@ -3050,6 +3063,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),

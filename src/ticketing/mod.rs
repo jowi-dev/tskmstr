@@ -1316,6 +1316,7 @@ mod tests {
             board_column_order: Vec::new(),
             work: crate::config::WorkConfig::default(),
             agent: crate::config::AgentKind::Claude,
+            agent_fallbacks: Vec::new(),
         }
     }
 

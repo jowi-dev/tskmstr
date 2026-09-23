@@ -1671,6 +1671,56 @@ discover these files for any session run in the repo, so the lane prompt's
 `## Delegation` section can name the agent and trust it resolves to the
 declared model.
 
+#### Priority routing between runners
+
+`[agent]` also accepts a priority mode that routes board-launched lane
+runs (`tm work run`, both `--fg` and the default detached/interactive
+dispatch) across more than one runner by usage availability, instead of
+picking exactly one runner via `[agent].runner`:
+
+```toml
+[agent]
+strategy = "priority"
+order = ["claude", "opencode"]
+```
+
+`strategy` and `runner` are mutually exclusive — set one or the other, not
+both — and `order` is required (non-empty, every entry a recognized
+runner name, no duplicates) whenever `strategy = "priority"` is set; an
+`order` key with no matching `strategy` is a config error too, rather than
+silently doing nothing. `order[0]` is still exposed as the ordinary
+preferred runner everywhere a single runner is expected (interactive
+sessions, `tm check`, board display, prompt template resolution, `tm work
+hooks install --user`), so only the lane-run dispatch path is aware
+priority mode exists at all — `tm review fix`, `tm ticket audit`/`create`,
+and interactive tmux sessions always use the preferred runner alone, no
+fallback.
+
+Routing is **reactive**, not a live quota check: no runner exposes a
+stable "how much usage do I have left" API. Instead, `tm` classifies each
+finished attempt's result for a usage-limit shape (Claude's `usage limit
+reached`/`credit balance too low`/`rate limit` text, opencode's
+`error`-event payload for `rate limit`/`429`/`quota`/`credit`), and on a
+match falls back to the next runner in `order` for that run, retrying the
+same prompt from scratch (sessions aren't portable across runners). The
+exhausted runner is remembered in `runs.db` and skipped on subsequent
+runs until its window reopens — the reset timestamp Claude's legacy
+usage-limit response carries, when present, or a 15-minute hold
+otherwise, since re-probing is cheap (the run still completes on the
+fallback runner; a premature probe costs one spawn, not the whole run). A
+successful run on a runner clears its recorded window, so a stale
+"exhausted" record self-heals rather than sticking around after the
+window has actually reset. If every runner in `order` is still within its
+window, `tm` still runs — it probes whichever one recovers soonest rather
+than refusing to run at all.
+
+One thing priority mode does **not** carry across runners: `--model`
+(and `[work].default_model`/a lane's own `model`) only ever applies to
+`order[0]`'s own attempt. Model strings are runner-specific in practice
+(`"fable"` vs. opencode's `"provider/model"` spelling), so a fallback
+attempt always omits `--model` and gets that runner's own configured
+default instead of misapplying the preferred runner's model string.
+
 ### Ranking
 
 `tm ticket rank <KEY> (--above|--below) <OTHER>` moves `<KEY>` to a new

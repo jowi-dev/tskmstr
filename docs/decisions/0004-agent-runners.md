@@ -65,16 +65,22 @@ touching every call site that happens to know Claude Code's argv shape.
    `no_agent_literals_outside_the_adapter_module` (in `src/agent/mod.rs`'s
    tests) walks every `.rs` file under `src/` except `src/agent/**`,
    strips `//` comments and everything from the first `#[cfg(test)]` line
-   onward, and asserts no case-insensitive `claude`/`anthropic` substring
-   remains in what's left. Two files are allowlisted, each for the reason
-   decisions 1 and 2 above already justify: `src/config/mod.rs` (the
-   `AgentKind::Claude` discriminant — the one-enum rule sanctions the name
-   living there, the same way `BackendKind::Jira`/`Github` already do) and
-   `src/main.rs` (the one factory dispatch site, `agent_runner_for`'s
-   `match`). Nothing else in the codebase outside `src/agent/` may name
-   claude or Anthropic in functional code; a test fixture asserting
-   claude-specific behavior stays legal because it lives inside a
-   `#[cfg(test)]` block, which the guard already excludes.
+   onward, and asserts no case-insensitive `claude`/`anthropic`/`opencode`
+   substring remains in what's left. One file is allowlisted, for the
+   reason decision 2 above already justifies: `src/config/mod.rs` (the
+   `AgentKind::Claude`/`AgentKind::Opencode` discriminants — the one-enum
+   rule sanctions the names living there, the same way
+   `BackendKind::Jira`/`Github` already do). `src/main.rs` is **not**
+   allowlisted: `agent_runner_for`'s `match` moved to
+   `src/agent/routing.rs`'s `runner_for` as part of GitHub issue #54
+   (`docs/decisions/0008-reactive-priority-routing.md`), so the one
+   factory dispatch site now lives inside `src/agent/` like everything
+   else the guard exempts, and `main.rs` delegates to it by name with no
+   runner literal of its own. Nothing else in the codebase outside
+   `src/agent/` may name claude, Anthropic, or opencode in functional
+   code; a test fixture asserting agent-specific behavior stays legal
+   because it lives inside a `#[cfg(test)]` block, which the guard already
+   excludes.
 
 See `docs/plans/agent-runner.md` for the full seven-phase plan this ADR
 closes out, and GitHub issue #17 for the original request.

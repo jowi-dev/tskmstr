@@ -240,11 +240,31 @@ impl BackendKind {
 }
 
 /// Raw, partially-specified `[agent]` section as parsed directly from TOML.
+///
+/// Two mutually exclusive modes (see GitHub issue #54 and
+/// `docs/plans/gh-54-priority-routing.md`): single-runner mode (`runner`
+/// alone, unchanged since issue #17) or priority mode (`strategy =
+/// "priority"` plus `order`). [`merge_agent`] validates which mode applies
+/// and rejects any mixing of the two.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawAgentConfig {
     /// Which AI coding agent to use: `"claude"` (default) or `"opencode"`.
-    /// An unrecognized value is [`ConfigError::InvalidRunner`].
+    /// An unrecognized value is [`ConfigError::InvalidRunner`]. Only legal
+    /// when `strategy` is unset — setting it alongside `strategy = "priority"`
+    /// is [`ConfigError::RunnerConflictsWithOrder`].
     pub runner: Option<String>,
+    /// Selects priority-routing mode when set to `"priority"` — the only
+    /// currently accepted value; anything else is
+    /// [`ConfigError::InvalidStrategy`]. Requires [`RawAgentConfig::order`]
+    /// to be set too.
+    pub strategy: Option<String>,
+    /// The agent preference order for priority mode, e.g. `["claude",
+    /// "opencode"]`. Each entry must parse via [`AgentKind::parse`]
+    /// ([`ConfigError::InvalidOrderEntry`] otherwise) and appear at most once
+    /// ([`ConfigError::DuplicateOrderEntry`] otherwise). Present without
+    /// `strategy = "priority"` is [`ConfigError::OrderRequiresPriorityStrategy`]
+    /// — the key must not be silently inert.
+    pub order: Option<Vec<String>>,
 }
 
 /// Which AI coding agent a config selects.
@@ -644,8 +664,18 @@ pub struct Config {
     pub work: WorkConfig,
     /// Which AI coding agent this config selects. See [`AgentKind`]; defaults
     /// to [`AgentKind::Claude`] when `[agent]` is absent from both global and
-    /// repo config. See GitHub issue #17 and `docs/plans/agent-runner.md`.
+    /// repo config. In priority mode (`[agent].strategy = "priority"`), this
+    /// is the *preferred* agent — `order[0]` — so every existing call site
+    /// that reads `Config.agent` (interactive sessions, `tm check`, board
+    /// display, prompt templates) is unaffected by priority routing. See
+    /// GitHub issue #17, GitHub issue #54, and
+    /// `docs/plans/gh-54-priority-routing.md`.
     pub agent: AgentKind,
+    /// The remaining agents in priority order after [`Config::agent`], to
+    /// fall back to when the preferred agent's usage window is exhausted.
+    /// Empty in single-runner mode. See GitHub issue #54 and
+    /// `docs/plans/gh-54-priority-routing.md`.
+    pub agent_fallbacks: Vec<AgentKind>,
 }
 
 /// Fully validated `[work]` section.
@@ -965,11 +995,60 @@ pub enum ConfigError {
 
     /// `[agent].runner` was set to a value that isn't a recognized agent
     /// runner name, mirroring [`ConfigError::InvalidProvider`].
-    #[error("invalid [agent] runner `{value}`; expected \"claude\" or \"opencode\"")]
+    #[error(
+        "invalid [agent] runner `{value}`; expected one of {}",
+        agent_runner_names_list()
+    )]
     InvalidRunner {
         /// The unrecognized value as written in config.
         value: String,
     },
+
+    /// `[agent].strategy` was set to a value other than the ones this
+    /// version recognizes (currently only `"priority"`).
+    #[error("invalid [agent] strategy `{value}`; expected \"priority\"")]
+    InvalidStrategy {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[agent].order` was set without `[agent].strategy = "priority"`. The
+    /// key must not be silently inert — priority mode is what makes it take
+    /// effect.
+    #[error(
+        "[agent].order is set but [agent].strategy is not \"priority\"; add strategy = \"priority\" or remove order"
+    )]
+    OrderRequiresPriorityStrategy,
+
+    /// `[agent].strategy = "priority"` was set without a non-empty
+    /// `[agent].order`.
+    #[error("[agent].strategy = \"priority\" requires a non-empty [agent].order")]
+    PriorityRequiresOrder,
+
+    /// An entry in `[agent].order` isn't a recognized agent runner name.
+    #[error(
+        "invalid entry `{value}` in [agent].order; expected one of {}",
+        agent_runner_names_list()
+    )]
+    InvalidOrderEntry {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[agent].order` listed the same agent more than once.
+    #[error("[agent].order lists `{value}` more than once")]
+    DuplicateOrderEntry {
+        /// The duplicated entry.
+        value: String,
+    },
+
+    /// `[agent].runner` was set alongside `[agent].strategy`/`[agent].order`
+    /// — single-runner mode and priority mode are mutually exclusive.
+    #[error(
+        "[agent].runner conflicts with [agent].strategy/[agent].order; \
+         single-runner mode (`runner`) and priority mode (`strategy`/`order`) are mutually exclusive"
+    )]
+    RunnerConflictsWithOrder,
 
     /// A parent directory for a config file could not be created.
     #[error("failed to create config directory {path}: {source}")]
@@ -1191,7 +1270,7 @@ fn merge_with_repo_dir(
     let repo = repo.unwrap_or_default();
 
     let backend = merge_backend(global.backend.clone(), repo.backend.clone())?;
-    let agent = merge_agent(global.agent.clone(), repo.agent.clone())?;
+    let (agent, agent_fallbacks) = merge_agent(global.agent.clone(), repo.agent.clone())?;
 
     let jira_base_url = resolved_jira_field(
         &repo,
@@ -1278,6 +1357,7 @@ fn merge_with_repo_dir(
             board_column_order,
             work,
             agent,
+            agent_fallbacks,
         }),
         BackendKind::Github => {
             let configured_repo = repo
@@ -1314,6 +1394,7 @@ fn merge_with_repo_dir(
                 board_column_order,
                 work,
                 agent,
+                agent_fallbacks,
             })
         }
     }
@@ -1341,23 +1422,93 @@ fn merge_backend(
     }
 }
 
-/// Merge a repo-local `[agent]` section on top of a global one, field by
-/// field, then parse the resulting `runner` string (if any) into an
-/// [`AgentKind`], exactly mirroring [`merge_backend`].
+/// Formats [`AgentKind::names`] as a quoted, comma-separated list (e.g.
+/// `"claude", "opencode"`) for error messages that need to list every
+/// accepted runner name.
+fn agent_runner_names_list() -> String {
+    AgentKind::names()
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Merge a repo-local `[agent]` section on top of a global one by
+/// **whole-table replacement** (like lane maps in [`merge_work`], not like
+/// [`merge_backend`]'s per-key merge), then validate and resolve the result
+/// into a preferred agent plus its fallback order.
 ///
-/// Absence in both global and repo config defaults to [`AgentKind::Claude`],
-/// so an existing config with no `[agent]` table at all keeps working
-/// unchanged.
+/// Whole-table replacement because the three keys form one mode
+/// declaration: merging them per key would let a global `runner` leak into
+/// a repo that only set `strategy`/`order` and trip the runner-vs-order
+/// conflict rule across layers — punishing exactly the common setup of a
+/// global single-runner default with one repo opted into priority routing.
+/// A repo `[agent]` table that sets any key is the sole source; a repo with
+/// no `[agent]` table inherits the global one untouched.
+///
+/// Absence of `strategy` and `order` in both global and repo config is
+/// single-runner mode: `runner` behaves exactly as before issue #54, and
+/// resolves to [`AgentKind::Claude`] when unset too, so an existing config
+/// with no `[agent]` table at all keeps working unchanged. `strategy =
+/// "priority"` switches to priority mode, requiring a non-empty `order` and
+/// forbidding `runner` (the two modes are mutually exclusive — see
+/// [`ConfigError::RunnerConflictsWithOrder`]). `order` present without
+/// `strategy = "priority"` is rejected outright
+/// ([`ConfigError::OrderRequiresPriorityStrategy`]) rather than silently
+/// ignored. See `docs/plans/gh-54-priority-routing.md`'s "Config" section.
 fn merge_agent(
     global: Option<RawAgentConfig>,
     repo: Option<RawAgentConfig>,
-) -> Result<AgentKind, ConfigError> {
+) -> Result<(AgentKind, Vec<AgentKind>), ConfigError> {
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
 
-    match repo.runner.or(global.runner) {
-        Some(value) => AgentKind::parse(&value).ok_or(ConfigError::InvalidRunner { value }),
-        None => Ok(AgentKind::default()),
+    let repo_declares_mode =
+        repo.runner.is_some() || repo.strategy.is_some() || repo.order.is_some();
+    let RawAgentConfig {
+        runner,
+        strategy,
+        order,
+    } = if repo_declares_mode { repo } else { global };
+
+    match strategy {
+        None => {
+            if order.is_some() {
+                return Err(ConfigError::OrderRequiresPriorityStrategy);
+            }
+            let agent = match runner {
+                Some(value) => {
+                    AgentKind::parse(&value).ok_or(ConfigError::InvalidRunner { value })?
+                }
+                None => AgentKind::default(),
+            };
+            Ok((agent, Vec::new()))
+        }
+        Some(value) if value == "priority" => {
+            if runner.is_some() {
+                return Err(ConfigError::RunnerConflictsWithOrder);
+            }
+            let order = order.ok_or(ConfigError::PriorityRequiresOrder)?;
+            if order.is_empty() {
+                return Err(ConfigError::PriorityRequiresOrder);
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut parsed = Vec::with_capacity(order.len());
+            for value in order {
+                let kind =
+                    AgentKind::parse(&value).ok_or_else(|| ConfigError::InvalidOrderEntry {
+                        value: value.clone(),
+                    })?;
+                if !seen.insert(value.clone()) {
+                    return Err(ConfigError::DuplicateOrderEntry { value });
+                }
+                parsed.push(kind);
+            }
+            let agent = parsed[0];
+            let fallbacks = parsed[1..].to_vec();
+            Ok((agent, fallbacks))
+        }
+        Some(value) => Err(ConfigError::InvalidStrategy { value }),
     }
 }
 
@@ -3252,6 +3403,7 @@ mod tests {
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("claude".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -3264,6 +3416,7 @@ mod tests {
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("opencode".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -3276,6 +3429,7 @@ mod tests {
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("bogus".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -3300,12 +3454,14 @@ mod tests {
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("bogus".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
         let repo = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("claude".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3318,6 +3474,7 @@ mod tests {
         let global = RawConfig {
             agent: Some(RawAgentConfig {
                 runner: Some("claude".to_string()),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -3327,6 +3484,245 @@ mod tests {
         };
         let cfg = merge(global, Some(repo)).expect("should merge");
         assert_eq!(cfg.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn merge_agent_single_mode_has_empty_fallbacks() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.agent_fallbacks, Vec::<AgentKind>::new());
+    }
+
+    #[test]
+    fn merge_agent_priority_strategy_happy_path() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let cfg = merge(global, None).expect("priority mode should merge");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+    }
+
+    #[test]
+    fn merge_agent_priority_strategy_missing_order_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::PriorityRequiresOrder => {}
+            other => panic!("expected PriorityRequiresOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_priority_strategy_empty_order_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(Vec::new()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::PriorityRequiresOrder => {}
+            other => panic!("expected PriorityRequiresOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_order_without_priority_strategy_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                order: Some(vec!["claude".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::OrderRequiresPriorityStrategy => {}
+            other => panic!("expected OrderRequiresPriorityStrategy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_invalid_strategy_value_errors_and_lists_accepted_values() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("round_robin".to_string()),
+                order: Some(vec!["claude".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("priority"),
+            "error should name accepted strategy values: {message}"
+        );
+        match err {
+            ConfigError::InvalidStrategy { value } => assert_eq!(value, "round_robin"),
+            other => panic!("expected InvalidStrategy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_priority_order_entry_that_does_not_parse_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "bogus".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::InvalidOrderEntry { value } => assert_eq!(value, "bogus"),
+            other => panic!("expected InvalidOrderEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_priority_order_duplicate_entry_errors() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "claude".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::DuplicateOrderEntry { value } => assert_eq!(value, "claude"),
+            other => panic!("expected DuplicateOrderEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_runner_alongside_priority_strategy_conflicts() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        match err {
+            ConfigError::RunnerConflictsWithOrder => {}
+            other => panic!("expected RunnerConflictsWithOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_agent_repo_over_global_for_strategy_and_order() {
+        // Whole-table repo-over-global precedence (see `merge_agent`'s doc
+        // comment): both layers declare priority mode, and the repo's order
+        // replaces the global one entirely.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["opencode".to_string(), "claude".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo override should take effect");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+    }
+
+    #[test]
+    fn merge_agent_repo_priority_wins_over_global_runner_without_conflict() {
+        // The common setup: a global config that names a single runner, and
+        // one repo opting into priority routing. The repo's `[agent]` table
+        // replaces the global one wholesale, so the global `runner` must not
+        // leak across layers and trip the same-file conflict rule.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("claude".to_string()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo priority should win cleanly");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+    }
+
+    #[test]
+    fn merge_agent_repo_runner_opts_out_of_global_priority() {
+        // The inverse: global config declares priority routing, a repo pins
+        // a single runner. The repo table wins wholesale — single mode, no
+        // fallbacks, and no cross-layer conflict.
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("opencode".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo single-runner should win cleanly");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, Vec::new());
+    }
+
+    #[test]
+    fn invalid_runner_error_message_lists_agent_kind_names() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                runner: Some("bogus".to_string()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        let message = err.to_string();
+        for name in AgentKind::names() {
+            assert!(
+                message.contains(name),
+                "error should list every AgentKind name, missing `{name}`: {message}"
+            );
+        }
     }
 
     // --- `[work]` section ---

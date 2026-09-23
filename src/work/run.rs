@@ -84,7 +84,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::agent::{AgentError, AgentRunner, InvocationInputs, RunMode};
+use crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS;
+use crate::agent::{AgentError, AgentInvocation, AgentRunner, InvocationInputs, RunMode};
 use crate::blocker_stacking::{self, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
@@ -258,6 +259,18 @@ impl std::fmt::Display for BackendMismatchInfo {
 pub trait Clock {
     /// `(year, month, day, hour, min, sec)`, `month` 1-12, in local time.
     fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32);
+
+    /// Seconds since the Unix epoch, UTC — the "now" GH-54's fallback
+    /// routing (`src/agent/routing.rs`'s `plan_attempts`) compares recorded
+    /// `agent_windows.exhausted_until` timestamps against. Deliberately a
+    /// separate method from [`Clock::now_parts`] (local-time components for
+    /// filename timestamps) rather than a derived conversion of it, so
+    /// [`SystemClock`] can answer with the real epoch directly instead of
+    /// round-tripping through a broken-down local time and a timezone-aware
+    /// reconstruction. Mirrors `crate::work::review_watch::Clock`'s
+    /// same-shaped method, kept a separate trait there because that trait
+    /// needs no broken-down local time at all — see its doc comment.
+    fn now_unix_secs(&self) -> i64;
 }
 
 /// Production [`Clock`] backed by `libc::time`/`libc::localtime`.
@@ -286,6 +299,16 @@ impl Clock for SystemClock {
             )
         }
     }
+
+    fn now_unix_secs(&self) -> i64 {
+        // SAFETY: `time(NULL)` is side-effect-free with respect to Rust's
+        // aliasing rules; `t` is a plain stack `time_t`.
+        let mut t: libc::time_t = 0;
+        unsafe {
+            libc::time(&mut t);
+        }
+        t as i64
+    }
 }
 
 /// A [`Clock`] test double returning a fixed, caller-supplied time.
@@ -296,6 +319,33 @@ impl Clock for FakeClock {
     fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32) {
         self.0
     }
+
+    fn now_unix_secs(&self) -> i64 {
+        let (year, month, day, hour, min, sec) = self.0;
+        civil_to_unix(year, month, day, hour, min, sec)
+    }
+}
+
+/// Converts a civil (Gregorian) date/time, treated as UTC, to seconds since
+/// the Unix epoch — Howard Hinnant's `days_from_civil` algorithm
+/// (<http://howardhinnant.github.io/date_algorithms.html>), valid across
+/// the full `i32` year range including proleptic Gregorian dates. Used only
+/// by [`FakeClock::now_unix_secs`]: a deterministic, pure conversion of its
+/// fixed test components, not a claim that local time equals UTC ([`SystemClock`]
+/// reads the real epoch directly instead — see its `now_unix_secs`).
+fn civil_to_unix(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (month as i64 + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
 }
 
 /// Dependencies [`run_lane_fg`] needs, gathered the same way
@@ -340,7 +390,10 @@ pub struct RunLaneDeps<'a> {
     pub backend_identity_resolver: &'a dyn BackendIdentityResolver,
     /// The AI coding agent this run's invocation is built for (Claude
     /// today; see [`crate::agent::AgentRunner`] and GitHub issue #17),
-    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`.
+    /// selected by `config.agent` via `main.rs`'s `agent_runner_for`. In
+    /// priority mode this is the *preferred* agent (`order[0]`), not
+    /// necessarily the one that ends up driving the primary attempt — see
+    /// [`fallback_runners`](Self::fallback_runners).
     pub runner: &'a dyn AgentRunner,
     /// The configured `status_on_run_start` workflow status (see
     /// [`crate::config::Config::status_on_run_start`]), or `None` when unset.
@@ -352,6 +405,19 @@ pub struct RunLaneDeps<'a> {
     /// [`RunLaneDeps::ticket_provider`]; absent that, the transition is
     /// skipped exactly like the branch-name slug lookup.
     pub status_on_run_start: Option<&'a str>,
+    /// The rest of `config.agent_fallbacks`' priority order, resolved to
+    /// live runners via `crate::agent::routing::runner_for`. Empty in
+    /// single-runner mode and everywhere but the lane-run path (`tm work
+    /// run`) — see GitHub issue #54,
+    /// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run
+    /// fallback" section. When non-empty, [`prepare_run_lane`] consults
+    /// `crate::agent::routing::plan_attempts` over `[runner] +
+    /// fallback_runners` to pick which agent actually drives the primary
+    /// invocation (it may not be `runner`, if `runner`'s usage window is
+    /// still open) and builds one extra invocation per remaining attempt,
+    /// carried on [`PreparedRun::fallbacks`] for
+    /// [`run_agent_and_finish`] to retry through on a rate-limit outcome.
+    pub fallback_runners: Vec<&'a dyn AgentRunner>,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -435,6 +501,40 @@ pub struct PreparedRun {
     /// Where the spawned `claude` process's stdout (its result JSON) is
     /// written, and later read back from.
     pub out_json_path: PathBuf,
+    /// Remaining priority-routing attempts beyond [`PreparedRun::invocation`]
+    /// (GitHub issue #54): one [`PlannedFallback`] per agent
+    /// `crate::agent::routing::plan_attempts` says to try next if the
+    /// active attempt's outcome classifies as a usage-limit hit. Empty in
+    /// single-runner mode.
+    ///
+    /// `#[serde(default)]`: a state file written by a pre-#54 `tm` binary
+    /// (or by prepare with no `fallback_runners` configured) has no
+    /// `fallbacks` key at all — this field's absence must still deserialize
+    /// cleanly, since [`PreparedRun`] round-trips through the detached
+    /// supervisor's JSON state file (see this struct's doc comment).
+    #[serde(default)]
+    pub fallbacks: Vec<PlannedFallback>,
+}
+
+/// One not-yet-attempted priority-routing fallback, carried on
+/// [`PreparedRun::fallbacks`] for [`run_agent_and_finish`] to retry through
+/// on a rate-limit outcome. See GitHub issue #54,
+/// `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run fallback"
+/// section.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlannedFallback {
+    /// [`crate::agent::AgentRunner::name`] of the runner this attempt uses,
+    /// e.g. `"opencode"` — resolved back to a live runner via
+    /// [`crate::config::AgentKind::parse`] +
+    /// [`crate::agent::routing::runner_for`] when the attempt is taken (see
+    /// [`run_agent_and_finish`]'s doc comment on why: an unparseable value
+    /// here, which should never happen from code `tm` itself writes, is
+    /// skipped with a warning rather than treated as fatal).
+    pub agent: String,
+    /// This attempt's fully resolved invocation, built the same way as
+    /// [`PreparedRun::invocation`] except `model` is always `None` — see
+    /// the plan doc's "model only for the configured preferred agent" rule.
+    pub invocation: crate::agent::AgentInvocation,
 }
 
 /// The result of one completed `tm work run --fg` invocation.
@@ -1052,11 +1152,45 @@ pub fn prepare_run_lane(
         None => prompt_text,
     };
 
-    // Step 8: deploy telemetry via the configured runner — `None` for a
-    // future telemetry-less runner (see `AgentRunner::deploy_telemetry`'s
-    // acceptance rule; run tracking below never depends on this being
-    // `Some`).
-    let settings_path = deps.runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
+    // Priority-routing attempt plan (GitHub issue #54,
+    // `docs/plans/gh-54-priority-routing.md`'s "Selection and in-run
+    // fallback" section): with `fallback_runners` configured, the agent
+    // that actually drives this run's primary invocation may not be
+    // `deps.runner` (the configured *preferred* agent) if its usage window
+    // is still open — `plan_attempts` filters `[preferred] + fallbacks` down
+    // to the agents worth trying, preserving order. With no
+    // `fallback_runners` configured, skip the window lookups entirely and
+    // keep today's single-attempt behavior exactly: `deps.runner` is always
+    // the primary, unconditionally.
+    let preferred_kind = crate::config::AgentKind::parse(deps.runner.name()).unwrap_or_default();
+    let attempts: Vec<crate::config::AgentKind> = if deps.fallback_runners.is_empty() {
+        vec![preferred_kind]
+    } else {
+        let full_order: Vec<crate::config::AgentKind> = std::iter::once(preferred_kind)
+            .chain(
+                deps.fallback_runners
+                    .iter()
+                    .filter_map(|r| crate::config::AgentKind::parse(r.name())),
+            )
+            .collect();
+        crate::agent::routing::plan_attempts(
+            &full_order,
+            |agent| deps.run_store.agent_exhausted_until(agent).ok().flatten(),
+            deps.clock.now_unix_secs(),
+        )
+    };
+    let primary_kind = attempts[0];
+    let primary_runner: &dyn AgentRunner = if primary_kind == preferred_kind {
+        deps.runner
+    } else {
+        crate::agent::routing::runner_for(primary_kind)
+    };
+
+    // Step 8: deploy telemetry via the primary attempt's runner — `None`
+    // for a future telemetry-less runner (see
+    // `AgentRunner::deploy_telemetry`'s acceptance rule; run tracking below
+    // never depends on this being `Some`).
+    let settings_path = primary_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
 
     // Step 9: start the tracked run. `pid` is `Some(current pid)` for --fg
     // (this process is the driver) and `None` for the detached path (the
@@ -1106,12 +1240,24 @@ pub fn prepare_run_lane(
     }
 
     // Build the claude invocation (still part of step 9's "safe to do in the
-    // foreground" work: pure argv construction, no spawning yet).
-    let model = request
-        .model
-        .clone()
-        .or_else(|| lane_config.model.clone())
-        .or_else(|| config.default_model.clone());
+    // foreground" work: pure argv construction, no spawning yet). `model`
+    // is only ever resolved for the *preferred* agent's own attempt —
+    // model strings are runner-specific ("fable" vs "provider/model"), so a
+    // fallback attempt always gets `None` and falls back to that runner's
+    // own default (see the plan doc's "model only for the configured
+    // preferred agent" rule). Since `preferred_kind` can only ever appear
+    // as `attempts[0]` (relative order is preserved, and it's always the
+    // first element of `full_order` above), this is equivalent to "only the
+    // primary attempt, and only when it wasn't a fallback substitution".
+    let model = if primary_kind == preferred_kind {
+        request
+            .model
+            .clone()
+            .or_else(|| lane_config.model.clone())
+            .or_else(|| config.default_model.clone())
+    } else {
+        None
+    };
     let max_turns = request
         .max_turns
         .clone()
@@ -1133,15 +1279,41 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let invocation = deps.runner.build_invocation(InvocationInputs {
-        prompt,
+    let invocation = primary_runner.build_invocation(InvocationInputs {
+        prompt: prompt.clone(),
         model,
-        max_turns,
-        permission_mode,
+        max_turns: max_turns.clone(),
+        permission_mode: permission_mode.clone(),
         settings_path,
         run_id: Some(run_id.to_string()),
         mode: request.mode,
     });
+
+    // Remaining priority-routing attempts (GitHub issue #54): one
+    // invocation per agent `plan_attempts` says to try next if the primary
+    // attempt's outcome classifies as a usage-limit hit. Same resolved
+    // prompt text, `permission_mode`/`max_turns` passed through, each
+    // attempt's own `deploy_telemetry` result as `settings_path`, and
+    // `model: None` always — see the model comment above; a fallback
+    // attempt is by definition never `preferred_kind`.
+    let mut fallbacks = Vec::with_capacity(attempts.len().saturating_sub(1));
+    for kind in attempts.iter().skip(1) {
+        let fallback_runner = crate::agent::routing::runner_for(*kind);
+        let fallback_settings_path = fallback_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
+        let fallback_invocation = fallback_runner.build_invocation(InvocationInputs {
+            prompt: prompt.clone(),
+            model: None,
+            max_turns: max_turns.clone(),
+            permission_mode: permission_mode.clone(),
+            settings_path: fallback_settings_path,
+            run_id: Some(run_id.to_string()),
+            mode: request.mode,
+        });
+        fallbacks.push(PlannedFallback {
+            agent: fallback_runner.name().to_string(),
+            invocation: fallback_invocation,
+        });
+    }
 
     std::fs::create_dir_all(&paths.state_dir)?;
     let out_json_path = paths.state_dir.join(format!("{wt_name}-{timestamp}.json"));
@@ -1156,6 +1328,7 @@ pub fn prepare_run_lane(
         branch,
         invocation,
         out_json_path,
+        fallbacks,
     })
 }
 
@@ -1304,6 +1477,7 @@ pub fn prepare_review_fix(
         branch: branch.to_string(),
         invocation,
         out_json_path,
+        fallbacks: Vec::new(),
     })
 }
 
@@ -1351,21 +1525,104 @@ pub fn run_agent_and_finish(
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
-    let invocation = &prepared.invocation;
+    // The attempt list (GitHub issue #54): the primary (`runner`,
+    // `prepared.invocation`) first, then each `prepared.fallbacks` entry
+    // resolved back to a live runner. A fallback whose `agent` string
+    // doesn't parse is skipped with a warning rather than treated as
+    // fatal — that should never happen from code `tm` itself writes (it's
+    // always `AgentRunner::name()`), but a stale/foreign state file isn't
+    // worth failing the run over.
+    struct Attempt<'a> {
+        runner: &'a dyn AgentRunner,
+        invocation: &'a AgentInvocation,
+    }
+    let mut attempts: Vec<Attempt<'_>> = vec![Attempt {
+        runner,
+        invocation: &prepared.invocation,
+    }];
+    for fallback in &prepared.fallbacks {
+        match crate::config::AgentKind::parse(&fallback.agent) {
+            Some(kind) => attempts.push(Attempt {
+                runner: crate::agent::routing::runner_for(kind),
+                invocation: &fallback.invocation,
+            }),
+            None => {
+                writeln!(
+                    out,
+                    "warning: skipping unrecognized fallback agent {:?}",
+                    fallback.agent
+                )?;
+            }
+        }
+    }
+    let last_attempt_index = attempts.len() - 1;
 
-    let status = spawner.spawn(SpawnRequest {
-        program: &invocation.program,
-        args: &invocation.args,
-        env_set: &invocation.env_set,
-        env_remove: &invocation.env_remove,
-        current_dir: &prepared.worktree,
-        stdout_path: &prepared.out_json_path,
-    })?;
+    // Spawn-wait-parse each attempt in turn. A rate-limited outcome with
+    // another attempt still to try persists that agent's usage window and
+    // falls through to the next attempt without finishing the run; every
+    // other outcome (including a rate limit on the *last* attempt) is
+    // terminal. See `docs/plans/gh-54-priority-routing.md`'s "Selection and
+    // in-run fallback" section.
+    let mut active_runner = runner;
+    let mut status = None;
+    let mut parsed = None;
+    let mut all_attempts_rate_limited = false;
+    for (index, attempt) in attempts.iter().enumerate() {
+        let attempt_status = spawner.spawn(SpawnRequest {
+            program: &attempt.invocation.program,
+            args: &attempt.invocation.args,
+            env_set: &attempt.invocation.env_set,
+            env_remove: &attempt.invocation.env_remove,
+            current_dir: &prepared.worktree,
+            stdout_path: &prepared.out_json_path,
+        })?;
+        let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
+        let attempt_parsed = attempt.runner.parse_outcome(&raw_result).ok();
+        let rate_limit = attempt_parsed.as_ref().and_then(|o| o.rate_limit.clone());
+
+        if let Some(rate_limit) = rate_limit {
+            let until = rate_limit
+                .reset_at
+                .unwrap_or_else(|| SystemClock.now_unix_secs() + DEFAULT_EXHAUSTED_HOLD_SECS);
+            run_store.set_agent_exhausted_until(attempt.runner.name(), until)?;
+            let detail = if index == last_attempt_index {
+                format!(
+                    "{} exhausted until {until}; no further agents to try",
+                    attempt.runner.name()
+                )
+            } else {
+                format!(
+                    "{} exhausted until {until}, falling back to {}",
+                    attempt.runner.name(),
+                    attempts[index + 1].runner.name()
+                )
+            };
+            run_store.add_event(prepared.run_id, "rate_limited", Some(&detail))?;
+            writeln!(out, "{detail}")?;
+
+            if index != last_attempt_index {
+                continue;
+            }
+            all_attempts_rate_limited = true;
+        }
+
+        active_runner = attempt.runner;
+        status = Some(attempt_status);
+        parsed = attempt_parsed;
+        break;
+    }
+    // `attempts` always has at least the primary attempt, and every
+    // iteration either `continue`s (only possible before the last index) or
+    // `break`s having set `status`, so this always ends up populated.
+    let status = status.expect("run_agent_and_finish attempted at least one agent");
+    let runner = active_runner;
 
     // Parse the outcome and classify the run's terminal status. A non-zero
     // exit is always Failed, regardless of what (if anything) the result
-    // says -- that's an unambiguous signal from the process itself.
-    // Otherwise:
+    // says -- that's an unambiguous signal from the process itself. Every
+    // attempt having hit its usage limit is also unambiguously Failed,
+    // overriding whatever `is_error` the last (still rate-limited) attempt
+    // happened to report. Otherwise:
     //
     // - Result parsed and `is_error` was explicit -> Failed/Done, exactly as
     //   before.
@@ -1379,9 +1636,7 @@ pub fn run_agent_and_finish(
     //   default straight to `Done` via `unwrap_or(false)`. See
     //   `RunStatus::Interrupted`'s doc comment and
     //   `AgentRunner::parse_outcome`'s tests for the exact contract.
-    let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
-    let parsed = runner.parse_outcome(&raw_result).ok();
-    let run_status = if !status.success() {
+    let run_status = if all_attempts_rate_limited || !status.success() {
         RunStatus::Failed
     } else {
         match parsed.as_ref().map(|o| o.is_error) {
@@ -1391,6 +1646,9 @@ pub fn run_agent_and_finish(
         }
     };
     let is_error = run_status != RunStatus::Done;
+    if run_status == RunStatus::Done {
+        run_store.clear_agent_window(runner.name())?;
+    }
 
     // Finish the tracked run.
     let model_usage_json = parsed
@@ -1441,10 +1699,18 @@ pub fn run_agent_and_finish(
         .and_then(|o| o.cost_usd)
         .map(|c| c.to_string())
         .unwrap_or_default();
-    let summary = parsed
-        .as_ref()
-        .and_then(|o| o.result.clone())
-        .unwrap_or_default();
+    let summary = if all_attempts_rate_limited {
+        format!(
+            "Every configured agent hit its usage limit ({} attempt{} tried); see the run's events for the fallback trail.",
+            attempts.len(),
+            if attempts.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        parsed
+            .as_ref()
+            .and_then(|o| o.result.clone())
+            .unwrap_or_default()
+    };
 
     writeln!(out)?;
     writeln!(out, "lane      {}", prepared.lane)?;
@@ -1497,6 +1763,7 @@ pub fn supervise_run(
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
+    use crate::agent::opencode::OpencodeRunner;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
@@ -1511,6 +1778,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    #[test]
+    fn fake_clock_now_unix_secs_is_deterministic_and_matches_a_known_epoch() {
+        // 2026-08-06 09:05:03 UTC, cross-checked against `date -u -d
+        // '2026-08-06 09:05:03' +%s`.
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        assert_eq!(clock.now_unix_secs(), 1_786_007_103);
+    }
+
+    #[test]
+    fn fake_clock_now_unix_secs_advances_with_its_components() {
+        let earlier = FakeClock((2026, 8, 6, 9, 5, 3));
+        let later = FakeClock((2026, 8, 6, 9, 5, 4));
+        assert_eq!(later.now_unix_secs(), earlier.now_unix_secs() + 1);
+    }
 
     /// A [`BackendIdentityResolver`] test double that resolves every
     /// directory to the same, fixed identity, regardless of what's asked.
@@ -1796,6 +2078,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -1866,6 +2149,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -1921,6 +2205,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -1975,6 +2260,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2028,6 +2314,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2083,6 +2370,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2141,6 +2429,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2228,6 +2517,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2308,6 +2598,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2358,6 +2649,262 @@ mod tests {
         assert_eq!(run.status, RunStatus::Blocked);
     }
 
+    // --- GH-54: in-run priority-routing fallback ---
+
+    fn claude_rate_limited_json_with_epoch() -> String {
+        r#"{"session_id":"sess-claude","is_error":false,"result":"Claude AI usage limit reached|1758600000"}"#.to_string()
+    }
+
+    fn claude_rate_limited_json_without_epoch() -> String {
+        r#"{"session_id":"sess-claude","is_error":true,"result":"You've hit your usage limit reached for this session, try again later."}"#.to_string()
+    }
+
+    fn opencode_success_json() -> String {
+        [
+            r#"{"type":"step_finish","timestamp":1,"sessionID":"ses-opencode","part":{"cost":0.2,"tokens":{"input":5,"output":5}}}"#,
+            r#"{"type":"text","timestamp":2,"sessionID":"ses-opencode","part":{"text":"done via opencode"}}"#,
+        ]
+        .join("\n")
+    }
+
+    fn opencode_rate_limited_json() -> String {
+        r#"{"type":"error","timestamp":1,"sessionID":"ses-opencode","error":{"name":"RateLimitError","data":{"message":"rate limit exceeded"}}}"#.to_string()
+    }
+
+    /// Prepares a lane run configured with `claude` preferred and
+    /// `opencode` as its sole fallback (GitHub issue #54), returning the
+    /// owned fixtures the caller's `run_agent_and_finish` call needs —
+    /// `TempDir` included, so it isn't dropped (and its directory removed)
+    /// before the test runs.
+    fn prepare_run_with_opencode_fallback() -> (TempDir, FakeGhCli, RunStore, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+
+        let prepare_deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut prepare_out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &prepare_deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.fallbacks.len(),
+            1,
+            "sanity: one opencode fallback planned"
+        );
+
+        (tmp, gh, run_store, prepared)
+    }
+
+    #[test]
+    fn run_agent_and_finish_falls_back_to_opencode_when_claude_is_rate_limited() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_with_epoch(), 0),
+            (opencode_success_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Done);
+        assert_eq!(run.session_id.as_deref(), Some("ses-opencode"));
+
+        assert_eq!(
+            run_store.agent_exhausted_until("claude").unwrap(),
+            Some(1758600000)
+        );
+
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        assert!(events.iter().any(|e| {
+            e.kind == "rate_limited"
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("claude") && d.contains("opencode"))
+        }));
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.to_lowercase().contains("falling back"));
+        // The finished run's summary/resume must reflect the active
+        // (opencode) attempt, not the originally preferred claude.
+        assert!(output.contains("opencode --session ses-opencode"));
+    }
+
+    #[test]
+    fn run_agent_and_finish_rate_limit_without_reset_epoch_holds_for_the_default_window() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_without_epoch(), 0),
+            (opencode_success_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let before = SystemClock.now_unix_secs();
+        run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+        let after = SystemClock.now_unix_secs();
+
+        let until = run_store.agent_exhausted_until("claude").unwrap().unwrap();
+        assert!(
+            until >= before + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS
+                && until <= after + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS,
+            "expected `until` ({until}) within [{}, {}]",
+            before + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS,
+            after + crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_all_attempts_rate_limited_marks_the_run_failed() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        let spawner = FakeProcessSpawner::sequence(vec![
+            (claude_rate_limited_json_with_epoch(), 0),
+            (opencode_rate_limited_json(), 0),
+        ]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run_store.agent_exhausted_until("claude").unwrap(),
+            Some(1758600000)
+        );
+        assert!(
+            run_store
+                .agent_exhausted_until("opencode")
+                .unwrap()
+                .is_some()
+        );
+
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "rate_limited").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_ordinary_failure_does_not_retry_on_the_fallback() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        // An ordinary `is_error: true` with no rate-limit text -- must not
+        // trigger any fallback attempt.
+        let json = r#"{"session_id":"sess-claude","is_error":true,"result":"tool call failed"}"#;
+        let spawner = FakeProcessSpawner::sequence(vec![(json.to_string(), 0)]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(spawner.recorded.lock().unwrap().len(), 1);
+        assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
+        assert!(
+            run_store
+                .events_for_run(prepared.run_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn run_agent_and_finish_success_on_primary_clears_a_stale_window() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+
+        // A stale window row from an earlier rate-limited run, now expired.
+        run_store.set_agent_exhausted_until("claude", 1).unwrap();
+
+        let spawner = FakeProcessSpawner::sequence(vec![(canned_json(), 0)]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
     #[test]
     fn run_lane_fg_errors_before_any_spawn_when_prompt_file_missing() {
         let (tmp, home, repo_root, worktree_root, prompt_path) = setup();
@@ -2387,6 +2934,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2438,6 +2986,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2502,6 +3051,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2564,6 +3114,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2614,6 +3165,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2670,6 +3222,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2723,6 +3276,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2776,6 +3330,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2827,6 +3382,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2899,6 +3455,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -2957,6 +3514,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3004,6 +3562,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3054,6 +3613,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3135,6 +3695,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3193,6 +3754,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3246,6 +3808,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3301,6 +3864,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3353,6 +3917,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3399,6 +3964,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3448,6 +4014,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3502,6 +4069,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3554,6 +4122,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3611,6 +4180,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3665,6 +4235,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3721,6 +4292,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3777,6 +4349,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3845,6 +4418,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3900,6 +4474,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -3955,6 +4530,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4004,6 +4580,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4060,6 +4637,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4114,6 +4692,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4144,6 +4723,202 @@ mod tests {
     }
 
     #[test]
+    fn prepared_run_state_without_a_fallbacks_key_still_deserializes() {
+        // A pre-GH-54 supervisor state file (or single-runner-mode prepare)
+        // has no `fallbacks` key at all — `#[serde(default)]` must keep
+        // that compatible, since `PreparedRun` round-trips through the
+        // detached supervisor's JSON state file.
+        let json = r#"{
+            "run_id": 1,
+            "lane": "mylane",
+            "ticket": null,
+            "wt_name": "mylane",
+            "timestamp": "20260806-090503",
+            "worktree": "/Worktrees/axiom/mylane",
+            "branch": "jowi-dev/mylane-20260806-090503",
+            "invocation": {
+                "program": "claude",
+                "args": ["-p", "do the thing"],
+                "env_set": [],
+                "env_remove": []
+            },
+            "out_json_path": "/state/mylane-20260806-090503.json"
+        }"#;
+
+        let prepared: PreparedRun = serde_json::from_str(json).unwrap();
+
+        assert!(prepared.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn prepare_run_lane_with_no_fallback_runners_builds_no_fallbacks() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(prepared.fallbacks.is_empty());
+        assert_eq!(prepared.invocation.program, "claude");
+    }
+
+    #[test]
+    fn prepare_run_lane_with_fallback_runners_builds_one_planned_fallback_with_no_model() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.model = Some("fable".to_string());
+        let config = config_with_lane("mylane", lane, &worktree_root);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        // Preferred (claude) is not exhausted, so it drives the primary
+        // attempt and keeps its configured model.
+        assert_eq!(prepared.invocation.program, "claude");
+        assert!(prepared.invocation.args.iter().any(|a| a == "fable"));
+
+        assert_eq!(prepared.fallbacks.len(), 1);
+        let fallback = &prepared.fallbacks[0];
+        assert_eq!(fallback.agent, "opencode");
+        assert_eq!(fallback.invocation.program, "opencode");
+        // model is runner-specific and only ever set for the preferred
+        // agent's own attempt — the opencode fallback must never see
+        // "fable".
+        assert!(!fallback.invocation.args.iter().any(|a| a == "fable"));
+    }
+
+    #[test]
+    fn prepare_run_lane_uses_fallback_runner_as_primary_when_preferred_is_exhausted() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.model = Some("fable".to_string());
+        let config = config_with_lane("mylane", lane, &worktree_root);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        // claude's window is open (exhausted until far in the future,
+        // beyond the fake clock's "now").
+        run_store
+            .set_agent_exhausted_until("claude", 9_999_999_999)
+            .unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: vec![&OpencodeRunner],
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        // opencode drives the primary attempt since claude is exhausted,
+        // and there's no further fallback to plan beyond it.
+        assert_eq!(prepared.invocation.program, "opencode");
+        assert!(!prepared.invocation.args.iter().any(|a| a == "fable"));
+        assert!(prepared.fallbacks.is_empty());
+    }
+
+    #[test]
     fn supervise_run_records_its_own_pid_then_completes_the_run() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
@@ -4171,6 +4946,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4249,6 +5025,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4530,6 +5307,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4600,6 +5378,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4667,6 +5446,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4733,6 +5513,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,
@@ -4787,6 +5568,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
             home,

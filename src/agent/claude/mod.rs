@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RunMode, RunOutcome, SessionEnvVars, shell_quote,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, shell_quote,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -324,6 +324,7 @@ impl AgentRunner for ClaudeRunner {
             .ok_or(OutcomeParseError::MissingSessionId)?;
 
         let model_usage = parsed.model_usage.filter(|models| !models.is_empty());
+        let rate_limit = parsed.result.as_deref().and_then(classify_rate_limit);
 
         Ok(RunOutcome {
             session_id,
@@ -332,6 +333,7 @@ impl AgentRunner for ClaudeRunner {
             is_error: parsed.is_error,
             result: parsed.result,
             model_usage,
+            rate_limit,
         })
     }
 
@@ -476,6 +478,53 @@ impl AgentRunner for ClaudeRunner {
         }
         Ok(())
     }
+}
+
+/// Case-insensitive usage-limit/rate-limit phrases, verified against the
+/// claude CLI 2.1.220 bundle's own strings (`docs/plans/gh-54-priority-routing.md`'s
+/// "Rate-limit classification" section). `"credit balance"` is paired with
+/// `"too low"` rather than matched alone, since "credit balance" on its own
+/// shows up in ordinary balance-inquiry prose that is not a limit hit.
+const RATE_LIMIT_PATTERNS: &[&str] = &["usage limit reached", "out of extra usage", "rate limit"];
+
+/// Longest `result` text that can still classify as a limit response. Every
+/// observed limit shape is a one-liner well under this; the guard exists so
+/// pattern words appearing inside a genuine multi-sentence work summary
+/// never trigger classification (see `classify_rate_limit`).
+const RATE_LIMIT_MAX_RESULT_LEN: usize = 240;
+
+/// Classifies `result` (a finished run's free-text summary) as a
+/// usage-limit/rate-limit response, per [`RATE_LIMIT_PATTERNS`] plus the
+/// `"credit balance" + "too low"` pair. Returns `None` for any result text
+/// that matches none of them — ordinary failures and ordinary successes
+/// alike.
+///
+/// The legacy headless shape `Claude AI usage limit reached|<epoch>` names
+/// its reset time after the last `|`; when that suffix parses as an `i64`
+/// unix-seconds timestamp it becomes [`RateLimitInfo::reset_at`], otherwise
+/// (no `|` at all, or a non-numeric suffix) `reset_at` stays `None`.
+///
+/// Only terse results classify: `result` is the agent's own closing prose
+/// on a normal run, so a successful run that merely *discusses* rate limits
+/// must not be mistaken for a limit hit. A real limit response replaces the
+/// whole result with a one-liner; anything over
+/// [`RATE_LIMIT_MAX_RESULT_LEN`] is a work summary and never classifies.
+fn classify_rate_limit(result: &str) -> Option<RateLimitInfo> {
+    if result.len() > RATE_LIMIT_MAX_RESULT_LEN {
+        return None;
+    }
+    let lower = result.to_lowercase();
+    let matched = RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
+        || (lower.contains("credit balance") && lower.contains("too low"));
+    if !matched {
+        return None;
+    }
+
+    let reset_at = result
+        .rsplit_once('|')
+        .and_then(|(_, suffix)| suffix.trim().parse::<i64>().ok());
+
+    Some(RateLimitInfo { reset_at })
 }
 
 /// Raw shape of the `claude -p --output-format json` result, deserialized
@@ -1071,6 +1120,77 @@ mod tests {
     fn parse_outcome_treats_empty_model_usage_map_as_none() {
         let json = r#"{"session_id": "sess-abc", "modelUsage": {}}"#;
         assert_eq!(ClaudeRunner.parse_outcome(json).unwrap().model_usage, None);
+    }
+
+    // --- rate-limit classification ---
+
+    #[test]
+    fn parse_outcome_classifies_legacy_usage_limit_shape_with_epoch() {
+        // The legacy headless shape shipped with `is_error: false` — see
+        // `RateLimitInfo`'s doc comment on why classification must not
+        // depend on `is_error`.
+        let json = r#"{"session_id": "sess-abc", "is_error": false, "result": "Claude AI usage limit reached|1758600000"}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(
+            outcome.rate_limit,
+            Some(RateLimitInfo {
+                reset_at: Some(1758600000)
+            })
+        );
+    }
+
+    #[test]
+    fn parse_outcome_classifies_prose_usage_limit_without_epoch() {
+        let json = r#"{"session_id": "sess-abc", "result": "You've hit your usage limit reached for this session, try again later."}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_classifies_credit_balance_too_low() {
+        let json =
+            r#"{"session_id": "sess-abc", "result": "Credit balance is too low to continue."}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_leaves_rate_limit_none_for_ordinary_error() {
+        let json = r#"{"session_id": "sess-abc", "is_error": true, "result": "tool call failed: permission denied"}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(outcome.rate_limit, None);
+    }
+
+    #[test]
+    fn parse_outcome_leaves_rate_limit_none_when_result_absent() {
+        let json = r#"{"session_id": "sess-abc"}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(outcome.rate_limit, None);
+    }
+
+    #[test]
+    fn parse_outcome_classifies_legacy_shape_with_non_numeric_suffix() {
+        let json =
+            r#"{"session_id": "sess-abc", "result": "Claude AI usage limit reached|not-a-number"}"#;
+        let outcome = ClaudeRunner.parse_outcome(json).unwrap();
+        assert_eq!(outcome.rate_limit, Some(RateLimitInfo { reset_at: None }));
+    }
+
+    #[test]
+    fn parse_outcome_ignores_rate_limit_mentions_in_long_work_summaries() {
+        // `result` is the agent's own closing prose: a successful run that
+        // merely *discusses* rate limits (say, a lane run implementing
+        // rate-limit handling) must not classify as a limit hit. Real limit
+        // responses are terse one-liners; anything longer is a work summary.
+        let summary = "Implemented the rate limit classifier and its fallback \
+                       loop, extended the config parser with the new strategy \
+                       key, added twelve tests covering the rate limit window \
+                       persistence, and verified fmt, clippy, and the full \
+                       test suite all pass. PR is ready for review.";
+        let json =
+            format!(r#"{{"session_id": "sess-abc", "is_error": false, "result": "{summary}"}}"#);
+        let outcome = ClaudeRunner.parse_outcome(&json).unwrap();
+        assert_eq!(outcome.rate_limit, None);
     }
 
     // --- session identity ---

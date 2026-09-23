@@ -140,6 +140,19 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN tmux_session TEXT;
     "#,
+    // GitHub issue #54: priority routing between agent harnesses needs to
+    // remember, per agent, when a usage-limit window was last hit and when
+    // it's expected to reopen, so a subsequent run can skip a still-
+    // exhausted agent without re-probing it. `agent` is
+    // `AgentRunner::name()` (e.g. "claude"); `exhausted_until` is a unix
+    // timestamp (seconds). See `docs/plans/gh-54-priority-routing.md`'s
+    // "Window persistence" section.
+    r#"
+    CREATE TABLE agent_windows (
+      agent            TEXT    PRIMARY KEY,
+      exhausted_until  INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// A handle to the run-state SQLite database.
@@ -2449,6 +2462,48 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Sets (inserting or overwriting) `agent`'s exhausted-until timestamp
+    /// (unix seconds) in the `agent_windows` table, so a subsequent run
+    /// knows to skip `agent` until its usage-limit window is expected to
+    /// reopen. GitHub issue #54; see the module doc comment's
+    /// "agent_windows" migration entry.
+    ///
+    /// Upserts rather than appending history, exactly like
+    /// [`RunStore::set_ticket_rank`]: an agent has a single current window,
+    /// not an event log.
+    pub fn set_agent_exhausted_until(&self, agent: &str, until: i64) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            "INSERT INTO agent_windows (agent, exhausted_until) VALUES (?1, ?2)
+             ON CONFLICT(agent) DO UPDATE SET exhausted_until = excluded.exhausted_until",
+            params![agent, until],
+        )?;
+        Ok(())
+    }
+
+    /// Returns `agent`'s recorded exhausted-until timestamp (unix seconds),
+    /// or `None` if it has never been recorded (or has been cleared by
+    /// [`RunStore::clear_agent_window`]).
+    pub fn agent_exhausted_until(&self, agent: &str) -> Result<Option<i64>, RunStoreError> {
+        self.conn
+            .query_row(
+                "SELECT exhausted_until FROM agent_windows WHERE agent = ?1",
+                params![agent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Clears `agent`'s recorded window, if any. Called on a successful
+    /// (zero-exit, non-failed) outcome so stale exhausted state self-heals
+    /// rather than sticking around after the agent's window has actually
+    /// reopened.
+    pub fn clear_agent_window(&self, agent: &str) -> Result<(), RunStoreError> {
+        self.conn
+            .execute("DELETE FROM agent_windows WHERE agent = ?1", params![agent])?;
+        Ok(())
+    }
+
     /// Returns cost aggregates grouped by retro verdict (clean / defect),
     /// restricted to `kind` when given (same filter as
     /// [`RunStore::list_runs_filtered`]), for `tm runs --by-retro`.
@@ -2674,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_10() {
+    fn open_migrates_a_fresh_db_to_user_version_11() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -2682,7 +2737,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -5625,6 +5680,92 @@ mod tests {
         let store = open_store(dir.path());
 
         assert!(store.all_ticket_ranks("",).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_exhausted_until_returns_none_when_never_recorded() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_agent_exhausted_until_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_agent_exhausted_until("claude", 1_000_000)
+            .unwrap();
+
+        assert_eq!(
+            store.agent_exhausted_until("claude").unwrap(),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn set_agent_exhausted_until_upserts_overwriting_existing_value() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_agent_exhausted_until("claude", 1_000_000)
+            .unwrap();
+        store
+            .set_agent_exhausted_until("claude", 2_000_000)
+            .unwrap();
+
+        assert_eq!(
+            store.agent_exhausted_until("claude").unwrap(),
+            Some(2_000_000)
+        );
+    }
+
+    #[test]
+    fn agent_windows_are_tracked_independently_per_agent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_agent_exhausted_until("claude", 1_000_000)
+            .unwrap();
+        store
+            .set_agent_exhausted_until("opencode", 2_000_000)
+            .unwrap();
+
+        assert_eq!(
+            store.agent_exhausted_until("claude").unwrap(),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            store.agent_exhausted_until("opencode").unwrap(),
+            Some(2_000_000)
+        );
+    }
+
+    #[test]
+    fn clear_agent_window_removes_the_recorded_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_agent_exhausted_until("claude", 1_000_000)
+            .unwrap();
+        store.clear_agent_window("claude").unwrap();
+
+        assert!(store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_agent_window_on_never_recorded_agent_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.clear_agent_window("claude").unwrap();
+
+        assert!(store.agent_exhausted_until("claude").unwrap().is_none());
     }
 
     #[test]
