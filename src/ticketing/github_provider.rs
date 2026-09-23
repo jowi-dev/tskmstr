@@ -705,6 +705,34 @@ impl TicketProvider for GithubProvider<'_> {
         })
     }
 
+    /// Fetch every issue's `blockedBy` dependencies in one batched
+    /// [`GhCli::issues_blocked_by`] call and replace each issue's inward
+    /// `Blocks` links with them. `search` deliberately skips dependencies
+    /// (one GraphQL call per issue); this is the bounded-cost way to get
+    /// them for a whole board at once (GitHub issue #62). Outward links
+    /// (issues this one blocks) are left as they are, since nothing that
+    /// reads readiness needs them.
+    fn hydrate_blockers(&self, issues: &mut [Issue]) -> Result<(), ProviderError> {
+        let numbers = issues
+            .iter()
+            .map(|issue| parse_issue_number(&issue.key))
+            .collect::<Result<Vec<u64>, _>>()?;
+        let mut blocked_by = self
+            .gh
+            .issues_blocked_by(&self.repo, &numbers)
+            .map_err(ProviderError::from)?;
+        for (issue, number) in issues.iter_mut().zip(numbers) {
+            let deps = IssueDependencies {
+                blocked_by: blocked_by.remove(&number).unwrap_or_default(),
+                blocking: Vec::new(),
+            };
+            let links = &mut issue.fields.issue_links;
+            links.retain(|link| link.inward_issue.is_none());
+            links.extend(self.to_issue_links(number, deps));
+        }
+        Ok(())
+    }
+
     fn get_project(&self, key: &str) -> Result<(), ProviderError> {
         self.gh
             .issue_list(
@@ -1389,6 +1417,73 @@ mod tests {
         assert_eq!(result.issues[0].key, "GH-1");
         let calls = fake.issue_list_calls();
         assert_eq!(calls[0].1.assignee, Some("jowi-dev".to_string()));
+    }
+
+    #[test]
+    fn hydrate_blockers_fills_blocked_by_links_for_every_issue_in_one_call() {
+        let fake = FakeGhCli::new()
+            .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+            .with_issue_list(Ok(vec![
+                issue_info(1, "Blocked", IssueState::Open, &[]),
+                issue_info(2, "Free", IssueState::Open, &[]),
+                issue_info(3, "Also free", IssueState::Open, &[]),
+            ]))
+            .with_issue_blocked_by(
+                1,
+                vec![IssueRef {
+                    number: 9,
+                    title: "Blocker".to_string(),
+                    state: IssueState::Open,
+                    url: String::new(),
+                }],
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = provider.search(&TicketQuery::MyOpen).unwrap().issues;
+        assert!(
+            issues.iter().all(|i| i.fields.issue_links.is_empty()),
+            "search itself stays dependency-free"
+        );
+
+        provider.hydrate_blockers(&mut issues).unwrap();
+
+        let blockers: Vec<&str> = crate::blocker_stacking::direct_blockers(&issues[0])
+            .into_iter()
+            .map(|b| b.key.as_str())
+            .collect();
+        assert_eq!(blockers, vec!["GH-9"]);
+        assert_eq!(
+            issues[0].fields.issue_links[0].id,
+            link_id(9, 1),
+            "same link id shape get_issue produces"
+        );
+        assert!(issues[1].fields.issue_links.is_empty());
+        assert!(issues[2].fields.issue_links.is_empty());
+        assert_eq!(
+            fake.issues_blocked_by_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![1, 2, 3])],
+            "one batched call regardless of issue count"
+        );
+        assert!(fake.issue_dependencies_calls().is_empty());
+    }
+
+    #[test]
+    fn hydrate_blockers_failure_is_an_error_not_an_empty_success() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(1, Ok(issue_info(1, "Blocked", IssueState::Open, &[])))
+            .with_issues_blocked_by_error(crate::github::gh_cli::GhError::Command {
+                command: "gh api graphql".to_string(),
+                exit_code: Some(1),
+                stderr: "rate limited".to_string(),
+            });
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-1",
+            1,
+            issue_info(1, "Blocked", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+
+        assert!(provider.hydrate_blockers(&mut issues).is_err());
     }
 
     #[test]

@@ -238,6 +238,20 @@ pub trait TicketProvider {
         target.to_string()
     }
 
+    /// Ensure every issue in `issues` (fresh from [`Self::search`]) carries
+    /// its direct `Blocks` blockers in `issue_links`, so
+    /// [`crate::blocker_stacking::readiness`] sees real dependency data.
+    /// Used by the board's readiness glyphs (GitHub issue #62).
+    ///
+    /// The default is a no-op: Jira's search already requests `issuelinks`.
+    /// A backend whose search omits dependencies for cost reasons (the
+    /// github backend) overrides this with a batched fetch. An `Err` means
+    /// the issues' blockers are unknown, and the caller must not treat any
+    /// of them as unblocked.
+    fn hydrate_blockers(&self, _issues: &mut [Issue]) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Whether `token` is plausibly a ticket key in this backend's key
     /// scheme. Used by PR title/body/branch key scraping
     /// ([`crate::ticketing::resolve_existing_key`] and every
