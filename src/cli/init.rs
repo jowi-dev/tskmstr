@@ -2482,7 +2482,7 @@ mod tests {
             .with_line("mylane")
             .with_line(".")
             .with_line("develop")
-            .with_line("prompts/custom.md")
+            .with_line(".tskmstr/prompts/custom.md")
             .with_line("") // leave model unset — keeps the file byte-identical
             .with_confirm(true) // labels
             .with_confirm(true); // update lane

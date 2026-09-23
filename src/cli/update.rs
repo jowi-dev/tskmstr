@@ -687,7 +687,7 @@ mod tests {
             read_repo_config(&env)
         );
         assert!(
-            read_repo_config(&env).contains("schema_version = 1"),
+            read_repo_config(&env).contains("schema_version = 2"),
             "the stamp still bumps even though the legacy path remains drift"
         );
     }
