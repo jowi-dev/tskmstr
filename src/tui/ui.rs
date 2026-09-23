@@ -1681,6 +1681,7 @@ mod tests {
             description: "A longer description of the ticket.".to_string(),
             status_category: "indeterminate".to_string(),
             assignee: None,
+            readiness: crate::blocker_stacking::Readiness::Unknown,
         }
     }
 

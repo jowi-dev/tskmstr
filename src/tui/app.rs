@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::blocker_stacking::Readiness;
 use crate::jira::client::RankAnchor;
 use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
 use crate::ticketing::provider::TicketQuery;
@@ -34,6 +35,11 @@ pub struct TicketSummary {
     pub status_category: String,
     /// Display name of the ticket's assignee, or `None` if unassigned.
     pub assignee: Option<String>,
+    /// Worker-lane readiness (GitHub issue #62), computed on the board's
+    /// network worker by [`crate::blocker_stacking::readiness`] after the
+    /// fetch. [`Readiness::Unknown`] wherever it wasn't (or couldn't be)
+    /// computed, e.g. on [`Screen::Rank`], which never renders it.
+    pub readiness: Readiness,
 }
 
 /// The board's assignee filter: which subset of tickets to show.
@@ -1136,6 +1142,11 @@ pub enum Msg {
         /// How many tickets were actually fetched and are on screen.
         shown: usize,
     },
+    /// A board fetch loaded its tickets, but a readiness input (blockers or
+    /// the PR list) couldn't be fetched, so some cards show
+    /// [`Readiness::Unknown`]. Emitted after the load message, like
+    /// [`Msg::SearchTruncated`], and carries the status-line note.
+    ReadinessDegraded(String),
     /// Transitions for the selected ticket finished loading.
     TransitionsLoaded(Vec<Transition>),
     /// Transitions for the selected ticket failed to load.
@@ -1936,6 +1947,10 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::SearchTruncated { shown } => {
             app.status_line =
                 format!("showing first {shown} tickets -- more matched; narrow the filter");
+            (app, Vec::new())
+        }
+        Msg::ReadinessDegraded(note) => {
+            app.status_line = note;
             (app, Vec::new())
         }
         Msg::Enter => enter(app),
@@ -3562,6 +3577,7 @@ mod tests {
             description: format!("Description for {key}"),
             status_category: "new".to_string(),
             assignee: None,
+            readiness: Readiness::Unknown,
         }
     }
 
@@ -3758,6 +3774,16 @@ mod tests {
         let app = App::new();
         let (app, cmds) = update(app, Msg::TicketsFailed("boom".to_string()));
         assert_eq!(app.status_line, "boom");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn readiness_degraded_puts_its_note_on_the_status_line() {
+        let (app, cmds) = update(
+            App::new(),
+            Msg::ReadinessDegraded("readiness unknown: boom".to_string()),
+        );
+        assert_eq!(app.status_line, "readiness unknown: boom");
         assert!(cmds.is_empty());
     }
 

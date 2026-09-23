@@ -40,6 +40,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
+use crate::blocker_stacking::{Readiness, direct_blockers, readiness};
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
@@ -1852,18 +1853,83 @@ impl TicketPage {
     }
 }
 
-/// Run `Cmd::FetchTickets`: search for tickets matching `query` and map them
-/// to [`crate::tui::app::TicketSummary`]s.
+/// Run `Cmd::FetchTickets`: search for tickets matching `query`, classify
+/// each one's worker-lane readiness ([`board_readiness`], GitHub issue #62),
+/// and map them to [`crate::tui::app::TicketSummary`]s.
+///
+/// Emits [`Msg::TicketsLoaded`], then [`Msg::SearchTruncated`] if the search
+/// hit its page budget, then [`Msg::ReadinessDegraded`] if a readiness input
+/// couldn't be fetched -- last, so the status line keeps the note the
+/// affected `?` glyphs need explaining by.
 fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
-    match search_tickets(deps, query) {
-        Ok(page) => {
-            let truncation = page.truncation_msg();
-            let mut msgs = vec![Msg::TicketsLoaded(page.tickets)];
-            msgs.extend(truncation);
-            msgs
-        }
-        Err(err) => vec![Msg::TicketsFailed(err.to_string())],
+    let result = match deps.jira.search(query) {
+        Ok(result) => result,
+        Err(err) => return vec![Msg::TicketsFailed(err.to_string())],
+    };
+    let truncated = result.next_page_token.is_some();
+    let mut issues = result.issues;
+    let (readiness, degraded) = board_readiness(deps, &mut issues);
+    let page = TicketPage {
+        truncated,
+        tickets: issues
+            .into_iter()
+            .zip(readiness)
+            .map(|(issue, readiness)| TicketSummary {
+                readiness,
+                ..to_ticket_summary(deps.jira.as_ref(), issue)
+            })
+            .collect(),
+    };
+    let truncation = page.truncation_msg();
+    let mut msgs = vec![Msg::TicketsLoaded(page.tickets)];
+    msgs.extend(truncation);
+    msgs.extend(degraded.map(Msg::ReadinessDegraded));
+    msgs
+}
+
+/// Classify every issue in `issues` (one [`Readiness`] each, in order) via
+/// [`crate::blocker_stacking::readiness`] -- the same rule `tm ready <KEY>`
+/// applies -- plus a status-line note when an input lookup failed.
+///
+/// Cost is bounded per refresh, not per ticket: one
+/// [`TicketProvider::hydrate_blockers`] (a no-op on Jira, one batched
+/// GraphQL query on GitHub) and at most one [`GhCli::pr_list_all`] against
+/// the board's own repo (`deps.cwd`), skipped entirely when no issue has a
+/// direct blocker.
+///
+/// Failure never reads as ready: a failed blocker fetch makes every card
+/// [`Readiness::Unknown`] (no blocker data at all), and a failed PR list
+/// makes every card *with* blockers unknown (a card with none is still
+/// ready, since `decide` never needs PRs for it).
+///
+/// [`GhCli::pr_list_all`]: crate::github::gh_cli::GhCli::pr_list_all
+fn board_readiness(deps: &NetDeps, issues: &mut [Issue]) -> (Vec<Readiness>, Option<String>) {
+    if let Err(err) = deps.jira.hydrate_blockers(issues) {
+        return (
+            vec![Readiness::Unknown; issues.len()],
+            Some(format!("readiness unknown: could not load blockers ({err})")),
+        );
     }
+    let mut degraded = None;
+    let prs = if issues.iter().any(|issue| !direct_blockers(issue).is_empty()) {
+        match deps.gh.pr_list_all(&deps.cwd) {
+            Ok(prs) => Some(prs),
+            Err(err) => {
+                let note = crate::github::gh_cli::permanence_note(&err);
+                degraded = Some(format!(
+                    "readiness unknown for blocked tickets: could not list PRs ({err}){note}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let readiness = issues
+        .iter()
+        .map(|issue| readiness(issue, prs.as_deref()))
+        .collect();
+    (readiness, degraded)
 }
 
 /// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
@@ -2241,6 +2307,7 @@ fn to_ticket_summary(jira: &dyn TicketProvider, issue: Issue) -> crate::tui::app
         status: issue.fields.status.name,
         description,
         assignee,
+        readiness: Readiness::Unknown,
     }
 }
 
@@ -2397,6 +2464,270 @@ mod tests {
                 assert_eq!(*shown, 2);
             }
             other => panic!("expected TicketsLoaded then SearchTruncated, got {other:?}"),
+        }
+    }
+
+    // --- Board readiness (GitHub issue #62) ---
+
+    /// `issue(key, "To Do")` with one direct `Blocks` link to an
+    /// in-progress `blocker_key`.
+    fn blocked_issue(key: &str, blocker_key: &str) -> Issue {
+        use crate::ticketing::types::{IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields};
+        let mut issue = issue(key, "To Do");
+        issue.fields.issue_links = vec![IssueLink {
+            id: "1".to_string(),
+            link_type: IssueLinkType {
+                name: "Blocks".to_string(),
+                inward: "is blocked by".to_string(),
+                outward: "blocks".to_string(),
+            },
+            inward_issue: Some(LinkedIssue {
+                key: blocker_key.to_string(),
+                fields: LinkedIssueFields {
+                    summary: "Blocker".to_string(),
+                    status: Status {
+                        name: "In Progress".to_string(),
+                        status_category: StatusCategory {
+                            key: "indeterminate".to_string(),
+                        },
+                    },
+                },
+            }),
+            outward_issue: None,
+        }];
+        issue
+    }
+
+    fn pr_summary(
+        number: u64,
+        head_ref_name: &str,
+        lifecycle: crate::github::gh_cli::PrLifecycle,
+    ) -> crate::github::gh_cli::PrSummary {
+        crate::github::gh_cli::PrSummary {
+            number,
+            head_ref_name: head_ref_name.to_string(),
+            lifecycle,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn loaded_readiness(msgs: &[Msg]) -> Vec<(String, Readiness)> {
+        match msgs.first() {
+            Some(Msg::TicketsLoaded(tickets)) => tickets
+                .iter()
+                .map(|t| (t.key.clone(), t.readiness.clone()))
+                .collect(),
+            other => panic!("expected TicketsLoaded first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_tickets_classifies_readiness_with_one_pr_list_call() {
+        use crate::github::gh_cli::{FakeGhCli, PrLifecycle};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![
+                issue("PROJ-1", "To Do"),
+                blocked_issue("PROJ-2", "PROJ-8"),
+                blocked_issue("PROJ-3", "PROJ-9"),
+            ],
+            next_page_token: None,
+        });
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            90,
+            "jowi-dev/proj-9-thing",
+            PrLifecycle::Open,
+        )]));
+        let mut deps = net_deps(jira);
+        deps.gh = Box::new(gh);
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![
+                ("PROJ-1".to_string(), Readiness::Ready),
+                (
+                    "PROJ-2".to_string(),
+                    Readiness::Blocked {
+                        blocker_keys: vec!["PROJ-8".to_string()]
+                    }
+                ),
+                (
+                    "PROJ-3".to_string(),
+                    Readiness::Stackable {
+                        blocker_key: "PROJ-9".to_string()
+                    }
+                ),
+            ]
+        );
+        assert_eq!(msgs.len(), 1, "no degradation note on success: {msgs:?}");
+    }
+
+    #[test]
+    fn fetch_tickets_skips_the_pr_list_when_nothing_has_blockers() {
+        use crate::github::gh_cli::FakeGhCli;
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do")],
+            next_page_token: None,
+        });
+        // A PR list that would fail if called: no blockers means no call,
+        // so no degradation note either.
+        let mut deps = net_deps(jira);
+        deps.gh = Box::new(FakeGhCli::new().with_pr_list_all(Err(
+            crate::github::gh_cli::GhError::Command {
+                command: "gh pr list".to_string(),
+                exit_code: Some(1),
+                stderr: "must not be called".to_string(),
+            },
+        )));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![("PROJ-1".to_string(), Readiness::Ready)]
+        );
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+    }
+
+    #[test]
+    fn fetch_tickets_pr_list_failure_marks_blocked_candidates_unknown_and_notes_it() {
+        use crate::github::gh_cli::{FakeGhCli, GhError};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do"), blocked_issue("PROJ-2", "PROJ-8")],
+            next_page_token: None,
+        });
+        let mut deps = net_deps(jira);
+        deps.gh = Box::new(FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        })));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![
+                ("PROJ-1".to_string(), Readiness::Ready),
+                ("PROJ-2".to_string(), Readiness::Unknown),
+            ]
+        );
+        match msgs.last() {
+            Some(Msg::ReadinessDegraded(note)) => {
+                assert!(note.contains("boom"), "{note}");
+                assert!(note.contains("readiness"), "{note}");
+            }
+            other => panic!("expected a trailing ReadinessDegraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_tickets_on_github_marks_an_open_blocked_by_dependency_blocked_in_bounded_calls() {
+        use crate::github::gh_cli::{FakeGhCli, IssueInfo, IssueRef, IssueState};
+        use crate::ticketing::github_provider::GithubProvider;
+
+        let info = |number: u64| IssueInfo {
+            number,
+            url: String::new(),
+            title: format!("Issue {number}"),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+        let provider_gh: &'static FakeGhCli = Box::leak(Box::new(
+            FakeGhCli::new()
+                .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+                .with_issue_list(Ok((1..=20).map(info).collect()))
+                .with_issue_blocked_by(
+                    2,
+                    vec![IssueRef {
+                        number: 7,
+                        title: "Blocker".to_string(),
+                        state: IssueState::Open,
+                        url: String::new(),
+                    }],
+                ),
+        ));
+        let mut deps = net_deps(FakeJiraClient::new());
+        deps.jira = Box::new(GithubProvider::new(
+            provider_gh,
+            "jowi-dev/tskmstr".to_string(),
+        ));
+        deps.gh = Box::new(FakeGhCli::new().with_pr_list_all(Ok(vec![])));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        let readiness = loaded_readiness(&msgs);
+        assert_eq!(readiness.len(), 20);
+        assert_eq!(
+            readiness[1],
+            (
+                "GH-2".to_string(),
+                Readiness::Blocked {
+                    blocker_keys: vec!["GH-7".to_string()]
+                }
+            )
+        );
+        assert!(
+            readiness
+                .iter()
+                .filter(|(key, _)| key != "GH-2")
+                .all(|(_, r)| *r == Readiness::Ready)
+        );
+        // Bounded regardless of ticket count: one list and one batched
+        // dependency query on the provider side -- never one per issue.
+        assert_eq!(provider_gh.issue_list_calls().len(), 1);
+        assert_eq!(provider_gh.issues_blocked_by_calls().len(), 1);
+        assert!(provider_gh.issue_dependencies_calls().is_empty());
+    }
+
+    #[test]
+    fn fetch_tickets_blocker_fetch_failure_marks_every_card_unknown() {
+        use crate::github::gh_cli::{FakeGhCli, GhError, IssueInfo, IssueState};
+        use crate::ticketing::github_provider::GithubProvider;
+
+        let provider_gh: &'static FakeGhCli = Box::leak(Box::new(
+            FakeGhCli::new()
+                .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+                .with_issue_list(Ok(vec![IssueInfo {
+                    number: 1,
+                    url: String::new(),
+                    title: "Issue 1".to_string(),
+                    body: String::new(),
+                    state: IssueState::Open,
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                }]))
+                .with_issues_blocked_by_error(GhError::Command {
+                    command: "gh api graphql".to_string(),
+                    exit_code: Some(1),
+                    stderr: "rate limited".to_string(),
+                }),
+        ));
+        let mut deps = net_deps(FakeJiraClient::new());
+        deps.jira = Box::new(GithubProvider::new(
+            provider_gh,
+            "jowi-dev/tskmstr".to_string(),
+        ));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![("GH-1".to_string(), Readiness::Unknown)],
+            "no blocker data must never read as ready"
+        );
+        match msgs.last() {
+            Some(Msg::ReadinessDegraded(note)) => assert!(note.contains("rate limited"), "{note}"),
+            other => panic!("expected a trailing ReadinessDegraded, got {other:?}"),
         }
     }
 
