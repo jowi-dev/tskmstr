@@ -1,6 +1,11 @@
-schema_version = 1
+schema_version = 2
+status_on_start = "In Progress"
+status_on_pr = "In Review"
 [backend]
 provider = "github"
+
+[backend.github]
+repo = "jowi-dev/tskmstr"
 
 [work.lanes.tskmstr]
 # Relative-path idiom (GitHub issue #5 phase 2): "." resolves to this
@@ -18,3 +23,8 @@ base_branch = "main"
 # it instructs and a run works no matter where `tm` was invoked from.
 # `.tskmstr/prompts/` is the canonical home for all prompt files (ADR-0006).
 prompt_file = ".tskmstr/prompts/tskmstr-lane.md"
+model = "opus"
+
+[work.create]
+dir = "."
+prompt_file = ".tskmstr/prompts/create.md"
