@@ -531,6 +531,18 @@ pub struct MergeConfirm {
     pub target_status: Option<String>,
 }
 
+/// The pending lane launch the blocked-launch confirmation overlay is asking
+/// about (GitHub issue #62): `w` on a card whose readiness is
+/// [`Readiness::Blocked`]. Captured whole at keypress time, like
+/// [`MergeConfirm`], so the prompt names exactly the blockers the glyph did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneConfirm {
+    /// Ticket key the lane run would launch for.
+    pub key: String,
+    /// The ticket's unmerged blockers, shown in the prompt.
+    pub blocker_keys: Vec<String>,
+}
+
 /// One choice in the floating picker [`Msg::OpenBrowserAction`] opens when
 /// the selected ticket has both a Jira issue and an open GitHub pull request.
 /// Built once, in [`browser_options_resolved`], from the ticket's own `url`
@@ -827,6 +839,12 @@ pub struct App {
     /// state here -- the overlay being open and a merge being pending are
     /// the same fact.
     pub merge_confirm: Option<MergeConfirm>,
+    /// The blocked-launch confirmation overlay's pending lane launch (`w`
+    /// on a [`Readiness::Blocked`] card, GitHub issue #62), or `None` when
+    /// closed. Shares the confirm/cancel keys with `merge_confirm`; the two
+    /// are never open at once, since each overlay makes every other key
+    /// inert.
+    pub lane_confirm: Option<LaneConfirm>,
     /// The configured `status_on_merge` target (see
     /// [`crate::config::Config::status_on_merge`]), threaded in at
     /// construction via [`App::with_status_on_merge`] so
@@ -1065,8 +1083,9 @@ pub enum Msg {
     },
     /// Accept whichever confirmation overlay is open: for a pending merge,
     /// close it and start the merge ([`Cmd::LaunchMerge`], `tm merge <key>`
-    /// as a watched child -- GitHub issue #61). A no-op when no
-    /// confirmation is pending.
+    /// as a watched child -- GitHub issue #61); for a pending blocked lane
+    /// launch ([`LaneConfirm`]), close it and launch as `w` would have for
+    /// a ready ticket. A no-op when no confirmation is pending.
     ConfirmAccept,
     /// Close whichever confirmation overlay is open without acting;
     /// everything is left untouched.
@@ -1898,9 +1917,14 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             repo_root,
             note,
         } => merge_pr_resolved(app, key, pr, repo_root, note),
-        Msg::ConfirmAccept => merge_confirm_accept(app),
+        Msg::ConfirmAccept => match app.lane_confirm.take() {
+            Some(confirm) => launch_lane(app, confirm.key),
+            None => merge_confirm_accept(app),
+        },
         Msg::ConfirmCancel => {
-            if let Some(confirm) = app.merge_confirm.take() {
+            if let Some(confirm) = app.lane_confirm.take() {
+                app.status_line = format!("lane run for {} cancelled", confirm.key);
+            } else if let Some(confirm) = app.merge_confirm.take() {
                 app.status_line = format!(
                     "merge of PR #{} for {} cancelled",
                     confirm.pr_number, confirm.key
@@ -2513,11 +2537,25 @@ fn bots_action(mut app: App) -> (App, Vec<Cmd>) {
 /// than claiming nothing is configured at all; exactly one lane launches
 /// directly (marking the ticket pending); more than one opens the lane
 /// picker, highlighting the first lane.
+///
+/// A ticket whose readiness is [`Readiness::Blocked`] asks first (GitHub
+/// issue #62): once the guards above pass, the blocked-launch confirmation
+/// overlay ([`LaneConfirm`]) opens naming its blockers, and only
+/// [`Msg::ConfirmAccept`] goes on to [`launch_lane`]. Ready, stackable, and
+/// unknown tickets launch as before -- unknown deliberately so, since a
+/// flaky readiness lookup must not turn every launch into a prompt.
 fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.lane_confirm.is_some() {
+        return (app, Vec::new());
+    }
     let Some(ticket) = app.selected_ticket() else {
         return (app, Vec::new());
     };
     let key = ticket.key.clone();
+    let blocker_keys = match &ticket.readiness {
+        Readiness::Blocked { blocker_keys } => Some(blocker_keys.clone()),
+        _ => None,
+    };
 
     let active = app.pending_lane_launches.contains(&key)
         || matches!(
@@ -2529,18 +2567,31 @@ fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     }
 
+    if app.lane_names.is_empty() {
+        app.status_line = if app.hidden_lane_count > 0 {
+            format!(
+                "no compatible lanes ({} hidden: backend mismatch)",
+                app.hidden_lane_count
+            )
+        } else {
+            "no lanes configured".to_string()
+        };
+        return (app, Vec::new());
+    }
+
+    if let Some(blocker_keys) = blocker_keys {
+        app.lane_confirm = Some(LaneConfirm { key, blocker_keys });
+        return (app, Vec::new());
+    }
+    launch_lane(app, key)
+}
+
+/// Launch a lane run for `key` past [`lane_run_action`]'s guards (and, for
+/// a blocked ticket, its confirmation): exactly one configured lane
+/// launches directly, marking the ticket pending; more than one opens the
+/// lane picker, highlighting the first lane.
+fn launch_lane(mut app: App, key: String) -> (App, Vec<Cmd>) {
     match app.lane_names.len() {
-        0 => {
-            app.status_line = if app.hidden_lane_count > 0 {
-                format!(
-                    "no compatible lanes ({} hidden: backend mismatch)",
-                    app.hidden_lane_count
-                )
-            } else {
-                "no lanes configured".to_string()
-            };
-            (app, Vec::new())
-        }
         1 => {
             let lane = app.lane_names[0].clone();
             app.pending_lane_launches.insert(key.clone());
@@ -6990,6 +7041,102 @@ mod tests {
     }
 
     // --- Msg::LaneRunAction / Msg::LanePicker* / Msg::LaneRunLaunchResult / Msg::LaneRunStatusLoaded ---
+
+    // --- Blocked-launch confirmation (GitHub issue #62) ---
+
+    fn blocked_ticket(key: &str, blockers: &[&str]) -> TicketSummary {
+        TicketSummary {
+            readiness: Readiness::Blocked {
+                blocker_keys: blockers.iter().map(|b| b.to_string()).collect(),
+            },
+            ..ticket(key)
+        }
+    }
+
+    #[test]
+    fn lane_run_action_on_a_blocked_ticket_asks_first_naming_the_blockers() {
+        let app = board_with(vec![blocked_ticket("PROJ-1", &["PROJ-8", "PROJ-9"])], 0)
+            .with_lane_names(vec!["backend".to_string()]);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert!(cmds.is_empty(), "nothing launches before confirming");
+        assert_eq!(
+            app.lane_confirm,
+            Some(LaneConfirm {
+                key: "PROJ-1".to_string(),
+                blocker_keys: vec!["PROJ-8".to_string(), "PROJ-9".to_string()],
+            })
+        );
+        assert!(app.pending_lane_launches.is_empty());
+    }
+
+    #[test]
+    fn confirming_a_blocked_launch_launches_it() {
+        let app = board_with(vec![blocked_ticket("PROJ-1", &["PROJ-8"])], 0)
+            .with_lane_names(vec!["backend".to_string()]);
+        let (app, _) = update(app, Msg::LaneRunAction);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchLaneRun {
+                lane: "backend".to_string(),
+                key: "PROJ-1".to_string(),
+            }]
+        );
+        assert!(app.lane_confirm.is_none());
+        assert!(app.pending_lane_launches.contains("PROJ-1"));
+    }
+
+    #[test]
+    fn confirming_a_blocked_launch_with_several_lanes_opens_the_picker() {
+        let app = board_with(vec![blocked_ticket("PROJ-1", &["PROJ-8"])], 0)
+            .with_lane_names(vec!["backend".to_string(), "frontend".to_string()]);
+        let (app, _) = update(app, Msg::LaneRunAction);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
+        assert!(cmds.is_empty());
+        assert!(app.show_lane_picker);
+        assert!(app.lane_confirm.is_none());
+    }
+
+    #[test]
+    fn declining_a_blocked_launch_launches_nothing() {
+        let app = board_with(vec![blocked_ticket("PROJ-1", &["PROJ-8"])], 0)
+            .with_lane_names(vec!["backend".to_string()]);
+        let (app, _) = update(app, Msg::LaneRunAction);
+        let (app, cmds) = update(app, Msg::ConfirmCancel);
+        assert!(cmds.is_empty());
+        assert!(app.lane_confirm.is_none());
+        assert!(app.pending_lane_launches.is_empty());
+        assert!(app.status_line.contains("PROJ-1"), "{}", app.status_line);
+    }
+
+    #[test]
+    fn ready_and_stackable_tickets_launch_without_a_prompt() {
+        for readiness in [
+            Readiness::Ready,
+            Readiness::Stackable {
+                blocker_key: "PROJ-8".to_string(),
+            },
+        ] {
+            let ticket = TicketSummary {
+                readiness: readiness.clone(),
+                ..ticket("PROJ-1")
+            };
+            let app = board_with(vec![ticket], 0).with_lane_names(vec!["backend".to_string()]);
+            let (app, cmds) = update(app, Msg::LaneRunAction);
+            assert!(app.lane_confirm.is_none(), "{readiness:?}");
+            assert_eq!(cmds.len(), 1, "{readiness:?} should launch directly");
+        }
+    }
+
+    #[test]
+    fn lane_run_action_is_inert_while_a_lane_confirmation_is_open() {
+        let app = board_with(vec![blocked_ticket("PROJ-1", &["PROJ-8"])], 0)
+            .with_lane_names(vec!["backend".to_string()]);
+        let (app, _) = update(app, Msg::LaneRunAction);
+        let (app, cmds) = update(app, Msg::LaneRunAction);
+        assert!(cmds.is_empty());
+        assert!(app.lane_confirm.is_some());
+    }
 
     #[test]
     fn lane_run_action_with_no_selected_ticket_is_a_noop() {

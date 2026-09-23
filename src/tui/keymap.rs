@@ -68,7 +68,8 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// `BrowserPicker*` (see [`Msg::OpenBrowserAction`]).
 ///
 /// While a confirmation overlay is shown (`show_confirm`: the merge prompt,
-/// see [`Msg::MergePrAction`]), only `y`/`Y`/`Enter` (confirm) and
+/// see [`Msg::MergePrAction`], or the blocked-launch prompt, see
+/// [`Msg::LaneRunAction`]), only `y`/`Y`/`Enter` (confirm) and
 /// `n`/`N`/`Esc`/`q` (cancel) are bound; every other key is inert, so
 /// nothing irreversible can happen from a stray keystroke while the prompt
 /// is up.

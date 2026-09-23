@@ -144,6 +144,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_merge_confirm(frame, app);
     }
 
+    if app.lane_confirm.is_some() {
+        draw_lane_confirm(frame, app);
+    }
+
     if app.show_retro_severity_picker {
         draw_retro_severity_picker(frame, app);
     }
@@ -1650,6 +1654,33 @@ fn draw_merge_confirm(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+/// A centered floating window asking to confirm a lane launch on a blocked
+/// ticket ([`crate::tui::app::LaneConfirm`], the board's `w` key -- GitHub
+/// issue #62), naming every unmerged blocker so declining is an informed
+/// choice. Same paragraph shape as [`draw_merge_confirm`].
+fn draw_lane_confirm(frame: &mut Frame, app: &App) {
+    let Some(confirm) = &app.lane_confirm else {
+        return;
+    };
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(format!("{} is blocked by:", confirm.key)),
+        Line::from(confirm.blocker_keys.join(", ")),
+        Line::from(""),
+        Line::from("A lane run now works against unfinished dependencies."),
+        Line::from(""),
+        Line::from("y/Enter launch anyway   n/Esc cancel"),
+    ];
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title("Launch blocked ticket")),
+    );
+    frame.render_widget(paragraph, area);
+}
+
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` percent of its
 /// width/height.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2635,6 +2666,21 @@ mod tests {
         assert!(text.contains("[PROJ-1] Fix the thing"));
         assert!(text.contains("then move PROJ-1 to Done"));
         assert!(text.contains("y/Enter merge"));
+    }
+
+    #[test]
+    fn draws_lane_confirm_overlay_naming_every_blocker() {
+        let app = App {
+            lane_confirm: Some(crate::tui::app::LaneConfirm {
+                key: "PROJ-1".to_string(),
+                blocker_keys: vec!["PROJ-8".to_string(), "PROJ-9".to_string()],
+            }),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("PROJ-1 is blocked"), "{text}");
+        assert!(text.contains("PROJ-8, PROJ-9"), "{text}");
+        assert!(text.contains("y/Enter launch anyway"), "{text}");
     }
 
     #[test]
