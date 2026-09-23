@@ -10,6 +10,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
+use crate::blocker_stacking::Readiness;
 use crate::runs::RunStatus;
 use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
 
@@ -180,6 +181,30 @@ pub fn run_indicator_label(indicator: RunIndicator) -> &'static str {
     }
 }
 
+/// The single-column glyph drawn beside a board card's key for its
+/// worker-lane [`Readiness`] (GitHub issue #62). Deliberately not emoji:
+/// most emoji render two columns wide and misalign cards across terminals.
+pub fn readiness_glyph(readiness: &Readiness) -> &'static str {
+    match readiness {
+        Readiness::Ready => "✓",
+        Readiness::Stackable { .. } => "◐",
+        Readiness::Blocked { .. } => "✗",
+        Readiness::Unknown => "?",
+    }
+}
+
+/// The color for [`readiness_glyph`]: green ready, cyan stackable (workable,
+/// on top of another branch), red blocked, dim unknown -- never green, since
+/// an unknown ticket must not read as launchable.
+pub fn readiness_style(readiness: &Readiness) -> Style {
+    match readiness {
+        Readiness::Ready => Style::new().fg(Color::Green),
+        Readiness::Stackable { .. } => Style::new().fg(Color::Cyan),
+        Readiness::Blocked { .. } => Style::new().fg(Color::Red),
+        Readiness::Unknown => DIM,
+    }
+}
+
 /// The style for a board ticket's [`BotWatchIndicator`] badge: `Ready` is the
 /// loud one (bold yellow, matching [`AWAITING_INPUT`] -- it is the state that
 /// wants a keypress, exactly like an audit session waiting on input),
@@ -271,6 +296,43 @@ pub fn event_kind_style(kind: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn every_readiness() -> [Readiness; 4] {
+        [
+            Readiness::Ready,
+            Readiness::Stackable {
+                blocker_key: "PROJ-9".to_string(),
+            },
+            Readiness::Blocked {
+                blocker_keys: vec!["PROJ-9".to_string()],
+            },
+            Readiness::Unknown,
+        ]
+    }
+
+    #[test]
+    fn readiness_glyphs_are_distinct_and_one_column_wide() {
+        let glyphs: Vec<&str> = every_readiness().iter().map(readiness_glyph).collect();
+        for glyph in &glyphs {
+            assert_eq!(
+                ratatui::text::Span::raw(*glyph).width(),
+                1,
+                "{glyph:?} must render one column wide to keep cards aligned"
+            );
+        }
+        let mut unique = glyphs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), glyphs.len(), "{glyphs:?}");
+    }
+
+    #[test]
+    fn unknown_readiness_never_shares_ready_color() {
+        assert_ne!(
+            readiness_style(&Readiness::Unknown),
+            readiness_style(&Readiness::Ready)
+        );
+    }
 
     #[test]
     fn ticket_status_style_maps_every_known_category_to_its_color() {

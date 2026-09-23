@@ -399,10 +399,20 @@ fn draw_card(
     };
     let key_style = style.patch(theme::CARD_KEY);
 
+    // The readiness glyph rides in the title beside the key rather than on
+    // a badge line of its own, so it costs no card height (GitHub issue #62).
+    let title = Line::from(vec![
+        Span::styled(ticket.key.clone(), key_style),
+        Span::styled(" ", style),
+        Span::styled(
+            theme::readiness_glyph(&ticket.readiness),
+            style.patch(theme::readiness_style(&ticket.readiness)),
+        ),
+    ]);
     let block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
-        .title(Line::from(Span::styled(ticket.key.clone(), key_style)))
+        .title(title)
         .border_style(style);
 
     let mut lines: Vec<Line> = wrapped_summary(&ticket.summary, content_width)
@@ -1393,6 +1403,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("f / F       cycle kind / scope view filter (runs watch only)"),
         Line::from("?           toggle this help"),
         Line::from(""),
+        Line::from("card key    ✓ ready  ◐ stackable  ✗ blocked  ? unknown (tm ready)"),
+        Line::from(""),
         Line::from("press any key to close"),
     ];
     let paragraph = Paragraph::new(lines).block(
@@ -1763,6 +1775,42 @@ mod tests {
         assert!(text.contains("In Progress"));
         assert!(text.contains("Fix the thing"));
         assert!(text.contains("Refreshing..."));
+    }
+
+    #[test]
+    fn draws_a_readiness_glyph_beside_each_card_key() {
+        use crate::blocker_stacking::Readiness;
+        let with = |key: &str, readiness: Readiness| TicketSummary {
+            readiness,
+            ..ticket(key)
+        };
+        let app = App {
+            columns: group_into_columns(
+                vec![
+                    with("PROJ-1", Readiness::Ready),
+                    with(
+                        "PROJ-2",
+                        Readiness::Stackable {
+                            blocker_key: "PROJ-9".to_string(),
+                        },
+                    ),
+                    with(
+                        "PROJ-3",
+                        Readiness::Blocked {
+                            blocker_keys: vec!["PROJ-9".to_string()],
+                        },
+                    ),
+                    with("PROJ-4", Readiness::Unknown),
+                ],
+                &[],
+            ),
+            ..App::new()
+        };
+        let text = buffer_text(&render_with_size(&app, 80, 40));
+        assert!(text.contains("PROJ-1 ✓"), "{text}");
+        assert!(text.contains("PROJ-2 ◐"), "{text}");
+        assert!(text.contains("PROJ-3 ✗"), "{text}");
+        assert!(text.contains("PROJ-4 ?"), "{text}");
     }
 
     #[test]
