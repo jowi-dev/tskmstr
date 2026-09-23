@@ -28,3 +28,10 @@ model = "opus"
 [work.create]
 dir = "."
 prompt_file = ".tskmstr/prompts/create.md"
+
+[work.merge]
+# Explicit because the conflict session passes only this key to the claude
+# adapter, which substitutes its own `fable` default when it is unset (it
+# does not consult [work] default_model the way lane runs do). Conflict
+# resolution is bounded mechanical work, so it runs on sonnet.
+model = "opus"
