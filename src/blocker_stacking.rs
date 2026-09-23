@@ -218,6 +218,53 @@ pub fn decide(unmerged: Vec<UnmergedBlocker>) -> StackDecision {
     }
 }
 
+/// A ticket's worker-lane readiness as the board reports it (GitHub issue
+/// #62): [`decide`]'s verdict collapsed to what a card glyph needs, plus an
+/// `Unknown` state for when the inputs `decide` needs couldn't be fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Readiness {
+    /// [`StackDecision::Ready`].
+    Ready,
+    /// [`StackDecision::Stackable`].
+    Stackable {
+        /// The one unmerged blocker whose open PR a run would stack on.
+        blocker_key: String,
+    },
+    /// [`StackDecision::BlockedNoPr`] or [`StackDecision::BlockedMultiple`].
+    Blocked {
+        /// Every unmerged blocker, in [`unmerged_direct_blockers`] order.
+        blocker_keys: Vec<String>,
+    },
+    /// The blocker or PR lookup failed, so [`decide`] never ran. Never
+    /// treated as ready: a false "ready" launches a lane on stuck work.
+    #[default]
+    Unknown,
+}
+
+/// Classify `issue` via [`decide`], the same rule `tm ready <KEY>` uses.
+/// `prs` is the blockers' repo PR list, or `None` when that lookup failed.
+/// A ticket with no direct blockers is [`Readiness::Ready`] without
+/// consulting `prs` at all (matching `tm ready`, which never shells out for
+/// one); a ticket with blockers and no PR list is [`Readiness::Unknown`].
+pub fn readiness(issue: &Issue, prs: Option<&[PrSummary]>) -> Readiness {
+    if direct_blockers(issue).is_empty() {
+        return Readiness::Ready;
+    }
+    let Some(prs) = prs else {
+        return Readiness::Unknown;
+    };
+    match decide(unmerged_direct_blockers(issue, prs)) {
+        StackDecision::Ready => Readiness::Ready,
+        StackDecision::Stackable { blocker_key, .. } => Readiness::Stackable { blocker_key },
+        StackDecision::BlockedNoPr { blocker } => Readiness::Blocked {
+            blocker_keys: vec![blocker.key],
+        },
+        StackDecision::BlockedMultiple { blockers } => Readiness::Blocked {
+            blocker_keys: blockers.into_iter().map(|b| b.key).collect(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +444,53 @@ mod tests {
             StackDecision::BlockedNoPr { blocker } => assert!(blocker.open_pr.is_none()),
             other => panic!("expected BlockedNoPr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn readiness_with_no_blockers_is_ready_even_without_a_pr_list() {
+        let issue = issue_blocked_by(vec![]);
+        assert_eq!(readiness(&issue, None), Readiness::Ready);
+    }
+
+    #[test]
+    fn readiness_with_a_blocker_but_no_pr_list_is_unknown_never_ready() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
+        assert_eq!(readiness(&issue, None), Readiness::Unknown);
+    }
+
+    #[test]
+    fn readiness_maps_each_decision() {
+        let stackable = issue_blocked_by(vec![linked_issue("AX-408", "Code Review")]);
+        let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
+        assert_eq!(
+            readiness(&stackable, Some(&prs)),
+            Readiness::Stackable {
+                blocker_key: "AX-408".to_string()
+            }
+        );
+
+        let blocked_no_pr = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
+        assert_eq!(
+            readiness(&blocked_no_pr, Some(&[])),
+            Readiness::Blocked {
+                blocker_keys: vec!["AX-408".to_string()]
+            }
+        );
+
+        let blocked_multiple = issue_blocked_by(vec![
+            linked_issue("AX-408", "Code Review"),
+            linked_issue("AX-409", "In Progress"),
+        ]);
+        assert_eq!(
+            readiness(&blocked_multiple, Some(&prs)),
+            Readiness::Blocked {
+                blocker_keys: vec!["AX-408".to_string(), "AX-409".to_string()]
+            }
+        );
+
+        let merged = issue_blocked_by(vec![linked_issue("AX-408", "Done")]);
+        let merged_prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
+        assert_eq!(readiness(&merged, Some(&merged_prs)), Readiness::Ready);
     }
 
     #[test]
