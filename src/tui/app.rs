@@ -780,7 +780,7 @@ pub struct App {
     /// [`Msg::LanePickerSelect`], cleared by [`Msg::LaneRunLaunchResult`].
     pub pending_lane_launches: std::collections::HashSet<String>,
     /// Ticket keys with a `tm merge` launcher child currently in flight.
-    /// Populated by [`Msg::MergeConfirm`]'s handler, cleared by
+    /// Populated by [`Msg::ConfirmAccept`]'s handler, cleared by
     /// [`Msg::MergePrResult`]. Gates a second `M` press/confirm for the
     /// same key the way `pending_lane_launches` gates a second `w` press,
     /// now that the merge itself is a watched child rather than a tracked
@@ -1038,7 +1038,7 @@ pub enum Msg {
     /// of the merge confirmation overlay. Like [`Msg::OpenBrowserAction`],
     /// never merges anything directly -- [`Msg::MergePrResolved`] decides
     /// between the confirmation overlay and a status-line "no open PR"
-    /// message, and only [`Msg::MergeConfirm`] can start the merge itself.
+    /// message, and only [`Msg::ConfirmAccept`] can start the merge itself.
     /// A no-op when no ticket is selected. Deliberately ungated by
     /// column/status, like the `a` audit key: the PR resolution itself is
     /// the authority on whether there is anything to merge.
@@ -1063,13 +1063,14 @@ pub enum Msg {
         /// mirroring [`Msg::BrowserOptionsResolved`]'s `note`.
         note: Option<String>,
     },
-    /// Accept the merge confirmation overlay: close it and start the
-    /// merge ([`Cmd::LaunchMerge`], `tm merge <key>` as a watched child --
-    /// GitHub issue #61). A no-op when no confirmation is pending.
-    MergeConfirm,
-    /// Close the merge confirmation overlay without merging; everything is
-    /// left untouched.
-    MergeCancel,
+    /// Accept whichever confirmation overlay is open: for a pending merge,
+    /// close it and start the merge ([`Cmd::LaunchMerge`], `tm merge <key>`
+    /// as a watched child -- GitHub issue #61). A no-op when no
+    /// confirmation is pending.
+    ConfirmAccept,
+    /// Close whichever confirmation overlay is open without acting;
+    /// everything is left untouched.
+    ConfirmCancel,
     /// [`Cmd::LaunchMerge`] finished, successfully or not; `message` carries
     /// the full status-line outcome either way (`tm merge`'s own summary --
     /// rebase, push, `gh pr merge`, `status_on_merge` -- on success, or its
@@ -1579,7 +1580,7 @@ pub enum Cmd {
     /// process through the same [`crate::tui::launcher::LaneLauncher`]
     /// seam [`Cmd::LaunchLaneRun`]/[`Cmd::LaunchBotWatch`]/
     /// [`Cmd::LaunchReviewFix`] use. Only ever emitted by
-    /// [`Msg::MergeConfirm`], so a merge can never run without the
+    /// [`Msg::ConfirmAccept`], so a merge can never run without the
     /// confirmation overlay having been accepted first (GitHub issue #61).
     /// `tm merge` re-resolves the PR itself, so unlike the direct-merge
     /// path this replaced, no PR number rides along.
@@ -1897,8 +1898,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             repo_root,
             note,
         } => merge_pr_resolved(app, key, pr, repo_root, note),
-        Msg::MergeConfirm => merge_confirm_accept(app),
-        Msg::MergeCancel => {
+        Msg::ConfirmAccept => merge_confirm_accept(app),
+        Msg::ConfirmCancel => {
             if let Some(confirm) = app.merge_confirm.take() {
                 app.status_line = format!(
                     "merge of PR #{} for {} cancelled",
@@ -2432,7 +2433,7 @@ fn merge_pr_resolved(
     (app, Vec::new())
 }
 
-/// Handle [`Msg::MergeConfirm`]: close the confirmation overlay and start
+/// Handle [`Msg::ConfirmAccept`]: close the confirmation overlay and start
 /// the merge it was asking about, via [`Cmd::LaunchMerge`] (`tm merge
 /// <key>`, spawned as a watched child -- GitHub issue #61). A no-op when no
 /// confirmation is pending, which [`crate::tui::keymap::map_key`]'s overlay
@@ -4097,7 +4098,7 @@ mod tests {
             merge_confirm: Some(merge_confirm_fixture()),
             ..App::new()
         };
-        let (app, cmds) = update(app, Msg::MergeConfirm);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
         assert_eq!(app.merge_confirm, None);
         assert_eq!(app.status_line, "merging PROJ-1 via tm merge...");
         assert!(app.pending_merge_launches.contains("PROJ-1"));
@@ -4112,7 +4113,7 @@ mod tests {
     #[test]
     fn merge_confirm_with_nothing_pending_is_a_noop() {
         let app = App::new();
-        let (app, cmds) = update(app, Msg::MergeConfirm);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
         assert_eq!(app.merge_confirm, None);
         assert!(cmds.is_empty());
     }
@@ -4123,7 +4124,7 @@ mod tests {
             merge_confirm: Some(merge_confirm_fixture()),
             ..App::new()
         };
-        let (app, cmds) = update(app, Msg::MergeCancel);
+        let (app, cmds) = update(app, Msg::ConfirmCancel);
         assert_eq!(app.merge_confirm, None);
         assert_eq!(app.status_line, "merge of PR #42 for PROJ-1 cancelled");
         assert!(cmds.is_empty());

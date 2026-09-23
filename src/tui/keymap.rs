@@ -67,8 +67,8 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// `j`/`k`/arrows/`Enter`/`Esc`/`q` shape applies again, routed to
 /// `BrowserPicker*` (see [`Msg::OpenBrowserAction`]).
 ///
-/// While the merge confirmation overlay is shown (`show_merge_confirm`,
-/// see [`Msg::MergePrAction`]), only `y`/`Y`/`Enter` (confirm the merge) and
+/// While a confirmation overlay is shown (`show_confirm`: the merge prompt,
+/// see [`Msg::MergePrAction`]), only `y`/`Y`/`Enter` (confirm) and
 /// `n`/`N`/`Esc`/`q` (cancel) are bound; every other key is inert, so
 /// nothing irreversible can happen from a stray keystroke while the prompt
 /// is up.
@@ -114,7 +114,7 @@ pub fn map_key(
     show_browser_picker: bool,
     rank_grabbed: bool,
     show_run_detail: bool,
-    show_merge_confirm: bool,
+    show_confirm: bool,
     retro_overlay: RetroOverlay,
     key: KeyCode,
 ) -> Option<Msg> {
@@ -165,11 +165,11 @@ pub fn map_key(
         };
     }
 
-    if show_merge_confirm {
+    if show_confirm {
         return match key {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Msg::MergeConfirm),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Msg::ConfirmAccept),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
-                Some(Msg::MergeCancel)
+                Some(Msg::ConfirmCancel)
             }
             _ => None,
         };
@@ -2344,7 +2344,7 @@ mod tests {
                     RetroOverlay::None,
                     key
                 ),
-                Some(Msg::MergeConfirm),
+                Some(Msg::ConfirmAccept),
                 "{key:?} should confirm the merge"
             );
         }
@@ -2369,7 +2369,7 @@ mod tests {
                     RetroOverlay::None,
                     key
                 ),
-                Some(Msg::MergeCancel),
+                Some(Msg::ConfirmCancel),
                 "{key:?} should cancel the merge"
             );
         }
