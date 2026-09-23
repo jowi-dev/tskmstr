@@ -1621,14 +1621,7 @@ impl GhCli for ShellGhCli {
         let name_arg = format!("name={name}");
         let output = Command::new("gh")
             .args([
-                "api",
-                "graphql",
-                "-f",
-                &query_arg,
-                "-F",
-                &owner_arg,
-                "-F",
-                &name_arg,
+                "api", "graphql", "-f", &query_arg, "-F", &owner_arg, "-F", &name_arg,
             ])
             .output()
             .map_err(|err| GhError::Spawn {
@@ -5279,7 +5272,9 @@ mod tests {
     fn shell_issues_blocked_by_with_no_numbers_makes_no_call() {
         // An empty alias list would be an invalid GraphQL selection set; the
         // empty case must short-circuit before ever spawning `gh`.
-        let map = ShellGhCli.issues_blocked_by("jowi-dev/tskmstr", &[]).unwrap();
+        let map = ShellGhCli
+            .issues_blocked_by("jowi-dev/tskmstr", &[])
+            .unwrap();
         assert!(map.is_empty());
     }
 

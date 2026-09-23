@@ -1907,11 +1907,16 @@ fn board_readiness(deps: &NetDeps, issues: &mut [Issue]) -> (Vec<Readiness>, Opt
     if let Err(err) = deps.jira.hydrate_blockers(issues) {
         return (
             vec![Readiness::Unknown; issues.len()],
-            Some(format!("readiness unknown: could not load blockers ({err})")),
+            Some(format!(
+                "readiness unknown: could not load blockers ({err})"
+            )),
         );
     }
     let mut degraded = None;
-    let prs = if issues.iter().any(|issue| !direct_blockers(issue).is_empty()) {
+    let prs = if issues
+        .iter()
+        .any(|issue| !direct_blockers(issue).is_empty())
+    {
         match deps.gh.pr_list_all(&deps.cwd) {
             Ok(prs) => Some(prs),
             Err(err) => {
