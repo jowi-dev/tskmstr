@@ -733,7 +733,7 @@ to" windows.
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
-| `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker (board only); see "Board-launched lane runs" below |
+| `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker; a ticket whose readiness glyph shows blocked asks for confirmation first, naming its blockers (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `m` | Ensure the selected ticket's session holds your configured `[work.manual]` window layout, then attach (board only); see "Board-opened manual sessions" below |
 | `b` | Arm a PR bot-findings watcher for the selected ticket, launch (or attach to) its cleanup session once the watcher finds something, or attach to a live cleanup session directly (board only) |
@@ -924,6 +924,26 @@ repo-local `.tskmstr.toml`, `repo = "."` roots the lane in that same repo,
 which is guaranteed backend-compatible with the board that offers it. See
 "Relative `repo`/`dir` paths in a repo-local config" under Configuration
 below.
+
+#### Readiness glyphs
+
+Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
+stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
+classification `tm ready <KEY>` reports, computed by the same rule
+(`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
+board repo's PR list. Pressing `w` on a blocked ticket opens a confirmation
+listing the blocking keys; `y`/`Enter` launches anyway, `n`/`Esc` launches
+nothing. Ready, stackable, and unknown tickets launch without a prompt.
+
+The lookup runs on the board's network worker with each ticket refresh and
+costs a fixed number of calls, not one per ticket: at most one `gh pr list`
+(skipped when no listed ticket has a blocker), and on the GitHub backend one
+batched GraphQL `blockedBy` query for every listed issue. If either lookup
+fails, the affected cards show `?`, never `✓`, and the status line says why.
+Unlike `tm ready <KEY>`, the board has no Jira-status-only fallback when the
+PR list fails, because a guessed "ready" is worse than no answer. GitHub
+dependency data only records open or closed, so an open blocker counts as
+cleared only once its PR is merged.
 
 ### Board-launched audit sessions
 
