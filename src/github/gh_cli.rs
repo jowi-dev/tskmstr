@@ -531,6 +531,20 @@ pub trait GhCli {
     /// [`GhCli::pr_review_threads`].
     fn issue_dependencies(&self, repo: &str, number: u64) -> Result<IssueDependencies, GhError>;
 
+    /// Fetch the `blockedBy` side of [`GhCli::issue_dependencies`] for every
+    /// issue in `numbers` in **one** `gh api graphql` call (one aliased
+    /// `issue(number:)` field per number, see [`issues_blocked_by_query`]),
+    /// keyed by issue number. The board's per-refresh readiness lookup
+    /// (GitHub issue #62) uses this so its `gh` call count stays bounded
+    /// regardless of how many tickets are listed. An empty `numbers` makes
+    /// no call at all. Same 100-per-issue single-page limit as
+    /// [`GhCli::issue_dependencies`].
+    fn issues_blocked_by(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Vec<IssueRef>>, GhError>;
+
     // --- Phase 6 additions (GithubProvider write path,
     // docs/plans/github-issues-backend.md) ---
 
@@ -868,6 +882,26 @@ const ISSUE_DEPENDENCIES_QUERY: &str = "query($owner: String!, $name: String!, $
     }
   }
 }";
+
+/// Build [`GhCli::issues_blocked_by`]'s batched query: one `i<number>:
+/// issue(number: <number>)` alias per requested issue, each selecting the
+/// same `blockedBy` connection [`ISSUE_DEPENDENCIES_QUERY`] does. The
+/// numbers are interpolated rather than passed as variables because GraphQL
+/// has no way to alias a variable-length list of fields; they are `u64`s,
+/// so nothing user-controlled reaches the query text.
+fn issues_blocked_by_query(numbers: &[u64]) -> String {
+    let fields: String = numbers
+        .iter()
+        .map(|n| {
+            format!(
+                "    i{n}: issue(number: {n}) {{ blockedBy(first: 100) {{ nodes {{ number title state url }} }} }}\n"
+            )
+        })
+        .collect();
+    format!(
+        "query($owner: String!, $name: String!) {{\n  repository(owner: $owner, name: $name) {{\n{fields}  }}\n}}"
+    )
+}
 
 /// GraphQL query resolving two issues' GraphQL node ids by number, for
 /// [`GhCli::create_issue_dependency`]/[`GhCli::delete_issue_dependency`]:
@@ -1569,6 +1603,43 @@ impl GhCli for ShellGhCli {
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
             number,
+        )
+    }
+
+    fn issues_blocked_by(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Vec<IssueRef>>, GhError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (owner, name) = split_repo_slug(repo)?;
+
+        let query_arg = format!("query={}", issues_blocked_by_query(numbers));
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &query_arg,
+                "-F",
+                &owner_arg,
+                "-F",
+                &name_arg,
+            ])
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh api graphql".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_issues_blocked_by_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
         )
     }
 
@@ -2663,6 +2734,74 @@ fn interpret_issue_dependencies_output(
     }
 }
 
+/// Raw shape of one aliased `i<number>` field in
+/// [`issues_blocked_by_query`]'s response, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawBlockedByIssue {
+    #[serde(rename = "blockedBy")]
+    blocked_by: RawDependencyConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesBlockedByData {
+    repository: Option<HashMap<String, Option<RawBlockedByIssue>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesBlockedByResponse {
+    data: Option<RawIssuesBlockedByData>,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`issues_blocked_by_query`], keyed by the issue number parsed back out of
+/// each `i<number>` alias. A null aliased issue (listed moments ago, gone
+/// now) is a [`GhError::Parse`] naming it rather than an empty entry: an
+/// empty entry would read as "no blockers", the false-ready outcome
+/// GitHub issue #62 forbids.
+fn interpret_issues_blocked_by_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<HashMap<u64, Vec<IssueRef>>, GhError> {
+    let parse_err = |message: String| GhError::Parse {
+        command: "gh api graphql".to_string(),
+        message,
+    };
+    match exit_code {
+        Some(0) => {
+            let response = serde_json::from_str::<RawIssuesBlockedByResponse>(stdout)
+                .map_err(|err| parse_err(err.to_string()))?;
+            let repository = response
+                .data
+                .and_then(|data| data.repository)
+                .ok_or_else(|| parse_err("repository not found".to_string()))?;
+            repository
+                .into_iter()
+                .map(|(alias, issue)| {
+                    let number = alias
+                        .strip_prefix('i')
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| parse_err(format!("unexpected alias `{alias}`")))?;
+                    let issue =
+                        issue.ok_or_else(|| parse_err(format!("issue #{number} not found")))?;
+                    let refs = issue
+                        .blocked_by
+                        .nodes
+                        .into_iter()
+                        .map(IssueRef::from)
+                        .collect();
+                    Ok((number, refs))
+                })
+                .collect()
+        }
+        code => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Raw shape of one aliased `issue(number: ...) { id }` field in
 /// [`ISSUE_NODE_IDS_QUERY`]'s response, for deserialization only.
 #[derive(Debug, Deserialize)]
@@ -2829,6 +2968,13 @@ pub struct FakeGhCli {
     issue_comment_calls: RefCell<Vec<(String, u64, String)>>,
     issue_dependencies_results: RefCell<HashMap<u64, Result<IssueDependencies, GhError>>>,
     issue_dependencies_calls: RefCell<Vec<(String, u64)>>,
+    /// Per-issue `blockedBy` results for `issues_blocked_by`; unconfigured
+    /// numbers read as unblocked.
+    issues_blocked_by_results: RefCell<HashMap<u64, Vec<IssueRef>>>,
+    /// When set, `issues_blocked_by` fails with this instead.
+    issues_blocked_by_error: RefCell<Option<GhError>>,
+    /// Every `(repo, numbers)` passed to `issues_blocked_by`.
+    issues_blocked_by_calls: RefCell<Vec<(String, Vec<u64>)>>,
     create_issue_dependency_result: RefCell<Result<(), GhError>>,
     create_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
     delete_issue_dependency_result: RefCell<Result<(), GhError>>,
@@ -2899,6 +3045,9 @@ impl Default for FakeGhCli {
             issue_comment_calls: RefCell::new(Vec::new()),
             issue_dependencies_results: RefCell::new(HashMap::new()),
             issue_dependencies_calls: RefCell::new(Vec::new()),
+            issues_blocked_by_results: RefCell::new(HashMap::new()),
+            issues_blocked_by_error: RefCell::new(None),
+            issues_blocked_by_calls: RefCell::new(Vec::new()),
             create_issue_dependency_result: RefCell::new(Ok(())),
             create_issue_dependency_calls: RefCell::new(Vec::new()),
             delete_issue_dependency_result: RefCell::new(Ok(())),
@@ -3199,6 +3348,29 @@ impl FakeGhCli {
         self.issue_dependencies_calls.borrow().clone()
     }
 
+    /// Set the `blockedBy` list `issues_blocked_by` reports for issue
+    /// `number`. Unconfigured numbers report no blockers, the same
+    /// unconfigured-is-empty convention as
+    /// [`FakeGhCli::with_issue_dependencies`].
+    pub fn with_issue_blocked_by(self, number: u64, blocked_by: Vec<IssueRef>) -> Self {
+        self.issues_blocked_by_results
+            .borrow_mut()
+            .insert(number, blocked_by);
+        self
+    }
+
+    /// Make every `issues_blocked_by` call fail with `err`.
+    pub fn with_issues_blocked_by_error(self, err: GhError) -> Self {
+        *self.issues_blocked_by_error.borrow_mut() = Some(err);
+        self
+    }
+
+    /// The `(repo, numbers)` pairs passed to `issues_blocked_by`, in call
+    /// order -- one entry per batched `gh api graphql` call.
+    pub fn issues_blocked_by_calls(&self) -> Vec<(String, Vec<u64>)> {
+        self.issues_blocked_by_calls.borrow().clone()
+    }
+
     /// Set the result `create_issue_dependency` will return.
     pub fn with_create_issue_dependency_result(self, result: Result<(), GhError>) -> Self {
         *self.create_issue_dependency_result.borrow_mut() = result;
@@ -3397,6 +3569,24 @@ impl GhCli for FakeGhCli {
             Some(result) => result.clone(),
             None => Ok(IssueDependencies::default()),
         }
+    }
+
+    fn issues_blocked_by(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Vec<IssueRef>>, GhError> {
+        self.issues_blocked_by_calls
+            .borrow_mut()
+            .push((repo.to_string(), numbers.to_vec()));
+        if let Some(err) = self.issues_blocked_by_error.borrow().clone() {
+            return Err(err);
+        }
+        let results = self.issues_blocked_by_results.borrow();
+        Ok(numbers
+            .iter()
+            .map(|n| (*n, results.get(n).cloned().unwrap_or_default()))
+            .collect())
     }
 
     fn create_issue_dependency(
@@ -5036,6 +5226,91 @@ mod tests {
             fake.issue_dependencies("jowi-dev/tskmstr", 3).unwrap(),
             deps
         );
+    }
+
+    // --- issues_blocked_by (batched, GitHub issue #62) ---
+
+    #[test]
+    fn issues_blocked_by_query_aliases_one_issue_field_per_number() {
+        let query = issues_blocked_by_query(&[3, 17]);
+        assert!(query.contains("i3: issue(number: 3)"), "{query}");
+        assert!(query.contains("i17: issue(number: 17)"), "{query}");
+        assert_eq!(query.matches("blockedBy(first: 100)").count(), 2);
+    }
+
+    #[test]
+    fn issues_blocked_by_parses_each_aliased_issue() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "i3": {"blockedBy": {"nodes": [
+                        {"number": 1, "title": "Provider trait", "state": "OPEN", "url": "u1"}
+                    ]}},
+                    "i17": {"blockedBy": {"nodes": []}}
+                }
+            }
+        }"#;
+        let map = interpret_issues_blocked_by_output(Some(0), stdout, "").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&3].len(), 1);
+        assert_eq!(map[&3][0].number, 1);
+        assert_eq!(map[&3][0].state, IssueState::Open);
+        assert!(map[&17].is_empty());
+    }
+
+    #[test]
+    fn issues_blocked_by_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"i3": null}}}"#;
+        let err = interpret_issues_blocked_by_output(Some(0), stdout, "").unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("#3"), "{message}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issues_blocked_by_failure_is_a_command_error() {
+        let err =
+            interpret_issues_blocked_by_output(Some(1), "", "gh: rate limit exceeded").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_issues_blocked_by_with_no_numbers_makes_no_call() {
+        // An empty alias list would be an invalid GraphQL selection set; the
+        // empty case must short-circuit before ever spawning `gh`.
+        let map = ShellGhCli.issues_blocked_by("jowi-dev/tskmstr", &[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_blocked_by_defaults_each_number_to_empty_and_logs_one_call() {
+        let blocker = IssueRef {
+            number: 1,
+            title: "Provider trait".to_string(),
+            state: IssueState::Open,
+            url: "u1".to_string(),
+        };
+        let fake = FakeGhCli::new().with_issue_blocked_by(3, vec![blocker.clone()]);
+
+        let map = fake.issues_blocked_by("jowi-dev/tskmstr", &[3, 4]).unwrap();
+
+        assert_eq!(map[&3], vec![blocker]);
+        assert!(map[&4].is_empty());
+        assert_eq!(
+            fake.issues_blocked_by_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![3, 4])]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_blocked_by_returns_configured_error() {
+        let fake = FakeGhCli::new().with_issues_blocked_by_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        });
+        assert!(fake.issues_blocked_by("jowi-dev/tskmstr", &[3]).is_err());
     }
 
     // --- issue dependency mutations (phase 6) ---
