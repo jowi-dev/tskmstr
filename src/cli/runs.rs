@@ -1800,6 +1800,8 @@ mod tests {
             last_event_age_secs: Some(45),
             awaiting_input: false,
             scope: String::new(),
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         };
 
         assert_eq!(last_event_column(&run), "tool_use 45s ago");
@@ -1819,6 +1821,8 @@ mod tests {
             last_event_age_secs: None,
             awaiting_input: false,
             scope: String::new(),
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         };
 
         assert_eq!(last_event_column(&run), "-");
