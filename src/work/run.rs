@@ -849,6 +849,13 @@ fn resolve_worktree_root(config: &WorkConfig, home: &Path) -> PathBuf {
 
 /// The final path component of `repo_root`, used as the worktree root's
 /// per-repo subdirectory, mirroring `work.ml`'s `repo_name`.
+/// The repo name a lane's worktrees are grouped under, and the `repo` half
+/// of its memory-estimate key (GitHub issue #66): the lane repo's directory
+/// name, falling back to the lane name.
+pub fn lane_repo_key(lane: &str, lane_config: &crate::config::LaneConfig) -> String {
+    repo_name(Path::new(&lane_config.repo)).unwrap_or_else(|| lane.to_string())
+}
+
 fn repo_name(repo_root: &Path) -> Option<String> {
     repo_root
         .file_name()
@@ -1013,7 +1020,7 @@ pub fn prepare_run_lane(
     }
 
     let worktree_root = resolve_worktree_root(config, &paths.home);
-    let repo = repo_name(&repo_root).unwrap_or_else(|| lane.to_string());
+    let repo = lane_repo_key(lane, lane_config);
     let wt_path = naming::worktree_path(&worktree_root.to_string_lossy(), &repo, &wt_name);
 
     // Belt-and-suspenders: re-check the *computed* path independently of

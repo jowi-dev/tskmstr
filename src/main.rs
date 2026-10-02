@@ -458,6 +458,7 @@ fn run_work(
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_run_start.as_deref()),
                 fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
+                memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,

@@ -118,6 +118,12 @@ pub enum WorkCliError {
     #[error(transparent)]
     RunStore(#[from] RunStoreError),
 
+    /// Memory-budget admission refused the lane (GitHub issue #66): the
+    /// estimate would exceed `[work] memory_budget_gb`, or the kernel
+    /// reports memory pressure. Checked before anything is provisioned.
+    #[error(transparent)]
+    MemoryAdmission(#[from] crate::work::admission::AdmissionRefusal),
+
     /// `tm work new`/`remove` was given an empty (or all-whitespace) name.
     /// See [`worktree_path_for`]'s doc comment for why this is rejected
     /// before ever calling `naming::worktree_path`.
@@ -381,6 +387,11 @@ pub struct RunDeps<'a> {
     /// [`crate::work::run::RunLaneDeps::fallback_runners`]. Empty in
     /// single-runner mode. See GitHub issue #54.
     pub fallback_runners: Vec<&'a dyn AgentRunner>,
+    /// Reads the kernel's memory-pressure level for memory-budget admission
+    /// (GitHub issue #66); production passes
+    /// [`crate::runs::footprint::memory_pressure`]. Only called when
+    /// `[work] memory_budget_gb` is set.
+    pub memory_pressure: &'a dyn Fn() -> crate::runs::footprint::MemoryPressure,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -440,6 +451,25 @@ pub fn run(
         mode: dispatch.run_mode(),
         ..request
     };
+
+    // Memory-budget admission (GitHub issue #66), ahead of every dispatch
+    // and of all provisioning, so a refusal leaves no worktree, branch, or
+    // run row behind. The board launches lanes through this same command,
+    // so this one check covers it too. An unknown lane is left for
+    // `prepare_run_lane` to report. The estimate is keyed by the preferred
+    // runner; priority routing may hand the run to a fallback agent.
+    if let Some(lane_config) = ctx.config.lanes.get(lane) {
+        let repo = crate::work::run::lane_repo_key(lane, lane_config);
+        if let Some(refusal) = crate::work::admission::check_lane_admission(
+            deps.run_store,
+            &ctx.config.memory,
+            deps.runner.name(),
+            &repo,
+            deps.memory_pressure,
+        )? {
+            return Err(refusal.into());
+        }
+    }
 
     match dispatch {
         Dispatch::Interactive => {
@@ -2302,6 +2332,137 @@ mod tests {
         assert_eq!(Dispatch::HeadlessForeground.run_mode(), RunMode::Headless);
     }
 
+    fn normal_pressure() -> crate::runs::footprint::MemoryPressure {
+        crate::runs::footprint::MemoryPressure::Normal
+    }
+
+    /// Runs `tm work run mylane PROJ-1` headless in the foreground against
+    /// `memory`, returning the result and the run store it used.
+    fn run_with_memory_config(
+        memory: crate::config::MemoryConfig,
+        pressure: &dyn Fn() -> crate::runs::footprint::MemoryPressure,
+        seed: &dyn Fn(&RunStore),
+    ) -> (Result<bool, WorkCliError>, Vec<crate::runs::RunSummary>) {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            memory,
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        seed(&run_store);
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: Vec::new(),
+            memory_pressure: pressure,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let result = run(
+            &ctx,
+            &deps,
+            "mylane",
+            request,
+            Dispatch::HeadlessForeground,
+            &mut out,
+        );
+        (result, run_store.list_runs().unwrap())
+    }
+
+    fn one_gig_budget() -> crate::config::MemoryConfig {
+        crate::config::MemoryConfig {
+            budget_bytes: Some(crate::runs::footprint::GIB),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn run_refuses_an_over_budget_lane_before_creating_a_run_row() {
+        let (result, runs) = run_with_memory_config(one_gig_budget(), &normal_pressure, &|_| {});
+
+        let err = result.expect_err("a 2 GB default estimate exceeds a 1 GB budget");
+        assert!(
+            matches!(
+                err,
+                WorkCliError::MemoryAdmission(
+                    crate::work::admission::AdmissionRefusal::OverBudget(_)
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("budget 1.0 GB"), "{err}");
+        assert!(runs.is_empty(), "no run row may be left behind: {runs:?}");
+    }
+
+    #[test]
+    fn run_refuses_a_lane_under_memory_pressure() {
+        let budget = crate::config::MemoryConfig {
+            budget_bytes: Some(1000 * crate::runs::footprint::GIB),
+            ..Default::default()
+        };
+        let (result, runs) = run_with_memory_config(
+            budget,
+            &|| crate::runs::footprint::MemoryPressure::Critical,
+            &|_| {},
+        );
+
+        let err = result.expect_err("critical pressure refuses any launch");
+        assert!(
+            err.to_string().contains("critical memory pressure"),
+            "{err}"
+        );
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn run_launches_as_before_with_no_memory_budget() {
+        let (result, runs) = run_with_memory_config(
+            crate::config::MemoryConfig::default(),
+            &|| crate::runs::footprint::MemoryPressure::Critical,
+            &|_| {},
+        );
+
+        assert!(result.unwrap());
+        assert_eq!(runs.len(), 1);
+    }
+
     #[test]
     fn run_interactive_hosts_claude_in_the_tickets_tmux_session() {
         let (tmp, home, repo_root, _prompt_path) = run_setup();
@@ -2347,6 +2508,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2469,6 +2631,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2539,6 +2702,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let mut out = Vec::new();
 
@@ -2697,6 +2861,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let mut out = Vec::new();
 
@@ -2773,6 +2938,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let mut out = Vec::new();
 
@@ -2835,6 +3001,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2947,6 +3114,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3010,6 +3178,7 @@ mod tests {
 
             status_on_run_start: None,
             fallback_runners: Vec::new(),
+            memory_pressure: &normal_pressure,
         };
         let mut out = Vec::new();
 
