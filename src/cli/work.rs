@@ -1055,6 +1055,7 @@ mod tests {
             merge: crate::config::MergeConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             manual: crate::config::ManualConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
         }
     }
 
