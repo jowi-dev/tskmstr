@@ -1710,7 +1710,12 @@ fn run_runs(
         None if by_retro => {
             tskmstr::cli::runs::list_by_retro(&store, kind.as_deref(), &mut stdout)?
         }
-        None => tskmstr::cli::runs::list(&store, kind.as_deref(), &mut stdout)?,
+        None => tskmstr::cli::runs::list(
+            &store,
+            kind.as_deref(),
+            &tskmstr::runs::footprint::tree_footprint,
+            &mut stdout,
+        )?,
         Some(RunsCmd::Start {
             ticket,
             lane,
@@ -1769,7 +1774,14 @@ fn run_runs(
             kind,
             detail,
         }) => {
-            tskmstr::cli::runs::event(&store, run_id, &kind, detail.as_deref(), &mut stdout)?;
+            tskmstr::cli::runs::event(
+                &store,
+                run_id,
+                &tskmstr::runs::footprint::tree_footprint,
+                &kind,
+                detail.as_deref(),
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::KillSafety { session }) => {
             tskmstr::cli::runs::kill_safety(

@@ -52,6 +52,22 @@ impl MemoryPressure {
     }
 }
 
+/// Bytes in one mebibyte.
+pub const MIB: u64 = 1024 * 1024;
+/// Bytes in one gibibyte. Config values like `memory_budget_gb` are read in
+/// these units, the same ones Activity Monitor labels "GB".
+pub const GIB: u64 = 1024 * MIB;
+
+/// Renders a byte count for display: whole megabytes below a gigabyte
+/// (`850 MB`), one decimal place from there up (`2.5 GB`).
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < GIB {
+        format!("{} MB", bytes / MIB)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    }
+}
+
 /// Returns the summed footprint, in bytes, of `root` and every process
 /// descended from it, or `None` when `root` is not running (or on a
 /// platform with no footprint API).
@@ -182,6 +198,14 @@ mod tests {
         assert!(MemoryPressure::Warn.blocks_launch());
         assert!(MemoryPressure::Critical.blocks_launch());
         assert!(!MemoryPressure::Unknown.blocks_launch());
+    }
+
+    #[test]
+    fn format_bytes_uses_mb_below_a_gigabyte_and_gb_above() {
+        assert_eq!(format_bytes(0), "0 MB");
+        assert_eq!(format_bytes(850 * MIB), "850 MB");
+        assert_eq!(format_bytes(1024 * MIB), "1.0 GB");
+        assert_eq!(format_bytes(2560 * MIB), "2.5 GB");
     }
 
     #[test]
