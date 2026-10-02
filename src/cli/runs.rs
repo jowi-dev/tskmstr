@@ -458,9 +458,8 @@ fn format_findings_count(findings_count: Option<i64>) -> String {
 /// Render a [`RunSummary`]'s last-event column: `{kind} {age} ago`, or `-`
 /// when the run has no recorded events.
 /// The `MEM` cell for a run: its current footprint while it runs, its peak
-/// once it has finished, `-` when nothing was ever sampled. Shared with the
-/// board's run detail.
-pub fn mem_column(status: RunStatus, current: Option<u64>, peak: Option<u64>) -> String {
+/// once it has finished, `-` when nothing was ever sampled.
+fn mem_column(status: RunStatus, current: Option<u64>, peak: Option<u64>) -> String {
     let bytes = if status == RunStatus::Running {
         current
     } else {

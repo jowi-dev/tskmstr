@@ -308,6 +308,12 @@ pub struct RunDetail {
     /// from events, never from a finish-time column. Empty when the run
     /// has emitted no `agent_usage` events.
     pub agent_usage: Vec<String>,
+    /// Latest footprint sample of the run's process tree, in bytes; see
+    /// [`crate::runs::Run::mem_current_bytes`].
+    pub mem_current_bytes: Option<u64>,
+    /// Largest footprint sample, in bytes; see
+    /// [`crate::runs::Run::mem_peak_bytes`].
+    pub mem_peak_bytes: Option<u64>,
 }
 
 /// A [`RunDetail`]'s model usage breakdown, labeled so the UI can
@@ -5925,6 +5931,8 @@ mod tests {
             tool_counts: vec![],
             model_usage: None,
             agent_usage: vec![],
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         }
     }
 

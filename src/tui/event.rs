@@ -1309,6 +1309,8 @@ fn run_to_detail(
         tool_counts,
         model_usage,
         agent_usage,
+        mem_current_bytes: run.mem_current_bytes,
+        mem_peak_bytes: run.mem_peak_bytes,
     }
 }
 
@@ -1339,7 +1341,8 @@ fn run_model_usage(
     None
 }
 
-/// Run `Cmd::ReapRuns` on the watch screen: mark abandoned runs as terminal,
+/// Run `Cmd::ReapRuns` on the watch screen: sample live runs' memory
+/// footprint, then mark abandoned runs as terminal,
 /// using the same staleness threshold as `tm runs reap`'s default (10
 /// minutes) and a real tmux snapshot for the session-liveness probe (see
 /// [`crate::runs::RunStore::reap`]). `WatchDeps` carries no tmux seam, so
@@ -1347,6 +1350,14 @@ fn run_model_usage(
 /// [`session_alive_probe`]'s tolerant fallback (no `tmux` binary reports
 /// every session alive) keeps tests deterministic anyway.
 fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
+    // Sampled before reaping (GitHub issue #66), so a run's last sample
+    // lands while its process is still there to measure.
+    if let Err(err) = deps
+        .store
+        .sample_footprints(&crate::runs::footprint::tree_footprint)
+    {
+        return vec![Msg::RunsFailed(err.to_string())];
+    }
     let session_alive = session_alive_probe(&crate::work::tmux::ShellTmuxOps);
     match deps
         .store
@@ -1527,7 +1538,8 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
 /// reducer-side instead, by `Msg::LaneRunStatusLoaded` in `app.rs`, since
 /// this function only sees `TuiDeps` and has no access to
 /// `App::pending_lane_launches`.
-/// Run `Cmd::ReapRuns` on the board: mark runs whose process or tmux session
+/// Run `Cmd::ReapRuns` on the board: sample live runs' memory footprint
+/// (GitHub issue #66), then mark runs whose process or tmux session
 /// died as terminal, so the status loads that follow on the same poll report
 /// their lanes relaunchable (GitHub issue #26). Same staleness threshold as
 /// `tm runs reap`'s default; the session probe comes from the board's own
@@ -1541,6 +1553,10 @@ fn reap_lane_runs(deps: &TuiDeps) -> Vec<Msg> {
         return Vec::new();
     };
 
+    // Same sample-then-reap order as the watch screen's `reap_runs`.
+    if let Err(err) = store.sample_footprints(&crate::runs::footprint::tree_footprint) {
+        return vec![Msg::RunsFailed(err.to_string())];
+    }
     let session_alive = session_alive_probe(deps.tmux.as_ref());
     match store.reap(10, &crate::runs::pid::pid_alive, &session_alive) {
         Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
@@ -3992,6 +4008,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn execute_watch_reap_runs_samples_the_footprint_of_live_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                pid: Some(std::process::id()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let deps = watch_deps(store);
+
+        execute_watch(&deps, Cmd::ReapRuns);
+
+        let run = deps.store.run_by_id(run_id).unwrap().unwrap();
+        assert!(run.mem_peak_bytes.is_some_and(|b| b > 0));
+    }
+
     #[test]
     fn execute_watch_reap_runs_on_empty_store_reaps_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -5242,6 +5277,36 @@ mod tests {
             }
             other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
         }
+    }
+
+    /// GitHub issue #66: the board's periodic reap is also a footprint
+    /// sampling point, so a live run's peak gets recorded while the board is
+    /// open. The test process itself stands in for a live lane.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn board_reap_samples_the_footprint_of_live_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                pid: Some(std::process::id()),
+                ..lane_start_params("PROJ-1")
+            })
+            .unwrap();
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        execute(&deps, Cmd::ReapRuns);
+
+        let run = deps
+            .store
+            .as_ref()
+            .unwrap()
+            .run_by_id(run_id)
+            .unwrap()
+            .unwrap();
+        assert!(run.mem_peak_bytes.is_some_and(|b| b > 0));
     }
 
     #[test]
