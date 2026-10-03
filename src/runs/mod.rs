@@ -2216,7 +2216,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              WHERE status = 'running'
                AND tmux_session IS NOT NULL

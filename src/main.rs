@@ -632,6 +632,8 @@ fn run_board(
             manual: config.work.manual,
             review_watch: config.work.review_watch,
             xdg_data_home,
+            idle_hibernate_mins: config.work.idle_hibernate_mins,
+            kill_pid: tskmstr::runs::pid::kill_pid,
             home,
             launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
             lane_names,
@@ -1893,6 +1895,12 @@ fn run_runs(
                     .as_ref()
                     .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).session_slug())
                     .unwrap_or_default(),
+                idle_hibernate_mins: full_config
+                    .as_ref()
+                    .map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
+                        cfg.work.idle_hibernate_mins
+                    }),
+                kill_pid: tskmstr::runs::pid::kill_pid,
             })?;
         }
         Some(RunsCmd::Logs {
