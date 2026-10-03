@@ -24,6 +24,12 @@
 //! rebase is deliberately left in progress on disk and
 //! [`MergeFlowOutcome::ConflictsHandedBack`] is returned so the caller can
 //! say so without treating it as an error.
+//!
+//! [`run_merge_batch`] is the multi-key form (`tm merge KEY1 KEY2 ...`): it
+//! merges every cleanly-rebasing ticket in order, sets conflicted ones
+//! aside, then resolves all of those in one shared agent session instead
+//! of one window per ticket. Both forms share the same prepare/finish
+//! stages, window launch, and per-tick rebase check.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -333,7 +339,52 @@ fn run_conflict_session(
         },
     };
     let prompt = conflict_prompt(&template, key, branch, base);
+    let session = open_agent_window(deps, prompt, key, key, dir)?;
+    let AgentWindow {
+        target,
+        window,
+        inside_tmux,
+    } = &session;
 
+    let conflicted = deps.git.conflicted_files(dir)?;
+    writeln!(
+        out,
+        "conflicts in {} files; opening agent session (window {target}:{window})",
+        conflicted.len()
+    )?;
+    if !inside_tmux {
+        writeln!(out, "attach: tmux attach -t {target}")?;
+    }
+
+    poll_conflict_session(deps, dir, target, window, branch, pre_rebase_rev, out)
+}
+
+/// Where [`open_agent_window`] opened a conflict-resolution session.
+struct AgentWindow {
+    /// The tmux session the window lives in.
+    target: String,
+    /// The window's name within `target`.
+    window: String,
+    /// Whether `target` is the invoking process's own tmux session (so no
+    /// attach hint is needed).
+    inside_tmux: bool,
+}
+
+/// Writes `prompt` to `merge-<prompt_stem>-<timestamp>.prompt.md` under
+/// [`MergeDeps::state_dir`] and opens a tmux window in `dir` running the
+/// agent against it — on the current tmux session when there is one,
+/// otherwise on `session_key`'s ticket session (created if needed).
+///
+/// The prompt file is written before any tmux call, so a `state_dir` write
+/// failure never leaves a half-opened session behind. See
+/// [`run_conflict_session`] for why the session is launched this way.
+fn open_agent_window(
+    deps: &MergeDeps<'_>,
+    prompt: String,
+    prompt_stem: &str,
+    session_key: &str,
+    dir: &Path,
+) -> Result<AgentWindow, MergeError> {
     let invocation = deps.runner.build_invocation(InvocationInputs {
         prompt,
         model: deps.merge_cfg.model.clone(),
@@ -348,7 +399,7 @@ fn run_conflict_session(
         .interactive_prompt(&invocation)
         .unwrap_or_default();
     let prompt_path = deps.state_dir.join(format!(
-        "merge-{key}-{}.prompt.md",
+        "merge-{prompt_stem}-{}.prompt.md",
         deps.clock.now_unix_secs()
     ));
     std::fs::create_dir_all(deps.state_dir).map_err(|source| MergeError::PromptWrite {
@@ -362,9 +413,9 @@ fn run_conflict_session(
     let command = deps.runner.tmux_command_line(&invocation, &prompt_path);
 
     let current_session = deps.tmux.current_session_name()?;
+    let inside_tmux = current_session.is_some();
     let target = current_session
-        .clone()
-        .unwrap_or_else(|| ticket_session_name(&deps.identity.session_slug(), key));
+        .unwrap_or_else(|| ticket_session_name(&deps.identity.session_slug(), session_key));
 
     let windows = deps.tmux.list_windows()?;
     let existing = session_window_names(&windows, &target);
@@ -379,17 +430,11 @@ fn run_conflict_session(
             .new_window_with_command(&target, &window, &dir_str, &[], &command)?;
     }
 
-    let conflicted = deps.git.conflicted_files(dir)?;
-    writeln!(
-        out,
-        "conflicts in {} files; opening agent session (window {target}:{window})",
-        conflicted.len()
-    )?;
-    if current_session.is_none() {
-        writeln!(out, "attach: tmux attach -t {target}")?;
-    }
-
-    poll_conflict_session(deps, dir, &target, &window, branch, pre_rebase_rev, out)
+    Ok(AgentWindow {
+        target,
+        window,
+        inside_tmux,
+    })
 }
 
 /// One poll tick's view of a conflicted rebase, from [`check_rebase`].
@@ -407,7 +452,8 @@ enum RebaseCheck {
 }
 
 /// Inspects `dir`'s rebase state once. Shared by the single-ticket poll
-/// loop ([`poll_conflict_session`]) and any future multi-ticket poll.
+/// loop ([`poll_conflict_session`]) and the batch one
+/// ([`poll_batch_conflict_session`]).
 ///
 /// `pre_rebase_rev` is the branch tip captured before `rebase_onto` ran:
 /// `git rebase --abort` restores it exactly, while a completed rebase
@@ -533,6 +579,352 @@ pub fn run_merge(
     }
     finish_merge(deps, &prepared, out)?;
     Ok(MergeFlowOutcome::Merged)
+}
+
+/// What [`run_merge_batch`] accomplished, ticket by ticket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchMergeReport {
+    /// Keys whose PR was merged, in the order they merged.
+    pub merged: Vec<String>,
+    /// Keys whose conflict resolution never finished (timed out, aborted,
+    /// or the session window died). Each rebase is left in progress (or
+    /// aborted) on disk, exactly like a single-ticket
+    /// [`MergeFlowOutcome::ConflictsHandedBack`].
+    pub handed_back: Vec<String>,
+    /// Keys that failed with an error, each paired with the error message.
+    /// One ticket's failure never stops the rest of the batch.
+    pub failed: Vec<(String, String)>,
+}
+
+impl BatchMergeReport {
+    /// The `tm merge` exit code for this batch: `1` if any ticket failed,
+    /// otherwise `2` if any was handed back, otherwise `0`. A failure
+    /// outranks a hand-back because it needs investigating, not just
+    /// finishing.
+    pub fn exit_code(&self) -> u8 {
+        if !self.failed.is_empty() {
+            1
+        } else if !self.handed_back.is_empty() {
+            2
+        } else {
+            0
+        }
+    }
+}
+
+/// `tm merge KEY1 KEY2 ...`: merge several tickets' PRs, sharing one
+/// conflict-resolution session across every ticket whose rebase stops on
+/// conflicts.
+///
+/// **Phase 1** walks `keys` in order, strictly sequentially (parallel
+/// rebases would race on the repo's index and worktrees). Each ticket runs
+/// the same pre-rebase steps as [`run_merge`] and attempts its rebase. A
+/// ticket that rebases cleanly (or needs no rebase) is merged, synced,
+/// cleaned up, and transitioned immediately. A ticket that stops on
+/// conflicts is set aside with its rebase left in progress on disk. A
+/// ticket that errors is recorded in [`BatchMergeReport::failed`] and the
+/// batch moves on.
+///
+/// **Phase 2** runs only if tickets were set aside. Exactly one set aside
+/// gets the ordinary single-ticket session (honoring
+/// `[work.merge].prompt`/`prompt_file`). Two or more share one agent window
+/// whose prompt comes from `[work.merge].batch_conflict_prompt` (or the
+/// runner's [`AgentRunner::default_batch_merge_conflict_prompt_template`])
+/// with `{ticket_list}` substituted. Every set-aside rebase is polled
+/// together until each resolves, is abandoned, the window dies, or
+/// [`CONFLICT_TIMEOUT_SECS`] per set-aside ticket elapses. Tickets that
+/// resolved are then pushed and merged in their original order; the rest
+/// are handed back.
+///
+/// Returns `Err` only when writing to `out` fails between tickets;
+/// per-ticket failures land in the report instead.
+pub fn run_merge_batch(
+    deps: &MergeDeps<'_>,
+    keys: &[String],
+    out: &mut dyn Write,
+) -> Result<BatchMergeReport, MergeError> {
+    let mut report = BatchMergeReport::default();
+    let mut set_aside: Vec<(PreparedMerge, PendingConflict)> = Vec::new();
+    let total = keys.len();
+
+    for (i, key) in keys.iter().enumerate() {
+        writeln!(out, "=== [{}/{total}] {key} ===", i + 1)?;
+        let mut prepared = match prepare_merge(deps, key, out) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                record_failure(&mut report, key, &err, out)?;
+                continue;
+            }
+        };
+        match prepared.conflict.take() {
+            Some(conflict) => {
+                writeln!(
+                    out,
+                    "{key}: rebase stopped on conflicts; set aside for the conflict session"
+                )?;
+                set_aside.push((prepared, conflict));
+            }
+            None => finish_into_report(deps, &prepared, &mut report, out)?,
+        }
+    }
+
+    let resolved: Vec<PreparedMerge> = match set_aside.len() {
+        0 => Vec::new(),
+        1 => {
+            let (prepared, conflict) = set_aside.remove(0);
+            writeln!(out, "=== conflict session: {} ===", prepared.key)?;
+            match run_conflict_session(
+                deps,
+                &prepared.key,
+                &prepared.branch,
+                &prepared.base,
+                &conflict.dir,
+                &conflict.pre_rebase_rev,
+                out,
+            ) {
+                Ok(ConflictOutcome::Resolved) => vec![prepared],
+                Ok(ConflictOutcome::HandedBack) => {
+                    report.handed_back.push(prepared.key);
+                    Vec::new()
+                }
+                Err(err) => {
+                    record_failure(&mut report, &prepared.key, &err, out)?;
+                    Vec::new()
+                }
+            }
+        }
+        n => {
+            writeln!(out, "=== shared conflict session: {n} tickets ===")?;
+            match run_batch_conflict_session(deps, &set_aside, out) {
+                Ok(flags) => {
+                    let mut resolved = Vec::new();
+                    for ((prepared, _), ok) in set_aside.into_iter().zip(flags) {
+                        if ok {
+                            resolved.push(prepared);
+                        } else {
+                            report.handed_back.push(prepared.key);
+                        }
+                    }
+                    resolved
+                }
+                Err(err) => {
+                    for (prepared, _) in &set_aside {
+                        record_failure(&mut report, &prepared.key, &err, out)?;
+                    }
+                    Vec::new()
+                }
+            }
+        }
+    };
+
+    for mut prepared in resolved {
+        writeln!(out, "=== finishing {} ===", prepared.key)?;
+        prepared.needs_push = true;
+        finish_into_report(deps, &prepared, &mut report, out)?;
+    }
+
+    writeln!(
+        out,
+        "batch done: {} merged, {} handed back, {} failed",
+        report.merged.len(),
+        report.handed_back.len(),
+        report.failed.len()
+    )?;
+    for key in &report.handed_back {
+        writeln!(
+            out,
+            "  handed back: {key} (finish the rebase, then rerun `tm merge {key}`)"
+        )?;
+    }
+    for (key, err) in &report.failed {
+        writeln!(out, "  failed: {key}: {err}")?;
+    }
+    Ok(report)
+}
+
+/// Records `key`'s failure in `report` and says so on `out`.
+fn record_failure(
+    report: &mut BatchMergeReport,
+    key: &str,
+    err: &MergeError,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    writeln!(out, "error: {key}: {err}")?;
+    report.failed.push((key.to_string(), err.to_string()));
+    Ok(())
+}
+
+/// Runs [`finish_merge`] for `prepared`, recording the result in `report`.
+fn finish_into_report(
+    deps: &MergeDeps<'_>,
+    prepared: &PreparedMerge,
+    report: &mut BatchMergeReport,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    match finish_merge(deps, prepared, out) {
+        Ok(()) => {
+            report.merged.push(prepared.key.clone());
+            Ok(())
+        }
+        Err(err) => record_failure(report, &prepared.key, &err, out),
+    }
+}
+
+/// Renders the `{ticket_list}` placeholder: one line per ticket giving its
+/// key, branch, base, and the checkout directory its rebase is in progress
+/// in.
+fn batch_ticket_list(tickets: &[(PreparedMerge, PendingConflict)]) -> String {
+    tickets
+        .iter()
+        .map(|(prepared, conflict)| {
+            format!(
+                "- {}: branch {} onto origin/{} in {}",
+                prepared.key,
+                prepared.branch,
+                prepared.base,
+                conflict.dir.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Opens the one agent window shared by every set-aside ticket, then polls
+/// them all. Returns one flag per ticket, in order: `true` if its rebase
+/// resolved.
+fn run_batch_conflict_session(
+    deps: &MergeDeps<'_>,
+    tickets: &[(PreparedMerge, PendingConflict)],
+    out: &mut dyn Write,
+) -> Result<Vec<bool>, MergeError> {
+    let template = match deps.merge_cfg.batch_conflict_prompt.as_deref() {
+        Some(prompt) => prompt.to_string(),
+        None => deps
+            .runner
+            .default_batch_merge_conflict_prompt_template()
+            .to_string(),
+    };
+    let prompt = template.replace("{ticket_list}", &batch_ticket_list(tickets));
+
+    // The window opens in the first ticket's checkout; the prompt names
+    // every other ticket's directory explicitly.
+    let (first, first_conflict) = &tickets[0];
+    let session = open_agent_window(deps, prompt, "batch", &first.key, &first_conflict.dir)?;
+    let AgentWindow {
+        target,
+        window,
+        inside_tmux,
+    } = &session;
+
+    let keys: Vec<&str> = tickets.iter().map(|(p, _)| p.key.as_str()).collect();
+    writeln!(
+        out,
+        "conflicts in {} tickets ({}); opening agent session (window {target}:{window})",
+        tickets.len(),
+        keys.join(", ")
+    )?;
+    if !inside_tmux {
+        writeln!(out, "attach: tmux attach -t {target}")?;
+    }
+
+    poll_batch_conflict_session(deps, tickets, target, window, out)
+}
+
+/// The batch counterpart of [`poll_conflict_session`]: each tick runs
+/// [`check_rebase`] on every still-pending ticket, then applies the shared
+/// timeout ([`CONFLICT_TIMEOUT_SECS`] per ticket, since the agent resolves
+/// them one after another) and the shared window's liveness check to
+/// whatever is still pending.
+fn poll_batch_conflict_session(
+    deps: &MergeDeps<'_>,
+    tickets: &[(PreparedMerge, PendingConflict)],
+    target: &str,
+    window: &str,
+    out: &mut dyn Write,
+) -> Result<Vec<bool>, MergeError> {
+    let timeout = CONFLICT_TIMEOUT_SECS * tickets.len() as i64;
+    let start = deps.clock.now_unix_secs();
+    let mut resolved = vec![false; tickets.len()];
+    let mut pending: Vec<usize> = (0..tickets.len()).collect();
+    let mut last_count: Option<usize> = None;
+    let mut last_heartbeat = start;
+
+    loop {
+        let mut still_pending = Vec::new();
+        for &i in &pending {
+            let (prepared, conflict) = &tickets[i];
+            let key = &prepared.key;
+            match check_rebase(
+                deps,
+                &conflict.dir,
+                &prepared.branch,
+                &conflict.pre_rebase_rev,
+            )? {
+                RebaseCheck::InProgress => still_pending.push(i),
+                RebaseCheck::Resolved => {
+                    writeln!(out, "{key}: conflicts resolved; rebase complete")?;
+                    resolved[i] = true;
+                }
+                RebaseCheck::Aborted => {
+                    writeln!(out, "{key}: rebase was aborted; handing back")?;
+                }
+                RebaseCheck::Incomplete => {
+                    writeln!(
+                        out,
+                        "{key}: rebase state cleared without completing; handing back"
+                    )?;
+                }
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() {
+            return Ok(resolved);
+        }
+
+        let now = deps.clock.now_unix_secs();
+        if now - start > timeout {
+            writeln!(out, "conflict resolution timed out after {timeout}s")?;
+            writeln!(out, "attach: tmux attach -t {target}")?;
+            for &i in &pending {
+                let (prepared, conflict) = &tickets[i];
+                writeln!(
+                    out,
+                    "abort {}: git -C {} rebase --abort",
+                    prepared.key,
+                    conflict.dir.display()
+                )?;
+            }
+            return Ok(resolved);
+        }
+
+        let windows = deps.tmux.list_windows()?;
+        if !has_live_window(&windows, target, window) {
+            writeln!(
+                out,
+                "conflict session ended without completing every rebase"
+            )?;
+            return Ok(resolved);
+        }
+
+        let mut count = 0;
+        for &i in &pending {
+            count += deps.git.conflicted_files(&tickets[i].1.dir)?.len();
+        }
+        let changed = last_count != Some(count);
+        let heartbeat_due = now - last_heartbeat >= 60;
+        if changed || heartbeat_due {
+            writeln!(
+                out,
+                "[{}] resolving conflicts for {} tickets ({count} files)...",
+                format_ts(now),
+                pending.len()
+            )?;
+            last_heartbeat = now;
+        }
+        last_count = Some(count);
+
+        deps.sleeper.sleep(CONFLICT_POLL_SECS);
+    }
 }
 
 /// A rebase that stopped on conflicts during [`prepare_merge`], left in
@@ -729,16 +1121,16 @@ fn finish_merge(
     }
 
     writeln!(out, "merging PR #{number}...")?;
-    deps.gh.pr_merge(&repo_root, number, MERGE_TIMEOUT)?;
+    deps.gh.pr_merge(repo_root, number, MERGE_TIMEOUT)?;
 
     writeln!(out, "syncing local {base}...")?;
-    deps.git.fetch_origin(&repo_root)?;
+    deps.git.fetch_origin(repo_root)?;
     let repo_root_on_base =
-        deps.git.current_branch(&repo_root).ok().as_deref() == Some(base.as_str());
+        deps.git.current_branch(repo_root).ok().as_deref() == Some(base.as_str());
     if repo_root_on_base {
-        if deps.git.status_is_clean(&repo_root)? {
+        if deps.git.status_is_clean(repo_root)? {
             deps.git
-                .merge_ff_only(&repo_root, &format!("origin/{base}"))?;
+                .merge_ff_only(repo_root, &format!("origin/{base}"))?;
             writeln!(out, "local {base} synced")?;
         } else {
             writeln!(
@@ -748,7 +1140,7 @@ fn finish_merge(
             )?;
         }
     } else {
-        match deps.git.fetch_branch_to_local(&repo_root, &base) {
+        match deps.git.fetch_branch_to_local(repo_root, base) {
             Ok(()) => writeln!(out, "local {base} synced")?,
             Err(err) => writeln!(
                 out,
@@ -773,7 +1165,7 @@ fn finish_merge(
             )?;
             skip_branch_due_to_worktree = true;
         } else if deps.git.is_worktree(dir).unwrap_or(false) {
-            match deps.git.remove_worktree(&repo_root, dir) {
+            match deps.git.remove_worktree(repo_root, dir) {
                 Ok(()) => writeln!(out, "removed worktree {}", dir.display())?,
                 Err(err) => writeln!(
                     out,
@@ -788,7 +1180,7 @@ fn finish_merge(
 
     let branch_exists = deps
         .git
-        .branch_exists_local(&repo_root, &branch)
+        .branch_exists_local(repo_root, branch)
         .unwrap_or(false);
     if branch_exists {
         if skip_branch_due_to_worktree {
@@ -798,10 +1190,10 @@ fn finish_merge(
                 repo_root.display()
             )?;
         } else {
-            let local_rev = deps.git.rev_parse(&repo_root, &branch);
-            let remote_rev = deps.git.rev_parse(&repo_root, &format!("origin/{branch}"));
+            let local_rev = deps.git.rev_parse(repo_root, branch);
+            let remote_rev = deps.git.rev_parse(repo_root, &format!("origin/{branch}"));
             match (local_rev, remote_rev) {
-                (Ok(l), Ok(r)) if l == r => match deps.git.delete_branch(&repo_root, &branch) {
+                (Ok(l), Ok(r)) if l == r => match deps.git.delete_branch(repo_root, branch) {
                     Ok(()) => writeln!(out, "deleted local branch {branch}")?,
                     Err(err) => writeln!(
                         out,
@@ -945,12 +1337,18 @@ mod tests {
         /// Keeps `repo_root` ("/repo", a path that doesn't exist on disk)
         /// free to represent the base branch's checkout in the same test.
         fn register_checkout(&mut self, branch: &str) -> PathBuf {
+            self.register_checkout_for("PROJ-1", branch)
+        }
+
+        /// [`Self::register_checkout`] for an arbitrary ticket `key` — the
+        /// batch tests register one checkout per ticket.
+        fn register_checkout_for(&mut self, key: &str, branch: &str) -> PathBuf {
             let dir = tempdir().unwrap();
             let path = dir.path().to_path_buf();
             self.store
                 .start_run(&StartRun {
                     scope: self.identity.scope(),
-                    ticket: "PROJ-1".to_string(),
+                    ticket: key.to_string(),
                     lane: "lane".to_string(),
                     worktree: path.to_string_lossy().into_owned(),
                     branch: Some(branch.to_string()),
@@ -1839,5 +2237,307 @@ mod tests {
             "a prompt-file write failure must create zero tmux windows, got: {:?}",
             fx.tmux.calls()
         );
+    }
+
+    // --- run_merge_batch ---
+
+    /// How one batch-test ticket's rebase behaves.
+    #[derive(Debug, Clone, Copy)]
+    enum BatchTicket {
+        /// The rebase completes without conflicts.
+        Clean,
+        /// The rebase stops on conflicts; `resolves` says whether the
+        /// shared session ever finishes it.
+        Conflict { resolves: bool },
+    }
+
+    fn shell_window() -> TmuxWindow {
+        TmuxWindow {
+            session: "dev".to_string(),
+            name: "shell".to_string(),
+            dead: false,
+        }
+    }
+
+    fn merge_window() -> TmuxWindow {
+        TmuxWindow {
+            session: "dev".to_string(),
+            name: "merge".to_string(),
+            dead: false,
+        }
+    }
+
+    /// Sets up `PROJ-<n>` (1-based) for each entry of `tickets`: an open PR
+    /// `#1<n>` from `proj-<n>-fix` onto `main`, a registered checkout, a
+    /// base that moved (so a rebase runs), and the entry's rebase
+    /// behavior. Runs inside tmux session `dev`.
+    fn batch_fixture(tickets: &[BatchTicket]) -> Fixture {
+        let mut fx = Fixture::new();
+        let prs = (1..=tickets.len())
+            .map(|n| {
+                pr_info(
+                    10 + n as u64,
+                    &format!("proj-{n}-fix"),
+                    "main",
+                    &format!("PROJ-{n}"),
+                )
+            })
+            .collect();
+        fx.gh = fx.gh.with_pr_list(Ok(prs));
+        for (i, ticket) in tickets.iter().enumerate() {
+            let n = i + 1;
+            let branch = format!("proj-{n}-fix");
+            let dir = fx.register_checkout_for(&format!("PROJ-{n}"), &branch);
+            let old_tip = format!("old-{n}");
+            let git = std::mem::take(&mut fx.git)
+                .with_rev_parse_result(format!("origin/{branch}"), Ok(old_tip.clone()));
+            fx.git = match ticket {
+                BatchTicket::Clean => git
+                    .with_rev_parse_result(branch.clone(), Ok(old_tip))
+                    .with_rebase_onto_result_for(dir, Ok(RebaseOutcome::Completed)),
+                BatchTicket::Conflict { resolves } => git
+                    .with_rev_parse_sequence(
+                        branch.clone(),
+                        vec![Ok(old_tip), Ok(format!("new-{n}"))],
+                    )
+                    .with_rebase_onto_result_for(dir.clone(), Ok(RebaseOutcome::Conflicted))
+                    .with_rebase_in_progress_sequence_for(
+                        dir,
+                        if *resolves {
+                            vec![Ok(true), Ok(false)]
+                        } else {
+                            vec![Ok(true)]
+                        },
+                    ),
+            };
+        }
+        fx.git = std::mem::take(&mut fx.git)
+            .with_current_branch(Ok("main".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_branch_exists_local(Ok(false))
+            .with_conflicted_files_sequence(vec![Ok(vec!["a.rs".to_string()])]);
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows_sequence(vec![
+                Ok(vec![shell_window()]),
+                Ok(vec![shell_window(), merge_window()]),
+            ]);
+        fx
+    }
+
+    fn keys(n: usize) -> Vec<String> {
+        (1..=n).map(|n| format!("PROJ-{n}")).collect()
+    }
+
+    fn run_batch(
+        deps: &MergeDeps<'_>,
+        keys: &[String],
+    ) -> (Result<BatchMergeReport, MergeError>, String) {
+        let mut out = Vec::new();
+        let result = run_merge_batch(deps, keys, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    fn opened_windows(fx: &Fixture) -> usize {
+        fx.tmux
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+                )
+            })
+            .count()
+    }
+
+    /// The single `merge-batch-*.prompt.md` file the batch session wrote.
+    fn batch_prompt(fx: &Fixture) -> String {
+        let files: Vec<PathBuf> = std::fs::read_dir(&fx.state_dir)
+            .expect("state dir should exist")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("merge-batch-")
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "expected one batch prompt file, got {files:?}"
+        );
+        std::fs::read_to_string(&files[0]).unwrap()
+    }
+
+    #[test]
+    fn batch_all_clean_merges_every_ticket_and_applies_each_status() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean; 3]);
+        fx.status_on_merge = Some("Done".to_string());
+        fx.jira = fx
+            .jira
+            .with_issue("PROJ-1", issue_with_status("PROJ-1", "Done"))
+            .with_issue("PROJ-2", issue_with_status("PROJ-2", "Done"))
+            .with_issue("PROJ-3", issue_with_status("PROJ-3", "Done"));
+
+        let (result, out) = run_batch(&fx.deps(), &keys(3));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, keys(3));
+        assert!(report.handed_back.is_empty());
+        assert!(report.failed.is_empty());
+        let merged: Vec<u64> = fx.gh.pr_merge_calls().iter().map(|(_, n)| *n).collect();
+        assert_eq!(merged, vec![11, 12, 13]);
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 3);
+        for key in keys(3) {
+            assert!(out.contains(&format!("moved {key} to Done")), "{out}");
+        }
+        assert_eq!(opened_windows(&fx), 0, "no conflict session needed");
+    }
+
+    #[test]
+    fn batch_mixed_merges_clean_tickets_before_opening_one_shared_session() {
+        let fx = batch_fixture(&[
+            BatchTicket::Conflict { resolves: true },
+            BatchTicket::Clean,
+            BatchTicket::Conflict { resolves: true },
+        ]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(3));
+
+        let report = result.expect("batch should succeed");
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.handed_back.is_empty());
+        assert_eq!(report.merged, vec!["PROJ-2", "PROJ-1", "PROJ-3"]);
+        // The clean ticket merged first, without waiting on the session.
+        let merged: Vec<u64> = fx.gh.pr_merge_calls().iter().map(|(_, n)| *n).collect();
+        assert_eq!(merged, vec![12, 11, 13]);
+        let clean_merged_at = out.find("merged PR #12").expect("PROJ-2 merged");
+        let session_at = out.find("opening agent session").expect("session opened");
+        assert!(clean_merged_at < session_at, "{out}");
+        assert_eq!(opened_windows(&fx), 1, "exactly one shared session");
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 3);
+    }
+
+    #[test]
+    fn batch_all_conflict_opens_one_session_naming_every_ticket() {
+        let fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+
+        let (result, _out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, keys(2));
+        assert_eq!(opened_windows(&fx), 1, "no second window");
+        let prompt = batch_prompt(&fx);
+        for (key, branch) in [("PROJ-1", "proj-1-fix"), ("PROJ-2", "proj-2-fix")] {
+            assert!(prompt.contains(key), "{prompt}");
+            assert!(prompt.contains(branch), "{prompt}");
+        }
+        assert!(prompt.contains("main"), "{prompt}");
+        assert!(!prompt.contains("{ticket_list}"), "{prompt}");
+    }
+
+    #[test]
+    fn batch_partial_resolution_merges_resolved_and_hands_back_the_rest() {
+        let mut fx = batch_fixture(&[
+            BatchTicket::Conflict { resolves: true },
+            BatchTicket::Conflict { resolves: false },
+        ]);
+        fx.clock = FakeClock::advancing(1_000, 300);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1"]);
+        assert_eq!(report.handed_back, vec!["PROJ-2"]);
+        assert!(report.failed.is_empty());
+        let merged: Vec<u64> = fx.gh.pr_merge_calls().iter().map(|(_, n)| *n).collect();
+        assert_eq!(merged, vec![11]);
+        assert!(out.contains("timed out"), "{out}");
+        assert!(out.contains("rebase --abort"), "{out}");
+    }
+
+    #[test]
+    fn batch_conflict_prompt_overrides_the_default_template() {
+        let mut fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+        fx.merge_cfg.batch_conflict_prompt = Some("CUSTOM BATCH\n{ticket_list}".to_string());
+
+        let (result, _out) = run_batch(&fx.deps(), &keys(2));
+
+        result.expect("batch should succeed");
+        let prompt = batch_prompt(&fx);
+        assert!(prompt.starts_with("CUSTOM BATCH\n"), "{prompt}");
+        assert!(
+            prompt.contains("PROJ-1") && prompt.contains("PROJ-2"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn batch_single_conflict_uses_the_single_ticket_session() {
+        let fx = batch_fixture(&[BatchTicket::Clean, BatchTicket::Conflict { resolves: true }]);
+
+        let (result, _out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1", "PROJ-2"]);
+        assert_eq!(opened_windows(&fx), 1);
+        let names: Vec<String> = std::fs::read_dir(&fx.state_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("merge-PROJ-2-")),
+            "expected the single-ticket prompt file, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn batch_ticket_error_is_recorded_and_the_rest_still_merge() {
+        let fx = batch_fixture(&[BatchTicket::Clean; 2]);
+        let keys = vec![
+            "PROJ-1".to_string(),
+            "PROJ-9".to_string(),
+            "PROJ-2".to_string(),
+        ];
+
+        let (result, out) = run_batch(&fx.deps(), &keys);
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1", "PROJ-2"]);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "PROJ-9");
+        assert!(report.failed[0].1.contains("no open pull request"));
+        assert!(out.contains("PROJ-9"), "{out}");
+    }
+
+    #[test]
+    fn batch_window_death_hands_back_every_unresolved_ticket() {
+        let mut fx = batch_fixture(&[BatchTicket::Conflict { resolves: false }; 2]);
+        fx.tmux = FakeTmuxOps::new()
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows_sequence(vec![Ok(vec![shell_window()])]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert!(report.merged.is_empty());
+        assert_eq!(report.handed_back, keys(2));
+        assert!(fx.gh.pr_merge_calls().is_empty());
+        assert!(out.contains("conflict session ended"), "{out}");
+    }
+
+    #[test]
+    fn batch_report_exit_code_prefers_failure_then_handback() {
+        let mut report = BatchMergeReport::default();
+        assert_eq!(report.exit_code(), 0);
+        report.handed_back.push("PROJ-1".to_string());
+        assert_eq!(report.exit_code(), 2);
+        report
+            .failed
+            .push(("PROJ-2".to_string(), "boom".to_string()));
+        assert_eq!(report.exit_code(), 1);
     }
 }
