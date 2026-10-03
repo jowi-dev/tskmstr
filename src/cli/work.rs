@@ -619,6 +619,14 @@ fn run_interactive(
         prepared.wt_name, prepared.timestamp
     ));
     launch_interactive_run(ctx.tmux, &target, &prepared, &prompt_path, run_deps.runner)?;
+    crate::work::hibernate::record_launch(
+        run_deps.run_store,
+        prepared.run_id,
+        &crate::work::hibernate::LaunchRecord {
+            window: target.window_name.clone(),
+            resume: run_deps.runner.resume_spec(&prepared.invocation),
+        },
+    )?;
 
     writeln!(
         out,
@@ -2566,6 +2574,14 @@ mod tests {
         // The hosting session is stamped on the row so the reaper can treat
         // a killed session as proof of death (GitHub issue #26).
         assert_eq!(run_row.tmux_session, Some("tm-proj-proj-1".to_string()));
+        // The launch records how to resume it, so an idle run can be
+        // hibernated and woken (GitHub issue #64).
+        let record = crate::work::hibernate::launch_record(&run_store, run_row.id)
+            .unwrap()
+            .expect("an interactive launch records a resume recipe");
+        assert_eq!(record.window, "work");
+        assert_eq!(record.resume.resume_flag, "--resume");
+        assert!(record.resume.args.iter().any(|arg| arg == "--settings"));
 
         // The prompt reaches `claude` through a file, not through the
         // command string tmux hands to `$SHELL -c`.
