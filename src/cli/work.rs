@@ -1079,6 +1079,7 @@ mod tests {
             default_permission_mode: None,
             tmux_windows: vec!["fish".to_string()],
             tmux_primary_window: Some("code".to_string()),
+            idle_hibernate_mins: 0,
             lanes,
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),
