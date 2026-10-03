@@ -88,13 +88,19 @@ pub enum Command {
     /// forward the local base branch, and best-effort clean up the
     /// worktree and branch.
     ///
-    /// Exit code: `0` merged, `2` a conflict-resolution session never
-    /// resolved (the rebase is left in progress on disk — see the printed
-    /// attach/abort commands), `1` any other error.
+    /// With two or more keys, merges them in order: tickets that rebase
+    /// cleanly merge immediately, and every ticket that stops on conflicts
+    /// is resolved in one shared agent session rather than one window each.
+    ///
+    /// Exit code: `0` merged (every ticket, for a batch), `2` a
+    /// conflict-resolution session never resolved (the rebase is left in
+    /// progress on disk — see the printed attach/abort commands), `1` any
+    /// other error. A batch with both a failure and a hand-back exits `1`.
     Merge {
-        /// Jira issue key whose open pull request to merge, e.g.
-        /// `PROJ-372` (case-insensitive).
-        key: String,
+        /// Ticket key(s) whose open pull request to merge, e.g. `PROJ-372`
+        /// (case-insensitive). Give several to merge them as a batch.
+        #[arg(required = true, num_args = 1..)]
+        keys: Vec<String>,
     },
     /// List tickets assigned to you that are ready to pick up, or check
     /// whether a specific ticket is ready.
@@ -1926,7 +1932,19 @@ mod tests {
     fn parses_merge_with_key() {
         let cli = Cli::try_parse_from(["tm", "merge", "proj-20"]).expect("should parse");
         match cli.command {
-            Some(Command::Merge { key }) => assert_eq!(key, "proj-20"),
+            Some(Command::Merge { keys }) => assert_eq!(keys, vec!["proj-20"]),
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_merge_with_multiple_keys_in_order() {
+        let cli = Cli::try_parse_from(["tm", "merge", "proj-20", "PROJ-3", "proj-7"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Merge { keys }) => {
+                assert_eq!(keys, vec!["proj-20", "PROJ-3", "proj-7"]);
+            }
             other => panic!("expected Merge, got {other:?}"),
         }
     }

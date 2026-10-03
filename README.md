@@ -191,7 +191,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`). Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1292,6 +1292,42 @@ rely on this:
   worktree (you'd be removing your own cwd); the branch deletion that
   depends on it is skipped too, with pointers to finish both once you `cd`
   out.
+
+### Merging several tickets at once
+
+`tm merge KEY1 KEY2 KEY3` merges a queue of tickets in one invocation. A
+single key always takes the single-ticket flow above, unchanged. With two
+or more keys, tm works in two phases:
+
+1. **Unattended merges.** Tickets are processed strictly in the order
+   given, one at a time; parallel rebases would race on the repo. Each runs
+   stages 1-2 above. A ticket that rebases cleanly, or needs no rebase,
+   goes straight through stages 4-7 without waiting on anything else. A
+   ticket that stops on conflicts is set aside with its rebase left in
+   progress on disk. A ticket that errors, for example one with no open PR,
+   is reported and the batch moves on.
+2. **One shared conflict session.** If exactly one ticket was set aside,
+   it gets the normal single-ticket session. If two or more were, tm opens
+   a single `merge` window whose prompt lists every conflicting ticket's
+   key, branch, base, and checkout directory, and asks the agent to resolve
+   them in order. tm polls all of them together. The timeout is 15 minutes
+   per set-aside ticket. Once polling ends, each ticket whose rebase
+   resolved is pushed, merged, cleaned up, and transitioned. The rest are
+   handed back.
+
+The batch ends with a summary of what merged, what was handed back, and
+what failed. The exit code is `1` if any ticket failed, else `2` if any was
+handed back, else `0`.
+
+Two boundaries worth knowing:
+
+- **The board's `M` key still merges one ticket.** Batch merge is CLI-only
+  for now.
+- **A resolved ticket merges onto the base it was rebased onto.** If a
+  later ticket in the same batch merged into that base in the meantime,
+  `gh pr merge` may refuse an out-of-date branch, depending on the repo's
+  branch protection. That ticket is then reported as failed; rerun
+  `tm merge <KEY>` for it.
 
 ### `[work.merge]`: conflict-resolution session settings
 

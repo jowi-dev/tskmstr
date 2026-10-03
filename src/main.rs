@@ -55,8 +55,8 @@ fn main() -> ExitCode {
     // exit code (0 merged, 2 a conflict-resolution session never resolved,
     // 1 any other error) rather than dispatch's uniform 0/1 — see
     // `MERGE_EXIT_CONFLICTS`'s doc comment.
-    if let Command::Merge { key } = command {
-        return run_merge_cmd(key);
+    if let Command::Merge { keys } = command {
+        return run_merge_cmd(keys);
     }
 
     // `tm review fix <KEY>` is special-cased the same way: it needs a
@@ -1520,7 +1520,13 @@ const MERGE_EXIT_CONFLICTS: u8 = 2;
 /// [`tskmstr::work::merge::MergeFlowOutcome`] to an exit code (`0` merged,
 /// `2` conflicts handed back — see [`MERGE_EXIT_CONFLICTS`]'s doc comment
 /// — `1` any other error) rather than `dispatch`'s uniform 0/1.
-fn run_merge_cmd(key: String) -> ExitCode {
+///
+/// With two or more `keys`, runs [`tskmstr::work::merge::run_merge_batch`]
+/// instead and exits with
+/// [`tskmstr::work::merge::BatchMergeReport::exit_code`] (same three
+/// codes; a failure outranks a hand-back). A single key always takes the
+/// unchanged `run_merge` path.
+fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
     let paths = default_config_paths();
     let env_token = std::env::var("JIRA_API_TOKEN").ok();
     let keychain = MacosKeychain::new();
@@ -1577,6 +1583,19 @@ fn run_merge_cmd(key: String) -> ExitCode {
         state_dir: &state_dir,
     };
     let mut stdout = std::io::stdout();
+
+    let key = match keys.as_slice() {
+        [key] => key.clone(),
+        _ => {
+            return match tskmstr::work::merge::run_merge_batch(&deps, &keys, &mut stdout) {
+                Ok(report) => ExitCode::from(report.exit_code()),
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    };
 
     match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
         Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
