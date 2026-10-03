@@ -704,6 +704,7 @@ pub fn supervise(
 /// alongside a live run (see [`crate::work::viewer`]), a tmux failure *is*
 /// fatal here — rebuilding the session is the entire point of the command, so
 /// there is nothing left to succeed at.
+#[allow(clippy::too_many_arguments)]
 pub fn session(
     ctx: &WorkContext<'_>,
     store: &RunStore,

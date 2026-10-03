@@ -843,6 +843,48 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
     msgs
 }
 
+/// Resume any hibernated runs hosted in `session_name` before attaching to
+/// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
+/// Returns a status-line prefix naming what was resumed, or the failure;
+/// `None` when there was nothing to resume (or no store), in which case no
+/// tmux call is made. A failure never blocks the attach that follows.
+fn wake_hibernated(
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> Option<String> {
+    let store = store?;
+    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
+        Ok(woken) if woken.is_empty() => None,
+        Ok(woken) => {
+            let windows: Vec<String> = woken
+                .iter()
+                .map(|run| format!("{session_name}:{}", run.window))
+                .collect();
+            Some(format!("resumed hibernated run in {}", windows.join(", ")))
+        }
+        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
+    }
+}
+
+/// [`attach_session`], preceded by [`wake_hibernated`]; the status line
+/// reports both.
+fn wake_and_attach<B: Backend>(
+    terminal: &mut Terminal<B>,
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> String {
+    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
+    let attached = attach_session(terminal, tmux, session_name);
+    match woke {
+        Some(woke) => format!("{woke}; {attached}"),
+        None => attached,
+    }
+}
+
 /// Suspend the board's alternate screen and raw mode, run
 /// [`TmuxOps::attach`] with inherited stdio — outside tmux that's a
 /// blocking `tmux attach-session -t <session_name>` (until the user
@@ -906,48 +948,6 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    "sessions should be nested with care" refusal). Jump back to the
 ///    board's window (`prefix + s`): it must be redrawn cleanly with the
 ///    status line reading `switched client to tm-<scope>-<key>`.
-/// Resume any hibernated runs hosted in `session_name` before attaching to
-/// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
-/// Returns a status-line prefix naming what was resumed, or the failure;
-/// `None` when there was nothing to resume (or no store), in which case no
-/// tmux call is made. A failure never blocks the attach that follows.
-fn wake_hibernated(
-    store: Option<&crate::runs::RunStore>,
-    tmux: &dyn TmuxOps,
-    session_name: &str,
-    sessions_dir: &std::path::Path,
-) -> Option<String> {
-    let store = store?;
-    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
-        Ok(woken) if woken.is_empty() => None,
-        Ok(woken) => {
-            let windows: Vec<String> = woken
-                .iter()
-                .map(|run| format!("{session_name}:{}", run.window))
-                .collect();
-            Some(format!("resumed hibernated run in {}", windows.join(", ")))
-        }
-        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
-    }
-}
-
-/// [`attach_session`], preceded by [`wake_hibernated`]; the status line
-/// reports both.
-fn wake_and_attach<B: Backend>(
-    terminal: &mut Terminal<B>,
-    store: Option<&crate::runs::RunStore>,
-    tmux: &dyn TmuxOps,
-    session_name: &str,
-    sessions_dir: &std::path::Path,
-) -> String {
-    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
-    let attached = attach_session(terminal, tmux, session_name);
-    match woke {
-        Some(woke) => format!("{woke}; {attached}"),
-        None => attached,
-    }
-}
-
 fn attach_session<B: Backend>(
     terminal: &mut Terminal<B>,
     tmux: &dyn TmuxOps,
