@@ -1055,6 +1055,17 @@ pub struct FakeGitOps {
     is_ancestor_overrides:
         std::cell::RefCell<std::collections::HashMap<(String, String), Result<bool, GitError>>>,
     rebase_onto_result: std::cell::RefCell<Result<RebaseOutcome, GitError>>,
+    /// Per-`dir` overrides for `rebase_onto`, consulted before the blanket
+    /// [`Self::rebase_onto_result`]. See [`Self::with_rebase_onto_result_for`].
+    rebase_onto_by_path:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<RebaseOutcome, GitError>>>,
+    /// Per-`dir` sequenced answers for `rebase_in_progress`, consumed one per
+    /// call with the last entry repeating; consulted before the blanket
+    /// [`Self::rebase_in_progress_sequence`]. See
+    /// [`Self::with_rebase_in_progress_sequence_for`].
+    rebase_in_progress_by_path: std::cell::RefCell<
+        std::collections::HashMap<PathBuf, std::collections::VecDeque<Result<bool, GitError>>>,
+    >,
     /// Sequenced answers for `rebase_in_progress`, consumed one per call;
     /// the last entry repeats once exhausted. See
     /// [`Self::with_rebase_in_progress_sequence`].
@@ -1120,6 +1131,8 @@ impl Default for FakeGitOps {
             is_ancestor_result: std::cell::RefCell::new(Ok(true)),
             is_ancestor_overrides: std::cell::RefCell::new(std::collections::HashMap::new()),
             rebase_onto_result: std::cell::RefCell::new(Ok(RebaseOutcome::Completed)),
+            rebase_onto_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rebase_in_progress_by_path: std::cell::RefCell::new(std::collections::HashMap::new()),
             rebase_in_progress_sequence: std::cell::RefCell::new(vec![Ok(false)]),
             rebase_in_progress_index: std::cell::RefCell::new(0),
             conflicted_files_sequence: std::cell::RefCell::new(vec![Ok(Vec::new())]),
@@ -1386,6 +1399,40 @@ impl FakeGitOps {
         self
     }
 
+    /// Set the result `rebase_onto` will return for `dir` specifically,
+    /// overriding [`Self::with_rebase_onto_result`]'s blanket answer for that
+    /// directory only. Lets a batch-merge test have one ticket's checkout
+    /// rebase cleanly while another's stops on conflicts.
+    pub fn with_rebase_onto_result_for(
+        self,
+        dir: PathBuf,
+        result: Result<RebaseOutcome, GitError>,
+    ) -> Self {
+        self.rebase_onto_by_path.borrow_mut().insert(dir, result);
+        self
+    }
+
+    /// Configure `rebase_in_progress` for `dir` specifically to return each
+    /// element of `sequence` in order, one per call, repeating the last
+    /// element once exhausted — the per-directory counterpart of
+    /// [`Self::with_rebase_in_progress_sequence`], consulted before it.
+    ///
+    /// Panics if `sequence` is empty.
+    pub fn with_rebase_in_progress_sequence_for(
+        self,
+        dir: PathBuf,
+        sequence: Vec<Result<bool, GitError>>,
+    ) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_rebase_in_progress_sequence_for requires at least one entry"
+        );
+        self.rebase_in_progress_by_path
+            .borrow_mut()
+            .insert(dir, sequence.into_iter().collect());
+        self
+    }
+
     /// Configure `rebase_in_progress` to return each element of `sequence`
     /// in order, one per call, repeating the last element once the sequence
     /// is exhausted. Lets a test model a poll loop, e.g. `[Ok(true),
@@ -1619,10 +1666,20 @@ impl GitOps for FakeGitOps {
         self.rebase_onto_calls
             .borrow_mut()
             .push((dir.to_path_buf(), onto.to_string()));
+        if let Some(result) = self.rebase_onto_by_path.borrow().get(dir) {
+            return result.clone();
+        }
         self.rebase_onto_result.borrow().clone()
     }
 
-    fn rebase_in_progress(&self, _dir: &Path) -> Result<bool, GitError> {
+    fn rebase_in_progress(&self, dir: &Path) -> Result<bool, GitError> {
+        if let Some(sequence) = self.rebase_in_progress_by_path.borrow_mut().get_mut(dir) {
+            return if sequence.len() > 1 {
+                sequence.pop_front().expect("checked non-empty")
+            } else {
+                sequence.front().expect("sequences are never empty").clone()
+            };
+        }
         next_from_sequence(
             &self.rebase_in_progress_sequence,
             &self.rebase_in_progress_index,

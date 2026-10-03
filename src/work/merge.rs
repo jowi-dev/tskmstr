@@ -392,6 +392,48 @@ fn run_conflict_session(
     poll_conflict_session(deps, dir, &target, &window, branch, pre_rebase_rev, out)
 }
 
+/// One poll tick's view of a conflicted rebase, from [`check_rebase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebaseCheck {
+    /// The rebase is still in progress.
+    InProgress,
+    /// The rebase completed: clean tree, back on the branch, tip rewritten.
+    Resolved,
+    /// The rebase state cleared but the tip is unchanged — `git rebase
+    /// --abort` restored it.
+    Aborted,
+    /// The rebase state cleared but the tree is dirty or off the branch.
+    Incomplete,
+}
+
+/// Inspects `dir`'s rebase state once. Shared by the single-ticket poll
+/// loop ([`poll_conflict_session`]) and any future multi-ticket poll.
+///
+/// `pre_rebase_rev` is the branch tip captured before `rebase_onto` ran:
+/// `git rebase --abort` restores it exactly, while a completed rebase
+/// always rewrites it (a rebase only runs when the base moved), so it is
+/// what distinguishes "resolved" from "aborted" once the rebase state
+/// clears.
+fn check_rebase(
+    deps: &MergeDeps<'_>,
+    dir: &Path,
+    branch: &str,
+    pre_rebase_rev: &str,
+) -> Result<RebaseCheck, MergeError> {
+    if deps.git.rebase_in_progress(dir)? {
+        return Ok(RebaseCheck::InProgress);
+    }
+    let clean = deps.git.status_is_clean(dir)?;
+    let on_branch = deps.git.current_branch(dir).ok().as_deref() == Some(branch);
+    if !(clean && on_branch) {
+        return Ok(RebaseCheck::Incomplete);
+    }
+    Ok(match deps.git.rev_parse(dir, branch) {
+        Ok(tip) if tip != pre_rebase_rev => RebaseCheck::Resolved,
+        _ => RebaseCheck::Aborted,
+    })
+}
+
 /// The poll loop itself, split out from [`run_conflict_session`] so the
 /// window-open step above only ever runs once.
 ///
@@ -416,23 +458,20 @@ fn poll_conflict_session(
     loop {
         // Resolution is checked before the timeout so a rebase that
         // finished right at the deadline still counts as resolved.
-        if !deps.git.rebase_in_progress(dir)? {
-            let clean = deps.git.status_is_clean(dir)?;
-            let on_branch = deps.git.current_branch(dir).ok().as_deref() == Some(branch);
-            if clean && on_branch {
-                return match deps.git.rev_parse(dir, branch) {
-                    Ok(tip) if tip != pre_rebase_rev => {
-                        writeln!(out, "conflicts resolved; rebase complete")?;
-                        Ok(ConflictOutcome::Resolved)
-                    }
-                    _ => {
-                        writeln!(out, "rebase was aborted; handing back")?;
-                        Ok(ConflictOutcome::HandedBack)
-                    }
-                };
+        match check_rebase(deps, dir, branch, pre_rebase_rev)? {
+            RebaseCheck::InProgress => {}
+            RebaseCheck::Resolved => {
+                writeln!(out, "conflicts resolved; rebase complete")?;
+                return Ok(ConflictOutcome::Resolved);
             }
-            writeln!(out, "conflict session ended without completing the rebase")?;
-            return Ok(ConflictOutcome::HandedBack);
+            RebaseCheck::Aborted => {
+                writeln!(out, "rebase was aborted; handing back")?;
+                return Ok(ConflictOutcome::HandedBack);
+            }
+            RebaseCheck::Incomplete => {
+                writeln!(out, "conflict session ended without completing the rebase")?;
+                return Ok(ConflictOutcome::HandedBack);
+            }
         }
 
         let now = deps.clock.now_unix_secs();
@@ -477,6 +516,68 @@ pub fn run_merge(
     key: &str,
     out: &mut dyn Write,
 ) -> Result<MergeFlowOutcome, MergeError> {
+    let mut prepared = prepare_merge(deps, key, out)?;
+    if let Some(conflict) = prepared.conflict.take() {
+        match run_conflict_session(
+            deps,
+            key,
+            &prepared.branch,
+            &prepared.base,
+            &conflict.dir,
+            &conflict.pre_rebase_rev,
+            out,
+        )? {
+            ConflictOutcome::Resolved => prepared.needs_push = true,
+            ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
+        }
+    }
+    finish_merge(deps, &prepared, out)?;
+    Ok(MergeFlowOutcome::Merged)
+}
+
+/// A rebase that stopped on conflicts during [`prepare_merge`], left in
+/// progress on disk for a conflict session to finish.
+#[derive(Debug, Clone)]
+struct PendingConflict {
+    /// The checkout the rebase is in progress in.
+    dir: PathBuf,
+    /// The branch tip before the rebase started (see [`check_rebase`]).
+    pre_rebase_rev: String,
+}
+
+/// Everything [`prepare_merge`] learned about a ticket's PR, carried into
+/// [`finish_merge`].
+#[derive(Debug, Clone)]
+struct PreparedMerge {
+    /// The ticket key.
+    key: String,
+    /// The ticket's repo root.
+    repo_root: PathBuf,
+    /// The PR number.
+    number: u64,
+    /// The PR's head branch.
+    branch: String,
+    /// The PR's base branch.
+    base: String,
+    /// The local checkout of `branch`, if one was found.
+    checkout_dir: Option<PathBuf>,
+    /// Whether the local tip must be force-pushed before `gh pr merge`.
+    needs_push: bool,
+    /// `Some` when the rebase stopped on conflicts; the caller must get it
+    /// resolved (and set `needs_push`) before calling [`finish_merge`].
+    conflict: Option<PendingConflict>,
+}
+
+/// Stages 1-2 of the flow: resolve the PR, locate a checkout, fetch,
+/// reconcile the local tip with its remote, and attempt the rebase onto
+/// the base. Never opens a conflict session: a rebase that stops on
+/// conflicts is returned in [`PreparedMerge::conflict`], still in
+/// progress on disk.
+fn prepare_merge(
+    deps: &MergeDeps<'_>,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<PreparedMerge, MergeError> {
     let scope = deps.identity.scope();
 
     let repo_root = match deps.run_store {
@@ -512,6 +613,12 @@ pub fn run_merge(
     deps.git
         .fetch_origin(checkout_dir.as_deref().unwrap_or(&repo_root))?;
 
+    // Tracks whether the local tip must be published before the merge: set
+    // when local is authoritative (ahead of, or a rebase of, the remote
+    // tip) or when a rebase runs below. The pushed tip is what `gh pr
+    // merge` merges.
+    let mut needs_push = false;
+    let mut conflict = None;
     match checkout_dir.as_deref() {
         Some(dir) => {
             let origin_branch_ref = format!("origin/{branch}");
@@ -522,11 +629,6 @@ pub fn run_merge(
                     branch: branch.clone(),
                 }
             })?;
-            // Tracks whether the local tip must be published before the
-            // merge: set when local is authoritative (ahead of, or a rebase
-            // of, the remote tip) or when a rebase runs below. The pushed
-            // tip is what `gh pr merge` merges.
-            let mut needs_push = false;
             let mut current_tip = local_rev.clone();
             if local_rev != remote_rev {
                 if deps.git.is_ancestor(dir, &branch, &origin_branch_ref)? {
@@ -572,27 +674,12 @@ pub fn run_merge(
                         needs_push = true;
                     }
                     RebaseOutcome::Conflicted => {
-                        match run_conflict_session(
-                            deps,
-                            key,
-                            &branch,
-                            &base,
-                            dir,
-                            &current_tip,
-                            out,
-                        )? {
-                            ConflictOutcome::Resolved => needs_push = true,
-                            ConflictOutcome::HandedBack => {
-                                return Ok(MergeFlowOutcome::ConflictsHandedBack);
-                            }
-                        }
+                        conflict = Some(PendingConflict {
+                            dir: dir.to_path_buf(),
+                            pre_rebase_rev: current_tip,
+                        });
                     }
                 }
-            }
-
-            if needs_push {
-                writeln!(out, "pushing {branch} (force-with-lease)...")?;
-                deps.git.push_force_with_lease(dir, &branch)?;
             }
         }
         None => {
@@ -601,6 +688,44 @@ pub fn run_merge(
                 "warning: no local checkout of {branch}; skipping auto-rebase"
             )?;
         }
+    }
+
+    Ok(PreparedMerge {
+        key: key.to_string(),
+        repo_root,
+        number,
+        branch,
+        base,
+        checkout_dir,
+        needs_push,
+        conflict,
+    })
+}
+
+/// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
+/// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
+/// merge`, sync the local base, best-effort clean up, and apply
+/// `status_on_merge`.
+fn finish_merge(
+    deps: &MergeDeps<'_>,
+    prepared: &PreparedMerge,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    let PreparedMerge {
+        key,
+        repo_root,
+        number,
+        branch,
+        base,
+        checkout_dir,
+        needs_push,
+        conflict: _,
+    } = prepared;
+    let (key, number, needs_push) = (key.as_str(), *number, *needs_push);
+
+    if needs_push && let Some(dir) = checkout_dir.as_deref() {
+        writeln!(out, "pushing {branch} (force-with-lease)...")?;
+        deps.git.push_force_with_lease(dir, branch)?;
     }
 
     writeln!(out, "merging PR #{number}...")?;
@@ -701,7 +826,7 @@ pub fn run_merge(
     }
 
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
-    Ok(MergeFlowOutcome::Merged)
+    Ok(())
 }
 
 #[cfg(test)]
