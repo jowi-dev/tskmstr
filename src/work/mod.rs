@@ -10,6 +10,7 @@ pub mod bugbot;
 pub mod create;
 pub mod detach;
 pub mod git;
+pub mod hibernate;
 pub mod interactive;
 pub mod kill_safety;
 pub mod manual;

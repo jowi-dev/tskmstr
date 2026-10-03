@@ -2290,6 +2290,21 @@ impl RunStore {
         Ok(true)
     }
 
+    /// Test-only: set `run_id`'s heartbeat to `minutes_ago` minutes in the
+    /// past, for tests outside this module that need an idle run (the
+    /// connection is private here).
+    #[cfg(test)]
+    pub(crate) fn backdate_heartbeat_for_tests(&self, run_id: i64, minutes_ago: i64) {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-{minutes_ago} minutes') WHERE id = ?1"
+                ),
+                params![run_id],
+            )
+            .expect("backdate heartbeat");
+    }
+
     /// Returns the latest run for `ticket` (by `started_at`, breaking ties
     /// by `id`, both descending), or `None` if it has no runs.
     ///

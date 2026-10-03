@@ -88,7 +88,7 @@ fn run_hosted_in(run: &Run, session: &str) -> bool {
 /// provably dead. A recorded pid is probed; a pid-less running row (a
 /// pre-adoption interactive launch) counts as live — the conservative
 /// reading, since the picker prompts for live runs.
-fn run_is_live(run: &Run, pid_alive: &dyn Fn(u32) -> bool) -> bool {
+pub(crate) fn run_is_live(run: &Run, pid_alive: &dyn Fn(u32) -> bool) -> bool {
     run.status == RunStatus::Running && run.pid.is_none_or(pid_alive)
 }
 
