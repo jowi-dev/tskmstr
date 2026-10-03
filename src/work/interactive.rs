@@ -186,7 +186,9 @@ pub fn interactive_prompt(kind: &str, ticket: &str, body: &str) -> String {
 /// a window running
 /// [`runner.tmux_command_line`](crate::agent::AgentRunner::tmux_command_line)
 /// against that file, with `SESSION_RUN_ID_ENV` carrying the pre-registered
-/// run id for the session to adopt.
+/// run id for the session to adopt, followed by every other variable in the
+/// invocation's `env_set` (such as the build-slot wrapper's `PATH`; see
+/// [`crate::work::build_slots`]).
 ///
 /// Creates the ticket's session — plus the worktree-rooted
 /// [`SHELL_WINDOW_NAME`] window every ticket session gets — when this is its
@@ -215,7 +217,19 @@ pub fn launch_interactive_run(
 
     let command = runner.tmux_command_line(&prepared.invocation, prompt_path);
     let dir = prepared.worktree.to_string_lossy().into_owned();
-    let env = [(SESSION_RUN_ID_ENV.to_string(), prepared.run_id.to_string())];
+    // The session run id always rides first; any other variable the
+    // invocation carries (the build-slot wrapper's PATH and settings, see
+    // `crate::work::build_slots`) follows, so a tmux-hosted lane gets the
+    // same environment a headless one is spawned with.
+    let mut env = vec![(SESSION_RUN_ID_ENV.to_string(), prepared.run_id.to_string())];
+    env.extend(
+        prepared
+            .invocation
+            .env_set
+            .iter()
+            .filter(|(key, _)| key != SESSION_RUN_ID_ENV)
+            .cloned(),
+    );
 
     if target.session_exists {
         tmux.new_window_with_command(
@@ -399,6 +413,35 @@ mod tests {
 
         assert!(prompt.starts_with("First, before anything else"));
         assert!(prompt.ends_with("Address every review comment"));
+    }
+
+    #[test]
+    fn launch_interactive_run_forwards_the_invocations_extra_env_to_tmux() {
+        let tmp = tempdir().unwrap();
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+        let prompt_path = tmp.path().join("state/proj-1.prompt.md");
+        let mut prepared = prepared(&worktree, "do the thing");
+        prepared
+            .invocation
+            .env_set
+            .push(("PATH".to_string(), "/shim:/usr/bin".to_string()));
+        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let tmux = FakeTmuxOps::new();
+
+        launch_interactive_run(&tmux, &target, &prepared, &prompt_path, &ClaudeRunner).unwrap();
+
+        let env = match &tmux.calls()[0] {
+            TmuxCall::NewSessionWithCommand { env, .. } => env.clone(),
+            other => panic!("expected NewSessionWithCommand, got {other:?}"),
+        };
+        assert_eq!(
+            env,
+            vec![
+                ("TSKMSTR_SESSION_RUN_ID".to_string(), "7".to_string()),
+                ("PATH".to_string(), "/shim:/usr/bin".to_string()),
+            ],
+            "session run id stays first and is not duplicated"
+        );
     }
 
     #[test]

@@ -1291,7 +1291,7 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let invocation = primary_runner.build_invocation(InvocationInputs {
+    let mut invocation = primary_runner.build_invocation(InvocationInputs {
         prompt: prompt.clone(),
         model,
         max_turns: max_turns.clone(),
@@ -1325,6 +1325,40 @@ pub fn prepare_run_lane(
             agent: fallback_runner.name().to_string(),
             invocation: fallback_invocation,
         });
+    }
+
+    // GitHub issue #65: with `[work] build_slots` set, put tm's `cargo`
+    // wrapper first on the lane's PATH so its builds share N machine-wide
+    // slots. Best-effort like the status transition above: a shim that
+    // cannot be deployed warns and the lane runs unwrapped rather than not
+    // at all.
+    if let Some(slots) = config.build_slots.filter(|&slots| slots > 0) {
+        let root = crate::work::build_slots::root_dir(&paths.home);
+        let deployed = std::env::current_exe()
+            .and_then(|tm_exe| crate::work::build_slots::deploy_shim(&root, &tm_exe));
+        match deployed {
+            Ok(shim_dir) => {
+                let env = crate::work::build_slots::lane_env(
+                    slots,
+                    &root,
+                    &shim_dir,
+                    std::env::var_os("PATH").as_deref(),
+                );
+                // Usage-limit fallback attempts run the same lane, so they
+                // share the same slots.
+                for fallback in &mut fallbacks {
+                    fallback.invocation.env_set.extend(env.iter().cloned());
+                }
+                invocation.env_set.extend(env);
+            }
+            Err(err) => {
+                let line = format!(
+                    "warning: could not deploy the cargo build-slot wrapper, running without it: {err}"
+                );
+                writeln!(out, "{line}")?;
+                append_log_line(&log_path, &line);
+            }
+        }
     }
 
     std::fs::create_dir_all(&paths.state_dir)?;
@@ -4333,6 +4367,93 @@ mod tests {
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.pid, None);
         assert_eq!(run.status, RunStatus::Running);
+    }
+
+    /// `prepare_run_lane` for a headless `mylane` run with `[work]
+    /// build_slots` set to `slots`, returning the prepared run and the home
+    /// directory the build-slot shim would be deployed under.
+    fn prepare_with_build_slots(slots: Option<u32>) -> (TempDir, PathBuf, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        config.build_slots = slots;
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home: home.clone(),
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            mode: RunMode::Headless,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        (tmp, home, prepared)
+    }
+
+    #[test]
+    fn prepare_run_lane_with_build_slots_routes_cargo_through_the_wrapper() {
+        let (_tmp, home, prepared) = prepare_with_build_slots(Some(3));
+
+        let root = crate::work::build_slots::root_dir(&home);
+        let shim_dir = root.join("bin");
+        assert!(shim_dir.join("cargo").is_file(), "shim deployed");
+        let env = &prepared.invocation.env_set;
+        let get = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} missing from {env:?}"))
+        };
+        assert!(
+            get("PATH").starts_with(&*shim_dir.to_string_lossy()),
+            "shim dir must be first on PATH"
+        );
+        assert_eq!(get(crate::work::build_slots::SLOTS_ENV), "3");
+        // The run id the agent adapter set is still there.
+        assert_eq!(get("TSKMSTR_RUN_ID"), prepared.run_id.to_string());
+    }
+
+    #[test]
+    fn prepare_run_lane_without_build_slots_leaves_path_untouched() {
+        for slots in [None, Some(0)] {
+            let (_tmp, home, prepared) = prepare_with_build_slots(slots);
+            assert!(
+                !prepared
+                    .invocation
+                    .env_set
+                    .iter()
+                    .any(|(k, _)| k == "PATH" || k == crate::work::build_slots::SLOTS_ENV),
+                "{slots:?}: {:?}",
+                prepared.invocation.env_set
+            );
+            assert!(!crate::work::build_slots::root_dir(&home).exists());
+        }
     }
 
     #[test]
