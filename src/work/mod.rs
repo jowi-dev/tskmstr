@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod audit;
 pub mod bugbot;
+pub mod build_slots;
 pub mod create;
 pub mod detach;
 pub mod git;
