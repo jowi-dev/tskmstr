@@ -268,6 +268,14 @@ pub enum RunStatus {
     /// [`crate::agent::AgentRunner::parse_outcome`]'s doc comment. Terminal
     /// for board/ordering purposes, same as `Done`/`Failed`.
     Interrupted,
+    /// An interactive run whose agent process tm stopped because it sat idle
+    /// past `[work] idle_hibernate_mins` (GitHub issue #64). Not terminal:
+    /// the conversation is intact on disk under the run's `session_id`, and
+    /// attaching to the ticket's session resumes it and returns the row to
+    /// [`RunStatus::Running`]. [`RunStore::reap`] never touches it (it only
+    /// sweeps `running` rows), which is what keeps a hibernated run from
+    /// reading as interrupted or failed.
+    Hibernated,
 }
 
 impl RunStatus {
@@ -281,6 +289,7 @@ impl RunStatus {
             RunStatus::Done => "done",
             RunStatus::Failed => "failed",
             RunStatus::Interrupted => "interrupted",
+            RunStatus::Hibernated => "hibernated",
         }
     }
 
@@ -295,6 +304,7 @@ impl RunStatus {
             "done" => Some(RunStatus::Done),
             "failed" => Some(RunStatus::Failed),
             "interrupted" => Some(RunStatus::Interrupted),
+            "hibernated" => Some(RunStatus::Hibernated),
             _ => None,
         }
     }
@@ -2857,6 +2867,13 @@ mod tests {
             RunStatus::parse("interrupted"),
             Some(RunStatus::Interrupted)
         );
+    }
+
+    #[test]
+    fn run_status_hibernated_round_trips_and_is_not_terminal() {
+        assert_eq!(RunStatus::Hibernated.as_str(), "hibernated");
+        assert_eq!(RunStatus::parse("hibernated"), Some(RunStatus::Hibernated));
+        assert!(!RunStatus::Hibernated.is_terminal());
     }
 
     #[test]

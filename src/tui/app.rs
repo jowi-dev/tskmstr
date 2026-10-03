@@ -439,6 +439,10 @@ pub enum RunIndicator {
     /// determined ([`RunStatus::Interrupted`]) — distinct from `Failed`
     /// because the agent never actually reported failure.
     Interrupted,
+    /// The latest lane run is [`RunStatus::Hibernated`]: tm stopped its idle
+    /// agent, and attaching to the ticket's session resumes it (GitHub
+    /// issue #64).
+    Hibernated,
 }
 
 /// Pure precedence rule for deriving a ticket's [`RunIndicator`] from
@@ -457,9 +461,10 @@ pub enum RunIndicator {
 /// 3. `Review`/`Done` -> [`RunIndicator::Done`].
 /// 4. `Failed` -> [`RunIndicator::Failed`].
 /// 5. `Interrupted` -> [`RunIndicator::Interrupted`].
-/// 6. No run recorded at all, but a launch is pending ->
+/// 6. `Hibernated` -> [`RunIndicator::Hibernated`].
+/// 7. No run recorded at all, but a launch is pending ->
 ///    [`RunIndicator::Starting`].
-/// 7. Otherwise: no badge.
+/// 8. Otherwise: no badge.
 pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Option<RunIndicator> {
     match run {
         Some((RunStatus::Running, true)) => Some(RunIndicator::Waiting),
@@ -470,6 +475,7 @@ pub fn lane_run_indicator(pending: bool, run: Option<(RunStatus, bool)>) -> Opti
         Some((RunStatus::Done, _)) => Some(RunIndicator::Done),
         Some((RunStatus::Failed, _)) => Some(RunIndicator::Failed),
         Some((RunStatus::Interrupted, _)) => Some(RunIndicator::Interrupted),
+        Some((RunStatus::Hibernated, _)) => Some(RunIndicator::Hibernated),
         None if pending => Some(RunIndicator::Starting),
         None => None,
     }
@@ -6545,6 +6551,14 @@ mod tests {
         assert_eq!(
             lane_run_indicator(false, Some((RunStatus::Running, true))),
             Some(RunIndicator::Waiting)
+        );
+    }
+
+    #[test]
+    fn lane_run_indicator_hibernated_is_its_own_badge() {
+        assert_eq!(
+            lane_run_indicator(true, Some((RunStatus::Hibernated, false))),
+            Some(RunIndicator::Hibernated)
         );
     }
 

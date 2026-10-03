@@ -69,7 +69,8 @@ pub const GRABBED_MARKER: Style = Style::new().fg(Color::Yellow).add_modifier(Mo
 /// human), done is green (success), failed is red (needs attention),
 /// interrupted is yellow (ambiguous outcome, needs a human to look but isn't
 /// a confirmed failure — the same "look at me" hue as [`AWAITING_INPUT`],
-/// without stealing red from a genuine failure).
+/// without stealing red from a genuine failure), hibernated is blue (parked,
+/// resumes on attach — GitHub issue #64).
 pub const fn run_status_style(status: RunStatus) -> Style {
     let color = match status {
         RunStatus::Queued => Color::DarkGray,
@@ -79,6 +80,7 @@ pub const fn run_status_style(status: RunStatus) -> Style {
         RunStatus::Done => Color::Green,
         RunStatus::Failed => Color::Red,
         RunStatus::Interrupted => Color::Yellow,
+        RunStatus::Hibernated => Color::Blue,
     };
     Style::new().fg(color)
 }
@@ -154,7 +156,8 @@ pub fn audit_indicator_label(indicator: AuditIndicator) -> &'static str {
 
 /// The style for a board ticket's [`RunIndicator`] badge: identical per-state
 /// colors to [`audit_indicator_style`] (`Waiting` bold yellow, `Running`
-/// cyan, `Starting` dim, `Done` green, `Failed` red, `Interrupted` yellow),
+/// cyan, `Starting` dim, `Done` green, `Failed` red, `Interrupted` yellow;
+/// `Hibernated`, which has no audit counterpart, is dim like `Starting`),
 /// since both badges signal the same underlying run lifecycle -- just for
 /// different `kind`s of run.
 pub fn run_indicator_style(indicator: RunIndicator) -> Style {
@@ -165,6 +168,7 @@ pub fn run_indicator_style(indicator: RunIndicator) -> Style {
         RunIndicator::Done => Style::new().fg(Color::Green),
         RunIndicator::Failed => Style::new().fg(Color::Red),
         RunIndicator::Interrupted => Style::new().fg(Color::Yellow),
+        RunIndicator::Hibernated => DIM,
     }
 }
 
@@ -178,6 +182,7 @@ pub fn run_indicator_label(indicator: RunIndicator) -> &'static str {
         RunIndicator::Done => "run: done",
         RunIndicator::Failed => "run: failed",
         RunIndicator::Interrupted => "run: interrupted",
+        RunIndicator::Hibernated => "run: hibernated",
     }
 }
 
@@ -490,6 +495,7 @@ mod tests {
             RunIndicator::Done,
             RunIndicator::Failed,
             RunIndicator::Interrupted,
+            RunIndicator::Hibernated,
         ] {
             assert_eq!(run_indicator_style(indicator).bg, None);
         }
@@ -665,6 +671,7 @@ mod tests {
             run_indicator_label(RunIndicator::Done),
             run_indicator_label(RunIndicator::Failed),
             run_indicator_label(RunIndicator::Interrupted),
+            run_indicator_label(RunIndicator::Hibernated),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "labels must be distinct");
