@@ -589,8 +589,17 @@ fn run_cmds<B: Backend>(
             // and `m`'s attach step): the Cmd is "attach to this ticket's
             // session" in every case, and only its status line differs.
             // `Msg::AuditActionResult` stays for *launch* outcomes, which are
-            // audit-specific.
-            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            // audit-specific. Hibernated runs in the session are resumed
+            // first (GitHub issue #64).
+            let sessions_dir =
+                crate::runs::session::sessions_dir(&deps.home, deps.xdg_data_home.as_deref());
+            let message = wake_and_attach(
+                terminal,
+                deps.store.as_ref(),
+                deps.tmux.as_ref(),
+                &session_name,
+                &sessions_dir,
+            );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
             app = next_app;
             pending.extend(more_cmds);
@@ -620,8 +629,17 @@ fn run_cmds<B: Backend>(
                 &key,
             ) {
                 Ok(outcome) => {
-                    let message =
-                        attach_session(terminal, deps.tmux.as_ref(), &outcome.session_name);
+                    let sessions_dir = crate::runs::session::sessions_dir(
+                        &deps.home,
+                        deps.xdg_data_home.as_deref(),
+                    );
+                    let message = wake_and_attach(
+                        terminal,
+                        deps.store.as_ref(),
+                        deps.tmux.as_ref(),
+                        &outcome.session_name,
+                        &sessions_dir,
+                    );
                     update(app, Msg::SessionAttachResult(message))
                 }
                 Err(err) => update(app, Msg::SessionAttachResult(err.to_string())),
@@ -888,6 +906,48 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 ///    "sessions should be nested with care" refusal). Jump back to the
 ///    board's window (`prefix + s`): it must be redrawn cleanly with the
 ///    status line reading `switched client to tm-<scope>-<key>`.
+/// Resume any hibernated runs hosted in `session_name` before attaching to
+/// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
+/// Returns a status-line prefix naming what was resumed, or the failure;
+/// `None` when there was nothing to resume (or no store), in which case no
+/// tmux call is made. A failure never blocks the attach that follows.
+fn wake_hibernated(
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> Option<String> {
+    let store = store?;
+    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
+        Ok(woken) if woken.is_empty() => None,
+        Ok(woken) => {
+            let windows: Vec<String> = woken
+                .iter()
+                .map(|run| format!("{session_name}:{}", run.window))
+                .collect();
+            Some(format!("resumed hibernated run in {}", windows.join(", ")))
+        }
+        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
+    }
+}
+
+/// [`attach_session`], preceded by [`wake_hibernated`]; the status line
+/// reports both.
+fn wake_and_attach<B: Backend>(
+    terminal: &mut Terminal<B>,
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> String {
+    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
+    let attached = attach_session(terminal, tmux, session_name);
+    match woke {
+        Some(woke) => format!("{woke}; {attached}"),
+        None => attached,
+    }
+}
+
 fn attach_session<B: Backend>(
     terminal: &mut Terminal<B>,
     tmux: &dyn TmuxOps,
@@ -1178,7 +1238,14 @@ fn run_watch_cmds<B: Backend>(
     while let Some(cmd) = pending.pop_front() {
         if let Cmd::AttachSession { session_name } = cmd {
             stamp_root_session(deps.tmux.as_ref(), &session_name);
-            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            let sessions_dir = crate::runs::session::sessions_dir_from_process_env();
+            let message = wake_and_attach(
+                terminal,
+                Some(&deps.store),
+                deps.tmux.as_ref(),
+                &session_name,
+                &sessions_dir,
+            );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
             app = next_app;
             pending.extend(more_cmds);
@@ -3818,6 +3885,64 @@ mod tests {
         );
     }
 
+    /// GitHub issue #64: attaching to a session that hosts a hibernated run
+    /// resumes it first, and says so on the status line.
+    #[test]
+    fn wake_hibernated_resumes_the_sessions_hibernated_run_before_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+
+        let message = wake_hibernated(
+            Some(&store),
+            &tmux,
+            "tm-proj-proj-1",
+            &dir.path().join("sessions"),
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some("resumed hibernated run in tm-proj-proj-1:work")
+        );
+        assert_eq!(
+            store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn wake_hibernated_is_silent_when_nothing_is_hibernated() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        assert_eq!(
+            wake_hibernated(
+                None,
+                &tmux,
+                "tm-proj-proj-1",
+                std::path::Path::new("/nowhere")
+            ),
+            None
+        );
+        assert!(tmux.calls().is_empty());
+    }
+
     /// Outside tmux there is no client session to point back at (and no
     /// need: detaching from `tmux attach-session` lands back in the watch's
     /// own terminal), so nothing is stamped.
@@ -4582,6 +4707,51 @@ mod tests {
             &mut launches,
         );
         assert_eq!(app.status_line, "detached from tm-proj-proj-1");
+    }
+
+    /// GitHub issue #64: every board attach (`a`, `b`, `s`) wakes the
+    /// session's hibernated runs first.
+    #[test]
+    fn run_cmds_attach_session_wakes_hibernated_runs_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let mut d = deps(FakeJiraClient::new());
+        d.store = Some(store);
+        d.home = dir.path().to_path_buf();
+        let mut terminal = test_terminal();
+
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-proj-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(
+            app.status_line,
+            "resumed hibernated run in tm-proj-proj-1:work; detached from tm-proj-proj-1"
+        );
     }
 
     /// From inside tmux, attach runs `switch-client` and returns immediately
