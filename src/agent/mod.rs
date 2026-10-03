@@ -643,6 +643,30 @@ pub trait AgentRunner: Sync {
          resolved safely, run `git rebase --abort` and explain why."
     }
 
+    /// Default prompt template used when `[work.merge].batch_conflict_prompt`
+    /// is unset, handed to the single interactive agent session a batch
+    /// `tm merge KEY1 KEY2 ...` opens when two or more of its tickets stop on
+    /// rebase conflicts. The one placeholder, `{ticket_list}`, is substituted
+    /// by the caller (`crate::work::merge`) with a pre-rendered,
+    /// newline-separated list of each conflicting ticket's key, branch,
+    /// base, and checkout directory.
+    ///
+    /// Runner-neutral for the same reason as
+    /// [`AgentRunner::default_merge_conflict_prompt_template`].
+    fn default_batch_merge_conflict_prompt_template(&self) -> &'static str {
+        "Several git rebases have stopped on conflicts, one per ticket below. Each line gives \
+         the ticket key, the branch being rebased, the base it is being rebased onto \
+         (origin/<base>), and the checkout directory the rebase is in progress in:\n\n\
+         {ticket_list}\n\n\
+         Your job is bounded: resolve only the merge conflicts, one ticket at a time, in the \
+         order listed. For each ticket, work in its checkout directory: inspect the conflicted \
+         files, resolve each conflict preserving the intent of both sides, `git add` the \
+         resolved files, and run `git rebase --continue` until that rebase completes, then move \
+         on to the next ticket. Do not push. Do not make unrelated changes. If a ticket's \
+         conflicts cannot be resolved safely, run `git rebase --abort` in its directory, \
+         explain why, and continue with the next ticket."
+    }
+
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
     /// file, for `claude`) into `deploy_dir`, returning the settings path
     /// [`InvocationInputs::settings_path`] should carry, or `Ok(None)` for a
@@ -736,6 +760,21 @@ mod tests {
                 "expected {placeholder} in the default merge conflict prompt template, got: {claude:?}"
             );
         }
+    }
+
+    /// Both adapters inherit
+    /// [`AgentRunner::default_batch_merge_conflict_prompt_template`]'s
+    /// provided default verbatim, and it carries the `{ticket_list}`
+    /// placeholder the batch merge flow substitutes.
+    #[test]
+    fn both_runners_inherit_the_default_batch_merge_conflict_prompt_template() {
+        let claude = ClaudeRunner.default_batch_merge_conflict_prompt_template();
+        let opencode = OpencodeRunner.default_batch_merge_conflict_prompt_template();
+        assert_eq!(claude, opencode);
+        assert!(
+            claude.contains("{ticket_list}"),
+            "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
+        );
     }
 
     /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
