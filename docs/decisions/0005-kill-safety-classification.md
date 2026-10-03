@@ -53,7 +53,7 @@ anchored on data recorded in the run rows themselves.
 
 | Token | Meaning | Suggested picker behavior |
 |---|---|---|
-| `live-run` | A run hosted in this session is still `running` in the runs store and not provably dead (recorded pid alive, or no pid recorded yet). Covers starting, running, and waiting-for-input agents. | Prompt. |
+| `live-run` | A run hosted in this session is still `running` in the runs store and not provably dead (recorded pid alive, or no pid recorded yet). Covers starting, running, and waiting-for-input agents. A `hibernated` run (GitHub issue #64: its idle agent was stopped, and it resumes on attach) is also `live-run` whatever its pid says, since it is unfinished work. Idle hibernation reuses this same predicate to decide which agents it may stop. | Prompt. |
 | `root-session` | The session is some session's `@root_session` target: a per-project hub session (where the board runs), not a ticket session. | Always prompt. |
 | `safe` | No hosted run is live, and the newest hosted run's recorded branch has a **merged** PR and no open one (checked via `gh pr list` in that run's worktree). | Kill silently. |
 | `unknown` | Everything else: a session tm has no runs for, no recorded branch, an open or missing PR, a deleted worktree, or a `gh`/`tmux` failure. | Prompt (treat like `live-run`). |
