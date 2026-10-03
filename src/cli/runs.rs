@@ -71,6 +71,30 @@ pub fn reap(
     Ok(())
 }
 
+/// The idle-hibernation half of `tm runs reap` (GitHub issue #64): stop
+/// interactive runs idle past `idle_mins` via
+/// [`crate::work::hibernate::sweep_idle`], printing `Hibernated run {id}
+/// ({ticket}): idle past {idle_mins}m` for each. Prints nothing when none
+/// qualified (the reap half already reports its own nothing-to-do line), and
+/// is a no-op when `idle_mins` is `0`.
+pub fn hibernate_idle(
+    store: &RunStore,
+    tmux: &dyn crate::work::tmux::TmuxOps,
+    idle_mins: u64,
+    pid_alive: &dyn Fn(u32) -> bool,
+    kill_pid: &dyn Fn(u32),
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    for run in crate::work::hibernate::sweep_idle(store, tmux, idle_mins, pid_alive, kill_pid)? {
+        writeln!(
+            out,
+            "Hibernated run {} ({}): idle past {idle_mins}m",
+            run.id, run.ticket
+        )?;
+    }
+    Ok(())
+}
+
 /// Errors surfaced by `tm runs` subcommands.
 #[derive(Debug, Error)]
 pub enum RunsCliError {
@@ -1278,6 +1302,63 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!("Finished run {id}: done\n")
         );
+    }
+
+    #[test]
+    fn hibernate_idle_prints_each_hibernated_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store
+            .start_run(&StartRun {
+                pid: Some(4242),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(id, "sess-1").unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: ClaudeRunner.resume_spec(&crate::agent::AgentInvocation {
+                    program: "claude".to_string(),
+                    args: vec!["prompt".to_string()],
+                    env_set: Vec::new(),
+                    env_remove: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+        store.backdate_heartbeat_for_tests(id, 200);
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let mut out = Vec::new();
+
+        hibernate_idle(&store, &tmux, 120, &|_| true, &|_| {}, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Hibernated run {id} (PROJ-1): idle past 120m\n")
+        );
+    }
+
+    #[test]
+    fn hibernate_idle_prints_nothing_when_nothing_is_idle() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        hibernate_idle(
+            &store,
+            &crate::work::tmux::FakeTmuxOps::new(),
+            120,
+            &|_| true,
+            &|_| {},
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(out.is_empty(), "reap already prints the nothing-to-do line");
     }
 
     /// The session-end hooks finish with `--status done` and swallow

@@ -1825,6 +1825,21 @@ fn run_runs(
                 &session_alive,
                 &mut stdout,
             )?;
+            // Idle hibernation (GitHub issue #64) rides along with every
+            // reap. No loadable config still gets the default threshold.
+            let idle_mins = full_config
+                .as_ref()
+                .map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
+                    cfg.work.idle_hibernate_mins
+                });
+            tskmstr::cli::runs::hibernate_idle(
+                &store,
+                &tskmstr::work::tmux::ShellTmuxOps,
+                idle_mins,
+                &tskmstr::runs::pid::pid_alive,
+                &tskmstr::runs::pid::kill_pid,
+                &mut stdout,
+            )?;
         }
         Some(RunsCmd::Show { ticket, json, kind }) => {
             tskmstr::cli::runs::show(

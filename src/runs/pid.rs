@@ -14,6 +14,17 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Sends `SIGKILL` to `pid`, ignoring failure (the process may already be
+/// gone). Hibernation's stop signal (GitHub issue #64): unlike `SIGTERM`/
+/// `SIGHUP`, a killed agent gets no chance to run its `SessionEnd` hook or
+/// exit handler, which would otherwise finish the run it was just
+/// hibernated from.
+pub fn kill_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,5 +43,19 @@ mod tests {
         child.wait().expect("failed to wait on child");
 
         assert!(!pid_alive(pid));
+    }
+
+    #[test]
+    fn kill_pid_terminates_a_running_child_without_letting_it_exit_cleanly() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn `sleep`");
+
+        kill_pid(child.id());
+
+        let status = child.wait().expect("failed to wait on child");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

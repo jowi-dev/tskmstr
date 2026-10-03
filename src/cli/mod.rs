@@ -838,7 +838,9 @@ pub enum RunsCmd {
         detail: Option<String>,
     },
     /// Marks abandoned runs as terminal: a dead recorded pid or killed tmux
-    /// session immediately, a stale heartbeat otherwise.
+    /// session immediately, a stale heartbeat otherwise. Also hibernates
+    /// interactive runs idle past `[work] idle_hibernate_mins` (stops their
+    /// agent; attaching to the ticket session resumes it).
     Reap {
         /// Minutes without a heartbeat before a signal-less run counts as
         /// stale.
