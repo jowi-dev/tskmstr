@@ -820,6 +820,11 @@ pub enum RunsCmd {
         /// it `NULL` ("not measured").
         #[arg(long)]
         findings_count: Option<i64>,
+        /// Finish the run even when it is hibernated. Without this, a
+        /// hibernated run is refused: its agent was stopped by tm, and the
+        /// session-end hook it may still fire must not close the run.
+        #[arg(long)]
+        force: bool,
     },
     /// Appends a telemetry event to a run and bumps its heartbeat.
     Event {

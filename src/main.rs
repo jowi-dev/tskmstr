@@ -1768,6 +1768,7 @@ fn run_runs(
             transcript,
             model_usage,
             findings_count,
+            force,
         }) => {
             let outcome = tskmstr::runs::FinishRun {
                 status: status.into(),
@@ -1785,6 +1786,7 @@ fn run_runs(
                 &store,
                 run_id,
                 &outcome,
+                force,
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
             )?;
