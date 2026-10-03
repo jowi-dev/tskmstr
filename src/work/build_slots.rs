@@ -313,6 +313,18 @@ pub fn run_wrapped(args: &[OsString], env: &WrapperEnv) -> io::Result<i32> {
         .unwrap_or(1))
 }
 
+/// The cargo arguments when `argv` (a full `tm` argv, program name first)
+/// is a shim invocation, `tm __cargo-wrap <args>`, and `None` otherwise.
+/// `main` checks this before clap sees `argv`, so cargo's own flags
+/// (`--help`, `-V`) reach cargo rather than tm's parser.
+pub fn wrapper_args(argv: impl IntoIterator<Item = OsString>) -> Option<Vec<OsString>> {
+    let mut argv = argv.into_iter().skip(1);
+    if argv.next()? != WRAPPER_ARG {
+        return None;
+    }
+    Some(argv.collect())
+}
+
 /// `tm __cargo-wrap <args>`: [`run_wrapped`] with [`WrapperEnv`] read from
 /// this process's environment. Exits `127` when the real cargo cannot be
 /// found or spawned.
@@ -360,6 +372,20 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn wrapper_args_takes_everything_after_the_wrapper_arg() {
+        assert_eq!(
+            wrapper_args(args(&["tm", "__cargo-wrap", "build", "--help"])),
+            Some(args(&["build", "--help"]))
+        );
+        assert_eq!(
+            wrapper_args(args(&["tm", "__cargo-wrap"])),
+            Some(Vec::new())
+        );
+        assert_eq!(wrapper_args(args(&["tm", "work", "run"])), None);
+        assert_eq!(wrapper_args(args(&["tm"])), None);
     }
 
     #[test]

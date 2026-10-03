@@ -25,6 +25,13 @@ use tskmstr::work::git::ShellGitOps;
 use tskmstr::work::tmux::ShellTmuxOps;
 
 fn main() -> ExitCode {
+    // The build-slot `cargo` shim (GitHub issue #65) re-execs `tm
+    // __cargo-wrap <args>`. Handled before clap so cargo's own flags reach
+    // cargo, and before any config load so a wrapped cargo costs nothing.
+    if let Some(args) = tskmstr::work::build_slots::wrapper_args(std::env::args_os()) {
+        return tskmstr::work::build_slots::run_wrapper(args);
+    }
+
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Board);
 
