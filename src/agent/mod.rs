@@ -239,6 +239,54 @@ pub struct AgentInvocation {
     pub env_remove: Vec<String>,
 }
 
+/// A self-contained recipe for resuming an interactive session in a fresh
+/// tmux window, recorded when the session is launched (GitHub issue #64).
+///
+/// A hibernated run is woken long after its launch, possibly by a process
+/// with a different config loaded, so everything the resumed agent needs is
+/// captured up front by [`AgentRunner::resume_spec`]: the launch's flags
+/// minus its prompt (the hooks `--settings`, `--model`, permission mode — a
+/// resume without them would run with no telemetry hooks), and the
+/// billing-safety env vars to strip (see [`AgentInvocation::env_remove`]).
+/// Only the session id is supplied at wake time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeSpec {
+    /// The program to run, e.g. the launch invocation's
+    /// [`AgentInvocation::program`].
+    pub program: String,
+    /// The flag that takes the session id to resume.
+    pub resume_flag: String,
+    /// The launch invocation's arguments with its prompt removed.
+    pub args: Vec<String>,
+    /// Environment variables to unset before the program runs.
+    pub env_remove: Vec<String>,
+}
+
+impl ResumeSpec {
+    /// The shell command line a tmux window runs to resume `session_id`:
+    /// `exec [env -u VAR ...] <program> <resume_flag> <session_id> <args...>`,
+    /// every argument [`shell_quote`]d.
+    ///
+    /// The leading `exec` replaces the window's shell with the agent, so the
+    /// pane's pid *is* the agent's pid — the liveness signal the woken run
+    /// records, and the process a later hibernation stops.
+    pub fn command_line(&self, session_id: &str) -> String {
+        let mut parts = vec!["exec".to_string()];
+        if !self.env_remove.is_empty() {
+            parts.push("env".to_string());
+            for var in &self.env_remove {
+                parts.push("-u".to_string());
+                parts.push(var.clone());
+            }
+        }
+        parts.push(self.program.clone());
+        parts.push(shell_quote(&self.resume_flag));
+        parts.push(shell_quote(session_id));
+        parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
+        parts.join(" ")
+    }
+}
+
 /// Errors from [`AgentRunner::parse_outcome`].
 #[derive(Debug, Error)]
 pub enum OutcomeParseError {
@@ -537,6 +585,13 @@ pub trait AgentRunner: Sync {
     /// --resume <id>`.
     fn resume_command(&self, session_id: &str) -> String;
 
+    /// The [`ResumeSpec`] for an interactive session launched with
+    /// `invocation` (built for [`RunMode::Interactive`]): the same program,
+    /// flags, and env stripping, with the prompt replaced by this runner's
+    /// resume-by-session-id flag. Recorded at launch so a hibernated run can
+    /// be woken later (GitHub issue #64).
+    fn resume_spec(&self, invocation: &AgentInvocation) -> ResumeSpec;
+
     /// Shell command string for a tmux-hosted audit/bugbot session: the
     /// adapter's CLI with an optional `--model` and `prompt` as its
     /// positional argument. Replaces `work::audit::claude_command`.
@@ -741,7 +796,7 @@ pub trait AgentRunner: Sync {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::AgentRunner;
+    use super::{AgentRunner, ResumeSpec};
     use crate::agent::claude::ClaudeRunner;
     use crate::agent::opencode::OpencodeRunner;
 
@@ -775,6 +830,33 @@ mod tests {
             claude.contains("{ticket_list}"),
             "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
         );
+    }
+
+    #[test]
+    fn resume_spec_command_line_execs_with_env_stripping_flag_and_args() {
+        let spec = ResumeSpec {
+            program: "agent".to_string(),
+            resume_flag: "--resume".to_string(),
+            args: vec!["--model".to_string(), "it's".to_string()],
+            env_remove: vec!["SECRET_KEY".to_string(), "OTHER".to_string()],
+        };
+
+        assert_eq!(
+            spec.command_line("sess-1"),
+            "exec env -u SECRET_KEY -u OTHER agent '--resume' 'sess-1' '--model' 'it'\\''s'"
+        );
+    }
+
+    #[test]
+    fn resume_spec_command_line_skips_env_when_nothing_to_strip() {
+        let spec = ResumeSpec {
+            program: "agent".to_string(),
+            resume_flag: "--session".to_string(),
+            args: Vec::new(),
+            env_remove: Vec::new(),
+        };
+
+        assert_eq!(spec.command_line("ses_9"), "exec agent '--session' 'ses_9'");
     }
 
     /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
