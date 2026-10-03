@@ -215,6 +215,12 @@ mod tests {
         fn kill_session(&self, _: &str) -> Result<(), TmuxError> {
             Err(Self::error())
         }
+        fn kill_window(&self, _: &str, _: &str) -> Result<(), TmuxError> {
+            Err(Self::error())
+        }
+        fn pane_pid(&self, _: &str, _: &str) -> Result<Option<u32>, TmuxError> {
+            Err(Self::error())
+        }
         fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
             Ok(Vec::new())
         }
