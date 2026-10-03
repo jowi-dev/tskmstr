@@ -1912,6 +1912,7 @@ mod tests {
         let mut lanes = BTreeMap::new();
         lanes.insert(name.to_string(), lane);
         WorkConfig {
+            build_slots: None,
             worktree_root: Some(worktree_root.to_string_lossy().into_owned()),
             default_model: None,
             default_max_turns: None,

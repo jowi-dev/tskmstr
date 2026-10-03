@@ -335,6 +335,13 @@ pub struct RawWorkConfig {
     /// Default permission mode for a lane's driver process when the lane
     /// itself doesn't set [`RawLaneConfig::permission_mode`].
     pub default_permission_mode: Option<String>,
+    /// How many `cargo` builds may run at once across every lane on this
+    /// machine (GitHub issue #65). A positive N puts tm's `cargo` wrapper
+    /// first on each launched lane's `PATH`, so extra builds queue for one
+    /// of N shared slots and each running build gets about cores / N jobs.
+    /// `0` or unset leaves `PATH` untouched. See
+    /// [`crate::work::build_slots`].
+    pub build_slots: Option<u32>,
     /// Extra tmux window names created alongside the primary window when a
     /// lane's session is provisioned.
     pub tmux_windows: Option<Vec<String>>,
@@ -717,6 +724,8 @@ pub struct WorkConfig {
     pub default_max_turns: Option<u32>,
     /// See [`RawWorkConfig::default_permission_mode`].
     pub default_permission_mode: Option<String>,
+    /// See [`RawWorkConfig::build_slots`].
+    pub build_slots: Option<u32>,
     /// See [`RawWorkConfig::tmux_windows`]. Empty when unset in both global
     /// and repo config.
     pub tmux_windows: Vec<String>,
@@ -1640,6 +1649,7 @@ fn merge_work(
     let worktree_root = repo.worktree_root.or(global.worktree_root);
     let default_model = repo.default_model.or(global.default_model);
     let default_max_turns = repo.default_max_turns.or(global.default_max_turns);
+    let build_slots = repo.build_slots.or(global.build_slots);
     let default_permission_mode = repo
         .default_permission_mode
         .or(global.default_permission_mode);
@@ -1709,6 +1719,7 @@ fn merge_work(
         default_model,
         default_max_turns,
         default_permission_mode,
+        build_slots,
         tmux_windows,
         tmux_primary_window,
         lanes,
@@ -4063,8 +4074,46 @@ mod tests {
     }
 
     #[test]
+    fn load_work_build_slots_repo_overrides_global() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work]
+            build_slots = 4
+            "#,
+        )
+        .unwrap();
+        let paths = ConfigPaths {
+            global: global_path.clone(),
+            repo: None,
+        };
+        assert_eq!(load(&paths).expect("should load").work.build_slots, Some(4));
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, "[work]\nbuild_slots = 0\n").unwrap();
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        };
+        assert_eq!(load(&paths).expect("should load").work.build_slots, Some(0));
+    }
+
+    #[test]
+    fn merge_work_build_slots_unset_in_both_is_none() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.work.build_slots, None);
+    }
+
+    #[test]
     fn merge_work_repo_overrides_global_scalar_fields() {
         let global = RawWorkConfig {
+            build_slots: None,
             worktree_root: Some("~/Worktrees".to_string()),
             default_model: Some("fable".to_string()),
             default_max_turns: Some(200),
@@ -4081,6 +4130,7 @@ mod tests {
             lane_memory_estimate_gb: None,
         };
         let repo = RawWorkConfig {
+            build_slots: None,
             worktree_root: Some("/repo/worktrees".to_string()),
             default_model: None,
             default_max_turns: None,
