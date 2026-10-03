@@ -776,12 +776,56 @@ fn agent_fallback_runners_for(config: Option<&Config>) -> Vec<&'static dyn Agent
 
 /// The default global/repo config paths for this machine and working
 /// directory.
+///
+/// The repo config (`.tskmstr.toml`) is resolved against the git
+/// common-dir root ([`git_common_repo_root`]), so `tm` run from inside a
+/// linked worktree (or a subdirectory) reads the main checkout's repo
+/// config. Outside a git repo, or when `git` is unavailable, it falls back
+/// to the current directory.
 fn default_config_paths() -> ConfigPaths {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
-    let repo_root = std::env::current_dir().ok();
+    let repo_root = git_common_repo_root().or_else(|| std::env::current_dir().ok());
     config::default_paths(&home, repo_root.as_deref())
+}
+
+/// The main repository root for the current directory, via
+/// `git rev-parse --path-format=absolute --git-common-dir` with the
+/// trailing `/.git` stripped. Unlike `--show-toplevel`, this returns the
+/// main checkout's root even from inside a linked worktree.
+///
+/// Returns `None` when `git` can't be spawned, the current directory isn't
+/// in a git repo, or the output isn't a `.git` directory path (see
+/// [`parse_git_common_dir_output`]). This deliberately doesn't go through
+/// [`tskmstr::work::git::GitOps`]: config bootstrap runs before any
+/// `GitOps` instance exists.
+fn git_common_repo_root() -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_git_common_dir_output(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+}
+
+/// Interpret `git rev-parse --git-common-dir` output for
+/// [`git_common_repo_root`]: a zero exit whose (trimmed) stdout is a path
+/// ending in a `.git` component yields that path's parent. A non-zero or
+/// missing exit code, or a path not named `.git` (e.g. a bare repo, which
+/// has no checkout to hold `.tskmstr.toml`), yields `None`.
+fn parse_git_common_dir_output(exit_code: Option<i32>, stdout: &str) -> Option<PathBuf> {
+    if exit_code != Some(0) {
+        return None;
+    }
+    let common_dir = Path::new(stdout.trim());
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
 }
 
 /// Build a [`TicketProvider`] for the given config and token.
@@ -2072,5 +2116,31 @@ mod tests {
         let provider = run_ticket_provider(&config, &keychain, Some("tok".to_string()));
 
         assert!(provider.is_some());
+    }
+
+    #[test]
+    fn git_common_dir_output_strips_trailing_dot_git() {
+        assert_eq!(
+            parse_git_common_dir_output(Some(0), "/home/jowi/Projects/tskmstr/.git\n"),
+            Some(PathBuf::from("/home/jowi/Projects/tskmstr"))
+        );
+    }
+
+    #[test]
+    fn git_common_dir_output_non_zero_exit_is_none() {
+        assert_eq!(
+            parse_git_common_dir_output(Some(128), "fatal: not a git repository\n"),
+            None
+        );
+        assert_eq!(parse_git_common_dir_output(None, ""), None);
+    }
+
+    #[test]
+    fn git_common_dir_output_without_dot_git_suffix_is_none() {
+        assert_eq!(
+            parse_git_common_dir_output(Some(0), "/srv/bare-repo\n"),
+            None
+        );
+        assert_eq!(parse_git_common_dir_output(Some(0), "\n"), None);
     }
 }
