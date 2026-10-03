@@ -489,6 +489,18 @@ pub struct RawMergeConfig {
     /// overriding the runner's default model. Same rationale as
     /// [`RawCreateConfig::model`].
     pub model: Option<String>,
+    /// Prompt template for the single combined conflict-resolution session
+    /// a batch `tm merge KEY1 KEY2 ...` opens when two or more of its
+    /// tickets stop on rebase conflicts. Defaults to the runner's built-in
+    /// batch template when unset. Supports one placeholder,
+    /// `{ticket_list}`, substituted with a newline-separated list of each
+    /// conflicting ticket's key, branch, base, and checkout directory.
+    ///
+    /// Independent of [`RawMergeConfig::prompt`]/
+    /// [`RawMergeConfig::prompt_file`], which stay single-ticket only:
+    /// setting this alongside either is not a
+    /// [`ConfigError::PromptSourceConflict`].
+    pub batch_conflict_prompt: Option<String>,
 }
 
 /// Raw, partially-specified `[work.manual]` subsection as parsed directly
@@ -768,8 +780,11 @@ pub struct CreateConfig {
 /// built-in conflict prompt — the prompt text supports `{key}` (the ticket
 /// key), `{branch}` (the branch being merged), and `{base}` (the branch it's
 /// being merged onto) placeholders. `model` overrides the runner's default
-/// model for that session. All fields are optional: an absent section falls
-/// back to the built-in prompt and the runner's default model.
+/// model for that session. `batch_conflict_prompt` overrides the built-in
+/// template for the combined session a multi-key `tm merge` opens (its one
+/// placeholder is `{ticket_list}`). All fields are optional: an absent
+/// section falls back to the built-in prompts and the runner's default
+/// model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergeConfig {
     /// See [`RawMergeConfig::prompt`].
@@ -778,6 +793,8 @@ pub struct MergeConfig {
     pub prompt_file: Option<String>,
     /// See [`RawMergeConfig::model`].
     pub model: Option<String>,
+    /// See [`RawMergeConfig::batch_conflict_prompt`].
+    pub batch_conflict_prompt: Option<String>,
 }
 
 /// Fully validated `[work.manual]` subsection.
@@ -1806,6 +1823,7 @@ fn merge_merge_section(
         prompt,
         prompt_file,
         model: repo.model.or(global.model),
+        batch_conflict_prompt: repo.batch_conflict_prompt.or(global.batch_conflict_prompt),
     })
 }
 
@@ -4678,12 +4696,94 @@ mod tests {
     }
 
     #[test]
+    fn merge_work_batch_conflict_prompt_repo_overrides_global() {
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                batch_conflict_prompt: Some("global {ticket_list}".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                batch_conflict_prompt: Some("repo {ticket_list}".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global.clone()), Some(repo), None).expect("should merge");
+        assert_eq!(
+            cfg.merge.batch_conflict_prompt,
+            Some("repo {ticket_list}".to_string())
+        );
+
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
+        assert_eq!(
+            cfg.merge.batch_conflict_prompt,
+            Some("global {ticket_list}".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_work_batch_conflict_prompt_coexists_with_single_ticket_prompt_file() {
+        // `batch_conflict_prompt` is a separate template for the combined
+        // session, not a third single-ticket prompt source, so it never
+        // trips the prompt/prompt_file conflict check.
+        let global = RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                prompt_file: Some("/abs/prompts/merge.md".to_string()),
+                batch_conflict_prompt: Some("batch {ticket_list}".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
+        assert_eq!(
+            cfg.merge.prompt_file,
+            Some("/abs/prompts/merge.md".to_string())
+        );
+        assert_eq!(
+            cfg.merge.batch_conflict_prompt,
+            Some("batch {ticket_list}".to_string())
+        );
+    }
+
+    #[test]
+    fn load_work_merge_section_parses_batch_conflict_prompt() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.merge]
+            batch_conflict_prompt = "resolve these: {ticket_list}"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.merge.batch_conflict_prompt,
+            Some("resolve these: {ticket_list}".to_string())
+        );
+    }
+
+    #[test]
     fn merge_work_repo_overrides_merge_section_field_by_field() {
         let global = RawWorkConfig {
             merge: Some(RawMergeConfig {
                 prompt: Some("/merge-conflict {key} {branch} {base}".to_string()),
                 prompt_file: None,
                 model: Some("opus".to_string()),
+                batch_conflict_prompt: None,
             }),
             ..Default::default()
         };
@@ -4692,6 +4792,7 @@ mod tests {
                 prompt: None,
                 prompt_file: None,
                 model: Some("sonnet".to_string()),
+                batch_conflict_prompt: None,
             }),
             ..Default::default()
         };

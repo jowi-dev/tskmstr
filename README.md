@@ -1305,6 +1305,7 @@ never gates whether merging is available at all, unlike `[work.audit]`'s
 # prompt = "..."                              # optional; ships a built-in default prompt
 # prompt_file = ".tskmstr/prompts/merge.md"    # optional; see [work.audit]'s prompt_file above
 # model = "fable"                              # optional; passed as `claude --model`
+# batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
 ```
 
 `prompt_file` and `prompt` are mutually exclusive — setting both is a
@@ -1316,6 +1317,14 @@ are — no config is required to get a working conflict-resolution session.
 the PR's base branch (e.g. `main`). `model` overrides whatever `claude`
 defaults to (or an enterprise model pin), same semantics as
 `[work.audit].model`.
+
+`batch_conflict_prompt` is the template for the single combined session a
+multi-key `tm merge` opens when its tickets stop on conflicts (see
+"Merging several tickets at once" above). Its one placeholder,
+`{ticket_list}`, is replaced with one line per conflicting ticket giving
+its key, branch, base, and checkout directory. Leave it unset and tm ships
+a built-in batch prompt. It is independent of `prompt`/`prompt_file`,
+which stay single-ticket only, so setting it alongside either is fine.
 
 ### Retro board
 
