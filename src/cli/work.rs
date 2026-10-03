@@ -75,6 +75,10 @@ pub enum WorkCliError {
     #[error(transparent)]
     Tmux(#[from] TmuxError),
 
+    /// Resuming a hibernated run failed (GitHub issue #64).
+    #[error(transparent)]
+    Wake(#[from] crate::work::hibernate::WakeError),
+
     /// A filesystem or output-write operation failed.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -685,7 +689,9 @@ pub fn supervise(
 /// comes back (only in-flight runs; a viewer for a headless one, a shell plus
 /// a printed `claude --resume` line for an interactive one) and why; this
 /// function is the I/O around it: one `list_windows` snapshot, the run rows,
-/// then the tmux calls and a summary.
+/// then the tmux calls and a summary. Hibernated runs are resumed first, in
+/// their own windows ([`crate::work::hibernate::wake_session`]; GitHub issue
+/// #64), since their agent was stopped by tm and cannot be driven twice.
 ///
 /// Never attaches, matching [`restore`]: reconstruction is something you may
 /// want to do for several tickets in a row, and it must be safe to run from a
@@ -703,6 +709,7 @@ pub fn session(
     store: &RunStore,
     identity: &crate::config::BackendIdentity,
     current_exe: &Path,
+    sessions_dir: &Path,
     key: &str,
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
@@ -711,6 +718,19 @@ pub fn session(
     let runs = store.runs_for_ticket(Some(&identity.scope()), &ticket)?;
     if runs.is_empty() {
         return Err(WorkCliError::NoRunsForTicket(ticket));
+    }
+
+    // Hibernated runs come back as their own agent, resumed in place
+    // (GitHub issue #64), before the snapshot the plan is built from; the
+    // plan then sees them as live and leaves their windows alone.
+    let session_name = crate::work::naming::ticket_session_name(&identity.session_slug(), &ticket);
+    for woken in crate::work::hibernate::wake_session(store, ctx.tmux, &session_name, sessions_dir)?
+    {
+        writeln!(
+            out,
+            "resumed   {session_name}:{} — hibernated run {} picked up where it left off",
+            woken.window, woken.id
+        )?;
     }
 
     let windows = ctx.tmux.list_windows()?;
@@ -1915,6 +1935,7 @@ mod tests {
             &store,
             compatible_test_identity(),
             &current_exe,
+            &tmp.path().join("sessions"),
             "proj-1",
             &ClaudeRunner,
             &mut out,
@@ -1987,6 +2008,7 @@ mod tests {
             &store,
             compatible_test_identity(),
             &current_exe,
+            &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
             &mut out,
@@ -2006,6 +2028,80 @@ mod tests {
         );
         let printed = out_string(&out);
         assert!(printed.contains("claude --resume sess-abc"), "{printed}");
+    }
+
+    /// GitHub issue #64: opening the ticket's session resumes a hibernated
+    /// run in its window, rather than only printing a resume hint.
+    #[test]
+    fn session_resumes_a_hibernated_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = default_config();
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: "/wt/proj-1".to_string(),
+                branch: None,
+                pid: Some(4242),
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-abc").unwrap();
+        let session_name = crate::work::naming::ticket_session_name(
+            &compatible_test_identity().session_slug(),
+            "PROJ-1",
+        );
+        store.update_tmux_session(run_id, &session_name).unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let mut out = Vec::new();
+
+        session(
+            &ctx,
+            &store,
+            compatible_test_identity(),
+            &PathBuf::from("/usr/local/bin/tm"),
+            &tmp.path().join("sessions"),
+            "PROJ-1",
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Running
+        );
+        let printed = out_string(&out);
+        assert!(
+            printed.contains(&format!("resumed   {session_name}:work")),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -2053,6 +2149,7 @@ mod tests {
             &store,
             compatible_test_identity(),
             &current_exe,
+            &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
             &mut out,
@@ -2090,6 +2187,7 @@ mod tests {
             &store,
             compatible_test_identity(),
             &current_exe,
+            &tmp.path().join("sessions"),
             "PROJ-404",
             &ClaudeRunner,
             &mut out,

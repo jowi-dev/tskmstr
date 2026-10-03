@@ -395,6 +395,7 @@ fn run_work(
                 &run_store,
                 &identity,
                 &current_exe,
+                &tskmstr::runs::session::sessions_dir_from_process_env(),
                 &key,
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
