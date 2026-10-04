@@ -1975,8 +1975,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             if let Some(confirm) = app.lane_confirm.take() {
                 app.status_line = format!("lane run for {} cancelled", confirm.key);
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
-                app.status_line =
-                    format!("batch merge of {} tickets cancelled", confirm.keys.len());
+                app.status_line = format!("batch merge of {} cancelled", confirm.keys.join(", "));
             } else if let Some(confirm) = app.merge_confirm.take() {
                 app.status_line = format!(
                     "merge of PR #{} for {} cancelled",
@@ -4527,7 +4526,7 @@ mod tests {
         assert_eq!(app.batch_merge_confirm, None);
         assert_eq!(app.merge_queue.len(), 2);
         assert!(app.pending_merge_launches.is_empty());
-        assert_eq!(app.status_line, "batch merge of 2 tickets cancelled");
+        assert_eq!(app.status_line, "batch merge of PROJ-9, PROJ-10 cancelled");
         assert!(cmds.is_empty());
     }
 
