@@ -1425,36 +1425,62 @@ fn draw_transition_window(frame: &mut Frame, app: &App) {
 
 /// A centered overlay listing every keybinding.
 fn draw_help_overlay(frame: &mut Frame) {
-    let area = centered_rect(60, 75, frame.area());
-    let lines = vec![
+    let area = centered_rect(80, 80, frame.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(bold_title("Help"));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    // Two columns so the full board action set fits without clipping on a
+    // short (24-row) terminal: navigation/general keys on the left, the
+    // board's action keys on the right. The right column mirrors the
+    // status-bar hint (`hint_for`) key-for-key -- see
+    // `help_overlay_documents_every_board_action`.
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+
+    let navigation = vec![
         Line::from("j / Down    move down"),
         Line::from("k / Up      move up"),
         Line::from("h / Left    previous column"),
         Line::from("l / Right   next column"),
         Line::from("Enter       open / apply"),
-        Line::from("Esc / q     back (quits from the board)"),
-        Line::from("r           refresh tickets (inert mid-grab in priority view)"),
-        Line::from("o           open in browser (picks Jira/GitHub if a PR exists, board only)"),
-        Line::from("O           open Jira directly, no PR lookup"),
-        Line::from("f           filter by assignee (board only)"),
-        Line::from("A           assign ticket (board only)"),
-        Line::from("p           priority (stack-rank) view (board only)"),
-        Line::from("Enter/Space grab or drop a ticket (priority view only)"),
-        Line::from("s           attach to the selected run's session (runs watch only)"),
-        Line::from("f / F       cycle kind / scope view filter (runs watch only)"),
+        Line::from("Esc / q     back / quit"),
+        Line::from("r           refresh tickets"),
+        Line::from("o           open in browser"),
+        Line::from("O           open Jira directly"),
+        Line::from("Enter/Space grab/drop (rank view)"),
         Line::from("?           toggle this help"),
         Line::from(""),
-        Line::from("card key    ✓ ready  ◐ stackable  ✗ blocked  ? unknown (tm ready)"),
-        Line::from(""),
+        Line::from("card key markers:"),
+        Line::from("  ✓ ready    ◐ stackable"),
+        Line::from("  ✗ blocked  ? unknown"),
         Line::from("press any key to close"),
     ];
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(bold_title("Help")),
-    );
-    frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, area);
+    let actions = vec![
+        Line::from("f       filter by assignee"),
+        Line::from("A       assign ticket"),
+        Line::from("p       priority (rank) view"),
+        Line::from("a       audit ticket"),
+        Line::from("s       attach session"),
+        Line::from("m       manual session"),
+        Line::from("w       work (autonomous run)"),
+        Line::from("b       watch review bots"),
+        Line::from("c       create ticket"),
+        Line::from("v       view run"),
+        Line::from("L       run logs"),
+        Line::from("V       vdiff review"),
+        Line::from("F       apply review fixes"),
+        Line::from("M       merge PR / merge queue"),
+        Line::from("Space   toggle merge queue"),
+        Line::from("R       retro verdict"),
+    ];
+    frame.render_widget(Paragraph::new(navigation), columns[0]);
+    frame.render_widget(Paragraph::new(actions), columns[1]);
 }
 
 /// A centered floating window listing the board's assignee filter options
@@ -2131,6 +2157,42 @@ mod tests {
         let text = buffer_text(&render(&app));
         assert!(text.contains("Help"));
         assert!(text.contains("toggle this help"));
+    }
+
+    #[test]
+    fn help_overlay_documents_every_board_action() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        // Every board action the status-bar hint advertises should also be
+        // documented in the `?` overlay, so the two never drift apart. The
+        // merge queue (M / Space, GitHub issues #61/#68) is the most recent
+        // addition the overlay had been missing entirely.
+        for phrase in [
+            "filter",
+            "assign",
+            "priority",
+            "audit",
+            "session",
+            "manual",
+            "work",
+            "bots",
+            "create",
+            "view run",
+            "logs",
+            "vdiff",
+            "fixes",
+            "merge",
+            "merge queue",
+            "retro",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "help overlay should document `{phrase}`:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -3114,7 +3176,7 @@ mod tests {
             ..App::new()
         };
         let text = buffer_text(&render(&app));
-        assert!(text.contains("A           assign ticket (board only)"));
+        assert!(text.contains("assign ticket"));
     }
 
     fn run_card(id: i64, ticket: &str, lane: &str, status: RunStatus) -> RunCard {
