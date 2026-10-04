@@ -127,9 +127,11 @@ as the follow-up tickets listed under **Slices**.
 7. **System header.** One line: CPU and memory summed across live lanes,
    host totals, the `[work]` memory budget against estimated lane cost
    (#66), and `build_slots` in use/total. That answers "can I launch
-   another lane". Per-lane memory already comes from `runs.db`. CPU is new
-   and is sampled with the same process-tree walk `footprint.rs` uses for
-   memory.
+   another lane". Per-lane memory already comes from `runs.db`, along with
+   the kernel memory-pressure level from `runs::footprint`. CPU is new and
+   is sampled per run's process tree, the same way `footprint.rs` handles
+   memory. Like footprint, it shows "unknown" on a platform where it can't
+   be read, and is never an error.
 
 ## Slices
 
