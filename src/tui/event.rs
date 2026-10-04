@@ -402,7 +402,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
-                    app.merge_confirm.is_some() || app.lane_confirm.is_some(),
+                    app.confirm_open(),
                     retro_overlay_for(&app),
                     key_event.code,
                 )
@@ -1118,7 +1118,7 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
                     app.show_browser_picker,
                     app.is_rank_grabbed(),
                     app.show_run_detail,
-                    app.merge_confirm.is_some() || app.lane_confirm.is_some(),
+                    app.confirm_open(),
                     RetroOverlay::None,
                     key_event.code,
                 )

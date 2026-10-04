@@ -537,6 +537,18 @@ pub struct MergeConfirm {
     pub target_status: Option<String>,
 }
 
+/// The pending batch merge the board's `M` key opens when
+/// [`App::merge_queue`] is non-empty (GitHub issue #68). Kept separate from
+/// [`MergeConfirm`]: a batch never resolves PRs up front -- `tm merge`
+/// resolves each one itself -- so there is no PR number or title to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchMergeConfirm {
+    /// The queued ticket keys, in the order they will be passed to `tm
+    /// merge`: board position (column, then row), with any queued key no
+    /// longer on the board appended last.
+    pub keys: Vec<String>,
+}
+
 /// The pending lane launch the blocked-launch confirmation overlay is asking
 /// about (GitHub issue #62): `w` on a card whose readiness is
 /// [`Readiness::Blocked`]. Captured whole at keypress time, like
@@ -853,6 +865,11 @@ pub struct App {
     /// state here -- the overlay being open and a merge being pending are
     /// the same fact.
     pub merge_confirm: Option<MergeConfirm>,
+    /// The batch merge confirmation overlay (`M` with a non-empty
+    /// [`App::merge_queue`], GitHub issue #68), or `None` when closed. Never
+    /// open alongside `merge_confirm` or `lane_confirm`; shares their
+    /// confirm/cancel keys.
+    pub batch_merge_confirm: Option<BatchMergeConfirm>,
     /// The blocked-launch confirmation overlay's pending lane launch (`w`
     /// on a [`Readiness::Blocked`] card, GitHub issue #62), or `None` when
     /// closed. Shares the confirm/cancel keys with `merge_confirm`; the two
@@ -922,6 +939,15 @@ impl App {
     pub fn with_status_on_merge(mut self, status_on_merge: Option<String>) -> Self {
         self.status_on_merge = status_on_merge;
         self
+    }
+
+    /// Whether any confirmation overlay -- single merge, batch merge, or
+    /// blocked lane launch -- is open, which is what gates
+    /// [`crate::tui::keymap::map_key`] down to its confirm/cancel keys.
+    pub fn confirm_open(&self) -> bool {
+        self.merge_confirm.is_some()
+            || self.batch_merge_confirm.is_some()
+            || self.lane_confirm.is_some()
     }
 
     /// The currently selected ticket, if any.
@@ -1073,7 +1099,9 @@ pub enum Msg {
     /// message, and only [`Msg::ConfirmAccept`] can start the merge itself.
     /// A no-op when no ticket is selected. Deliberately ungated by
     /// column/status, like the `a` audit key: the PR resolution itself is
-    /// the authority on whether there is anything to merge.
+    /// the authority on whether there is anything to merge. With a
+    /// non-empty [`App::merge_queue`] it instead opens the batch
+    /// confirmation ([`BatchMergeConfirm`], GitHub issue #68) with no lookup.
     MergePrAction,
     /// The `Space` key on [`Screen::Board`] (GitHub issue #68): flip the
     /// selected ticket in or out of [`App::merge_queue`]. A no-op when no
@@ -1940,13 +1968,21 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             repo_root,
             note,
         } => merge_pr_resolved(app, key, pr, repo_root, note),
-        Msg::ConfirmAccept => match app.lane_confirm.take() {
-            Some(confirm) => launch_lane(app, confirm.key),
-            None => merge_confirm_accept(app),
-        },
+        Msg::ConfirmAccept => {
+            if let Some(confirm) = app.lane_confirm.take() {
+                launch_lane(app, confirm.key)
+            } else if let Some(confirm) = app.batch_merge_confirm.take() {
+                batch_merge_confirm_accept(app, confirm.keys)
+            } else {
+                merge_confirm_accept(app)
+            }
+        }
         Msg::ConfirmCancel => {
             if let Some(confirm) = app.lane_confirm.take() {
                 app.status_line = format!("lane run for {} cancelled", confirm.key);
+            } else if let Some(confirm) = app.batch_merge_confirm.take() {
+                app.status_line =
+                    format!("batch merge of {} tickets cancelled", confirm.keys.len());
             } else if let Some(confirm) = app.merge_confirm.take() {
                 app.status_line = format!(
                     "merge of PR #{} for {} cancelled",
@@ -2426,8 +2462,21 @@ fn browser_picker_select(mut app: App) -> (App, Vec<Cmd>) {
 /// lookup is out on the worker -- because it reuses the same resolution
 /// path; only the follow-up message differs. Additionally inert while a
 /// confirmed merge for the same ticket is still in flight (see below).
+///
+/// With a non-empty [`App::merge_queue`] (GitHub issue #68) it skips the PR
+/// lookup entirely and opens the [`BatchMergeConfirm`] overlay over the
+/// queued keys instead; the selection plays no part.
 fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
-    if app.screen != Screen::Board || app.merge_confirm.is_some() {
+    if app.screen != Screen::Board
+        || app.merge_confirm.is_some()
+        || app.batch_merge_confirm.is_some()
+    {
+        return (app, Vec::new());
+    }
+    if !app.merge_queue.is_empty() {
+        let keys = merge_queue_in_board_order(&app);
+        app.status_line = String::new();
+        app.batch_merge_confirm = Some(BatchMergeConfirm { keys });
         return (app, Vec::new());
     }
     let Some(ticket) = app.selected_ticket() else {
@@ -2452,7 +2501,11 @@ fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
 /// with no selection, or while a confirmation overlay is open; refuses a
 /// ticket whose merge is already in flight, mirroring [`merge_pr_action`].
 fn toggle_merge_queue(mut app: App) -> (App, Vec<Cmd>) {
-    if app.screen != Screen::Board || app.merge_confirm.is_some() || app.lane_confirm.is_some() {
+    if app.screen != Screen::Board
+        || app.merge_confirm.is_some()
+        || app.lane_confirm.is_some()
+        || app.batch_merge_confirm.is_some()
+    {
         return (app, Vec::new());
     }
     let Some(ticket) = app.selected_ticket() else {
@@ -2467,6 +2520,27 @@ fn toggle_merge_queue(mut app: App) -> (App, Vec<Cmd>) {
         app.merge_queue.insert(key);
     }
     (app, Vec::new())
+}
+
+/// [`App::merge_queue`]'s keys in board order -- column by column, top to
+/// bottom -- so `tm merge` receives them the way the operator sees them
+/// rather than in the set's lexical order (where `PROJ-10` sorts before
+/// `PROJ-9`). Queued keys no longer on the board (filtered out by a
+/// refresh) are appended last, in set order.
+fn merge_queue_in_board_order(app: &App) -> Vec<String> {
+    let mut keys: Vec<String> = app
+        .columns
+        .iter()
+        .flat_map(|column| &column.tickets)
+        .filter(|ticket| app.merge_queue.contains(&ticket.key))
+        .map(|ticket| ticket.key.clone())
+        .collect();
+    for key in &app.merge_queue {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys
 }
 
 /// Handle [`Msg::MergePrResolved`]: [`Cmd::ResolvePrForMerge`]'s result
@@ -2518,6 +2592,17 @@ fn merge_confirm_accept(mut app: App) -> (App, Vec<Cmd>) {
     app.status_line = format!("merging {key} via tm merge...");
     app.pending_merge_launches.insert(key.clone());
     (app, vec![Cmd::LaunchMerge { keys: vec![key] }])
+}
+
+/// Handle [`Msg::ConfirmAccept`] for an open [`BatchMergeConfirm`]: move
+/// every queued key into [`App::pending_merge_launches`], clear
+/// [`App::merge_queue`], and launch one `tm merge KEY1 KEY2 ...` child
+/// (GitHub issue #68).
+fn batch_merge_confirm_accept(mut app: App, keys: Vec<String>) -> (App, Vec<Cmd>) {
+    app.status_line = format!("merging {} via tm merge...", keys.join(", "));
+    app.pending_merge_launches.extend(keys.iter().cloned());
+    app.merge_queue.clear();
+    (app, vec![Cmd::LaunchMerge { keys }])
 }
 
 /// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm
@@ -4347,6 +4432,109 @@ mod tests {
         };
         let (app, _) = update(app, Msg::ToggleMergeQueue);
         assert!(app.merge_queue.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_while_the_batch_confirmation_is_open_is_a_noop() {
+        let app = App {
+            batch_merge_confirm: Some(BatchMergeConfirm {
+                keys: vec!["PROJ-2".to_string()],
+            }),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
+    }
+
+    // --- queue-aware Msg::MergePrAction / batch confirm (GitHub issue #68) ---
+
+    #[test]
+    fn confirm_open_covers_the_batch_merge_overlay() {
+        let app = App {
+            batch_merge_confirm: Some(BatchMergeConfirm {
+                keys: vec!["PROJ-1".to_string()],
+            }),
+            ..App::new()
+        };
+        assert!(app.confirm_open());
+        assert!(!App::new().confirm_open());
+    }
+
+    fn board_with_queue(keys: &[&str]) -> App {
+        let mut app = board_with(vec![ticket("PROJ-9"), ticket("PROJ-10")], 0);
+        app.merge_queue = keys.iter().map(|k| k.to_string()).collect();
+        app
+    }
+
+    #[test]
+    fn merge_pr_action_with_a_queue_opens_the_batch_confirmation_without_resolving_a_pr() {
+        let app = board_with_queue(&["PROJ-9", "PROJ-10"]);
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert!(cmds.is_empty());
+        assert_eq!(app.merge_confirm, None);
+        assert_eq!(
+            app.batch_merge_confirm,
+            Some(BatchMergeConfirm {
+                // Board order, not the BTreeSet's lexical PROJ-10 < PROJ-9.
+                keys: vec!["PROJ-9".to_string(), "PROJ-10".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn merge_pr_action_batch_keeps_queued_keys_no_longer_on_the_board() {
+        let app = board_with_queue(&["PROJ-10", "PROJ-77"]);
+        let (app, _) = update(app, Msg::MergePrAction);
+        assert_eq!(
+            app.batch_merge_confirm.map(|c| c.keys),
+            Some(vec!["PROJ-10".to_string(), "PROJ-77".to_string()])
+        );
+    }
+
+    #[test]
+    fn merge_pr_action_while_the_batch_confirmation_is_open_is_a_noop() {
+        let mut app = board_with_queue(&["PROJ-9"]);
+        app.batch_merge_confirm = Some(BatchMergeConfirm {
+            keys: vec!["PROJ-9".to_string()],
+        });
+        let (app, cmds) = update(app, Msg::MergePrAction);
+        assert!(cmds.is_empty());
+        assert_eq!(
+            app.batch_merge_confirm,
+            Some(BatchMergeConfirm {
+                keys: vec!["PROJ-9".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn batch_confirm_accept_launches_one_merge_and_moves_the_queue_in_flight() {
+        let app = board_with_queue(&["PROJ-9", "PROJ-10"]);
+        let (app, _) = update(app, Msg::MergePrAction);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
+        assert_eq!(app.batch_merge_confirm, None);
+        assert!(app.merge_queue.is_empty());
+        assert!(app.pending_merge_launches.contains("PROJ-9"));
+        assert!(app.pending_merge_launches.contains("PROJ-10"));
+        assert_eq!(app.status_line, "merging PROJ-9, PROJ-10 via tm merge...");
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchMerge {
+                keys: vec!["PROJ-9".to_string(), "PROJ-10".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn batch_confirm_cancel_closes_the_overlay_and_keeps_the_queue() {
+        let app = board_with_queue(&["PROJ-9", "PROJ-10"]);
+        let (app, _) = update(app, Msg::MergePrAction);
+        let (app, cmds) = update(app, Msg::ConfirmCancel);
+        assert_eq!(app.batch_merge_confirm, None);
+        assert_eq!(app.merge_queue.len(), 2);
+        assert!(app.pending_merge_launches.is_empty());
+        assert_eq!(app.status_line, "batch merge of 2 tickets cancelled");
+        assert!(cmds.is_empty());
     }
 
     fn app_with_browser_picker(options: Vec<BrowserPickerOption>, selected: usize) -> App {
