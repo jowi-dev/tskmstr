@@ -1656,6 +1656,48 @@ mod tests {
     }
 
     #[test]
+    fn ready_tickets_hydrates_blockers_so_blocked_candidates_are_not_ready() {
+        let fake = FakeGhCli::new()
+            .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+            .with_issue_list(Ok(vec![
+                issue_info(1, "Blocked", IssueState::Open, &[]),
+                issue_info(2, "Free", IssueState::Open, &[]),
+            ]))
+            .with_issue_blocked_by(
+                1,
+                vec![IssueRef {
+                    number: 9,
+                    title: "Blocker".to_string(),
+                    state: IssueState::Open,
+                    url: String::new(),
+                }],
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let listing = crate::ticketing::ready_tickets(&provider).unwrap();
+
+        let ready: Vec<&str> = listing.ready.iter().map(|i| i.key.as_str()).collect();
+        let blocked: Vec<&str> = listing.blocked.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(ready, vec!["GH-2"]);
+        assert_eq!(blocked, vec!["GH-1"]);
+    }
+
+    #[test]
+    fn ready_tickets_fails_rather_than_listing_tickets_with_unknown_blockers() {
+        let fake = FakeGhCli::new()
+            .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+            .with_issue_list(Ok(vec![issue_info(1, "Maybe", IssueState::Open, &[])]))
+            .with_issues_blocked_by_error(crate::github::gh_cli::GhError::Command {
+                command: "gh api graphql".to_string(),
+                exit_code: Some(1),
+                stderr: "rate limited".to_string(),
+            });
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert!(crate::ticketing::ready_tickets(&provider).is_err());
+    }
+
+    #[test]
     fn create_issue_calls_issue_create_with_todo_label_and_ignores_issue_type_name() {
         let created = issue_info(9, "New", IssueState::Open, &[]);
         let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
