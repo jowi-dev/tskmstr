@@ -97,6 +97,7 @@
 
 use thiserror::Error;
 
+pub mod drift;
 pub mod error;
 pub mod github_provider;
 pub mod provider;
