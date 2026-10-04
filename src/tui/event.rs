@@ -281,6 +281,8 @@ pub struct TuiDeps {
 /// [`crate::tui::launcher::LaunchHandle::try_finish`] resolves).
 struct PendingLaunch {
     /// The ticket key the launch was for, echoed back in the result `Msg`.
+    /// For a [`PendingLaunchKind::Merge`] it is only a space-joined label;
+    /// the kind itself carries the keys its result reports.
     key: String,
     /// Which `Msg` this entry's completion reports as.
     kind: PendingLaunchKind,
@@ -292,7 +294,7 @@ struct PendingLaunch {
 /// [`poll_pending_launches`] needs in order to pick the right result `Msg`.
 /// Both kinds share one launcher trait and one registry -- they differ only in
 /// argv and in which `Msg` their completion feeds back through `update`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingLaunchKind {
     /// `tm work run <lane> <key>`; reports [`Msg::LaneRunLaunchResult`].
     LaneRun,
@@ -300,8 +302,14 @@ enum PendingLaunchKind {
     BotWatch,
     /// `tm review fix <key>`; reports [`Msg::ReviewFixLaunchResult`].
     ReviewFix,
-    /// `tm merge <key>`; reports [`Msg::MergePrResult`] (GitHub issue #61).
-    Merge,
+    /// `tm merge <key>...`; reports [`Msg::MergePrResult`] (GitHub issue
+    /// #61). Carries every key the child merges, since a batch (GitHub
+    /// issue #68) clears all of them from `pending_merge_launches` at once
+    /// while [`PendingLaunch::key`] holds only a single label.
+    Merge {
+        /// Every ticket key passed to `tm merge`, in argv order.
+        keys: Vec<String>,
+    },
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -667,10 +675,17 @@ fn run_cmds<B: Backend>(
             pending.extend(more_cmds);
             continue;
         }
-        if let Cmd::LaunchMerge { key } = cmd {
-            let argv = merge_argv(&key);
-            let (next_app, more_cmds) =
-                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::Merge, &argv);
+        if let Cmd::LaunchMerge { keys } = cmd {
+            let argv = merge_argv(&keys);
+            let label = keys.join(" ");
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps,
+                launches,
+                label,
+                PendingLaunchKind::Merge { keys },
+                &argv,
+            );
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -716,11 +731,14 @@ fn review_fix_argv(key: &str) -> Vec<String> {
 }
 
 /// The argv [`Cmd::LaunchMerge`] spawns through
-/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm merge <key>` (GitHub
-/// issue #61). `tm merge` re-resolves the PR itself, so unlike the old
+/// [`crate::tui::launcher::LaneLauncher::spawn`]: `tm merge <key>...`
+/// (GitHub issue #61), one child for every key -- a single ticket or a
+/// board batch (GitHub issue #68). `tm merge` re-resolves the PR itself, so unlike the old
 /// direct-merge `Cmd`, no PR number rides along.
-fn merge_argv(key: &str) -> Vec<String> {
-    vec!["merge".to_string(), key.to_string()]
+fn merge_argv(keys: &[String]) -> Vec<String> {
+    std::iter::once("merge".to_string())
+        .chain(keys.iter().cloned())
+        .collect()
 }
 
 /// Spawn `argv` as a watched child for `key`, registering it in `launches` on
@@ -762,14 +780,14 @@ fn launch_result_msg(kind: PendingLaunchKind, key: String, result: Result<(), St
         PendingLaunchKind::LaneRun => Msg::LaneRunLaunchResult { key, result },
         PendingLaunchKind::BotWatch => Msg::BotWatchLaunchResult { key, result },
         PendingLaunchKind::ReviewFix => Msg::ReviewFixLaunchResult { key, result },
-        PendingLaunchKind::Merge => match result {
+        PendingLaunchKind::Merge { keys } => match result {
             Ok(()) => Msg::MergePrResult {
-                message: format!("merged {key} via tm merge"),
-                key,
+                message: format!("merged {} via tm merge", keys.join(", ")),
+                keys,
                 merged: true,
             },
             Err(message) => Msg::MergePrResult {
-                key,
+                keys,
                 merged: false,
                 message,
             },
@@ -788,7 +806,11 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
     let mut msgs = Vec::new();
     launches.retain_mut(|pending| match pending.handle.try_finish() {
         Some(result) => {
-            msgs.push(launch_result_msg(pending.kind, pending.key.clone(), result));
+            msgs.push(launch_result_msg(
+                pending.kind.clone(),
+                pending.key.clone(),
+                result,
+            ));
             false
         }
         None => true,
@@ -4846,7 +4868,7 @@ mod tests {
         run_cmds_test(
             App::new(),
             vec![Cmd::LaunchMerge {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
             }],
             &d,
             &mut terminal,
@@ -4860,6 +4882,55 @@ mod tests {
     }
 
     #[test]
+    fn run_cmds_launch_merge_spawns_one_child_with_every_batch_key() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut d = deps();
+        d.launcher = Box::new(RecordingLauncher(calls.clone()));
+        let mut terminal = test_terminal();
+        let mut launches = Vec::new();
+        run_cmds_test(
+            App::new(),
+            vec![Cmd::LaunchMerge {
+                keys: vec!["PROJ-1".to_string(), "PROJ-2".to_string()],
+            }],
+            &d,
+            &mut terminal,
+            &mut launches,
+        );
+        assert_eq!(
+            calls.borrow().clone(),
+            vec![vec![
+                "merge".to_string(),
+                "PROJ-1".to_string(),
+                "PROJ-2".to_string()
+            ]]
+        );
+        assert_eq!(launches.len(), 1);
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_a_batch_merge_with_every_key() {
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
+        let handle = launcher.spawn(&merge_argv(&keys)).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "PROJ-1 PROJ-2".to_string(),
+            kind: PendingLaunchKind::Merge { keys: keys.clone() },
+            handle,
+        }];
+        let msgs = poll_pending_launches(&mut launches);
+        assert_eq!(
+            msgs,
+            vec![Msg::MergePrResult {
+                keys,
+                merged: true,
+                message: "merged PROJ-1, PROJ-2 via tm merge".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn run_cmds_launch_merge_success_registers_pending_launch() {
         let d = deps();
         let mut terminal = test_terminal();
@@ -4867,7 +4938,7 @@ mod tests {
         let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchMerge {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
             }],
             &d,
             &mut terminal,
@@ -4889,7 +4960,7 @@ mod tests {
         let app = run_cmds_test(
             App::new(),
             vec![Cmd::LaunchMerge {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
             }],
             &d,
             &mut terminal,
@@ -4903,17 +4974,21 @@ mod tests {
     fn poll_pending_launches_reports_a_successful_merge_entry_as_merged() {
         let launcher =
             crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
-        let handle = launcher.spawn(&merge_argv("PROJ-1")).unwrap();
+        let handle = launcher
+            .spawn(&merge_argv(&["PROJ-1".to_string()]))
+            .unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
-            kind: PendingLaunchKind::Merge,
+            kind: PendingLaunchKind::Merge {
+                keys: vec!["PROJ-1".to_string()],
+            },
             handle,
         }];
         let msgs = poll_pending_launches(&mut launches);
         assert_eq!(
             msgs,
             vec![Msg::MergePrResult {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
                 merged: true,
                 message: "merged PROJ-1 via tm merge".to_string(),
             }]
@@ -4929,17 +5004,21 @@ mod tests {
                  rerun `tm merge PROJ-1`"
                     .to_string(),
             ))]);
-        let handle = launcher.spawn(&merge_argv("PROJ-1")).unwrap();
+        let handle = launcher
+            .spawn(&merge_argv(&["PROJ-1".to_string()]))
+            .unwrap();
         let mut launches = vec![PendingLaunch {
             key: "PROJ-1".to_string(),
-            kind: PendingLaunchKind::Merge,
+            kind: PendingLaunchKind::Merge {
+                keys: vec!["PROJ-1".to_string()],
+            },
             handle,
         }];
         let msgs = poll_pending_launches(&mut launches);
         assert_eq!(
             msgs,
             vec![Msg::MergePrResult {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
                 merged: false,
                 message: "conflicts handed back for PROJ-1: resolve in the merge tmux window, \
                           then rerun `tm merge PROJ-1`"
