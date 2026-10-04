@@ -77,3 +77,33 @@ Structural presence and the stamp together are the *entire* definition of
   direnv-style shell-entry nudge: it compares only the stamp, so it stays
   cheap enough to run on every `cd`, and the full scan stays behind
   on-demand `tm check`/`tm update`.
+
+## Addendum: expected config keys (GitHub issue #74)
+
+The stamp alone says *that* a repo is behind, never *which* config key it
+lacks. `src/config/manifest.rs` now also holds `EXPECTED_CONFIG_KEYS`: one
+entry per key a feature expects (dotted path, the schema version it arrived
+in, `Required` or `Recommended`, and a per-backend suggested value). A new
+feature that ships a key registers it there.
+
+- `tm check` reports each registered key set in neither the repo-local nor
+  the global config as a `MissingConfigKey` finding naming the key and its
+  suggested value. Still presence-only: an existing value is never judged.
+- **Required** keys are drift (exit `1`, and the `--quiet` nudge surfaces
+  them). **Recommended** keys are advisory: reported, but they never change
+  the exit code or reach the quiet nudge, since a default is already
+  assumed.
+- A recommended key with no safe default for the repo's backend (Jira status
+  names belong to the board) isn't reported at all: an unfixable advisory on
+  every run would just be noise. A required key with no default is still
+  reported, for the operator to set by hand.
+- `tm update` lists the keys it can fill and writes all their suggested
+  values after one batch confirmation (`--yes` skips the question), only
+  where no value exists. A declined key stays an advisory finding.
+- `--quiet` now parses the raw global config file as well as the repo one,
+  so a key set globally isn't misreported. It still does no merged config
+  load, so it stays cheap enough for every `cd`.
+- Registering a key does not by itself bump `CURRENT_SCHEMA_VERSION`; the
+  key's presence is checked directly. The keys shipped with this change
+  (`status_on_pr`, `status_on_run_start`, both recommended, GitHub defaults
+  `In Review` / `In Progress`) predate it and are tagged with schema 2.
