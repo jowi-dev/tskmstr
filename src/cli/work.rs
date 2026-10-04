@@ -785,6 +785,14 @@ pub fn session(
 /// the session *is* the ticket, so cleanup is one `kill-session` plus one
 /// worktree removal.
 ///
+/// The session goes through [`crate::work::session_gc::archive_and_kill`],
+/// the same path `tm merge` uses (GitHub issue #78): every window's
+/// scrollback is archived under `~/.local/state/tskmstr/work/archive` and
+/// recorded in `runs.db` first (readable later via `tm runs scrollback`),
+/// and the session is left running, with a `warning:`, when it hosts a live
+/// run, is the session `tm` is running in, or can't be archived. The
+/// worktree step runs either way.
+///
 /// # Which worktree, and the guard on it
 ///
 /// The worktree comes from the ticket's run rows, newest first — the rows
@@ -815,12 +823,23 @@ pub fn clean(
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
-    let session_name = naming::ticket_session_name(&identity.session_slug(), &ticket);
+    let slug = identity.session_slug();
+    let session_name = naming::ticket_session_name(&slug, &ticket);
 
-    if ctx.tmux.has_session(&session_name)? {
-        writeln!(out, "Killing tmux session: {session_name}")?;
-        ctx.tmux.kill_session(&session_name)?;
-    } else {
+    let archive_root =
+        crate::work::session_gc::archive_root(&ctx.home.join(".local/state/tskmstr/work"));
+    let gc = crate::work::session_gc::SessionGcDeps {
+        tmux: ctx.tmux,
+        store: Some(store),
+        archive_root: &archive_root,
+        pid_alive: &crate::runs::pid::pid_alive,
+        now_unix_secs: crate::work::review_watch::Clock::now_unix_secs(
+            &crate::work::review_watch::SystemClock,
+        ),
+    };
+    if crate::work::session_gc::archive_and_kill(&gc, &identity.scope(), &slug, &ticket, out)?
+        == crate::work::session_gc::SessionGcOutcome::NoSession
+    {
         writeln!(out, "No tmux session {session_name} to kill")?;
     }
 
@@ -2226,7 +2245,13 @@ mod tests {
         let config = clean_config(&tmp, &repo);
 
         let git = FakeGitOps::new();
-        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let tmux = FakeTmuxOps::new()
+            .with_has_session(Ok(true))
+            .with_list_windows(Ok(vec![crate::work::tmux::TmuxWindow {
+                session: "tm-proj-proj-1".to_string(),
+                name: "work".to_string(),
+                dead: false,
+            }]));
         let ctx = WorkContext {
             git: &git,
             tmux: &tmux,
@@ -2250,13 +2275,30 @@ mod tests {
 
         clean(&ctx, &store, compatible_test_identity(), "proj-1", &mut out).unwrap();
 
+        let gc_calls: Vec<TmuxCall> = tmux
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, TmuxCall::CapturePane { .. } | TmuxCall::KillSession(_)))
+            .collect();
         assert_eq!(
-            tmux.calls(),
+            gc_calls,
             vec![
-                TmuxCall::HasSession("tm-proj-proj-1".to_string()),
+                TmuxCall::CapturePane {
+                    name: "tm-proj-proj-1".to_string(),
+                    window: "work".to_string()
+                },
                 TmuxCall::KillSession("tm-proj-proj-1".to_string()),
             ],
-            "one kill-session, not one per action"
+            "archive each window, then one kill-session, not one per action"
+        );
+        let archives = store
+            .session_archives_for_ticket(Some(&compatible_test_identity().scope()), "PROJ-1")
+            .unwrap();
+        assert_eq!(archives.len(), 1);
+        assert!(
+            Path::new(&archives[0].path)
+                .starts_with(home.join(".local/state/tskmstr/work/archive")),
+            "{archives:?}"
         );
         assert_eq!(
             git.remove_worktree_calls(),
@@ -2313,6 +2355,49 @@ mod tests {
         );
         let printed = out_string(&out);
         assert!(printed.contains("No lane-run worktree"), "{printed}");
+    }
+
+    /// Same kill-safety guard as `tm merge`: a session hosting a live run is
+    /// left running, with a warning, instead of killed out from under it.
+    #[test]
+    fn clean_leaves_a_session_hosting_a_live_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let config = clean_config(&tmp, &repo);
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+        let store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: compatible_test_identity().scope(),
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: repo.to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        clean(&ctx, &store, compatible_test_identity(), "PROJ-1", &mut out).unwrap();
+
+        assert!(
+            !tmux
+                .calls()
+                .contains(&TmuxCall::KillSession("tm-proj-proj-1".to_string()))
+        );
+        let printed = out_string(&out);
+        assert!(printed.contains("warning:"), "{printed}");
     }
 
     #[test]
