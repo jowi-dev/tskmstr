@@ -942,8 +942,14 @@ impl ReadyListing {
 ///
 /// Rank order from the search is preserved in both [`ReadyListing::ready`]
 /// and [`ReadyListing::blocked`].
+///
+/// Candidates are run through [`TicketProvider::hydrate_blockers`] first,
+/// since a backend's search may omit dependencies (the github backend does,
+/// GitHub issue #70). A hydration failure is returned as an error rather
+/// than listing tickets whose blockers are unknown as ready.
 pub fn ready_tickets(jira: &dyn TicketProvider) -> Result<ReadyListing, TicketingError> {
-    let result = jira.search(&TicketQuery::ReadyCandidates)?;
+    let mut result = jira.search(&TicketQuery::ReadyCandidates)?;
+    jira.hydrate_blockers(&mut result.issues)?;
     let mut ready = Vec::new();
     let mut blocked = Vec::new();
     for issue in result.issues {

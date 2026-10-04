@@ -241,7 +241,8 @@ pub trait TicketProvider {
     /// Ensure every issue in `issues` (fresh from [`Self::search`]) carries
     /// its direct `Blocks` blockers in `issue_links`, so
     /// [`crate::blocker_stacking::readiness`] sees real dependency data.
-    /// Used by the board's readiness glyphs (GitHub issue #62).
+    /// Used by the board's readiness glyphs (GitHub issue #62) and by
+    /// [`crate::ticketing::ready_tickets`] (GitHub issue #70).
     ///
     /// The default is a no-op: Jira's search already requests `issuelinks`.
     /// A backend whose search omits dependencies for cost reasons (the
