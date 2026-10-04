@@ -191,7 +191,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -207,12 +207,13 @@ tm auth status
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
+| `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
 | `tm work list` | List every current tmux session with a worktree/session kind column |
 | `tm work restore` | Recreate tmux sessions for every existing worktree that doesn't already have one running |
 | `tm work session <KEY>` | Rebuild `<KEY>`'s `tm-<scope>-<key>` tmux session and its windows from the ticket's recorded runs — after a reboot, a `tmux kill-server`, or an accidental `kill-session`. Only runs still in flight come back; never attaches, and does nothing to a healthy session. See "Per-ticket tmux sessions" below |
-| `tm work clean <KEY>` | Finish with `<KEY>`: one `kill-session` on `tm-<scope>-<key>` plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
+| `tm work clean <KEY>` | Finish with `<KEY>`: archive each window's scrollback, then one `kill-session` on `tm-<scope>-<key>`, plus one worktree removal. Only a path under the configured worktree root is ever removed, so an audit run's `[work.audit].dir` is never touched |
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
@@ -925,7 +926,9 @@ the audit in a window named `audit`, the bugbot-cleanup session in
 `bugbot`, plus a plain `shell` window rooted where the session was created,
 for `claude --resume`, manual git work, and running tests. So `tmux attach
 -t tm-proj-proj-123` shows one ticket's whole history, live windows
-included.
+included. The session lasts until the ticket is finished. `tm merge` and
+`tm work clean` then archive each window's scrollback and kill it (see
+"Archived scrollback" below).
 
 The `<scope>` segment is the repo's backend identity slug — the lowercased
 `owner-name` repo slug under the GitHub backend, the lowercased project key
@@ -1012,6 +1015,44 @@ path sitting one level below the configured worktree root is ever removed —
 an `audit` run records `[work.audit].dir`, your own checkout, and that can
 never be handed to `git worktree remove`. A worktree that is already gone is
 reported, not an error.
+
+The session is archived before it is killed, and sometimes left running,
+exactly as after `tm merge`. See "Archived scrollback" below. You rarely
+need `tm work clean` after a `tm merge`, since the merge already does both
+halves.
+
+#### Archived scrollback
+
+Sessions don't pile up after their tickets finish: `tm merge` (after a
+successful merge, single or batch) and `tm work clean` kill the ticket's
+`tm-<scope>-<key>` session. Before killing it they capture every window's
+scrollback (`tmux capture-pane -p -S -`) to
+`~/.local/state/tskmstr/work/archive/<scope>/<KEY>/<YYYYMMDD-HHMMSS>-<window>.log`
+and record one row per window in `runs.db`. Read it back without tmux:
+
+```
+tm runs scrollback GH-78                 # list: captured-at, window, file
+tm runs scrollback GH-78 --window work   # print that window's newest archive
+```
+
+The session is **left running**, with a `warning:` line that gives the
+`tmux kill-session` command, when:
+
+- a run hosted in it is still `running` (pid alive or unrecorded) or
+  `hibernated`. This is the same test as kill-safety's `live-run` tier.
+- it is the session the command itself is running in.
+- any window fails to capture, or the archive can't be written or recorded.
+  Nothing is killed unarchived.
+
+None of these fail the merge or the clean. A ticket with no session is a
+quiet no-op.
+
+The archive is **best-effort history, not a transcript**. `capture-pane`
+only sees what is still inside tmux's `history-limit`. For an agent window,
+the agent's own transcript (found through the run's recorded session id,
+e.g. `tm runs resume`) is still the authoritative record. The archive
+matters most for windows that have nothing else, like `shell` and finished
+interactive runs, which keep no log file.
 
 ### Board-launched lane runs
 
@@ -1396,7 +1437,11 @@ these stages:
    branch (only once the local branch matches `origin/<branch>`).
    Skipped, with a warning naming the manual follow-up command, when `cwd`
    is inside the worktree being removed — you can't remove the worktree
-   you're standing in.
+   you're standing in. Then the ticket's `tm-<scope>-<key>` tmux session
+   has every window's scrollback archived and is killed. It is left running
+   instead, with a warning, if it hosts a live run, if it is the session
+   `tm merge` is running in, or if archiving fails (see "Archived
+   scrollback").
 7. **`status_on_merge`.** Same advisory transition the board's `M` key
    applies (see its config docs below).
 8. **Stale status-label sweep (GitHub backend).** If the ticket's issue is
@@ -1449,7 +1494,9 @@ or more keys, tm works in two phases:
    them in order. tm polls all of them together. The timeout is 15 minutes
    per set-aside ticket. Once polling ends, each ticket whose rebase
    resolved is pushed, merged, cleaned up, and transitioned. The rest are
-   handed back.
+   handed back. A handed-back ticket's session is never killed. When the
+   shared window lives in a merged ticket's session (the case outside tmux),
+   that session is also kept while any ticket is still handed back to it.
 
 The batch ends with a summary of what merged, what was handed back, and
 what failed. The exit code is `1` if any ticket failed, else `2` if any was
