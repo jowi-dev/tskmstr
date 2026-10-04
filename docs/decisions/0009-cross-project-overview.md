@@ -138,21 +138,21 @@ as the follow-up tickets listed under **Slices**.
 Each slice leaves `tm overview` usable on its own. Signals land before
 actions, and read-only actions land before ones that change state.
 
-1. **Data model + `repo_root` column.** A pure `OverviewRow` join over
+1. **Data model + `repo_root` column (#82).** A pure `OverviewRow` join over
    `runs.db` keyed by `(scope, ticket)`, with stage derivation and queue
    ordering as unit-tested pure functions. Adds the `runs.repo_root`
    migration and stamping.
-2. **`tm overview` render: attention queue + project strip.** Runs-only
+2. **`tm overview` render: attention queue + project strip (#83).** Runs-only
    signals (needs input, running, stuck from run status/heartbeat), `s`
    attach, and the toggle to and from `tm runs watch`. Useful before any
    network fetch exists.
-3. **Tracker + PR state fetch with refresh budget.** The background
+3. **Tracker + PR state fetch with refresh budget (#84).** The background
    per-repo batched poller from decision 3. Lights up Needs review, Ready
    to merge, Conflicted and Not started. Drift glyph once #80 lands.
-4. **Lifecycle-columns toggle.** Layout (1) over the same rows.
-5. **System resource header.** Decision 7.
-6. **Scope-aware read actions: `v`, `L`, `B`.**
-7. **Scope-aware write actions: `V`, `F`, `M`, `Space`.** Per-repo batch
+4. **Lifecycle-columns toggle (#85).** Layout (1) over the same rows.
+5. **System resource header (#86).** Decision 7.
+6. **Scope-aware read actions: `v`, `L`, `B` (#87).**
+7. **Scope-aware write actions: `V`, `F`, `M`, `Space` (#88).** Per-repo batch
    queues.
 
 ## Dependencies
