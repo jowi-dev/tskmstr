@@ -446,6 +446,11 @@ impl TicketProvider for FakeJiraClient {
         Ok(JiraClient::transition(self, key, transition_id)?)
     }
 
+    fn clear_closed_status_labels(&self, key: &str) -> Result<Vec<String>, ProviderError> {
+        self.take_clear_closed_status_labels(key)
+            .map_err(|(status, message)| ProviderError::Api { status, message })
+    }
+
     fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
         Ok(JiraClient::search(self, &render_jql(query))?)
     }
