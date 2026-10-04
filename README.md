@@ -722,6 +722,40 @@ Only `running` lane runs count, so a finished run frees its share at once.
 Gigabytes here are GiB, the same unit Activity Monitor labels "GB". A
 refused launch is not queued; launch it again once memory frees up.
 
+### Limiting concurrent cargo builds (`[work] build_slots`)
+
+Parallel lanes each run `cargo` from inside their agent, and cargo starts
+one compile job per core by default. A dozen lanes building at once can
+run the machine out of memory. Set `build_slots` to cap how many cargo
+builds run at the same moment across every lane on the machine:
+
+```toml
+[work]
+build_slots = 3   # 0 or unset: lanes run cargo directly, PATH untouched
+```
+
+With a positive N, `tm work run` writes a small `cargo` shim to
+`~/.local/share/tskmstr/build-slots/bin` and puts that directory first on
+the lane's `PATH`, for both interactive and headless runs. The shim runs
+`tm __cargo-wrap`, which:
+
+- **takes a slot** by locking one of N files under
+  `~/.local/share/tskmstr/build-slots/locks`. When all N are held it prints
+  one `tm: ... queued for a build slot...` line to stderr and waits. The
+  lock is released when the process exits, so a killed build never strands
+  its slot.
+- **splits the cores** by setting `CARGO_BUILD_JOBS` to cores / N, unless
+  it is already set.
+- **runs the real cargo**, the next `cargo` on `PATH`, with the original
+  arguments. Its stdout, stderr, and exit code pass through unchanged.
+
+Commands that compile nothing skip the slot, so a queued build never
+blocks them. That covers `fmt`, `metadata`, `tree`, `clean`, `add`,
+`update`, `--version`, and similar. A cargo started from inside a build
+that already holds a slot, such as a build script calling cargo, also
+skips it. The slot pool is shared by every lane on the machine, whichever
+repo it belongs to.
+
 ### Interactive-session hooks (`tm work hooks install --user`)
 
 `tm work run`'s lane worktrees get tm's telemetry hooks deployed fresh on
