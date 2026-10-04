@@ -59,6 +59,10 @@ struct BoardBadges<'a> {
     pending_bot_watch: &'a std::collections::HashSet<String>,
     /// Per-ticket bugbot-cleanup badge state, from [`App::cleanup_status`].
     cleanup_status: &'a HashMap<String, AuditStatusEntry>,
+    /// Ticket keys marked for a batch merge, from [`App::merge_queue`]
+    /// (GitHub issue #68); a queued card gets [`theme::MERGE_QUEUED_GLYPH`]
+    /// in its title.
+    merge_queue: &'a std::collections::BTreeSet<String>,
 }
 
 /// The `bots:` badge to render for `ticket_key`, if any: its loaded
@@ -242,7 +246,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  R retro  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -284,6 +288,7 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         bot_watch_status: &app.bot_watch_status,
         pending_bot_watch: &app.pending_bot_watch_launches,
         cleanup_status: &app.cleanup_status,
+        merge_queue: &app.merge_queue,
     };
 
     for (index, column) in app.columns.iter().enumerate() {
@@ -409,14 +414,23 @@ fn draw_card(
 
     // The readiness glyph rides in the title beside the key rather than on
     // a badge line of its own, so it costs no card height (GitHub issue #62).
-    let title = Line::from(vec![
+    // The merge-queue glyph follows it the same way (GitHub issue #68).
+    let mut title_spans = vec![
         Span::styled(ticket.key.clone(), key_style),
         Span::styled(" ", style),
         Span::styled(
             theme::readiness_glyph(&ticket.readiness),
             style.patch(theme::readiness_style(&ticket.readiness)),
         ),
-    ]);
+    ];
+    if badges.merge_queue.contains(&ticket.key) {
+        title_spans.push(Span::styled(" ", style));
+        title_spans.push(Span::styled(
+            theme::MERGE_QUEUED_GLYPH,
+            style.patch(theme::MERGE_QUEUED),
+        ));
+    }
+    let title = Line::from(title_spans);
     let block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
@@ -1901,6 +1915,23 @@ mod tests {
     }
 
     #[test]
+    fn draws_a_merge_queue_glyph_only_on_queued_cards() {
+        use crate::blocker_stacking::Readiness;
+        let ready = |key: &str| TicketSummary {
+            readiness: Readiness::Ready,
+            ..ticket(key)
+        };
+        let mut app = App {
+            columns: group_into_columns(vec![ready("PROJ-1"), ready("PROJ-2")], &[]),
+            ..App::new()
+        };
+        app.merge_queue.insert("PROJ-1".to_string());
+        let text = buffer_text(&render_with_size(&app, 80, 40));
+        assert!(text.contains("PROJ-1 ✓ +"), "{text}");
+        assert!(!text.contains("PROJ-2 ✓ +"), "{text}");
+    }
+
+    #[test]
     fn board_hint_lists_every_board_key() {
         let hint = hint_for(Screen::Board, false);
         for key in [
@@ -1923,6 +1954,8 @@ mod tests {
             "L logs",
             "V vdiff",
             "F fix",
+            "M merge",
+            "Space queue",
             "R retro",
             "?",
             "q",
