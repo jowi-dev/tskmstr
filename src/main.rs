@@ -1031,9 +1031,10 @@ fn launch_setup_session(
 
 /// `tm update [--yes]`: build real dependencies and run
 /// [`tskmstr::cli::update::run_update`], mapping its result to `tm check`'s
-/// three-way exit code (`0` up to date after the fixes, `1` drift remains,
-/// `2` error). Config loads leniently for the same reason as
-/// [`run_check_cmd`]'s full path: only the runner resolution needs it.
+/// three-way exit code (`0` up to date after the fixes — advisory findings
+/// aside — `1` drift remains, `2` error). Config loads leniently for the
+/// same reason as [`run_check_cmd`]'s full path: only the runner resolution
+/// needs it.
 fn run_update_cmd(yes: bool) -> ExitCode {
     let paths = default_config_paths();
     let home = std::env::var_os("HOME")
