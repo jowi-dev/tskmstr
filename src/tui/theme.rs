@@ -193,6 +193,14 @@ pub fn readiness_glyph(readiness: &Readiness) -> &'static str {
     }
 }
 
+/// The single-column glyph drawn after a board card's readiness glyph when
+/// the ticket is in the board's merge queue (`Space`, GitHub issue #68).
+pub const MERGE_QUEUED_GLYPH: &str = "+";
+
+/// The style for [`MERGE_QUEUED_GLYPH`]: bold magenta, distinct from every
+/// readiness color so a queued card never reads as a readiness change.
+pub const MERGE_QUEUED: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+
 /// The color for [`readiness_glyph`]: green ready, cyan stackable (workable,
 /// on top of another branch), red blocked, dim unknown -- never green, since
 /// an unknown ticket must not read as launchable.
