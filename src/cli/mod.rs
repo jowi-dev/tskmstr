@@ -232,7 +232,8 @@ pub enum Command {
     /// lane (plus the current repo): finished work still in To Do, merged
     /// PRs whose ticket isn't done, running lanes on a To Do ticket, and
     /// in-progress tickets with no live run or open PR (stalled). Read-only
-    /// unless `--fix` is given. See `docs/plans/gh-80-status-drift.md`.
+    /// unless `--fix` is given; pass ticket keys to fix only the findings
+    /// you agree with. See `docs/plans/gh-80-status-drift.md`.
     Drift {
         /// Apply each finding's suggested `status_on_*` transition. Stalled
         /// tickets are never moved.
@@ -242,6 +243,9 @@ pub enum Command {
         /// with no live run or open PR, before it counts as stalled.
         #[arg(long, default_value_t = drift::DEFAULT_STALL_HOURS)]
         stall_hours: i64,
+        /// Only list (and, with `--fix`, only move) these ticket keys
+        /// (case-insensitive); omit to cover every drifted ticket.
+        keys: Vec<String>,
     },
 }
 
@@ -1347,21 +1351,24 @@ mod tests {
             cli.command,
             Some(Command::Drift {
                 fix: false,
-                stall_hours: 24
-            })
+                stall_hours: 24,
+                ref keys,
+            }) if keys.is_empty()
         ));
     }
 
     #[test]
     fn parses_drift_fix_and_stall_hours() {
-        let cli = Cli::try_parse_from(["tm", "drift", "--fix", "--stall-hours", "6"])
-            .expect("should parse");
+        let cli =
+            Cli::try_parse_from(["tm", "drift", "GH-1", "gh-2", "--fix", "--stall-hours", "6"])
+                .expect("should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Drift {
                 fix: true,
-                stall_hours: 6
-            })
+                stall_hours: 6,
+                ref keys,
+            }) if keys == &["GH-1", "gh-2"]
         ));
     }
 

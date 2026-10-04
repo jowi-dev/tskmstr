@@ -49,11 +49,17 @@ pub struct DriftProject<'a> {
 
 /// `tm drift`'s flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DriftOptions {
+pub struct DriftOptions<'a> {
     /// Apply each finding's suggested transition.
     pub fix: bool,
     /// [`Drift::Stalled`] threshold in hours.
     pub stall_hours: i64,
+    /// Restrict listing (and `fix`) to these ticket keys, compared
+    /// case-insensitively; empty means every drifted ticket. Lets an
+    /// operator fix the findings they agree with and leave deliberate
+    /// exceptions (a merged PR that intentionally doesn't finish its
+    /// ticket) alone.
+    pub keys: &'a [String],
 }
 
 /// One drifted ticket, as found by [`collect`].
@@ -212,13 +218,13 @@ pub fn run(
     projects: &[DriftProject],
     gh: &dyn GhCli,
     store: &RunStore,
-    opts: DriftOptions,
+    opts: DriftOptions<'_>,
     out: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut total = 0;
     let mut checked = 0;
     for project in projects {
-        let drifted = match collect(project, gh, store, opts.stall_hours) {
+        let mut drifted = match collect(project, gh, store, opts.stall_hours) {
             Ok(drifted) => drifted,
             Err(err) => {
                 writeln!(out, "warning: {}: {err}", project.name)?;
@@ -226,6 +232,9 @@ pub fn run(
             }
         };
         checked += 1;
+        if !opts.keys.is_empty() {
+            drifted.retain(|t| opts.keys.iter().any(|k| k.eq_ignore_ascii_case(&t.key)));
+        }
         if drifted.is_empty() {
             continue;
         }
@@ -578,6 +587,7 @@ mod tests {
             DriftOptions {
                 fix: false,
                 stall_hours: 24,
+                keys: &[],
             },
             &mut out,
         )
@@ -592,6 +602,58 @@ mod tests {
              (run: done, pr: none) -> In Review\n\
              1 drifted ticket(s) across 1 project(s). Run `tm drift --fix` to apply the suggested transitions.\n"
         );
+    }
+
+    #[test]
+    fn run_restricts_listing_and_fix_to_given_keys() {
+        let config = config();
+        let jira = FakeJiraClient::new()
+            .with_search_result(search(vec![
+                issue("PROJ-1", "To Do", "new"),
+                issue("PROJ-2", "To Do", "new"),
+            ]))
+            .with_issue("PROJ-2", issue("PROJ-2", "To Do", "new"))
+            .with_transitions(
+                "PROJ-2",
+                vec![Transition {
+                    id: "21".to_string(),
+                    name: "Review".to_string(),
+                    to: Status {
+                        name: "In Review".to_string(),
+                        status_category: StatusCategory {
+                            key: "indeterminate".to_string(),
+                        },
+                    },
+                }],
+            );
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![]))
+            .with_pr_list_all(Ok(vec![]));
+        let (_dir, store) = store();
+        lane_run(&store, "PROJ-1", "me/proj-1", RunStatus::Done);
+        lane_run(&store, "PROJ-2", "me/proj-2", RunStatus::Done);
+        let mut out = Vec::new();
+
+        let total = run(
+            &[project(&config, &jira)],
+            &gh,
+            &store,
+            DriftOptions {
+                fix: true,
+                stall_hours: 24,
+                keys: &["proj-2".to_string()],
+            },
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-2".to_string(), "21".to_string())]
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("PROJ-1"), "{out}");
     }
 
     #[test]
@@ -627,6 +689,7 @@ mod tests {
             DriftOptions {
                 fix: true,
                 stall_hours: 24,
+                keys: &[],
             },
             &mut out,
         )
@@ -660,6 +723,7 @@ mod tests {
             DriftOptions {
                 fix: false,
                 stall_hours: 24,
+                keys: &[],
             },
             &mut out,
         )

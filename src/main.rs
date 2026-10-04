@@ -228,7 +228,11 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Merge { .. } => {
             unreachable!("tm merge is special-cased in main() before dispatch")
         }
-        Command::Drift { fix, stall_hours } => run_drift(fix, stall_hours, &keychain, env_token),
+        Command::Drift {
+            fix,
+            stall_hours,
+            keys,
+        } => run_drift(fix, stall_hours, &keys, &keychain, env_token),
     }
 }
 
@@ -247,6 +251,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 fn run_drift(
     fix: bool,
     stall_hours: i64,
+    keys: &[String],
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -301,7 +306,11 @@ fn run_drift(
         &projects,
         &gh,
         &run_store,
-        tskmstr::cli::drift::DriftOptions { fix, stall_hours },
+        tskmstr::cli::drift::DriftOptions {
+            fix,
+            stall_hours,
+            keys,
+        },
         &mut stdout,
     )?;
     Ok(())
