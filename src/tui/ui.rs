@@ -144,6 +144,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_merge_confirm(frame, app);
     }
 
+    if app.batch_merge_confirm.is_some() {
+        draw_batch_merge_confirm(frame, app);
+    }
+
     if app.lane_confirm.is_some() {
         draw_lane_confirm(frame, app);
     }
@@ -1673,6 +1677,39 @@ fn draw_merge_confirm(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+/// A centered floating window asking to confirm a batch merge
+/// ([`crate::tui::app::BatchMergeConfirm`], the board's `M` key with a
+/// non-empty merge queue -- GitHub issue #68), listing every queued key one
+/// per line in the order `tm merge` will receive them. No PR or target
+/// status line: `tm merge` resolves each PR itself, so neither is known
+/// here. Same paragraph shape as [`draw_merge_confirm`].
+fn draw_batch_merge_confirm(frame: &mut Frame, app: &App) {
+    let Some(confirm) = &app.batch_merge_confirm else {
+        return;
+    };
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from("Merge the queued tickets in one tm merge run?"),
+        Line::from(""),
+    ];
+    lines.extend(
+        confirm
+            .keys
+            .iter()
+            .map(|key| Line::from(format!("  {key}"))),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from("y/Enter merge all   n/Esc cancel"));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title("Merge queue")),
+    );
+    frame.render_widget(paragraph, area);
+}
+
 /// A centered floating window asking to confirm a lane launch on a blocked
 /// ticket ([`crate::tui::app::LaneConfirm`], the board's `w` key -- GitHub
 /// issue #62), naming every unmerged blocker so declining is an informed
@@ -2685,6 +2722,25 @@ mod tests {
         assert!(text.contains("[PROJ-1] Fix the thing"));
         assert!(text.contains("then move PROJ-1 to Done"));
         assert!(text.contains("y/Enter merge"));
+    }
+
+    #[test]
+    fn draws_batch_merge_confirm_overlay_listing_every_queued_key() {
+        let app = App {
+            batch_merge_confirm: Some(crate::tui::app::BatchMergeConfirm {
+                keys: vec!["PROJ-9".to_string(), "PROJ-10".to_string()],
+            }),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("Merge queue"), "{text}");
+        assert!(
+            text.contains("Merge the queued tickets in one tm merge run?"),
+            "{text}"
+        );
+        assert!(text.contains("PROJ-9"), "{text}");
+        assert!(text.contains("PROJ-10"), "{text}");
+        assert!(text.contains("y/Enter merge all"), "{text}");
     }
 
     #[test]
