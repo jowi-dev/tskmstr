@@ -266,6 +266,10 @@ mod tests {
             model_usage: None,
             log_path: log.map(str::to_string),
             findings_count: None,
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
+            agent: None,
+            repo: None,
         }
     }
 

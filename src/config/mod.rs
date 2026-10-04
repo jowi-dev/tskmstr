@@ -382,6 +382,16 @@ pub struct RawWorkConfig {
     /// action is disabled: [`ManualConfig::windows`] must be non-empty for
     /// `crate::work::manual::ensure_manual_session` to do anything.
     pub manual: Option<RawManualConfig>,
+    /// Memory budget, in gigabytes, that running lanes' estimated peak
+    /// footprints must fit within for a new lane to launch (GitHub issue
+    /// #66). Setting it turns on memory admission, including the kernel
+    /// memory-pressure gate; leaving it unset in both global and repo config
+    /// launches lanes exactly as before. Footprint tracking is always on.
+    pub memory_budget_gb: Option<f64>,
+    /// Estimated peak footprint, in gigabytes, of a lane with no recorded
+    /// history for its agent and repo. Defaults to 2 when unset. Only used
+    /// when [`RawWorkConfig::memory_budget_gb`] is set.
+    pub lane_memory_estimate_gb: Option<f64>,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -732,6 +742,67 @@ pub struct WorkConfig {
     /// windows, action disabled) when the `[work.manual]` section is absent
     /// from both global and repo config.
     pub manual: ManualConfig,
+    /// Validated memory-admission settings. See [`MemoryConfig`].
+    pub memory: MemoryConfig,
+}
+
+/// Validated memory-admission settings from [`RawWorkConfig::memory_budget_gb`]
+/// and [`RawWorkConfig::lane_memory_estimate_gb`], converted to bytes
+/// (gigabytes here are [`crate::runs::footprint::GIB`]s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryConfig {
+    /// The budget, or `None` when memory admission is off.
+    pub budget_bytes: Option<u64>,
+    /// The estimate for a lane with no history.
+    pub default_lane_estimate_bytes: u64,
+}
+
+impl Default for MemoryConfig {
+    /// Admission off, with the 2 GB default lane estimate.
+    fn default() -> Self {
+        MemoryConfig {
+            budget_bytes: None,
+            default_lane_estimate_bytes: DEFAULT_LANE_ESTIMATE_GB * crate::runs::footprint::GIB,
+        }
+    }
+}
+
+/// Default for [`RawWorkConfig::lane_memory_estimate_gb`]: an opencode lane
+/// measured 0.8-1 GB on its own, with about 1 GB more for the language
+/// server it starts, before any build.
+const DEFAULT_LANE_ESTIMATE_GB: u64 = 2;
+
+/// Converts a configured gigabyte value to bytes, rejecting anything that
+/// isn't a positive, finite number.
+fn gigabytes_to_bytes(field: &'static str, gb: f64) -> Result<u64, ConfigError> {
+    if !gb.is_finite() || gb <= 0.0 {
+        return Err(ConfigError::InvalidMemorySize {
+            field,
+            value: gb.to_string(),
+        });
+    }
+    Ok((gb * crate::runs::footprint::GIB as f64) as u64)
+}
+
+/// Merges the memory keys repo-over-global, like every other scalar
+/// `[work]` key, then validates and converts them.
+fn merge_memory(global: &RawWorkConfig, repo: &RawWorkConfig) -> Result<MemoryConfig, ConfigError> {
+    let budget_bytes = repo
+        .memory_budget_gb
+        .or(global.memory_budget_gb)
+        .map(|gb| gigabytes_to_bytes("memory_budget_gb", gb))
+        .transpose()?;
+    let default_lane_estimate_bytes = match repo
+        .lane_memory_estimate_gb
+        .or(global.lane_memory_estimate_gb)
+    {
+        Some(gb) => gigabytes_to_bytes("lane_memory_estimate_gb", gb)?,
+        None => MemoryConfig::default().default_lane_estimate_bytes,
+    };
+    Ok(MemoryConfig {
+        budget_bytes,
+        default_lane_estimate_bytes,
+    })
 }
 
 /// Fully validated `[work.audit]` subsection.
@@ -989,6 +1060,16 @@ pub enum ConfigError {
     )]
     InvalidOnBotsDone {
         /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[work] memory_budget_gb` or `lane_memory_estimate_gb` was not a
+    /// positive number.
+    #[error("invalid [work] {field} `{value}`; expected a positive number of gigabytes")]
+    InvalidMemorySize {
+        /// The offending key.
+        field: &'static str,
+        /// The value as parsed.
         value: String,
     },
 
@@ -1555,6 +1636,7 @@ fn merge_work(
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
 
+    let memory = merge_memory(&global, &repo)?;
     let worktree_root = repo.worktree_root.or(global.worktree_root);
     let default_model = repo.default_model.or(global.default_model);
     let default_max_turns = repo.default_max_turns.or(global.default_max_turns);
@@ -1635,6 +1717,7 @@ fn merge_work(
         merge,
         review_watch,
         manual,
+        memory,
     })
 }
 
@@ -3994,6 +4077,8 @@ mod tests {
             merge: None,
             review_watch: None,
             manual: None,
+            memory_budget_gb: None,
+            lane_memory_estimate_gb: None,
         };
         let repo = RawWorkConfig {
             worktree_root: Some("/repo/worktrees".to_string()),
@@ -4008,6 +4093,8 @@ mod tests {
             merge: None,
             review_watch: None,
             manual: None,
+            memory_budget_gb: None,
+            lane_memory_estimate_gb: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
@@ -5085,6 +5172,81 @@ mod tests {
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.work.worktree_root, Some("/repo/worktrees".to_string()));
         assert_eq!(cfg.work.lanes.get("solo").unwrap().repo, "/repo-local/solo");
+    }
+
+    // --- memory budget (GitHub issue #66) ---
+
+    fn load_global_work(work_toml: &str) -> Result<Config, ConfigError> {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            format!(
+                r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work]
+            {work_toml}
+            "#
+            ),
+        )
+        .unwrap();
+        load(&ConfigPaths {
+            global: global_path,
+            repo: None,
+        })
+    }
+
+    #[test]
+    fn memory_admission_is_off_by_default_with_a_two_gigabyte_lane_estimate() {
+        let cfg = load_global_work("").expect("should load");
+        assert_eq!(cfg.work.memory.budget_bytes, None);
+        assert_eq!(
+            cfg.work.memory.default_lane_estimate_bytes,
+            2 * crate::runs::footprint::GIB
+        );
+    }
+
+    #[test]
+    fn memory_budget_and_lane_estimate_are_read_in_gigabytes() {
+        let cfg = load_global_work("memory_budget_gb = 20\nlane_memory_estimate_gb = 1.5")
+            .expect("should load");
+        assert_eq!(
+            cfg.work.memory.budget_bytes,
+            Some(20 * crate::runs::footprint::GIB)
+        );
+        assert_eq!(
+            cfg.work.memory.default_lane_estimate_bytes,
+            3 * crate::runs::footprint::GIB / 2
+        );
+    }
+
+    #[test]
+    fn a_non_positive_memory_budget_is_a_config_error() {
+        let err = load_global_work("memory_budget_gb = 0").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidMemorySize {
+                    field: "memory_budget_gb",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let err = load_global_work("lane_memory_estimate_gb = -1").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidMemorySize {
+                    field: "lane_memory_estimate_gb",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     // --- relative lane `repo` / `[work.audit].dir` paths (GitHub issue #5

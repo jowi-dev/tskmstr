@@ -849,6 +849,13 @@ fn resolve_worktree_root(config: &WorkConfig, home: &Path) -> PathBuf {
 
 /// The final path component of `repo_root`, used as the worktree root's
 /// per-repo subdirectory, mirroring `work.ml`'s `repo_name`.
+/// The repo name a lane's worktrees are grouped under, and the `repo` half
+/// of its memory-estimate key (GitHub issue #66): the lane repo's directory
+/// name, falling back to the lane name.
+pub fn lane_repo_key(lane: &str, lane_config: &crate::config::LaneConfig) -> String {
+    repo_name(Path::new(&lane_config.repo)).unwrap_or_else(|| lane.to_string())
+}
+
 fn repo_name(repo_root: &Path) -> Option<String> {
     repo_root
         .file_name()
@@ -1013,7 +1020,7 @@ pub fn prepare_run_lane(
     }
 
     let worktree_root = resolve_worktree_root(config, &paths.home);
-    let repo = repo_name(&repo_root).unwrap_or_else(|| lane.to_string());
+    let repo = lane_repo_key(lane, lane_config);
     let wt_path = naming::worktree_path(&worktree_root.to_string_lossy(), &repo, &wt_name);
 
     // Belt-and-suspenders: re-check the *computed* path independently of
@@ -1207,6 +1214,11 @@ pub fn prepare_run_lane(
         kind: "lane".to_string(),
         log_path: None,
     })?;
+    // The key memory-budget admission estimates the next lane's cost from
+    // (GitHub issue #66). A fallback attempt that switches agents mid-run
+    // keeps the primary's key; its peak still lands on this row.
+    deps.run_store
+        .update_agent_repo(run_id, primary_runner.name(), &repo)?;
 
     // Step 9b (GitHub issue #49): now that the run row exists — the moment tm
     // knows work is beginning — advisorily move the ticket to the configured
@@ -1912,6 +1924,7 @@ mod tests {
             merge: crate::config::MergeConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             manual: crate::config::ManualConfig::default(),
+            memory: crate::config::MemoryConfig::default(),
         }
     }
 
@@ -4602,6 +4615,62 @@ mod tests {
 
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.pid, Some(4242));
+    }
+
+    /// GitHub issue #66: a lane row carries the (agent, repo) key that
+    /// memory-budget admission estimates the next lane's cost from.
+    #[test]
+    fn prepare_run_lane_stamps_the_agent_and_repo_on_the_run_row() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.agent.as_deref(), Some(ClaudeRunner.name()));
+        assert_eq!(run.repo, repo_name(&repo_root));
+        assert!(run.repo.is_some());
     }
 
     #[test]

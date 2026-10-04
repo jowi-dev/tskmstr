@@ -193,9 +193,16 @@ pub fn finish(
 /// If `detail` is given, it is validated as JSON before the store is
 /// touched at all, so an invalid `--detail` never results in a partially
 /// recorded event. Prints `Recorded {kind} for run {run_id}` on success.
+///
+/// A running run with a recorded pid also gets a footprint sample (GitHub
+/// issue #66) via `footprint` (production:
+/// [`crate::runs::footprint::tree_footprint`]). Hooks call this on every
+/// tool use, so it is the most frequent sampling point a lane has; the
+/// sample is best-effort and never fails the event.
 pub fn event(
     store: &RunStore,
     run_id: i64,
+    footprint: &dyn Fn(u32) -> Option<u64>,
     kind: &str,
     detail: Option<&str>,
     out: &mut dyn Write,
@@ -205,6 +212,12 @@ pub fn event(
     }
 
     store.add_event(run_id, kind, detail)?;
+    if let Ok(Some(run)) = store.run_by_id(run_id)
+        && run.status == RunStatus::Running
+        && let Some(bytes) = run.pid.and_then(footprint)
+    {
+        let _ = store.record_footprint(run_id, bytes);
+    }
     writeln!(out, "Recorded {kind} for run {run_id}")?;
     Ok(())
 }
@@ -213,7 +226,18 @@ pub fn event(
 /// restricted to `kind` when given (see [`RunStore::list_runs_filtered`]).
 ///
 /// Prints `No runs recorded.` instead of an empty table when there are none.
-pub fn list(store: &RunStore, kind: Option<&str>, out: &mut dyn Write) -> Result<(), RunsCliError> {
+///
+/// Samples every live run's footprint first (see
+/// [`RunStore::sample_footprints`]; production passes
+/// [`crate::runs::footprint::tree_footprint`]), so the `MEM` column shows a
+/// live run's current footprint and a finished run's peak.
+pub fn list(
+    store: &RunStore,
+    kind: Option<&str>,
+    footprint: &dyn Fn(u32) -> Option<u64>,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    store.sample_footprints(footprint)?;
     // Deliberately unscoped: a bare `tm runs` is the machine-wide dashboard
     // (and must work with no config at all), unlike the ticket-keyed
     // lookups below, which scope to the invoking repo when one resolves.
@@ -224,7 +248,7 @@ pub fn list(store: &RunStore, kind: Option<&str>, out: &mut dyn Write) -> Result
         return Ok(());
     }
 
-    let rows: Vec<[String; 6]> = runs
+    let rows: Vec<[String; 7]> = runs
         .iter()
         .map(|run| {
             [
@@ -233,12 +257,21 @@ pub fn list(store: &RunStore, kind: Option<&str>, out: &mut dyn Write) -> Result
                 run.kind.clone(),
                 run.status.as_str().to_string(),
                 format_age(run.age_secs),
+                mem_column(run.status, run.mem_current_bytes, run.mem_peak_bytes),
                 last_event_column(run),
             ]
         })
         .collect();
 
-    let headers = ["TICKET", "LANE", "KIND", "STATUS", "AGE", "LAST EVENT"];
+    let headers = [
+        "TICKET",
+        "LANE",
+        "KIND",
+        "STATUS",
+        "AGE",
+        "MEM",
+        "LAST EVENT",
+    ];
     let mut widths = headers.map(str::len);
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
@@ -399,7 +432,7 @@ fn format_outcome_row(row: &[String; 4], widths: &[usize; 4]) -> String {
 
 /// Format `row` as space-padded columns per `widths`, except the last
 /// column, which is left unpadded (no trailing whitespace on each line).
-fn format_row(row: &[String; 6], widths: &[usize; 6]) -> String {
+fn format_row(row: &[String; 7], widths: &[usize; 7]) -> String {
     let mut parts = Vec::with_capacity(row.len());
     for (i, cell) in row.iter().enumerate() {
         if i + 1 == row.len() {
@@ -424,6 +457,19 @@ fn format_findings_count(findings_count: Option<i64>) -> String {
 
 /// Render a [`RunSummary`]'s last-event column: `{kind} {age} ago`, or `-`
 /// when the run has no recorded events.
+/// The `MEM` cell for a run: its current footprint while it runs, its peak
+/// once it has finished, `-` when nothing was ever sampled.
+fn mem_column(status: RunStatus, current: Option<u64>, peak: Option<u64>) -> String {
+    let bytes = if status == RunStatus::Running {
+        current
+    } else {
+        peak
+    };
+    bytes
+        .map(crate::runs::footprint::format_bytes)
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn last_event_column(run: &RunSummary) -> String {
     match (&run.last_event_kind, run.last_event_age_secs) {
         (Some(kind), Some(age_secs)) => format!("{kind} {} ago", format_age(age_secs)),
@@ -1381,8 +1427,15 @@ mod tests {
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        event(&store, id, "tool_use", Some(r#"{"file":"a.rs"}"#), &mut out)
-            .expect("should succeed");
+        event(
+            &store,
+            id,
+            &no_footprint,
+            "tool_use",
+            Some(r#"{"file":"a.rs"}"#),
+            &mut out,
+        )
+        .expect("should succeed");
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -1390,7 +1443,7 @@ mod tests {
         );
 
         let mut list_out = Vec::new();
-        list(&store, None, &mut list_out).unwrap();
+        list(&store, None, &no_footprint, &mut list_out).unwrap();
         let list_output = String::from_utf8(list_out).unwrap();
         assert!(
             list_output.contains("tool_use"),
@@ -1405,7 +1458,7 @@ mod tests {
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        event(&store, id, "stop", None, &mut out).expect("should succeed");
+        event(&store, id, &no_footprint, "stop", None, &mut out).expect("should succeed");
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -1420,14 +1473,21 @@ mod tests {
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        let err =
-            event(&store, id, "tool_use", Some("not json"), &mut out).expect_err("should fail");
+        let err = event(
+            &store,
+            id,
+            &no_footprint,
+            "tool_use",
+            Some("not json"),
+            &mut out,
+        )
+        .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::InvalidDetailJson(_)));
         assert!(out.is_empty());
 
         let mut list_out = Vec::new();
-        list(&store, None, &mut list_out).unwrap();
+        list(&store, None, &no_footprint, &mut list_out).unwrap();
         let list_output = String::from_utf8(list_out).unwrap();
         assert!(
             !list_output.contains("tool_use"),
@@ -1447,14 +1507,21 @@ mod tests {
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        let err =
-            event(&store, id, "agent_usage", Some("not json"), &mut out).expect_err("should fail");
+        let err = event(
+            &store,
+            id,
+            &no_footprint,
+            "agent_usage",
+            Some("not json"),
+            &mut out,
+        )
+        .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::InvalidDetailJson(_)));
         assert!(out.is_empty());
 
         let mut list_out = Vec::new();
-        list(&store, None, &mut list_out).unwrap();
+        list(&store, None, &no_footprint, &mut list_out).unwrap();
         let list_output = String::from_utf8(list_out).unwrap();
         assert!(
             !list_output.contains("agent_usage"),
@@ -1468,7 +1535,8 @@ mod tests {
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err = event(&store, 999, "tool_use", None, &mut out).expect_err("should fail");
+        let err =
+            event(&store, 999, &no_footprint, "tool_use", None, &mut out).expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -1477,13 +1545,85 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    fn no_footprint(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    #[test]
+    fn event_samples_the_runs_footprint() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store
+            .start_run(&StartRun {
+                pid: Some(7),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        event(&store, id, &|_| Some(4096), "tool_use", None, &mut out).unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.mem_peak_bytes, Some(4096));
+    }
+
+    #[test]
+    fn list_samples_live_runs_and_shows_their_current_footprint() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&StartRun {
+                pid: Some(7),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let mut out = Vec::new();
+
+        list(
+            &store,
+            None,
+            &|_| Some(3 * 1024 * 1024 * 1024 / 2),
+            &mut out,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.lines().next().unwrap().contains("MEM"), "{output}");
+        assert!(output.contains("1.5 GB"), "{output}");
+    }
+
+    #[test]
+    fn list_shows_the_peak_footprint_of_a_finished_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.record_footprint(id, 2 * 1024 * 1024 * 1024).unwrap();
+        store.record_footprint(id, 100 * 1024 * 1024).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+
+        list(&store, None, &no_footprint, &mut out).unwrap();
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("2.0 GB"), "{output}");
+        assert!(!output.contains("100 MB"), "{output}");
+    }
+
     #[test]
     fn list_with_no_runs_prints_no_runs_recorded() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        list(&store, None, &mut out).expect("should succeed");
+        list(&store, None, &no_footprint, &mut out).expect("should succeed");
 
         assert_eq!(String::from_utf8(out).unwrap(), "No runs recorded.\n");
     }
@@ -1753,16 +1893,16 @@ mod tests {
         store.start_run(&start_params("PROJ-1")).unwrap();
         let mut out = Vec::new();
 
-        list(&store, None, &mut out).expect("should succeed");
+        list(&store, None, &no_footprint, &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         let mut lines = output.lines();
         assert_eq!(
             lines.next(),
-            Some("TICKET  LANE     KIND  STATUS   AGE  LAST EVENT")
+            Some("TICKET  LANE     KIND  STATUS   AGE  MEM  LAST EVENT")
         );
         let row = lines.next().expect("should have a data row");
-        assert_eq!(row, "PROJ-1  backend  lane  running  0s   -");
+        assert_eq!(row, "PROJ-1  backend  lane  running  0s   -    -");
         assert!(lines.next().is_none());
     }
 
@@ -1779,7 +1919,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
 
-        list(&store, Some("audit"), &mut out).expect("should succeed");
+        list(&store, Some("audit"), &no_footprint, &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("PROJ-2"));
@@ -1800,6 +1940,8 @@ mod tests {
             last_event_age_secs: Some(45),
             awaiting_input: false,
             scope: String::new(),
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         };
 
         assert_eq!(last_event_column(&run), "tool_use 45s ago");
@@ -1819,6 +1961,8 @@ mod tests {
             last_event_age_secs: None,
             awaiting_input: false,
             scope: String::new(),
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         };
 
         assert_eq!(last_event_column(&run), "-");
@@ -1956,12 +2100,13 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool_use",
             Some(r#"{"file":"a.rs"}"#),
             &mut Vec::new(),
         )
         .unwrap();
-        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "proj-1", None, false, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2055,6 +2200,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Bash","summary":"cargo test"}"#),
             &mut Vec::new(),
@@ -2077,6 +2223,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool_use",
             Some(r#"{"file":"a.rs"}"#),
             &mut Vec::new(),
@@ -2098,6 +2245,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Bash"}"#),
             &mut Vec::new(),
@@ -2106,6 +2254,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Bash"}"#),
             &mut Vec::new(),
@@ -2114,6 +2263,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Edit"}"#),
             &mut Vec::new(),
@@ -2122,6 +2272,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "checklist",
             Some(r#"{"items":[{"text":"write tests","done":true}]}"#),
             &mut Vec::new(),
@@ -2146,7 +2297,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
-        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "PROJ-1", None, false, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2160,8 +2311,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
-        event(&store, id, "first", None, &mut Vec::new()).unwrap();
-        event(&store, id, "second", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "first", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "second", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "PROJ-1", None, false, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2183,6 +2334,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "checklist",
             Some(r#"{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}"#),
             &mut Vec::new(),
@@ -2209,7 +2361,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
-        event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "tool_use", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "PROJ-1", None, false, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2226,6 +2378,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "usage",
             Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
             &mut Vec::new(),
@@ -2264,6 +2417,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "usage",
             Some(r#"{"models":{"claude-fable-5":{"outputTokens":58564}}}"#),
             &mut Vec::new(),
@@ -2327,6 +2481,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "agent_usage",
             Some(AGENT_USAGE_FIXTURE),
             &mut Vec::new(),
@@ -2354,7 +2509,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let id = store.start_run(&start_params("PROJ-1")).unwrap();
-        event(&store, id, "tool_use", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "tool_use", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "PROJ-1", None, false, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2530,12 +2685,13 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Bash"}"#),
             &mut Vec::new(),
         )
         .unwrap();
-        event(&store, id, "stop", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "stop", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "proj-1", None, true, &ClaudeRunner, &mut out).expect("should succeed");
@@ -2623,6 +2779,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "checklist",
             Some(r#"{"items":[{"text":"write tests","done":true},{"text":"implement","done":false}]}"#),
             &mut Vec::new(),
@@ -2653,6 +2810,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "usage",
             Some(r#"{"models":{"claude-fable-5":{"outputTokens":1}}}"#),
             &mut Vec::new(),
@@ -2697,6 +2855,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "usage",
             Some(r#"{"models":{"claude-fable-5":{"outputTokens":58564}}}"#),
             &mut Vec::new(),
@@ -2815,6 +2974,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "agent_usage",
             Some(AGENT_USAGE_FIXTURE),
             &mut Vec::new(),
@@ -2856,6 +3016,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "agent_usage",
             Some(AGENT_USAGE_FIXTURE),
             &mut Vec::new(),
@@ -2864,6 +3025,7 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "agent_usage",
             Some(AGENT_USAGE_FIXTURE),
             &mut Vec::new(),
@@ -2908,12 +3070,13 @@ mod tests {
         event(
             &store,
             id,
+            &no_footprint,
             "tool",
             Some(r#"{"tool":"Bash","summary":"cargo test"}"#),
             &mut Vec::new(),
         )
         .unwrap();
-        event(&store, id, "second", None, &mut Vec::new()).unwrap();
+        event(&store, id, &no_footprint, "second", None, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         show(&store, None, "PROJ-1", None, true, &ClaudeRunner, &mut out).expect("should succeed");

@@ -248,6 +248,10 @@ rule: `failed` once its last heartbeat is older than `--stale-after`
 minutes (default 10). An alive recorded pid always protects a run, however
 stale.
 
+`tm runs` also has a `MEM` column: a live run's current memory footprint, or
+a finished run's peak. See "Memory footprint and the lane memory budget"
+below for how it is measured.
+
 ### The `checklist` event convention
 
 A `checklist` event reports a run's current todo list (Claude's own
@@ -674,6 +678,49 @@ completion it records the PR URL, if any, on the run's `pr_url` field:
 first by asking `gh` directly for the branch's open PR, falling back to
 scraping the first GitHub pull-request URL out of the run's result text —
 no PR is a normal outcome, not an error.
+
+### Memory footprint and the lane memory budget
+
+tm records the memory footprint of every run that has a recorded pid
+(GitHub issue #66). **Footprint** is the macOS measure Activity Monitor and
+`footprint -p` show: unlike resident set size, it counts compressed and
+swapped-out pages, so it stays accurate on a machine that is already under
+pressure. tm measures the run's whole process tree, because most of a
+lane's memory goes to the `cargo`, `rustc`, language-server, and test
+processes the agent starts, not to the agent itself.
+
+There is no sampling daemon. A sample is taken whenever something already
+looks at the run: bare `tm runs`, every `tm runs event` a hook sends, the
+board's status poll, and `tm runs watch`'s reap. Each run keeps its latest
+sample and its peak. `tm runs` shows them in its `MEM` column, and the run
+detail overlay shows a `mem` line. Tracking is always on, and macOS-only for
+now; on other platforms the column stays `-`.
+
+Memory admission is off until you set a budget:
+
+```toml
+[work]
+memory_budget_gb = 20          # turns admission on
+# lane_memory_estimate_gb = 2  # estimate for a lane with no history; default 2
+```
+
+With a budget set, `tm work run` (and so the board's `w` key, which runs
+it) checks two things before provisioning anything:
+
+- **Memory pressure.** If the kernel reports warn or critical pressure, the
+  launch is refused, whatever the budget says.
+- **The budget.** The new lane is estimated at the largest peak among the
+  last five finished lanes for the same agent and repo, or at
+  `lane_memory_estimate_gb` when there are none. Each running lane counts at
+  the larger of its own peak so far and that same estimate, so a lane that
+  is quiet now but will build later still holds its share. If the running
+  total plus the new estimate exceeds the budget, the launch is refused with
+  the numbers, for example `not launching: memory budget exceeded:
+  lemma/opencode lanes peak ~2.5 GB; 8 running (~20.0 GB); budget 20.0 GB`.
+
+Only `running` lane runs count, so a finished run frees its share at once.
+Gigabytes here are GiB, the same unit Activity Monitor labels "GB". A
+refused launch is not queued; launch it again once memory frees up.
 
 ### Interactive-session hooks (`tm work hooks install --user`)
 

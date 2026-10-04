@@ -1036,7 +1036,7 @@ fn timing_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
     lines
 }
 
-/// The header grid's cost/process column: cost, pid, session -- all
+/// The header grid's cost/process column: cost, memory, pid, session -- all
 /// optional, omitted when absent.
 fn cost_process_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1046,6 +1046,9 @@ fn cost_process_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>>
             format!("${cost:.2}"),
             Style::default(),
         ));
+    }
+    if let Some(mem) = memory_value(detail) {
+        lines.push(label_value_line("mem", mem, Style::default()));
     }
     if let Some(pid) = detail.pid {
         lines.push(label_value_line("pid", pid.to_string(), Style::default()));
@@ -1058,6 +1061,22 @@ fn cost_process_lines(detail: &crate::tui::app::RunDetail) -> Vec<Line<'static>>
         ));
     }
     lines
+}
+
+/// The run detail's `mem` value (GitHub issue #66): a live run's current
+/// footprint with its peak so far, or a finished run's peak. `None` when
+/// nothing was sampled.
+fn memory_value(detail: &crate::tui::app::RunDetail) -> Option<String> {
+    use crate::runs::footprint::format_bytes;
+    let peak = detail.mem_peak_bytes?;
+    match detail.mem_current_bytes {
+        Some(current) if detail.status == crate::runs::RunStatus::Running => Some(format!(
+            "{} (peak {})",
+            format_bytes(current),
+            format_bytes(peak)
+        )),
+        _ => Some(format!("peak {}", format_bytes(peak))),
+    }
 }
 
 /// The header grid's full-width lines below the three columns: worktree
@@ -3268,6 +3287,8 @@ mod tests {
             tool_counts: vec![],
             model_usage: None,
             agent_usage: vec![],
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         };
         let app = App {
             show_run_detail: true,
@@ -3309,6 +3330,8 @@ mod tests {
             tool_counts: vec![],
             model_usage: None,
             agent_usage: vec![],
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         }
     }
 
@@ -3578,7 +3601,43 @@ mod tests {
             tool_counts: vec![],
             model_usage: None,
             agent_usage: vec![],
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
         }
+    }
+
+    #[test]
+    fn run_detail_overlay_shows_a_live_runs_current_and_peak_memory() {
+        let detail = crate::tui::app::RunDetail {
+            mem_current_bytes: Some(1536 * 1024 * 1024),
+            mem_peak_bytes: Some(2048 * 1024 * 1024),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Running)])
+        };
+        let text = buffer_text(&render_with_size(&app, 120, 40));
+        assert!(text.contains("1.5 GB (peak 2.0 GB)"), "{text}");
+    }
+
+    #[test]
+    fn run_detail_overlay_shows_a_finished_runs_peak_memory() {
+        let detail = crate::tui::app::RunDetail {
+            status: RunStatus::Done,
+            mem_current_bytes: Some(100 * 1024 * 1024),
+            mem_peak_bytes: Some(2048 * 1024 * 1024),
+            ..run_detail_fixture()
+        };
+        let app = App {
+            show_run_detail: true,
+            run_detail: Some(detail),
+            ..runs_app(vec![run_card(1, "PROJ-1", "backend", RunStatus::Done)])
+        };
+        let text = buffer_text(&render_with_size(&app, 120, 40));
+        assert!(text.contains("peak 2.0 GB"), "{text}");
+        assert!(!text.contains("100 MB"), "{text}");
     }
 
     #[test]

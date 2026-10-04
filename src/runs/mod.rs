@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+pub mod footprint;
 pub mod pid;
 pub mod pricing;
 pub mod session;
@@ -153,7 +154,25 @@ const MIGRATIONS: &[&str] = &[
       exhausted_until  INTEGER NOT NULL
     );
     "#,
+    // GitHub issue #66: memory footprint of a run's whole process tree, in
+    // bytes. `mem_current_bytes` is the latest sample, `mem_peak_bytes` the
+    // largest seen; both NULL until a sample lands. `agent` and `repo` key
+    // the per-lane cost estimate that memory-budget admission uses
+    // (`AgentRunner::name()` and the lane repo's directory name). All four
+    // are NULL for rows predating the columns.
+    r#"
+    ALTER TABLE runs ADD COLUMN mem_current_bytes INTEGER;
+    ALTER TABLE runs ADD COLUMN mem_peak_bytes INTEGER;
+    ALTER TABLE runs ADD COLUMN agent TEXT;
+    ALTER TABLE runs ADD COLUMN repo TEXT;
+    "#,
 ];
+
+/// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
+/// back over. Small enough that the estimate follows a repo whose builds got
+/// heavier, large enough that one unusually light run doesn't hide the
+/// usual peak.
+pub const LANE_ESTIMATE_WINDOW: i64 = 5;
 
 /// A handle to the run-state SQLite database.
 ///
@@ -470,6 +489,24 @@ pub struct RunSummary {
     /// [`StartRun::scope`]); `""` for legacy rows recorded before scoping
     /// existed.
     pub scope: String,
+    /// Latest footprint sample, in bytes; see [`Run::mem_current_bytes`].
+    pub mem_current_bytes: Option<u64>,
+    /// Largest footprint sample, in bytes; see [`Run::mem_peak_bytes`].
+    pub mem_peak_bytes: Option<u64>,
+}
+
+/// A running lane as seen by memory-budget admission (GitHub issue #66); see
+/// [`RunStore::running_lanes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningLane {
+    /// Row id.
+    pub id: i64,
+    /// See [`Run::agent`].
+    pub agent: Option<String>,
+    /// See [`Run::repo`].
+    pub repo: Option<String>,
+    /// See [`Run::mem_peak_bytes`].
+    pub mem_peak_bytes: Option<u64>,
 }
 
 /// A run's bot-findings outcome bucket, as measured by `findings_count`; see
@@ -588,6 +625,17 @@ pub struct Run {
     /// that no longer exists is treated as proof of death by
     /// [`RunStore::reap`].
     pub tmux_session: Option<String>,
+    /// Latest footprint sample of the run's process tree, in bytes; see
+    /// [`RunStore::record_footprint`]. `None` until a sample lands.
+    pub mem_current_bytes: Option<u64>,
+    /// Largest footprint sample seen for the run's process tree, in bytes.
+    pub mem_peak_bytes: Option<u64>,
+    /// [`crate::agent::AgentRunner::name`] of the agent driving the run, if
+    /// recorded; see [`RunStore::update_agent_repo`].
+    pub agent: Option<String>,
+    /// Directory name of the lane's repo, if recorded; see
+    /// [`RunStore::update_agent_repo`].
+    pub repo: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1755,6 +1803,144 @@ impl RunStore {
         Ok(event_id)
     }
 
+    /// Records one footprint sample (in bytes) for `run_id`: it becomes the
+    /// run's `mem_current_bytes`, and its `mem_peak_bytes` if larger than any
+    /// earlier sample (GitHub issue #66).
+    ///
+    /// Does not bump `heartbeat_at`, for the same reason [`RunStore::reap`]
+    /// doesn't: a sample is taken by an outside observer (a poll), not
+    /// reported by the run itself, so it says nothing about the run being
+    /// active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn record_footprint(&self, run_id: i64, bytes: u64) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs
+                SET mem_current_bytes = ?1,
+                    mem_peak_bytes = MAX(COALESCE(mem_peak_bytes, 0), ?1)
+              WHERE id = ?2",
+            params![bytes, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
+    /// Samples the footprint of every `running` run that has a recorded pid
+    /// and records it via [`RunStore::record_footprint`], returning how many
+    /// runs were sampled.
+    ///
+    /// `footprint` is the measurement seam, like [`RunStore::reap`]'s
+    /// `pid_alive`: production passes
+    /// [`footprint::tree_footprint`], which sums the pid's whole process
+    /// tree; a `None` (process gone, or no footprint API) skips the run. It
+    /// rides the existing liveness polls (`tm runs`, the board) rather than a
+    /// sampling daemon, so a peak is only as fine-grained as those polls.
+    pub fn sample_footprints(
+        &self,
+        footprint: &dyn Fn(u32) -> Option<u64>,
+    ) -> Result<usize, RunStoreError> {
+        let candidates: Vec<(i64, u32)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, pid FROM runs WHERE status = 'running' AND pid IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut sampled = 0;
+        for (id, pid) in candidates {
+            if let Some(bytes) = footprint(pid) {
+                self.record_footprint(id, bytes)?;
+                sampled += 1;
+            }
+        }
+        Ok(sampled)
+    }
+
+    /// Records which agent drives `run_id` and which repo it runs against,
+    /// the key [`RunStore::lane_peak_estimate`] groups by. A separate update
+    /// rather than [`StartRun`] fields for the same reason as
+    /// [`RunStore::update_tmux_session`]: only the lane-run path knows both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_agent_repo(
+        &self,
+        run_id: i64,
+        agent: &str,
+        repo: &str,
+    ) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET agent = ?1, repo = ?2 WHERE id = ?3",
+            params![agent, repo, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
+    /// The expected peak footprint, in bytes, of a new lane run for `agent`
+    /// against `repo`: the largest recorded peak among the
+    /// [`LANE_ESTIMATE_WINDOW`] most recent finished lane runs with that
+    /// key, or `None` with no such history.
+    ///
+    /// Uses the peak, not an average, because admission has to hold room
+    /// for a lane's worst moment (a build), not its typical one.
+    pub fn lane_peak_estimate(
+        &self,
+        agent: &str,
+        repo: &str,
+    ) -> Result<Option<u64>, RunStoreError> {
+        self.conn
+            .query_row(
+                "SELECT MAX(mem_peak_bytes) FROM (
+                    SELECT mem_peak_bytes FROM runs
+                     WHERE kind = 'lane' AND agent = ?1 AND repo = ?2
+                       AND status NOT IN ('running', 'queued')
+                       AND mem_peak_bytes IS NOT NULL
+                     ORDER BY started_at DESC, id DESC
+                     LIMIT ?3
+                 )",
+                params![agent, repo, LANE_ESTIMATE_WINDOW],
+                |row| row.get(0),
+            )
+            .map_err(RunStoreError::from)
+    }
+
+    /// Every `running` lane-kind run, across every scope, for memory-budget
+    /// admission to total up. Other kinds (audits, review watchers) are left
+    /// out: admission budgets lanes, and a review watcher is a small `tm`
+    /// poller, not an agent.
+    ///
+    /// Only `running` rows count, so a run moved to any other status (a
+    /// hibernated run from issue #64, once it exists, included) frees its
+    /// share of the budget.
+    pub fn running_lanes(&self) -> Result<Vec<RunningLane>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent, repo, mem_peak_bytes FROM runs
+              WHERE status = 'running' AND kind = 'lane'
+              ORDER BY started_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunningLane {
+                id: row.get(0)?,
+                agent: row.get(1)?,
+                repo: row.get(2)?,
+                mem_peak_bytes: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Lists all runs, ordered with active runs (queued/running/blocked/
     /// review) before terminal ones (done/failed), and by `started_at`
     /// descending within each group.
@@ -1790,7 +1976,9 @@ impl RunStore {
                 (SELECT e.kind FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_kind,
                 (SELECT CAST((julianday('now') - julianday(e.at)) * 86400 AS INTEGER)
                     FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1) AS last_event_age_secs,
-                r.scope
+                r.scope,
+                r.mem_current_bytes,
+                r.mem_peak_bytes
              FROM runs r
              WHERE (?1 IS NULL OR r.kind = ?1)
                 AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
@@ -1819,6 +2007,8 @@ impl RunStore {
                 last_event_age_secs: row.get(8)?,
                 awaiting_input,
                 scope: row.get(9)?,
+                mem_current_bytes: row.get(10)?,
+                mem_peak_bytes: row.get(11)?,
             })
         })?;
 
@@ -2033,7 +2223,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
              ORDER BY started_at ASC, id ASC";
@@ -2057,7 +2248,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2090,7 +2282,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2115,7 +2308,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              ORDER BY started_at DESC, id DESC";
 
@@ -2135,7 +2329,8 @@ impl RunStore {
                 id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
-                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
              FROM runs
              WHERE id = ?1";
 
@@ -2148,8 +2343,8 @@ impl RunStore {
     /// Maps one row of the `id, ticket, lane, kind, status, session_id,
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
-    /// model_usage, log_path, findings_count, scope, tmux_session, age_secs`
-    /// projection (shared
+    /// model_usage, log_path, findings_count, scope, tmux_session, age_secs,
+    /// mem_current_bytes, mem_peak_bytes, agent, repo` projection (shared
     /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
     /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -2182,6 +2377,10 @@ impl RunStore {
             scope: row.get(21)?,
             tmux_session: row.get(22)?,
             age_secs: row.get(23)?,
+            mem_current_bytes: row.get(24)?,
+            mem_peak_bytes: row.get(25)?,
+            agent: row.get(26)?,
+            repo: row.get(27)?,
         })
     }
 
@@ -2729,7 +2928,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_11() {
+    fn open_migrates_a_fresh_db_to_user_version_12() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -2737,7 +2936,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -7134,5 +7333,179 @@ mod tests {
             .unwrap();
         assert_eq!(clean.run_count, 1);
         assert_eq!(clean.total_cost_usd, Some(5.0));
+    }
+
+    // --- memory footprint (GitHub issue #66) ---
+
+    fn start_lane_with_pid(store: &RunStore, ticket: &str, pid: Option<u32>) -> i64 {
+        store
+            .start_run(&StartRun {
+                pid,
+                ..start_params(ticket)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn record_footprint_keeps_the_peak_and_the_latest_sample() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", Some(1));
+
+        store.record_footprint(id, 300).unwrap();
+        store.record_footprint(id, 900).unwrap();
+        store.record_footprint(id, 500).unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.mem_peak_bytes, Some(900));
+        assert_eq!(run.mem_current_bytes, Some(500));
+        let summary = &store.list_runs().unwrap()[0];
+        assert_eq!(summary.mem_peak_bytes, Some(900));
+        assert_eq!(summary.mem_current_bytes, Some(500));
+    }
+
+    #[test]
+    fn record_footprint_does_not_bump_the_heartbeat() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", Some(1));
+
+        store.record_footprint(id, 300).unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.heartbeat_at, None);
+    }
+
+    #[test]
+    fn record_footprint_on_an_unknown_run_is_an_error() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        assert!(matches!(
+            store.record_footprint(99, 1),
+            Err(RunStoreError::RunNotFound(99))
+        ));
+    }
+
+    #[test]
+    fn sample_footprints_measures_running_runs_with_a_pid_only() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let live = start_lane_with_pid(&store, "PROJ-1", Some(11));
+        let gone = start_lane_with_pid(&store, "PROJ-2", Some(22));
+        let pidless = start_lane_with_pid(&store, "PROJ-3", None);
+        let finished = start_lane_with_pid(&store, "PROJ-4", Some(11));
+        store
+            .finish_run(
+                finished,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let sampled = store
+            .sample_footprints(&|pid| (pid == 11).then_some(4096))
+            .unwrap();
+
+        assert_eq!(sampled, 1);
+        let mem = |id| store.run_by_id(id).unwrap().unwrap().mem_peak_bytes;
+        assert_eq!(mem(live), Some(4096));
+        assert_eq!(mem(gone), None);
+        assert_eq!(mem(pidless), None);
+        assert_eq!(mem(finished), None);
+    }
+
+    #[test]
+    fn update_agent_repo_stamps_the_estimate_key() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+
+        store.update_agent_repo(id, "opencode", "lemma").unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.agent.as_deref(), Some("opencode"));
+        assert_eq!(run.repo.as_deref(), Some("lemma"));
+    }
+
+    fn finished_lane_with_peak(store: &RunStore, agent: &str, repo: &str, peak: u64) -> i64 {
+        let id = start_lane_with_pid(store, "PROJ-1", Some(1));
+        store.update_agent_repo(id, agent, repo).unwrap();
+        store.record_footprint(id, peak).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn lane_peak_estimate_is_the_largest_recent_peak_for_the_agent_and_repo() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        finished_lane_with_peak(&store, "opencode", "lemma", 2_000);
+        finished_lane_with_peak(&store, "opencode", "lemma", 3_000);
+        finished_lane_with_peak(&store, "claude", "lemma", 9_000);
+        finished_lane_with_peak(&store, "opencode", "other", 9_000);
+
+        assert_eq!(
+            store.lane_peak_estimate("opencode", "lemma").unwrap(),
+            Some(3_000)
+        );
+        assert_eq!(store.lane_peak_estimate("claude", "nowhere").unwrap(), None);
+    }
+
+    #[test]
+    fn lane_peak_estimate_only_looks_at_the_most_recent_runs() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let old = finished_lane_with_peak(&store, "claude", "tskmstr", 50_000);
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![old],
+            )
+            .unwrap();
+        for _ in 0..LANE_ESTIMATE_WINDOW {
+            finished_lane_with_peak(&store, "claude", "tskmstr", 1_000);
+        }
+
+        assert_eq!(
+            store.lane_peak_estimate("claude", "tskmstr").unwrap(),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn running_lanes_lists_only_running_lane_kind_runs() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let running = start_lane_with_pid(&store, "PROJ-1", Some(1));
+        store
+            .update_agent_repo(running, "claude", "tskmstr")
+            .unwrap();
+        store.record_footprint(running, 700).unwrap();
+        finished_lane_with_peak(&store, "claude", "tskmstr", 900);
+        store
+            .start_run(&StartRun {
+                kind: "review-watch".to_string(),
+                ..start_params("PROJ-2")
+            })
+            .unwrap();
+
+        let lanes = store.running_lanes().unwrap();
+
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].id, running);
+        assert_eq!(lanes[0].agent.as_deref(), Some("claude"));
+        assert_eq!(lanes[0].repo.as_deref(), Some("tskmstr"));
+        assert_eq!(lanes[0].mem_peak_bytes, Some(700));
     }
 }
