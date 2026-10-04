@@ -22,6 +22,7 @@ pub mod review_watch;
 pub mod run;
 pub mod runner;
 pub mod session;
+pub mod session_gc;
 pub mod tmux;
 pub mod vdiff;
 pub mod viewer;
