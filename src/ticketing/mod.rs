@@ -171,6 +171,10 @@ pub struct AssociateOutcome {
 pub enum StatusTransition {
     /// The ticket was moved to the named status.
     Applied(String),
+    /// The ticket already sat in the target status (case-insensitive match
+    /// after [`TicketProvider::normalize_status_target`]), so no transition
+    /// was attempted. Carries the ticket's own current status name.
+    AlreadyInStatus(String),
     /// No matching transition was found, or the transition API call
     /// failed. Carries a human-readable explanation to surface to the
     /// user as a warning.
@@ -414,7 +418,7 @@ pub fn associate_existing_ticket_for_pr_create(
         if issue.fields.status.name.eq_ignore_ascii_case(&target) {
             None
         } else {
-            Some(apply_status_transition(ctx.jira, key, &target))
+            Some(transition_to(ctx.jira, key, &target))
         }
     });
 
@@ -479,11 +483,20 @@ pub fn create_ticket(
 /// Jira-shaped `status_on_pr`/`status_on_create` value inherited by a
 /// github-backend repo still names a real status; every outcome reports the
 /// normalized name, since that's the status the ticket actually lands in.
-/// Fetches the issue's available transitions and picks the first one whose
-/// target status name matches `target` case-insensitively, falling back to
-/// matching the transition's own name case-insensitively if none of the
-/// target statuses match (some workflows name a transition the same as the
-/// status it leads to). Never propagates an error: any failure — no
+///
+/// Reads the issue's current status first: if it already matches `target`
+/// case-insensitively, nothing is transitioned and the outcome is
+/// [`StatusTransition::AlreadyInStatus`] (GitHub issue #79 -- workflows
+/// rarely offer a self-transition, so "already there" would otherwise land in
+/// the no-match warning). A failed status read falls through to the
+/// transition attempt rather than warning on its own; the read only feeds
+/// this short-circuit.
+///
+/// Otherwise fetches the issue's available transitions and picks the first
+/// one whose target status name matches `target` case-insensitively, falling
+/// back to matching the transition's own name case-insensitively if none of
+/// the target statuses match (some workflows name a transition the same as
+/// the status it leads to). Never propagates an error: any failure — no
 /// matching transition, or the transition API call itself failing — is
 /// reported as a [`StatusTransition::Warning`], since the ticket has
 /// already been created (and, where applicable, linked) by this point.
@@ -493,6 +506,20 @@ pub fn create_ticket(
 /// and names `tm ticket transition` as the manual recovery.
 fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
     let target = &jira.normalize_status_target(target);
+    if let Ok(issue) = jira.get_issue(key)
+        && issue.fields.status.name.eq_ignore_ascii_case(target)
+    {
+        return StatusTransition::AlreadyInStatus(issue.fields.status.name);
+    }
+    transition_to(jira, key, target)
+}
+
+/// The transition half of [`apply_status_transition`], minus its
+/// current-status check: match `target` (already normalized) against the
+/// issue's available transitions and apply it, reporting every outcome as
+/// a [`StatusTransition`]. Called directly only by callers that already hold
+/// the issue's current status and checked it themselves.
+fn transition_to(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
     let transitions = match jira.transitions(key) {
         Ok(transitions) => transitions,
         Err(err) => {
@@ -520,20 +547,16 @@ fn apply_status_transition(jira: &dyn TicketProvider, key: &str, target: &str) -
 }
 
 /// Advisorily move `key` to the configured `status_on_merge` target after
-/// its PR merged, tolerating a ticket that is already there.
+/// its PR merged.
 ///
-/// Same contract as [`apply_status_transition`] (never propagates an error;
-/// every outcome is a [`StatusTransition`]), plus one tolerance that
-/// function's callers don't need: merging a PR whose body carries a closing
-/// keyword auto-closes its GitHub issue, so by the time this runs the
-/// ticket may already read as the target status (a closed issue
-/// synthesizes as `Done`) with no matching transition left (closed issues
-/// only offer `Reopen`). Checking the current status first turns that race
-/// into a clean [`StatusTransition::Applied`] -- carrying the ticket's own
-/// status name, since no transition picked a name to report -- instead of
-/// a spurious no-matching-transition warning. A failed status read falls
-/// through to the ordinary transition attempt rather than warning on its
-/// own; the read is only this tolerance's input, not a prerequisite.
+/// Exactly [`apply_status_transition`]'s contract, including its
+/// already-in-status short-circuit -- which this path leans on hardest:
+/// merging a PR whose body carries a closing keyword auto-closes its GitHub
+/// issue, so by the time this runs the ticket may already read as the
+/// target status (a closed issue synthesizes as `Done`) with no matching
+/// transition left (closed issues only offer `Reopen`). That race comes back
+/// as [`StatusTransition::AlreadyInStatus`] rather than a spurious
+/// no-matching-transition warning.
 ///
 /// `pub` (not just crate-visible) deliberately: this is the transition half
 /// of the merge plumbing GitHub issue #32's NOTES ask to keep reusable for
@@ -543,12 +566,6 @@ pub fn apply_status_on_merge(
     key: &str,
     target: &str,
 ) -> StatusTransition {
-    let normalized = jira.normalize_status_target(target);
-    if let Ok(issue) = jira.get_issue(key)
-        && issue.fields.status.name.eq_ignore_ascii_case(&normalized)
-    {
-        return StatusTransition::Applied(issue.fields.status.name);
-    }
     apply_status_transition(jira, key, target)
 }
 
@@ -1888,6 +1905,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_status_transition_already_in_target_is_a_no_op_not_a_warning() {
+        // GitHub issue #79: workflows rarely offer a self-transition, so a
+        // ticket already in the target status must short-circuit before the
+        // transition match instead of falling into the no-match warning.
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-9", issue_with_status("PROJ-9", "In Review"))
+            .with_transitions("PROJ-9", vec![transition("31", "Ship it", "Done")]);
+
+        let outcome = apply_status_transition(&jira, "PROJ-9", "in review");
+
+        assert_eq!(
+            outcome,
+            StatusTransition::AlreadyInStatus("In Review".to_string())
+        );
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn apply_status_transition_already_in_normalized_target_is_a_no_op() {
+        // The current-status check compares against the *normalized* target,
+        // so a Jira-shaped "Code Review" matches a GitHub ticket in In Review.
+        let gh = FakeGhCli::new().with_issue_view(
+            12,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 12,
+                url: "https://github.com/jowi-dev/tskmstr/issues/12".to_string(),
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Open,
+                labels: vec!["tm:status/in-review".to_string()],
+                assignees: Vec::new(),
+            }),
+        );
+        let provider = crate::ticketing::github_provider::GithubProvider::new(
+            &gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+
+        let outcome = apply_status_transition(&provider, "GH-12", "Code Review");
+
+        assert_eq!(
+            outcome,
+            StatusTransition::AlreadyInStatus("In Review".to_string())
+        );
+        assert!(gh.issue_edit_calls().is_empty());
+    }
+
+    #[test]
+    fn apply_status_transition_status_read_failure_still_attempts_the_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue_not_found("PROJ-9")
+            .with_transitions("PROJ-9", vec![transition("31", "Ship it", "Done")]);
+
+        let outcome = apply_status_transition(&jira, "PROJ-9", "Done");
+
+        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+    }
+
+    #[test]
+    fn auto_create_and_associate_ticket_already_in_status_on_pr_is_a_no_op() {
+        let jira = FakeJiraClient::new()
+            .with_create_issue_result(issue_with_status("PROJ-9", "In Review"))
+            .with_issue("PROJ-9", issue_with_status("PROJ-9", "In Review"))
+            .with_transitions("PROJ-9", vec![]);
+        let gh = FakeGhCli::new();
+        let cfg = config_with_status_on_pr("In Review");
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+
+        let outcome = auto_create_and_associate(&ctx, &pr("Add the widget")).expect("ok");
+
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::AlreadyInStatus("In Review".to_string()))
+        );
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn create_ticket_under_github_backend_with_status_to_do_is_a_no_op() {
+        // GitHub issue #79's reported case: `tm ticket create --status "To
+        // Do"` under the github backend. The issue is born `tm:status/todo`,
+        // so there is nothing to do: no warning and no label edit.
+        let created = crate::github::gh_cli::IssueInfo {
+            number: 78,
+            url: "https://github.com/jowi-dev/tskmstr/issues/78".to_string(),
+            title: "Add the widget".to_string(),
+            body: String::new(),
+            state: crate::github::gh_cli::IssueState::Open,
+            labels: vec!["tm:status/todo".to_string()],
+            assignees: Vec::new(),
+        };
+        let gh = FakeGhCli::new()
+            .with_issue_create_result(Ok(created.clone()))
+            .with_issue_view(78, Ok(created));
+        let provider = crate::ticketing::github_provider::GithubProvider::new(
+            &gh,
+            "jowi-dev/tskmstr".to_string(),
+        );
+        let cfg = github_config();
+        let ctx = CreateTicketContext {
+            jira: &provider,
+            config: &cfg,
+        };
+
+        let outcome = create_ticket(&ctx, "Add the widget", None, Some("To Do")).expect("ok");
+
+        assert_eq!(
+            outcome.status_transition,
+            Some(StatusTransition::AlreadyInStatus("To Do".to_string()))
+        );
+        assert!(gh.issue_edit_calls().is_empty());
+    }
+
     fn issue_with_status(key: &str, status_name: &str) -> Issue {
         let mut issue = issue(key);
         issue.fields.status.name = status_name.to_string();
@@ -1904,7 +2039,10 @@ mod tests {
 
         let outcome = apply_status_on_merge(&jira, "PROJ-9", "done");
 
-        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+        assert_eq!(
+            outcome,
+            StatusTransition::AlreadyInStatus("Done".to_string())
+        );
         assert!(jira.transition_calls().is_empty());
     }
 
@@ -1950,7 +2088,10 @@ mod tests {
 
         let outcome = apply_status_on_merge(&provider, "GH-10", "Done");
 
-        assert_eq!(outcome, StatusTransition::Applied("Done".to_string()));
+        assert_eq!(
+            outcome,
+            StatusTransition::AlreadyInStatus("Done".to_string())
+        );
         assert!(gh.issue_edit_calls().is_empty());
     }
 

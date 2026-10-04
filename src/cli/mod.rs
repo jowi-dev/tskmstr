@@ -30,11 +30,12 @@ use crate::ticketing::StatusTransition;
 /// transition attempt, if one was made.
 ///
 /// Prints nothing when `status_transition` is `None` (the relevant config
-/// key isn't set, the ticket was already in the target status, or the
-/// outcome came from a path that never transitions, like `tm ticket <KEY>`).
-/// Shared by `cli::pr` (auto-created and pre-existing tickets) and
-/// `cli::ticket` (`tm ticket create`) so the same "Moved ... to ..." /
-/// "warning: ..." wording appears on every path.
+/// key isn't set, `tm pr create` found a pre-existing ticket already in the
+/// target status, or the outcome came from a path that never transitions,
+/// like `tm ticket <KEY>`). Shared by `cli::pr` (auto-created and
+/// pre-existing tickets) and `cli::ticket` (`tm ticket create`) so the same
+/// "Moved ... to ..." / "... already in ..." / "warning: ..." wording
+/// appears on every path.
 pub(crate) fn print_status_transition(
     issue_key: &str,
     status_transition: &Option<StatusTransition>,
@@ -42,6 +43,9 @@ pub(crate) fn print_status_transition(
 ) -> io::Result<()> {
     match status_transition {
         Some(StatusTransition::Applied(status)) => writeln!(out, "Moved {issue_key} to {status}"),
+        Some(StatusTransition::AlreadyInStatus(status)) => {
+            writeln!(out, "{issue_key} already in {status}")
+        }
         Some(StatusTransition::Warning(message)) => writeln!(out, "warning: {message}"),
         None => Ok(()),
     }
@@ -1239,6 +1243,18 @@ impl EditorPrompter for FakeEditorPrompter {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn print_status_transition_already_in_status_is_not_a_warning() {
+        let mut out = Vec::new();
+        print_status_transition(
+            "GH-78",
+            &Some(StatusTransition::AlreadyInStatus("To Do".to_string())),
+            &mut out,
+        )
+        .expect("write");
+        assert_eq!(String::from_utf8(out).unwrap(), "GH-78 already in To Do\n");
+    }
 
     #[test]
     fn fake_prompter_confirm_with_default_falls_back_to_default() {
