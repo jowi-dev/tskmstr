@@ -45,6 +45,10 @@ enum AssignableUsersOutcome {
     Error { status: u16, message: String },
 }
 
+/// Canned outcome for `TicketProvider::clear_closed_status_labels` on a
+/// given key: the labels removed, or an API error `(status, message)`.
+type ClearedLabelsOutcome = Result<Vec<String>, (u16, String)>;
+
 /// An in-memory [`JiraClient`] test double.
 ///
 /// Issues are seeded by key via [`with_issue`](Self::with_issue),
@@ -77,6 +81,8 @@ pub struct FakeJiraClient {
     update_description_calls: RefCell<Vec<(String, serde_json::Value)>>,
     add_comment_result: RefCell<Result<(), (u16, String)>>,
     add_comment_calls: RefCell<Vec<(String, serde_json::Value)>>,
+    cleared_status_labels: RefCell<HashMap<String, ClearedLabelsOutcome>>,
+    clear_closed_status_labels_calls: RefCell<Vec<String>>,
 }
 
 impl Default for FakeJiraClient {
@@ -105,6 +111,8 @@ impl Default for FakeJiraClient {
             update_description_calls: RefCell::new(Vec::new()),
             add_comment_result: RefCell::new(Ok(())),
             add_comment_calls: RefCell::new(Vec::new()),
+            cleared_status_labels: RefCell::new(HashMap::new()),
+            clear_closed_status_labels_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -233,6 +241,54 @@ impl FakeJiraClient {
     /// order.
     pub fn transition_calls(&self) -> Vec<(String, String)> {
         self.transition_calls.borrow().clone()
+    }
+
+    /// Seed `TicketProvider::clear_closed_status_labels(key)` to report
+    /// `labels` as removed. Unseeded keys report nothing removed, like the
+    /// trait's Jira default.
+    pub fn with_cleared_status_labels(self, key: &str, labels: &[&str]) -> Self {
+        self.cleared_status_labels.borrow_mut().insert(
+            key.to_string(),
+            Ok(labels.iter().map(|label| label.to_string()).collect()),
+        );
+        self
+    }
+
+    /// Seed `TicketProvider::clear_closed_status_labels(key)` to fail with
+    /// [`crate::ticketing::ProviderError::Api`].
+    pub fn with_clear_closed_status_labels_error(
+        self,
+        key: &str,
+        status: u16,
+        message: &str,
+    ) -> Self {
+        self.cleared_status_labels
+            .borrow_mut()
+            .insert(key.to_string(), Err((status, message.to_string())));
+        self
+    }
+
+    /// Record a `TicketProvider::clear_closed_status_labels(key)` call and
+    /// return its seeded outcome. Lives here because the `TicketProvider`
+    /// impl (in `crate::ticketing::provider`) can't reach private fields.
+    pub(crate) fn take_clear_closed_status_labels(
+        &self,
+        key: &str,
+    ) -> Result<Vec<String>, (u16, String)> {
+        self.clear_closed_status_labels_calls
+            .borrow_mut()
+            .push(key.to_string());
+        self.cleared_status_labels
+            .borrow()
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// The keys passed to `TicketProvider::clear_closed_status_labels`, in
+    /// call order.
+    pub fn clear_closed_status_labels_calls(&self) -> Vec<String> {
+        self.clear_closed_status_labels_calls.borrow().clone()
     }
 
     /// Seed `assignable_users(project)` to return `users`.

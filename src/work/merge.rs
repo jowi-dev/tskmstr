@@ -7,8 +7,9 @@
 //! rebase (opening a conflict-resolution tmux session and polling it to
 //! completion when the rebase stops on conflicts), merge the PR via `gh`,
 //! fast-forward the local base branch, best-effort clean up the worktree
-//! and branch, and finally apply the configured `status_on_merge`
-//! transition.
+//! and branch, apply the configured `status_on_merge` transition, and
+//! finally clear any `tm:status/*` label GitHub left on an issue the PR's
+//! closing keyword closed (GitHub issue #75).
 //!
 //! The conflict-resolution session is launched the same way an interactive
 //! lane run is: [`crate::agent::AgentRunner::build_invocation`] under
@@ -1097,7 +1098,7 @@ fn prepare_merge(
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
 /// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
 /// merge`, sync the local base, best-effort clean up, and apply
-/// `status_on_merge`.
+/// `status_on_merge`, then sweep stale status labels off a closed ticket.
 fn finish_merge(
     deps: &MergeDeps<'_>,
     prepared: &PreparedMerge,
@@ -1215,6 +1216,20 @@ fn finish_merge(
             StatusTransition::Applied(status) => writeln!(out, "moved {key} to {status}")?,
             StatusTransition::Warning(warning) => writeln!(out, "warning: {warning}")?,
         }
+    }
+
+    // Last, so a closing keyword GitHub applies asynchronously after the
+    // merge has had the whole sync/cleanup above to land (GitHub issue #75).
+    match deps.jira.clear_closed_status_labels(key) {
+        Ok(removed) => {
+            for label in removed {
+                writeln!(out, "cleared stale status label {label} from {key}")?;
+            }
+        }
+        Err(err) => writeln!(
+            out,
+            "warning: failed to clear stale status labels from {key}: {err} (run: tm backend clean-status-labels)"
+        )?,
     }
 
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
@@ -2033,6 +2048,69 @@ mod tests {
 
         assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
         assert!(out.contains("moved PROJ-1 to Done"));
+    }
+
+    // --- stale status-label sweep (GitHub issue #75) ---
+
+    fn merged_fixture() -> Fixture {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_branch_exists_local(Ok(false));
+        fx
+    }
+
+    #[test]
+    fn merge_without_status_on_merge_still_clears_stale_status_labels() {
+        // The PR's closing keyword closes the issue outside tm; with no
+        // status_on_merge nothing else would remove its tm:status/* label.
+        let mut fx = merged_fixture();
+        fx.jira = fx
+            .jira
+            .with_cleared_status_labels("PROJ-1", &["tm:status/in-review"]);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert_eq!(
+            fx.jira.clear_closed_status_labels_calls(),
+            vec!["PROJ-1".to_string()]
+        );
+        assert!(
+            out.contains("cleared stale status label tm:status/in-review from PROJ-1"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn merge_with_nothing_to_clear_prints_nothing_about_labels() {
+        let fx = merged_fixture();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert_eq!(fx.jira.clear_closed_status_labels_calls().len(), 1);
+        assert!(!out.contains("status label"), "{out}");
+    }
+
+    #[test]
+    fn stale_status_label_sweep_failure_only_warns() {
+        let mut fx = merged_fixture();
+        fx.jira = fx
+            .jira
+            .with_clear_closed_status_labels_error("PROJ-1", 0, "boom");
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(
+            out.contains("warning: failed to clear stale status labels from PROJ-1"),
+            "{out}"
+        );
     }
 
     // --- no PR for ticket ---

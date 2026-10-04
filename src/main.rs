@@ -231,7 +231,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Dispatch `tm backend init-labels`.
+/// Dispatch `tm backend init-labels` / `tm backend clean-status-labels`.
 ///
 /// Needs no Jira token (or keychain access at all): `gh` handles its own
 /// authentication, so this only loads config to learn `backend` and
@@ -244,6 +244,18 @@ fn run_backend(cmd: BackendCmd, paths: &ConfigPaths) -> Result<(), Box<dyn std::
             let repo = config.github_repo.clone().unwrap_or_default();
             let mut stdout = std::io::stdout();
             tskmstr::cli::backend::init_labels(config.backend, &repo, &gh, &mut stdout)?;
+        }
+        BackendCmd::CleanStatusLabels { dry_run } => {
+            let gh = ShellGhCli::new();
+            let repo = config.github_repo.clone().unwrap_or_default();
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::backend::clean_status_labels(
+                config.backend,
+                &repo,
+                dry_run,
+                &gh,
+                &mut stdout,
+            )?;
         }
     }
     Ok(())
