@@ -1710,18 +1710,20 @@ the target status, `tm pr create` leaves it alone and prints nothing extra.
 `tm pr status --auto-ticket` also applies it to a freshly auto-created
 ticket. Jira's create-issue API can't set status directly, so without this
 setting an auto-created ticket is left in the workflow's initial status
-(typically Backlog/To Do). When set, `tm` looks up the ticket's available
-transitions and applies the first one whose target status matches,
-case-insensitively; if none match, or the transition call itself fails,
-`tm` prints a warning and continues — the ticket is still created/linked
-either way. The warning is actionable: on no match it lists the ticket's
-available transitions and names `tm ticket transition <KEY> <STATUS>` as
-the manual recovery. `tm ticket <KEY>` (plain association, no PR being
-created) never changes an existing ticket's status. `tm init` offers to
-wire this key when onboarding a repo (GitHub defaults it to `"In Review"`),
-so a fresh repo's board moves on PR-open without your having to know the
-key exists; when unset, `tm pr create` leaves every ticket in its current
-status.
+(typically Backlog/To Do). When set, `tm` first checks the ticket's current
+status: a ticket already in the target status is left alone and reported
+as `<KEY> already in <STATUS>`, not warned about. Otherwise it looks up
+the ticket's available transitions and applies the first one whose
+target status matches, case-insensitively; if none match, or the
+transition call itself fails, `tm` prints a warning and continues — the
+ticket is still created/linked either way. The warning is actionable: on
+no match it lists the ticket's available transitions and names `tm
+ticket transition <KEY> <STATUS>` as the manual recovery. `tm ticket
+<KEY>` (plain association, no PR being created) never changes an existing
+ticket's status. `tm init` offers to wire this key when onboarding a
+repo (GitHub defaults it to `"In Review"`), so a fresh repo's board moves
+on PR-open without your having to know the key exists; when unset, `tm pr
+create` leaves every ticket in its current status.
 
 `status_on_create` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to right after `tm ticket create` makes it. It's matched the
@@ -1739,7 +1741,7 @@ deploys, merged means done; in a repo whose root branch is staging, a
 human moves the ticket when the work actually ships — so absence means
 "merge only". A ticket already sitting in the target status (on the
 GitHub backend, an issue the PR's closing keyword auto-closed reads as
-Done) is reported as moved rather than warned about.
+Done) is reported as `<KEY> already in <STATUS>` rather than warned about.
 
 `status_on_run_start` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to when a tracked `tm work run` starts against it — the
