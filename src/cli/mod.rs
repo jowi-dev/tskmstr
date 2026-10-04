@@ -228,8 +228,8 @@ pub enum Command {
         yes: bool,
     },
     /// List tickets whose tracker status has drifted from what their lane
-    /// runs and PRs actually did, across every project with a configured
-    /// lane (plus the current repo): finished work still in To Do, merged
+    /// runs and PRs actually did, across every project the run store has
+    /// lane runs for (plus the current repo): finished work still in To Do, merged
     /// PRs whose ticket isn't done, running lanes on a To Do ticket, and
     /// in-progress tickets with no live run or open PR (stalled). Read-only
     /// unless `--fix` is given; pass ticket keys to fix only the findings
