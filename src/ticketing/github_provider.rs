@@ -60,7 +60,7 @@ use serde_json::Value;
 /// `{prefix}todo`/`in-progress`/`in-review`/`blocked` should be set on an
 /// open issue at a time; [`synthesize_status_slug`] documents the tie-break
 /// used when more than one is present.
-const STATUS_LABEL_PREFIX: &str = "tm:status/";
+pub(crate) const STATUS_LABEL_PREFIX: &str = "tm:status/";
 
 /// [`TicketProvider`] backed by GitHub Issues via a borrowed [`GhCli`].
 ///

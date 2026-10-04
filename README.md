@@ -191,7 +191,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1399,8 +1399,15 @@ these stages:
    you're standing in.
 7. **`status_on_merge`.** Same advisory transition the board's `M` key
    applies (see its config docs below).
+8. **Stale status-label sweep (GitHub backend).** If the ticket's issue is
+   now closed (typically GitHub closing it for the PR's `Closes #N`), any
+   `tm:status/*` label left on it is removed, with or without
+   `status_on_merge`. An issue that's still open (a PR that only says
+   `Refs #N`) keeps its label. GitHub closes the issue asynchronously, so a
+   rare close that lands after this step is caught by `tm backend
+   clean-status-labels`. A failure here only warns.
 
-Exit codes: `0` merged (steps 4-7 all attempted; cleanup/base-sync
+Exit codes: `0` merged (steps 4-8 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
 3), `1` any other error (no open PR, a diverged branch, a dirty worktree,
 a `gh`/`git` failure).
@@ -1658,7 +1665,11 @@ login`/`gh auth status`, not a stored Jira token); ticket keys are
 closed issue, both map to their obvious default) rather than a Jira
 workflow; and `tm backend init-labels` creates those four labels in the
 configured repo (idempotently — safe to re-run) so a fresh repo's board has
-somewhere to put issues. `tm ticket`/`tm ready`/the board's mutating keys
+somewhere to put issues. `tm backend clean-status-labels` (`--dry-run` to
+preview) removes `tm:status/*` labels left on closed issues — GitHub's
+closing keywords close an issue without touching its labels; `tm merge`
+sweeps the ticket it merged, and this command backfills the rest. Open
+issues are never touched. `tm ticket`/`tm ready`/the board's mutating keys
 work end to end under the GitHub backend: create, comment, update
 description, and transitions map onto `gh issue create/comment/edit`;
 associating a PR needs no remote link (the `Closes #N` line already renders

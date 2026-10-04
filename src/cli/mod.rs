@@ -229,6 +229,19 @@ pub enum BackendCmd {
     /// backend (Jira has no label taxonomy to create) is an error naming the
     /// configured provider.
     InitLabels,
+    /// Remove leftover `tm:status/*` labels from every closed issue in the
+    /// configured `[backend.github].repo`.
+    ///
+    /// GitHub closes an issue on its own when a merged PR says `Closes #N`,
+    /// leaving whatever status label it last had. `tm merge` sweeps the
+    /// ticket it merged; this backfills older issues and any GitHub closed
+    /// after `tm merge` looked. Open issues are never touched. GitHub
+    /// backend only.
+    CleanStatusLabels {
+        /// List what would be removed without editing any issue.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// `tm review` subcommands.
