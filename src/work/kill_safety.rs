@@ -26,8 +26,9 @@ use crate::work::tmux::TmuxOps;
 /// tokens the session picker branches its confirmation behavior on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillSafetyTier {
-    /// An agent run is live in this session (starting, running, or waiting
-    /// for input) — killing it interrupts work in flight.
+    /// An agent run is live in this session (starting, running, waiting for
+    /// input, or hibernated awaiting resume) — killing it interrupts work in
+    /// flight.
     LiveRun,
     /// This session is some session's `@root_session` target: a per-project
     /// hub session (the one the board runs in), not a disposable ticket
@@ -88,8 +89,18 @@ fn run_hosted_in(run: &Run, session: &str) -> bool {
 /// provably dead. A recorded pid is probed; a pid-less running row (a
 /// pre-adoption interactive launch) counts as live — the conservative
 /// reading, since the picker prompts for live runs.
-fn run_is_live(run: &Run, pid_alive: &dyn Fn(u32) -> bool) -> bool {
-    run.status == RunStatus::Running && run.pid.is_none_or(pid_alive)
+///
+/// A [`RunStatus::Hibernated`] run counts as live whatever its pid says: its
+/// process was stopped on purpose, but the run is unfinished and resumes on
+/// attach, so killing its session and worktree would lose work in flight
+/// (GitHub issue #64). Also the predicate
+/// [`crate::work::hibernate::sweep_idle`] reuses to decide what it may stop.
+pub(crate) fn run_is_live(run: &Run, pid_alive: &dyn Fn(u32) -> bool) -> bool {
+    match run.status {
+        RunStatus::Running => run.pid.is_none_or(pid_alive),
+        RunStatus::Hibernated => true,
+        _ => false,
+    }
 }
 
 /// Classify tmux session `session` for the picker's kill key.
@@ -267,6 +278,34 @@ mod tests {
 
         assert_eq!(verdict.tier, KillSafetyTier::LiveRun);
         assert!(verdict.detail.contains("GH-26"));
+    }
+
+    /// A hibernated run has no process, but it is unfinished work the user
+    /// expects to resume — killing its session (and worktree) would lose it,
+    /// so the picker must prompt exactly as for a live run (GitHub #64).
+    #[test]
+    fn a_hibernated_run_classifies_as_live_run_even_with_a_dead_pid() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let id = store
+            .start_run(&StartRun {
+                pid: Some(4242),
+                ..start("/tmp/wt", "GH-64", "lane", None)
+            })
+            .unwrap();
+        store.update_tmux_session(id, "tm-x-custom").unwrap();
+        store.hibernate_run(id).unwrap();
+
+        let verdict = classify_session(
+            "tm-x-custom",
+            &store,
+            &FakeTmuxOps::new(),
+            &FakeGhCli::new(),
+            &dead,
+        )
+        .unwrap();
+
+        assert_eq!(verdict.tier, KillSafetyTier::LiveRun);
     }
 
     /// Runs adopted via `tm runs register` (audits, registered lane runs)

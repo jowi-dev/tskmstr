@@ -1953,6 +1953,7 @@ mod tests {
             default_permission_mode: None,
             tmux_windows: vec![],
             tmux_primary_window: None,
+            idle_hibernate_mins: 0,
             lanes,
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),

@@ -485,6 +485,18 @@ impl AgentRunner for OpencodeRunner {
         format!("opencode --session {session_id}")
     }
 
+    /// The interactive prompt is `args[0..2]` (`"--prompt", prompt`, see
+    /// `build_invocation`), so both are dropped and the rest carries over
+    /// behind `--session <id>`.
+    fn resume_spec(&self, invocation: &AgentInvocation) -> crate::agent::ResumeSpec {
+        crate::agent::ResumeSpec {
+            program: invocation.program.clone(),
+            resume_flag: "--session".to_string(),
+            args: invocation.args.iter().skip(2).cloned().collect(),
+            env_remove: invocation.env_remove.clone(),
+        }
+    }
+
     /// Builds `opencode --model <model> --prompt <prompt>` (or `opencode
     /// --prompt <prompt>` when `model` is `None`), every value
     /// [`shell_quote`]d. Mirrors [`crate::agent::claude::ClaudeRunner`]'s
@@ -858,6 +870,32 @@ mod tests {
             def.contains("model: TODO-set-the-subagent-model"),
             "placeholder model: {def}"
         );
+    }
+
+    #[test]
+    fn resume_spec_drops_the_prompt_flag_and_its_value() {
+        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
+            prompt: "do the thing".to_string(),
+            model: Some("anthropic/claude-sonnet-4-5".to_string()),
+            max_turns: None,
+            permission_mode: None,
+            settings_path: None,
+            run_id: Some("7".to_string()),
+            mode: RunMode::Interactive,
+        });
+
+        let spec = OpencodeRunner.resume_spec(&invocation);
+
+        assert_eq!(spec.program, "opencode");
+        assert_eq!(spec.resume_flag, "--session");
+        assert_eq!(
+            spec.args,
+            vec![
+                "--model".to_string(),
+                "anthropic/claude-sonnet-4-5".to_string()
+            ]
+        );
+        assert_eq!(spec.env_remove, invocation.env_remove);
     }
 
     #[test]

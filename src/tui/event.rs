@@ -222,6 +222,13 @@ pub struct TuiDeps {
     /// `$XDG_DATA_HOME`, if set, used (with `home`) to locate the findings
     /// file a launched cleanup session's prompt points at.
     pub xdg_data_home: Option<std::path::PathBuf>,
+    /// `[work] idle_hibernate_mins`: the board's poll hibernates interactive
+    /// runs idle this long (GitHub issue #64); `0` disables it.
+    pub idle_hibernate_mins: u64,
+    /// How hibernation stops an idle agent: [`crate::runs::pid::kill_pid`]
+    /// in production, a no-op in tests (which would otherwise kill the test
+    /// process whose pid stands in for a live agent).
+    pub kill_pid: fn(u32),
     /// `config.work.lanes` keys, threaded into
     /// [`crate::tui::app::App::with_lane_names`] at construction (see that
     /// method's doc comment).
@@ -582,8 +589,17 @@ fn run_cmds<B: Backend>(
             // and `m`'s attach step): the Cmd is "attach to this ticket's
             // session" in every case, and only its status line differs.
             // `Msg::AuditActionResult` stays for *launch* outcomes, which are
-            // audit-specific.
-            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            // audit-specific. Hibernated runs in the session are resumed
+            // first (GitHub issue #64).
+            let sessions_dir =
+                crate::runs::session::sessions_dir(&deps.home, deps.xdg_data_home.as_deref());
+            let message = wake_and_attach(
+                terminal,
+                deps.store.as_ref(),
+                deps.tmux.as_ref(),
+                &session_name,
+                &sessions_dir,
+            );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
             app = next_app;
             pending.extend(more_cmds);
@@ -613,8 +629,17 @@ fn run_cmds<B: Backend>(
                 &key,
             ) {
                 Ok(outcome) => {
-                    let message =
-                        attach_session(terminal, deps.tmux.as_ref(), &outcome.session_name);
+                    let sessions_dir = crate::runs::session::sessions_dir(
+                        &deps.home,
+                        deps.xdg_data_home.as_deref(),
+                    );
+                    let message = wake_and_attach(
+                        terminal,
+                        deps.store.as_ref(),
+                        deps.tmux.as_ref(),
+                        &outcome.session_name,
+                        &sessions_dir,
+                    );
                     update(app, Msg::SessionAttachResult(message))
                 }
                 Err(err) => update(app, Msg::SessionAttachResult(err.to_string())),
@@ -816,6 +841,48 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
         None => true,
     });
     msgs
+}
+
+/// Resume any hibernated runs hosted in `session_name` before attaching to
+/// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
+/// Returns a status-line prefix naming what was resumed, or the failure;
+/// `None` when there was nothing to resume (or no store), in which case no
+/// tmux call is made. A failure never blocks the attach that follows.
+fn wake_hibernated(
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> Option<String> {
+    let store = store?;
+    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
+        Ok(woken) if woken.is_empty() => None,
+        Ok(woken) => {
+            let windows: Vec<String> = woken
+                .iter()
+                .map(|run| format!("{session_name}:{}", run.window))
+                .collect();
+            Some(format!("resumed hibernated run in {}", windows.join(", ")))
+        }
+        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
+    }
+}
+
+/// [`attach_session`], preceded by [`wake_hibernated`]; the status line
+/// reports both.
+fn wake_and_attach<B: Backend>(
+    terminal: &mut Terminal<B>,
+    store: Option<&crate::runs::RunStore>,
+    tmux: &dyn TmuxOps,
+    session_name: &str,
+    sessions_dir: &std::path::Path,
+) -> String {
+    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
+    let attached = attach_session(terminal, tmux, session_name);
+    match woke {
+        Some(woke) => format!("{woke}; {attached}"),
+        None => attached,
+    }
 }
 
 /// Suspend the board's alternate screen and raw mode, run
@@ -1073,6 +1140,10 @@ pub struct WatchDeps {
     /// scoped rows resolve their slug from their own recorded scope; see
     /// [`crate::tui::app::Msg::RunSessionAction`].
     pub session_slug: String,
+    /// See [`TuiDeps::idle_hibernate_mins`].
+    pub idle_hibernate_mins: u64,
+    /// See [`TuiDeps::kill_pid`].
+    pub kill_pid: fn(u32),
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1167,7 +1238,14 @@ fn run_watch_cmds<B: Backend>(
     while let Some(cmd) = pending.pop_front() {
         if let Cmd::AttachSession { session_name } = cmd {
             stamp_root_session(deps.tmux.as_ref(), &session_name);
-            let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+            let sessions_dir = crate::runs::session::sessions_dir_from_process_env();
+            let message = wake_and_attach(
+                terminal,
+                Some(&deps.store),
+                deps.tmux.as_ref(),
+                &session_name,
+                &sessions_dir,
+            );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
             app = next_app;
             pending.extend(more_cmds);
@@ -1381,13 +1459,24 @@ fn reap_runs(deps: &WatchDeps) -> Vec<Msg> {
         return vec![Msg::RunsFailed(err.to_string())];
     }
     let session_alive = session_alive_probe(&crate::work::tmux::ShellTmuxOps);
-    match deps
+    let reaped = match deps
         .store
         .reap(10, &crate::runs::pid::pid_alive, &session_alive)
     {
-        Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
-        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+        Ok(reaped) => reaped,
+        Err(err) => return vec![Msg::RunsFailed(err.to_string())],
+    };
+    // Idle hibernation (GitHub issue #64), as on the board.
+    if let Err(err) = crate::work::hibernate::sweep_idle(
+        &deps.store,
+        deps.tmux.as_ref(),
+        deps.idle_hibernate_mins,
+        &crate::runs::pid::pid_alive,
+        &deps.kill_pid,
+    ) {
+        return vec![Msg::RunsFailed(err.to_string())];
     }
+    vec![Msg::RunsReaped(reaped.len())]
 }
 
 /// Translate a single local (non-network) [`Cmd`] into the [`Msg`]s it
@@ -1563,7 +1652,8 @@ fn load_audit_status(deps: &TuiDeps) -> Vec<Msg> {
 /// Run `Cmd::ReapRuns` on the board: sample live runs' memory footprint
 /// (GitHub issue #66), then mark runs whose process or tmux session
 /// died as terminal, so the status loads that follow on the same poll report
-/// their lanes relaunchable (GitHub issue #26). Same staleness threshold as
+/// their lanes relaunchable (GitHub issue #26). Then hibernate interactive runs
+/// idle past [`TuiDeps::idle_hibernate_mins`] (GitHub issue #64). Same staleness threshold as
 /// `tm runs reap`'s default; the session probe comes from the board's own
 /// tmux seam, so tests drive it with a [`crate::work::tmux::FakeTmuxOps`].
 ///
@@ -1580,10 +1670,22 @@ fn reap_lane_runs(deps: &TuiDeps) -> Vec<Msg> {
         return vec![Msg::RunsFailed(err.to_string())];
     }
     let session_alive = session_alive_probe(deps.tmux.as_ref());
-    match store.reap(10, &crate::runs::pid::pid_alive, &session_alive) {
-        Ok(reaped) => vec![Msg::RunsReaped(reaped.len())],
-        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    let reaped = match store.reap(10, &crate::runs::pid::pid_alive, &session_alive) {
+        Ok(reaped) => reaped,
+        Err(err) => return vec![Msg::RunsFailed(err.to_string())],
+    };
+    // Idle hibernation (GitHub issue #64) rides along with the reap, so
+    // the status loads that follow on this poll show it too.
+    if let Err(err) = crate::work::hibernate::sweep_idle(
+        store,
+        deps.tmux.as_ref(),
+        deps.idle_hibernate_mins,
+        &crate::runs::pid::pid_alive,
+        &deps.kill_pid,
+    ) {
+        return vec![Msg::RunsFailed(err.to_string())];
     }
+    vec![Msg::RunsReaped(reaped.len())]
 }
 
 fn load_lane_run_status(deps: &TuiDeps) -> Vec<Msg> {
@@ -2404,6 +2506,8 @@ mod tests {
             home: std::path::PathBuf::from("/home/test"),
             review_watch: crate::config::ReviewWatchConfig::default(),
             xdg_data_home: None,
+            idle_hibernate_mins: 0,
+            kill_pid: |_| {},
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             lane_names: Vec::new(),
             hidden_lane_count: 0,
@@ -3753,6 +3857,8 @@ mod tests {
             runner: &crate::agent::claude::ClaudeRunner,
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             session_slug: String::new(),
+            idle_hibernate_mins: 0,
+            kill_pid: |_| {},
         }
     }
 
@@ -3777,6 +3883,64 @@ mod tests {
             "expected a @root_session stamp, got {:?}",
             tmux.calls()
         );
+    }
+
+    /// GitHub issue #64: attaching to a session that hosts a hibernated run
+    /// resumes it first, and says so on the status line.
+    #[test]
+    fn wake_hibernated_resumes_the_sessions_hibernated_run_before_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+
+        let message = wake_hibernated(
+            Some(&store),
+            &tmux,
+            "tm-proj-proj-1",
+            &dir.path().join("sessions"),
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some("resumed hibernated run in tm-proj-proj-1:work")
+        );
+        assert_eq!(
+            store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn wake_hibernated_is_silent_when_nothing_is_hibernated() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        assert_eq!(
+            wake_hibernated(
+                None,
+                &tmux,
+                "tm-proj-proj-1",
+                std::path::Path::new("/nowhere")
+            ),
+            None
+        );
+        assert!(tmux.calls().is_empty());
     }
 
     /// Outside tmux there is no client session to point back at (and no
@@ -4047,6 +4211,45 @@ mod tests {
 
         let run = deps.store.run_by_id(run_id).unwrap().unwrap();
         assert!(run.mem_peak_bytes.is_some_and(|b| b > 0));
+    }
+
+    /// GitHub issue #64: `tm runs watch`'s periodic reap also hibernates.
+    #[test]
+    fn execute_watch_reap_runs_hibernates_an_idle_interactive_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                pid: Some(std::process::id()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.backdate_heartbeat_for_tests(run_id, 200);
+        let mut deps = watch_deps(store);
+        deps.idle_hibernate_mins = 120;
+
+        execute_watch(&deps, Cmd::ReapRuns);
+
+        assert_eq!(
+            deps.store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Hibernated
+        );
     }
 
     #[test]
@@ -4504,6 +4707,51 @@ mod tests {
             &mut launches,
         );
         assert_eq!(app.status_line, "detached from tm-proj-proj-1");
+    }
+
+    /// GitHub issue #64: every board attach (`a`, `b`, `s`) wakes the
+    /// session's hibernated runs first.
+    #[test]
+    fn run_cmds_attach_session_wakes_hibernated_runs_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let mut d = deps(FakeJiraClient::new());
+        d.store = Some(store);
+        d.home = dir.path().to_path_buf();
+        let mut terminal = test_terminal();
+
+        let app = run_cmds(
+            App::new(),
+            vec![Cmd::AttachSession {
+                session_name: "tm-proj-proj-1".to_string(),
+            }],
+            &d,
+            &mut terminal,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(
+            app.status_line,
+            "resumed hibernated run in tm-proj-proj-1:work; detached from tm-proj-proj-1"
+        );
     }
 
     /// From inside tmux, attach runs `switch-client` and returns immediately
@@ -5386,6 +5634,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(run.mem_peak_bytes.is_some_and(|b| b > 0));
+    }
+
+    /// GitHub issue #64: the board's poll also hibernates idle interactive
+    /// runs, and the lane badge then reads hibernated rather than running.
+    #[test]
+    fn board_reap_hibernates_an_idle_interactive_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                // Our own pid: alive, so the reap half keeps the run.
+                pid: Some(std::process::id()),
+                ..lane_start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.backdate_heartbeat_for_tests(run_id, 200);
+
+        let mut deps = deps();
+        deps.store = Some(store);
+        deps.idle_hibernate_mins = 120;
+        // Never SIGKILL the test process.
+        deps.kill_pid = |_| {};
+
+        execute(&deps, Cmd::ReapRuns);
+
+        let msgs = execute(&deps, Cmd::LoadLaneRunStatus);
+        match msgs.as_slice() {
+            [Msg::LaneRunStatusLoaded(status)] => {
+                assert_eq!(
+                    status.get("PROJ-1"),
+                    Some(&crate::tui::app::RunIndicator::Hibernated)
+                );
+            }
+            other => panic!("expected LaneRunStatusLoaded, got {other:?}"),
+        }
     }
 
     #[test]

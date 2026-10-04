@@ -197,9 +197,9 @@ tm auth status
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
-| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>] [--findings-count <N>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown and/or the number of unresolved bot review findings (`0` for measured-clean; omit to leave it unmeasured) |
+| `tm runs finish <RUN_ID> --status <STATUS> [...] [--model-usage <JSON>] [--findings-count <N>]` | Record a run's terminal outcome (`done`/`failed`/`blocked`/`review`/`interrupted`), optionally with the authoritative per-model token/cost breakdown and/or the number of unresolved bot review findings (`0` for measured-clean; omit to leave it unmeasured). Refuses a `hibernated` run unless `--force` is passed |
 | `tm runs event <RUN_ID> --kind <KIND> [--detail <JSON>]` | Append a telemetry event to a run and bump its heartbeat |
-| `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs as terminal: a dead recorded pid or killed tmux session immediately (as `interrupted`), a stale signal-less heartbeat otherwise (as `failed`) |
+| `tm runs reap [--stale-after <MINS>]` | Mark abandoned runs as terminal: a dead recorded pid or killed tmux session immediately (as `interrupted`), a stale signal-less heartbeat otherwise (as `failed`). Also hibernates interactive runs idle past `[work] idle_hibernate_mins`; see "Hibernating idle interactive runs" below |
 | `tm runs kill-safety <SESSION>` | Classify how dangerous killing a tmux session would be (`live-run`/`root-session`/`safe`/`unknown` on line 1, reason on line 2), for the session picker's kill confirmation — see `docs/decisions/0005-kill-safety-classification.md` |
 | `tm runs show <KEY> [--kind <KIND>] [--json]` | Print the latest run for a ticket (optionally restricted to one `kind`), its latest checklist (if any), and its event timeline (newest first); `--json` prints one machine-readable JSON object instead (see below) |
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
@@ -251,6 +251,37 @@ stale.
 `tm runs` also has a `MEM` column: a live run's current memory footprint, or
 a finished run's peak. See "Memory footprint and the lane memory budget"
 below for how it is measured.
+
+### Hibernating idle interactive runs
+
+An interactive run's agent sits at its prompt in its tmux window until
+someone closes it, holding hundreds of MB the whole time. Every reap (the
+board's poll, `tm runs watch`, `tm runs reap`) therefore also
+**hibernates** interactive runs whose heartbeat is older than
+`[work] idle_hibernate_mins` (default 120). Every hook event bumps the
+heartbeat, so its age is the time since the agent last did anything.
+
+```toml
+[work]
+idle_hibernate_mins = 120   # 0 turns hibernation off
+```
+
+Hibernating marks the run `hibernated`, then stops its agent with
+`SIGKILL` and closes its window. `SIGKILL` gives the agent no chance to run
+its session-end hook, so the run is never closed as `done`, and
+`tm runs finish` refuses a hibernated run without `--force` anyway. The
+reaper ignores hibernated runs.
+
+Attaching to the ticket's session from the board (`a`, `b`, `s`, `m`), from
+`tm runs watch`, or with `tm work session <KEY>` resumes it. tm reopens the
+same conversation in a fresh window with the runner's resume flag and the
+launch's original flags, and the run goes back to `running`.
+
+Only runs tm can resume are hibernated: an interactive work or fix run
+launched by tm, with a live recorded pid, a registered session id, and not
+hosted in a project root session. Headless runs, audits, and sessions tm
+did not launch are never touched. The kill-safety picker treats a
+hibernated run as `live-run`.
 
 ### The `checklist` event convention
 
@@ -962,6 +993,9 @@ session from the ticket's runs:
   pane. Its window comes back as a shell in the run's worktree, and the
   command prints the `claude --resume <session-id>` line for it. Resuming is
   never automatic: it would start billing and start editing unasked.
+- A **hibernated run** (see "Hibernating idle interactive runs") is resumed
+  in place, in its own window: tm stopped that agent itself, so nothing can
+  be driving it twice.
 - A **finished run** gets no window, of either kind. Reconstruction restores
   working state, not history; `tm runs show`/`tm runs logs` (and the board's
   `L`) are where a finished run lives. A finished interactive run has no log

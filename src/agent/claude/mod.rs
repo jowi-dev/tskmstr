@@ -341,6 +341,18 @@ impl AgentRunner for ClaudeRunner {
         format!("claude --resume {session_id}")
     }
 
+    /// The interactive prompt is positional at `args[0]` (see
+    /// `build_invocation`), so everything after it carries over unchanged
+    /// behind `--resume <id>`.
+    fn resume_spec(&self, invocation: &AgentInvocation) -> crate::agent::ResumeSpec {
+        crate::agent::ResumeSpec {
+            program: invocation.program.clone(),
+            resume_flag: "--resume".to_string(),
+            args: invocation.args.iter().skip(1).cloned().collect(),
+            env_remove: invocation.env_remove.clone(),
+        }
+    }
+
     /// Builds `claude --model <model> <prompt>` (or `claude <prompt>` when
     /// `model` is `None`), every value [`shell_quote`]d. `--model` is
     /// emitted only when `model` is `Some`, so an unconfigured launch keeps
@@ -611,6 +623,22 @@ mod tests {
             def.contains("model: TODO-set-the-subagent-model"),
             "placeholder model: {def}"
         );
+    }
+
+    #[test]
+    fn resume_spec_keeps_every_launch_flag_but_the_prompt() {
+        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
+            mode: RunMode::Interactive,
+            ..base_inputs()
+        });
+
+        let spec = ClaudeRunner.resume_spec(&invocation);
+
+        assert_eq!(spec.program, "claude");
+        assert_eq!(spec.resume_flag, "--resume");
+        assert_eq!(spec.args, invocation.args[1..].to_vec());
+        assert!(!spec.args.iter().any(|a| a == "do the thing"));
+        assert_eq!(spec.env_remove, invocation.env_remove);
     }
 
     #[test]

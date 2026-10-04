@@ -268,6 +268,14 @@ pub enum RunStatus {
     /// [`crate::agent::AgentRunner::parse_outcome`]'s doc comment. Terminal
     /// for board/ordering purposes, same as `Done`/`Failed`.
     Interrupted,
+    /// An interactive run whose agent process tm stopped because it sat idle
+    /// past `[work] idle_hibernate_mins` (GitHub issue #64). Not terminal:
+    /// the conversation is intact on disk under the run's `session_id`, and
+    /// attaching to the ticket's session resumes it and returns the row to
+    /// [`RunStatus::Running`]. [`RunStore::reap`] never touches it (it only
+    /// sweeps `running` rows), which is what keeps a hibernated run from
+    /// reading as interrupted or failed.
+    Hibernated,
 }
 
 impl RunStatus {
@@ -281,6 +289,7 @@ impl RunStatus {
             RunStatus::Done => "done",
             RunStatus::Failed => "failed",
             RunStatus::Interrupted => "interrupted",
+            RunStatus::Hibernated => "hibernated",
         }
     }
 
@@ -295,6 +304,7 @@ impl RunStatus {
             "done" => Some(RunStatus::Done),
             "failed" => Some(RunStatus::Failed),
             "interrupted" => Some(RunStatus::Interrupted),
+            "hibernated" => Some(RunStatus::Hibernated),
             _ => None,
         }
     }
@@ -2187,6 +2197,115 @@ impl RunStore {
         Ok(reaped)
     }
 
+    /// Returns the `running` rows that are candidates for hibernation
+    /// (GitHub issue #64): hosted in tmux (`tmux_session` recorded — headless
+    /// `-p` runs never are), resumable (`session_id` recorded), and quiet for
+    /// longer than `idle_mins` (last heartbeat, falling back to
+    /// `started_at`). Every hook event bumps the heartbeat, so its age is the
+    /// time since the agent last did anything.
+    ///
+    /// Liveness and the presence of a recorded resume recipe are the
+    /// caller's to check (see [`crate::work::hibernate::sweep_idle`]): this
+    /// is only the SQL-expressible part of the rule.
+    pub fn idle_interactive_runs(&self, idle_mins: u64) -> Result<Vec<Run>, RunStoreError> {
+        // idle_mins is a plain integer, not user-supplied text; same
+        // reasoning as `reap`'s modifier.
+        let modifier = format!("-{idle_mins} minutes");
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo
+             FROM runs
+             WHERE status = 'running'
+               AND tmux_session IS NOT NULL
+               AND session_id IS NOT NULL
+               AND COALESCE(heartbeat_at, started_at)
+                     < strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![modifier], Self::row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<Run>>>()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Moves a `running` row to [`RunStatus::Hibernated`] and appends a
+    /// `hibernated` event, atomically. Returns `false` (changing nothing)
+    /// when the row is not `running` — a run that finished or was reaped
+    /// between the caller's candidate query and this call must not be
+    /// resurrected into a resumable state.
+    ///
+    /// `ended_at` stays `NULL`: hibernation is a pause, not an ending. The
+    /// event is inserted directly rather than through [`RunStore::add_event`]
+    /// so the heartbeat keeps recording when the agent was last active.
+    pub fn hibernate_run(&self, run_id: i64) -> Result<bool, RunStoreError> {
+        self.transition_with_event(run_id, "running", RunStatus::Hibernated, "hibernated", None)
+    }
+
+    /// Moves a [`RunStatus::Hibernated`] row back to `running`, recording the
+    /// resumed agent's `pid` and bumping the heartbeat (without the bump the
+    /// next sweep would find the row still idle and hibernate it again), and
+    /// appends a `woke` event. Returns `false` (changing nothing) when the
+    /// row is not hibernated, so two concurrent wakers cannot both claim it.
+    pub fn wake_run(&self, run_id: i64, pid: Option<u32>) -> Result<bool, RunStoreError> {
+        self.transition_with_event(run_id, "hibernated", RunStatus::Running, "woke", Some(pid))
+    }
+
+    /// Shared body of [`RunStore::hibernate_run`]/[`RunStore::wake_run`]: a
+    /// compare-and-set on `status`, plus an event row, in one transaction.
+    /// `pid` of `Some(_)` overwrites the row's pid and bumps its heartbeat.
+    fn transition_with_event(
+        &self,
+        run_id: i64,
+        from: &str,
+        to: RunStatus,
+        event_kind: &str,
+        pid: Option<Option<u32>>,
+    ) -> Result<bool, RunStoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = match pid {
+            Some(pid) => tx.execute(
+                &format!(
+                    "UPDATE runs SET status = ?1, pid = ?2, heartbeat_at = {NOW_SQL}
+                     WHERE id = ?3 AND status = ?4"
+                ),
+                params![to.as_str(), pid, run_id, from],
+            )?,
+            None => tx.execute(
+                "UPDATE runs SET status = ?1 WHERE id = ?2 AND status = ?3",
+                params![to.as_str(), run_id, from],
+            )?,
+        };
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, ?2, NULL)"
+            ),
+            params![run_id, event_kind],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Test-only: set `run_id`'s heartbeat to `minutes_ago` minutes in the
+    /// past, for tests outside this module that need an idle run (the
+    /// connection is private here).
+    #[cfg(test)]
+    pub(crate) fn backdate_heartbeat_for_tests(&self, run_id: i64, minutes_ago: i64) {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE runs SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-{minutes_ago} minutes') WHERE id = ?1"
+                ),
+                params![run_id],
+            )
+            .expect("backdate heartbeat");
+    }
+
     /// Returns the latest run for `ticket` (by `started_at`, breaking ties
     /// by `id`, both descending), or `None` if it has no runs.
     ///
@@ -2857,6 +2976,13 @@ mod tests {
             RunStatus::parse("interrupted"),
             Some(RunStatus::Interrupted)
         );
+    }
+
+    #[test]
+    fn run_status_hibernated_round_trips_and_is_not_terminal() {
+        assert_eq!(RunStatus::Hibernated.as_str(), "hibernated");
+        assert_eq!(RunStatus::parse("hibernated"), Some(RunStatus::Hibernated));
+        assert!(!RunStatus::Hibernated.is_terminal());
     }
 
     #[test]
@@ -5110,6 +5236,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "running");
+    }
+
+    /// A running, tmux-hosted, session-registered run whose heartbeat is
+    /// `idle_mins` old: the shape [`RunStore::idle_interactive_runs`] picks.
+    fn idle_interactive_run(store: &RunStore, ticket: &str, idle_mins: i64) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                pid: Some(4242),
+                ..start_params(ticket)
+            })
+            .unwrap();
+        store.update_session_id(id, "sess-1").unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+        backdate_heartbeat(store, id, idle_mins);
+        id
+    }
+
+    #[test]
+    fn idle_interactive_runs_returns_only_quiet_tmux_hosted_resumable_runs() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let idle = idle_interactive_run(&store, "PROJ-1", 90);
+        let fresh = idle_interactive_run(&store, "PROJ-2", 5);
+        let no_session_id = store.start_run(&start_params("PROJ-3")).unwrap();
+        store
+            .update_tmux_session(no_session_id, "tm-proj-proj-3")
+            .unwrap();
+        backdate_heartbeat(&store, no_session_id, 90);
+        let headless = store.start_run(&start_params("PROJ-4")).unwrap();
+        store.update_session_id(headless, "sess-4").unwrap();
+        backdate_heartbeat(&store, headless, 90);
+        let finished = idle_interactive_run(&store, "PROJ-5", 90);
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET status = 'done' WHERE id = ?1",
+                params![finished],
+            )
+            .unwrap();
+
+        let ids: Vec<i64> = store
+            .idle_interactive_runs(60)
+            .unwrap()
+            .iter()
+            .map(|run| run.id)
+            .collect();
+
+        assert_eq!(ids, vec![idle]);
+        let _ = fresh;
+    }
+
+    #[test]
+    fn hibernate_run_moves_a_running_row_and_records_an_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = idle_interactive_run(&store, "PROJ-1", 90);
+
+        assert!(store.hibernate_run(id).unwrap());
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Hibernated);
+        assert_eq!(run.ended_at, None, "hibernation is not an ending");
+        let events = store.events_for_run(id).unwrap();
+        assert_eq!(events.last().unwrap().kind, "hibernated");
+    }
+
+    #[test]
+    fn hibernate_run_refuses_a_row_that_is_not_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = idle_interactive_run(&store, "PROJ-1", 90);
+        store
+            .conn
+            .execute("UPDATE runs SET status = 'done' WHERE id = ?1", params![id])
+            .unwrap();
+
+        assert!(!store.hibernate_run(id).unwrap());
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
+    #[test]
+    fn hibernated_runs_are_never_reaped() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = idle_interactive_run(&store, "PROJ-1", 90);
+        store.hibernate_run(id).unwrap();
+
+        let reaped = store.reap(10, &|_| false, &|_| false).unwrap();
+
+        assert!(reaped.is_empty());
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Hibernated
+        );
+    }
+
+    #[test]
+    fn wake_run_returns_a_hibernated_row_to_running_with_a_fresh_pid_and_heartbeat() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = idle_interactive_run(&store, "PROJ-1", 90);
+        store.hibernate_run(id).unwrap();
+
+        assert!(store.wake_run(id, Some(5151)).unwrap());
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.pid, Some(5151));
+        assert!(
+            store.idle_interactive_runs(60).unwrap().is_empty(),
+            "waking must bump the heartbeat, or the next sweep re-hibernates it"
+        );
+        assert_eq!(
+            store.events_for_run(id).unwrap().last().unwrap().kind,
+            "woke"
+        );
+    }
+
+    #[test]
+    fn wake_run_refuses_a_row_that_is_not_hibernated() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = idle_interactive_run(&store, "PROJ-1", 90);
+
+        assert!(!store.wake_run(id, Some(5151)).unwrap());
+        assert_eq!(store.run_by_id(id).unwrap().unwrap().pid, Some(4242));
     }
 
     #[test]

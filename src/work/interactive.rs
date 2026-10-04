@@ -21,6 +21,11 @@
 //! 4. `hooks/tm-session-end.sh` finishes the run when the Claude Code
 //!    session ends.
 //!
+//! Callers also record a [`crate::work::hibernate::LaunchRecord`] right
+//! after launching (the window name plus the runner's resume recipe), so
+//! the run can be hibernated when idle and resumed on attach (GitHub issue
+//! #64).
+//!
 //! # Guard before side effects, not at launch time
 //!
 //! `launch_audit` can take one `list_windows` snapshot, refuse a

@@ -200,6 +200,17 @@ pub trait TmuxOps {
     /// Kill session `name` (`tmux kill-session -t <name>`).
     fn kill_session(&self, name: &str) -> Result<(), TmuxError>;
 
+    /// Kill window `window` of session `name` (`tmux kill-window -t
+    /// <name>:<window>`), ending its pane. Used to clear a hibernated run's
+    /// window (GitHub issue #64).
+    fn kill_window(&self, name: &str, window: &str) -> Result<(), TmuxError>;
+
+    /// The pid of the pane process in window `window` of session `name`
+    /// (`tmux display-message -p -t <name>:<window> '#{pane_pid}'`), or
+    /// `Ok(None)` when tmux printed nothing parseable. A woken hibernated
+    /// run records it as its liveness pid (GitHub issue #64).
+    fn pane_pid(&self, name: &str, window: &str) -> Result<Option<u32>, TmuxError>;
+
     /// List all running tmux sessions
     /// (`tmux list-sessions -F '#{session_name}|#{session_path}'`).
     ///
@@ -488,6 +499,30 @@ fn kill_session_args(name: &str) -> Vec<String> {
     ]
 }
 
+fn kill_window_args(name: &str, window: &str) -> Vec<String> {
+    vec![
+        "kill-window".to_string(),
+        "-t".to_string(),
+        format!("{name}:{window}"),
+    ]
+}
+
+fn pane_pid_args(name: &str, window: &str) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        format!("{name}:{window}"),
+        "#{pane_pid}".to_string(),
+    ]
+}
+
+/// Parses `tmux display-message -p '#{pane_pid}'` output; anything that is
+/// not a pid is `None` rather than an error.
+fn parse_pane_pid(stdout: &str) -> Option<u32> {
+    stdout.trim().parse().ok()
+}
+
 fn list_sessions_args() -> Vec<String> {
     vec![
         "list-sessions".to_string(),
@@ -720,6 +755,17 @@ impl TmuxOps for ShellTmuxOps {
         require_success("tmux kill-session", &output)
     }
 
+    fn kill_window(&self, name: &str, window: &str) -> Result<(), TmuxError> {
+        let output = run("tmux kill-window", &kill_window_args(name, window))?;
+        require_success("tmux kill-window", &output)
+    }
+
+    fn pane_pid(&self, name: &str, window: &str) -> Result<Option<u32>, TmuxError> {
+        let output = run("tmux display-message", &pane_pid_args(name, window))?;
+        require_success("tmux display-message", &output)?;
+        Ok(parse_pane_pid(&String::from_utf8_lossy(&output.stdout)))
+    }
+
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         // `work.ml` reads via `Unix.open_process_in` and never inspects the
         // child's exit status (and redirects stderr to /dev/null), so a
@@ -799,6 +845,7 @@ pub struct FakeTmuxOps {
     list_windows_index: std::cell::RefCell<usize>,
     attach_outcome: std::cell::RefCell<AttachOutcome>,
     current_session_name_result: std::cell::RefCell<Result<Option<String>, TmuxError>>,
+    pane_pid_result: std::cell::RefCell<Result<Option<u32>, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -868,6 +915,20 @@ pub enum TmuxCall {
     Attach(String),
     /// `kill_session(name)`.
     KillSession(String),
+    /// `kill_window(name, window)`.
+    KillWindow {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window: String,
+    },
+    /// `pane_pid(name, window)`.
+    PanePid {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window: String,
+    },
     /// `list_sessions()`.
     ListSessions,
     /// `root_session_targets()`.
@@ -901,6 +962,7 @@ impl FakeTmuxOps {
             list_windows_index: std::cell::RefCell::new(0),
             attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
             current_session_name_result: std::cell::RefCell::new(Ok(None)),
+            pane_pid_result: std::cell::RefCell::new(Ok(None)),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -951,6 +1013,12 @@ impl FakeTmuxOps {
     /// Set the result `current_session_name` will return.
     pub fn with_current_session_name(self, result: Result<Option<String>, TmuxError>) -> Self {
         *self.current_session_name_result.borrow_mut() = result;
+        self
+    }
+
+    /// Set the result `pane_pid` will return.
+    pub fn with_pane_pid(self, result: Result<Option<u32>, TmuxError>) -> Self {
+        *self.pane_pid_result.borrow_mut() = result;
         self
     }
 
@@ -1046,6 +1114,22 @@ impl TmuxOps for FakeTmuxOps {
             .borrow_mut()
             .push(TmuxCall::KillSession(name.to_string()));
         Ok(())
+    }
+
+    fn kill_window(&self, name: &str, window: &str) -> Result<(), TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::KillWindow {
+            name: name.to_string(),
+            window: window.to_string(),
+        });
+        Ok(())
+    }
+
+    fn pane_pid(&self, name: &str, window: &str) -> Result<Option<u32>, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::PanePid {
+            name: name.to_string(),
+            window: window.to_string(),
+        });
+        self.pane_pid_result.borrow().clone()
     }
 
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
@@ -1703,6 +1787,57 @@ mod tests {
                 env,
                 command: "claude '/ticket-audit PROJ-1'".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn kill_window_args_target_the_session_window() {
+        assert_eq!(
+            kill_window_args("tm-proj-proj-1", "work"),
+            vec!["kill-window", "-t", "tm-proj-proj-1:work"]
+        );
+    }
+
+    #[test]
+    fn pane_pid_args_print_the_windows_pane_pid() {
+        assert_eq!(
+            pane_pid_args("tm-proj-proj-1", "work"),
+            vec![
+                "display-message",
+                "-p",
+                "-t",
+                "tm-proj-proj-1:work",
+                "#{pane_pid}"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_pane_pid_reads_a_number_and_tolerates_garbage() {
+        assert_eq!(parse_pane_pid("4242\n"), Some(4242));
+        assert_eq!(parse_pane_pid(""), None);
+        assert_eq!(parse_pane_pid("nope"), None);
+    }
+
+    #[test]
+    fn fake_kill_window_and_pane_pid_are_recorded() {
+        let fake = FakeTmuxOps::new().with_pane_pid(Ok(Some(77)));
+
+        fake.kill_window("s", "work").unwrap();
+        assert_eq!(fake.pane_pid("s", "work").unwrap(), Some(77));
+
+        assert_eq!(
+            fake.calls(),
+            vec![
+                TmuxCall::KillWindow {
+                    name: "s".to_string(),
+                    window: "work".to_string()
+                },
+                TmuxCall::PanePid {
+                    name: "s".to_string(),
+                    window: "work".to_string()
+                },
+            ]
         );
     }
 

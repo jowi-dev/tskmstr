@@ -71,6 +71,30 @@ pub fn reap(
     Ok(())
 }
 
+/// The idle-hibernation half of `tm runs reap` (GitHub issue #64): stop
+/// interactive runs idle past `idle_mins` via
+/// [`crate::work::hibernate::sweep_idle`], printing `Hibernated run {id}
+/// ({ticket}): idle past {idle_mins}m` for each. Prints nothing when none
+/// qualified (the reap half already reports its own nothing-to-do line), and
+/// is a no-op when `idle_mins` is `0`.
+pub fn hibernate_idle(
+    store: &RunStore,
+    tmux: &dyn crate::work::tmux::TmuxOps,
+    idle_mins: u64,
+    pid_alive: &dyn Fn(u32) -> bool,
+    kill_pid: &dyn Fn(u32),
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    for run in crate::work::hibernate::sweep_idle(store, tmux, idle_mins, pid_alive, kill_pid)? {
+        writeln!(
+            out,
+            "Hibernated run {} ({}): idle past {idle_mins}m",
+            run.id, run.ticket
+        )?;
+    }
+    Ok(())
+}
+
 /// Errors surfaced by `tm runs` subcommands.
 #[derive(Debug, Error)]
 pub enum RunsCliError {
@@ -107,6 +131,13 @@ pub enum RunsCliError {
         /// The run id that has no session id.
         run_id: i64,
     },
+
+    /// `tm runs finish` was pointed at a hibernated run without `--force`.
+    #[error(
+        "run {0} is hibernated (its idle agent was stopped and resumes on attach); \
+         pass --force to finish it anyway"
+    )]
+    Hibernated(i64),
 
     /// `tm runs reopen` was given a numeric id with no matching run row.
     #[error("no run with id {0}")]
@@ -145,13 +176,28 @@ pub fn start(store: &RunStore, params: &StartRun, out: &mut dyn Write) -> Result
 ///
 /// Prints `Finished run {id}: {status}` with `status` lowercased, matching
 /// the string [`crate::runs::RunStatus::as_str`] stores in the database.
+///
+/// A [`RunStatus::Hibernated`] run is refused with
+/// [`RunsCliError::Hibernated`] unless `force` is set (`--force`): the only
+/// automated callers are the agents' session-end hooks, and a hibernated
+/// run's agent ending is tm stopping it on purpose, not the run finishing
+/// (GitHub issue #64).
 pub fn finish(
     store: &RunStore,
     run_id: i64,
     outcome: &FinishRun,
+    force: bool,
     runner: &dyn crate::agent::AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
+    if !force
+        && store
+            .run_by_id(run_id)?
+            .is_some_and(|run| run.status == RunStatus::Hibernated)
+    {
+        return Err(RunsCliError::Hibernated(run_id));
+    }
+
     let mut outcome = outcome.clone();
 
     if let Some(model_usage) = &outcome.model_usage {
@@ -1246,6 +1292,7 @@ mod tests {
                 status: RunStatus::Done,
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut out,
         )
@@ -1258,13 +1305,108 @@ mod tests {
     }
 
     #[test]
+    fn hibernate_idle_prints_each_hibernated_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store
+            .start_run(&StartRun {
+                pid: Some(4242),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(id, "sess-1").unwrap();
+        store.update_tmux_session(id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: ClaudeRunner.resume_spec(&crate::agent::AgentInvocation {
+                    program: "claude".to_string(),
+                    args: vec!["prompt".to_string()],
+                    env_set: Vec::new(),
+                    env_remove: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+        store.backdate_heartbeat_for_tests(id, 200);
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+        let mut out = Vec::new();
+
+        hibernate_idle(&store, &tmux, 120, &|_| true, &|_| {}, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Hibernated run {id} (PROJ-1): idle past 120m\n")
+        );
+    }
+
+    #[test]
+    fn hibernate_idle_prints_nothing_when_nothing_is_idle() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut out = Vec::new();
+
+        hibernate_idle(
+            &store,
+            &crate::work::tmux::FakeTmuxOps::new(),
+            120,
+            &|_| true,
+            &|_| {},
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(out.is_empty(), "reap already prints the nothing-to-do line");
+    }
+
+    /// The session-end hooks finish with `--status done` and swallow
+    /// errors; refusing here is what keeps an agent stopped for
+    /// hibernation from closing its own run (GitHub issue #64).
+    #[test]
+    fn finish_refuses_a_hibernated_run_unless_forced() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.hibernate_run(id).unwrap();
+        let done = FinishRun {
+            status: RunStatus::Done,
+            ..FinishRun::default()
+        };
+        let mut out = Vec::new();
+
+        let err = finish(&store, id, &done, false, &ClaudeRunner, &mut out)
+            .expect_err("a hibernated run is not finished by default");
+        assert!(matches!(err, RunsCliError::Hibernated(run) if run == id));
+        assert!(out.is_empty());
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Hibernated
+        );
+
+        finish(&store, id, &done, true, &ClaudeRunner, &mut out).expect("forced finish");
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
+    #[test]
     fn finish_unknown_run_id_errors_and_prints_nothing() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
         let mut out = Vec::new();
 
-        let err = finish(&store, 999, &FinishRun::default(), &ClaudeRunner, &mut out)
-            .expect_err("should fail");
+        let err = finish(
+            &store,
+            999,
+            &FinishRun::default(),
+            false,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .expect_err("should fail");
 
         assert!(matches!(
             err,
@@ -1288,6 +1430,7 @@ mod tests {
                 model_usage: Some(r#"{"claude-unpriced-model":{"inputTokens":146}}"#.to_string()),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut out,
         )
@@ -1323,7 +1466,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            &ClaudeRunner,
+            false, &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -1360,7 +1503,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            &ClaudeRunner,
+            false, &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -1384,6 +1527,7 @@ mod tests {
                 model_usage: Some("not json".to_string()),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut out,
         )
@@ -1412,6 +1556,7 @@ mod tests {
                 model_usage: Some("[1,2,3]".to_string()),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut out,
         )
@@ -2394,6 +2539,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2445,6 +2591,7 @@ mod tests {
                 status: RunStatus::Done,
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2474,6 +2621,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2826,6 +2974,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
+            false,
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2896,7 +3045,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            &ClaudeRunner,
+            false, &ClaudeRunner,
             &mut Vec::new(),
         )
         .unwrap();
@@ -2933,7 +3082,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            &ClaudeRunner,
+            false, &ClaudeRunner,
             &mut Vec::new(),
         )
         .unwrap();

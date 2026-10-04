@@ -294,6 +294,14 @@ pub fn fix(
             prepared.wt_name, prepared.timestamp
         ));
         launch_interactive_run(deps.tmux, target, &prepared, &prompt_path, deps.runner)?;
+        crate::work::hibernate::record_launch(
+            deps.run_store,
+            prepared.run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: target.window_name.clone(),
+                resume: deps.runner.resume_spec(&prepared.invocation),
+            },
+        )?;
 
         writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
         writeln!(out, "worktree  {}", worktree.display())?;
@@ -792,6 +800,11 @@ mod tests {
             review_fix_run.tmux_session,
             Some("tm-proj-proj-1".to_string())
         );
+        // The deduplicated window is what a wake must recreate (issue #64).
+        let record = crate::work::hibernate::launch_record(&run_store, review_fix_run.id)
+            .unwrap()
+            .expect("an interactive fix pass records a resume recipe");
+        assert_eq!(record.window, "fix-2");
 
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("window    tm-proj-proj-1:fix-2"));

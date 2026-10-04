@@ -402,6 +402,7 @@ fn run_work(
                 &run_store,
                 &identity,
                 &current_exe,
+                &tskmstr::runs::session::sessions_dir_from_process_env(),
                 &key,
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
@@ -639,6 +640,8 @@ fn run_board(
             manual: config.work.manual,
             review_watch: config.work.review_watch,
             xdg_data_home,
+            idle_hibernate_mins: config.work.idle_hibernate_mins,
+            kill_pid: tskmstr::runs::pid::kill_pid,
             home,
             launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
             lane_names,
@@ -1775,6 +1778,7 @@ fn run_runs(
             transcript,
             model_usage,
             findings_count,
+            force,
         }) => {
             let outcome = tskmstr::runs::FinishRun {
                 status: status.into(),
@@ -1792,6 +1796,7 @@ fn run_runs(
                 &store,
                 run_id,
                 &outcome,
+                force,
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,
             )?;
@@ -1828,6 +1833,21 @@ fn run_runs(
                 stale_after,
                 &tskmstr::runs::pid::pid_alive,
                 &session_alive,
+                &mut stdout,
+            )?;
+            // Idle hibernation (GitHub issue #64) rides along with every
+            // reap. No loadable config still gets the default threshold.
+            let idle_mins = full_config
+                .as_ref()
+                .map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
+                    cfg.work.idle_hibernate_mins
+                });
+            tskmstr::cli::runs::hibernate_idle(
+                &store,
+                &tskmstr::work::tmux::ShellTmuxOps,
+                idle_mins,
+                &tskmstr::runs::pid::pid_alive,
+                &tskmstr::runs::pid::kill_pid,
                 &mut stdout,
             )?;
         }
@@ -1883,6 +1903,12 @@ fn run_runs(
                     .as_ref()
                     .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).session_slug())
                     .unwrap_or_default(),
+                idle_hibernate_mins: full_config
+                    .as_ref()
+                    .map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
+                        cfg.work.idle_hibernate_mins
+                    }),
+                kill_pid: tskmstr::runs::pid::kill_pid,
             })?;
         }
         Some(RunsCmd::Logs {

@@ -315,6 +315,12 @@ impl AgentKind {
     }
 }
 
+/// Default for [`RawWorkConfig::idle_hibernate_mins`]: two hours. Generous
+/// on purpose: heartbeat age is a proxy for idleness, and a user reading a
+/// long agent reply without typing looks idle too. A wrong guess costs one
+/// attach, which resumes the conversation.
+pub const DEFAULT_IDLE_HIBERNATE_MINS: u64 = 120;
+
 /// Raw, partially-specified `[work]` section as parsed directly from TOML.
 ///
 /// Mirrors [`RawConfig`]'s optional-everything shape: either the global or
@@ -348,6 +354,12 @@ pub struct RawWorkConfig {
     /// Name of the tmux window considered "primary" (e.g. where the driver
     /// process runs) when a lane's session is provisioned.
     pub tmux_primary_window: Option<String>,
+    /// Minutes an interactive run may sit idle (no hook events) before
+    /// tm hibernates it: stops its agent process and resumes it the next
+    /// time its ticket session is attached (GitHub issue #64). `0` turns
+    /// hibernation off. Defaults to [`DEFAULT_IDLE_HIBERNATE_MINS`] when
+    /// unset in both global and repo config.
+    pub idle_hibernate_mins: Option<u64>,
     /// Per-lane definitions, keyed by lane name.
     ///
     /// Merge precedence: a repo-local lane entry replaces the corresponding
@@ -731,6 +743,9 @@ pub struct WorkConfig {
     pub tmux_windows: Vec<String>,
     /// See [`RawWorkConfig::tmux_primary_window`].
     pub tmux_primary_window: Option<String>,
+    /// See [`RawWorkConfig::idle_hibernate_mins`]; already defaulted, so `0`
+    /// here always means "off".
+    pub idle_hibernate_mins: u64,
     /// Validated per-lane definitions, keyed by lane name.
     pub lanes: BTreeMap<String, LaneConfig>,
     /// Validated `[work.audit]` settings. See [`AuditConfig`]; empty (no
@@ -1658,6 +1673,10 @@ fn merge_work(
         .or(global.tmux_windows)
         .unwrap_or_default();
     let tmux_primary_window = repo.tmux_primary_window.or(global.tmux_primary_window);
+    let idle_hibernate_mins = repo
+        .idle_hibernate_mins
+        .or(global.idle_hibernate_mins)
+        .unwrap_or(DEFAULT_IDLE_HIBERNATE_MINS);
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
@@ -1722,6 +1741,7 @@ fn merge_work(
         build_slots,
         tmux_windows,
         tmux_primary_window,
+        idle_hibernate_mins,
         lanes,
         audit,
         create,
@@ -3840,6 +3860,57 @@ mod tests {
     // --- `[work]` section ---
 
     #[test]
+    fn idle_hibernate_mins_defaults_to_two_hours_when_unset() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.idle_hibernate_mins, DEFAULT_IDLE_HIBERNATE_MINS);
+        assert_eq!(DEFAULT_IDLE_HIBERNATE_MINS, 120);
+    }
+
+    #[test]
+    fn idle_hibernate_mins_repo_overrides_global_and_zero_is_kept() {
+        let global = RawWorkConfig {
+            idle_hibernate_mins: Some(60),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            idle_hibernate_mins: Some(0),
+            ..Default::default()
+        };
+
+        let cfg = merge_work(Some(global.clone()), Some(repo), None).expect("should merge");
+        assert_eq!(cfg.idle_hibernate_mins, 0, "0 is the opt-out, not unset");
+
+        let cfg = merge_work(Some(global), None, None).expect("should merge");
+        assert_eq!(cfg.idle_hibernate_mins, 60);
+    }
+
+    #[test]
+    fn load_parses_idle_hibernate_mins_from_the_work_section() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work]
+            idle_hibernate_mins = 45
+            "#,
+        )
+        .unwrap();
+
+        let cfg = load(&ConfigPaths {
+            global: global_path,
+            repo: None,
+        })
+        .expect("should load");
+
+        assert_eq!(cfg.work.idle_hibernate_mins, 45);
+    }
+
+    #[test]
     fn merge_work_absent_from_both_produces_empty_defaults() {
         let cfg = merge(raw_full(), None).expect("should merge");
         assert_eq!(cfg.work.worktree_root, None);
@@ -4120,6 +4191,7 @@ mod tests {
             default_permission_mode: Some("acceptEdits".to_string()),
             tmux_windows: Some(vec!["shell".to_string()]),
             tmux_primary_window: Some("code".to_string()),
+            idle_hibernate_mins: None,
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
@@ -4137,6 +4209,7 @@ mod tests {
             default_permission_mode: None,
             tmux_windows: None,
             tmux_primary_window: None,
+            idle_hibernate_mins: None,
             lanes: BTreeMap::new(),
             audit: None,
             create: None,
