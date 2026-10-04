@@ -4733,12 +4733,12 @@ mod tests {
         )
         .unwrap();
         store.hibernate_run(run_id).unwrap();
-        let mut d = deps(FakeJiraClient::new());
+        let mut d = deps();
         d.store = Some(store);
         d.home = dir.path().to_path_buf();
         let mut terminal = test_terminal();
 
-        let app = run_cmds(
+        let app = run_cmds_test(
             App::new(),
             vec![Cmd::AttachSession {
                 session_name: "tm-proj-proj-1".to_string(),
