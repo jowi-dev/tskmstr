@@ -798,6 +798,14 @@ pub struct App {
     /// now that the merge itself is a watched child rather than a tracked
     /// [`InFlight`] network action (GitHub issue #61).
     pub pending_merge_launches: std::collections::HashSet<String>,
+    /// Ticket keys the operator has marked on [`Screen::Board`] for one
+    /// batch `tm merge KEY1 KEY2 ...` ([`Msg::ToggleMergeQueue`], GitHub
+    /// issue #68). Non-empty, it turns `M` into the batch confirmation
+    /// ([`Msg::MergePrAction`]); accepting that confirmation moves every key
+    /// into `pending_merge_launches` and clears this set. A `BTreeSet` so
+    /// membership and rendering are deterministic; the launch itself orders
+    /// keys by board position, not by this set's lexical order.
+    pub merge_queue: std::collections::BTreeSet<String>,
     /// Per-ticket lane-run badge state for [`Screen::Board`], keyed by ticket
     /// key. Populated by [`Cmd::LoadLaneRunStatus`], polled every 8th
     /// [`Msg::Tick`] (~2s at the 250ms poll interval), same cadence as
@@ -1061,6 +1069,12 @@ pub enum Msg {
     /// column/status, like the `a` audit key: the PR resolution itself is
     /// the authority on whether there is anything to merge.
     MergePrAction,
+    /// The `Space` key on [`Screen::Board`] (GitHub issue #68): flip the
+    /// selected ticket in or out of [`App::merge_queue`]. A no-op when no
+    /// ticket is selected or a confirmation overlay is open; a status-line
+    /// message only when the ticket's merge is already in
+    /// [`App::pending_merge_launches`].
+    ToggleMergeQueue,
     /// [`Cmd::ResolvePrForMerge`] finished: `pr`/`repo_root` are `Some`
     /// when an open GitHub PR was found for `key` (the executor always
     /// sets both or neither), `None` otherwise -- which covers "no PR
@@ -1913,6 +1927,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::MergePrAction => merge_pr_action(app),
+        Msg::ToggleMergeQueue => toggle_merge_queue(app),
         Msg::MergePrResolved {
             key,
             pr,
@@ -2424,6 +2439,28 @@ fn merge_pr_action(mut app: App) -> (App, Vec<Cmd>) {
     }
     app.status_line = format!("resolving PR for {key}...");
     (app, vec![Cmd::ResolvePrForMerge { key }])
+}
+
+/// Handle [`Msg::ToggleMergeQueue`]: flip the selected board ticket in or
+/// out of [`App::merge_queue`] (GitHub issue #68). Inert off the board,
+/// with no selection, or while a confirmation overlay is open; refuses a
+/// ticket whose merge is already in flight, mirroring [`merge_pr_action`].
+fn toggle_merge_queue(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Board || app.merge_confirm.is_some() || app.lane_confirm.is_some() {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    if app.pending_merge_launches.contains(&key) {
+        app.status_line = format!("merge for {key} already in flight");
+        return (app, Vec::new());
+    }
+    if !app.merge_queue.remove(&key) {
+        app.merge_queue.insert(key);
+    }
+    (app, Vec::new())
 }
 
 /// Handle [`Msg::MergePrResolved`]: [`Cmd::ResolvePrForMerge`]'s result
@@ -4244,6 +4281,66 @@ mod tests {
         );
         assert!(!app.pending_merge_launches.contains("PROJ-1"));
         assert!(cmds.is_empty());
+    }
+
+    // --- Msg::ToggleMergeQueue (GitHub issue #68) ---
+
+    #[test]
+    fn toggle_merge_queue_adds_the_hovered_ticket() {
+        let app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1);
+        let (app, cmds) = update(app, Msg::ToggleMergeQueue);
+        assert_eq!(
+            app.merge_queue,
+            std::collections::BTreeSet::from(["PROJ-2".to_string()])
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_removes_an_already_queued_ticket() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.merge_queue.insert("PROJ-1".to_string());
+        let (app, cmds) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_on_an_in_flight_merge_is_a_noop_with_a_status_line() {
+        let mut app = board_with(vec![ticket("PROJ-1")], 0);
+        app.pending_merge_launches.insert("PROJ-1".to_string());
+        let (app, cmds) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
+        assert_eq!(app.status_line, "merge for PROJ-1 already in flight");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_with_no_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_while_a_confirmation_is_open_is_a_noop() {
+        let app = App {
+            merge_confirm: Some(merge_confirm_fixture()),
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
+    }
+
+    #[test]
+    fn toggle_merge_queue_off_board_is_a_noop() {
+        let app = App {
+            screen: Screen::Detail,
+            ..board_with(vec![ticket("PROJ-1")], 0)
+        };
+        let (app, _) = update(app, Msg::ToggleMergeQueue);
+        assert!(app.merge_queue.is_empty());
     }
 
     fn app_with_browser_picker(options: Vec<BrowserPickerOption>, selected: usize) -> App {
