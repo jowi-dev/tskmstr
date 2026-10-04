@@ -228,7 +228,83 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Merge { .. } => {
             unreachable!("tm merge is special-cased in main() before dispatch")
         }
+        Command::Drift { fix, stall_hours } => run_drift(fix, stall_hours, &keychain, env_token),
     }
+}
+
+/// `tm drift [--fix] [--stall-hours N]`: audit every known project for
+/// ticket/run status drift (GitHub issue #80).
+///
+/// "Known projects" are the main repo roots behind every ticket scope the
+/// run store has lane runs for (each scope's newest worktree still on
+/// disk, see [`tskmstr::cli::drift::project_worktrees`]), plus the current
+/// repo, deduplicated by path: lanes are configured per repo, so the run
+/// store is the only cross-project registry. Each project is loaded with
+/// its own `.tskmstr.toml` layered over the global config, so its own
+/// backend and `status_on_*` keys apply; one whose config can't load, or
+/// whose ticket provider can't be built, is reported as a warning and
+/// skipped.
+fn run_drift(
+    fix: bool,
+    stall_hours: i64,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+    let mut dirs: Vec<PathBuf> = tskmstr::cli::drift::project_worktrees(&run_store.all_runs()?)
+        .iter()
+        .filter_map(|worktrees| {
+            worktrees
+                .iter()
+                .find_map(|worktree| git_common_repo_root_of(Path::new(worktree)))
+        })
+        .collect();
+    dirs.extend(git_common_repo_root());
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.canonicalize().unwrap_or_else(|_| dir.clone())));
+
+    let mut stdout = std::io::stdout();
+    let mut loaded = Vec::new();
+    for dir in dirs {
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        let built = config::load(&config::default_paths(&home, Some(&dir)))
+            .map_err(Box::<dyn std::error::Error>::from)
+            .and_then(|cfg| {
+                let provider = ticket_provider_for(&cfg, keychain, env_token.clone())?;
+                Ok((cfg, provider))
+            });
+        match built {
+            Ok((cfg, provider)) => loaded.push((name, dir, cfg, provider)),
+            Err(err) => writeln!(stdout, "warning: {name}: skipped: {err}")?,
+        }
+    }
+
+    let projects: Vec<_> = loaded
+        .iter()
+        .map(
+            |(name, dir, cfg, provider)| tskmstr::cli::drift::DriftProject {
+                name: name.clone(),
+                repo_dir: dir.clone(),
+                config: cfg,
+                provider: provider.as_ref(),
+            },
+        )
+        .collect();
+    let gh = ShellGhCli::new();
+    tskmstr::cli::drift::run(
+        &projects,
+        &gh,
+        &run_store,
+        tskmstr::cli::drift::DriftOptions { fix, stall_hours },
+        &mut stdout,
+    )?;
+    Ok(())
 }
 
 /// Dispatch `tm backend init-labels` / `tm backend clean-status-labels`.
@@ -823,7 +899,15 @@ fn default_config_paths() -> ConfigPaths {
 /// [`tskmstr::work::git::GitOps`]: config bootstrap runs before any
 /// `GitOps` instance exists.
 fn git_common_repo_root() -> Option<PathBuf> {
+    git_common_repo_root_of(Path::new("."))
+}
+
+/// [`git_common_repo_root`] for an arbitrary `dir` rather than the current
+/// directory, e.g. a lane worktree recorded in the run store (`tm drift`'s
+/// project discovery). `None` when `dir` no longer exists.
+fn git_common_repo_root_of(dir: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
+        .current_dir(dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .stderr(std::process::Stdio::null())
         .output()

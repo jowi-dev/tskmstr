@@ -157,6 +157,34 @@ pub fn collect(
     Ok(drifted)
 }
 
+/// Group `runs` (newest first, as [`RunStore::all_runs`] returns them) into
+/// one list of lane worktree paths per ticket scope: the run store is the
+/// only cross-project registry tskmstr has, since lanes are configured in
+/// each repo's own `.tskmstr.toml`. Scopes come out in order of their
+/// newest lane run, and each list newest first and deduplicated, so a
+/// caller can resolve a project's repo root from its first worktree still
+/// on disk. Legacy unscoped rows (`""`) and non-lane runs are skipped.
+pub fn project_worktrees(runs: &[Run]) -> Vec<Vec<String>> {
+    let mut scopes: Vec<(&str, Vec<String>)> = Vec::new();
+    for run in runs
+        .iter()
+        .filter(|run| run.kind == "lane" && !run.scope.is_empty())
+    {
+        let index = match scopes.iter().position(|(scope, _)| *scope == run.scope) {
+            Some(index) => index,
+            None => {
+                scopes.push((&run.scope, Vec::new()));
+                scopes.len() - 1
+            }
+        };
+        let worktrees = &mut scopes[index].1;
+        if !worktrees.contains(&run.worktree) {
+            worktrees.push(run.worktree.clone());
+        }
+    }
+    scopes.into_iter().map(|(_, worktrees)| worktrees).collect()
+}
+
 /// The lifecycle of the PR `run` opened, matched by the run's recorded
 /// branch or by the number at the end of its recorded PR URL. The most
 /// recently updated match wins.
@@ -177,7 +205,9 @@ fn run_pr_lifecycle(run: &Run, prs: &[PrSummary]) -> Option<PrLifecycle> {
 /// `tm drift`: print every project's drifted tickets and, with
 /// `opts.fix`, apply their suggested transitions. A project whose lookups
 /// fail is reported as a warning and skipped, so one broken repo doesn't
-/// hide drift in the others. Returns the number of drifted tickets found.
+/// hide drift in the others; the closing summary counts only the projects
+/// actually checked, so a clean result says how much it covered. Returns
+/// the number of drifted tickets found.
 pub fn run(
     projects: &[DriftProject],
     gh: &dyn GhCli,
@@ -186,6 +216,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> io::Result<usize> {
     let mut total = 0;
+    let mut checked = 0;
     for project in projects {
         let drifted = match collect(project, gh, store, opts.stall_hours) {
             Ok(drifted) => drifted,
@@ -194,6 +225,7 @@ pub fn run(
                 continue;
             }
         };
+        checked += 1;
         if drifted.is_empty() {
             continue;
         }
@@ -218,12 +250,15 @@ pub fn run(
     }
 
     match (total, opts.fix) {
-        (0, _) => writeln!(out, "No drifted tickets.")?,
+        (0, _) => writeln!(
+            out,
+            "No drifted tickets across {checked} project(s) checked."
+        )?,
         (n, false) => writeln!(
             out,
-            "{n} drifted ticket(s). Run `tm drift --fix` to apply the suggested transitions."
+            "{n} drifted ticket(s) across {checked} project(s). Run `tm drift --fix` to apply the suggested transitions."
         )?,
-        (n, true) => writeln!(out, "{n} drifted ticket(s).")?,
+        (n, true) => writeln!(out, "{n} drifted ticket(s) across {checked} project(s).")?,
     }
     Ok(total)
 }
@@ -468,6 +503,41 @@ mod tests {
     }
 
     #[test]
+    fn project_worktrees_groups_lane_worktrees_by_scope_newest_first() {
+        let (_dir, store) = store();
+        let start = |ticket: &str, scope: &str, worktree: &str, kind: &str| {
+            store
+                .start_run(&StartRun {
+                    ticket: ticket.to_string(),
+                    scope: scope.to_string(),
+                    lane: "lane".to_string(),
+                    worktree: worktree.to_string(),
+                    branch: None,
+                    pid: None,
+                    kind: kind.to_string(),
+                    log_path: None,
+                })
+                .unwrap()
+        };
+        start("GH-1", "github:a/one", "/wt/one/gh-1", "lane");
+        start("GH-2", "github:b/two", "/wt/two/gh-2", "lane");
+        start("GH-3", "github:a/one", "/wt/one/gh-3", "lane");
+        start("GH-3", "github:a/one", "/wt/one/gh-3", "lane");
+        start("GH-4", "github:a/one", "/wt/one/audit", "audit");
+        start("GH-5", "", "/wt/legacy", "lane");
+        // Same-second starts tie on started_at; ids break the tie.
+        let runs = store.all_runs().unwrap();
+
+        assert_eq!(
+            project_worktrees(&runs),
+            vec![
+                vec!["/wt/one/gh-3".to_string(), "/wt/one/gh-1".to_string()],
+                vec!["/wt/two/gh-2".to_string()],
+            ]
+        );
+    }
+
+    #[test]
     fn suggested_target_prefers_configured_keys_and_never_fixes_stalled() {
         let config = Config {
             status_on_pr: Some("Code Review".to_string()),
@@ -520,7 +590,7 @@ mod tests {
             out,
             "proj\n  PROJ-1 [To Do] work finished, ticket still not started \
              (run: done, pr: none) -> In Review\n\
-             1 drifted ticket(s). Run `tm drift --fix` to apply the suggested transitions.\n"
+             1 drifted ticket(s) across 1 project(s). Run `tm drift --fix` to apply the suggested transitions.\n"
         );
     }
 
@@ -601,6 +671,6 @@ mod tests {
             out.starts_with("warning: proj: ticket search failed:"),
             "{out}"
         );
-        assert!(out.ends_with("No drifted tickets.\n"));
+        assert!(out.ends_with("No drifted tickets across 0 project(s) checked.\n"));
     }
 }

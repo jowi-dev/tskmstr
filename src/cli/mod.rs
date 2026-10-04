@@ -227,6 +227,22 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// List tickets whose tracker status has drifted from what their lane
+    /// runs and PRs actually did, across every project with a configured
+    /// lane (plus the current repo): finished work still in To Do, merged
+    /// PRs whose ticket isn't done, running lanes on a To Do ticket, and
+    /// in-progress tickets with no live run or open PR (stalled). Read-only
+    /// unless `--fix` is given. See `docs/plans/gh-80-status-drift.md`.
+    Drift {
+        /// Apply each finding's suggested `status_on_*` transition. Stalled
+        /// tickets are never moved.
+        #[arg(long)]
+        fix: bool,
+        /// Hours since an in-progress ticket's latest lane run started,
+        /// with no live run or open PR, before it counts as stalled.
+        #[arg(long, default_value_t = drift::DEFAULT_STALL_HOURS)]
+        stall_hours: i64,
+    },
 }
 
 /// `tm backend` subcommands.
@@ -1322,6 +1338,31 @@ mod tests {
     fn parses_check_quiet() {
         let cli = Cli::try_parse_from(["tm", "check", "--quiet"]).expect("should parse");
         assert!(matches!(cli.command, Some(Command::Check { quiet: true })));
+    }
+
+    #[test]
+    fn parses_drift_read_only_with_default_stall_hours() {
+        let cli = Cli::try_parse_from(["tm", "drift"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Drift {
+                fix: false,
+                stall_hours: 24
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_drift_fix_and_stall_hours() {
+        let cli = Cli::try_parse_from(["tm", "drift", "--fix", "--stall-hours", "6"])
+            .expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Drift {
+                fix: true,
+                stall_hours: 6
+            })
+        ));
     }
 
     #[test]
