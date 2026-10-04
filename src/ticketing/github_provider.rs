@@ -9,7 +9,10 @@
 //! place that rule lives; [`transitions`](TicketProvider::transitions) and
 //! [`transition`](TicketProvider::transition) both build on it rather than
 //! fetching a transition list from anywhere, since GitHub has nothing to
-//! fetch. Dependencies come from GitHub's native issue-dependencies GraphQL
+//! fetch. A label left behind on an issue closed outside `tm` (a PR's
+//! closing keyword) is cleared by
+//! [`clear_closed_status_labels`](TicketProvider::clear_closed_status_labels)
+//! (GitHub issue #75). Dependencies come from GitHub's native issue-dependencies GraphQL
 //! feature (already wrapped by [`crate::github::gh_cli::GhCli::issue_dependencies`])
 //! and are surfaced as [`LinkedIssue`]s under the link type name `"Blocks"`,
 //! matching the hardcoded string [`crate::blocker_stacking`] and
@@ -629,6 +632,35 @@ impl TicketProvider for GithubProvider<'_> {
                 None => ProviderError::from(err),
             }
         })
+    }
+
+    /// Removes every `tm:status/*` label from `key` when the issue is
+    /// closed; an open issue (or a closed one with no status label) is left
+    /// untouched and costs only the `issue_view`. See the trait method for
+    /// why (GitHub issue #75).
+    fn clear_closed_status_labels(&self, key: &str) -> Result<Vec<String>, ProviderError> {
+        let number = parse_issue_number(key)?;
+        let info = self
+            .gh
+            .issue_view(&self.repo, number)
+            .map_err(|err| map_issue_view_error(key, err))?;
+        if !matches!(info.state, IssueState::Closed) {
+            return Ok(Vec::new());
+        }
+        let remove_labels: Vec<String> = info
+            .labels
+            .into_iter()
+            .filter(|label| label.starts_with(STATUS_LABEL_PREFIX))
+            .collect();
+        if remove_labels.is_empty() {
+            return Ok(remove_labels);
+        }
+        let req = IssueEditRequest {
+            remove_labels: remove_labels.clone(),
+            ..Default::default()
+        };
+        self.gh.issue_edit(&self.repo, number, &req)?;
+        Ok(remove_labels)
     }
 
     fn search(&self, query: &TicketQuery) -> Result<SearchResult, ProviderError> {
@@ -1260,6 +1292,65 @@ mod tests {
         assert_eq!(*number, 3);
         assert_eq!(req.remove_labels, vec!["tm:status/todo".to_string()]);
         assert_eq!(req.add_labels, vec!["tm:status/blocked".to_string()]);
+    }
+
+    #[test]
+    fn clear_closed_status_labels_strips_status_labels_from_a_closed_issue() {
+        let fake = FakeGhCli::new().with_issue_view(
+            27,
+            Ok(issue_info(
+                27,
+                "T",
+                IssueState::Closed,
+                &["bug", "tm:status/in-review"],
+            )),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/vocalfry".to_string());
+
+        let removed = provider.clear_closed_status_labels("GH-27").unwrap();
+
+        assert_eq!(removed, vec!["tm:status/in-review".to_string()]);
+        let calls = fake.issue_edit_calls();
+        assert_eq!(calls.len(), 1);
+        let (repo, number, req) = &calls[0];
+        assert_eq!(repo, "jowi-dev/vocalfry");
+        assert_eq!(*number, 27);
+        assert_eq!(req.remove_labels, vec!["tm:status/in-review".to_string()]);
+        assert!(req.add_labels.is_empty());
+        assert_eq!(req.state, None);
+    }
+
+    #[test]
+    fn clear_closed_status_labels_leaves_an_open_issue_alone() {
+        // A PR that only says `Refs #N` leaves its issue open on purpose;
+        // its status label must survive the merge.
+        let fake = FakeGhCli::new().with_issue_view(
+            27,
+            Ok(issue_info(
+                27,
+                "T",
+                IssueState::Open,
+                &["tm:status/in-review"],
+            )),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/vocalfry".to_string());
+
+        let removed = provider.clear_closed_status_labels("GH-27").unwrap();
+
+        assert!(removed.is_empty());
+        assert!(fake.issue_edit_calls().is_empty());
+    }
+
+    #[test]
+    fn clear_closed_status_labels_skips_the_edit_when_a_closed_issue_has_none() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(27, Ok(issue_info(27, "T", IssueState::Closed, &["bug"])));
+        let provider = GithubProvider::new(&fake, "jowi-dev/vocalfry".to_string());
+
+        let removed = provider.clear_closed_status_labels("GH-27").unwrap();
+
+        assert!(removed.is_empty());
+        assert!(fake.issue_edit_calls().is_empty());
     }
 
     #[test]

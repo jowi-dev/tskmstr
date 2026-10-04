@@ -252,6 +252,24 @@ pub trait TicketProvider {
         Ok(())
     }
 
+    /// Strip leftover workflow-status markers from `key` if (and only if)
+    /// the ticket is already closed, returning the markers removed (empty
+    /// when there was nothing to strip or the ticket is still open).
+    ///
+    /// A ticket closed outside `tm` -- GitHub closing an issue because a
+    /// merged PR's body said `Closes #N` -- keeps whatever status marker it
+    /// last had, so a closed issue still shows `tm:status/in-review`
+    /// everywhere labels are read directly (GitHub issue #75). Open tickets
+    /// are never touched: a PR that only says `Refs #N` deliberately leaves
+    /// its ticket open and in its current status.
+    ///
+    /// The default is a no-op: a Jira status is a workflow field that
+    /// closing already moves, so there's no separate marker to go stale.
+    /// The github backend overrides this to remove `tm:status/*` labels.
+    fn clear_closed_status_labels(&self, _key: &str) -> Result<Vec<String>, ProviderError> {
+        Ok(Vec::new())
+    }
+
     /// Whether `token` is plausibly a ticket key in this backend's key
     /// scheme. Used by PR title/body/branch key scraping
     /// ([`crate::ticketing::resolve_existing_key`] and every
