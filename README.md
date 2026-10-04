@@ -789,7 +789,8 @@ to" windows.
 | `L` | Open the selected ticket's latest run's log file in `less` (board only); see "`tm runs logs`" below |
 | `V` | Open the selected ticket's lane-run worktree in `vdiff` for review (board only); see "Board-launched vdiff review loop" below |
 | `F` | Dispatch a fix pass over the review comments `vdiff` captured for the selected ticket (board only); see "Board-launched vdiff review loop" below |
-| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); see "Merging from the board" below |
+| `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); with tickets queued via `Space`, confirms and merges the whole queue in one `tm merge KEY1 KEY2 ...` instead; see "Merging from the board" below |
+| `Space` | Toggle the selected ticket in or out of the merge queue, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
 | `R` | Open the retro board (board only); see "Retro board" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
@@ -1270,6 +1271,19 @@ in progress on disk in the meantime. Any other failure (no mergeable PR, a
 `gh`/`git` error) surfaces as its own status-line message; nothing is
 merged and no status is touched.
 
+#### Queueing several tickets for one batch merge
+
+`Space` on a board card toggles it in and out of a merge queue; a queued
+card shows a magenta `+` after its readiness glyph. A ticket whose merge is
+already in flight can't be queued (the status line says so). With anything
+queued, `M` skips the PR lookup and opens a "Merge queue" confirmation
+listing every queued key in board order (column, then position), which is
+the order `tm merge` receives them. Confirming runs one
+`tm merge KEY1 KEY2 ...` watched child (see "Merging several tickets at once"
+below), clears the queue, and marks every key in flight until it
+finishes. Cancelling leaves the queue as it was. With nothing queued, `M`
+merges the hovered ticket exactly as described above.
+
 ### Merging a ticket's PR
 
 `tm merge <KEY>` is what the board's `M` key runs (see "Merging from the
@@ -1368,8 +1382,9 @@ handed back, else `0`.
 
 Two boundaries worth knowing:
 
-- **The board's `M` key still merges one ticket.** Batch merge is CLI-only
-  for now.
+- **The board's `M` key batches only what you queue.** Queue tickets with
+  `Space` first (see "Queueing several tickets for one batch merge" above);
+  with nothing queued, `M` merges just the selected ticket.
 - **A resolved ticket merges onto the base it was rebased onto.** If a
   later ticket in the same batch merged into that base in the meantime,
   `gh pr merge` may refuse an out-of-date branch, depending on the repo's
