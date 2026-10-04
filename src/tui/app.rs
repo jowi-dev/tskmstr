@@ -1103,10 +1103,10 @@ pub enum Msg {
     /// tmux window). `merged` additionally refetches the board's tickets so
     /// a transitioned ticket moves column (or, on the GitHub backend, a
     /// closed one leaves the board) without waiting for a manual refresh.
-    /// Also clears `key` from [`App::pending_merge_launches`].
+    /// Also clears every one of `keys` from [`App::pending_merge_launches`].
     MergePrResult {
-        /// Ticket key the merge was for.
-        key: String,
+        /// Ticket keys the merge was for (more than one for a batch).
+        keys: Vec<String>,
         /// Whether the merge itself succeeded.
         merged: bool,
         /// The status-line outcome text.
@@ -1610,8 +1610,10 @@ pub enum Cmd {
     /// `tm merge` re-resolves the PR itself, so unlike the direct-merge
     /// path this replaced, no PR number rides along.
     LaunchMerge {
-        /// Ticket key whose confirmed PR to merge.
-        key: String,
+        /// Ticket keys whose PRs to merge, in argv order: one for the
+        /// single-ticket confirm, the whole merge queue for a batch
+        /// (GitHub issue #68).
+        keys: Vec<String>,
     },
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::OpenBrowserAction`]'s picker-or-direct-open decision. Reports
@@ -1939,11 +1941,13 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::MergePrResult {
-            key,
+            keys,
             merged,
             message,
         } => {
-            app.pending_merge_launches.remove(&key);
+            for key in &keys {
+                app.pending_merge_launches.remove(key);
+            }
             app.status_line = message;
             if merged {
                 let query = query_for_filter(&app.filter, &app.project_key);
@@ -2476,7 +2480,7 @@ fn merge_confirm_accept(mut app: App) -> (App, Vec<Cmd>) {
     let key = confirm.key;
     app.status_line = format!("merging {key} via tm merge...");
     app.pending_merge_launches.insert(key.clone());
-    (app, vec![Cmd::LaunchMerge { key }])
+    (app, vec![Cmd::LaunchMerge { keys: vec![key] }])
 }
 
 /// Handle [`Msg::BotsAction`]: the `b` key's attach-or-launch-or-arm
@@ -4162,7 +4166,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::LaunchMerge {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
             }]
         );
     }
@@ -4194,7 +4198,7 @@ mod tests {
         let (app, cmds) = update(
             app,
             Msg::MergePrResult {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
                 merged: true,
                 message: "merged PROJ-1 via tm merge".to_string(),
             },
@@ -4210,13 +4214,29 @@ mod tests {
     }
 
     #[test]
+    fn merge_pr_result_clears_every_batch_key_from_pending_merge_launches() {
+        let mut app = board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 0);
+        app.pending_merge_launches.insert("PROJ-1".to_string());
+        app.pending_merge_launches.insert("PROJ-2".to_string());
+        let (app, _) = update(
+            app,
+            Msg::MergePrResult {
+                keys: vec!["PROJ-1".to_string(), "PROJ-2".to_string()],
+                merged: false,
+                message: "conflicts handed back".to_string(),
+            },
+        );
+        assert!(app.pending_merge_launches.is_empty());
+    }
+
+    #[test]
     fn merge_pr_result_failed_sets_status_line_without_refetching() {
         let mut app = board_with(vec![ticket("PROJ-1")], 0);
         app.pending_merge_launches.insert("PROJ-1".to_string());
         let (app, cmds) = update(
             app,
             Msg::MergePrResult {
-                key: "PROJ-1".to_string(),
+                keys: vec!["PROJ-1".to_string()],
                 merged: false,
                 message: "conflicts handed back for PROJ-1: resolve in the merge tmux window, \
                           then rerun `tm merge PROJ-1`"
