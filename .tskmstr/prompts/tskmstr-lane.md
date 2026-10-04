@@ -34,3 +34,19 @@ cargo test
 ```
 
 Do not report the ticket done while any of these fail.
+
+## Open the pull request
+
+Once the checks above are green, the ticket is not done until its PR is
+open. Push the branch and open the PR with tskmstr, which also links the
+ticket and applies the configured `status_on_pr` transition:
+
+```
+git push -u origin HEAD
+tm pr create --title "<KEY>: <short summary>" --body "<what changed and why>"
+```
+
+- If `tm ready` returned `3` (stackable), add `--base <blocking PR's branch>`.
+- Do not end the session without a PR URL. If `tm pr create` fails, retry
+  once, then report the exact error in your final message.
+- Include the PR URL in your final message.

@@ -1,5 +1,5 @@
 schema_version = 2
-status_on_start = "In Progress"
+status_on_run_start = "In Progress"
 status_on_pr = "In Review"
 [backend]
 provider = "github"
