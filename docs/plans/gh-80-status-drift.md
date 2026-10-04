@@ -84,14 +84,17 @@ silently moving tickets would hide the bugs this command exists to find.
 The reconciliation is a safety net. These gaps were filed as their own
 tickets:
 
-- Headless lane supervisor resolves the run's PR but never applies
+- #92: the headless lane supervisor resolves the run's PR but never applies
   `status_on_pr`, so a PR opened with `gh pr create` leaves the ticket
   behind.
-- `tm work run` skips `status_on_run_start` silently when its ticket
+- #93: `tm work run` skips `status_on_run_start` silently when its ticket
   provider can't be built.
-- A stacked PR merged outside `tm merge` never closes its issue (closing
+- #94: a stacked PR merged outside `tm merge` never closes its issue (closing
   keywords only fire on the default branch).
 
 Already tracked: #74 (missing config keys), #75 (stale status labels on
 closed issues, fixed), #79 (false "no transition" warning when already in
 target).
+
+#82 (a `runs.repo_root` column) would let project discovery read repo roots
+directly instead of resolving them from each scope's lane worktrees.
