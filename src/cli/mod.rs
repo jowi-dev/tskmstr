@@ -15,6 +15,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 pub mod auth;
 pub mod backend;
 pub mod check;
+pub mod drift;
 pub mod init;
 pub mod pr;
 pub mod ready;
