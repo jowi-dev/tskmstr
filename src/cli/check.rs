@@ -1,6 +1,6 @@
 //! `tm check`: a read-only drift report for a repo already onboarded by `tm
 //! init` (GitHub issue #38). It answers "is this repo up to date with the
-//! tskmstr binary running it?" two ways:
+//! tskmstr binary running it?" three ways:
 //!
 //! - **The schema_version stamp** ([`crate::config::manifest`]): does the
 //!   repo's `.tskmstr.toml` carry the revision this binary expects, an older
@@ -10,8 +10,12 @@
 //!   for it, does every configured session's `prompt_file` (when set) exist
 //!   where its launcher would read it, and does every configured session's
 //!   leading `/skill` exist somewhere this binary would find it?
+//! - **Expected config keys** ([`manifest::EXPECTED_CONFIG_KEYS`], GitHub
+//!   issue #74): is every key a newer feature registered set in the repo or
+//!   global config? A missing key is named with its suggested value; a
+//!   missing *recommended* key is advisory and doesn't affect the exit code.
 //!
-//! Both checks are presence-only. `tm check` never opens a scaffolded
+//! All three are presence-only. `tm check` never opens a scaffolded
 //! asset's *contents* — lane prompts and skills are meant to be edited after
 //! `tm init` writes them (GitHub issue #30's agent-assisted setup edits them
 //! on purpose), so a content diff would flag normal customization as drift.
@@ -29,8 +33,9 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item};
 
 use crate::agent::AgentRunner;
+use crate::config::BackendKind;
 use crate::config::ConfigPaths;
-use crate::config::manifest::{self, StampStatus};
+use crate::config::manifest::{self, ExpectedConfigKey, KeySeverity, StampStatus};
 
 use super::init::{existing_lane_prompt_path, resolve_repo_relative, str_at};
 
@@ -135,6 +140,42 @@ pub enum DriftFinding {
     /// content decision, so this is reported as drift `tm update` cannot
     /// clear on its own.
     LegacyPromptDir { key: String, value: String },
+    /// A config key registered in [`manifest::EXPECTED_CONFIG_KEYS`] is set
+    /// in neither the repo-local nor the global config (GitHub issue #74).
+    /// `key` is its dotted path (e.g. `status_on_pr`); `suggested_default`
+    /// is the value `tm update` would write for this repo's backend, or
+    /// `None` when there is no safe one to assume. A
+    /// [`KeySeverity::Recommended`] key is advisory (see
+    /// [`DriftFinding::is_advisory`]).
+    MissingConfigKey {
+        key: String,
+        since_schema_version: i64,
+        severity: KeySeverity,
+        suggested_default: Option<String>,
+    },
+}
+
+impl DriftFinding {
+    /// `true` for a finding that is worth reporting but isn't drift: a
+    /// missing [`KeySeverity::Recommended`] config key, for which tskmstr
+    /// already assumes a default. Advisory findings never make `tm check` /
+    /// `tm update` exit non-zero.
+    pub fn is_advisory(&self) -> bool {
+        matches!(
+            self,
+            DriftFinding::MissingConfigKey {
+                severity: KeySeverity::Recommended,
+                ..
+            }
+        )
+    }
+}
+
+/// `true` when `findings` holds real drift — anything but an
+/// [advisory](DriftFinding::is_advisory) finding. Drives `tm check`'s and
+/// `tm update`'s exit code: advisory-only results still exit `0`.
+pub fn has_drift(findings: &[DriftFinding]) -> bool {
+    findings.iter().any(|finding| !finding.is_advisory())
 }
 
 impl std::fmt::Display for DriftFinding {
@@ -190,6 +231,22 @@ impl std::fmt::Display for DriftFinding {
                 "`{key}` = \"{value}\" points at the legacy top-level prompts/ directory; \
                  move the file under .tskmstr/prompts/ and update the key"
             ),
+            DriftFinding::MissingConfigKey {
+                key,
+                since_schema_version,
+                severity,
+                suggested_default,
+            } => {
+                write!(
+                    f,
+                    "`{key}` is not set ({} since schema_version {since_schema_version}); ",
+                    severity.as_str()
+                )?;
+                match suggested_default {
+                    Some(default) => write!(f, "suggested: {key} = \"{default}\""),
+                    None => write!(f, "set it in .tskmstr.toml"),
+                }
+            }
         }
     }
 }
@@ -216,22 +273,42 @@ pub fn run_check(
     Ok(findings)
 }
 
-/// `tm check --quiet`: the stamp-only fast path (GitHub issue #39), meant to
-/// run on every shell entry via direnv. Reads `.tskmstr.toml` and compares
-/// only its `schema_version` stamp against
-/// [`manifest::CURRENT_SCHEMA_VERSION`] — none of the full report's lane and
-/// skill scans, no global config, no runner resolution. Prints nothing when
-/// the stamp is current, and exactly one nudge line when it isn't.
+/// `tm check --quiet`: the fast path (GitHub issue #39), meant to run on
+/// every shell entry via direnv. Reads `.tskmstr.toml` and compares its
+/// `schema_version` stamp against [`manifest::CURRENT_SCHEMA_VERSION`], and
+/// flags any missing [`KeySeverity::Required`] config key (GitHub issue
+/// #74) — none of the full report's lane and skill scans, no merged config
+/// load, no runner resolution. The global config file is only parsed as
+/// TOML, so a key set there counts as present. Prints nothing when there's
+/// no such drift, and one nudge line per finding when there is.
 pub fn run_check_quiet(
     paths: &ConfigPaths,
     out: &mut dyn Write,
 ) -> Result<Vec<DriftFinding>, CheckCliError> {
     let (doc, _) = read_repo_doc(paths)?;
-    let finding = stamp_finding(&doc);
-    if let Some(finding) = &finding {
+    let global = read_global_doc(paths);
+    let findings = quiet_findings(&doc, global.as_ref(), manifest::EXPECTED_CONFIG_KEYS);
+    for finding in &findings {
         writeln!(out, "{}", quiet_nudge(finding))?;
     }
-    Ok(finding.into_iter().collect())
+    Ok(findings)
+}
+
+/// The quiet path's findings: the stamp, then every missing required key in
+/// `keys`. Recommended keys are advisory and stay out of the shell-entry
+/// nudge.
+fn quiet_findings(
+    doc: &DocumentMut,
+    global: Option<&DocumentMut>,
+    keys: &[ExpectedConfigKey],
+) -> Vec<DriftFinding> {
+    let mut findings: Vec<DriftFinding> = stamp_finding(doc).into_iter().collect();
+    findings.extend(
+        config_key_findings(doc, global, keys)
+            .into_iter()
+            .filter(|finding| !finding.is_advisory()),
+    );
+    findings
 }
 
 /// The one-line nudge `tm check --quiet` prints for a stamp finding: what's
@@ -252,8 +329,77 @@ fn quiet_nudge(finding: &DriftFinding) -> String {
             "this repo was onboarded by a newer tskmstr (schema_version {found}, expected {}); update tskmstr",
             manifest::CURRENT_SCHEMA_VERSION
         ),
+        DriftFinding::MissingConfigKey { key, .. } => {
+            format!("tskmstr config is missing required key `{key}`; run `tm check` for details")
+        }
         other => other.to_string(),
     }
+}
+
+/// Parse the global config file as a raw TOML document, for key-presence
+/// checks only. Lenient by design: a missing or unparseable global file is
+/// `None` (no keys set there), because `tm check` reports on the repo-local
+/// file and must run even when the global one is absent or broken — the
+/// commands that actually load config report a bad global file themselves.
+pub(crate) fn read_global_doc(paths: &ConfigPaths) -> Option<DocumentMut> {
+    std::fs::read_to_string(&paths.global).ok()?.parse().ok()
+}
+
+/// `true` when `doc` has any value at `path` (tables descended in order).
+fn has_key(doc: &DocumentMut, path: &[&str]) -> bool {
+    let Some((last, tables)) = path.split_last() else {
+        return false;
+    };
+    let mut table = doc.as_table() as &dyn toml_edit::TableLike;
+    for name in tables {
+        match table.get(name).and_then(Item::as_table_like) {
+            Some(next) => table = next,
+            None => return false,
+        }
+    }
+    table.get(last).is_some()
+}
+
+/// The backend this repo selects: `[backend].provider` from the repo config,
+/// else the global config, else the [`BackendKind`] default (Jira). An
+/// unrecognized provider is `None` — no backend-specific default applies.
+fn backend_kind(doc: &DocumentMut, global: Option<&DocumentMut>) -> Option<BackendKind> {
+    let provider = str_at(doc, &["backend", "provider"])
+        .or_else(|| global.and_then(|g| str_at(g, &["backend", "provider"])));
+    match provider {
+        Some(provider) => BackendKind::parse(provider),
+        None => Some(BackendKind::default()),
+    }
+}
+
+/// The config-key half of the report (GitHub issue #74): every key in
+/// `keys` set in neither `doc` nor `global`, in registry order. A
+/// recommended key with no suggested default for this repo's backend is
+/// skipped — there is nothing actionable to tell the operator, and a
+/// permanent unfixable nag would bury real drift.
+fn config_key_findings(
+    doc: &DocumentMut,
+    global: Option<&DocumentMut>,
+    keys: &[ExpectedConfigKey],
+) -> Vec<DriftFinding> {
+    let backend = backend_kind(doc, global);
+    keys.iter()
+        .filter(|key| !has_key(doc, key.path) && !global.is_some_and(|g| has_key(g, key.path)))
+        .filter_map(|key| {
+            let suggested_default = backend
+                .and_then(|backend| (key.suggested_default)(backend))
+                .map(str::to_string);
+            if suggested_default.is_none() && key.severity == KeySeverity::Recommended {
+                return None;
+            }
+            Some(DriftFinding::MissingConfigKey {
+                key: key.dotted(),
+                since_schema_version: key.since_schema_version,
+                severity: key.severity,
+                suggested_default,
+            })
+        })
+        .collect()
 }
 
 /// Read and parse the repo-local `.tskmstr.toml`, shared by the full and
@@ -290,6 +436,12 @@ pub(crate) fn collect_findings(
     findings.extend(lane_findings(ctx, doc, repo_dir));
     findings.extend(session_prompt_findings(ctx, doc, repo_dir));
     findings.extend(session_findings(ctx, doc, repo_dir));
+    let global = read_global_doc(ctx.paths);
+    findings.extend(config_key_findings(
+        doc,
+        global.as_ref(),
+        manifest::EXPECTED_CONFIG_KEYS,
+    ));
     findings
 }
 
@@ -1228,6 +1380,176 @@ mod tests {
         assert!(
             !rendered.contains("tm update"),
             "`tm update` cannot fix a newer stamp: {rendered}"
+        );
+    }
+
+    fn parse(text: &str) -> DocumentMut {
+        text.parse().expect("valid toml")
+    }
+
+    /// A key registry for exercising the severity/default branches the
+    /// shipped [`manifest::EXPECTED_CONFIG_KEYS`] doesn't (yet) use.
+    const TEST_KEYS: &[ExpectedConfigKey] = &[
+        ExpectedConfigKey {
+            path: &["work", "merge", "model"],
+            since_schema_version: 2,
+            severity: KeySeverity::Required,
+            suggested_default: |_| None,
+        },
+        ExpectedConfigKey {
+            path: &["status_on_pr"],
+            since_schema_version: 1,
+            severity: KeySeverity::Recommended,
+            suggested_default: |backend| match backend {
+                BackendKind::Github => Some("In Review"),
+                BackendKind::Jira => None,
+            },
+        },
+    ];
+
+    #[test]
+    fn github_repo_missing_status_keys_names_each_with_its_suggested_value() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [backend]\n\
+             provider = \"github\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert_eq!(
+            findings,
+            vec![
+                DriftFinding::MissingConfigKey {
+                    key: "status_on_pr".to_string(),
+                    since_schema_version: 2,
+                    severity: KeySeverity::Recommended,
+                    suggested_default: Some("In Review".to_string()),
+                },
+                DriftFinding::MissingConfigKey {
+                    key: "status_on_run_start".to_string(),
+                    since_schema_version: 2,
+                    severity: KeySeverity::Recommended,
+                    suggested_default: Some("In Progress".to_string()),
+                },
+            ]
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("`status_on_pr` is not set")
+                && rendered.contains("status_on_pr = \"In Review\""),
+            "key and suggested value named in: {rendered}"
+        );
+        assert!(
+            rendered.contains("recommended since schema_version 2"),
+            "severity and version named in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn config_key_set_in_repo_is_not_reported() {
+        let doc = parse(
+            "status_on_pr = \"Review\"\n\
+             [backend]\n\
+             provider = \"github\"\n",
+        );
+        assert_eq!(config_key_findings(&doc, None, TEST_KEYS).len(), 1);
+        assert!(config_key_findings(&doc, None, TEST_KEYS).iter().all(
+            |f| !matches!(f, DriftFinding::MissingConfigKey { key, .. } if key == "status_on_pr")
+        ));
+    }
+
+    #[test]
+    fn config_key_set_in_global_config_is_not_reported() {
+        let doc = parse("[backend]\nprovider = \"github\"\n");
+        let global = parse("status_on_pr = \"Review\"\n[work.merge]\nmodel = \"opus\"\n");
+        assert_eq!(config_key_findings(&doc, Some(&global), TEST_KEYS), vec![]);
+    }
+
+    #[test]
+    fn backend_selected_in_global_config_picks_the_suggested_default() {
+        let doc = parse("[work.merge]\nmodel = \"opus\"\n");
+        let global = parse("[backend]\nprovider = \"github\"\n");
+        assert_eq!(
+            config_key_findings(&doc, Some(&global), TEST_KEYS),
+            vec![DriftFinding::MissingConfigKey {
+                key: "status_on_pr".to_string(),
+                since_schema_version: 1,
+                severity: KeySeverity::Recommended,
+                suggested_default: Some("In Review".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn recommended_key_without_a_default_for_the_backend_is_not_reported() {
+        // No `[backend]`: Jira, for which status_on_pr has no safe default.
+        let doc = parse("[work.merge]\nmodel = \"opus\"\n");
+        assert_eq!(config_key_findings(&doc, None, TEST_KEYS), vec![]);
+    }
+
+    #[test]
+    fn required_key_without_a_default_is_still_reported() {
+        let doc = parse("");
+        assert_eq!(
+            config_key_findings(&doc, None, TEST_KEYS),
+            vec![DriftFinding::MissingConfigKey {
+                key: "work.merge.model".to_string(),
+                since_schema_version: 2,
+                severity: KeySeverity::Required,
+                suggested_default: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn only_recommended_config_keys_are_advisory() {
+        let finding = |severity| DriftFinding::MissingConfigKey {
+            key: "k".to_string(),
+            since_schema_version: 2,
+            severity,
+            suggested_default: None,
+        };
+        assert!(finding(KeySeverity::Recommended).is_advisory());
+        assert!(!finding(KeySeverity::Required).is_advisory());
+        assert!(!DriftFinding::StampMissing.is_advisory());
+    }
+
+    #[test]
+    fn has_drift_ignores_advisory_findings() {
+        let recommended = DriftFinding::MissingConfigKey {
+            key: "status_on_pr".to_string(),
+            since_schema_version: 2,
+            severity: KeySeverity::Recommended,
+            suggested_default: Some("In Review".to_string()),
+        };
+        assert!(!has_drift(&[]));
+        assert!(!has_drift(std::slice::from_ref(&recommended)));
+        assert!(has_drift(&[recommended, DriftFinding::StampMissing]));
+    }
+
+    #[test]
+    fn quiet_findings_surface_missing_required_keys_but_not_recommended_ones() {
+        let doc = parse("schema_version = 2\n[backend]\nprovider = \"github\"\n");
+        let findings = quiet_findings(&doc, None, TEST_KEYS);
+        assert_eq!(
+            findings,
+            vec![DriftFinding::MissingConfigKey {
+                key: "work.merge.model".to_string(),
+                since_schema_version: 2,
+                severity: KeySeverity::Required,
+                suggested_default: None,
+            }]
+        );
+        let nudge = quiet_nudge(&findings[0]);
+        assert!(
+            nudge.contains("work.merge.model") && nudge.contains("tm check"),
+            "names the key and where to look: {nudge}"
         );
     }
 

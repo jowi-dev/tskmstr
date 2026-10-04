@@ -137,6 +137,8 @@ pub fn run_update(
             // an additive fix; reported as remaining drift only (GitHub
             // issue #53).
             DriftFinding::LegacyPromptDir { .. } => {}
+            // Not yet reconciled; reported as remaining drift.
+            DriftFinding::MissingConfigKey { .. } => {}
         }
     }
 
