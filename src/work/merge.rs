@@ -6,8 +6,10 @@
 //! open PR, locate a local checkout of its branch (if any), fetch and
 //! rebase (opening a conflict-resolution tmux session and polling it to
 //! completion when the rebase stops on conflicts), merge the PR via `gh`,
-//! fast-forward the local base branch, best-effort clean up the worktree
-//! and branch, apply the configured `status_on_merge` transition, and
+//! fast-forward the local base branch, best-effort clean up the worktree,
+//! branch, and ticket tmux session (its scrollback archived first, see
+//! [`crate::work::session_gc`]; GitHub issue #78), apply the configured
+//! `status_on_merge` transition, and
 //! finally clear any `tm:status/*` label GitHub left on an issue the PR's
 //! closing keyword closed (GitHub issue #75).
 //!
@@ -44,6 +46,7 @@ use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::github::pr::find_pr_for_ticket;
+use crate::runs::pid::pid_alive;
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::{StatusTransition, apply_status_on_merge};
@@ -51,6 +54,7 @@ use crate::work::git::{GitError, GitOps, RebaseOutcome};
 use crate::work::naming::ticket_session_name;
 use crate::work::prompt::{PromptFileError, read_prompt_file};
 use crate::work::review_watch::{Clock, Sleeper};
+use crate::work::session_gc;
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
 };
@@ -578,7 +582,7 @@ pub fn run_merge(
             ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
         }
     }
-    finish_merge(deps, &prepared, out)?;
+    finish_merge(deps, &prepared, None, out)?;
     Ok(MergeFlowOutcome::Merged)
 }
 
@@ -665,10 +669,13 @@ pub fn run_merge_batch(
                 )?;
                 set_aside.push((prepared, conflict));
             }
-            None => finish_into_report(deps, &prepared, &mut report, out)?,
+            None => finish_into_report(deps, &prepared, None, &mut report, out)?,
         }
     }
 
+    // The shared conflict session, kept alive while any ticket is handed
+    // back to it (see [`finish_merge`]'s `kept_session`).
+    let mut kept_session: Option<String> = None;
     let resolved: Vec<PreparedMerge> = match set_aside.len() {
         0 => Vec::new(),
         1 => {
@@ -697,7 +704,10 @@ pub fn run_merge_batch(
         n => {
             writeln!(out, "=== shared conflict session: {n} tickets ===")?;
             match run_batch_conflict_session(deps, &set_aside, out) {
-                Ok(flags) => {
+                Ok((flags, target)) => {
+                    if flags.contains(&false) {
+                        kept_session = Some(target);
+                    }
                     let mut resolved = Vec::new();
                     for ((prepared, _), ok) in set_aside.into_iter().zip(flags) {
                         if ok {
@@ -721,7 +731,7 @@ pub fn run_merge_batch(
     for mut prepared in resolved {
         writeln!(out, "=== finishing {} ===", prepared.key)?;
         prepared.needs_push = true;
-        finish_into_report(deps, &prepared, &mut report, out)?;
+        finish_into_report(deps, &prepared, kept_session.as_deref(), &mut report, out)?;
     }
 
     writeln!(
@@ -756,13 +766,15 @@ fn record_failure(
 }
 
 /// Runs [`finish_merge`] for `prepared`, recording the result in `report`.
+/// `kept_session` is passed through (see [`finish_merge`]).
 fn finish_into_report(
     deps: &MergeDeps<'_>,
     prepared: &PreparedMerge,
+    kept_session: Option<&str>,
     report: &mut BatchMergeReport,
     out: &mut dyn Write,
 ) -> Result<(), MergeError> {
-    match finish_merge(deps, prepared, out) {
+    match finish_merge(deps, prepared, kept_session, out) {
         Ok(()) => {
             report.merged.push(prepared.key.clone());
             Ok(())
@@ -791,13 +803,13 @@ fn batch_ticket_list(tickets: &[(PreparedMerge, PendingConflict)]) -> String {
 }
 
 /// Opens the one agent window shared by every set-aside ticket, then polls
-/// them all. Returns one flag per ticket, in order: `true` if its rebase
-/// resolved.
+/// them all. Returns one flag per ticket, in order (`true` if its rebase
+/// resolved), plus the tmux session the shared window was opened in.
 fn run_batch_conflict_session(
     deps: &MergeDeps<'_>,
     tickets: &[(PreparedMerge, PendingConflict)],
     out: &mut dyn Write,
-) -> Result<Vec<bool>, MergeError> {
+) -> Result<(Vec<bool>, String), MergeError> {
     let template = match deps.merge_cfg.batch_conflict_prompt.as_deref() {
         Some(prompt) => prompt.to_string(),
         None => deps
@@ -828,7 +840,8 @@ fn run_batch_conflict_session(
         writeln!(out, "attach: tmux attach -t {target}")?;
     }
 
-    poll_batch_conflict_session(deps, tickets, target, window, out)
+    let flags = poll_batch_conflict_session(deps, tickets, target, window, out)?;
+    Ok((flags, session.target))
 }
 
 /// The batch counterpart of [`poll_conflict_session`]: each tick runs
@@ -1097,11 +1110,18 @@ fn prepare_merge(
 
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
 /// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
-/// merge`, sync the local base, best-effort clean up, and apply
-/// `status_on_merge`, then sweep stale status labels off a closed ticket.
+/// merge`, sync the local base, best-effort clean up (worktree, local
+/// branch, then the ticket's tmux session via
+/// [`session_gc::archive_and_kill`]), and apply `status_on_merge`, then
+/// sweep stale status labels off a closed ticket.
+///
+/// `kept_session` names a tmux session that must survive this ticket's
+/// cleanup even if it is the ticket's own: a batch's shared conflict
+/// session while another ticket is still handed back to it.
 fn finish_merge(
     deps: &MergeDeps<'_>,
     prepared: &PreparedMerge,
+    kept_session: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), MergeError> {
     let PreparedMerge {
@@ -1211,6 +1231,8 @@ fn finish_merge(
         }
     }
 
+    cleanup_ticket_session(deps, key, kept_session, out)?;
+
     if let Some(target_status) = deps.status_on_merge {
         match apply_status_on_merge(deps.jira, key, target_status) {
             StatusTransition::Applied(status) => writeln!(out, "moved {key} to {status}")?,
@@ -1236,6 +1258,38 @@ fn finish_merge(
     }
 
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
+    Ok(())
+}
+
+/// The ticket-session step of [`finish_merge`]'s best-effort cleanup
+/// (GitHub issue #78): archive `key`'s `tm-<scope>-<key>` session's
+/// scrollback under `<state_dir>/archive`, then kill it — unless it is
+/// `kept_session`, or [`session_gc::archive_and_kill`] finds a reason to
+/// leave it. Never fails the merge; only writing to `out` can error.
+fn cleanup_ticket_session(
+    deps: &MergeDeps<'_>,
+    key: &str,
+    kept_session: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    let slug = deps.identity.session_slug();
+    let session = ticket_session_name(&slug, key);
+    if kept_session == Some(session.as_str()) {
+        writeln!(
+            out,
+            "warning: left tmux session {session} running; it hosts the conflict session for handed-back tickets (run: tmux kill-session -t {session} once they are merged)"
+        )?;
+        return Ok(());
+    }
+    let archive_root = session_gc::archive_root(deps.state_dir);
+    let gc = session_gc::SessionGcDeps {
+        tmux: deps.tmux,
+        store: deps.run_store,
+        archive_root: &archive_root,
+        pid_alive: &pid_alive,
+        now_unix_secs: deps.clock.now_unix_secs(),
+    };
+    session_gc::archive_and_kill(&gc, &deps.identity.scope(), &slug, key, out)?;
     Ok(())
 }
 
@@ -2643,6 +2697,207 @@ mod tests {
         assert_eq!(report.handed_back, keys(2));
         assert!(fx.gh.pr_merge_calls().is_empty());
         assert!(out.contains("conflict session ended"), "{out}");
+    }
+
+    // --- ticket session archive-then-kill (GitHub issue #78) ---
+
+    fn ticket_window(key: &str, name: &str) -> TmuxWindow {
+        TmuxWindow {
+            session: format!("tm-proj-{}", key.to_lowercase()),
+            name: name.to_string(),
+            dead: false,
+        }
+    }
+
+    /// A clean, no-rebase merge of `PROJ-1` whose ticket session
+    /// `tm-proj-proj-1` is alive with `work` and `shell` windows.
+    fn session_fixture() -> Fixture {
+        let mut fx = merged_fixture();
+        fx.tmux = FakeTmuxOps::new()
+            .with_has_session(Ok(true))
+            .with_list_windows(Ok(vec![
+                ticket_window("PROJ-1", "work"),
+                ticket_window("PROJ-1", "shell"),
+            ]));
+        fx
+    }
+
+    /// Marks every recorded run done, so no run counts as live in its
+    /// session (fixtures register `running` checkout rows).
+    fn finish_all_runs(fx: &Fixture) {
+        for run in fx.store.all_runs().unwrap() {
+            fx.store
+                .finish_run(
+                    run.id,
+                    &crate::runs::FinishRun {
+                        status: crate::runs::RunStatus::Done,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn killed(fx: &Fixture, key: &str) -> bool {
+        fx.tmux.calls().contains(&TmuxCall::KillSession(format!(
+            "tm-proj-{}",
+            key.to_lowercase()
+        )))
+    }
+
+    #[test]
+    fn merge_archives_each_window_of_the_ticket_session_before_killing_it() {
+        let fx = session_fixture();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let gc_calls: Vec<TmuxCall> = fx
+            .tmux
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, TmuxCall::CapturePane { .. } | TmuxCall::KillSession(_)))
+            .collect();
+        assert_eq!(
+            gc_calls,
+            vec![
+                TmuxCall::CapturePane {
+                    name: "tm-proj-proj-1".to_string(),
+                    window: "work".to_string()
+                },
+                TmuxCall::CapturePane {
+                    name: "tm-proj-proj-1".to_string(),
+                    window: "shell".to_string()
+                },
+                TmuxCall::KillSession("tm-proj-proj-1".to_string()),
+            ]
+        );
+        let rows = fx
+            .store
+            .session_archives_for_ticket(Some(&fx.identity.scope()), "PROJ-1")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            Path::new(&rows[0].path).starts_with(fx.state_dir.join("archive")),
+            "{rows:?}"
+        );
+        assert!(out.contains("killed tmux session tm-proj-proj-1"), "{out}");
+    }
+
+    #[test]
+    fn merge_with_no_ticket_session_is_quiet_about_tmux() {
+        let fx = merged_fixture();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(!out.contains("tmux session"), "{out}");
+        assert!(!killed(&fx, "PROJ-1"));
+    }
+
+    #[test]
+    fn merge_capture_failure_leaves_the_session_alive_and_still_merges() {
+        let mut fx = session_fixture();
+        fx.tmux = std::mem::take(&mut fx.tmux).with_capture_pane_failure(
+            "shell",
+            TmuxError::Command {
+                command: "tmux capture-pane".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            },
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(!killed(&fx, "PROJ-1"));
+        assert!(out.contains("warning:"), "{out}");
+        assert!(out.contains("tmux kill-session -t tm-proj-proj-1"), "{out}");
+    }
+
+    #[test]
+    fn merge_leaves_a_session_hosting_a_running_run() {
+        let fx = session_fixture();
+        fx.store
+            .start_run(&StartRun {
+                scope: fx.identity.scope(),
+                ticket: "PROJ-1".to_string(),
+                lane: "audit".to_string(),
+                worktree: "/repo".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(!killed(&fx, "PROJ-1"));
+        assert!(out.contains("is still running"), "{out}");
+    }
+
+    #[test]
+    fn merge_never_kills_the_session_it_is_running_in() {
+        let mut fx = session_fixture();
+        fx.tmux = std::mem::take(&mut fx.tmux)
+            .with_current_session_name(Ok(Some("tm-proj-proj-1".to_string())));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(!killed(&fx, "PROJ-1"));
+        assert!(out.contains("inside it"), "{out}");
+    }
+
+    #[test]
+    fn batch_kills_every_merged_tickets_session_but_not_a_handed_back_one() {
+        let mut fx = batch_fixture(&[
+            BatchTicket::Clean,
+            BatchTicket::Conflict { resolves: false },
+        ]);
+        fx.clock = FakeClock::advancing(1_000, 300);
+        fx.tmux = std::mem::take(&mut fx.tmux).with_has_session(Ok(true));
+        finish_all_runs(&fx);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1"], "{out}");
+        assert_eq!(report.handed_back, vec!["PROJ-2"], "{out}");
+        assert!(killed(&fx, "PROJ-1"), "{out}");
+        assert!(!killed(&fx, "PROJ-2"), "{out}");
+    }
+
+    #[test]
+    fn batch_keeps_the_shared_conflict_session_while_a_ticket_is_handed_back() {
+        // Outside tmux, the shared window opens in the first ticket's
+        // session; killing it after PROJ-1 merges would take the window
+        // PROJ-2 is handed back to with it.
+        let mut fx = batch_fixture(&[
+            BatchTicket::Conflict { resolves: true },
+            BatchTicket::Conflict { resolves: false },
+        ]);
+        fx.clock = FakeClock::advancing(1_000, 300);
+        fx.tmux = FakeTmuxOps::new()
+            .with_has_session(Ok(true))
+            .with_list_windows_sequence(vec![
+                Ok(vec![]),
+                Ok(vec![ticket_window("PROJ-1", "merge")]),
+            ]);
+        finish_all_runs(&fx);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1"], "{out}");
+        assert_eq!(report.handed_back, vec!["PROJ-2"], "{out}");
+        assert!(!killed(&fx, "PROJ-1"), "{out}");
+        assert!(
+            out.contains("tm-proj-proj-1 running; it hosts the conflict session"),
+            "{out}"
+        );
     }
 
     #[test]
