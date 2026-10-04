@@ -243,6 +243,7 @@ pub fn map_key(
         KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
         KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
         KeyCode::Char('M') if *screen == Screen::Board => Some(Msg::MergePrAction),
+        KeyCode::Char(' ') if *screen == Screen::Board => Some(Msg::ToggleMergeQueue),
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
@@ -1350,8 +1351,28 @@ mod tests {
     }
 
     #[test]
-    fn space_is_unbound_off_the_rank_screen() {
-        for screen in [Screen::Board, Screen::Detail, Screen::TransitionMenu] {
+    fn space_on_board_toggles_the_merge_queue() {
+        assert_eq!(
+            map_key(
+                &Screen::Board,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RetroOverlay::None,
+                KeyCode::Char(' ')
+            ),
+            Some(Msg::ToggleMergeQueue)
+        );
+    }
+
+    #[test]
+    fn space_is_unbound_off_the_rank_and_board_screens() {
+        for screen in [Screen::Detail, Screen::TransitionMenu] {
             assert_eq!(
                 map_key(
                     &screen,
