@@ -567,6 +567,18 @@ pub fn apply_status_on_merge(
     key: &str,
     target: &str,
 ) -> StatusTransition {
+    reconcile_status(jira, key, target)
+}
+
+/// Advisorily move `key` to `target` after the fact, reporting a ticket
+/// already there as [`StatusTransition::AlreadyInStatus`] rather than a
+/// no-matching-transition warning.
+///
+/// The shared body of [`apply_status_on_merge`] and `tm drift --fix`
+/// (GitHub issue #80): both run against a ticket that may already have been
+/// moved by another path. Exactly [`apply_status_transition`]'s contract,
+/// exposed `pub` so callers outside this module can reuse it.
+pub fn reconcile_status(jira: &dyn TicketProvider, key: &str, target: &str) -> StatusTransition {
     apply_status_transition(jira, key, target)
 }
 
@@ -2028,6 +2040,37 @@ mod tests {
         let mut issue = issue(key);
         issue.fields.status.name = status_name.to_string();
         issue
+    }
+
+    #[test]
+    fn reconcile_status_already_in_target_is_a_no_op_without_transitioning() {
+        // GitHub issue #80: `tm drift --fix` reuses the advisory path, so a
+        // ticket someone already moved by hand must not produce a warning.
+        let jira =
+            FakeJiraClient::new().with_issue("PROJ-9", issue_with_status("PROJ-9", "In Review"));
+
+        let outcome = reconcile_status(&jira, "PROJ-9", "in review");
+
+        assert_eq!(
+            outcome,
+            StatusTransition::AlreadyInStatus("In Review".to_string())
+        );
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn reconcile_status_applies_matching_transition() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-9", issue("PROJ-9"))
+            .with_transitions("PROJ-9", vec![transition("21", "Review", "In Review")]);
+
+        let outcome = reconcile_status(&jira, "PROJ-9", "In Review");
+
+        assert_eq!(outcome, StatusTransition::Applied("In Review".to_string()));
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("PROJ-9".to_string(), "21".to_string())]
+        );
     }
 
     #[test]
