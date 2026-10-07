@@ -562,6 +562,9 @@ fn run_work(
                 status_on_run_start: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_run_start.as_deref()),
+                status_on_pr: full_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.status_on_pr.as_deref()),
                 fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             };
@@ -593,10 +596,17 @@ fn run_work(
             let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
             let spawner = tskmstr::work::runner::StdProcessSpawner;
             let gh = ShellGhCli::new();
+            // Best-effort, like `tm work run`'s own provider: the supervisor
+            // only needs it to apply the run's `status_on_pr` once a PR
+            // turns up (GitHub issue #92), never to finish the run itself.
+            let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
+                .as_ref()
+                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
             let succeeded = tskmstr::cli::work::supervise(
                 &spawner,
                 &gh,
                 &run_store,
+                ticket_provider.as_deref(),
                 &state,
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,

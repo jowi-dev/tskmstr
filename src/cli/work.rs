@@ -387,6 +387,10 @@ pub struct RunDeps<'a> {
     /// [`crate::work::run::RunLaneDeps::status_on_run_start`]. `None` when
     /// unset. See [`crate::config::Config::status_on_run_start`].
     pub status_on_run_start: Option<&'a str>,
+    /// The configured `status_on_pr`, passed through to
+    /// [`crate::work::run::RunLaneDeps::status_on_pr`]. `None` when unset.
+    /// See [`crate::config::Config::status_on_pr`].
+    pub status_on_pr: Option<&'a str>,
     /// The rest of the priority-routing order, passed through to
     /// [`crate::work::run::RunLaneDeps::fallback_runners`]. Empty in
     /// single-runner mode. See GitHub issue #54.
@@ -449,6 +453,7 @@ pub fn run(
         backend_identity_resolver: deps.backend_identity_resolver,
         runner: deps.runner,
         status_on_run_start: deps.status_on_run_start,
+        status_on_pr: deps.status_on_pr,
         fallback_runners: deps.fallback_runners.clone(),
     };
     let request = RunLaneRequest {
@@ -665,6 +670,7 @@ pub fn supervise(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
     run_store: &RunStore,
+    ticket_provider: Option<&dyn TicketProvider>,
     state: &crate::work::detach::SupervisorState,
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
@@ -673,6 +679,7 @@ pub fn supervise(
         spawner,
         gh,
         run_store,
+        ticket_provider,
         &state.prepared,
         std::process::id(),
         runner,
@@ -2580,6 +2587,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: pressure,
         };
@@ -2701,6 +2709,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -2832,6 +2841,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -2903,6 +2913,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3062,6 +3073,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3139,6 +3151,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3202,6 +3215,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3315,6 +3329,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3379,6 +3394,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3435,6 +3451,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = crate::work::run::RunLanePaths {
@@ -3466,6 +3483,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &state,
             &ClaudeRunner,
             &mut out,

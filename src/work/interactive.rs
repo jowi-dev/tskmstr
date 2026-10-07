@@ -302,6 +302,7 @@ mod tests {
             invocation: interactive_invocation(prompt),
             out_json_path: PathBuf::from("/state/proj-1-20260820-120000.json"),
             fallbacks: Vec::new(),
+            status_on_pr: None,
         }
     }
 

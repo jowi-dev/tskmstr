@@ -320,6 +320,7 @@ pub fn fix(
             deps.spawner,
             deps.gh,
             deps.run_store,
+            None,
             &prepared,
             deps.runner,
             out,

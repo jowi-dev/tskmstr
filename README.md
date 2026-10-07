@@ -235,8 +235,8 @@ tm auth status
 Every status move tskmstr makes (`status_on_create`, `status_on_run_start`,
 `status_on_pr`, `status_on_merge`) is a one-shot, advisory transition fired
 by one command. A key left unset, a transition that fails with a warning, or
-a bypass path (an agent running `gh pr create` itself, a PR merged in the
-GitHub UI) leaves the ticket behind, and nothing corrects it later. `tm drift` is
+a bypass path (an interactive agent running `gh pr create` itself, a PR
+merged in the GitHub UI) leaves the ticket behind, and nothing corrects it later. `tm drift` is
 the safety net that shows when that has happened:
 
 ```
@@ -1815,6 +1815,14 @@ ticket's status. `tm init` offers to wire this key when onboarding a
 repo (GitHub defaults it to `"In Review"`), so a fresh repo's board moves
 on PR-open without your having to know the key exists; when unset, `tm pr
 create` leaves every ticket in its current status.
+
+A `tm work run` lane run applies `status_on_pr` too: when the finished run
+has a PR (found by asking `gh` for the run's branch, or in the agent's
+result text), its ticket is moved the same advisory way, so an agent that
+opened its PR with plain `gh pr create` still moves the board. A ticket
+already in the target status (say, `tm pr create` moved it) is left alone
+silently; a failed transition is a warning in the run's output (the run
+log, for a detached run), never a failed run.
 
 `status_on_create` names the workflow status (e.g. `"In Progress"`) to
 move a ticket to right after `tm ticket create` makes it. It's matched the
