@@ -166,6 +166,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE runs ADD COLUMN agent TEXT;
     ALTER TABLE runs ADD COLUMN repo TEXT;
     "#,
+    // GitHub issue #78: a ticket session's per-window scrollback, captured
+    // to a plain file just before tm kills the session (`tm merge`, `tm
+    // work clean`). One row per archived window; `path` is the file, which
+    // outlives the tmux server. Keyed by ticket rather than run, since a
+    // window (`shell`, a manual one) need not belong to any run. See
+    // `docs/decisions/0009-session-scrollback-archive.md`.
+    r#"
+    CREATE TABLE session_archives (
+      id          INTEGER PRIMARY KEY,
+      scope       TEXT NOT NULL DEFAULT '',
+      ticket      TEXT NOT NULL,
+      session     TEXT NOT NULL,
+      window      TEXT NOT NULL,
+      path        TEXT NOT NULL,
+      captured_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_session_archives_ticket ON session_archives(ticket, captured_at);
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -660,6 +678,42 @@ pub struct TicketAudit {
     pub notes: Option<String>,
     /// When the audit was recorded, per [`NOW_SQL`].
     pub audited_at: String,
+}
+
+/// One window's archived scrollback to record via
+/// [`RunStore::record_session_archive`] (GitHub issue #78).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSessionArchive {
+    /// [`crate::config::BackendIdentity::scope`] of the ticket's repo.
+    pub scope: String,
+    /// Ticket key the session belonged to.
+    pub ticket: String,
+    /// The killed tmux session's name, e.g. `tm-<slug>-<key>`.
+    pub session: String,
+    /// The archived window's name within `session`.
+    pub window: String,
+    /// The file the scrollback was written to.
+    pub path: String,
+}
+
+/// A recorded session archive row, from
+/// [`RunStore::session_archives_for_ticket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArchive {
+    /// Row id.
+    pub id: i64,
+    /// Scope the row was recorded under (`''` for none).
+    pub scope: String,
+    /// Ticket key.
+    pub ticket: String,
+    /// The tmux session the window was in.
+    pub session: String,
+    /// The window's name.
+    pub window: String,
+    /// The scrollback file.
+    pub path: String,
+    /// When the row was recorded, per [`NOW_SQL`].
+    pub captured_at: String,
 }
 
 /// Whether a shipped ticket turned out defective in production; see
@@ -2581,6 +2635,58 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Records one archived window of a ticket session (GitHub issue #78),
+    /// with `captured_at` set to the database's current time. Returns the
+    /// new row id. Append-only: re-archiving a session adds rows.
+    pub fn record_session_archive(
+        &self,
+        archive: &NewSessionArchive,
+    ) -> Result<i64, RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO session_archives (scope, ticket, session, window, path, captured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, {NOW_SQL})"
+            ),
+            params![
+                archive.scope,
+                archive.ticket,
+                archive.session,
+                archive.window,
+                archive.path
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every archived window recorded for `ticket`, oldest first. `scope`
+    /// filters like [`RunStore::latest_run_for_ticket`]: `None` sees every
+    /// scope, `Some` sees that scope plus unscoped (`''`) rows.
+    pub fn session_archives_for_ticket(
+        &self,
+        scope: Option<&str>,
+        ticket: &str,
+    ) -> Result<Vec<SessionArchive>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, ticket, session, window, path, captured_at
+             FROM session_archives
+             WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
+             ORDER BY captured_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![ticket, scope], |row| {
+            Ok(SessionArchive {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                ticket: row.get(2)?,
+                session: row.get(3)?,
+                window: row.get(4)?,
+                path: row.get(5)?,
+                captured_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Records a shipped-ticket retro verdict for `ticket_key`, with
     /// `recorded_at` set to the database's current time (see [`NOW_SQL`]).
     ///
@@ -3054,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_12() {
+    fn open_migrates_a_fresh_db_to_user_version_13() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3062,7 +3168,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -6037,6 +6143,77 @@ mod tests {
                 .latest_audit_for_ticket(None, "PROJ-1")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // --- session archives (GitHub issue #78) ---
+
+    fn archive(scope: &str, ticket: &str, window: &str, path: &str) -> NewSessionArchive {
+        NewSessionArchive {
+            scope: scope.to_string(),
+            ticket: ticket.to_string(),
+            session: format!("tm-x-{}", ticket.to_lowercase()),
+            window: window.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn session_archives_round_trip_oldest_first_and_survive_a_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("runs.db");
+        {
+            let store = RunStore::open(&db_path).unwrap();
+            store
+                .record_session_archive(&archive("s", "GH-1", "work", "/a/work.log"))
+                .unwrap();
+            store
+                .record_session_archive(&archive("s", "GH-1", "shell", "/a/shell.log"))
+                .unwrap();
+        }
+
+        let store = RunStore::open(&db_path).unwrap();
+        let rows = store
+            .session_archives_for_ticket(Some("s"), "GH-1")
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].window, "work");
+        assert_eq!(rows[0].path, "/a/work.log");
+        assert_eq!(rows[0].session, "tm-x-gh-1");
+        assert_eq!(rows[0].scope, "s");
+        assert_eq!(rows[1].window, "shell");
+        assert!(!rows[0].captured_at.is_empty());
+    }
+
+    #[test]
+    fn session_archives_are_filtered_by_scope_and_ticket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .record_session_archive(&archive("repo-a", "GH-1", "work", "/a"))
+            .unwrap();
+        store
+            .record_session_archive(&archive("repo-b", "GH-1", "work", "/b"))
+            .unwrap();
+        store
+            .record_session_archive(&archive("repo-a", "GH-2", "work", "/c"))
+            .unwrap();
+
+        let rows = store
+            .session_archives_for_ticket(Some("repo-a"), "GH-1")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/a"]
+        );
+        assert_eq!(
+            store
+                .session_archives_for_ticket(None, "GH-1")
+                .unwrap()
+                .len(),
+            2,
+            "no scope sees every repo's rows"
         );
     }
 

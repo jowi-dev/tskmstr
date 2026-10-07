@@ -1918,6 +1918,9 @@ fn run_runs(
                 &mut stdout,
             )?;
         }
+        Some(RunsCmd::Scrollback { ticket, window }) => {
+            tskmstr::cli::runs::scrollback(&store, scope, &ticket, window.as_deref(), &mut stdout)?;
+        }
         Some(RunsCmd::Resume { ticket }) => {
             let mut stderr = std::io::stderr();
             tskmstr::cli::runs::resume(

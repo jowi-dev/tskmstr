@@ -156,11 +156,22 @@ pub enum RunsCliError {
         id: i64,
     },
 
-    /// `tm runs logs` resolved a log path, but nothing exists there.
+    /// `tm runs logs` resolved a log path, but nothing exists there (also
+    /// `tm runs scrollback` for an archive file that was deleted).
     #[error("log file {path} does not exist")]
     LogFileMissing {
         /// The path that was resolved but not found.
         path: std::path::PathBuf,
+    },
+
+    /// `tm runs scrollback` found no archived scrollback for the ticket (or
+    /// for the requested window).
+    #[error("no archived scrollback for {what}; see `tm runs scrollback {ticket}`")]
+    NoScrollback {
+        /// The ticket key that was looked up.
+        ticket: String,
+        /// What was missing: the ticket, or `<ticket> window <name>`.
+        what: String,
     },
 }
 
@@ -962,6 +973,61 @@ fn format_event_line(event: &RunEvent, runner: &dyn AgentRunner) -> String {
             None => format!("{}  {}", event.at, event.kind),
         },
     }
+}
+
+/// `tm runs scrollback`: read back a ticket's archived tmux scrollback
+/// (GitHub issue #78; see [`crate::work::session_gc`]).
+///
+/// With no `window`, lists every archived window oldest first, one line
+/// each: `<captured_at>  <window>  <path>`. With `window`, prints that
+/// window's newest archive file verbatim.
+///
+/// # Errors
+///
+/// [`RunsCliError::NoScrollback`] when nothing (or nothing for `window`) is
+/// archived for `ticket`; [`RunsCliError::LogFileMissing`] when the
+/// recorded file has since been deleted.
+pub fn scrollback(
+    store: &RunStore,
+    scope: Option<&str>,
+    ticket: &str,
+    window: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    let ticket = ticket.to_uppercase();
+    let archives = store.session_archives_for_ticket(scope, &ticket)?;
+
+    let Some(window) = window else {
+        if archives.is_empty() {
+            return Err(RunsCliError::NoScrollback {
+                what: ticket.clone(),
+                ticket,
+            });
+        }
+        for archive in &archives {
+            writeln!(
+                out,
+                "{}  {}  {}",
+                archive.captured_at, archive.window, archive.path
+            )?;
+        }
+        return Ok(());
+    };
+
+    let newest = archives
+        .iter()
+        .rev()
+        .find(|archive| archive.window == window)
+        .ok_or_else(|| RunsCliError::NoScrollback {
+            what: format!("{ticket} window {window}"),
+            ticket: ticket.clone(),
+        })?;
+    let path = std::path::PathBuf::from(&newest.path);
+    if !path.exists() {
+        return Err(RunsCliError::LogFileMissing { path });
+    }
+    out.write_all(&std::fs::read(&path)?)?;
+    Ok(())
 }
 
 /// `tm runs resume`: print the session id of the latest run of `ticket`, for
@@ -3239,6 +3305,96 @@ mod tests {
             r#"{"tool":"Bash","summary":"cargo test"}"#
         );
         assert_eq!(events[1]["kind"], "second");
+    }
+
+    // --- scrollback (GitHub issue #78) ---
+
+    /// Archives `window` of `GH-78` to a real file holding `text`.
+    fn archive_window(
+        store: &RunStore,
+        dir: &std::path::Path,
+        file: &str,
+        window: &str,
+        text: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.join(file);
+        std::fs::write(&path, text).unwrap();
+        store
+            .record_session_archive(&crate::runs::NewSessionArchive {
+                scope: "github:acme".to_string(),
+                ticket: "GH-78".to_string(),
+                session: "tm-acme-gh-78".to_string(),
+                window: window.to_string(),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn scrollback_lists_every_archived_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let work = archive_window(&store, dir.path(), "a-work.log", "work", "w\n");
+        let shell = archive_window(&store, dir.path(), "a-shell.log", "shell", "s\n");
+
+        let mut out = Vec::new();
+        scrollback(&store, Some("github:acme"), "gh-78", None, &mut out).unwrap();
+
+        let printed = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 2, "{printed}");
+        assert!(lines[0].contains("work"), "{printed}");
+        assert!(lines[0].contains(&*work.to_string_lossy()), "{printed}");
+        assert!(lines[1].contains("shell"), "{printed}");
+        assert!(lines[1].contains(&*shell.to_string_lossy()), "{printed}");
+    }
+
+    #[test]
+    fn scrollback_with_a_window_prints_its_newest_archive() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        archive_window(&store, dir.path(), "1-work.log", "work", "old\n");
+        archive_window(&store, dir.path(), "2-work.log", "work", "new\n");
+        archive_window(&store, dir.path(), "2-shell.log", "shell", "shell\n");
+
+        let mut out = Vec::new();
+        scrollback(&store, None, "GH-78", Some("work"), &mut out).unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn scrollback_errors_when_nothing_is_archived() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = scrollback(&store, None, "GH-78", None, &mut Vec::new()).unwrap_err();
+
+        assert!(matches!(err, RunsCliError::NoScrollback { .. }), "{err}");
+    }
+
+    #[test]
+    fn scrollback_errors_for_an_unarchived_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        archive_window(&store, dir.path(), "a-work.log", "work", "w\n");
+
+        let err = scrollback(&store, None, "GH-78", Some("nope"), &mut Vec::new()).unwrap_err();
+
+        assert!(matches!(err, RunsCliError::NoScrollback { .. }), "{err}");
+    }
+
+    #[test]
+    fn scrollback_errors_when_the_archive_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let path = archive_window(&store, dir.path(), "a-work.log", "work", "w\n");
+        std::fs::remove_file(&path).unwrap();
+
+        let err = scrollback(&store, None, "GH-78", Some("work"), &mut Vec::new()).unwrap_err();
+
+        assert!(matches!(err, RunsCliError::LogFileMissing { .. }), "{err}");
     }
 
     #[test]

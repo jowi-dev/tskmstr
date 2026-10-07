@@ -888,6 +888,18 @@ pub enum RunsCmd {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// List a ticket's archived tmux scrollback, or print one window's
+    /// (GitHub issue #78). `tm merge` and `tm work clean` capture every
+    /// window of the ticket's session to a file before killing it; this
+    /// reads those files back without tmux. Best-effort history: only what
+    /// was still inside tmux's `history-limit` was captured.
+    Scrollback {
+        /// Ticket key, e.g. `GH-78`.
+        ticket: String,
+        /// Print this window's newest archived scrollback instead of listing.
+        #[arg(long)]
+        window: Option<String>,
+    },
     /// Print the session id of the latest run of a ticket, for `claude --resume`.
     Resume {
         /// Jira ticket key, e.g. `PROJ-123`.
@@ -2390,6 +2402,31 @@ mod tests {
                 assert_eq!(kind, Some("audit".to_string()));
             }
             other => panic!("expected Runs Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_scrollback_with_and_without_a_window() {
+        let cli = Cli::try_parse_from(["tm", "runs", "scrollback", "GH-78"]).expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Scrollback { ticket, window }),
+                ..
+            }) => {
+                assert_eq!(ticket, "GH-78");
+                assert_eq!(window, None);
+            }
+            other => panic!("expected Runs Scrollback, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["tm", "runs", "scrollback", "GH-78", "--window", "work"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd: Some(RunsCmd::Scrollback { window, .. }),
+                ..
+            }) => assert_eq!(window.as_deref(), Some("work")),
+            other => panic!("expected Runs Scrollback, got {other:?}"),
         }
     }
 

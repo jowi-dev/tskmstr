@@ -72,7 +72,7 @@ pub struct KillSafetyVerdict {
 /// ticket compute to ([`ticket_session_name`], covering runs adopted via `tm
 /// runs register`, which have no recorded session); and, for `create` runs,
 /// the scope's keyless creation session ([`create_session_name`]).
-fn run_hosted_in(run: &Run, session: &str) -> bool {
+pub(crate) fn run_hosted_in(run: &Run, session: &str) -> bool {
     if run.tmux_session.as_deref() == Some(session) {
         return true;
     }

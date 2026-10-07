@@ -221,6 +221,9 @@ mod tests {
         fn pane_pid(&self, _: &str, _: &str) -> Result<Option<u32>, TmuxError> {
             Err(Self::error())
         }
+        fn capture_pane(&self, _: &str, _: &str) -> Result<String, TmuxError> {
+            Err(Self::error())
+        }
         fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
             Ok(Vec::new())
         }

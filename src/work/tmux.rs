@@ -211,6 +211,13 @@ pub trait TmuxOps {
     /// run records it as its liveness pid (GitHub issue #64).
     fn pane_pid(&self, name: &str, window: &str) -> Result<Option<u32>, TmuxError>;
 
+    /// Window `window` of session `name`'s full scrollback as plain text
+    /// (`tmux capture-pane -p -S - -t <name>:<window>`): everything still
+    /// inside tmux's `history-limit`, oldest line first. Archived before a
+    /// ticket session is killed (GitHub issue #78), so it is best-effort
+    /// history, not a full transcript.
+    fn capture_pane(&self, name: &str, window: &str) -> Result<String, TmuxError>;
+
     /// List all running tmux sessions
     /// (`tmux list-sessions -F '#{session_name}|#{session_path}'`).
     ///
@@ -517,6 +524,17 @@ fn pane_pid_args(name: &str, window: &str) -> Vec<String> {
     ]
 }
 
+fn capture_pane_args(name: &str, window: &str) -> Vec<String> {
+    vec![
+        "capture-pane".to_string(),
+        "-p".to_string(),
+        "-S".to_string(),
+        "-".to_string(),
+        "-t".to_string(),
+        format!("{name}:{window}"),
+    ]
+}
+
 /// Parses `tmux display-message -p '#{pane_pid}'` output; anything that is
 /// not a pid is `None` rather than an error.
 fn parse_pane_pid(stdout: &str) -> Option<u32> {
@@ -766,6 +784,12 @@ impl TmuxOps for ShellTmuxOps {
         Ok(parse_pane_pid(&String::from_utf8_lossy(&output.stdout)))
     }
 
+    fn capture_pane(&self, name: &str, window: &str) -> Result<String, TmuxError> {
+        let output = run("tmux capture-pane", &capture_pane_args(name, window))?;
+        require_success("tmux capture-pane", &output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
         // `work.ml` reads via `Unix.open_process_in` and never inspects the
         // child's exit status (and redirects stderr to /dev/null), so a
@@ -846,6 +870,9 @@ pub struct FakeTmuxOps {
     attach_outcome: std::cell::RefCell<AttachOutcome>,
     current_session_name_result: std::cell::RefCell<Result<Option<String>, TmuxError>>,
     pane_pid_result: std::cell::RefCell<Result<Option<u32>, TmuxError>>,
+    /// Windows whose `capture_pane` fails, by window name; every other
+    /// window captures as `"<session>:<window> scrollback\n"`.
+    capture_pane_failures: std::cell::RefCell<std::collections::HashMap<String, TmuxError>>,
     calls: std::cell::RefCell<Vec<TmuxCall>>,
 }
 
@@ -929,6 +956,13 @@ pub enum TmuxCall {
         /// Window name.
         window: String,
     },
+    /// `capture_pane(name, window)`.
+    CapturePane {
+        /// Session name.
+        name: String,
+        /// Window name.
+        window: String,
+    },
     /// `list_sessions()`.
     ListSessions,
     /// `root_session_targets()`.
@@ -963,6 +997,7 @@ impl FakeTmuxOps {
             attach_outcome: std::cell::RefCell::new(AttachOutcome::Detached),
             current_session_name_result: std::cell::RefCell::new(Ok(None)),
             pane_pid_result: std::cell::RefCell::new(Ok(None)),
+            capture_pane_failures: std::cell::RefCell::new(std::collections::HashMap::new()),
             calls: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -1019,6 +1054,15 @@ impl FakeTmuxOps {
     /// Set the result `pane_pid` will return.
     pub fn with_pane_pid(self, result: Result<Option<u32>, TmuxError>) -> Self {
         *self.pane_pid_result.borrow_mut() = result;
+        self
+    }
+
+    /// Make `capture_pane` fail with `err` for any session's window named
+    /// `window`.
+    pub fn with_capture_pane_failure(self, window: &str, err: TmuxError) -> Self {
+        self.capture_pane_failures
+            .borrow_mut()
+            .insert(window.to_string(), err);
         self
     }
 
@@ -1130,6 +1174,17 @@ impl TmuxOps for FakeTmuxOps {
             window: window.to_string(),
         });
         self.pane_pid_result.borrow().clone()
+    }
+
+    fn capture_pane(&self, name: &str, window: &str) -> Result<String, TmuxError> {
+        self.calls.borrow_mut().push(TmuxCall::CapturePane {
+            name: name.to_string(),
+            window: window.to_string(),
+        });
+        match self.capture_pane_failures.borrow().get(window) {
+            Some(err) => Err(err.clone()),
+            None => Ok(format!("{name}:{window} scrollback\n")),
+        }
     }
 
     fn list_sessions(&self) -> Result<Vec<TmuxSession>, TmuxError> {
@@ -1836,6 +1891,45 @@ mod tests {
                 TmuxCall::PanePid {
                     name: "s".to_string(),
                     window: "work".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_pane_args_print_the_whole_history_of_the_session_window() {
+        assert_eq!(
+            capture_pane_args("tm-proj-proj-1", "work"),
+            vec!["capture-pane", "-p", "-S", "-", "-t", "tm-proj-proj-1:work"]
+        );
+    }
+
+    #[test]
+    fn fake_capture_pane_is_recorded_and_returns_canned_scrollback() {
+        let fake = FakeTmuxOps::new().with_capture_pane_failure(
+            "shell",
+            TmuxError::Command {
+                command: "tmux capture-pane".to_string(),
+                exit_code: Some(1),
+                stderr: "can't find window".to_string(),
+            },
+        );
+
+        assert_eq!(
+            fake.capture_pane("s", "work").unwrap(),
+            "s:work scrollback\n"
+        );
+        assert!(fake.capture_pane("s", "shell").is_err());
+        assert_eq!(
+            fake.calls(),
+            vec![
+                TmuxCall::CapturePane {
+                    name: "s".to_string(),
+                    window: "work".to_string()
+                },
+                TmuxCall::CapturePane {
+                    name: "s".to_string(),
+                    window: "shell".to_string()
                 },
             ]
         );
