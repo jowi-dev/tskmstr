@@ -38,7 +38,7 @@ Path → status the ticket should reach → what actually happens.
 | `status_on_pr` unset | In Review | stays in In Progress / To Do | `FinishedStillNew` if still To Do |
 | PR merged with `tm merge` / board | Done | `status_on_merge`, plus GitHub's closing keyword | — |
 | PR merged in the GitHub UI or with `gh pr merge` (GitHub backend, PR into the default branch) | Done | `Closes #N` in the PR body closes the issue, which reads as Done; stale `tm:status/*` label (#75, fixed) | — |
-| PR merged outside tm into a **non-default** base (a stacked PR) | Done | closing keywords only fire on the default branch, so the issue stays open | `MergedNotDone` |
+| PR merged outside tm into a **non-default** base (a stacked PR) | Done | closing keywords only fire on the default branch, so the issue stays open until `tm merge` merges the base PR, which moves it to `status_on_merge` (else Done) (#94) | `MergedNotDone` until then, or for good if the base PR is merged outside tm too |
 | PR merged outside tm, Jira backend | Done | nothing | `MergedNotDone` |
 | PR deliberately written with `Refs #N` (the ticket needs more than the PR, e.g. a manual acceptance step) | stays open on purpose | stays open | `MergedNotDone`: a **true positive for the rule, but not drift**. Don't fix it: pass the keys you do want moved to `tm drift --fix KEY...` |
 | Ticket In Progress, run died, no PR | a human decision | stays In Progress | `Stalled` (never auto-fixed) |
@@ -89,8 +89,9 @@ tickets:
   behind.
 - #93: `tm work run` skips `status_on_run_start` silently when its ticket
   provider can't be built.
-- #94: a stacked PR merged outside `tm merge` never closes its issue (closing
-  keywords only fire on the default branch).
+- #94 (fixed): a stacked PR merged outside `tm merge` never closed its issue (closing
+  keywords only fire on the default branch). `tm merge` now moves the
+  tickets of PRs already merged into the branch it merges.
 
 Already tracked: #74 (missing config keys), #75 (stale status labels on
 closed issues, fixed), #79 (false "no transition" warning when already in

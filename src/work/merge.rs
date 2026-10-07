@@ -9,9 +9,10 @@
 //! fast-forward the local base branch, best-effort clean up the worktree,
 //! branch, and ticket tmux session (its scrollback archived first, see
 //! [`crate::work::session_gc`]; GitHub issue #78), apply the configured
-//! `status_on_merge` transition, and
-//! finally clear any `tm:status/*` label GitHub left on an issue the PR's
-//! closing keyword closed (GitHub issue #75).
+//! `status_on_merge` transition, clear any `tm:status/*` label GitHub left
+//! on an issue the PR's closing keyword closed (GitHub issue #75), and
+//! finally move the tickets of stacked PRs already merged into the branch,
+//! whose closing keywords GitHub never honoured (GitHub issue #94).
 //!
 //! The conflict-resolution session is launched the same way an interactive
 //! lane run is: [`crate::agent::AgentRunner::build_invocation`] under
@@ -45,11 +46,11 @@ use crate::agent::{AgentRunner, InvocationInputs, RunMode};
 use crate::cli::pr::{PrCliError, resolve_watch_repo_root};
 use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
 use crate::github::gh_cli::{GhCli, GhError};
-use crate::github::pr::find_pr_for_ticket;
+use crate::github::pr::{find_issue_key, find_pr_for_ticket};
 use crate::runs::pid::pid_alive;
 use crate::runs::{RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
-use crate::ticketing::{StatusTransition, apply_status_on_merge};
+use crate::ticketing::{StatusTransition, apply_status_on_merge, reconcile_status};
 use crate::work::git::{GitError, GitOps, RebaseOutcome};
 use crate::work::naming::ticket_session_name;
 use crate::work::prompt::{PromptFileError, read_prompt_file};
@@ -1257,7 +1258,67 @@ fn finish_merge(
         )?,
     }
 
+    reconcile_stacked_children(deps, repo_root, branch, out)?;
+
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
+    Ok(())
+}
+
+/// The stacked-children step of [`finish_merge`] (GitHub issue #94): move
+/// the ticket of every PR already merged into `branch`, and transitively
+/// into those PRs' branches, to `status_on_merge` (else `Done`, the target
+/// `tm drift --fix` suggests), then sweep its stale status labels.
+///
+/// GitHub only honours a closing keyword on a PR into the default branch,
+/// so a stacked PR merged into its blocker's branch outside `tm merge`
+/// never moves its ticket; merging the blocker is when that work lands.
+/// Advisory like the rest of the cleanup: never fails the merge.
+fn reconcile_stacked_children(
+    deps: &MergeDeps<'_>,
+    repo_root: &Path,
+    branch: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    let target = deps.status_on_merge.unwrap_or("Done");
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![branch.to_string()];
+    while let Some(base) = pending.pop() {
+        if !visited.insert(base.clone()) {
+            continue;
+        }
+        let children = match deps.gh.pr_list_merged_into(repo_root, &base) {
+            Ok(children) => children,
+            Err(err) => {
+                writeln!(
+                    out,
+                    "warning: failed to list PRs merged into {base}: {err} (run: tm drift)"
+                )?;
+                continue;
+            }
+        };
+        for child in children {
+            pending.push(child.head_ref_name.clone());
+            let number = child.number;
+            let Some(key) = find_issue_key(&child, &|token| deps.jira.is_ticket_key(token)) else {
+                continue;
+            };
+            match reconcile_status(deps.jira, &key, target) {
+                StatusTransition::Applied(status) => {
+                    writeln!(out, "moved stacked {key} (PR #{number}) to {status}")?
+                }
+                StatusTransition::AlreadyInStatus(status) => {
+                    writeln!(out, "stacked {key} (PR #{number}) already in {status}")?
+                }
+                StatusTransition::Warning(warning) => writeln!(out, "warning: {warning}")?,
+            }
+            if let Err(err) = deps.jira.clear_closed_status_labels(&key) {
+                writeln!(
+                    out,
+                    "warning: failed to clear stale status labels from {key}: {err} (run: tm backend clean-status-labels)"
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2201,6 +2262,119 @@ mod tests {
         assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
         assert!(
             out.contains("warning: failed to clear stale status labels from PROJ-1"),
+            "{out}"
+        );
+    }
+
+    // --- stacked children merged outside tm merge (GitHub issue #94) ---
+
+    fn done_transition() -> crate::ticketing::types::Transition {
+        crate::ticketing::types::Transition {
+            id: "31".to_string(),
+            name: "Ship it".to_string(),
+            to: Status {
+                name: "Done".to_string(),
+                status_category: StatusCategory {
+                    key: "done".to_string(),
+                },
+            },
+        }
+    }
+
+    /// `merged_fixture` plus `PROJ-2`'s PR #8, already merged into
+    /// `PROJ-1`'s branch, its ticket still In Review.
+    fn stacked_fixture() -> Fixture {
+        let mut fx = merged_fixture();
+        fx.gh = fx.gh.with_pr_list_merged_into(
+            "proj-1-fix",
+            Ok(vec![pr_info(8, "proj-2-fix", "proj-1-fix", "PROJ-2")]),
+        );
+        fx.jira = fx
+            .jira
+            .with_issue("PROJ-2", issue_with_status("PROJ-2", "In Review"))
+            .with_transitions("PROJ-2", vec![done_transition()]);
+        fx
+    }
+
+    #[test]
+    fn merge_moves_a_stacked_child_already_merged_into_the_branch() {
+        let mut fx = stacked_fixture();
+        fx.status_on_merge = Some("Done".to_string());
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert_eq!(
+            fx.gh.pr_list_merged_into_calls()[0],
+            (PathBuf::from("/repo"), "proj-1-fix".to_string())
+        );
+        assert!(
+            out.contains("moved stacked PROJ-2 (PR #8) to Done"),
+            "{out}"
+        );
+        assert!(
+            fx.jira
+                .clear_closed_status_labels_calls()
+                .contains(&"PROJ-2".to_string())
+        );
+    }
+
+    #[test]
+    fn stacked_child_falls_back_to_done_without_status_on_merge() {
+        // Same target `tm drift --fix` suggests for MergedNotDone: the
+        // child's closing keyword never fired, so nothing else closes it.
+        let fx = stacked_fixture();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(
+            out.contains("moved stacked PROJ-2 (PR #8) to Done"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn stacked_children_are_followed_transitively() {
+        let mut fx = stacked_fixture();
+        fx.gh = fx.gh.with_pr_list_merged_into(
+            "proj-2-fix",
+            Ok(vec![pr_info(9, "proj-3-fix", "proj-2-fix", "PROJ-3")]),
+        );
+        fx.jira = fx
+            .jira
+            .with_issue("PROJ-3", issue_with_status("PROJ-3", "Done"));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(
+            out.contains("moved stacked PROJ-2 (PR #8) to Done"),
+            "{out}"
+        );
+        assert!(
+            out.contains("stacked PROJ-3 (PR #9) already in Done"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn stacked_child_lookup_failure_only_warns() {
+        let mut fx = merged_fixture();
+        fx.gh = fx.gh.with_pr_list_merged_into(
+            "proj-1-fix",
+            Err(GhError::Command {
+                command: "gh pr list".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            }),
+        );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(
+            out.contains("warning: failed to list PRs merged into proj-1-fix"),
             "{out}"
         );
     }
