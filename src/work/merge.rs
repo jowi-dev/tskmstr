@@ -1214,6 +1214,9 @@ fn finish_merge(
     if let Some(target_status) = deps.status_on_merge {
         match apply_status_on_merge(deps.jira, key, target_status) {
             StatusTransition::Applied(status) => writeln!(out, "moved {key} to {status}")?,
+            StatusTransition::AlreadyInStatus(status) => {
+                writeln!(out, "{key} already in {status}")?
+            }
             StatusTransition::Warning(warning) => writeln!(out, "warning: {warning}")?,
         }
     }
@@ -2042,12 +2045,47 @@ mod tests {
         fx.status_on_merge = Some("Done".to_string());
         fx.jira = fx
             .jira
+            .with_issue("PROJ-1", issue_with_status("PROJ-1", "In Review"))
+            .with_transitions(
+                "PROJ-1",
+                vec![crate::ticketing::types::Transition {
+                    id: "31".to_string(),
+                    name: "Ship it".to_string(),
+                    to: Status {
+                        name: "Done".to_string(),
+                        status_category: StatusCategory {
+                            key: "done".to_string(),
+                        },
+                    },
+                }],
+            );
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(out.contains("moved PROJ-1 to Done"), "{out}");
+    }
+
+    #[test]
+    fn status_on_merge_already_in_target_prints_a_no_op_not_a_warning() {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("main".to_string()))
+            .with_branch_exists_local(Ok(false));
+        fx.status_on_merge = Some("Done".to_string());
+        fx.jira = fx
+            .jira
             .with_issue("PROJ-1", issue_with_status("PROJ-1", "Done"));
 
         let (result, out) = run(&fx.deps(), "PROJ-1");
 
         assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
-        assert!(out.contains("moved PROJ-1 to Done"));
+        assert!(out.contains("PROJ-1 already in Done"), "{out}");
+        assert!(!out.contains("no transition"), "{out}");
     }
 
     // --- stale status-label sweep (GitHub issue #75) ---
@@ -2470,7 +2508,7 @@ mod tests {
         assert_eq!(merged, vec![11, 12, 13]);
         assert_eq!(fx.git.push_force_with_lease_calls().len(), 3);
         for key in keys(3) {
-            assert!(out.contains(&format!("moved {key} to Done")), "{out}");
+            assert!(out.contains(&format!("{key} already in Done")), "{out}");
         }
         assert_eq!(opened_windows(&fx), 0, "no conflict session needed");
     }
