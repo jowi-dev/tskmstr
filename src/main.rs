@@ -565,6 +565,7 @@ fn run_work(
                 status_on_pr: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_pr.as_deref()),
+                ticket_provider_error: None,
                 fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             };

@@ -391,6 +391,10 @@ pub struct RunDeps<'a> {
     /// [`crate::work::run::RunLaneDeps::status_on_pr`]. `None` when unset.
     /// See [`crate::config::Config::status_on_pr`].
     pub status_on_pr: Option<&'a str>,
+    /// Why `ticket_provider` could not be built, passed through to
+    /// [`crate::work::run::RunLaneDeps::ticket_provider_error`]. `None` when
+    /// a provider was built or no config was loaded. See GitHub issue #93.
+    pub ticket_provider_error: Option<&'a str>,
     /// The rest of the priority-routing order, passed through to
     /// [`crate::work::run::RunLaneDeps::fallback_runners`]. Empty in
     /// single-runner mode. See GitHub issue #54.
@@ -454,6 +458,7 @@ pub fn run(
         runner: deps.runner,
         status_on_run_start: deps.status_on_run_start,
         status_on_pr: deps.status_on_pr,
+        ticket_provider_error: deps.ticket_provider_error,
         fallback_runners: deps.fallback_runners.clone(),
     };
     let request = RunLaneRequest {
@@ -2588,6 +2593,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: pressure,
         };
@@ -2710,6 +2716,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -2842,6 +2849,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -2914,6 +2922,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3074,6 +3083,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3152,6 +3162,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3216,6 +3227,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3330,6 +3342,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3395,6 +3408,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
         };
@@ -3452,6 +3466,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = crate::work::run::RunLanePaths {
