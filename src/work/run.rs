@@ -403,7 +403,8 @@ pub struct RunLaneDeps<'a> {
     /// (on `out` and the durable run log) but never sinks the run, and a
     /// ticket already in the target status is a silent no-op. Uses
     /// [`RunLaneDeps::ticket_provider`]; absent that, the transition is
-    /// skipped exactly like the branch-name slug lookup.
+    /// skipped exactly like the branch-name slug lookup — with a warning
+    /// when [`RunLaneDeps::ticket_provider_error`] says why.
     pub status_on_run_start: Option<&'a str>,
     /// The configured `status_on_pr` workflow status (see
     /// [`crate::config::Config::status_on_pr`]), or `None` when unset.
@@ -413,6 +414,14 @@ pub struct RunLaneDeps<'a> {
     /// agent opened with plain `gh pr create` rather than `tm pr create`
     /// (GitHub issue #92).
     pub status_on_pr: Option<&'a str>,
+    /// Why [`RunLaneDeps::ticket_provider`] is `None`, when it is `None`
+    /// because construction failed (no Jira token, a github backend with no
+    /// repo, ...) rather than because no config was loaded at all. Only
+    /// consulted when `status_on_run_start` is set and the run has a ticket:
+    /// the skipped transition then warns with this reason (on `out` and the
+    /// durable run log) instead of silently never firing (GitHub issue #93).
+    /// Never fails the run.
+    pub ticket_provider_error: Option<&'a str>,
     /// The rest of `config.agent_fallbacks`' priority order, resolved to
     /// live runners via `crate::agent::routing::runner_for`. Empty in
     /// single-runner mode and everywhere but the lane-run path (`tm work
@@ -1250,20 +1259,26 @@ pub fn prepare_run_lane(
     // silent no-op (no warning spam on re-runs); a lane-only (ticketless) run
     // has nothing to move, so the `Some(ticket)` guard skips it. Both the
     // interactive and detached headless paths reach here, so this one
-    // placement covers every run shape.
-    if let (Some(target), Some(provider), Some(ticket)) = (
-        deps.status_on_run_start,
-        deps.ticket_provider,
-        request.ticket.as_deref(),
-    ) {
-        match crate::ticketing::transition_ticket(provider, ticket, target) {
-            Ok(crate::ticketing::TransitionOutcome::Applied(status)) => {
+    // placement covers every run shape. A provider that couldn't be built
+    // warns the same way with its construction error (GitHub issue #93),
+    // rather than the transition silently never firing.
+    if let (Some(target), Some(ticket)) = (deps.status_on_run_start, request.ticket.as_deref()) {
+        let result = match (deps.ticket_provider, deps.ticket_provider_error) {
+            (Some(provider), _) => Some(
+                crate::ticketing::transition_ticket(provider, ticket, target)
+                    .map_err(|e| e.to_string()),
+            ),
+            (None, Some(err)) => Some(Err(err.to_string())),
+            (None, None) => None,
+        };
+        match result {
+            Some(Ok(crate::ticketing::TransitionOutcome::Applied(status))) => {
                 let line = format!("moved {ticket} to {status}");
                 writeln!(out, "{line}")?;
                 append_log_line(&log_path, &line);
             }
-            Ok(crate::ticketing::TransitionOutcome::AlreadyInStatus(_)) => {}
-            Err(err) => {
+            None | Some(Ok(crate::ticketing::TransitionOutcome::AlreadyInStatus(_))) => {}
+            Some(Err(err)) => {
                 let line =
                     format!("warning: could not move {ticket} to \"{target}\" at run start: {err}");
                 writeln!(out, "{line}")?;
@@ -2199,6 +2214,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2271,6 +2287,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2328,6 +2345,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2384,6 +2402,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2439,6 +2458,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2496,6 +2516,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2556,6 +2577,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2646,6 +2668,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2729,6 +2752,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2835,6 +2859,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -3073,6 +3098,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3126,6 +3152,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3192,6 +3219,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3256,6 +3284,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3308,6 +3337,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3366,6 +3396,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3421,6 +3452,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3476,6 +3508,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3529,6 +3562,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3603,6 +3637,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3663,6 +3698,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3712,6 +3748,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3764,6 +3801,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3847,6 +3885,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3907,6 +3946,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3962,6 +4002,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3986,6 +4027,68 @@ mod tests {
             printed.contains("warning: could not move ABC-123 to \"In Progress\" at run start"),
             "{printed}"
         );
+    }
+
+    /// GitHub issue #93: `status_on_run_start` is configured but the ticket
+    /// provider couldn't be built (no Jira token, ...). The transition can't
+    /// fire, but that must warn — with the construction error, on `out` and
+    /// the durable run log — rather than silently skip.
+    #[test]
+    fn prepare_run_lane_status_on_run_start_warns_when_provider_unavailable() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: Some("In Progress"),
+            ticket_provider_error: Some("no Jira API token found"),
+            status_on_pr: None,
+            fallback_runners: Vec::new(),
+        };
+        let state_dir = tmp.path().join("state");
+        let paths = RunLanePaths {
+            home,
+            state_dir: state_dir.clone(),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        assert!(run_store.run_by_id(prepared.run_id).unwrap().is_some());
+
+        let expected = "warning: could not move ABC-123 to \"In Progress\" at run start: \
+                        no Jira API token found";
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains(expected), "{printed}");
+
+        let log_path = run_log_path(&state_dir, "abc-123", "20260806-090503");
+        let log_contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|err| panic!("expected a log file at {log_path:?}: {err}"));
+        assert!(log_contents.contains(expected), "{log_contents:?}");
     }
 
     #[test]
@@ -4019,6 +4122,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4073,6 +4177,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4121,6 +4226,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4172,6 +4278,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4228,6 +4335,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4282,6 +4390,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4368,6 +4477,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4499,6 +4609,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: Some("In Review"),
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4559,6 +4670,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4615,6 +4727,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4673,6 +4786,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4732,6 +4846,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4819,6 +4934,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4889,6 +5005,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4946,6 +5063,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5003,6 +5121,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5054,6 +5173,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5109,6 +5229,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5169,6 +5290,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5225,6 +5347,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5311,6 +5434,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5361,6 +5485,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -5427,6 +5552,7 @@ mod tests {
             runner: &ClaudeRunner,
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -5483,6 +5609,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5564,6 +5691,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5848,6 +5976,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5920,6 +6049,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
@@ -5989,6 +6119,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
@@ -6057,6 +6188,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -6113,6 +6245,7 @@ mod tests {
 
             status_on_run_start: None,
             status_on_pr: None,
+            ticket_provider_error: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {

@@ -406,15 +406,17 @@ fn agent_runner_for(config: &Config) -> &'static dyn AgentRunner {
 
 /// Best-effort ticket provider for `tm work run`'s branch-name-slug lookup
 /// (see `run_work`'s doc comment): the same provider [`ticket_provider_for`]
-/// builds for `config.backend`, or `None` on any construction/auth failure
-/// — never a hard error, since `tm work run` has always worked without
-/// ticket-backend access and this feature must not change that.
+/// builds for `config.backend`, or the construction/auth error rendered as a
+/// string. Callers treat an error as "no provider" — never a hard error,
+/// since `tm work run` has always worked without ticket-backend access — but
+/// keep the message so a skipped `status_on_run_start` can warn with it
+/// (GitHub issue #93).
 fn run_ticket_provider(
     config: &Config,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
-) -> Option<Box<dyn TicketProvider>> {
-    ticket_provider_for(config, keychain, env_token).ok()
+) -> Result<Box<dyn TicketProvider>, String> {
+    ticket_provider_for(config, keychain, env_token).map_err(|err| err.to_string())
 }
 
 /// `tm review fix <KEY>` is always special-cased in `main` as
@@ -533,12 +535,18 @@ fn run_work(
             let detach = tskmstr::work::detach::RealDetachSpawner;
             let current_exe = std::env::current_exe()?;
             // Best-effort ticket provider for the branch-name slug: absent
-            // config or a construction/auth failure silently means no
-            // provider, never a hard error — see this function's doc
-            // comment.
-            let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
+            // config or a construction/auth failure means no provider, never
+            // a hard error — see this function's doc comment. A construction
+            // failure's message is kept so a skipped `status_on_run_start`
+            // warns instead of silently not firing (GitHub issue #93).
+            let provider_result = full_config
                 .as_ref()
-                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
+                .map(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
+            let ticket_provider_error = provider_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err().cloned());
+            let ticket_provider: Option<Box<dyn TicketProvider>> =
+                provider_result.and_then(Result::ok);
             // The invoking repo's own backend identity, for the
             // lane/backend-compatibility preflight (GitHub issue #5 phase
             // 2). See `backend_identity_or_placeholder` on why the
@@ -565,6 +573,7 @@ fn run_work(
                 status_on_pr: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_pr.as_deref()),
+                ticket_provider_error: ticket_provider_error.as_deref(),
                 fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             };
@@ -601,7 +610,7 @@ fn run_work(
             // turns up (GitHub issue #92), never to finish the run itself.
             let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
                 .as_ref()
-                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()));
+                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()).ok());
             let succeeded = tskmstr::cli::work::supervise(
                 &spawner,
                 &gh,
@@ -2236,8 +2245,8 @@ mod tests {
         // sandboxed `$HOME` (verified: this test fails there with "github
         // backend must not require a Jira token to produce a ticket
         // provider", because `RunStore::open` fails and `run_ticket_provider`
-        // swallows it into `None` per its documented opportunistic
-        // contract). Point it at a temp dir instead, so the test is
+        // turns it into an `Err` that `tm work run` treats as "no
+        // provider"). Point it at a temp dir instead, so the test is
         // hermetic regardless of the ambient `$HOME`.
         let tmp = tempfile::tempdir().unwrap();
         let mut config = github_config("jowi-dev/tskmstr");
@@ -2247,19 +2256,25 @@ mod tests {
         let provider = run_ticket_provider(&config, &keychain, None);
 
         assert!(
-            provider.is_some(),
+            provider.is_ok(),
             "github backend must not require a Jira token to produce a ticket provider"
         );
     }
 
     #[test]
-    fn run_ticket_provider_jira_backend_is_none_without_a_token() {
+    fn run_ticket_provider_jira_backend_reports_why_without_a_token() {
         let config = jira_config();
         let keychain = InMemoryKeychain::empty();
 
         let provider = run_ticket_provider(&config, &keychain, None);
 
-        assert!(provider.is_none());
+        // The construction error is kept (not swallowed) so `tm work run`
+        // can warn when `status_on_run_start` can't fire (GitHub issue #93).
+        let err = provider.err().expect("no token must mean no provider");
+        assert_eq!(
+            err,
+            tskmstr::keychain::AuthError::NoTokenAvailable.to_string()
+        );
     }
 
     #[test]
@@ -2269,7 +2284,7 @@ mod tests {
 
         let provider = run_ticket_provider(&config, &keychain, Some("tok".to_string()));
 
-        assert!(provider.is_some());
+        assert!(provider.is_ok());
     }
 
     #[test]
