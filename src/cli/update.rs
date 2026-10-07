@@ -5,14 +5,17 @@
 //!
 //! - scaffold the asset kinds the running binary expects but the repo lacks
 //!   (a configured lane's missing prompt file, using the same starter
-//!   template `tm init` writes), and
+//!   template `tm init` writes),
+//! - write the suggested default for each missing expected config key
+//!   (GitHub issue #74), after one batch confirmation, and
 //! - bump the `.tskmstr.toml` `schema_version` stamp to
 //!   [`manifest::CURRENT_SCHEMA_VERSION`].
 //!
-//! Strictly additive: it only ever writes files that don't exist and the
-//! stamp key. Existing user-customized assets (edited lane prompts, skill
-//! bodies, config values, comments) are never touched — the same reasoning
-//! that keeps `tm check` from content-diffing them (see
+//! Strictly additive: it only ever writes files that don't exist, config
+//! keys that are set nowhere, and the stamp key. Existing user-customized
+//! assets (edited lane prompts, skill bodies, config values, comments) are
+//! never touched — the same reasoning that keeps `tm check` from
+//! content-diffing them (see
 //! `docs/decisions/0007-asset-schema-version.md`). Two things it therefore
 //! cannot fix are reported as remaining drift instead: a user-supplied
 //! session skill that exists nowhere (tm doesn't ship skill content), and a
@@ -25,6 +28,7 @@ use std::path::Path;
 use crate::agent::{AgentInvocation, AgentRunner};
 use crate::config::ConfigPaths;
 use crate::config::manifest;
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::Prompter;
 use super::check::{self, CheckCliError, CheckContext, DriftFinding};
@@ -52,10 +56,11 @@ pub struct UpdateContext<'a> {
 /// `tm update`: compute `tm check`'s findings, apply every additive fix,
 /// offer the agent-assisted setup session for only the assets this run
 /// introduced (skipped under `yes`, like `tm init --yes`), and return the
-/// drift that remains (empty when the repo is now up to date). Errors
-/// mirror `tm check`'s: a repo that was never onboarded is a
-/// [`CheckCliError::MissingRepoConfig`], not something to "update" into
-/// existence — that's `tm init`'s job.
+/// findings that remain (no drift — see [`check::has_drift`] — when the repo
+/// is now up to date; declined recommended config keys stay as advisory
+/// findings). Errors mirror `tm check`'s: a repo that was never onboarded
+/// is a [`CheckCliError::MissingRepoConfig`], not something to "update"
+/// into existence — that's `tm init`'s job.
 pub fn run_update(
     ctx: &UpdateContext,
     yes: bool,
@@ -137,14 +142,22 @@ pub fn run_update(
             // an additive fix; reported as remaining drift only (GitHub
             // issue #53).
             DriftFinding::LegacyPromptDir { .. } => {}
+            // Collected below and written in one confirmed batch.
+            DriftFinding::MissingConfigKey { .. } => {}
         }
     }
 
+    reconcile_config_keys(&findings, &mut doc, yes, prompter, out)?;
+
+    let before_stamp = doc.to_string();
     if !newer_stamp {
         super::init::stamp_schema_version(&mut doc);
     }
+    let stamped = doc.to_string() != before_stamp;
     if doc.to_string() != original {
         std::fs::write(&repo_config_path, doc.to_string())?;
+    }
+    if stamped {
         writeln!(
             out,
             "Stamped schema_version = {} in {}",
@@ -166,9 +179,12 @@ pub fn run_update(
     // Re-check against what's on disk now: scaffolds cleared their lane
     // findings, a session may have authored the missing skills, the stamp
     // is current unless it was newer, and whatever is left is drift this
-    // command cannot fix additively.
+    // command cannot fix additively. Advisory findings (recommended config
+    // keys the operator declined) are listed separately: they aren't drift.
     let remaining = check::collect_findings(&check_ctx, &doc, &repo_dir);
-    if remaining.is_empty() {
+    let (advisory, drift): (Vec<&DriftFinding>, Vec<&DriftFinding>) =
+        remaining.iter().partition(|finding| finding.is_advisory());
+    if drift.is_empty() {
         writeln!(
             out,
             "up to date (schema_version {})",
@@ -177,11 +193,106 @@ pub fn run_update(
     } else {
         writeln!(out)?;
         writeln!(out, "Drift `tm update` cannot fix:")?;
-        for finding in &remaining {
+        for finding in &drift {
+            writeln!(out, "{finding}")?;
+        }
+    }
+    if !advisory.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Advisory:")?;
+        for finding in &advisory {
             writeln!(out, "{finding}")?;
         }
     }
     Ok(remaining)
+}
+
+/// Write the suggested default for every [`DriftFinding::MissingConfigKey`]
+/// that has one (GitHub issue #74), after one batch confirmation (skipped
+/// under `yes`). Additive only: a finding exists only for a key set nowhere,
+/// and [`set_missing_key`] re-checks before writing. A key with no suggested
+/// default has nothing safe to write and stays a finding for the operator.
+fn reconcile_config_keys(
+    findings: &[DriftFinding],
+    doc: &mut DocumentMut,
+    yes: bool,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let suggestions: Vec<(&str, &str)> = findings
+        .iter()
+        .filter_map(|finding| match finding {
+            DriftFinding::MissingConfigKey {
+                key,
+                suggested_default: Some(default),
+                ..
+            } => Some((key.as_str(), default.as_str())),
+            _ => None,
+        })
+        .collect();
+    if suggestions.is_empty() {
+        return Ok(());
+    }
+
+    if !yes {
+        writeln!(out, "Missing config keys with suggested defaults:")?;
+        for (key, default) in &suggestions {
+            writeln!(out, "  {key} = \"{default}\"")?;
+        }
+        if !prompter.confirm_with_default("Write these to .tskmstr.toml?", true)? {
+            return Ok(());
+        }
+    }
+
+    for (key, default) in suggestions {
+        let path: Vec<&str> = key.split('.').collect();
+        if set_missing_key(doc, &path, default) {
+            writeln!(out, "Set {key} = \"{default}\"")?;
+        }
+    }
+    Ok(())
+}
+
+/// Set the string `val` at `path` (tables, then the key) in `doc` when no
+/// value is there yet, creating missing tables as implicit parents (so a
+/// nested key renders as a `[work.merge]` header, not `[work]` +
+/// `[work.merge]`). Returns `false` and leaves `doc` untouched when the key
+/// already has a value or a parent on the path isn't a table.
+fn set_missing_key(doc: &mut DocumentMut, path: &[&str], val: &str) -> bool {
+    let Some((last, tables)) = path.split_last() else {
+        return false;
+    };
+    // Validate the whole path before creating anything, so a non-table
+    // parent can't leave half-created tables behind.
+    let mut probe = doc.as_table() as &dyn toml_edit::TableLike;
+    for name in tables {
+        match probe.get(name) {
+            None => break,
+            Some(item) => match item.as_table_like() {
+                Some(next) => probe = next,
+                None => return false,
+            },
+        }
+    }
+
+    let mut table = doc.as_table_mut();
+    for name in tables {
+        let item = table.entry(name).or_insert_with(|| {
+            let mut created = Table::new();
+            created.set_implicit(true);
+            Item::Table(created)
+        });
+        let Some(next) = item.as_table_mut() else {
+            return false;
+        };
+        table = next;
+    }
+    if table.contains_key(last) {
+        return false;
+    }
+    table.set_implicit(false);
+    table.insert(last, value(val));
+    true
 }
 
 #[cfg(test)]
@@ -702,5 +813,134 @@ mod tests {
         let err = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
             .expect_err("missing config should error");
         assert!(matches!(err, CheckCliError::MissingRepoConfig { .. }));
+    }
+
+    /// A current-stamped GitHub repo whose only drift is the recommended
+    /// status keys (GitHub issue #74).
+    const GITHUB_CONFIG: &str = "schema_version = 2\n\
+                                 [backend]\n\
+                                 provider = \"github\"\n";
+
+    #[test]
+    fn yes_writes_suggested_defaults_for_missing_config_keys() {
+        let env = test_env();
+        write_repo_config(&env, GITHUB_CONFIG);
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
+
+        assert!(remaining.is_empty(), "keys reconciled: {remaining:?}");
+        let written = read_repo_config(&env);
+        assert!(
+            written.contains("status_on_pr = \"In Review\"")
+                && written.contains("status_on_run_start = \"In Progress\""),
+            "suggested defaults written: {written}"
+        );
+        assert!(
+            written.contains("provider = \"github\""),
+            "existing config kept: {written}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("Set status_on_pr = \"In Review\""),
+            "write named in: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Stamped"),
+            "stamp was already current: {rendered}"
+        );
+    }
+
+    #[test]
+    fn confirmed_prompt_writes_all_suggested_defaults_in_one_batch() {
+        let env = test_env();
+        write_repo_config(&env, GITHUB_CONFIG);
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut prompter = FakePrompter::new().with_confirm(true);
+        let mut out = Vec::new();
+        let remaining =
+            run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        assert!(remaining.is_empty(), "keys reconciled: {remaining:?}");
+        let written = read_repo_config(&env);
+        assert!(
+            written.contains("status_on_pr = \"In Review\"")
+                && written.contains("status_on_run_start = \"In Progress\""),
+            "both written on one confirmation: {written}"
+        );
+    }
+
+    #[test]
+    fn declined_prompt_leaves_config_untouched_and_keys_advisory() {
+        let env = test_env();
+        write_repo_config(&env, GITHUB_CONFIG);
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut prompter = FakePrompter::new().with_confirm(false);
+        let mut out = Vec::new();
+        let remaining =
+            run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        assert_eq!(read_repo_config(&env), GITHUB_CONFIG, "nothing written");
+        assert_eq!(remaining.len(), 2, "both keys remain: {remaining:?}");
+        assert!(
+            !check::has_drift(&remaining),
+            "recommended keys are advisory: {remaining:?}"
+        );
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            !rendered.contains("cannot fix") && rendered.contains("Advisory:"),
+            "declined keys are advisory, not unfixable drift: {rendered}"
+        );
+    }
+
+    #[test]
+    fn existing_config_key_is_never_overwritten() {
+        let env = test_env();
+        let config = format!("status_on_pr = \"Code Review\"\n{GITHUB_CONFIG}");
+        write_repo_config(&env, &config);
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        run_update(&ctx, true, &mut FakePrompter::new(), &mut out).expect("update should succeed");
+
+        let written = read_repo_config(&env);
+        assert!(
+            written.contains("status_on_pr = \"Code Review\"") && !written.contains("In Review"),
+            "existing value kept: {written}"
+        );
+        assert!(
+            written.contains("status_on_run_start = \"In Progress\""),
+            "missing key still added: {written}"
+        );
+    }
+
+    #[test]
+    fn set_missing_key_creates_tables_and_skips_a_non_table_parent() {
+        let mut doc: toml_edit::DocumentMut = "work = 3\n".parse().expect("toml");
+        assert!(!set_missing_key(
+            &mut doc,
+            &["work", "merge", "model"],
+            "opus"
+        ));
+        assert_eq!(doc.to_string(), "work = 3\n");
+
+        let mut doc = toml_edit::DocumentMut::new();
+        assert!(set_missing_key(
+            &mut doc,
+            &["work", "merge", "model"],
+            "opus"
+        ));
+        assert!(
+            doc.to_string().contains("[work.merge]\nmodel = \"opus\""),
+            "nested table created: {doc}"
+        );
     }
 }

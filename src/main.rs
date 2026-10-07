@@ -1031,9 +1031,10 @@ fn launch_setup_session(
 
 /// `tm update [--yes]`: build real dependencies and run
 /// [`tskmstr::cli::update::run_update`], mapping its result to `tm check`'s
-/// three-way exit code (`0` up to date after the fixes, `1` drift remains,
-/// `2` error). Config loads leniently for the same reason as
-/// [`run_check_cmd`]'s full path: only the runner resolution needs it.
+/// three-way exit code (`0` up to date after the fixes — advisory findings
+/// aside — `1` drift remains, `2` error). Config loads leniently for the
+/// same reason as [`run_check_cmd`]'s full path: only the runner resolution
+/// needs it.
 fn run_update_cmd(yes: bool) -> ExitCode {
     let paths = default_config_paths();
     let home = std::env::var_os("HOME")
@@ -1059,7 +1060,7 @@ fn run_update_cmd(yes: bool) -> ExitCode {
     let mut stdout = std::io::stdout();
 
     match tskmstr::cli::update::run_update(&ctx, yes, &mut prompter, &mut stdout) {
-        Ok(remaining) if remaining.is_empty() => ExitCode::SUCCESS,
+        Ok(remaining) if !tskmstr::cli::check::has_drift(&remaining) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(err) => {
             eprintln!("{err}");
@@ -1069,9 +1070,11 @@ fn run_update_cmd(yes: bool) -> ExitCode {
 }
 
 /// `tm check [--quiet]`: build real dependencies and run
-/// [`tskmstr::cli::check::run_check`] (or the stamp-only
+/// [`tskmstr::cli::check::run_check`] (or the stamp-and-required-keys
 /// [`tskmstr::cli::check::run_check_quiet`]), mapping the result to a
 /// three-way exit code (`0` up to date, `1` drift found, `2` error).
+/// Advisory findings (a missing *recommended* config key, GitHub issue #74)
+/// are reported but don't count as drift for the exit code.
 ///
 /// The full report loads the global config the same lenient way `tm work
 /// run`/`tm review fix` do (`config::load(&paths).ok()`): `tm check` must
@@ -1079,7 +1082,7 @@ fn run_update_cmd(yes: bool) -> ExitCode {
 /// repo-local `.tskmstr.toml` alone drives the report — only the runner
 /// resolution (for lane/skill path defaults) benefits from a loaded config,
 /// and falls back to the default runner when there is none. The quiet path
-/// reads nothing but the repo-local `.tskmstr.toml` at all — it runs on
+/// parses only the repo-local `.tskmstr.toml` and the raw global file — it runs on
 /// every shell entry under direnv, so it must stay cheap.
 fn run_check_cmd(quiet: bool) -> ExitCode {
     let paths = default_config_paths();
@@ -1103,7 +1106,7 @@ fn run_check_cmd(quiet: bool) -> ExitCode {
     };
 
     match result {
-        Ok(findings) if findings.is_empty() => ExitCode::SUCCESS,
+        Ok(findings) if !tskmstr::cli::check::has_drift(&findings) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(err) => {
             eprintln!("{err}");

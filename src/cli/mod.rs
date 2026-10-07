@@ -190,34 +190,39 @@ pub enum Command {
     /// Reports [`crate::config::manifest::CURRENT_SCHEMA_VERSION`] drift
     /// (missing/stale/newer `schema_version` stamp) and the same structural
     /// presence checks `tm init` runs on every re-run — a configured lane's
-    /// missing prompt file, a configured session's missing skill — without
-    /// writing anything. User-edited asset *content* (lane prompts, skill
-    /// bodies) is never compared; see `docs/decisions/0007-asset-schema-version.md`.
+    /// missing prompt file, a configured session's missing skill — plus
+    /// every expected config key (GitHub issue #74) set in neither the repo
+    /// nor the global config, with its suggested value, without writing
+    /// anything. User-edited asset *content* (lane prompts, skill bodies) is
+    /// never compared; see `docs/decisions/0007-asset-schema-version.md`.
     ///
-    /// Exit code: `0` up to date, `1` drift found, `2` error (e.g. the repo
-    /// was never onboarded).
+    /// Exit code: `0` up to date (a missing *recommended* config key is
+    /// advisory), `1` drift found, `2` error (e.g. the repo was never
+    /// onboarded).
     Check {
-        /// Stamp-only fast path, suitable for direnv: compare just the
-        /// `schema_version` stamp against this binary's expected revision,
-        /// skipping the lane/skill presence scans and all config loading.
-        /// Prints nothing when current, one nudge line when not.
+        /// Fast path, suitable for direnv: compare the `schema_version`
+        /// stamp against this binary's expected revision and flag missing
+        /// *required* config keys, skipping the lane/skill presence scans
+        /// and merged config loading. Prints nothing when current, one
+        /// nudge line per finding when not.
         #[arg(long)]
         quiet: bool,
     },
     /// Apply the additive fixes for `tm check`'s drift findings: scaffold
     /// the assets the running tskmstr expects but this onboarded repo lacks
-    /// (a configured lane's missing prompt file), bump the `schema_version`
-    /// stamp, and offer the agent-assisted setup session for only those new
-    /// assets. Never overwrites an existing file or config value — drift it
+    /// (a configured lane's missing prompt file), write suggested values for
+    /// missing expected config keys after one confirmation, bump the
+    /// `schema_version` stamp, and offer the agent-assisted setup session
+    /// for only those new assets. Never overwrites an existing file or config value — drift it
     /// cannot fix additively (a user-supplied skill that exists nowhere, a
     /// stamp newer than this binary) is reported instead.
     ///
     /// Exit code: `0` up to date after the fixes, `1` drift remains, `2`
     /// error (e.g. the repo was never onboarded — run `tm init` first).
     Update {
-        /// Apply the fixes without offering the agent setup session
-        /// (scripted update keeps the static skeletons, like `tm init
-        /// --yes`).
+        /// Apply the fixes (including suggested config keys) without asking
+        /// and without offering the agent setup session (scripted update
+        /// keeps the static skeletons, like `tm init --yes`).
         #[arg(long)]
         yes: bool,
     },

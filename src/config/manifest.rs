@@ -13,6 +13,10 @@
 //! `tm check` (a later, separate task) is the consumer that actually reads a
 //! repo's stamp and reports [`StampStatus`] to the user — this module only
 //! defines the shared primitive both `tm init` and `tm check` build on.
+//!
+//! It also holds [`EXPECTED_CONFIG_KEYS`] (GitHub issue #74): the config keys
+//! the running tskmstr expects an onboarded repo to set, so `tm check` can
+//! name a specific missing key rather than only a stale stamp.
 
 /// The asset/config schema revision this binary expects.
 ///
@@ -70,9 +74,146 @@ pub fn stamp_status(found: Option<i64>) -> StampStatus {
     }
 }
 
+/// How much a missing [`ExpectedConfigKey`] matters (GitHub issue #74).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum KeySeverity {
+    /// A feature breaks or misbehaves without the key. A missing required
+    /// key is drift `tm check` exits non-zero for, and the `tm check --quiet`
+    /// shell-entry nudge surfaces it.
+    Required,
+    /// A default is assumed when the key is absent, but setting it
+    /// explicitly is better. Reported by `tm check` as advisory only: it
+    /// never makes `tm check` exit non-zero and never reaches the quiet
+    /// nudge.
+    Recommended,
+}
+
+impl KeySeverity {
+    /// The lowercase word `tm check` renders for this severity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySeverity::Required => "required",
+            KeySeverity::Recommended => "recommended",
+        }
+    }
+}
+
+/// A config key a newer tskmstr expects an onboarded repo to set (GitHub
+/// issue #74). Registered in [`EXPECTED_CONFIG_KEYS`] — the one place a
+/// feature that ships a new key declares it, the way
+/// [`CURRENT_SCHEMA_VERSION`] centralizes the stamp — so `tm check` can name
+/// exactly which keys a repo is missing and `tm update` can write their
+/// suggested defaults additively.
+#[derive(Debug)]
+pub struct ExpectedConfigKey {
+    /// Table path plus key name, e.g. `["status_on_pr"]` for a top-level key
+    /// or `["work", "merge", "model"]` for `[work.merge].model`.
+    pub path: &'static [&'static str],
+    /// The [`CURRENT_SCHEMA_VERSION`] at which tskmstr started expecting this
+    /// key. Informational (rendered in the finding); presence alone decides
+    /// whether the key is reported.
+    pub since_schema_version: i64,
+    /// Whether a missing key is drift or advisory. See [`KeySeverity`].
+    pub severity: KeySeverity,
+    /// The string value `tm update` writes for a repo on the given backend,
+    /// or `None` when there is no safe value to assume (e.g. a Jira
+    /// workflow's status names are arbitrary). A recommended key with no
+    /// default for the repo's backend isn't reported at all — there is
+    /// nothing actionable to suggest; a required one is reported for the
+    /// operator to set by hand.
+    pub suggested_default: fn(super::BackendKind) -> Option<&'static str>,
+}
+
+impl ExpectedConfigKey {
+    /// The key's dotted path, e.g. `work.merge.model`.
+    pub fn dotted(&self) -> String {
+        self.path.join(".")
+    }
+}
+
+/// Every config key the running tskmstr expects an onboarded repo to set.
+/// A feature that adds a key registers it here.
+///
+/// The GitHub defaults name the workflow statuses whose `tm:status/*` labels
+/// `tm init` creates, so they're safe to assume; a Jira workflow's status
+/// names are the board's own, so Jira gets no default.
+pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
+    ExpectedConfigKey {
+        path: &["status_on_pr"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |backend| match backend {
+            super::BackendKind::Github => Some("In Review"),
+            super::BackendKind::Jira => None,
+        },
+    },
+    ExpectedConfigKey {
+        path: &["status_on_run_start"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |backend| match backend {
+            super::BackendKind::Github => Some("In Progress"),
+            super::BackendKind::Jira => None,
+        },
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BackendKind;
+
+    fn expected(path: &[&str]) -> &'static ExpectedConfigKey {
+        EXPECTED_CONFIG_KEYS
+            .iter()
+            .find(|k| k.path == path)
+            .unwrap_or_else(|| panic!("{path:?} registered"))
+    }
+
+    #[test]
+    fn status_on_pr_is_recommended_with_a_github_only_default() {
+        let key = expected(&["status_on_pr"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!(
+            (key.suggested_default)(BackendKind::Github),
+            Some("In Review")
+        );
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn status_on_run_start_is_recommended_with_a_github_only_default() {
+        let key = expected(&["status_on_run_start"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!(
+            (key.suggested_default)(BackendKind::Github),
+            Some("In Progress")
+        );
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn no_registered_key_claims_a_schema_version_newer_than_this_binary() {
+        for key in EXPECTED_CONFIG_KEYS {
+            assert!(
+                key.since_schema_version <= CURRENT_SCHEMA_VERSION,
+                "{:?} since {}",
+                key.path,
+                key.since_schema_version
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_joins_the_key_path() {
+        let key = ExpectedConfigKey {
+            path: &["work", "merge", "model"],
+            since_schema_version: 1,
+            severity: KeySeverity::Recommended,
+            suggested_default: |_| None,
+        };
+        assert_eq!(key.dotted(), "work.merge.model");
+    }
 
     #[test]
     fn missing_when_no_stamp_found() {

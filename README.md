@@ -100,7 +100,14 @@ newer than this binary expects) and the same structural presence checks
 file, a lane whose `subagent` key names a definition that doesn't exist,
 a configured session's missing skill, a relative `prompt_file` still
 pointing at the legacy top-level `prompts/` directory instead of the
-canonical `.tskmstr/prompts/`. It never writes anything and
+canonical `.tskmstr/prompts/`. It also names every expected config key
+(registered in `src/config/manifest.rs`'s `EXPECTED_CONFIG_KEYS`) that is
+set in neither the repo nor the global config, with the value to set —
+e.g. `status_on_pr = "In Review"` on the GitHub backend. A *required* key
+is drift; a *recommended* one (a default is assumed, but explicit is
+better) is advisory and doesn't affect the exit code. A recommended key
+with no safe default for the repo's backend (Jira's workflow status names
+are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
 checked (see `docs/decisions/0007-asset-schema-version.md`).
@@ -112,7 +119,9 @@ scaffolds a starter prompt for any configured lane whose prompt file is
 missing, scaffolds a missing subagent definition for any lane that
 declares one (with a placeholder `model` for you to fill, since `tm
 update` has no model to declare — that's `tm init`'s interactive
-question), bumps the `schema_version` stamp, and makes the same
+question), writes the suggested value for each missing expected config
+key after one confirmation (`--yes` writes them without asking), bumps
+the `schema_version` stamp, and makes the same
 agent-assisted setup offer `tm init` does — for only the new assets
 (`--yes` skips the offer and keeps the static skeletons). It never
 overwrites an existing file or config value, so hand-edited assets are
@@ -122,10 +131,11 @@ check`'s exit codes: a user-supplied session skill that exists nowhere
 binary (bumping that would be a downgrade — update tskmstr instead).
 
 `tm check --quiet` is the cheap staleness nudge for shell entry: it
-compares only the `schema_version` stamp — no lane/skill scans, no config
-loading — prints nothing when current, and prints a single line naming
-the remedy when the repo is behind. With direnv, add this to an onboarded
-repo's `.envrc`:
+compares only the `schema_version` stamp and flags missing *required*
+config keys — no lane/skill scans, no merged config loading — prints
+nothing when current, and prints one line naming the remedy per finding
+when the repo is behind. With direnv, add this to an onboarded repo's
+`.envrc`:
 
 ```
 tm check --quiet || true
@@ -134,7 +144,7 @@ tm check --quiet || true
 The `|| true` keeps a stale repo from failing the `.envrc` under direnv's
 strict shell; the nudge line still prints. The full asset scan stays
 behind on-demand `tm check`/`tm update`, so the per-`cd` cost is one
-small file read.
+or two small file reads.
 
 Under the Jira backend, `tm init` hands off to `tm auth login` when no
 API token resolves; you can also bootstrap auth directly:
@@ -162,8 +172,8 @@ tm auth status
 | Command | What it does |
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
-| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp and asset presence match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-only fast path for direnv: silent when current, one nudge line when not. Exits `0` up to date, `1` drift found, `2` error |
-| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
+| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp, asset presence, and expected config keys match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-and-required-keys fast path for direnv: silent when current, one nudge line per finding when not. Exits `0` up to date (recommended keys are advisory), `1` drift found, `2` error |
+| `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, write suggested values for missing config keys (one confirmation), bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
