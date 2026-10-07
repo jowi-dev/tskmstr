@@ -405,6 +405,14 @@ pub struct RunLaneDeps<'a> {
     /// [`RunLaneDeps::ticket_provider`]; absent that, the transition is
     /// skipped exactly like the branch-name slug lookup.
     pub status_on_run_start: Option<&'a str>,
+    /// The configured `status_on_pr` workflow status (see
+    /// [`crate::config::Config::status_on_pr`]), or `None` when unset.
+    /// [`prepare_run_lane`] carries it on [`PreparedRun::status_on_pr`] for
+    /// a ticketed run, so [`run_agent_and_finish`] can advisorily apply it
+    /// once the finished run turns out to have a PR — including one the
+    /// agent opened with plain `gh pr create` rather than `tm pr create`
+    /// (GitHub issue #92).
+    pub status_on_pr: Option<&'a str>,
     /// The rest of `config.agent_fallbacks`' priority order, resolved to
     /// live runners via `crate::agent::routing::runner_for`. Empty in
     /// single-runner mode and everywhere but the lane-run path (`tm work
@@ -514,6 +522,18 @@ pub struct PreparedRun {
     /// supervisor's JSON state file (see this struct's doc comment).
     #[serde(default)]
     pub fallbacks: Vec<PlannedFallback>,
+    /// The `status_on_pr` workflow status to advisorily move
+    /// [`PreparedRun::ticket`] to once the finished run has a PR (see
+    /// [`RunLaneDeps::status_on_pr`] and GitHub issue #92). Captured at
+    /// prepare time from the invoking repo's config, like
+    /// `status_on_run_start`, so the detached supervisor applies the same
+    /// target the run started under. `None` for ticketless runs, review-fix
+    /// runs (their PR predates the run), or when unset.
+    ///
+    /// `#[serde(default)]` for the same pre-existing-state-file reason as
+    /// [`PreparedRun::fallbacks`].
+    #[serde(default)]
+    pub status_on_pr: Option<String>,
 }
 
 /// One not-yet-attempted priority-routing fallback, carried on
@@ -937,6 +957,7 @@ pub fn run_lane_fg(
         deps.spawner,
         deps.gh,
         deps.run_store,
+        deps.ticket_provider,
         &prepared,
         deps.runner,
         out,
@@ -1375,6 +1396,10 @@ pub fn prepare_run_lane(
         invocation,
         out_json_path,
         fallbacks,
+        status_on_pr: request
+            .ticket
+            .as_ref()
+            .and(deps.status_on_pr.map(str::to_string)),
     })
 }
 
@@ -1524,6 +1549,7 @@ pub fn prepare_review_fix(
         invocation,
         out_json_path,
         fallbacks: Vec::new(),
+        status_on_pr: None,
     })
 }
 
@@ -1563,10 +1589,17 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
 /// detached runs record `pr_url` the same way. `runner` is the adapter whose
 /// [`AgentRunner::parse_outcome`] and [`AgentRunner::resume_command`] this
 /// tail defers to — see GitHub issue #17.
+///
+/// `ticket_provider` is used only once a PR URL resolves for a ticketed run
+/// carrying [`PreparedRun::status_on_pr`]: the ticket is then advisorily
+/// moved there via [`crate::ticketing::reconcile_status`], after the run row
+/// is finished, so a provider failure prints a warning but never fails the
+/// run (GitHub issue #92). `None` skips the transition.
 pub fn run_agent_and_finish(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
     run_store: &RunStore,
+    ticket_provider: Option<&dyn TicketProvider>,
     prepared: &PreparedRun,
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
@@ -1706,6 +1739,7 @@ pub fn run_agent_and_finish(
         &prepared.branch,
         parsed.as_ref().and_then(|o| o.result.as_deref()),
     );
+    let has_pr = pr_url.is_some();
     // Only a non-zero exit or an explicit `is_error: true` (both folded into
     // `run_status == Failed` above) may clobber a status the in-session
     // agent already set for itself via `tm runs finish` -- a crashed run is
@@ -1732,6 +1766,33 @@ pub fn run_agent_and_finish(
         },
         force_status,
     )?;
+
+    // GitHub issue #92: `tm pr create` is the only other place
+    // `status_on_pr` fires, so a run whose agent opened its PR with plain
+    // `gh pr create` would otherwise leave its ticket wherever run start
+    // left it. Advisory, like `status_on_run_start` in `prepare_run_lane`:
+    // the run is already recorded, a ticket already in the target status
+    // (say, `tm pr create` moved it) is silent, and a failure only warns.
+    // `out` is the run log for a detached run, so both lines land there.
+    if let (true, Some(provider), Some(ticket), Some(target)) = (
+        has_pr,
+        ticket_provider,
+        prepared.ticket.as_deref(),
+        prepared.status_on_pr.as_deref(),
+    ) {
+        match crate::ticketing::reconcile_status(provider, ticket, target) {
+            crate::ticketing::StatusTransition::Applied(status) => {
+                writeln!(out, "moved {ticket} to {status}")?;
+            }
+            crate::ticketing::StatusTransition::AlreadyInStatus(_) => {}
+            crate::ticketing::StatusTransition::Warning(message) => {
+                writeln!(
+                    out,
+                    "warning: could not move {ticket} to \"{target}\" after its PR opened: {message}"
+                )?;
+            }
+        }
+    }
 
     // Print the summary, mirroring work.ml's final printf block.
     let session_id = parsed.as_ref().map(|o| o.session_id.clone());
@@ -1792,17 +1853,27 @@ pub fn run_agent_and_finish(
 /// factored out here (rather than living in `detach.rs`) so it can be
 /// exercised with fakes exactly like [`run_lane_fg`], with no process
 /// re-exec, setsid, or file I/O involved in the test.
+#[allow(clippy::too_many_arguments)]
 pub fn supervise_run(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
     run_store: &RunStore,
+    ticket_provider: Option<&dyn TicketProvider>,
     prepared: &PreparedRun,
     supervisor_pid: u32,
     runner: &dyn AgentRunner,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
-    run_agent_and_finish(spawner, gh, run_store, prepared, runner, out)
+    run_agent_and_finish(
+        spawner,
+        gh,
+        run_store,
+        ticket_provider,
+        prepared,
+        runner,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -2127,6 +2198,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2198,6 +2270,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2254,6 +2327,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2309,6 +2383,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2363,6 +2438,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2419,6 +2495,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2478,6 +2555,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2520,6 +2598,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut supervisor_out,
@@ -2566,6 +2645,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2604,6 +2684,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut supervisor_out,
@@ -2647,6 +2728,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -2688,6 +2770,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut supervisor_out,
@@ -2751,6 +2834,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -2793,6 +2877,7 @@ mod tests {
             &spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut out,
@@ -2839,6 +2924,7 @@ mod tests {
             &spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut out,
@@ -2870,6 +2956,7 @@ mod tests {
             &spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut out,
@@ -2911,6 +2998,7 @@ mod tests {
             &spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut out,
@@ -2944,6 +3032,7 @@ mod tests {
             &spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             &ClaudeRunner,
             &mut out,
@@ -2983,6 +3072,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3035,6 +3125,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3100,6 +3191,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3163,6 +3255,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3214,6 +3307,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3271,6 +3365,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3325,6 +3420,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3379,6 +3475,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3431,6 +3528,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3504,6 +3602,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3563,6 +3662,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3611,6 +3711,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3662,6 +3763,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3744,6 +3846,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3803,6 +3906,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3857,6 +3961,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3913,6 +4018,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: Some("In Progress"),
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -3966,6 +4072,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4013,6 +4120,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4063,6 +4171,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4118,6 +4227,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4171,6 +4281,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4198,6 +4309,224 @@ mod tests {
             run.pr_url,
             Some("https://github.com/example/repo/pull/7".to_string())
         );
+    }
+
+    // --- status_on_pr at run finish (GitHub issue #92): a ticketed run that
+    // ends with a PR — even one the agent opened with plain `gh pr create` —
+    // advisorily moves its ticket to `status_on_pr`, with the same
+    // best-effort stance as status_on_run_start. ---
+
+    /// The one transition the status_on_pr-at-finish tests seed: to "In
+    /// Review".
+    fn to_in_review() -> Transition {
+        Transition {
+            id: "t-review".to_string(),
+            name: "Request review".to_string(),
+            to: Status {
+                name: "In Review".to_string(),
+                status_category: StatusCategory {
+                    key: "indeterminate".to_string(),
+                },
+            },
+        }
+    }
+
+    /// Run `ABC-123` through [`run_lane_fg`] with `status_on_pr` set to
+    /// `status_on_pr`, `gh` reporting `pr_url` for the run's branch, and
+    /// `jira` as the ticket provider. Returns the finished run row and
+    /// everything printed.
+    fn run_ticketed_lane_fg(
+        jira: &FakeJiraClient,
+        status_on_pr: Option<&str>,
+        pr_url: Option<&str>,
+    ) -> (crate::runs::Run, String) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_url_for_branch(Ok(pr_url.map(str::to_string)));
+        let spawner = FakeProcessSpawner::success(
+            // No PR URL in the result text, so `pr_url` alone decides.
+            r#"{"session_id":"sess-1","total_cost_usd":0.5,"num_turns":3,"is_error":false,"result":"done"}"#
+                .to_string(),
+        );
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            status_on_pr,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+
+        let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
+        (run, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn run_agent_and_finish_moves_ticket_to_status_on_pr_when_the_run_has_a_pr() {
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![to_in_review()]);
+
+        let (run, printed) = run_ticketed_lane_fg(
+            &jira,
+            Some("In Review"),
+            Some("https://github.com/example/repo/pull/7"),
+        );
+
+        assert_eq!(
+            jira.transition_calls(),
+            vec![("ABC-123".to_string(), "t-review".to_string())],
+        );
+        assert!(printed.contains("moved ABC-123 to In Review"), "{printed}");
+        assert_eq!(run.status, RunStatus::Done);
+    }
+
+    #[test]
+    fn run_agent_and_finish_leaves_ticket_alone_when_the_run_has_no_pr() {
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![to_in_review()]);
+
+        let (_run, printed) = run_ticketed_lane_fg(&jira, Some("In Review"), None);
+
+        assert!(jira.transition_calls().is_empty());
+        assert!(!printed.contains("moved ABC-123"), "{printed}");
+    }
+
+    #[test]
+    fn run_agent_and_finish_does_nothing_when_status_on_pr_is_unset() {
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![to_in_review()]);
+
+        run_ticketed_lane_fg(&jira, None, Some("https://github.com/example/repo/pull/7"));
+
+        assert!(jira.transition_calls().is_empty());
+    }
+
+    #[test]
+    fn run_agent_and_finish_status_on_pr_already_in_status_is_silent() {
+        let jira = FakeJiraClient::new()
+            .with_issue(
+                "ABC-123",
+                issue_in_status("ABC-123", "Delete bid connector", "In Review"),
+            )
+            .with_transitions("ABC-123", vec![to_in_review()]);
+
+        let (_run, printed) = run_ticketed_lane_fg(
+            &jira,
+            Some("In Review"),
+            Some("https://github.com/example/repo/pull/7"),
+        );
+
+        assert!(jira.transition_calls().is_empty());
+        assert!(!printed.contains("In Review"), "{printed}");
+    }
+
+    #[test]
+    fn run_agent_and_finish_status_on_pr_failure_warns_and_still_finishes_the_run() {
+        // No matching transition: the advisory move fails, but the run is
+        // already recorded and must stay `Done`.
+        let jira = FakeJiraClient::new()
+            .with_issue("ABC-123", issue("ABC-123", "Delete bid connector"))
+            .with_transitions("ABC-123", vec![]);
+
+        let (run, printed) = run_ticketed_lane_fg(
+            &jira,
+            Some("In Review"),
+            Some("https://github.com/example/repo/pull/7"),
+        );
+
+        assert!(
+            printed.contains("warning: could not move ABC-123 to \"In Review\""),
+            "{printed}"
+        );
+        assert_eq!(run.status, RunStatus::Done);
+        assert_eq!(
+            run.pr_url.as_deref(),
+            Some("https://github.com/example/repo/pull/7")
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_carries_status_on_pr_only_for_ticketed_runs() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            status_on_pr: Some("In Review"),
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let ticketed = RunLaneRequest {
+            ticket: Some("ABC-123".to_string()),
+            ..Default::default()
+        };
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", ticketed, None, &mut out).unwrap();
+        assert_eq!(prepared.status_on_pr.as_deref(), Some("In Review"));
+
+        let ticketless = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(ticketless.status_on_pr, None);
     }
 
     #[test]
@@ -4229,6 +4558,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4284,6 +4614,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4341,6 +4672,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4399,6 +4731,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4485,6 +4818,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4554,6 +4888,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4610,6 +4945,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4666,6 +5002,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4716,6 +5053,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4770,6 +5108,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4829,6 +5168,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4884,6 +5224,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -4969,6 +5310,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5018,6 +5360,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -5083,6 +5426,7 @@ mod tests {
             backend_identity_resolver: compatible_test_resolver(),
             runner: &ClaudeRunner,
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: vec![&OpencodeRunner],
         };
         let paths = RunLanePaths {
@@ -5138,6 +5482,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5173,6 +5518,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             9999,
             &ClaudeRunner,
@@ -5217,6 +5563,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5244,6 +5591,7 @@ mod tests {
             &supervisor_spawner,
             &gh,
             &run_store,
+            None,
             &prepared,
             4321,
             &ClaudeRunner,
@@ -5499,6 +5847,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5570,6 +5919,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
@@ -5638,6 +5988,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let state_dir = tmp.path().join("state");
@@ -5705,6 +6056,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {
@@ -5760,6 +6112,7 @@ mod tests {
             runner: &ClaudeRunner,
 
             status_on_run_start: None,
+            status_on_pr: None,
             fallback_runners: Vec::new(),
         };
         let paths = RunLanePaths {

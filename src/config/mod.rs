@@ -59,7 +59,9 @@ pub struct RawConfig {
     /// Applies to tickets auto-created by `tm pr create` /
     /// `tm pr status --auto-ticket`, and to a pre-existing ticket that
     /// `tm pr create` associates with a newly opened PR (unless that ticket
-    /// is already in the target status). `tm ticket <KEY>` never
+    /// is already in the target status). Also applied advisorily by
+    /// `tm work run` when a finished lane run has a PR, however it was
+    /// opened (GitHub issue #92). `tm ticket <KEY>` never
     /// transitions a ticket's status. When unset, tickets are left in
     /// whatever status they're already in.
     pub status_on_pr: Option<String>,
