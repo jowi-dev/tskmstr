@@ -202,6 +202,7 @@ tm auth status
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -228,6 +229,31 @@ tm auth status
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+
+## Ticket/run status drift (`tm drift`)
+
+Every status move tskmstr makes (`status_on_create`, `status_on_run_start`,
+`status_on_pr`, `status_on_merge`) is a one-shot, advisory transition fired
+by one command. A key left unset, a transition that fails with a warning, or
+a bypass path (an agent running `gh pr create` itself, a PR merged in the
+GitHub UI) leaves the ticket behind, and nothing corrects it later. `tm drift` is
+the safety net that shows when that has happened:
+
+```
+$ tm drift
+vocalfry
+  GH-17 [In Review] PR merged, ticket not done (run: done, pr: merged) -> Done
+1 drifted ticket(s) across 6 project(s). Run `tm drift --fix` to apply the suggested transitions.
+```
+
+Each finding names the transition `--fix` would apply: the repo's
+configured `status_on_*` key for the hook that should have fired, falling
+back to `In Review` / `Done` / `In Progress`. Review the list before fixing.
+A PR written with `Refs #N` rather than `Closes #N` may intentionally leave
+its ticket open, so use `tm drift --fix KEY...` to move only the tickets you
+agree with. Stalled tickets are listed but never moved. The full drift
+matrix (every hook, every bypass path) is in
+`docs/plans/gh-80-status-drift.md`.
 
 ## `tm runs`
 
