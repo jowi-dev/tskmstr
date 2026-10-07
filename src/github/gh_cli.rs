@@ -448,6 +448,19 @@ pub trait GhCli {
     /// corrupting blocker resolution without any obviously-related error.
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError>;
 
+    /// List pull requests already merged into `base` in the repository
+    /// rooted at `dir` (`gh pr list --state merged --base <base> --limit 200
+    /// --json number,url,title,body,headRefName,baseRefName`), with the same
+    /// [`PrInfo`] fields as [`GhCli::pr_list`] so callers can resolve each
+    /// one's ticket key.
+    ///
+    /// Used by `tm merge` to find stacked PRs merged into the branch it just
+    /// merged (GitHub issue #94): GitHub only honours a closing keyword on a
+    /// PR into the default branch, so those PRs' tickets are otherwise never
+    /// moved. `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_list_all`]'s doc comment.
+    fn pr_list_merged_into(&self, dir: &Path, base: &str) -> Result<Vec<PrInfo>, GhError>;
+
     /// Merge open pull request `number` (`gh pr merge <number>
     /// --merge|--squash|--rebase`), run from `dir` like [`GhCli::pr_list`].
     ///
@@ -1414,6 +1427,34 @@ impl GhCli for ShellGhCli {
             })?;
 
         interpret_pr_list_all_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_list_merged_into(&self, dir: &Path, base: &str) -> Result<Vec<PrInfo>, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--base",
+                base,
+                "--limit",
+                "200",
+                "--json",
+                PR_VIEW_JSON_FIELDS,
+            ])
+            .current_dir(dir)
+            .output()
+            .map_err(|err| GhError::Spawn {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            })?;
+
+        interpret_pr_list_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
@@ -2947,6 +2988,8 @@ pub struct FakeGhCli {
     pr_url_for_branch_calls: RefCell<Vec<String>>,
     pr_list_all_result: RefCell<Result<Vec<PrSummary>, GhError>>,
     pr_list_all_calls: RefCell<Vec<PathBuf>>,
+    pr_list_merged_into_results: RefCell<HashMap<String, Result<Vec<PrInfo>, GhError>>>,
+    pr_list_merged_into_calls: RefCell<Vec<(PathBuf, String)>>,
     pr_merge_result: RefCell<Result<(), GhError>>,
     pr_merge_calls: RefCell<Vec<(PathBuf, u64)>>,
     issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
@@ -3018,6 +3061,8 @@ impl Default for FakeGhCli {
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
             pr_list_all_result: RefCell::new(Ok(Vec::new())),
             pr_list_all_calls: RefCell::new(Vec::new()),
+            pr_list_merged_into_results: RefCell::new(HashMap::new()),
+            pr_list_merged_into_calls: RefCell::new(Vec::new()),
             issue_view_results: RefCell::new(HashMap::new()),
             issue_view_calls: RefCell::new(Vec::new()),
             issue_list_result: RefCell::new(Ok(Vec::new())),
@@ -3250,6 +3295,25 @@ impl FakeGhCli {
     /// doc comment on why that distinction matters).
     pub fn pr_list_all_calls(&self) -> Vec<PathBuf> {
         self.pr_list_all_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_list_merged_into` will return for `base`.
+    /// Unconfigured bases return an empty list.
+    pub fn with_pr_list_merged_into(
+        self,
+        base: &str,
+        result: Result<Vec<PrInfo>, GhError>,
+    ) -> Self {
+        self.pr_list_merged_into_results
+            .borrow_mut()
+            .insert(base.to_string(), result);
+        self
+    }
+
+    /// The `(dir, base)` arguments passed to `pr_list_merged_into`, in call
+    /// order.
+    pub fn pr_list_merged_into_calls(&self) -> Vec<(PathBuf, String)> {
+        self.pr_list_merged_into_calls.borrow().clone()
     }
 
     /// Set the result `issue_view` will return for issue `number`.
@@ -3503,6 +3567,16 @@ impl GhCli for FakeGhCli {
     fn pr_list_all(&self, dir: &Path) -> Result<Vec<PrSummary>, GhError> {
         self.pr_list_all_calls.borrow_mut().push(dir.to_path_buf());
         self.pr_list_all_result.borrow().clone()
+    }
+
+    fn pr_list_merged_into(&self, dir: &Path, base: &str) -> Result<Vec<PrInfo>, GhError> {
+        self.pr_list_merged_into_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), base.to_string()));
+        match self.pr_list_merged_into_results.borrow().get(base) {
+            Some(result) => result.clone(),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn pr_merge(&self, dir: &Path, number: u64, _timeout: Duration) -> Result<(), GhError> {
