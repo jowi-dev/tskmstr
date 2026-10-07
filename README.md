@@ -201,7 +201,7 @@ tm auth status
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
@@ -1487,8 +1487,16 @@ these stages:
    `Refs #N`) keeps its label. GitHub closes the issue asynchronously, so a
    rare close that lands after this step is caught by `tm backend
    clean-status-labels`. A failure here only warns.
+9. **Stacked children.** Every PR already merged into this PR's branch
+   (a stacked PR, `tm pr create --base <blocker branch>`, merged outside
+   `tm merge`), and transitively into those PRs' branches, has its ticket
+   moved to `status_on_merge`, or `Done` when that's unset, with the same
+   label sweep. GitHub only honours `Closes #N` on a PR into the default
+   branch, so nothing else closes those issues. Already-done tickets are
+   reported, not moved. A failure here only warns; `tm drift` still finds
+   any left behind.
 
-Exit codes: `0` merged (steps 4-8 all attempted; cleanup/base-sync
+Exit codes: `0` merged (steps 4-9 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
 3), `1` any other error (no open PR, a diverged branch, a dirty worktree,
 a `gh`/`git` failure).
