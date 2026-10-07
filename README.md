@@ -1850,9 +1850,12 @@ covers every run shape (interactive and detached/headless run through the
 same path) and is matched the same way as its siblings (available
 transitions, case-insensitive, warn-and-continue on no match or API
 failure): a provider hiccup warns and the run proceeds rather than sinking
-it. A ticket already in the target status is a silent no-op, so re-running a
-lane doesn't spam warnings, and a lane-only (ticketless) run has nothing to
-move and does nothing. When unset, a run starts without touching its
+it. So does a provider that can't be built at all (no Jira token in the
+environment, a github backend with no repo): the warning carries the
+construction error instead of the transition silently never firing. A
+ticket already in the target status is a silent no-op, so re-running a lane
+doesn't spam warnings, and a lane-only (ticketless) run has nothing to move
+and does nothing. When unset, a run starts without touching its
 ticket's status.
 
 `tm ticket create` takes two flags to control this per invocation:
