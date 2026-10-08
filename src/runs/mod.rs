@@ -184,6 +184,15 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_session_archives_ticket ON session_archives(ticket, captured_at);
     "#,
+    // GitHub issue #82 (ADR-0009 decision 5): the absolute path of the
+    // lane repo's main checkout, so the cross-project overview can route an
+    // action to the row's own repo. `repo` is only the directory name and
+    // `worktree` is removed by `tm merge`, so neither can stand in. Stamped
+    // at run start next to `agent`/`repo`; NULL for rows predating the
+    // column (no backfill) and for run shapes that don't stamp it.
+    r#"
+    ALTER TABLE runs ADD COLUMN repo_root TEXT;
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -675,6 +684,9 @@ pub struct Run {
     /// Directory name of the lane's repo, if recorded; see
     /// [`RunStore::update_agent_repo`].
     pub repo: Option<String>,
+    /// Absolute path of the lane repo's main checkout, if recorded; see
+    /// [`RunStore::update_repo_root`]. `None` for rows predating the column.
+    pub repo_root: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1962,6 +1974,27 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records `repo_root`, the absolute path of the lane repo's main
+    /// checkout, on run `run_id` (GitHub issue #82, ADR-0009 decision 5).
+    /// The cross-project overview routes a row's actions by it; stamped next
+    /// to [`RunStore::update_agent_repo`] for the same reason that is a
+    /// separate update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_repo_root(&self, run_id: i64, repo_root: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET repo_root = ?1 WHERE id = ?2",
+            params![repo_root, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// The expected peak footprint, in bytes, of a new lane run for `agent`
     /// against `repo`: the largest recorded peak among the
     /// [`LANE_ESTIMATE_WINDOW`] most recent finished lane runs with that
@@ -2282,7 +2315,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE status = 'running'
                AND tmux_session IS NOT NULL
@@ -2408,7 +2441,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
              ORDER BY started_at ASC, id ASC";
@@ -2433,7 +2466,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2467,7 +2500,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2493,7 +2526,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              ORDER BY started_at DESC, id DESC";
 
@@ -2569,7 +2602,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE id = ?1";
 
@@ -2583,7 +2616,7 @@ impl RunStore {
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
     /// model_usage, log_path, findings_count, scope, tmux_session, age_secs,
-    /// mem_current_bytes, mem_peak_bytes, agent, repo` projection (shared
+    /// mem_current_bytes, mem_peak_bytes, agent, repo, repo_root` projection (shared
     /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
     /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -2620,6 +2653,7 @@ impl RunStore {
             mem_peak_bytes: row.get(25)?,
             agent: row.get(26)?,
             repo: row.get(27)?,
+            repo_root: row.get(28)?,
         })
     }
 
@@ -3226,7 +3260,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_13() {
+    fn open_migrates_a_fresh_db_to_user_version_14() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3234,7 +3268,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -7984,6 +8018,41 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.agent.as_deref(), Some("opencode"));
         assert_eq!(run.repo.as_deref(), Some("lemma"));
+    }
+
+    // --- repo root (GitHub issue #82, ADR-0009 decision 5) ---
+
+    #[test]
+    fn update_repo_root_stamps_the_main_checkout_path() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+
+        store
+            .update_repo_root(id, "/home/me/Projects/lemma")
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.repo_root.as_deref(), Some("/home/me/Projects/lemma"));
+    }
+
+    #[test]
+    fn repo_root_is_none_for_an_unstamped_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.repo_root, None);
+    }
+
+    #[test]
+    fn update_repo_root_rejects_an_unknown_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store.update_repo_root(999, "/repo").unwrap_err();
+        assert!(matches!(err, RunStoreError::RunNotFound(999)));
     }
 
     fn finished_lane_with_peak(store: &RunStore, agent: &str, repo: &str, peak: u64) -> i64 {
