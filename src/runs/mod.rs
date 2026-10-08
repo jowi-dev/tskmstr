@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod footprint;
+pub mod overview;
 pub mod pid;
 pub mod pricing;
 pub mod session;
