@@ -40,7 +40,7 @@ use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::fake::FakeJiraClient;
 use crate::jira::jql::{
-    assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
+    assignee_tickets_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql, ranked_tickets_jql,
     ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
 };
 use crate::jira::types::CreateIssueRequest;
@@ -57,7 +57,8 @@ use crate::ticketing::types::{
 /// ticketing orchestration function builds one of these variants and hands
 /// it to [`TicketProvider::search`].
 ///
-/// Every variant but [`TicketQuery::MyOpen`] and [`TicketQuery::ReadyCandidates`]
+/// Every variant but [`TicketQuery::MyOpen`], [`TicketQuery::ReadyCandidates`],
+/// and [`TicketQuery::Keys`]
 /// carries the project key to scope to, mirroring the corresponding
 /// `src/jira/jql.rs` builder's `project_key` parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +111,14 @@ pub enum TicketQuery {
     /// GitHub issue #3's variant list; added because [`ready_candidates_jql`]
     /// has no other variant it maps onto (see the phase 2 report).
     ReadyCandidates,
+    /// Exactly these tickets, open or closed, in one search: the
+    /// cross-project overview's per-scope tracker-status fetch (ADR-0009
+    /// decision 3). See [`keys_jql`]. Unscoped by project, since the keys
+    /// already name one.
+    Keys {
+        /// Ticket keys to fetch.
+        keys: Vec<String>,
+    },
 }
 
 /// Render `query` into the JQL string [`JiraProvider::search`] (and
@@ -130,6 +139,7 @@ fn render_jql(query: &TicketQuery) -> String {
             shipped_awaiting_retro_jql(project_key)
         }
         TicketQuery::ReadyCandidates => ready_candidates_jql(),
+        TicketQuery::Keys { keys } => keys_jql(keys),
     }
 }
 
@@ -642,6 +652,12 @@ mod tests {
         assert_eq!(
             render_jql(&TicketQuery::ReadyCandidates),
             crate::jira::jql::ready_candidates_jql()
+        );
+        assert_eq!(
+            render_jql(&TicketQuery::Keys {
+                keys: vec!["PROJ-1".to_string()]
+            }),
+            crate::jira::jql::keys_jql(&["PROJ-1".to_string()])
         );
     }
 
