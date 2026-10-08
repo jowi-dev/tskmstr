@@ -323,16 +323,10 @@ fn ticket_row(
     stale_after_secs: i64,
     from_worktree: &dyn Fn(&Path) -> Option<PathBuf>,
 ) -> Option<OverviewRow> {
-    let is_live = |run: &OverviewRun| {
-        matches!(
-            run.status,
-            RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
-        )
-    };
     let standing = runs
         .iter()
         .enumerate()
-        .filter(|(i, run)| *i == 0 || is_live(run))
+        .filter(|(i, run)| *i == 0 || is_live(run.status))
         .map(|(_, run)| *run);
 
     let (stage, run) = standing
@@ -367,6 +361,36 @@ fn ticket_row(
     })
 }
 
+/// How recently a scope must have had a run end to stay in the overview
+/// with nothing live: 7 days (ADR-0009 decision 3).
+pub const ACTIVE_SCOPE_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The runs of every scope still "in flight" (ADR-0009 decision 3): one with
+/// a live run (`running`, `queued`, `hibernated`) or a run that ended within
+/// `window_secs`. A repo the operator stopped working in drops out on its
+/// own, taking its weeks-old failed runs with it, rather than parking them
+/// in [`Stage::Stuck`] forever. Order is preserved.
+pub fn active_scope_runs(runs: &[OverviewRun], window_secs: i64) -> Vec<OverviewRun> {
+    let active: HashSet<&str> = runs
+        .iter()
+        .filter(|run| is_live(run.status) || run.state_age_secs <= window_secs)
+        .map(|run| run.scope.as_str())
+        .collect();
+    runs.iter()
+        .filter(|run| active.contains(run.scope.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Whether a run with `status` is still live: it can still change on its
+/// own or is waiting on the operator to resume it.
+fn is_live(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
+    )
+}
+
 /// Sorts `rows` into attention-queue order: by [`Stage`] rank, then oldest
 /// in its stage first, then by key so the order is stable across refreshes.
 pub fn attention_order(rows: &mut [OverviewRow]) {
@@ -381,6 +405,8 @@ pub fn attention_order(rows: &mut [OverviewRow]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY_SECS: i64 = 24 * 60 * 60;
 
     fn no_worktree(_: &Path) -> Option<PathBuf> {
         None
@@ -868,5 +894,55 @@ mod tests {
 
         let order: Vec<_> = rows.iter().map(|r| r.key.ticket.as_str()).collect();
         assert_eq!(order, vec!["GH-2", "GH-3", "GH-1"]);
+    }
+
+    // --- active_scope_runs: ADR-0009 decision 3's polled-scope window ---
+
+    fn scoped(id: i64, scope: &str, status: RunStatus, state_age_secs: i64) -> OverviewRun {
+        OverviewRun {
+            scope: scope.to_string(),
+            state_age_secs,
+            ..run(id, &format!("GH-{id}"), status)
+        }
+    }
+
+    #[test]
+    fn active_scope_runs_keeps_every_run_of_a_scope_with_a_live_run() {
+        let runs = vec![
+            scoped(1, "gh:me/live", RunStatus::Hibernated, 30 * DAY_SECS),
+            scoped(2, "gh:me/live", RunStatus::Failed, 30 * DAY_SECS),
+        ];
+
+        let ids: Vec<i64> = active_scope_runs(&runs, ACTIVE_SCOPE_WINDOW_SECS)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn active_scope_runs_keeps_a_scope_whose_run_ended_inside_the_window() {
+        let runs = vec![
+            scoped(1, "gh:me/recent", RunStatus::Done, DAY_SECS),
+            scoped(2, "gh:me/recent", RunStatus::Failed, 30 * DAY_SECS),
+        ];
+
+        assert_eq!(active_scope_runs(&runs, ACTIVE_SCOPE_WINDOW_SECS).len(), 2);
+    }
+
+    #[test]
+    fn active_scope_runs_drops_a_scope_with_nothing_live_or_recent() {
+        let runs = vec![
+            scoped(1, "gh:me/stale", RunStatus::Failed, 8 * DAY_SECS),
+            scoped(2, "gh:me/fresh", RunStatus::Running, 10),
+        ];
+
+        let ids: Vec<i64> = active_scope_runs(&runs, ACTIVE_SCOPE_WINDOW_SECS)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert_eq!(ids, vec![2]);
     }
 }
