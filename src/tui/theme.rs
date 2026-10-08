@@ -12,6 +12,7 @@ use ratatui::text::Span;
 
 use crate::blocker_stacking::Readiness;
 use crate::runs::RunStatus;
+use crate::runs::overview::Stage;
 use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
 
 /// Bold, default color. Used for board/runs column titles and every other
@@ -83,6 +84,22 @@ pub const fn run_status_style(status: RunStatus) -> Style {
         RunStatus::Hibernated => Color::Blue,
     };
     Style::new().fg(color)
+}
+
+/// An overview row's stage label (GitHub issue #83, ADR-0009): the stages
+/// the operator acts on get the loud colors (needs input yellow bold, the
+/// PR stages green/magenta/red, stuck red), a running row the same cyan as
+/// a running run, and a not-started row recedes.
+pub const fn stage_style(stage: Stage) -> Style {
+    match stage {
+        Stage::NeedsInput => AWAITING_INPUT,
+        Stage::ReadyToMerge => Style::new().fg(Color::Green),
+        Stage::NeedsReview => Style::new().fg(Color::Magenta),
+        Stage::Conflicted => Style::new().fg(Color::LightRed),
+        Stage::Stuck => Style::new().fg(Color::Red),
+        Stage::Running => Style::new().fg(Color::Cyan),
+        Stage::NotStarted => DIM,
+    }
 }
 
 /// The style for a run's `kind` badge (e.g. `audit`, `create`, `lane`).
@@ -370,6 +387,14 @@ mod tests {
             run_status_style(RunStatus::Interrupted).fg,
             Some(Color::Yellow)
         );
+    }
+
+    #[test]
+    fn stage_style_makes_needs_input_loud_and_not_started_quiet() {
+        assert_eq!(stage_style(Stage::NeedsInput), AWAITING_INPUT);
+        assert_eq!(stage_style(Stage::Stuck).fg, Some(Color::Red));
+        assert_eq!(stage_style(Stage::Running).fg, Some(Color::Cyan));
+        assert_eq!(stage_style(Stage::NotStarted), DIM);
     }
 
     #[test]

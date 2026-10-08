@@ -20,6 +20,7 @@ use ratatui::widgets::{
 
 use crate::agent::AgentRunner;
 use crate::cli::runs::format_age;
+use crate::runs::overview::{OverviewRow, Stage};
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
     App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column,
@@ -93,6 +94,7 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
     match app.screen {
         Screen::Rank => draw_rank_list(frame, app, body),
         Screen::Runs => draw_runs_board(frame, app, body),
+        Screen::Overview => draw_overview(frame, app, body),
         Screen::Retro => draw_retro_list(frame, app, body),
         _ => draw_board_columns(frame, app, body),
     }
@@ -114,7 +116,7 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
                 draw_run_detail_window(frame, app, runner);
             }
         }
-        Screen::Retro => {}
+        Screen::Retro | Screen::Overview => {}
     }
 
     draw_status_bar(
@@ -255,11 +257,12 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
         }
         Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
         Screen::Runs => {
-            "h/l/j/k: move  enter: detail  s: attach  f/F: kind/scope filter  r: refresh  q: quit"
+            "h/l/j/k: move  enter: detail  s: attach  f/F: kind/scope filter  Tab: overview  r: refresh  q: quit"
         }
         Screen::Retro => {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
+        Screen::Overview => "j/k: move  s: attach  Tab: watch  r: refresh  q: quit",
     }
 }
 
@@ -799,11 +802,155 @@ fn draw_retro_note_entry(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+/// [`Screen::Overview`] (GitHub issue #83, ADR-0009): a one-line-per-project
+/// counts strip above the attention queue, one row per `(scope, ticket)` in
+/// [`App::overview_rows`]' order (already the queue order).
+fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
+    let strip = project_strip_lines(&app.overview_rows);
+    let strip_height = u16::try_from(strip.len().max(1))
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let [strip_area, queue_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(strip_height), Constraint::Min(0)])
+        .areas(area);
+
+    let block = |title: &'static str| {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title(title))
+    };
+
+    if app.overview_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("Nothing in flight", theme::DIM)).block(block("Projects")),
+            strip_area,
+        );
+        frame.render_widget(block("Attention"), queue_area);
+        return;
+    }
+
+    let strip: Vec<Line> = strip.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(strip).block(block("Projects")), strip_area);
+
+    let project_width = column_width(
+        app.overview_rows
+            .iter()
+            .map(|r| project_label(&r.key.scope)),
+    );
+    let ticket_width = column_width(app.overview_rows.iter().map(|r| r.key.ticket.as_str()));
+    let stage_width = column_width(app.overview_rows.iter().map(|r| stage_label(r.stage)));
+    let items: Vec<ListItem> = app
+        .overview_rows
+        .iter()
+        .map(|row| {
+            let run = match (&row.kind, row.run_status) {
+                (Some(kind), Some(status)) => format!("{kind} {}", status.as_str()),
+                _ => "-".to_string(),
+            };
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {:<stage_width$}", stage_label(row.stage)),
+                    theme::stage_style(row.stage),
+                ),
+                Span::raw(format!(
+                    "  {:<project_width$}  ",
+                    project_label(&row.key.scope)
+                )),
+                Span::styled(
+                    format!("{:<ticket_width$}", row.key.ticket),
+                    theme::CARD_KEY,
+                ),
+                Span::styled(
+                    format!("  {run}  {}", format_age(row.stage_age_secs)),
+                    theme::DIM,
+                ),
+            ];
+            if row.pr_url.is_some() {
+                spans.push(Span::styled("  PR", theme::DIM));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(block("Attention"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(Some(app.overview_selected.min(app.overview_rows.len() - 1)));
+    frame.render_stateful_widget(list, queue_area, &mut state);
+}
+
+/// The overview's project strip: one `"{project}  {counts}"` line per scope,
+/// sorted by scope, labels padded to a common width. Counts list each stage
+/// the project has rows in, in queue order, e.g. `1 needs input · 2 running`.
+fn project_strip_lines(rows: &[OverviewRow]) -> Vec<String> {
+    let mut by_scope: std::collections::BTreeMap<&str, Vec<Stage>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        by_scope.entry(&row.key.scope).or_default().push(row.stage);
+    }
+    let width = column_width(by_scope.keys().map(|scope| project_label(scope)));
+    by_scope
+        .into_iter()
+        .map(|(scope, mut stages)| {
+            stages.sort();
+            let mut counts: Vec<(Stage, usize)> = Vec::new();
+            for stage in stages {
+                match counts.last_mut() {
+                    Some((last, n)) if *last == stage => *n += 1,
+                    _ => counts.push((stage, 1)),
+                }
+            }
+            let counts: Vec<String> = counts
+                .into_iter()
+                .map(|(stage, n)| format!("{n} {}", stage_label(stage)))
+                .collect();
+            format!("{:<width$}  {}", project_label(scope), counts.join(" · "))
+        })
+        .collect()
+}
+
+/// The overview's short name for a stage.
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::NeedsInput => "needs input",
+        Stage::ReadyToMerge => "ready to merge",
+        Stage::NeedsReview => "needs review",
+        Stage::Conflicted => "conflicted",
+        Stage::Stuck => "stuck",
+        Stage::Running => "running",
+        Stage::NotStarted => "not started",
+    }
+}
+
+/// A scope's short project name for the overview: the repo of a
+/// `github:owner/repo` scope, the project key of a `jira:url:KEY` scope,
+/// `(unscoped)` for a legacy pre-scoping row, and anything else as-is.
+fn project_label(scope: &str) -> &str {
+    if scope.is_empty() {
+        return "(unscoped)";
+    }
+    if let Some(repo) = scope.strip_prefix("github:") {
+        return repo.rsplit('/').next().unwrap_or(repo);
+    }
+    if scope.starts_with("jira:") {
+        return scope.rsplit(':').next().unwrap_or(scope);
+    }
+    scope
+}
+
+/// The display width of the widest of `values`, for padding a column.
+fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
+    values.map(|v| v.chars().count()).max().unwrap_or(0)
+}
+
 /// How many seconds without a heartbeat before a running card is marked
-/// stale with a leading `!`. Matches `tm runs reap`'s reasoning, though not
+/// stale with a leading `!`, and before [`Screen::Overview`] counts a
+/// running ticket as stuck. Matches `tm runs reap`'s reasoning, though not
 /// its default threshold: this is purely a visual warning, not a reap
 /// decision.
-const STALE_HEARTBEAT_SECS: i64 = 600;
+pub const STALE_HEARTBEAT_SECS: i64 = 600;
 
 /// The runs kanban board: one bordered column per [`RUN_COLUMNS`] entry,
 /// always all six, even when empty.
@@ -3962,5 +4109,99 @@ mod tests {
         let hint = hint_for(Screen::Runs, false);
         assert!(hint.contains("enter"));
         assert!(hint.contains("refresh"));
+    }
+
+    // --- Screen::Overview (GitHub issue #83) ---
+
+    fn overview_row(scope: &str, ticket: &str, stage: Stage) -> OverviewRow {
+        OverviewRow {
+            key: crate::runs::overview::TicketKey::new(scope, ticket),
+            stage,
+            stage_age_secs: 120,
+            run_id: Some(1),
+            run_status: Some(RunStatus::Running),
+            kind: Some("lane".to_string()),
+            pr_url: None,
+            worktree: None,
+            repo_root: crate::runs::overview::RepoRoot::Unresolved,
+        }
+    }
+
+    fn overview_app(rows: Vec<OverviewRow>) -> App {
+        App {
+            screen: Screen::Overview,
+            overview_rows: rows,
+            ..App::new()
+        }
+    }
+
+    fn line_of(text: &str, needle: &str) -> Option<usize> {
+        text.lines().position(|line| line.contains(needle))
+    }
+
+    #[test]
+    fn overview_lists_the_queue_in_order_with_stage_and_project() {
+        let app = overview_app(vec![
+            overview_row("github:me/alpha", "GH-1", Stage::NeedsInput),
+            overview_row("github:me/beta", "GH-2", Stage::Running),
+        ]);
+        let text = buffer_text(&render_with_size(&app, 100, 24));
+
+        let first = line_of(&text, "GH-1").expect("GH-1 row renders");
+        let second = line_of(&text, "GH-2").expect("GH-2 row renders");
+        assert!(first < second, "{text}");
+        let first_line = text.lines().nth(first).unwrap();
+        assert!(first_line.contains("needs input"), "{first_line}");
+        assert!(first_line.contains("alpha"), "{first_line}");
+    }
+
+    #[test]
+    fn overview_strip_counts_each_projects_rows_by_stage() {
+        let app = overview_app(vec![
+            overview_row("github:me/alpha", "GH-1", Stage::NeedsInput),
+            overview_row("github:me/alpha", "GH-2", Stage::Running),
+            overview_row("github:me/alpha", "GH-3", Stage::Running),
+            overview_row("github:me/beta", "GH-4", Stage::Stuck),
+        ]);
+        let text = buffer_text(&render_with_size(&app, 100, 24));
+
+        assert!(text.contains("alpha  1 needs input · 2 running"), "{text}");
+        assert!(text.contains("beta   1 stuck"), "{text}");
+    }
+
+    #[test]
+    fn overview_with_no_rows_says_nothing_is_in_flight() {
+        let text = buffer_text(&render_with_size(&overview_app(Vec::new()), 100, 24));
+        assert!(text.contains("Nothing in flight"), "{text}");
+    }
+
+    #[test]
+    fn overview_stage_label_carries_its_stage_color() {
+        let app = overview_app(vec![overview_row("github:me/alpha", "GH-1", Stage::Stuck)]);
+        let buffer = render_with_size(&app, 100, 24);
+        let row = line_of(&buffer_text(&buffer), "GH-1").unwrap() as u16;
+        let cell = (0..buffer.area.width)
+            .map(|x| &buffer[(x, row)])
+            .find(|cell| cell.symbol() == "s")
+            .expect("stage label renders");
+        assert_eq!(cell.fg, theme::stage_style(Stage::Stuck).fg.unwrap());
+    }
+
+    #[test]
+    fn overview_and_watch_hints_name_the_switch_key() {
+        assert!(hint_for(Screen::Overview, false).contains("Tab: watch"));
+        assert!(hint_for(Screen::Overview, false).contains("s: attach"));
+        assert!(hint_for(Screen::Runs, false).contains("Tab: overview"));
+    }
+
+    #[test]
+    fn project_label_shortens_known_scopes() {
+        assert_eq!(project_label("github:jowi-dev/tskmstr"), "tskmstr");
+        assert_eq!(
+            project_label("jira:https://acme.atlassian.net:PROJ"),
+            "PROJ"
+        );
+        assert_eq!(project_label(""), "(unscoped)");
+        assert_eq!(project_label("other"), "other");
     }
 }
