@@ -149,6 +149,19 @@ actions, and read-only actions land before ones that change state.
 3. **Tracker + PR state fetch with refresh budget (#84).** The background
    per-repo batched poller from decision 3. Lights up Needs review, Ready
    to merge, Conflicted and Not started. Drift glyph once #80 lands.
+   Lives in `src/overview_poll/`. Notes from the implementation:
+   - Only an explicit `APPROVED` review decision counts as Ready to merge,
+     and only with no conflicts and no failing or pending checks. A repo
+     that requires no review keeps its PRs in Needs review until someone
+     approves one.
+   - The GitHub backend's tracked-keys query is one `gh issue list --state
+     all` (200 limit) filtered to the keys, so a tracked issue older than
+     the newest 200 has no tracker status.
+   - The snapshot holds open PRs only, so the overview's drift helper never
+     reports `MergedNotDone`. `tm drift` stays the full audit.
+   - The poller is library code. It gets hooked into the view (draining
+     snapshots each tick, `r`, the stale strip marker, and resolving repo
+     roots for targets) once slices 1 and 2 land.
 4. **Lifecycle-columns toggle (#85).** Layout (1) over the same rows.
 5. **System resource header (#86).** Decision 7.
 6. **Scope-aware read actions: `v`, `L`, `B` (#87).**
