@@ -1155,6 +1155,31 @@ pub struct WatchDeps {
 /// key pressed (the board loop just redraws instead; the watch loop uses the
 /// timeout as its clock for polling and periodic reaping).
 pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
+    run_watch_loop(
+        deps,
+        crate::tui::app::Screen::Runs,
+        vec![Cmd::ReapRuns, Cmd::LoadRuns],
+    )
+}
+
+/// Run `tm overview` (GitHub issue #83) until the user quits: the same loop
+/// as [`run_watch`], started on [`crate::tui::app::Screen::Overview`]. The
+/// two share one loop so `Tab` can switch between them in place.
+pub fn run_overview(deps: WatchDeps) -> Result<(), TuiError> {
+    run_watch_loop(
+        deps,
+        crate::tui::app::Screen::Overview,
+        vec![Cmd::ReapRuns, Cmd::LoadOverview],
+    )
+}
+
+/// The loop behind [`run_watch`] and [`run_overview`]: starts on `screen`
+/// and runs `startup` before the first draw.
+fn run_watch_loop(
+    deps: WatchDeps,
+    screen: crate::tui::app::Screen,
+    startup: Vec<Cmd>,
+) -> Result<(), TuiError> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -1163,16 +1188,11 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App {
-        screen: crate::tui::app::Screen::Runs,
+        screen,
         session_slug: deps.session_slug.clone(),
         ..App::new()
     };
-    app = run_watch_cmds(
-        app,
-        vec![Cmd::ReapRuns, Cmd::LoadRuns],
-        &deps,
-        &mut terminal,
-    );
+    app = run_watch_cmds(app, startup, &deps, &mut terminal);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
@@ -1261,8 +1281,9 @@ fn run_watch_cmds<B: Backend>(
 }
 
 /// Translate a single [`Cmd`] into the [`Msg`]s it produces, for `tm runs
-/// watch`. Handles only the run-store `Cmd`s; every other variant is
-/// unreachable from [`crate::tui::app::Screen::Runs`].
+/// watch` and `tm overview`. Handles only the run-store `Cmd`s; every other
+/// variant is unreachable from [`crate::tui::app::Screen::Runs`] and
+/// [`crate::tui::app::Screen::Overview`].
 fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
         Cmd::LoadRuns => load_runs(deps),
@@ -1272,7 +1293,7 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         other => {
             debug_assert!(
                 false,
-                "execute_watch: unreachable Cmd from Screen::Runs: {other:?}"
+                "execute_watch: unreachable Cmd from Screen::Runs/Overview: {other:?}"
             );
             Vec::new()
         }
