@@ -2,3 +2,4 @@
 //! (ADR-0009 decision 3, GitHub issue #84).
 
 pub mod signal;
+pub mod snapshot;
