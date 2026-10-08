@@ -730,6 +730,21 @@ impl TicketProvider for GithubProvider<'_> {
                     .collect();
                 self.apply_local_rank_order(issues)
             }
+            TicketQuery::Keys { keys } => {
+                // One `gh issue list --state all` (up to its 200 limit)
+                // filtered client-side, rather than one `gh issue view`
+                // per key: the overview's poll budget is one issue query
+                // per repo (ADR-0009 decision 3). A tracked issue older
+                // than the newest 200 is simply missing from the result.
+                let wanted: Vec<String> = keys.iter().map(|key| key.to_uppercase()).collect();
+                self.list_and_map(IssueListFilter {
+                    state: IssueListState::All,
+                    ..Default::default()
+                })?
+                .into_iter()
+                .filter(|issue| wanted.contains(&issue.key.to_uppercase()))
+                .collect()
+            }
         };
         Ok(SearchResult {
             issues,
@@ -1631,6 +1646,28 @@ mod tests {
 
         assert_eq!(result.issues.len(), 1);
         assert_eq!(result.issues[0].key, "GH-1");
+    }
+
+    #[test]
+    fn search_keys_lists_open_and_closed_issues_once_and_keeps_only_the_keys() {
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![
+            issue_info(1, "Tracked open", IssueState::Open, &[]),
+            issue_info(2, "Untracked", IssueState::Open, &[]),
+            issue_info(3, "Tracked closed", IssueState::Closed, &[]),
+        ]));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let result = provider
+            .search(&TicketQuery::Keys {
+                keys: vec!["GH-1".to_string(), "gh-3".to_string()],
+            })
+            .unwrap();
+
+        let keys: Vec<_> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["GH-1", "GH-3"]);
+        let calls = fake.issue_list_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.state, IssueListState::All);
     }
 
     #[test]

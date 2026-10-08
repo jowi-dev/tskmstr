@@ -523,6 +523,17 @@ pub struct RunSummary {
     pub mem_peak_bytes: Option<u64>,
 }
 
+/// One ticket scope's recent runs, from [`RunStore::recent_scope_activity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeActivity {
+    /// The ticket scope (see [`StartRun::scope`]).
+    pub scope: String,
+    /// Tickets of the scope's live or recently ended runs, newest first.
+    pub tickets: Vec<String>,
+    /// Worktrees of those runs, newest first.
+    pub worktrees: Vec<String>,
+}
+
 /// A running lane as seen by memory-budget admission (GitHub issue #66); see
 /// [`RunStore::running_lanes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2492,6 +2503,61 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Every ticket scope with a live run (no `ended_at`) or a run that
+    /// ended within the last `within_days` days, newest activity first,
+    /// with the tickets and worktrees of exactly those runs (each newest
+    /// first, deduplicated).
+    ///
+    /// This is the cross-project overview's poll set (ADR-0009 decision
+    /// 3): a repo the operator stopped working in drops out on its own.
+    /// The tickets are the keys whose tracker status the poller fetches;
+    /// the worktrees let it resolve the repo root while `runs.repo_root`
+    /// is not yet recorded. Legacy unscoped (`""`) rows are skipped, since
+    /// they can't name a repo.
+    pub fn recent_scope_activity(
+        &self,
+        within_days: u32,
+    ) -> Result<Vec<ScopeActivity>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope, ticket, worktree FROM runs
+             WHERE scope != ''
+               AND (ended_at IS NULL OR julianday('now') - julianday(ended_at) <= ?1)
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![within_days], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut activity: Vec<ScopeActivity> = Vec::new();
+        for (scope, ticket, worktree) in rows {
+            let index = match activity.iter().position(|a| a.scope == scope) {
+                Some(index) => index,
+                None => {
+                    activity.push(ScopeActivity {
+                        scope,
+                        tickets: Vec::new(),
+                        worktrees: Vec::new(),
+                    });
+                    activity.len() - 1
+                }
+            };
+            let entry = &mut activity[index];
+            if !entry.tickets.contains(&ticket) {
+                entry.tickets.push(ticket);
+            }
+            if !entry.worktrees.contains(&worktree) {
+                entry.worktrees.push(worktree);
+            }
+        }
+        Ok(activity)
+    }
+
     /// Returns the run with id `run_id`, or `None` if no such row exists.
     ///
     /// Used by `tm runs watch`'s detail window, which navigates by row id
@@ -4281,6 +4347,64 @@ mod tests {
             RunStoreError::RunNotFound(id) => assert_eq!(id, 999),
             other => panic!("expected RunNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recent_scope_activity_keeps_scopes_with_a_live_or_recently_ended_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let start = |scope: &str, ticket: &str, worktree: &str| {
+            store
+                .start_run(&StartRun {
+                    scope: scope.to_string(),
+                    ticket: ticket.to_string(),
+                    lane: "backend".to_string(),
+                    worktree: worktree.to_string(),
+                    branch: None,
+                    pid: None,
+                    kind: "lane".to_string(),
+                    log_path: None,
+                })
+                .unwrap()
+        };
+        let end_days_ago = |run_id: i64, days: i64| {
+            store
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE runs SET status = 'done', ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-{days} days') WHERE id = ?1"
+                    ),
+                    params![run_id],
+                )
+                .unwrap();
+        };
+        start("github:o/live", "GH-1", "/wt/live-1");
+        let old = start("github:o/live", "GH-2", "/wt/live-2");
+        end_days_ago(old, 30);
+        let recent = start("github:o/recent", "GH-5", "/wt/recent");
+        end_days_ago(recent, 3);
+        let stale = start("github:o/stale", "GH-9", "/wt/stale");
+        end_days_ago(stale, 10);
+        start("", "GH-7", "/wt/unscoped");
+
+        let activity = store.recent_scope_activity(7).unwrap();
+
+        assert_eq!(
+            activity,
+            vec![
+                ScopeActivity {
+                    scope: "github:o/recent".to_string(),
+                    tickets: vec!["GH-5".to_string()],
+                    worktrees: vec!["/wt/recent".to_string()],
+                },
+                ScopeActivity {
+                    scope: "github:o/live".to_string(),
+                    tickets: vec!["GH-1".to_string()],
+                    worktrees: vec!["/wt/live-1".to_string()],
+                },
+            ],
+            "stale and unscoped rows drop out; only recent runs' tickets are tracked"
+        );
     }
 
     #[test]

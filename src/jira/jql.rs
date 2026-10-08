@@ -37,6 +37,14 @@ pub fn ranked_tickets_jql(project_key: &str) -> String {
     format!("project = {project_key} AND statusCategory != Done ORDER BY Rank ASC")
 }
 
+/// The JQL query the cross-project overview's background poller uses to
+/// fetch the tracker status of every ticket a scope has runs for, in one
+/// search (ADR-0009 decision 3). Keys are spliced unquoted: they come from
+/// `runs.db`, where every key was already validated as a ticket key.
+pub fn keys_jql(keys: &[String]) -> String {
+    format!("key in ({})", keys.join(", "))
+}
+
 /// The JQL query used by `tm ready` to list the current user's candidate
 /// tickets: assigned to them and still in the "To Do" status category.
 /// Restricted to "To Do" rather than every open status (unlike
@@ -100,10 +108,18 @@ pub fn ticket_search_jql(project_key: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        assignee_tickets_jql, everyone_tickets_jql, my_open_tickets_jql, ranked_tickets_jql,
-        ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
+        assignee_tickets_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql,
+        ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
         unassigned_tickets_jql,
     };
+
+    #[test]
+    fn keys_jql_lists_every_key_in_one_clause() {
+        assert_eq!(
+            keys_jql(&["PROJ-1".to_string(), "PROJ-22".to_string()]),
+            "key in (PROJ-1, PROJ-22)"
+        );
+    }
 
     #[test]
     fn returns_exact_pinned_jql() {

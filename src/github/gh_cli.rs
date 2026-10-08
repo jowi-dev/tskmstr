@@ -404,6 +404,21 @@ pub trait GhCli {
     /// there is no reason to newly bound them.
     fn pr_list_bounded(&self, dir: &Path, timeout: Duration) -> Result<Vec<PrInfo>, GhError>;
 
+    /// List open pull requests in the repository rooted at `dir` with their
+    /// review decision, merge state, and checks folded into one verdict
+    /// (`gh pr list --state open --limit 200 --json` with
+    /// [`PR_REVIEW_STATE_JSON_FIELDS`]): one batched call per repo, for the
+    /// cross-project overview's background poller (ADR-0009 decision 3).
+    ///
+    /// Bounded by `timeout` like [`GhCli::pr_list_bounded`]: the poller runs
+    /// off the render thread, but a hung `gh` would otherwise stall every
+    /// later refresh of every repo behind it.
+    fn pr_list_review_state(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<PrReviewState>, GhError>;
+
     /// The login of the currently authenticated `gh` user
     /// (`gh api user -q .login`), used by `tm work run`'s branch-owner
     /// resolution (see `crate::work::run`).
@@ -636,6 +651,60 @@ pub struct PrSummary {
     pub updated_at: String,
 }
 
+/// An open pull request's review and merge state, as returned by
+/// [`GhCli::pr_list_review_state`]: the [`PrInfo`] fields (so callers can
+/// resolve its ticket key with [`super::pr::find_issue_key`]) plus what the
+/// cross-project overview needs to tell "needs review" from "ready to
+/// merge" from "conflicted" (ADR-0009 decision 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReviewState {
+    /// The pull request's identifying fields.
+    pub pr: PrInfo,
+    /// `gh`'s `reviewDecision`.
+    pub review_decision: ReviewDecision,
+    /// `gh`'s raw `mergeStateStatus` (`CLEAN`, `DIRTY`, `BLOCKED`,
+    /// `BEHIND`, `UNSTABLE`, `DRAFT`, `HAS_HOOKS`, or `UNKNOWN`).
+    pub merge_state_status: String,
+    /// `statusCheckRollup` folded into one verdict.
+    pub checks: ChecksState,
+}
+
+impl PrReviewState {
+    /// Whether the PR has merge conflicts with its base
+    /// (`mergeStateStatus == DIRTY`).
+    pub fn is_conflicting(&self) -> bool {
+        self.merge_state_status == "DIRTY"
+    }
+}
+
+/// A pull request's `reviewDecision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// Approved by the required reviewers.
+    Approved,
+    /// A reviewer requested changes.
+    ChangesRequested,
+    /// A review is required and hasn't been given.
+    ReviewRequired,
+    /// No decision: the repo requires no review, or `gh` reported none.
+    None,
+}
+
+/// A pull request's checks (`statusCheckRollup`), folded into one verdict.
+/// Failing wins over pending, which wins over passing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksState {
+    /// The PR has no checks.
+    None,
+    /// Every check finished without failing (skipped and neutral count).
+    Passing,
+    /// At least one check is still queued or running, and none failed.
+    Pending,
+    /// At least one check failed, errored, timed out, was cancelled, or
+    /// needs action.
+    Failing,
+}
+
 /// The open/closed state of a GitHub issue, as reported by `state` in `gh
 /// issue view`/`gh issue list --json` output (`"OPEN"` or `"CLOSED"`).
 ///
@@ -811,6 +880,13 @@ const PR_STATE_JSON_FIELDS: &str = "state";
 /// deserialization stay in lockstep. Same `merged`-field pitfall as
 /// [`PR_STATE_JSON_FIELDS`] applies here.
 const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,state,updatedAt";
+
+/// Fields requested from `gh pr list --json` in
+/// [`GhCli::pr_list_review_state`]: [`PR_VIEW_JSON_FIELDS`] plus review,
+/// merge, and check state. Shared so the flag and [`RawPrReviewState`]
+/// deserialization stay in lockstep.
+const PR_REVIEW_STATE_JSON_FIELDS: &str = "number,url,title,body,headRefName,baseRefName,\
+     reviewDecision,mergeStateStatus,statusCheckRollup";
 
 /// Fields requested from `gh repo view --json` in [`GhCli::pr_merge`] to
 /// derive the repository's default merge method; shared so the flag and
@@ -1373,6 +1449,34 @@ impl GhCli for ShellGhCli {
         let output = spawn_with_timeout(command, "gh pr list", timeout)?;
 
         interpret_pr_list_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn pr_list_review_state(
+        &self,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<PrReviewState>, GhError> {
+        let mut command = Command::new("gh");
+        command
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                PR_REVIEW_STATE_JSON_FIELDS,
+            ])
+            .current_dir(dir);
+
+        let output = spawn_with_timeout(command, "gh pr list", timeout)?;
+
+        interpret_pr_review_state_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
@@ -2195,6 +2299,118 @@ fn interpret_pr_list_output(
     }
 }
 
+/// Raw shape of one entry in `gh pr list --json` with
+/// [`PR_REVIEW_STATE_JSON_FIELDS`], for deserialization only;
+/// [`PrReviewState`] is the folded shape callers use.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPrReviewState {
+    #[serde(flatten)]
+    pr: PrInfo,
+    #[serde(default)]
+    review_decision: Option<String>,
+    #[serde(default)]
+    merge_state_status: Option<String>,
+    #[serde(default)]
+    status_check_rollup: Option<Vec<RawCheck>>,
+}
+
+/// One `statusCheckRollup` entry: a `CheckRun` (`status` + `conclusion`)
+/// or a commit `StatusContext` (`state`). Both shapes deserialize here,
+/// with the other shape's fields absent.
+#[derive(Debug, Deserialize)]
+struct RawCheck {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+impl RawCheck {
+    fn verdict(&self) -> ChecksState {
+        let failed = |value: &str| {
+            matches!(
+                value,
+                "FAILURE"
+                    | "ERROR"
+                    | "TIMED_OUT"
+                    | "CANCELLED"
+                    | "ACTION_REQUIRED"
+                    | "STARTUP_FAILURE"
+            )
+        };
+        if let Some(state) = self.state.as_deref() {
+            return match state {
+                s if failed(s) => ChecksState::Failing,
+                "PENDING" | "EXPECTED" => ChecksState::Pending,
+                _ => ChecksState::Passing,
+            };
+        }
+        match self.conclusion.as_deref().filter(|c| !c.is_empty()) {
+            Some(conclusion) if failed(conclusion) => ChecksState::Failing,
+            Some(_) => ChecksState::Passing,
+            None if self.status.as_deref() == Some("COMPLETED") => ChecksState::Passing,
+            None => ChecksState::Pending,
+        }
+    }
+}
+
+impl From<RawPrReviewState> for PrReviewState {
+    fn from(raw: RawPrReviewState) -> Self {
+        let review_decision = match raw.review_decision.as_deref() {
+            Some("APPROVED") => ReviewDecision::Approved,
+            Some("CHANGES_REQUESTED") => ReviewDecision::ChangesRequested,
+            Some("REVIEW_REQUIRED") => ReviewDecision::ReviewRequired,
+            _ => ReviewDecision::None,
+        };
+        let verdicts: Vec<ChecksState> = raw
+            .status_check_rollup
+            .unwrap_or_default()
+            .iter()
+            .map(RawCheck::verdict)
+            .collect();
+        let checks = if verdicts.is_empty() {
+            ChecksState::None
+        } else if verdicts.contains(&ChecksState::Failing) {
+            ChecksState::Failing
+        } else if verdicts.contains(&ChecksState::Pending) {
+            ChecksState::Pending
+        } else {
+            ChecksState::Passing
+        };
+        PrReviewState {
+            pr: raw.pr,
+            review_decision,
+            merge_state_status: raw.merge_state_status.unwrap_or_default(),
+            checks,
+        }
+    }
+}
+
+/// Interpret `gh pr list --json` [`PR_REVIEW_STATE_JSON_FIELDS`] output,
+/// the same exit-code handling as [`interpret_pr_list_output`].
+fn interpret_pr_review_state_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<PrReviewState>, GhError> {
+    match exit_code {
+        Some(0) => serde_json::from_str::<Vec<RawPrReviewState>>(stdout)
+            .map(|raws| raws.into_iter().map(PrReviewState::from).collect())
+            .map_err(|err| GhError::Parse {
+                command: "gh pr list".to_string(),
+                message: err.to_string(),
+            }),
+        code => Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Raw shape of one entry in `gh pr list --state all --json
 /// number,headRefName,state,updatedAt` output, for deserialization only;
 /// [`PrSummary`] is the flattened shape callers use.
@@ -2983,6 +3199,8 @@ pub struct FakeGhCli {
     pr_list_calls: RefCell<Vec<PathBuf>>,
     pr_list_bounded_result: RefCell<Option<Result<Vec<PrInfo>, GhError>>>,
     pr_list_bounded_calls: RefCell<Vec<PathBuf>>,
+    pr_list_review_state_result: RefCell<Result<Vec<PrReviewState>, GhError>>,
+    pr_list_review_state_calls: RefCell<Vec<PathBuf>>,
     current_user_login_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_result: RefCell<Result<Option<String>, GhError>>,
     pr_url_for_branch_calls: RefCell<Vec<String>>,
@@ -3056,6 +3274,8 @@ impl Default for FakeGhCli {
             pr_merge_result: RefCell::new(Ok(())),
             pr_merge_calls: RefCell::new(Vec::new()),
             pr_list_bounded_calls: RefCell::new(Vec::new()),
+            pr_list_review_state_result: RefCell::new(Ok(Vec::new())),
+            pr_list_review_state_calls: RefCell::new(Vec::new()),
             current_user_login_result: RefCell::new(Ok(None)),
             pr_url_for_branch_result: RefCell::new(Ok(None)),
             pr_url_for_branch_calls: RefCell::new(Vec::new()),
@@ -3262,6 +3482,17 @@ impl FakeGhCli {
     /// The `dir` arguments passed to `pr_list_bounded`, in call order.
     pub fn pr_list_bounded_calls(&self) -> Vec<PathBuf> {
         self.pr_list_bounded_calls.borrow().clone()
+    }
+
+    /// Configure the result [`GhCli::pr_list_review_state`] returns.
+    pub fn with_pr_list_review_state(self, result: Result<Vec<PrReviewState>, GhError>) -> Self {
+        *self.pr_list_review_state_result.borrow_mut() = result;
+        self
+    }
+
+    /// Every `dir` passed to [`GhCli::pr_list_review_state`].
+    pub fn pr_list_review_state_calls(&self) -> Vec<PathBuf> {
+        self.pr_list_review_state_calls.borrow().clone()
     }
 
     /// Set the result `current_user_login` will return.
@@ -3553,6 +3784,17 @@ impl GhCli for FakeGhCli {
         }
     }
 
+    fn pr_list_review_state(
+        &self,
+        dir: &Path,
+        _timeout: Duration,
+    ) -> Result<Vec<PrReviewState>, GhError> {
+        self.pr_list_review_state_calls
+            .borrow_mut()
+            .push(dir.to_path_buf());
+        self.pr_list_review_state_result.borrow().clone()
+    }
+
     fn current_user_login(&self) -> Result<Option<String>, GhError> {
         self.current_user_login_result.borrow().clone()
     }
@@ -3711,6 +3953,76 @@ impl GhCli for FakeGhCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- pr_list_review_state parsing ---
+
+    fn review_state_json(decision: &str, merge: &str, rollup: &str) -> String {
+        format!(
+            r#"[{{"number":7,"url":"https://github.com/o/r/pull/7","title":"GH-3: thing",
+                "body":"","headRefName":"jowi-dev/gh-3-thing","baseRefName":"main",
+                "reviewDecision":"{decision}","mergeStateStatus":"{merge}",
+                "statusCheckRollup":{rollup}}}]"#
+        )
+    }
+
+    #[test]
+    fn review_state_output_parses_decision_merge_state_and_pr_fields() {
+        let states = interpret_pr_review_state_output(
+            Some(0),
+            &review_state_json("APPROVED", "DIRTY", "[]"),
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].pr.number, 7);
+        assert_eq!(states[0].pr.head_ref_name, "jowi-dev/gh-3-thing");
+        assert_eq!(states[0].review_decision, ReviewDecision::Approved);
+        assert!(states[0].is_conflicting());
+        assert_eq!(states[0].checks, ChecksState::None);
+    }
+
+    #[test]
+    fn review_state_output_reads_an_empty_decision_as_none() {
+        let states =
+            interpret_pr_review_state_output(Some(0), &review_state_json("", "CLEAN", "[]"), "")
+                .unwrap();
+
+        assert_eq!(states[0].review_decision, ReviewDecision::None);
+        assert!(!states[0].is_conflicting());
+    }
+
+    #[test]
+    fn review_state_output_folds_check_runs_and_status_contexts() {
+        let passing = r#"[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+                          {"__typename":"StatusContext","state":"SUCCESS"},
+                          {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED"}]"#;
+        let pending = r#"[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+                          {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""}]"#;
+        let failing = r#"[{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""},
+                          {"__typename":"StatusContext","state":"FAILURE"}]"#;
+        let checks = |rollup: &str| {
+            interpret_pr_review_state_output(
+                Some(0),
+                &review_state_json("REVIEW_REQUIRED", "BLOCKED", rollup),
+                "",
+            )
+            .unwrap()[0]
+                .checks
+        };
+
+        assert_eq!(checks(passing), ChecksState::Passing);
+        assert_eq!(checks(pending), ChecksState::Pending);
+        assert_eq!(checks(failing), ChecksState::Failing);
+        assert_eq!(checks("null"), ChecksState::None);
+    }
+
+    #[test]
+    fn review_state_output_surfaces_a_nonzero_exit_as_a_command_error() {
+        let err = interpret_pr_review_state_output(Some(1), "", "auth required").unwrap_err();
+
+        assert!(matches!(err, GhError::Command { .. }));
+    }
 
     // --- GhError::is_permanent ---
     //
