@@ -1249,6 +1249,16 @@ pub fn prepare_run_lane(
     // keeps the primary's key; its peak still lands on this row.
     deps.run_store
         .update_agent_repo(run_id, primary_runner.name(), &repo)?;
+    // GitHub issue #82 (ADR-0009 decision 5): the main checkout's absolute
+    // path, so the cross-project overview can route this row's actions to
+    // its own repo. Canonicalized so a relative lane `repo` still records
+    // something usable from another cwd; falls back to the configured path
+    // verbatim when it can't be resolved.
+    let stamped_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+    deps.run_store
+        .update_repo_root(run_id, &stamped_root.to_string_lossy())?;
 
     // Step 9b (GitHub issue #49): now that the run row exists — the moment tm
     // knows work is beginning — advisorily move the ticket to the configured
@@ -5199,9 +5209,11 @@ mod tests {
     }
 
     /// GitHub issue #66: a lane row carries the (agent, repo) key that
-    /// memory-budget admission estimates the next lane's cost from.
+    /// memory-budget admission estimates the next lane's cost from. GitHub
+    /// issue #82: and the main checkout's absolute path, which the
+    /// cross-project overview routes the row's actions by.
     #[test]
-    fn prepare_run_lane_stamps_the_agent_and_repo_on_the_run_row() {
+    fn prepare_run_lane_stamps_the_agent_repo_and_repo_root_on_the_run_row() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let config = config_with_lane(
             "mylane",
@@ -5254,6 +5266,16 @@ mod tests {
         assert_eq!(run.agent.as_deref(), Some(ClaudeRunner.name()));
         assert_eq!(run.repo, repo_name(&repo_root));
         assert!(run.repo.is_some());
+        assert_eq!(
+            run.repo_root,
+            Some(
+                repo_root
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
     }
 
     #[test]
