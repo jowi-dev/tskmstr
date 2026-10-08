@@ -234,7 +234,12 @@ pub fn map_key(
         KeyCode::Char('p') if *screen == Screen::Board => Some(Msg::OpenRank),
         KeyCode::Char('a') if *screen == Screen::Board => Some(Msg::AuditAction),
         KeyCode::Char('s') if *screen == Screen::Board => Some(Msg::SessionAction),
-        KeyCode::Char('s') if *screen == Screen::Runs => Some(Msg::RunSessionAction),
+        KeyCode::Char('s') if matches!(screen, Screen::Runs | Screen::Overview) => {
+            Some(Msg::RunSessionAction)
+        }
+        KeyCode::Tab if matches!(screen, Screen::Runs | Screen::Overview) => {
+            Some(Msg::ToggleOverview)
+        }
         KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
@@ -2804,5 +2809,51 @@ mod tests {
             ),
             Some(Msg::RetroNoteCancel)
         );
+    }
+
+    fn plain_key(screen: &Screen, key: KeyCode) -> Option<Msg> {
+        map_key(
+            screen,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            RetroOverlay::None,
+            key,
+        )
+    }
+
+    /// GitHub issue #83: `Tab` switches between `tm runs watch` and
+    /// `tm overview`, both ways, and nowhere else.
+    #[test]
+    fn tab_toggles_between_watch_and_overview() {
+        assert_eq!(
+            plain_key(&Screen::Runs, KeyCode::Tab),
+            Some(Msg::ToggleOverview)
+        );
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Tab),
+            Some(Msg::ToggleOverview)
+        );
+        assert_eq!(plain_key(&Screen::Board, KeyCode::Tab), None);
+    }
+
+    #[test]
+    fn s_on_overview_attaches_like_the_watch_screen() {
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Char('s')),
+            Some(Msg::RunSessionAction)
+        );
+    }
+
+    /// The watch screen's view filters don't apply to the overview.
+    #[test]
+    fn watch_filter_keys_are_inert_on_overview() {
+        assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('f')), None);
+        assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('F')), None);
     }
 }
