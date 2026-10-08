@@ -205,6 +205,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
+        Command::Overview => run_overview(),
         Command::Runs {
             kind,
             by_outcome,
@@ -2069,21 +2070,7 @@ fn run_runs(
             tskmstr::cli::runs::register(&store, scope, &sessions_dir, &session_env, &kind, &key);
         }
         Some(RunsCmd::Watch) => {
-            tskmstr::tui::event::run_watch(tskmstr::tui::event::WatchDeps {
-                store,
-                runner: agent_runner_or_default(full_config.as_ref()),
-                tmux: Box::new(tskmstr::work::tmux::ShellTmuxOps::new()),
-                session_slug: full_config
-                    .as_ref()
-                    .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).session_slug())
-                    .unwrap_or_default(),
-                idle_hibernate_mins: full_config
-                    .as_ref()
-                    .map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
-                        cfg.work.idle_hibernate_mins
-                    }),
-                kill_pid: tskmstr::runs::pid::kill_pid,
-            })?;
+            tskmstr::tui::event::run_watch(watch_deps(store, full_config.as_ref()))?;
         }
         Some(RunsCmd::Logs {
             ticket_or_id,
@@ -2118,6 +2105,35 @@ fn run_runs(
 /// config at all, so a missing or invalid config file is silently ignored
 /// here rather than surfaced as an error (unlike every other command, which
 /// requires config to load via [`config::load`]).
+/// The local-only dependencies shared by `tm runs watch` and `tm overview`.
+/// `config` is the invoking repo's config when it loads; both views stay
+/// usable without one, like the rest of `tm runs`.
+fn watch_deps(
+    store: tskmstr::runs::RunStore,
+    config: Option<&Config>,
+) -> tskmstr::tui::event::WatchDeps {
+    tskmstr::tui::event::WatchDeps {
+        store,
+        runner: agent_runner_or_default(config),
+        tmux: Box::new(tskmstr::work::tmux::ShellTmuxOps::new()),
+        session_slug: config
+            .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).session_slug())
+            .unwrap_or_default(),
+        idle_hibernate_mins: config.map_or(tskmstr::config::DEFAULT_IDLE_HIBERNATE_MINS, |cfg| {
+            cfg.work.idle_hibernate_mins
+        }),
+        kill_pid: tskmstr::runs::pid::kill_pid,
+    }
+}
+
+/// `tm overview`: the cross-project attention queue (GitHub issue #83).
+fn run_overview() -> Result<(), Box<dyn std::error::Error>> {
+    let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+    let config = config::load(&default_config_paths()).ok();
+    tskmstr::tui::event::run_overview(watch_deps(store, config.as_ref()))?;
+    Ok(())
+}
+
 fn resolve_run_db_path() -> PathBuf {
     let paths = default_config_paths();
     let configured = config::load(&paths).ok().and_then(|cfg| cfg.run_db_path);

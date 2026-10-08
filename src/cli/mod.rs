@@ -125,6 +125,11 @@ pub enum Command {
     },
     /// Open the interactive terminal board.
     Board,
+    /// Cross-project attention queue: one row per ticket with a run, ordered
+    /// by how much it needs you, under a per-project counts strip (polls the
+    /// local run db; see docs/decisions/0009-cross-project-overview.md).
+    /// `Tab` switches to and from `tm runs watch`.
+    Overview,
     /// Inspect and record autonomous lane runs (local SQLite; see
     /// docs/decisions/0001-run-state.md).
     #[command(args_conflicts_with_subcommands = true)]
@@ -3055,6 +3060,12 @@ mod tests {
             .find_subcommand("__supervise")
             .expect("__supervise subcommand should be registered");
         assert!(supervise.is_hide_set());
+    }
+
+    #[test]
+    fn parses_overview() {
+        let cli = Cli::try_parse_from(["tm", "overview"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Overview)));
     }
 
     #[test]
