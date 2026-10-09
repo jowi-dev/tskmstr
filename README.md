@@ -216,7 +216,8 @@ tm auth status
 | `tm runs resume <KEY>` | Print the session id of the latest run of a ticket, for `claude --resume`; warns on stderr (without blocking) if that run's status is terminal, pointing at `tm runs reopen` |
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
-| `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope |
+| `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
+| `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `s` attaches, `Tab` switches to `tm runs watch` |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
@@ -378,6 +379,34 @@ runs, then back to unfiltered) and `F` cycles a scope filter the same way;
 active filters are pinned as a `Filter: ...` prefix on the status line so
 a narrowed view is never mistaken for the whole. Filters only affect what
 is shown — nothing is reloaded or discarded.
+
+### `tm overview`: the cross-project attention queue
+
+`tm overview` (GitHub issue #83, ADR-0009
+`docs/decisions/0009-cross-project-overview.md`) answers "what do I touch
+next" across every repo. Watch is per **run**; the overview is per
+**ticket**: every run recorded for a `(scope, ticket)` collapses into one
+row, placed in the most urgent stage its runs reach and sorted by that
+stage, oldest first within it:
+
+- **needs input**: a running session awaiting input, or a hibernated one
+- **stuck**: the latest run failed, was interrupted, or is blocked, or a
+  running run's heartbeat is more than 10 minutes stale
+- **running**: a live run that needs nothing from you
+
+The review, merge, and not-started stages need tracker and PR state and
+light up once the per-repo poller lands (ADR-0009 slice 3); until then the
+overview is built from the run db alone. Above the queue, one line per
+project counts its rows by stage. Only projects still in flight are shown:
+one with a live run, or a run that ended in the last 7 days, so a repo you
+stopped working in drops out on its own.
+
+`j`/`k` move, `s` attaches to the highlighted ticket's session exactly as
+watch's `s` does (routed by the row's own scope), `r` refreshes, and `q`
+quits. `Tab` switches to `tm runs watch` in place and back again, keeping
+the highlighted ticket: from the overview, watch lands on the run the row
+stood for (or any visible run of the ticket); from watch, the overview
+lands on the card's ticket.
 
 ### `Interrupted` vs. `Failed`, and recovering a run
 

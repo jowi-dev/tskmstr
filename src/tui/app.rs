@@ -196,6 +196,10 @@ pub enum Screen {
     /// Shipped tickets awaiting a retro verdict, entered via `R` from
     /// [`Screen::Board`]. See [`RetroRow`].
     Retro,
+    /// Cross-project attention queue, one row per `(scope, ticket)`,
+    /// entered via `tm overview` (GitHub issue #83, ADR-0009). Shares the
+    /// watch loop with [`Screen::Runs`]; `Tab` switches between the two.
+    Overview,
 }
 
 /// A run as displayed on the [`Screen::Runs`] kanban board, derived from a
@@ -235,6 +239,17 @@ pub struct RunCard {
     /// run list is machine-wide, so the invoking repo's own slug would be
     /// wrong for another repo's run.
     pub scope: String,
+}
+
+/// The ticket [`Msg::ToggleOverview`] hands from one view to the other: its
+/// `(scope, ticket)`, plus the run the overview row stood for, which the
+/// watch screen prefers when the ticket has several run cards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewFocus {
+    /// The ticket.
+    pub key: crate::runs::overview::TicketKey,
+    /// The run to land on in [`Screen::Runs`], if known.
+    pub run_id: Option<i64>,
 }
 
 /// One event in a [`RunDetail`]'s timeline, mirroring
@@ -774,6 +789,17 @@ pub struct App {
     /// [`RunCard::scope`]) are shown on [`Screen::Runs`]; cycled by the `F`
     /// key. Applied in [`App::runs_in_col`] like `runs_kind_filter`.
     pub runs_scope_filter: Option<String>,
+    /// [`Screen::Overview`]'s rows, already in attention-queue order
+    /// (see [`crate::runs::overview::attention_order`]).
+    pub overview_rows: Vec<crate::runs::overview::OverviewRow>,
+    /// Index into `overview_rows` of the highlighted row. Always clamped
+    /// into bounds (`0` when the queue is empty).
+    pub overview_selected: usize,
+    /// The ticket to highlight on the next load after [`Msg::ToggleOverview`]
+    /// switched between [`Screen::Runs`] and [`Screen::Overview`], so the
+    /// operator keeps their place across the switch. Consumed by that load
+    /// whether or not the ticket is there.
+    pub view_focus: Option<ViewFocus>,
     /// Whether the run detail floating window is shown.
     pub show_run_detail: bool,
     /// Detail for the run shown in the floating window, `None` while it's
@@ -1026,6 +1052,11 @@ impl App {
                     .is_none_or(|scope| c.scope == scope)
             })
             .collect()
+    }
+
+    /// The currently highlighted row on [`Screen::Overview`], if any.
+    pub fn selected_overview_row(&self) -> Option<&crate::runs::overview::OverviewRow> {
+        self.overview_rows.get(self.overview_selected)
     }
 
     /// The currently highlighted run card on [`Screen::Runs`], if any.
@@ -1327,6 +1358,12 @@ pub enum Msg {
     /// from the run's own recorded scope (GitHub issue #25). See
     /// [`run_session_action`].
     RunSessionAction,
+    /// `Tab` on [`Screen::Runs`] or [`Screen::Overview`]: switch to the
+    /// other one, keeping the highlighted ticket (ADR-0009 decision 2).
+    ToggleOverview,
+    /// [`Screen::Overview`]'s rows finished loading. A load failure
+    /// reuses [`Msg::RunsFailed`]: both read the same run store.
+    OverviewLoaded(Vec<crate::runs::overview::OverviewRow>),
     /// The `f` key was pressed on [`Screen::Runs`]: advance the kind view
     /// filter to the next distinct kind among the loaded runs (then back to
     /// unfiltered). See [`cycle_run_kind_filter`].
@@ -1526,6 +1563,8 @@ pub enum Cmd {
     },
     /// Reload [`Screen::Runs`]'s kanban board from the run store.
     LoadRuns,
+    /// Reload [`Screen::Overview`]'s rows from the run store.
+    LoadOverview,
     /// Load the full detail (including its event timeline) of one run, for
     /// the run detail floating window.
     LoadRunDetail {
@@ -1918,7 +1957,9 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
-            if app.screen == Screen::Runs {
+            if app.screen == Screen::Overview {
+                (app, vec![Cmd::LoadOverview])
+            } else if app.screen == Screen::Runs {
                 let mut cmds = vec![Cmd::LoadRuns];
                 if app.show_run_detail
                     && let Some(card) = app.selected_run_card()
@@ -2231,6 +2272,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::SessionAction => session_action(app),
         Msg::ManualSessionAction => manual_session_action(app),
         Msg::RunSessionAction => run_session_action(app),
+        Msg::ToggleOverview => toggle_overview(app),
+        Msg::OverviewLoaded(rows) => {
+            overview_loaded(&mut app, rows);
+            (app, Vec::new())
+        }
         Msg::CycleRunKindFilter => cycle_run_kind_filter(app),
         Msg::CycleRunScopeFilter => cycle_run_scope_filter(app),
         Msg::SessionAttachResult(message) => {
@@ -2811,8 +2857,9 @@ fn session_action(app: App) -> (App, Vec<Cmd>) {
 }
 
 /// Handle [`Msg::RunSessionAction`]: attach to the highlighted run card's
-/// `tm-<slug>-<key>` session on [`Screen::Runs`] (GitHub issue #25). A no-op
-/// when no card is highlighted.
+/// `tm-<slug>-<key>` session on [`Screen::Runs`] (GitHub issue #25), or the
+/// highlighted row's on [`Screen::Overview`] (GitHub issue #83). A no-op
+/// when nothing is highlighted.
 ///
 /// Unconditional like [`session_action`] (no liveness pre-check: a dead or
 /// never-created session surfaces as the `tmux` failure in the status line,
@@ -2824,11 +2871,16 @@ fn session_action(app: App) -> (App, Vec<Cmd>) {
 /// fall back to `app.session_slug`; when that is empty too (no repo config
 /// loaded), the status line explains and no attach is attempted.
 fn run_session_action(mut app: App) -> (App, Vec<Cmd>) {
-    let Some(card) = app.selected_run_card() else {
+    let selected = if app.screen == Screen::Overview {
+        app.selected_overview_row()
+            .map(|row| (row.key.scope.clone(), row.key.ticket.clone()))
+    } else {
+        app.selected_run_card()
+            .map(|card| (card.scope.clone(), card.ticket.clone()))
+    };
+    let Some((scope, ticket)) = selected else {
         return (app, Vec::new());
     };
-    let ticket = card.ticket.clone();
-    let scope = card.scope.clone();
     let slug = match crate::config::BackendIdentity::session_slug_for_scope(&scope) {
         Some(slug) => slug,
         None if !app.session_slug.is_empty() => app.session_slug.clone(),
@@ -2840,6 +2892,59 @@ fn run_session_action(mut app: App) -> (App, Vec<Cmd>) {
     };
     let session_name = crate::work::naming::ticket_session_name(&slug, &ticket);
     (app, vec![Cmd::AttachSession { session_name }])
+}
+
+/// Handle [`Msg::ToggleOverview`]: switch between [`Screen::Runs`] and
+/// [`Screen::Overview`] (ADR-0009 decision 2), handing the highlighted
+/// ticket over as [`App::view_focus`] and loading the target view fresh, so
+/// the focus lands on current data rather than whatever the target view
+/// last showed. Closes the run detail window if one is open. A no-op on any
+/// other screen.
+fn toggle_overview(mut app: App) -> (App, Vec<Cmd>) {
+    use crate::runs::overview::TicketKey;
+    let (screen, focus, cmd) = match app.screen {
+        Screen::Runs => (
+            Screen::Overview,
+            app.selected_run_card().map(|card| ViewFocus {
+                key: TicketKey::new(&card.scope, &card.ticket),
+                run_id: Some(card.id),
+            }),
+            Cmd::LoadOverview,
+        ),
+        Screen::Overview => (
+            Screen::Runs,
+            app.selected_overview_row().map(|row| ViewFocus {
+                key: row.key.clone(),
+                run_id: row.run_id,
+            }),
+            Cmd::LoadRuns,
+        ),
+        _ => return (app, Vec::new()),
+    };
+    app.screen = screen;
+    app.view_focus = focus;
+    app.show_run_detail = false;
+    app.run_detail = None;
+    (app, vec![cmd])
+}
+
+/// Handle [`Msg::OverviewLoaded`]: replace `app.overview_rows`, keeping the
+/// highlighted ticket highlighted by key — or, on the first load after
+/// [`Msg::ToggleOverview`], highlighting the ticket it handed over — and
+/// otherwise clamping the selection into bounds.
+fn overview_loaded(app: &mut App, rows: Vec<crate::runs::overview::OverviewRow>) {
+    let preferred = match app.view_focus.take() {
+        Some(focus) => Some(focus.key),
+        None => app.selected_overview_row().map(|row| row.key.clone()),
+    };
+    app.overview_rows = rows;
+    if let Some(index) =
+        preferred.and_then(|key| app.overview_rows.iter().position(|row| row.key == key))
+    {
+        app.overview_selected = index;
+    } else if app.overview_selected >= app.overview_rows.len() {
+        app.overview_selected = app.overview_rows.len().saturating_sub(1);
+    }
 }
 
 /// The value after `current` in a cycle over `values` plus "no filter":
@@ -3047,6 +3152,17 @@ fn review_fix_action(mut app: App) -> (App, Vec<Cmd>) {
 /// (~500ms), matching the watch screen's detail refresh cadence.
 fn tick(mut app: App) -> (App, Vec<Cmd>) {
     match app.screen {
+        Screen::Overview => {
+            app.watch_tick += 1;
+            let mut cmds = Vec::new();
+            if app.watch_tick.is_multiple_of(2) {
+                cmds.push(Cmd::LoadOverview);
+            }
+            if app.watch_tick.is_multiple_of(120) {
+                cmds.push(Cmd::ReapRuns);
+            }
+            (app, cmds)
+        }
         Screen::Runs => {
             app.watch_tick += 1;
             let mut cmds = Vec::new();
@@ -3097,12 +3213,18 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
 /// Handle [`Msg::RunsLoaded`]: replace `app.runs` with server truth,
 /// preferring to keep the previously selected run card selected (by id) if
 /// it still exists, otherwise clamping the row within the current column
-/// (mirroring [`clamp_row`]'s board behavior).
+/// (mirroring [`clamp_row`]'s board behavior). On the first load after
+/// [`Msg::ToggleOverview`] the handed-over ticket wins instead: its focused
+/// run if that card is visible, else any visible card of the ticket.
 fn runs_loaded(app: &mut App, cards: Vec<RunCard>) {
     let preferred_id = app.selected_run_card().map(|c| c.id);
+    let focus = app.view_focus.take();
     app.runs = cards;
 
-    let found = preferred_id.is_some_and(|id| select_run_by_id(app, id));
+    let found = match focus {
+        Some(focus) => select_focused_run(app, &focus),
+        None => preferred_id.is_some_and(|id| select_run_by_id(app, id)),
+    };
     if !found {
         clamp_runs_row(app);
     }
@@ -3113,6 +3235,26 @@ fn runs_loaded(app: &mut App, cards: Vec<RunCard>) {
 fn select_run_by_id(app: &mut App, id: i64) -> bool {
     for col in 0..RUN_COLUMNS.len() {
         if let Some(row) = app.runs_in_col(col).iter().position(|c| c.id == id) {
+            app.runs_selected_col = col;
+            app.runs_selected_row = row;
+            return true;
+        }
+    }
+    false
+}
+
+/// Select `focus`'s run card if visible, else the first visible card of
+/// `focus`'s ticket. Returns whether either was found.
+fn select_focused_run(app: &mut App, focus: &ViewFocus) -> bool {
+    if focus.run_id.is_some_and(|id| select_run_by_id(app, id)) {
+        return true;
+    }
+    for col in 0..RUN_COLUMNS.len() {
+        if let Some(row) = app
+            .runs_in_col(col)
+            .iter()
+            .position(|c| c.scope == focus.key.scope && c.ticket == focus.key.ticket)
+        {
             app.runs_selected_col = col;
             app.runs_selected_row = row;
             return true;
@@ -3513,6 +3655,8 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
         // drill into here, kept as a no-op so `Screen` stays exhaustively
         // matched.
         Screen::Retro => (app, Vec::new()),
+        // Run detail from the overview is slice 6 of ADR-0009 (`v`).
+        Screen::Overview => (app, Vec::new()),
     }
 }
 
@@ -3555,6 +3699,8 @@ fn back(app: &mut App) {
         // `Msg::RetroNoteCancel` while either overlay is open, so `Back`
         // only ever fires here with both closed.
         Screen::Retro => app.screen = Screen::Board,
+        // `tm overview` has no screen to fall back to.
+        Screen::Overview => app.quit = true,
     }
 }
 
@@ -3590,6 +3736,9 @@ fn move_up(app: &mut App) {
         }
         Screen::Retro => {
             app.retro_selected = app.retro_selected.saturating_sub(1);
+        }
+        Screen::Overview => {
+            app.overview_selected = app.overview_selected.saturating_sub(1);
         }
     }
 }
@@ -3633,6 +3782,12 @@ fn move_down(app: &mut App) {
         Screen::Retro => {
             if !app.retro_tickets.is_empty() {
                 app.retro_selected = (app.retro_selected + 1).min(app.retro_tickets.len() - 1);
+            }
+        }
+        Screen::Overview => {
+            if !app.overview_rows.is_empty() {
+                app.overview_selected =
+                    (app.overview_selected + 1).min(app.overview_rows.len() - 1);
             }
         }
     }
@@ -8211,5 +8366,211 @@ mod tests {
         );
         assert_eq!(cmds.len(), 2);
         assert!(app.in_flight.is_empty());
+    }
+
+    // --- Screen::Overview (GitHub issue #83) ---
+
+    fn overview_row(
+        scope: &str,
+        ticket: &str,
+        stage: crate::runs::overview::Stage,
+        run_id: Option<i64>,
+    ) -> crate::runs::overview::OverviewRow {
+        crate::runs::overview::OverviewRow {
+            key: crate::runs::overview::TicketKey::new(scope, ticket),
+            stage,
+            stage_age_secs: 60,
+            run_id,
+            run_status: run_id.map(|_| crate::runs::RunStatus::Running),
+            kind: run_id.map(|_| "lane".to_string()),
+            pr_url: None,
+            worktree: None,
+            repo_root: crate::runs::overview::RepoRoot::Unresolved,
+        }
+    }
+
+    fn overview_app(rows: Vec<crate::runs::overview::OverviewRow>, selected: usize) -> App {
+        App {
+            screen: Screen::Overview,
+            overview_rows: rows,
+            overview_selected: selected,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn tick_on_overview_loads_every_second_tick_and_reaps_every_120th() {
+        let app = overview_app(Vec::new(), 0);
+        let (app, cmds) = update(app, Msg::Tick);
+        assert!(cmds.is_empty());
+        let (app, cmds) = update(app, Msg::Tick);
+        assert_eq!(cmds, vec![Cmd::LoadOverview]);
+
+        let app = App {
+            watch_tick: 119,
+            ..app
+        };
+        let (_, cmds) = update(app, Msg::Tick);
+        assert_eq!(cmds, vec![Cmd::LoadOverview, Cmd::ReapRuns]);
+    }
+
+    #[test]
+    fn refresh_on_overview_reloads_the_overview() {
+        let (_, cmds) = update(overview_app(Vec::new(), 0), Msg::Refresh);
+        assert_eq!(cmds, vec![Cmd::LoadOverview]);
+    }
+
+    #[test]
+    fn overview_up_down_move_the_selection_within_bounds() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![
+                overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                overview_row("github:a/b", "GH-2", Stage::Running, Some(2)),
+            ],
+            0,
+        );
+        let (app, _) = update(app, Msg::Down);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.overview_selected, 1);
+        let (app, _) = update(app, Msg::Up);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.overview_selected, 0);
+    }
+
+    #[test]
+    fn overview_loaded_keeps_the_selected_ticket_selected() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![
+                overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                overview_row("github:a/b", "GH-2", Stage::Running, Some(2)),
+            ],
+            1,
+        );
+        let (app, _) = update(
+            app,
+            Msg::OverviewLoaded(vec![
+                overview_row("github:a/b", "GH-3", Stage::NeedsInput, Some(3)),
+                overview_row("github:a/b", "GH-1", Stage::Stuck, Some(1)),
+                overview_row("github:a/b", "GH-2", Stage::Stuck, Some(2)),
+            ]),
+        );
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
+    }
+
+    #[test]
+    fn overview_loaded_clamps_when_the_selected_ticket_disappears() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![
+                overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                overview_row("github:a/b", "GH-2", Stage::Running, Some(2)),
+            ],
+            1,
+        );
+        let (app, _) = update(
+            app,
+            Msg::OverviewLoaded(vec![overview_row(
+                "github:a/b",
+                "GH-1",
+                Stage::NeedsInput,
+                Some(1),
+            )]),
+        );
+        assert_eq!(app.overview_selected, 0);
+    }
+
+    #[test]
+    fn back_on_overview_quits() {
+        let (app, _) = update(overview_app(Vec::new(), 0), Msg::Back);
+        assert!(app.quit);
+    }
+
+    /// `s` on the overview attaches by the row's own scope, exactly like the
+    /// watch screen (#25): the overview is machine-wide too.
+    #[test]
+    fn run_session_action_on_overview_attaches_using_the_rows_scope() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row(
+                "github:jowi-dev/tskmstr",
+                "GH-83",
+                Stage::NeedsInput,
+                Some(1),
+            )],
+            0,
+        );
+        let (_, cmds) = update(app, Msg::RunSessionAction);
+        let slug =
+            crate::config::BackendIdentity::session_slug_for_scope("github:jowi-dev/tskmstr")
+                .unwrap();
+        assert_eq!(
+            cmds,
+            vec![Cmd::AttachSession {
+                session_name: crate::work::naming::ticket_session_name(&slug, "GH-83"),
+            }]
+        );
+    }
+
+    #[test]
+    fn toggle_from_watch_opens_the_overview_on_the_highlighted_ticket() {
+        use crate::runs::overview::Stage;
+        let mut card = run_card(7, "GH-2", crate::runs::RunStatus::Running);
+        card.scope = "github:a/b".to_string();
+        let app = runs_app(vec![card], 1, 0);
+
+        let (app, cmds) = update(app, Msg::ToggleOverview);
+        assert_eq!(app.screen, Screen::Overview);
+        assert_eq!(cmds, vec![Cmd::LoadOverview]);
+
+        let (app, _) = update(
+            app,
+            Msg::OverviewLoaded(vec![
+                overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                overview_row("github:a/b", "GH-2", Stage::Running, Some(7)),
+            ]),
+        );
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
+    }
+
+    #[test]
+    fn toggle_from_overview_opens_watch_on_the_rows_run() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::Stuck, Some(7))],
+            0,
+        );
+
+        let (app, cmds) = update(app, Msg::ToggleOverview);
+        assert_eq!(app.screen, Screen::Runs);
+        assert_eq!(cmds, vec![Cmd::LoadRuns]);
+
+        let mut other = run_card(1, "GH-1", crate::runs::RunStatus::Running);
+        other.scope = "github:a/b".to_string();
+        let mut target = run_card(7, "GH-2", crate::runs::RunStatus::Failed);
+        target.scope = "github:a/b".to_string();
+        let (app, _) = update(app, Msg::RunsLoaded(vec![other, target]));
+        assert_eq!(app.selected_run_card().unwrap().id, 7);
+    }
+
+    /// The focus is a one-shot hand-off: once a load has tried to honor it,
+    /// later reloads go back to keeping whatever the operator has moved to.
+    #[test]
+    fn toggle_focus_is_consumed_by_the_first_load() {
+        use crate::runs::overview::Stage;
+        let mut card = run_card(7, "GH-9", crate::runs::RunStatus::Running);
+        card.scope = "github:a/b".to_string();
+        let (app, _) = update(runs_app(vec![card], 1, 0), Msg::ToggleOverview);
+
+        let rows = vec![
+            overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+            overview_row("github:a/b", "GH-2", Stage::Running, Some(2)),
+        ];
+        let (app, _) = update(app, Msg::OverviewLoaded(rows.clone()));
+        assert_eq!(app.overview_selected, 0);
+        let (app, _) = update(app, Msg::Down);
+        let (app, _) = update(app, Msg::OverviewLoaded(rows));
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
     }
 }

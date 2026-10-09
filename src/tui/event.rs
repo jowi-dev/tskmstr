@@ -1155,6 +1155,31 @@ pub struct WatchDeps {
 /// key pressed (the board loop just redraws instead; the watch loop uses the
 /// timeout as its clock for polling and periodic reaping).
 pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
+    run_watch_loop(
+        deps,
+        crate::tui::app::Screen::Runs,
+        vec![Cmd::ReapRuns, Cmd::LoadRuns],
+    )
+}
+
+/// Run `tm overview` (GitHub issue #83) until the user quits: the same loop
+/// as [`run_watch`], started on [`crate::tui::app::Screen::Overview`]. The
+/// two share one loop so `Tab` can switch between them in place.
+pub fn run_overview(deps: WatchDeps) -> Result<(), TuiError> {
+    run_watch_loop(
+        deps,
+        crate::tui::app::Screen::Overview,
+        vec![Cmd::ReapRuns, Cmd::LoadOverview],
+    )
+}
+
+/// The loop behind [`run_watch`] and [`run_overview`]: starts on `screen`
+/// and runs `startup` before the first draw.
+fn run_watch_loop(
+    deps: WatchDeps,
+    screen: crate::tui::app::Screen,
+    startup: Vec<Cmd>,
+) -> Result<(), TuiError> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -1163,16 +1188,11 @@ pub fn run_watch(deps: WatchDeps) -> Result<(), TuiError> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App {
-        screen: crate::tui::app::Screen::Runs,
+        screen,
         session_slug: deps.session_slug.clone(),
         ..App::new()
     };
-    app = run_watch_cmds(
-        app,
-        vec![Cmd::ReapRuns, Cmd::LoadRuns],
-        &deps,
-        &mut terminal,
-    );
+    app = run_watch_cmds(app, startup, &deps, &mut terminal);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
@@ -1261,17 +1281,19 @@ fn run_watch_cmds<B: Backend>(
 }
 
 /// Translate a single [`Cmd`] into the [`Msg`]s it produces, for `tm runs
-/// watch`. Handles only the run-store `Cmd`s; every other variant is
-/// unreachable from [`crate::tui::app::Screen::Runs`].
+/// watch` and `tm overview`. Handles only the run-store `Cmd`s; every other
+/// variant is unreachable from [`crate::tui::app::Screen::Runs`] and
+/// [`crate::tui::app::Screen::Overview`].
 fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
         Cmd::LoadRuns => load_runs(deps),
+        Cmd::LoadOverview => load_overview(deps),
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
         other => {
             debug_assert!(
                 false,
-                "execute_watch: unreachable Cmd from Screen::Runs: {other:?}"
+                "execute_watch: unreachable Cmd from Screen::Runs/Overview: {other:?}"
             );
             Vec::new()
         }
@@ -1297,6 +1319,33 @@ fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
                 .map(|summary| run_summary_to_card(deps, summary))
                 .collect(),
         )],
+        Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
+/// Run `Cmd::LoadOverview`: join the run store into
+/// [`crate::runs::overview::OverviewRow`]s, one per `(scope, ticket)`, for
+/// the scopes still in flight (see
+/// [`crate::runs::overview::active_scope_runs`]).
+///
+/// Runs-only for now (GitHub issue #83): the tracker signals are empty, so
+/// no row reaches a PR stage or Not started until the per-repo poller
+/// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`
+/// alone, with no worktree fallback: nothing on the overview routes by repo
+/// root yet (the `s` attach routes by scope), and the fallback would spawn
+/// a `git` per unstamped row on every load.
+fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
+    use crate::runs::overview;
+    match deps.store.overview_runs() {
+        Ok(runs) => {
+            let runs = overview::active_scope_runs(&runs, overview::ACTIVE_SCOPE_WINDOW_SECS);
+            vec![Msg::OverviewLoaded(overview::join_rows(
+                &runs,
+                &overview::TrackerSignals::default(),
+                crate::tui::ui::STALE_HEARTBEAT_SECS,
+                &|_| None,
+            ))]
+        }
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
     }
 }
@@ -1520,6 +1569,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // issue #26 — the board reaps dead runs on its own poll — so it's
         // handled above.)
         other @ (Cmd::LoadRuns
+        | Cmd::LoadOverview
         | Cmd::LoadRunDetail { .. }
         | Cmd::AttachSession { .. }
         | Cmd::LaunchCreate
@@ -4015,6 +4065,31 @@ mod tests {
                 assert_eq!(cards[0].status, crate::runs::RunStatus::Running);
             }
             other => panic!("expected RunsLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_overview_maps_runs_to_overview_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+
+        let msgs = execute_watch(&watch_deps(store), Cmd::LoadOverview);
+        match msgs.as_slice() {
+            [Msg::OverviewLoaded(rows)] => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].key,
+                    crate::runs::overview::TicketKey::new("github:a/b", "GH-1")
+                );
+                assert_eq!(rows[0].stage, crate::runs::overview::Stage::Running);
+            }
+            other => panic!("expected OverviewLoaded, got {other:?}"),
         }
     }
 

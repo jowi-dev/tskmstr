@@ -270,6 +270,7 @@ mod tests {
             mem_peak_bytes: None,
             agent: None,
             repo: None,
+            repo_root: None,
         }
     }
 

@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod footprint;
+pub mod overview;
 pub mod pid;
 pub mod pricing;
 pub mod session;
@@ -183,6 +184,15 @@ const MIGRATIONS: &[&str] = &[
       captured_at TEXT NOT NULL
     );
     CREATE INDEX idx_session_archives_ticket ON session_archives(ticket, captured_at);
+    "#,
+    // GitHub issue #82 (ADR-0009 decision 5): the absolute path of the
+    // lane repo's main checkout, so the cross-project overview can route an
+    // action to the row's own repo. `repo` is only the directory name and
+    // `worktree` is removed by `tm merge`, so neither can stand in. Stamped
+    // at run start next to `agent`/`repo`; NULL for rows predating the
+    // column (no backfill) and for run shapes that don't stamp it.
+    r#"
+    ALTER TABLE runs ADD COLUMN repo_root TEXT;
     "#,
 ];
 
@@ -675,6 +685,9 @@ pub struct Run {
     /// Directory name of the lane's repo, if recorded; see
     /// [`RunStore::update_agent_repo`].
     pub repo: Option<String>,
+    /// Absolute path of the lane repo's main checkout, if recorded; see
+    /// [`RunStore::update_repo_root`]. `None` for rows predating the column.
+    pub repo_root: Option<String>,
 }
 
 /// A recorded audit verdict for a ticket, from [`RunStore::record_audit`]
@@ -1962,6 +1975,27 @@ impl RunStore {
         Ok(())
     }
 
+    /// Records `repo_root`, the absolute path of the lane repo's main
+    /// checkout, on run `run_id` (GitHub issue #82, ADR-0009 decision 5).
+    /// The cross-project overview routes a row's actions by it; stamped next
+    /// to [`RunStore::update_agent_repo`] for the same reason that is a
+    /// separate update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_repo_root(&self, run_id: i64, repo_root: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET repo_root = ?1 WHERE id = ?2",
+            params![repo_root, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// The expected peak footprint, in bytes, of a new lane run for `agent`
     /// against `repo`: the largest recorded peak among the
     /// [`LANE_ESTIMATE_WINDOW`] most recent finished lane runs with that
@@ -2282,7 +2316,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE status = 'running'
                AND tmux_session IS NOT NULL
@@ -2408,7 +2442,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR scope = ?2 OR scope = '')
              ORDER BY started_at ASC, id ASC";
@@ -2433,7 +2467,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND (?2 IS NULL OR kind = ?2)
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2467,7 +2501,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE ticket = ?1 AND kind = ?2 AND status NOT IN ('running', 'queued')
                 AND (?3 IS NULL OR scope = ?3 OR scope = '')
@@ -2493,7 +2527,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              ORDER BY started_at DESC, id DESC";
 
@@ -2558,6 +2592,58 @@ impl RunStore {
         Ok(activity)
     }
 
+    /// Every recorded run, across every scope and kind, newest first (by
+    /// `started_at`, breaking ties by `id`), projected for the
+    /// cross-project overview's per-ticket join
+    /// ([`overview::join_rows`], GitHub issue #82). Computes the same
+    /// `awaiting_input`/`heartbeat_age_secs` [`RunStore::list_runs_filtered`]
+    /// does, plus [`overview::OverviewRun::state_age_secs`].
+    pub fn overview_runs(&self) -> Result<Vec<overview::OverviewRun>, RunStoreError> {
+        let sql = "SELECT
+                r.id, r.scope, r.ticket, r.kind, r.status, r.worktree, r.pr_url, r.repo_root,
+                CASE WHEN r.ended_at IS NULL THEN
+                    CAST((julianday('now') - julianday(COALESCE(r.heartbeat_at, r.started_at))) * 86400 AS INTEGER)
+                ELSE NULL END AS heartbeat_age_secs,
+                CAST((julianday('now') - julianday(COALESCE(r.ended_at, r.started_at))) * 86400 AS INTEGER)
+                    AS since_end_or_start_secs,
+                (SELECT e.kind FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1)
+                    AS last_event_kind,
+                (SELECT CAST((julianday('now') - julianday(e.at)) * 86400 AS INTEGER)
+                    FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1)
+                    AS last_event_age_secs
+             FROM runs r
+             ORDER BY r.started_at DESC, r.id DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(4)?;
+            // Same forward-compat fallback as list_runs_filtered.
+            let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
+            let last_event_kind: Option<String> = row.get(10)?;
+            let awaiting_input = is_awaiting_input(status, last_event_kind.as_deref());
+            let since_end_or_start: i64 = row.get(9)?;
+            let last_event_age: Option<i64> = row.get(11)?;
+            Ok(overview::OverviewRun {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                ticket: row.get(2)?,
+                kind: row.get(3)?,
+                status,
+                worktree: row.get(5)?,
+                pr_url: row.get(6)?,
+                repo_root: row.get(7)?,
+                heartbeat_age_secs: row.get(8)?,
+                awaiting_input,
+                state_age_secs: match last_event_age {
+                    Some(age) if awaiting_input => age,
+                    _ => since_end_or_start,
+                },
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns the run with id `run_id`, or `None` if no such row exists.
     ///
     /// Used by `tm runs watch`'s detail window, which navigates by row id
@@ -2569,7 +2655,7 @@ impl RunStore {
                 started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
                 blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
                 CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
-                mem_current_bytes, mem_peak_bytes, agent, repo
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
              FROM runs
              WHERE id = ?1";
 
@@ -2583,7 +2669,7 @@ impl RunStore {
     /// worktree, branch, pid, transcript, started_at, heartbeat_at,
     /// ended_at, exit_code, num_turns, cost_usd, blocker, pr_url,
     /// model_usage, log_path, findings_count, scope, tmux_session, age_secs,
-    /// mem_current_bytes, mem_peak_bytes, agent, repo` projection (shared
+    /// mem_current_bytes, mem_peak_bytes, agent, repo, repo_root` projection (shared
     /// by [`RunStore::run_by_id`], [`RunStore::latest_run_for_ticket_kind`],
     /// and [`RunStore::latest_finished_run_for_ticket_kind`]) to a [`Run`].
     fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -2620,6 +2706,7 @@ impl RunStore {
             mem_peak_bytes: row.get(25)?,
             agent: row.get(26)?,
             repo: row.get(27)?,
+            repo_root: row.get(28)?,
         })
     }
 
@@ -3226,7 +3313,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_13() {
+    fn open_migrates_a_fresh_db_to_user_version_14() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3234,7 +3321,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -7984,6 +8071,181 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.agent.as_deref(), Some("opencode"));
         assert_eq!(run.repo.as_deref(), Some("lemma"));
+    }
+
+    // --- repo root (GitHub issue #82, ADR-0009 decision 5) ---
+
+    #[test]
+    fn update_repo_root_stamps_the_main_checkout_path() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+
+        store
+            .update_repo_root(id, "/home/me/Projects/lemma")
+            .unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.repo_root.as_deref(), Some("/home/me/Projects/lemma"));
+    }
+
+    #[test]
+    fn repo_root_is_none_for_an_unstamped_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.repo_root, None);
+    }
+
+    // --- overview_runs (GitHub issue #82) ---
+
+    /// Backdates run `id`'s timestamps by whole hours (`None` leaves a
+    /// column as is), so age-derived fields are distinguishable in tests.
+    fn backdate(store: &RunStore, id: i64, started_h: i64, ended_h: Option<i64>) {
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1),
+                                 heartbeat_at = NULL
+                 WHERE id = ?2",
+                params![format!("-{started_h} hours"), id],
+            )
+            .unwrap();
+        if let Some(h) = ended_h {
+            store
+                .conn
+                .execute(
+                    "UPDATE runs SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+                     WHERE id = ?2",
+                    params![format!("-{h} hours"), id],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn overview_runs_lists_every_scope_newest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let older = store
+            .start_run(&StartRun {
+                scope: "gh:me/a".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        let newer = store
+            .start_run(&StartRun {
+                scope: "gh:me/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+
+        let runs = store.overview_runs().unwrap();
+
+        let ids: Vec<_> = runs.iter().map(|r| (r.id, r.scope.as_str())).collect();
+        assert_eq!(ids, vec![(newer, "gh:me/b"), (older, "gh:me/a")]);
+    }
+
+    #[test]
+    fn overview_runs_carries_the_routing_fields() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-7", None);
+        store.update_repo_root(id, "/src/proj").unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Review,
+                    pr_url: Some("https://github.com/me/proj/pull/9".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+
+        let run = &store.overview_runs().unwrap()[0];
+
+        assert_eq!(run.ticket, "GH-7");
+        assert_eq!(run.kind, "lane");
+        assert_eq!(run.status, RunStatus::Review);
+        assert_eq!(run.worktree, "/tmp/wt");
+        assert_eq!(run.repo_root.as_deref(), Some("/src/proj"));
+        assert_eq!(
+            run.pr_url.as_deref(),
+            Some("https://github.com/me/proj/pull/9")
+        );
+        assert_eq!(
+            run.heartbeat_age_secs, None,
+            "an ended run has no heartbeat age"
+        );
+    }
+
+    #[test]
+    fn overview_runs_ages_a_running_run_from_its_start() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-1", None);
+        backdate(&store, id, 2, None);
+
+        let run = &store.overview_runs().unwrap()[0];
+
+        assert!(!run.awaiting_input);
+        assert!(
+            (7190..=7210).contains(&run.state_age_secs),
+            "{}",
+            run.state_age_secs
+        );
+        assert!(run.heartbeat_age_secs.is_some_and(|age| age >= 7190));
+    }
+
+    #[test]
+    fn overview_runs_ages_an_ended_run_from_its_end() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-1", None);
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Failed,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        backdate(&store, id, 5, Some(1));
+
+        let run = &store.overview_runs().unwrap()[0];
+
+        assert!(
+            (3590..=3610).contains(&run.state_age_secs),
+            "{}",
+            run.state_age_secs
+        );
+    }
+
+    #[test]
+    fn overview_runs_ages_an_awaiting_run_from_its_await_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-1", None);
+        store.add_event(id, "await", None).unwrap();
+        backdate(&store, id, 3, None);
+
+        let run = &store.overview_runs().unwrap()[0];
+
+        assert!(run.awaiting_input);
+        assert!(run.state_age_secs < 60, "{}", run.state_age_secs);
+    }
+
+    #[test]
+    fn update_repo_root_rejects_an_unknown_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store.update_repo_root(999, "/repo").unwrap_err();
+        assert!(matches!(err, RunStoreError::RunNotFound(999)));
     }
 
     fn finished_lane_with_peak(store: &RunStore, agent: &str, repo: &str, peak: u64) -> i64 {
