@@ -1336,7 +1336,8 @@ pub enum Msg {
     ViewRunAction,
     /// The `L` key was pressed on [`Screen::Board`] for the selected ticket:
     /// open its latest run's log file (see [`Cmd::ViewLogs`]). A no-op when
-    /// no ticket is selected.
+    /// no ticket is selected. On [`Screen::Overview`] (GitHub issue #87) it
+    /// pages the highlighted row's run log instead ([`Cmd::ViewRunLogs`]).
     ViewLogsAction,
     /// The outcome of [`Cmd::ViewLogs`], already rendered to a
     /// human-readable status-line message -- mirrors
@@ -1699,6 +1700,14 @@ pub enum Cmd {
     ViewLogs {
         /// Ticket key to view the latest run's log for.
         key: String,
+    },
+    /// Open run `run_id`'s log file in a pager, for `L` on
+    /// [`Screen::Overview`] (GitHub issue #87): [`Cmd::ViewLogs`] by run id
+    /// rather than ticket key, so it needs neither a scope nor a repo root.
+    /// Intercepted by the watch loop the same way.
+    ViewRunLogs {
+        /// The run whose log to page.
+        run_id: i64,
     },
     /// Open `key`'s worktree (its latest `kind = "lane"` run's `worktree`)
     /// in `vdiff`, suspending and restoring the board's terminal state
@@ -3142,16 +3151,23 @@ fn view_run_action(mut app: App) -> (App, Vec<Cmd>) {
     (app, vec![Cmd::LoadTicketRunDetail { key }])
 }
 
+/// The highlighted overview row's run, for the overview's by-run actions
+/// (`v`, `L`). A not-started row has no run: the status line says so and
+/// this returns `None`, as it does with no row at all.
+fn overview_run_id(app: &mut App) -> Option<i64> {
+    let row = app.selected_overview_row()?;
+    let run_id = row.run_id;
+    if run_id.is_none() {
+        app.status_line = format!("no run recorded for {}", row.key.ticket);
+    }
+    run_id
+}
+
 /// [`view_run_action`] on [`Screen::Overview`] (GitHub issue #87, ADR-0009
 /// decision 6): open the run detail overlay on the highlighted row's own
-/// run, by id, so it needs no repo root. A not-started row has no run, so
-/// the status line says so instead.
+/// run, by id, so it needs no repo root.
 fn view_overview_run_action(mut app: App) -> (App, Vec<Cmd>) {
-    let Some(row) = app.selected_overview_row() else {
-        return (app, Vec::new());
-    };
-    let Some(run_id) = row.run_id else {
-        app.status_line = format!("no run recorded for {}", row.key.ticket);
+    let Some(run_id) = overview_run_id(&mut app) else {
         return (app, Vec::new());
     };
     app.show_run_detail = true;
@@ -3167,7 +3183,17 @@ fn view_overview_run_action(mut app: App) -> (App, Vec<Cmd>) {
 /// [`crate::tui::event::run_cmds`]'s [`Cmd::ViewLogs`] interception, since
 /// that needs the run store and a real terminal, neither of which `update`
 /// has access to (it stays pure, per this module's doc comment).
-fn view_logs_action(app: App) -> (App, Vec<Cmd>) {
+///
+/// On [`Screen::Overview`] (GitHub issue #87) it pages the highlighted row's
+/// run log instead, by id ([`Cmd::ViewRunLogs`]).
+fn view_logs_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen == Screen::Overview {
+        let cmds = overview_run_id(&mut app)
+            .map(|run_id| Cmd::ViewRunLogs { run_id })
+            .into_iter()
+            .collect();
+        return (app, cmds);
+    }
     if app.screen != Screen::Board {
         return (app, Vec::new());
     }
@@ -8760,6 +8786,29 @@ mod tests {
         let (app, cmds) = update(overview_app(Vec::new(), 0), Msg::ViewRunAction);
         assert!(!app.show_run_detail);
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn view_logs_action_on_overview_pages_the_rows_run_log() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::Stuck, Some(7))],
+            0,
+        );
+        let (_, cmds) = update(app, Msg::ViewLogsAction);
+        assert_eq!(cmds, vec![Cmd::ViewRunLogs { run_id: 7 }]);
+    }
+
+    #[test]
+    fn view_logs_action_on_a_not_started_row_explains_why_on_the_status_line() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::NotStarted, None)],
+            0,
+        );
+        let (app, cmds) = update(app, Msg::ViewLogsAction);
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "no run recorded for GH-2");
     }
 
     #[test]

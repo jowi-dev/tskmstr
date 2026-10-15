@@ -247,7 +247,9 @@ pub fn map_key(
         KeyCode::Char('v') if matches!(screen, Screen::Board | Screen::Overview) => {
             Some(Msg::ViewRunAction)
         }
-        KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
+        KeyCode::Char('L') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ViewLogsAction)
+        }
         KeyCode::Char('V') if matches!(screen, Screen::Board | Screen::Overview) => {
             Some(Msg::ViewDiffAction)
         }
@@ -2895,6 +2897,10 @@ mod tests {
         assert_eq!(
             plain_key(&Screen::Overview, KeyCode::Char('v')),
             Some(Msg::ViewRunAction)
+        );
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Char('L')),
+            Some(Msg::ViewLogsAction)
         );
     }
 
