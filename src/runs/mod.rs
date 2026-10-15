@@ -545,7 +545,8 @@ pub struct ScopeActivity {
     pub worktrees: Vec<String>,
 }
 
-/// A running lane as seen by memory-budget admission (GitHub issue #66); see
+/// A running lane as seen by memory-budget admission (GitHub issue #66) and
+/// the overview's system header (GitHub issue #86); see
 /// [`RunStore::running_lanes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningLane {
@@ -557,6 +558,10 @@ pub struct RunningLane {
     pub repo: Option<String>,
     /// See [`Run::mem_peak_bytes`].
     pub mem_peak_bytes: Option<u64>,
+    /// See [`Run::mem_current_bytes`].
+    pub mem_current_bytes: Option<u64>,
+    /// The run's root process, whose tree the overview samples for CPU.
+    pub pid: Option<u32>,
 }
 
 /// A run's bot-findings outcome bucket, as measured by `findings_count`; see
@@ -2035,7 +2040,7 @@ impl RunStore {
     /// share of the budget.
     pub fn running_lanes(&self) -> Result<Vec<RunningLane>, RunStoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, repo, mem_peak_bytes FROM runs
+            "SELECT id, agent, repo, mem_peak_bytes, mem_current_bytes, pid FROM runs
               WHERE status = 'running' AND kind = 'lane'
               ORDER BY started_at ASC, id ASC",
         )?;
@@ -2045,6 +2050,8 @@ impl RunStore {
                 agent: row.get(1)?,
                 repo: row.get(2)?,
                 mem_peak_bytes: row.get(3)?,
+                mem_current_bytes: row.get(4)?,
+                pid: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -8327,5 +8334,7 @@ mod tests {
         assert_eq!(lanes[0].agent.as_deref(), Some("claude"));
         assert_eq!(lanes[0].repo.as_deref(), Some("tskmstr"));
         assert_eq!(lanes[0].mem_peak_bytes, Some(700));
+        assert_eq!(lanes[0].mem_current_bytes, Some(700));
+        assert_eq!(lanes[0].pid, Some(1));
     }
 }
