@@ -31,6 +31,7 @@ pub mod overview;
 pub mod pid;
 pub mod pricing;
 pub mod session;
+pub mod system;
 
 /// A SQL expression yielding the current UTC time as
 /// `YYYY-MM-DDTHH:MM:SS.sssZ`. Takes no user input, so it is safe to splice
