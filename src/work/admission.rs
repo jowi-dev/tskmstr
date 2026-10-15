@@ -116,31 +116,10 @@ pub fn check_lane_admission(
         return Ok(Some(AdmissionRefusal::Pressure(level)));
     }
 
-    let mut estimates: HashMap<(String, String), Option<u64>> = HashMap::new();
-    let mut estimate_for = |agent: &str, repo: &str| -> Result<Option<u64>, RunStoreError> {
-        let key = (agent.to_string(), repo.to_string());
-        if let Some(cached) = estimates.get(&key) {
-            return Ok(*cached);
-        }
-        let estimate = store.lane_peak_estimate(agent, repo)?;
-        estimates.insert(key, estimate);
-        Ok(estimate)
-    };
-
-    let running = store.running_lanes()?;
-    let mut running_bytes = 0u64;
-    for lane in &running {
-        let key_estimate = match (&lane.agent, &lane.repo) {
-            (Some(agent), Some(repo)) => estimate_for(agent, repo)?,
-            _ => None,
-        };
-        let estimate = key_estimate.unwrap_or(memory.default_lane_estimate_bytes);
-        running_bytes += estimate.max(lane.mem_peak_bytes.unwrap_or(0));
-    }
-
-    let history = estimate_for(agent, repo)?;
+    let running = running_lane_estimate(store, memory)?;
+    let history = store.lane_peak_estimate(agent, repo)?;
     let estimate_bytes = history.unwrap_or(memory.default_lane_estimate_bytes);
-    if running_bytes + estimate_bytes <= budget_bytes {
+    if running.bytes + estimate_bytes <= budget_bytes {
         return Ok(None);
     }
 
@@ -149,10 +128,60 @@ pub fn check_lane_admission(
         repo: repo.to_string(),
         estimate_bytes,
         from_history: history.is_some(),
-        running_count: running.len(),
-        running_bytes,
+        running_count: running.count,
+        running_bytes: running.bytes,
         budget_bytes,
     })))
+}
+
+/// What the running lanes count against the memory budget; see
+/// [`running_lane_estimate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningEstimate {
+    /// How many lanes are running.
+    pub count: usize,
+    /// Their summed estimates, in bytes.
+    pub bytes: u64,
+}
+
+/// Sums the running lanes' estimated cost the way admission does: each
+/// lane at the larger of its own peak so far and its `(agent, repo)` key's
+/// estimate, falling back to [`MemoryConfig::default_lane_estimate_bytes`]
+/// with no history. Shared with the overview's system header (GitHub issue
+/// #86), which shows it against the budget.
+///
+/// # Errors
+///
+/// Returns a [`RunStoreError`] if the run store can't be read.
+pub fn running_lane_estimate(
+    store: &RunStore,
+    memory: &MemoryConfig,
+) -> Result<RunningEstimate, RunStoreError> {
+    let mut estimates: HashMap<(String, String), Option<u64>> = HashMap::new();
+    let running = store.running_lanes()?;
+    let mut bytes = 0u64;
+    for lane in &running {
+        let key_estimate = match (&lane.agent, &lane.repo) {
+            (Some(agent), Some(repo)) => {
+                let key = (agent.clone(), repo.clone());
+                match estimates.get(&key) {
+                    Some(cached) => *cached,
+                    None => {
+                        let estimate = store.lane_peak_estimate(agent, repo)?;
+                        estimates.insert(key, estimate);
+                        estimate
+                    }
+                }
+            }
+            _ => None,
+        };
+        let estimate = key_estimate.unwrap_or(memory.default_lane_estimate_bytes);
+        bytes += estimate.max(lane.mem_peak_bytes.unwrap_or(0));
+    }
+    Ok(RunningEstimate {
+        count: running.len(),
+        bytes,
+    })
 }
 
 #[cfg(test)]
@@ -334,5 +363,26 @@ mod tests {
             check_lane_admission(&store, &budget(1), "claude", "tskmstr", &normal).unwrap();
 
         assert_eq!(verdict, None);
+    }
+
+    #[test]
+    fn running_estimate_sums_each_lane_at_its_estimate_or_peak() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        finished_lane(&store, "claude", "tskmstr", GIB);
+        start_lane(&store, "claude", "tskmstr");
+        let big = start_lane(&store, "claude", "tskmstr");
+        store.record_footprint(big, 6 * GIB).unwrap();
+        start_lane(&store, "opencode", "lemma");
+
+        let running = running_lane_estimate(&store, &budget(100)).unwrap();
+
+        assert_eq!(
+            running,
+            RunningEstimate {
+                count: 3,
+                bytes: GIB + 6 * GIB + 2 * GIB,
+            }
+        );
     }
 }

@@ -246,6 +246,25 @@ pub fn acquire_slot(lock_dir: &Path, slots: u32, on_queue: &mut dyn FnMut()) -> 
     }
 }
 
+/// How many of the first `slots` slot locks under `lock_dir` are held right
+/// now, for the overview's system header (GitHub issue #86).
+///
+/// Each existing lock file is probed with a non-blocking `flock` that is
+/// released at once. A wrapper racing the probe may find that one slot busy
+/// and take the next, or poll once more. Missing lock files are free and
+/// are not created, and an unreadable one counts as free: the header is a
+/// display, never an error.
+pub fn slots_in_use(lock_dir: &Path, slots: u32) -> u32 {
+    let held = (0..slots).filter(|slot| {
+        let path = lock_dir.join(format!("slot-{slot}.lock"));
+        let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    });
+    held.count() as u32
+}
+
 /// The wrapper's inputs, read from the environment by [`run_wrapper`] and
 /// built directly by tests.
 #[derive(Debug, Clone, Default)]
@@ -579,6 +598,27 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _a = acquire_slot(tmp.path(), 2, &mut || panic!("slot 1 free")).unwrap();
         let _b = acquire_slot(tmp.path(), 2, &mut || panic!("slot 2 free")).unwrap();
+    }
+
+    #[test]
+    fn slots_in_use_counts_held_slots_only() {
+        let tmp = tempdir().unwrap();
+        let held = acquire_slot(tmp.path(), 3, &mut || panic!("slot free")).unwrap();
+        let released = acquire_slot(tmp.path(), 3, &mut || panic!("slot free")).unwrap();
+        drop(released);
+
+        assert_eq!(slots_in_use(tmp.path(), 3), 1);
+        // Probing must not keep a slot: a lane can still take the free ones.
+        let _b = acquire_slot(tmp.path(), 3, &mut || panic!("slot free")).unwrap();
+        let _c = acquire_slot(tmp.path(), 3, &mut || panic!("slot free")).unwrap();
+        drop(held);
+    }
+
+    #[test]
+    fn slots_in_use_is_zero_without_a_lock_dir() {
+        let tmp = tempdir().unwrap();
+        assert_eq!(slots_in_use(&tmp.path().join("missing"), 2), 0);
+        assert!(!tmp.path().join("missing").exists());
     }
 
     /// A fake real cargo that records its args and `CARGO_BUILD_JOBS`/held

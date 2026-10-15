@@ -2112,6 +2112,9 @@ fn watch_deps(
     store: tskmstr::runs::RunStore,
     config: Option<&Config>,
 ) -> tskmstr::tui::event::WatchDeps {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
     tskmstr::tui::event::WatchDeps {
         store,
         runner: agent_runner_or_default(config),
@@ -2123,6 +2126,12 @@ fn watch_deps(
             cfg.work.idle_hibernate_mins
         }),
         kill_pid: tskmstr::runs::pid::kill_pid,
+        memory: config
+            .map(|cfg| cfg.work.memory.clone())
+            .unwrap_or_default(),
+        build_slots: config.and_then(|cfg| cfg.work.build_slots),
+        build_slot_lock_dir: tskmstr::work::build_slots::root_dir(&home).join("locks"),
+        cpu_sampler: std::cell::RefCell::new(tskmstr::runs::cpu::CpuSampler::new()),
     }
 }
 
