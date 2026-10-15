@@ -176,7 +176,16 @@ actions, and read-only actions land before ones that change state.
    - Build slots in use are counted by probing each lock file with a
      non-blocking `flock` that is released at once. Budget and slot totals
      come from the invoking repo's config.
-6. **Scope-aware read actions: `v`, `L`, `B` (#87).**
+6. **Scope-aware read actions: `v`, `L`, `B` (#87).** Notes from the
+   implementation:
+   - `v` and `L` go by the row's run id, so only `B` is disabled for a row
+     with an unresolved repo root. A not-started row has no run, so `v`
+     and `L` say so on the status line.
+   - The worktree fallback runs in `load_overview` through a per-process
+     cache (`RepoRootCache`), so it spawns at most one `git` per worktree.
+     Slice 7 can route by `OverviewRow::repo_root` directly.
+   - `B` appends a window to the tmux session the overview runs in, and
+     says it needs tmux when run outside one.
 7. **Scope-aware write actions: `V`, `F`, `M`, `Space` (#88).** Per-repo batch
    queues. Lives in `src/tui/overview_actions.rs`. Notes from the
    implementation:
