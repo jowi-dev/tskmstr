@@ -166,7 +166,24 @@ actions, and read-only actions land before ones that change state.
 5. **System resource header (#86).** Decision 7.
 6. **Scope-aware read actions: `v`, `L`, `B` (#87).**
 7. **Scope-aware write actions: `V`, `F`, `M`, `Space` (#88).** Per-repo batch
-   queues.
+   queues. Lives in `src/tui/overview_actions.rs`. Notes from the
+   implementation:
+   - The gate on `M`/`Space` is "a PR is known": a PR stage from the
+     tracker snapshot, or a `pr_url` one of the ticket's runs recorded.
+     Conflicted is allowed through, because `tm merge` hands conflicts to
+     its own session. There's no up-front PR lookup (the watch loop has no
+     network worker), so the confirmation names tickets, and `tm merge`
+     re-resolves the PR itself.
+   - The queue and the in-flight set are keyed by `(scope, ticket)`, apart
+     from the board's `merge_queue`. That keeps `GH-1` in one repo separate
+     from `GH-1` in another.
+   - Repo roots still come from `runs.repo_root` only. The worktree
+     fallback from decision 5 isn't wired into `load_overview`, so rows
+     from before that column existed keep their actions disabled. They age
+     out of the 7-day scope window anyway.
+   - The `tm` children are spawned through the board's
+     `LaneLauncher::spawn_in` with the repo root as cwd, and polled by the
+     watch loop the way the board polls its own.
 
 ## Dependencies
 
