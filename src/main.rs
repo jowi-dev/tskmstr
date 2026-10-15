@@ -2123,6 +2123,7 @@ fn watch_deps(
             cfg.work.idle_hibernate_mins
         }),
         kill_pid: tskmstr::runs::pid::kill_pid,
+        launcher: Box::new(tskmstr::tui::launcher::RealLaneLauncher),
     }
 }
 

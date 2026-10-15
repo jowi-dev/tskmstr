@@ -317,6 +317,14 @@ enum PendingLaunchKind {
         /// Every ticket key passed to `tm merge`, in argv order.
         keys: Vec<String>,
     },
+    /// An overview-launched `tm merge <key>...` (GitHub issue #88), run in
+    /// one scope's repo root; reports [`Msg::OverviewMergeResult`].
+    OverviewMerge {
+        /// The scope every key belongs to.
+        scope: String,
+        /// Every ticket key passed to `tm merge`, in argv order.
+        keys: Vec<String>,
+    },
 }
 
 /// Restores the terminal (raw mode and the alternate screen) when dropped.
@@ -650,16 +658,30 @@ fn run_cmds<B: Backend>(
         }
         if let Cmd::LaunchLaneRun { lane, key } = cmd {
             let argv = lane_run_argv(&lane, &key);
-            let (next_app, more_cmds) =
-                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::LaneRun, &argv);
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps.launcher.as_ref(),
+                None,
+                launches,
+                key,
+                PendingLaunchKind::LaneRun,
+                &argv,
+            );
             app = next_app;
             pending.extend(more_cmds);
             continue;
         }
         if let Cmd::LaunchBotWatch { key } = cmd {
             let argv = bot_watch_argv(&key);
-            let (next_app, more_cmds) =
-                spawn_watched_child(app, deps, launches, key, PendingLaunchKind::BotWatch, &argv);
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps.launcher.as_ref(),
+                None,
+                launches,
+                key,
+                PendingLaunchKind::BotWatch,
+                &argv,
+            );
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -690,7 +712,8 @@ fn run_cmds<B: Backend>(
             let argv = review_fix_argv(&key);
             let (next_app, more_cmds) = spawn_watched_child(
                 app,
-                deps,
+                deps.launcher.as_ref(),
+                None,
                 launches,
                 key,
                 PendingLaunchKind::ReviewFix,
@@ -705,7 +728,8 @@ fn run_cmds<B: Backend>(
             let label = keys.join(" ");
             let (next_app, more_cmds) = spawn_watched_child(
                 app,
-                deps,
+                deps.launcher.as_ref(),
+                None,
                 launches,
                 label,
                 PendingLaunchKind::Merge { keys },
@@ -769,17 +793,20 @@ fn merge_argv(keys: &[String]) -> Vec<String> {
 /// Spawn `argv` as a watched child for `key`, registering it in `launches` on
 /// success. A spawn failure never reaches the registry: it feeds the matching
 /// launch-result `Msg` (an `Err`) straight back through `update`, returning
-/// any further `Cmd`s that produced. Shared by [`Cmd::LaunchLaneRun`] and
+/// any further `Cmd`s that produced. The child runs in `cwd` when given (the
+/// overview's repo-routed launches, GitHub issue #88). Shared by
+/// [`Cmd::LaunchLaneRun`] and
 /// [`Cmd::LaunchBotWatch`], which differ only in argv and result `Msg`.
 fn spawn_watched_child(
     app: App,
-    deps: &TuiDeps,
+    launcher: &dyn crate::tui::launcher::LaneLauncher,
+    cwd: Option<&std::path::Path>,
     launches: &mut Vec<PendingLaunch>,
     key: String,
     kind: PendingLaunchKind,
     argv: &[String],
 ) -> (App, Vec<Cmd>) {
-    match deps.launcher.spawn(argv) {
+    match launcher.spawn_in(argv, cwd) {
         Ok(handle) => {
             launches.push(PendingLaunch { key, kind, handle });
             (app, Vec::new())
@@ -812,6 +839,20 @@ fn launch_result_msg(kind: PendingLaunchKind, key: String, result: Result<(), St
                 merged: true,
             },
             Err(message) => Msg::MergePrResult {
+                keys,
+                merged: false,
+                message,
+            },
+        },
+        PendingLaunchKind::OverviewMerge { scope, keys } => match result {
+            Ok(()) => Msg::OverviewMergeResult {
+                message: format!("merged {} via tm merge", keys.join(", ")),
+                scope,
+                keys,
+                merged: true,
+            },
+            Err(message) => Msg::OverviewMergeResult {
+                scope,
                 keys,
                 merged: false,
                 message,
@@ -1144,6 +1185,10 @@ pub struct WatchDeps {
     pub idle_hibernate_mins: u64,
     /// See [`TuiDeps::kill_pid`].
     pub kill_pid: fn(u32),
+    /// Spawns the overview's write actions (`F` fix pass, `M` merge,
+    /// GitHub issue #88) as watched `tm` children in each row's repo root.
+    /// See [`TuiDeps::launcher`].
+    pub launcher: Box<dyn crate::tui::launcher::LaneLauncher>,
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1174,7 +1219,9 @@ pub fn run_overview(deps: WatchDeps) -> Result<(), TuiError> {
 }
 
 /// The loop behind [`run_watch`] and [`run_overview`]: starts on `screen`
-/// and runs `startup` before the first draw.
+/// and runs `startup` before the first draw. Like the board's [`run`], it
+/// polls the overview's in-flight `tm` children every iteration (see
+/// [`poll_pending_launches`]).
 fn run_watch_loop(
     deps: WatchDeps,
     screen: crate::tui::app::Screen,
@@ -1186,13 +1233,14 @@ fn run_watch_loop(
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut launches: Vec<PendingLaunch> = Vec::new();
 
     let mut app = App {
         screen,
         session_slug: deps.session_slug.clone(),
         ..App::new()
     };
-    app = run_watch_cmds(app, startup, &deps, &mut terminal);
+    app = run_watch_cmds(app, startup, &deps, &mut terminal, &mut launches);
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app, deps.runner))?;
@@ -1215,11 +1263,16 @@ fn run_watch_loop(
                 )
             {
                 let (next_app, cmds) = update(app, msg);
-                app = run_watch_cmds(next_app, cmds, &deps, &mut terminal);
+                app = run_watch_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
             }
         } else {
             let (next_app, cmds) = update(app, Msg::Tick);
-            app = run_watch_cmds(next_app, cmds, &deps, &mut terminal);
+            app = run_watch_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+        }
+
+        for msg in poll_pending_launches(&mut launches) {
+            let (next_app, cmds) = update(app, msg);
+            app = run_watch_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
         }
     }
 
@@ -1247,12 +1300,17 @@ fn stamp_root_session(tmux: &dyn TmuxOps, session_name: &str) {
 /// `Cmd`s). Mirrors [`run_cmds`], including its [`Cmd::AttachSession`]
 /// interception (the attach needs `&mut Terminal` to suspend/restore around
 /// the blocking call — see the module docs); the watch additionally stamps
-/// the jump-back option first, see [`stamp_root_session`].
+/// the jump-back option first, see [`stamp_root_session`]. The overview's
+/// repo-routed actions (GitHub issue #88) are intercepted the same way:
+/// [`Cmd::ViewDiffInScope`] needs the terminal for `vdiff`, and
+/// [`Cmd::LaunchReviewFixIn`]/[`Cmd::LaunchMergeIn`] spawn into
+/// `launches` with the row's repo root as cwd.
 fn run_watch_cmds<B: Backend>(
     mut app: App,
     cmds: Vec<Cmd>,
     deps: &WatchDeps,
     terminal: &mut Terminal<B>,
+    launches: &mut Vec<PendingLaunch>,
 ) -> App {
     let mut pending: VecDeque<Cmd> = cmds.into();
     while let Some(cmd) = pending.pop_front() {
@@ -1267,6 +1325,49 @@ fn run_watch_cmds<B: Backend>(
                 &sessions_dir,
             );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::ViewDiffInScope { scope, key } = cmd {
+            let message = view_diff(terminal, Some(&deps.store), Some(&scope), &key);
+            let (next_app, more_cmds) = update(app, Msg::DiffActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::LaunchReviewFixIn { key, repo_root } = cmd {
+            let argv = review_fix_argv(&key);
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps.launcher.as_ref(),
+                Some(&repo_root),
+                launches,
+                key,
+                PendingLaunchKind::ReviewFix,
+                &argv,
+            );
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::LaunchMergeIn {
+            scope,
+            repo_root,
+            keys,
+        } = cmd
+        {
+            let argv = merge_argv(&keys);
+            let label = keys.join(" ");
+            let (next_app, more_cmds) = spawn_watched_child(
+                app,
+                deps.launcher.as_ref(),
+                Some(&repo_root),
+                launches,
+                label,
+                PendingLaunchKind::OverviewMerge { scope, keys },
+                &argv,
+            );
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -3913,6 +4014,7 @@ mod tests {
             session_slug: String::new(),
             idle_hibernate_mins: 0,
             kill_pid: |_| {},
+            launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
         }
     }
 
@@ -4037,9 +4139,180 @@ mod tests {
             }],
             &deps,
             &mut terminal,
+            &mut Vec::new(),
         );
 
         assert_eq!(app.status_line, "detached from tm-proj-proj-1");
+    }
+
+    /// Every spawn's argv and cwd, shared with the test after the launcher
+    /// moves into [`WatchDeps`].
+    type SpawnLog = std::rc::Rc<std::cell::RefCell<Vec<(Vec<String>, Option<std::path::PathBuf>)>>>;
+
+    /// A [`crate::tui::launcher::LaneLauncher`] recording argv *and* cwd,
+    /// for the overview's repo-routed launches (GitHub issue #88).
+    struct CwdRecordingLauncher(SpawnLog, Option<String>);
+
+    impl crate::tui::launcher::LaneLauncher for CwdRecordingLauncher {
+        fn spawn_in(
+            &self,
+            argv: &[String],
+            cwd: Option<&std::path::Path>,
+        ) -> Result<Box<dyn crate::tui::launcher::LaunchHandle>, String> {
+            self.0
+                .borrow_mut()
+                .push((argv.to_vec(), cwd.map(std::path::Path::to_path_buf)));
+            if let Some(err) = &self.1 {
+                return Err(err.clone());
+            }
+            crate::tui::launcher::FakeLaneLauncher::new()
+                .with_finish_sequence(vec![None])
+                .spawn(argv)
+        }
+    }
+
+    fn overview_watch_deps(spawn_error: Option<&str>) -> (WatchDeps, SpawnLog, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let log = SpawnLog::default();
+        let mut deps = watch_deps(store);
+        deps.launcher = Box::new(CwdRecordingLauncher(
+            log.clone(),
+            spawn_error.map(str::to_string),
+        ));
+        (deps, log, dir)
+    }
+
+    fn overview_screen() -> App {
+        App {
+            screen: crate::tui::app::Screen::Overview,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn run_watch_cmds_spawns_the_overview_fix_pass_in_the_repo_root() {
+        let (deps, log, _dir) = overview_watch_deps(None);
+        let mut launches = Vec::new();
+        run_watch_cmds(
+            overview_screen(),
+            vec![Cmd::LaunchReviewFixIn {
+                key: "GH-3".to_string(),
+                repo_root: std::path::PathBuf::from("/repos/b"),
+            }],
+            &deps,
+            &mut test_terminal(),
+            &mut launches,
+        );
+        assert_eq!(
+            log.borrow().clone(),
+            vec![(
+                review_fix_argv("GH-3"),
+                Some(std::path::PathBuf::from("/repos/b"))
+            )]
+        );
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].kind, PendingLaunchKind::ReviewFix);
+    }
+
+    #[test]
+    fn run_watch_cmds_spawns_one_overview_merge_per_repo() {
+        let (deps, log, _dir) = overview_watch_deps(None);
+        let mut launches = Vec::new();
+        run_watch_cmds(
+            overview_screen(),
+            vec![
+                Cmd::LaunchMergeIn {
+                    scope: "github:o/a".to_string(),
+                    repo_root: std::path::PathBuf::from("/repos/a"),
+                    keys: vec!["GH-1".to_string(), "GH-2".to_string()],
+                },
+                Cmd::LaunchMergeIn {
+                    scope: "github:o/b".to_string(),
+                    repo_root: std::path::PathBuf::from("/repos/b"),
+                    keys: vec!["GH-1".to_string()],
+                },
+            ],
+            &deps,
+            &mut test_terminal(),
+            &mut launches,
+        );
+        assert_eq!(
+            log.borrow().clone(),
+            vec![
+                (
+                    merge_argv(&["GH-1".to_string(), "GH-2".to_string()]),
+                    Some(std::path::PathBuf::from("/repos/a"))
+                ),
+                (
+                    merge_argv(&["GH-1".to_string()]),
+                    Some(std::path::PathBuf::from("/repos/b"))
+                ),
+            ]
+        );
+        assert_eq!(
+            launches.iter().map(|l| l.kind.clone()).collect::<Vec<_>>(),
+            vec![
+                PendingLaunchKind::OverviewMerge {
+                    scope: "github:o/a".to_string(),
+                    keys: vec!["GH-1".to_string(), "GH-2".to_string()],
+                },
+                PendingLaunchKind::OverviewMerge {
+                    scope: "github:o/b".to_string(),
+                    keys: vec!["GH-1".to_string()],
+                },
+            ]
+        );
+    }
+
+    /// A spawn failure clears the in-flight marker straight away, so the
+    /// ticket can be merged again.
+    #[test]
+    fn run_watch_cmds_reports_an_overview_merge_spawn_failure() {
+        let (deps, _log, _dir) = overview_watch_deps(Some("no exe"));
+        let mut app = overview_screen();
+        app.overview_pending_merges
+            .insert(crate::runs::overview::TicketKey::new("github:o/a", "GH-1"));
+        let mut launches = Vec::new();
+        let app = run_watch_cmds(
+            app,
+            vec![Cmd::LaunchMergeIn {
+                scope: "github:o/a".to_string(),
+                repo_root: std::path::PathBuf::from("/repos/a"),
+                keys: vec!["GH-1".to_string()],
+            }],
+            &deps,
+            &mut test_terminal(),
+            &mut launches,
+        );
+        assert!(launches.is_empty());
+        assert!(app.overview_pending_merges.is_empty());
+        assert_eq!(app.status_line, "no exe");
+    }
+
+    #[test]
+    fn poll_pending_launches_reports_an_overview_merge_with_its_scope() {
+        let launcher =
+            crate::tui::launcher::FakeLaneLauncher::new().with_finish_sequence(vec![Some(Ok(()))]);
+        let keys = vec!["GH-1".to_string()];
+        let handle = launcher.spawn(&merge_argv(&keys)).unwrap();
+        let mut launches = vec![PendingLaunch {
+            key: "GH-1".to_string(),
+            kind: PendingLaunchKind::OverviewMerge {
+                scope: "github:o/a".to_string(),
+                keys: keys.clone(),
+            },
+            handle,
+        }];
+        assert_eq!(
+            poll_pending_launches(&mut launches),
+            vec![Msg::OverviewMergeResult {
+                scope: "github:o/a".to_string(),
+                keys,
+                merged: true,
+                message: "merged GH-1 via tm merge".to_string(),
+            }]
+        );
     }
 
     fn start_params(ticket: &str) -> crate::runs::StartRun {
