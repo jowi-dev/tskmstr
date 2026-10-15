@@ -1180,6 +1180,41 @@ pub struct WatchDeps {
     /// The user's home directory, for `L`'s fallback log path on the
     /// overview (see [`crate::cli::runs::resolve_log_path`]).
     pub home: std::path::PathBuf,
+    /// Resolves an overview row's repo root from its worktree when its runs
+    /// predate `runs.repo_root` (ADR-0009 decision 5), for `B`.
+    pub repo_roots: RepoRootCache,
+}
+
+/// A memoised worktree-to-repo-root lookup for [`load_overview`]'s rows. The
+/// overview reloads every other tick and the production lookup spawns `git
+/// rev-parse --git-common-dir`, so each worktree is asked about once per
+/// process, and a miss is remembered too: a worktree `tm merge` removed
+/// doesn't come back.
+pub struct RepoRootCache {
+    lookup: Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>,
+    resolved: std::cell::RefCell<HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+}
+
+impl RepoRootCache {
+    /// A cache over `lookup`.
+    pub fn new(lookup: Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>) -> Self {
+        Self {
+            lookup,
+            resolved: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The repo root for `worktree`, asking `lookup` only the first time.
+    pub fn resolve(&self, worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+        if let Some(hit) = self.resolved.borrow().get(worktree) {
+            return hit.clone();
+        }
+        let root = (self.lookup)(worktree);
+        self.resolved
+            .borrow_mut()
+            .insert(worktree.to_path_buf(), root.clone());
+        root
+    }
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1337,6 +1372,16 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadOverview => load_overview(deps),
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
+        Cmd::OpenBoardWindow { repo_root } => match std::env::current_exe() {
+            Ok(exe) => vec![Msg::OpenBoardResult(open_board_window(
+                deps.tmux.as_ref(),
+                &repo_root,
+                &exe,
+            ))],
+            Err(err) => vec![Msg::OpenBoardResult(format!(
+                "cannot find the tm executable: {err}"
+            ))],
+        },
         other => {
             debug_assert!(
                 false,
@@ -1377,10 +1422,9 @@ fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
 ///
 /// Runs-only for now (GitHub issue #83): the tracker signals are empty, so
 /// no row reaches a PR stage or Not started until the per-repo poller
-/// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`
-/// alone, with no worktree fallback: nothing on the overview routes by repo
-/// root yet (the `s` attach routes by scope), and the fallback would spawn
-/// a `git` per unstamped row on every load.
+/// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`,
+/// falling back to the row's worktree through [`WatchDeps::repo_roots`]
+/// (GitHub issue #87), which spawns at most one `git` per worktree.
 fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
     use crate::runs::overview;
     match deps.store.overview_runs() {
@@ -1390,10 +1434,43 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
                 &runs,
                 &overview::TrackerSignals::default(),
                 crate::tui::ui::STALE_HEARTBEAT_SECS,
-                &|_| None,
+                &|worktree| deps.repo_roots.resolve(worktree),
             ))]
         }
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
+/// Run [`Cmd::OpenBoardWindow`]: append a window running `<exe> board` in
+/// `repo_root` to the tmux session the overview runs in, named after the
+/// repo directory. Outside tmux there is no session to add it to, so the
+/// status line says so; every outcome is a status-line message.
+fn open_board_window(
+    tmux: &dyn TmuxOps,
+    repo_root: &std::path::Path,
+    exe: &std::path::Path,
+) -> String {
+    let session = match tmux.current_session_name() {
+        Ok(Some(session)) => session,
+        Ok(None) => return "B opens tm board in a new tmux window: not inside tmux".to_string(),
+        Err(err) => return format!("cannot read the current tmux session: {err}"),
+    };
+    let repo = repo_root
+        .file_name()
+        .map_or_else(|| "repo".into(), |name| name.to_string_lossy());
+    let command = format!(
+        "{} board",
+        crate::agent::shell_quote(&exe.to_string_lossy())
+    );
+    match tmux.new_window_with_command(
+        &session,
+        &format!("board-{repo}"),
+        &repo_root.to_string_lossy(),
+        &[],
+        &command,
+    ) {
+        Ok(()) => format!("opened tm board for {}", repo_root.display()),
+        Err(err) => format!("opening tm board for {} failed: {err}", repo_root.display()),
     }
 }
 
@@ -1626,6 +1703,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LaunchMerge { .. }
         | Cmd::ViewLogs { .. }
         | Cmd::ViewRunLogs { .. }
+        | Cmd::OpenBoardWindow { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
         | Cmd::FetchTickets { .. }
@@ -3958,6 +4036,7 @@ mod tests {
             idle_hibernate_mins: 0,
             kill_pid: |_| {},
             home: std::path::PathBuf::new(),
+            repo_roots: RepoRootCache::new(Box::new(|_| None)),
         }
     }
 
@@ -4140,6 +4219,87 @@ mod tests {
             }
             other => panic!("expected OverviewLoaded, got {other:?}"),
         }
+    }
+
+    /// GitHub issue #87: a run that predates `runs.repo_root` resolves its
+    /// row's repo root from its worktree, so `B` can route by it.
+    #[test]
+    fn execute_watch_load_overview_resolves_unstamped_rows_from_their_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        let deps = WatchDeps {
+            repo_roots: RepoRootCache::new(Box::new(|worktree| {
+                (worktree == std::path::Path::new("/tmp/wt"))
+                    .then(|| std::path::PathBuf::from("/repos/b"))
+            })),
+            ..watch_deps(store)
+        };
+
+        match execute_watch(&deps, Cmd::LoadOverview).as_slice() {
+            [Msg::OverviewLoaded(rows)] => assert_eq!(
+                rows[0].repo_root,
+                crate::runs::overview::RepoRoot::FromWorktree("/repos/b".into())
+            ),
+            other => panic!("expected OverviewLoaded, got {other:?}"),
+        }
+    }
+
+    /// The overview reloads every ~500ms; the worktree fallback spawns a
+    /// `git`, so each worktree is asked about once per process.
+    #[test]
+    fn repo_root_cache_resolves_each_worktree_once() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        let cache = RepoRootCache::new(Box::new(move |_| {
+            counted.set(counted.get() + 1);
+            None
+        }));
+        let worktree = std::path::Path::new("/tmp/wt");
+        assert_eq!(cache.resolve(worktree), None);
+        assert_eq!(cache.resolve(worktree), None);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn open_board_window_outside_tmux_says_it_needs_tmux() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new().with_current_session_name(Ok(None));
+        let message = open_board_window(
+            &tmux,
+            std::path::Path::new("/repos/alpha"),
+            std::path::Path::new("/bin/tm"),
+        );
+        assert_eq!(
+            message,
+            "B opens tm board in a new tmux window: not inside tmux"
+        );
+    }
+
+    #[test]
+    fn open_board_window_appends_a_board_window_in_the_repo_root() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new()
+            .with_current_session_name(Ok(Some("monitoring".to_string())));
+        let message = open_board_window(
+            &tmux,
+            std::path::Path::new("/repos/alpha"),
+            std::path::Path::new("/bin/tm"),
+        );
+        assert_eq!(message, "opened tm board for /repos/alpha");
+        assert!(
+            tmux.calls()
+                .contains(&crate::work::tmux::TmuxCall::NewWindowWithCommand {
+                    name: "monitoring".to_string(),
+                    window_name: "board-alpha".to_string(),
+                    dir: "/repos/alpha".to_string(),
+                    env: Vec::new(),
+                    command: "'/bin/tm' board".to_string(),
+                })
+        );
     }
 
     #[test]

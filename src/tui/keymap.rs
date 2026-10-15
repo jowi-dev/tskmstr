@@ -250,6 +250,7 @@ pub fn map_key(
         KeyCode::Char('L') if matches!(screen, Screen::Board | Screen::Overview) => {
             Some(Msg::ViewLogsAction)
         }
+        KeyCode::Char('B') if *screen == Screen::Overview => Some(Msg::OpenBoardAction),
         KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
         KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
         KeyCode::Char('M') if *screen == Screen::Board => Some(Msg::MergePrAction),
@@ -2873,6 +2874,12 @@ mod tests {
             plain_key(&Screen::Overview, KeyCode::Char('L')),
             Some(Msg::ViewLogsAction)
         );
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Char('B')),
+            Some(Msg::OpenBoardAction)
+        );
+        assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('B')), None);
+        assert_eq!(plain_key(&Screen::Board, KeyCode::Char('B')), None);
     }
 
     #[test]

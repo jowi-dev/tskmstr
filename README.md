@@ -217,7 +217,7 @@ tm auth status
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
-| `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `s` attaches, `Tab` switches to `tm runs watch` |
+| `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `s` attaches, `v`/`L` show the run detail/log, `B` opens `tm board` for the row's repo in a new tmux window, `Tab` switches to `tm runs watch` |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
@@ -407,6 +407,15 @@ quits. `Tab` switches to `tm runs watch` in place and back again, keeping
 the highlighted ticket: from the overview, watch lands on the run the row
 stood for (or any visible run of the ticket); from watch, the overview
 lands on the card's ticket.
+
+The read actions route by the row itself (GitHub issue #87). `v` opens the
+run detail window on the row's run and `L` pages that run's log, both by
+run id, so they work for any repo. `B` opens `tm board` for the row's repo
+in a new window of the tmux session the overview runs in. It needs the
+repo's main checkout: the run's recorded `repo_root`, or for a run that
+predates it, the repo its worktree belongs to while the worktree still
+exists. When neither resolves, `B` stays disabled for that row and the
+status line says why. Outside tmux, `B` says it needs tmux.
 
 ### `Interrupted` vs. `Failed`, and recovering a run
 
