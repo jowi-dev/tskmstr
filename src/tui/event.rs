@@ -1185,19 +1185,22 @@ pub struct WatchDeps {
     pub repo_roots: RepoRootCache,
 }
 
+/// The worktree-to-repo-root lookup a [`RepoRootCache`] memoises.
+pub type RepoRootLookup = Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>;
+
 /// A memoised worktree-to-repo-root lookup for [`load_overview`]'s rows. The
 /// overview reloads every other tick and the production lookup spawns `git
 /// rev-parse --git-common-dir`, so each worktree is asked about once per
 /// process, and a miss is remembered too: a worktree `tm merge` removed
 /// doesn't come back.
 pub struct RepoRootCache {
-    lookup: Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>,
+    lookup: RepoRootLookup,
     resolved: std::cell::RefCell<HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
 }
 
 impl RepoRootCache {
     /// A cache over `lookup`.
-    pub fn new(lookup: Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>) -> Self {
+    pub fn new(lookup: RepoRootLookup) -> Self {
         Self {
             lookup,
             resolved: std::cell::RefCell::new(HashMap::new()),
