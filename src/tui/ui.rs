@@ -21,6 +21,7 @@ use ratatui::widgets::{
 use crate::agent::AgentRunner;
 use crate::cli::runs::format_age;
 use crate::runs::overview::{OverviewRow, Stage};
+use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
     App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column,
@@ -816,10 +817,16 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let strip_height = u16::try_from(strip.len().max(1))
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let [strip_area, queue_area] = Layout::default()
+    let [header_area, strip_area, queue_area] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(strip_height), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(strip_height),
+            Constraint::Min(0),
+        ])
         .areas(area);
+
+    frame.render_widget(system_header_line(app.system_header.as_ref()), header_area);
 
     let block = |title: &'static str| {
         Block::default()
@@ -893,6 +900,20 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.overview_selected.min(app.overview_rows.len() - 1)));
     frame.render_stateful_widget(list, queue_area, &mut state);
+}
+
+/// The overview's system header (GitHub issue #86): the
+/// [`SystemHeader::summary`] line, dim normally and drawn as a warning when
+/// [`SystemHeader::launch_blocked`] says a new lane would be refused.
+fn system_header_line(header: Option<&SystemHeader>) -> Paragraph<'static> {
+    let span = match header {
+        None => Span::styled(" sampling system…", theme::DIM),
+        Some(header) if header.launch_blocked() => {
+            Span::styled(format!(" {}", header.summary()), theme::STALE_MARKER)
+        }
+        Some(header) => Span::styled(format!(" {}", header.summary()), theme::DIM),
+    };
+    Paragraph::new(Line::from(span))
 }
 
 /// The overview's project strip: one `"{project}  {counts}"` line per scope,
@@ -4215,6 +4236,59 @@ mod tests {
 
         assert!(text.contains("alpha  1 needs input · 2 running"), "{text}");
         assert!(text.contains("beta   1 stuck"), "{text}");
+    }
+
+    fn system_header(pressure: crate::runs::footprint::MemoryPressure) -> SystemHeader {
+        SystemHeader {
+            lanes: 2,
+            lane_cpu_percent: Some(150.0),
+            lane_mem_bytes: None,
+            host_cores: 8,
+            host_mem_bytes: None,
+            pressure,
+            budget: None,
+            build_slots: None,
+        }
+    }
+
+    #[test]
+    fn overview_shows_the_system_header_above_the_projects() {
+        let app = App {
+            system_header: Some(system_header(
+                crate::runs::footprint::MemoryPressure::Normal,
+            )),
+            ..overview_app(vec![overview_row(
+                "github:me/alpha",
+                "GH-1",
+                Stage::Running,
+            )])
+        };
+        let text = buffer_text(&render_with_size(&app, 140, 24));
+
+        let header = line_of(&text, "2 lanes · cpu 150% of 8 cores").expect("header renders");
+        let projects = line_of(&text, "Projects").unwrap();
+        assert!(header < projects, "{text}");
+    }
+
+    #[test]
+    fn overview_header_says_sampling_before_the_first_load() {
+        let text = buffer_text(&render_with_size(&overview_app(Vec::new()), 100, 24));
+        assert!(text.contains("sampling system"), "{text}");
+    }
+
+    #[test]
+    fn overview_header_warns_when_a_launch_would_be_refused() {
+        let app = App {
+            system_header: Some(system_header(crate::runs::footprint::MemoryPressure::Warn)),
+            ..overview_app(Vec::new())
+        };
+        let buffer = render_with_size(&app, 140, 24);
+        let row = line_of(&buffer_text(&buffer), "2 lanes").unwrap() as u16;
+        let cell = (0..buffer.area.width)
+            .map(|x| &buffer[(x, row)])
+            .find(|cell| cell.symbol() == "2")
+            .unwrap();
+        assert_eq!(cell.fg, theme::STALE_MARKER.fg.unwrap());
     }
 
     #[test]
