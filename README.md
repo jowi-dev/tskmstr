@@ -217,7 +217,7 @@ tm auth status
 | `tm runs reopen <ticket-or-run-id> [--kind <KIND>] [--to queued\|running\|blocked]` | Reopen a finished run (status `done`/`failed`/`interrupted`) so it's actionable again — clears `ended_at`/`pid`/`heartbeat_at` and moves `status` to `--to` (default `queued`); `--to blocked` is for repairing a run mislabeled `done` when it was actually blocked |
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
-| `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `s` attaches, `Tab` switches to `tm runs watch` |
+| `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `c` toggles lifecycle columns, `s` attaches, `Tab` switches to `tm runs watch` |
 | `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
@@ -407,6 +407,14 @@ quits. `Tab` switches to `tm runs watch` in place and back again, keeping
 the highlighted ticket: from the overview, watch lands on the run the row
 stood for (or any visible run of the ticket); from watch, the overview
 lands on the card's ticket.
+
+`c` switches the queue to lifecycle columns and back (GitHub issue #85):
+one column per stage, left to right in the order a ticket lives through
+them (not started, running, needs input, needs review, conflicted, ready
+to merge, stuck), each card tagged with its project. It is the same rows
+as the queue, so nothing is refetched and the highlighted ticket stays
+highlighted. In columns, `h`/`l` move between non-empty columns and
+`j`/`k` within one. The layout is kept across `Tab` to watch and back.
 
 ### `Interrupted` vs. `Failed`, and recovering a run
 

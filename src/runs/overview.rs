@@ -92,6 +92,20 @@ pub enum Stage {
     NotStarted,
 }
 
+/// The stages in lifecycle order, left to right: the columns of the
+/// overview's lifecycle layout (ADR-0009 layout 1, GitHub issue #85). The
+/// same stages as the queue, ordered by where a ticket is in its life
+/// rather than by how urgently it needs the operator.
+pub const LIFECYCLE_COLUMNS: [Stage; 7] = [
+    Stage::NotStarted,
+    Stage::Running,
+    Stage::NeedsInput,
+    Stage::NeedsReview,
+    Stage::Conflicted,
+    Stage::ReadyToMerge,
+    Stage::Stuck,
+];
+
 impl Stage {
     /// The stage's 1-based rank in ADR-0009's table (1 = most urgent).
     pub fn rank(self) -> u8 {

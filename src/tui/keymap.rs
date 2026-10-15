@@ -240,6 +240,7 @@ pub fn map_key(
         KeyCode::Tab if matches!(screen, Screen::Runs | Screen::Overview) => {
             Some(Msg::ToggleOverview)
         }
+        KeyCode::Char('c') if *screen == Screen::Overview => Some(Msg::ToggleOverviewLayout),
         KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
@@ -2855,5 +2856,16 @@ mod tests {
     fn watch_filter_keys_are_inert_on_overview() {
         assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('f')), None);
         assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('F')), None);
+    }
+
+    /// GitHub issue #85: `c` toggles the overview between the attention
+    /// queue and lifecycle columns, and only on the overview.
+    #[test]
+    fn c_toggles_the_overview_layout_only_on_the_overview() {
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Char('c')),
+            Some(Msg::ToggleOverviewLayout)
+        );
+        assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('c')), None);
     }
 }
