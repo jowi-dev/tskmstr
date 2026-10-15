@@ -242,8 +242,8 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
 /// picks the detail-window variant on [`Screen::Board`], [`Screen::Runs`]
 /// and [`Screen::Overview`] -- the run-detail overlay's keymap
-/// (scroll/close/refresh) is shared between the hosts (see `docs/plans/board-run-detail.md`'s
-/// "Key gating" decision).
+/// (scroll/close/refresh) is shared between the hosts (see
+/// `docs/plans/board-run-detail.md`'s "Key gating" decision).
 fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
