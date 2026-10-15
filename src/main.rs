@@ -2123,6 +2123,9 @@ fn watch_deps(
             cfg.work.idle_hibernate_mins
         }),
         kill_pid: tskmstr::runs::pid::kill_pid,
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~")),
     }
 }
 

@@ -992,19 +992,52 @@ fn view_logs<B: Backend>(
         Ok(run) => run,
         Err(_) => return format!("no runs recorded for {key}"),
     };
-    let Some(path) = crate::cli::runs::resolve_log_path(&run, home) else {
-        return format!("run {} for {key} has no log path", run.id);
+    match existing_log_path(&run, home) {
+        Ok(path) => page_log(terminal, &path, key),
+        Err(message) => message,
+    }
+}
+
+/// `run`'s log file (see [`crate::cli::runs::resolve_log_path`]), or the
+/// status-line message saying why there isn't one on disk.
+fn existing_log_path(
+    run: &crate::runs::Run,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let Some(path) = crate::cli::runs::resolve_log_path(run, home) else {
+        return Err(format!("run {} for {} has no log path", run.id, run.ticket));
     };
     if !path.exists() {
-        return format!("log file {} does not exist", path.display());
+        return Err(format!("log file {} does not exist", path.display()));
     }
+    Ok(path)
+}
 
+/// Run [`Cmd::ViewRunLogs`]'s resolution: run `run_id`'s log file and
+/// ticket, or the status-line message saying why it can't be paged. Pulled
+/// out of the watch loop's interception so it stays unit-testable.
+fn resolve_run_log(
+    store: &crate::runs::RunStore,
+    run_id: i64,
+    home: &std::path::Path,
+) -> Result<(std::path::PathBuf, String), String> {
+    let run = match store.run_by_id(run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return Err(format!("no run with id {run_id}")),
+        Err(err) => return Err(err.to_string()),
+    };
+    existing_log_path(&run, home).map(|path| (path, run.ticket))
+}
+
+/// Page `path` in `less`, suspending and restoring the TUI's terminal state
+/// around the blocking call, and report the outcome for `key`'s log.
+fn page_log<B: Backend>(terminal: &mut Terminal<B>, path: &std::path::Path, key: &str) -> String {
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 
     let result = std::process::Command::new("less")
         .arg("+G")
-        .arg(&path)
+        .arg(path)
         .status();
 
     let _ = enable_raw_mode();
@@ -1144,6 +1177,9 @@ pub struct WatchDeps {
     pub idle_hibernate_mins: u64,
     /// See [`TuiDeps::kill_pid`].
     pub kill_pid: fn(u32),
+    /// The user's home directory, for `L`'s fallback log path on the
+    /// overview (see [`crate::cli::runs::resolve_log_path`]).
+    pub home: std::path::PathBuf,
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1247,7 +1283,8 @@ fn stamp_root_session(tmux: &dyn TmuxOps, session_name: &str) {
 /// `Cmd`s). Mirrors [`run_cmds`], including its [`Cmd::AttachSession`]
 /// interception (the attach needs `&mut Terminal` to suspend/restore around
 /// the blocking call — see the module docs); the watch additionally stamps
-/// the jump-back option first, see [`stamp_root_session`].
+/// the jump-back option first, see [`stamp_root_session`]. [`Cmd::ViewRunLogs`]
+/// is intercepted the same way, since paging also needs the terminal.
 fn run_watch_cmds<B: Backend>(
     mut app: App,
     cmds: Vec<Cmd>,
@@ -1267,6 +1304,16 @@ fn run_watch_cmds<B: Backend>(
                 &sessions_dir,
             );
             let (next_app, more_cmds) = update(app, Msg::SessionAttachResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
+        if let Cmd::ViewRunLogs { run_id } = cmd {
+            let message = match resolve_run_log(&deps.store, run_id, &deps.home) {
+                Ok((path, ticket)) => page_log(terminal, &path, &ticket),
+                Err(message) => message,
+            };
+            let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
             app = next_app;
             pending.extend(more_cmds);
             continue;
@@ -1578,6 +1625,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LaunchBotWatch { .. }
         | Cmd::LaunchMerge { .. }
         | Cmd::ViewLogs { .. }
+        | Cmd::ViewRunLogs { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
         | Cmd::FetchTickets { .. }
@@ -3909,6 +3957,7 @@ mod tests {
             session_slug: String::new(),
             idle_hibernate_mins: 0,
             kill_pid: |_| {},
+            home: std::path::PathBuf::new(),
         }
     }
 
@@ -5489,6 +5538,55 @@ mod tests {
             .unwrap();
         let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(result, Ok(worktree.path().to_path_buf()));
+    }
+
+    // --- Cmd::ViewRunLogs / resolve_run_log (GitHub issue #87) ---
+
+    fn start_run_with_log(store: &crate::runs::RunStore, log_path: Option<String>) -> i64 {
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ticket: "GH-2".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn resolve_run_log_with_an_unknown_run_id_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let result = resolve_run_log(&store, 99, dir.path());
+        assert_eq!(result, Err("no run with id 99".to_string()));
+    }
+
+    #[test]
+    fn resolve_run_log_resolves_the_runs_recorded_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let log = dir.path().join("gh-2.log");
+        std::fs::write(&log, "hello\n").unwrap();
+        let id = start_run_with_log(&store, Some(log.to_string_lossy().to_string()));
+        let result = resolve_run_log(&store, id, dir.path());
+        assert_eq!(result, Ok((log, "GH-2".to_string())));
+    }
+
+    #[test]
+    fn resolve_run_log_with_a_missing_log_file_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let log = dir.path().join("gone.log");
+        let id = start_run_with_log(&store, Some(log.to_string_lossy().to_string()));
+        let result = resolve_run_log(&store, id, dir.path());
+        assert_eq!(
+            result,
+            Err(format!("log file {} does not exist", log.display()))
+        );
     }
 
     // --- Cmd::LaunchCleanup / launch_cleanup_cmd ---
