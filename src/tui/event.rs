@@ -5012,9 +5012,10 @@ mod tests {
     struct RecordingLauncher(std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>);
 
     impl crate::tui::launcher::LaneLauncher for RecordingLauncher {
-        fn spawn(
+        fn spawn_in(
             &self,
             argv: &[String],
+            _cwd: Option<&std::path::Path>,
         ) -> Result<Box<dyn crate::tui::launcher::LaunchHandle>, String> {
             self.0.borrow_mut().push(argv.to_vec());
             crate::tui::launcher::FakeLaneLauncher::new()
