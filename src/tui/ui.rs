@@ -270,7 +270,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
         Screen::Overview => {
-            "j/k: move  s: attach  v: view run  L: logs  V: vdiff  F: fix  M: merge  Space: queue  Tab: watch  r: refresh  q: quit"
+            "j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  Tab: watch  r: refresh  q: quit"
         }
     }
 }
@@ -4396,6 +4396,7 @@ mod tests {
         let hint = hint_for(Screen::Overview, false);
         assert!(hint.contains("v: view run"));
         assert!(hint.contains("L: logs"));
+        assert!(hint.contains("B: board"));
         assert_eq!(
             hint_for(Screen::Overview, true),
             hint_for(Screen::Runs, true)

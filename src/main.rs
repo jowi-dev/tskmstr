@@ -2136,6 +2136,17 @@ fn watch_deps(
         home: std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("~")),
+        repo_roots: tskmstr::tui::event::RepoRootCache::new(Box::new(|worktree| {
+            use tskmstr::work::git::GitOps;
+            worktree
+                .is_dir()
+                .then(|| {
+                    tskmstr::work::git::ShellGitOps::new()
+                        .repo_root(worktree)
+                        .ok()
+                })
+                .flatten()
+        })),
     }
 }
 

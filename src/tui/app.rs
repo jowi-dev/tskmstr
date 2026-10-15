@@ -1339,6 +1339,13 @@ pub enum Msg {
     /// no ticket is selected. On [`Screen::Overview`] (GitHub issue #87) it
     /// pages the highlighted row's run log instead ([`Cmd::ViewRunLogs`]).
     ViewLogsAction,
+    /// The `B` key was pressed on [`Screen::Overview`] (GitHub issue #87,
+    /// ADR-0009 decision 6): open `tm board` in the highlighted row's repo
+    /// root, in a new tmux window ([`Cmd::OpenBoardWindow`]). Disabled with a
+    /// status-line reason when the row's repo root is unresolved.
+    OpenBoardAction,
+    /// The outcome of [`Cmd::OpenBoardWindow`], as a status-line message.
+    OpenBoardResult(String),
     /// The outcome of [`Cmd::ViewLogs`], already rendered to a
     /// human-readable status-line message -- mirrors
     /// [`Msg::AuditActionResult`]'s single-string-variant shape.
@@ -1708,6 +1715,13 @@ pub enum Cmd {
     ViewRunLogs {
         /// The run whose log to page.
         run_id: i64,
+    },
+    /// Open `tm board` with `repo_root` as its working directory in a new
+    /// window of the tmux session the overview runs in, for `B` on
+    /// [`Screen::Overview`] (GitHub issue #87).
+    OpenBoardWindow {
+        /// The row's main checkout.
+        repo_root: std::path::PathBuf,
     },
     /// Open `key`'s worktree (its latest `kind = "lane"` run's `worktree`)
     /// in `vdiff`, suspending and restoring the board's terminal state
@@ -2331,6 +2345,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::ViewRunAction => view_run_action(app),
         Msg::ViewLogsAction => view_logs_action(app),
+        Msg::OpenBoardAction => open_board_action(app),
+        Msg::OpenBoardResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
         Msg::LogsActionResult(message) => {
             app.status_line = message;
             (app, Vec::new())
@@ -3174,6 +3193,32 @@ fn view_overview_run_action(mut app: App) -> (App, Vec<Cmd>) {
     app.run_detail = None;
     app.run_detail_scroll = 0;
     (app, vec![Cmd::LoadRunDetail { run_id }])
+}
+
+/// Handle [`Msg::OpenBoardAction`]: open `tm board` in the highlighted
+/// overview row's repo root. A row whose root resolved neither from
+/// `runs.repo_root` nor its worktree keeps the action disabled and says why
+/// (ADR-0009 decision 5). A no-op off [`Screen::Overview`] or with no row.
+fn open_board_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen != Screen::Overview {
+        return (app, Vec::new());
+    }
+    let Some(row) = app.selected_overview_row() else {
+        return (app, Vec::new());
+    };
+    match row.repo_root.path() {
+        Some(path) => {
+            let repo_root = path.to_path_buf();
+            (app, vec![Cmd::OpenBoardWindow { repo_root }])
+        }
+        None => {
+            app.status_line = format!(
+                "B disabled for {}: repo root unknown (no recorded repo_root and no worktree left)",
+                row.key.ticket
+            );
+            (app, Vec::new())
+        }
+    }
 }
 
 /// Handle [`Msg::ViewLogsAction`]: open the selected ticket's latest run's
@@ -8809,6 +8854,44 @@ mod tests {
         let (app, cmds) = update(app, Msg::ViewLogsAction);
         assert!(cmds.is_empty());
         assert_eq!(app.status_line, "no run recorded for GH-2");
+    }
+
+    #[test]
+    fn open_board_action_on_overview_opens_the_board_in_the_rows_repo_root() {
+        use crate::runs::overview::{RepoRoot, Stage};
+        let mut row = overview_row("github:a/b", "GH-2", Stage::Stuck, Some(7));
+        row.repo_root = RepoRoot::FromWorktree("/repos/b".into());
+        let (_, cmds) = update(overview_app(vec![row], 0), Msg::OpenBoardAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenBoardWindow {
+                repo_root: "/repos/b".into()
+            }]
+        );
+    }
+
+    /// ADR-0009 decision 5: a row whose repo root resolves neither way stays
+    /// visible with its repo-routed actions disabled, and says why.
+    #[test]
+    fn open_board_action_with_an_unresolved_repo_root_explains_why() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::Stuck, Some(7))],
+            0,
+        );
+        let (app, cmds) = update(app, Msg::OpenBoardAction);
+        assert!(cmds.is_empty());
+        assert_eq!(
+            app.status_line,
+            "B disabled for GH-2: repo root unknown (no recorded repo_root and no worktree left)"
+        );
+    }
+
+    #[test]
+    fn open_board_action_off_the_overview_is_a_noop() {
+        let (app, cmds) = update(App::new(), Msg::OpenBoardAction);
+        assert!(cmds.is_empty());
+        assert!(app.status_line.is_empty());
     }
 
     #[test]
