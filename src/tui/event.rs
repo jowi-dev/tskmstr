@@ -992,19 +992,52 @@ fn view_logs<B: Backend>(
         Ok(run) => run,
         Err(_) => return format!("no runs recorded for {key}"),
     };
-    let Some(path) = crate::cli::runs::resolve_log_path(&run, home) else {
-        return format!("run {} for {key} has no log path", run.id);
+    match existing_log_path(&run, home) {
+        Ok(path) => page_log(terminal, &path, key),
+        Err(message) => message,
+    }
+}
+
+/// `run`'s log file (see [`crate::cli::runs::resolve_log_path`]), or the
+/// status-line message saying why there isn't one on disk.
+fn existing_log_path(
+    run: &crate::runs::Run,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let Some(path) = crate::cli::runs::resolve_log_path(run, home) else {
+        return Err(format!("run {} for {} has no log path", run.id, run.ticket));
     };
     if !path.exists() {
-        return format!("log file {} does not exist", path.display());
+        return Err(format!("log file {} does not exist", path.display()));
     }
+    Ok(path)
+}
 
+/// Run [`Cmd::ViewRunLogs`]'s resolution: run `run_id`'s log file and
+/// ticket, or the status-line message saying why it can't be paged. Pulled
+/// out of the watch loop's interception so it stays unit-testable.
+fn resolve_run_log(
+    store: &crate::runs::RunStore,
+    run_id: i64,
+    home: &std::path::Path,
+) -> Result<(std::path::PathBuf, String), String> {
+    let run = match store.run_by_id(run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return Err(format!("no run with id {run_id}")),
+        Err(err) => return Err(err.to_string()),
+    };
+    existing_log_path(&run, home).map(|path| (path, run.ticket))
+}
+
+/// Page `path` in `less`, suspending and restoring the TUI's terminal state
+/// around the blocking call, and report the outcome for `key`'s log.
+fn page_log<B: Backend>(terminal: &mut Terminal<B>, path: &std::path::Path, key: &str) -> String {
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 
     let result = std::process::Command::new("less")
         .arg("+G")
-        .arg(&path)
+        .arg(path)
         .status();
 
     let _ = enable_raw_mode();
@@ -1144,6 +1177,47 @@ pub struct WatchDeps {
     pub idle_hibernate_mins: u64,
     /// See [`TuiDeps::kill_pid`].
     pub kill_pid: fn(u32),
+    /// The user's home directory, for `L`'s fallback log path on the
+    /// overview (see [`crate::cli::runs::resolve_log_path`]).
+    pub home: std::path::PathBuf,
+    /// Resolves an overview row's repo root from its worktree when its runs
+    /// predate `runs.repo_root` (ADR-0009 decision 5), for `B`.
+    pub repo_roots: RepoRootCache,
+}
+
+/// The worktree-to-repo-root lookup a [`RepoRootCache`] memoises.
+pub type RepoRootLookup = Box<dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>>;
+
+/// A memoised worktree-to-repo-root lookup for [`load_overview`]'s rows. The
+/// overview reloads every other tick and the production lookup spawns `git
+/// rev-parse --git-common-dir`, so each worktree is asked about once per
+/// process, and a miss is remembered too: a worktree `tm merge` removed
+/// doesn't come back.
+pub struct RepoRootCache {
+    lookup: RepoRootLookup,
+    resolved: std::cell::RefCell<HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+}
+
+impl RepoRootCache {
+    /// A cache over `lookup`.
+    pub fn new(lookup: RepoRootLookup) -> Self {
+        Self {
+            lookup,
+            resolved: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The repo root for `worktree`, asking `lookup` only the first time.
+    pub fn resolve(&self, worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+        if let Some(hit) = self.resolved.borrow().get(worktree) {
+            return hit.clone();
+        }
+        let root = (self.lookup)(worktree);
+        self.resolved
+            .borrow_mut()
+            .insert(worktree.to_path_buf(), root.clone());
+        root
+    }
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1247,7 +1321,8 @@ fn stamp_root_session(tmux: &dyn TmuxOps, session_name: &str) {
 /// `Cmd`s). Mirrors [`run_cmds`], including its [`Cmd::AttachSession`]
 /// interception (the attach needs `&mut Terminal` to suspend/restore around
 /// the blocking call — see the module docs); the watch additionally stamps
-/// the jump-back option first, see [`stamp_root_session`].
+/// the jump-back option first, see [`stamp_root_session`]. [`Cmd::ViewRunLogs`]
+/// is intercepted the same way, since paging also needs the terminal.
 fn run_watch_cmds<B: Backend>(
     mut app: App,
     cmds: Vec<Cmd>,
@@ -1271,6 +1346,16 @@ fn run_watch_cmds<B: Backend>(
             pending.extend(more_cmds);
             continue;
         }
+        if let Cmd::ViewRunLogs { run_id } = cmd {
+            let message = match resolve_run_log(&deps.store, run_id, &deps.home) {
+                Ok((path, ticket)) => page_log(terminal, &path, &ticket),
+                Err(message) => message,
+            };
+            let (next_app, more_cmds) = update(app, Msg::LogsActionResult(message));
+            app = next_app;
+            pending.extend(more_cmds);
+            continue;
+        }
         for msg in execute_watch(deps, cmd) {
             let (next_app, more_cmds) = update(app, msg);
             app = next_app;
@@ -1290,6 +1375,16 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadOverview => load_overview(deps),
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
+        Cmd::OpenBoardWindow { repo_root } => match std::env::current_exe() {
+            Ok(exe) => vec![Msg::OpenBoardResult(open_board_window(
+                deps.tmux.as_ref(),
+                &repo_root,
+                &exe,
+            ))],
+            Err(err) => vec![Msg::OpenBoardResult(format!(
+                "cannot find the tm executable: {err}"
+            ))],
+        },
         other => {
             debug_assert!(
                 false,
@@ -1330,10 +1425,9 @@ fn load_runs(deps: &WatchDeps) -> Vec<Msg> {
 ///
 /// Runs-only for now (GitHub issue #83): the tracker signals are empty, so
 /// no row reaches a PR stage or Not started until the per-repo poller
-/// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`
-/// alone, with no worktree fallback: nothing on the overview routes by repo
-/// root yet (the `s` attach routes by scope), and the fallback would spawn
-/// a `git` per unstamped row on every load.
+/// (ADR-0009 slice 3) feeds them in. Repo roots come from `runs.repo_root`,
+/// falling back to the row's worktree through [`WatchDeps::repo_roots`]
+/// (GitHub issue #87), which spawns at most one `git` per worktree.
 fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
     use crate::runs::overview;
     match deps.store.overview_runs() {
@@ -1343,10 +1437,43 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
                 &runs,
                 &overview::TrackerSignals::default(),
                 crate::tui::ui::STALE_HEARTBEAT_SECS,
-                &|_| None,
+                &|worktree| deps.repo_roots.resolve(worktree),
             ))]
         }
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
+    }
+}
+
+/// Run [`Cmd::OpenBoardWindow`]: append a window running `<exe> board` in
+/// `repo_root` to the tmux session the overview runs in, named after the
+/// repo directory. Outside tmux there is no session to add it to, so the
+/// status line says so; every outcome is a status-line message.
+fn open_board_window(
+    tmux: &dyn TmuxOps,
+    repo_root: &std::path::Path,
+    exe: &std::path::Path,
+) -> String {
+    let session = match tmux.current_session_name() {
+        Ok(Some(session)) => session,
+        Ok(None) => return "B opens tm board in a new tmux window: not inside tmux".to_string(),
+        Err(err) => return format!("cannot read the current tmux session: {err}"),
+    };
+    let repo = repo_root
+        .file_name()
+        .map_or_else(|| "repo".into(), |name| name.to_string_lossy());
+    let command = format!(
+        "{} board",
+        crate::agent::shell_quote(&exe.to_string_lossy())
+    );
+    match tmux.new_window_with_command(
+        &session,
+        &format!("board-{repo}"),
+        &repo_root.to_string_lossy(),
+        &[],
+        &command,
+    ) {
+        Ok(()) => format!("opened tm board for {}", repo_root.display()),
+        Err(err) => format!("opening tm board for {} failed: {err}", repo_root.display()),
     }
 }
 
@@ -1578,6 +1705,8 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::LaunchBotWatch { .. }
         | Cmd::LaunchMerge { .. }
         | Cmd::ViewLogs { .. }
+        | Cmd::ViewRunLogs { .. }
+        | Cmd::OpenBoardWindow { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
         | Cmd::FetchTickets { .. }
@@ -3909,6 +4038,8 @@ mod tests {
             session_slug: String::new(),
             idle_hibernate_mins: 0,
             kill_pid: |_| {},
+            home: std::path::PathBuf::new(),
+            repo_roots: RepoRootCache::new(Box::new(|_| None)),
         }
     }
 
@@ -4091,6 +4222,87 @@ mod tests {
             }
             other => panic!("expected OverviewLoaded, got {other:?}"),
         }
+    }
+
+    /// GitHub issue #87: a run that predates `runs.repo_root` resolves its
+    /// row's repo root from its worktree, so `B` can route by it.
+    #[test]
+    fn execute_watch_load_overview_resolves_unstamped_rows_from_their_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        let deps = WatchDeps {
+            repo_roots: RepoRootCache::new(Box::new(|worktree| {
+                (worktree == std::path::Path::new("/tmp/wt"))
+                    .then(|| std::path::PathBuf::from("/repos/b"))
+            })),
+            ..watch_deps(store)
+        };
+
+        match execute_watch(&deps, Cmd::LoadOverview).as_slice() {
+            [Msg::OverviewLoaded(rows)] => assert_eq!(
+                rows[0].repo_root,
+                crate::runs::overview::RepoRoot::FromWorktree("/repos/b".into())
+            ),
+            other => panic!("expected OverviewLoaded, got {other:?}"),
+        }
+    }
+
+    /// The overview reloads every ~500ms; the worktree fallback spawns a
+    /// `git`, so each worktree is asked about once per process.
+    #[test]
+    fn repo_root_cache_resolves_each_worktree_once() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        let cache = RepoRootCache::new(Box::new(move |_| {
+            counted.set(counted.get() + 1);
+            None
+        }));
+        let worktree = std::path::Path::new("/tmp/wt");
+        assert_eq!(cache.resolve(worktree), None);
+        assert_eq!(cache.resolve(worktree), None);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn open_board_window_outside_tmux_says_it_needs_tmux() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new().with_current_session_name(Ok(None));
+        let message = open_board_window(
+            &tmux,
+            std::path::Path::new("/repos/alpha"),
+            std::path::Path::new("/bin/tm"),
+        );
+        assert_eq!(
+            message,
+            "B opens tm board in a new tmux window: not inside tmux"
+        );
+    }
+
+    #[test]
+    fn open_board_window_appends_a_board_window_in_the_repo_root() {
+        let tmux = crate::work::tmux::FakeTmuxOps::new()
+            .with_current_session_name(Ok(Some("monitoring".to_string())));
+        let message = open_board_window(
+            &tmux,
+            std::path::Path::new("/repos/alpha"),
+            std::path::Path::new("/bin/tm"),
+        );
+        assert_eq!(message, "opened tm board for /repos/alpha");
+        assert!(
+            tmux.calls()
+                .contains(&crate::work::tmux::TmuxCall::NewWindowWithCommand {
+                    name: "monitoring".to_string(),
+                    window_name: "board-alpha".to_string(),
+                    dir: "/repos/alpha".to_string(),
+                    env: Vec::new(),
+                    command: "'/bin/tm' board".to_string(),
+                })
+        );
     }
 
     #[test]
@@ -5489,6 +5701,55 @@ mod tests {
             .unwrap();
         let result = resolve_vdiff_worktree(Some(&store), None, "PROJ-1");
         assert_eq!(result, Ok(worktree.path().to_path_buf()));
+    }
+
+    // --- Cmd::ViewRunLogs / resolve_run_log (GitHub issue #87) ---
+
+    fn start_run_with_log(store: &crate::runs::RunStore, log_path: Option<String>) -> i64 {
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "github:a/b".to_string(),
+                ticket: "GH-2".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn resolve_run_log_with_an_unknown_run_id_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let result = resolve_run_log(&store, 99, dir.path());
+        assert_eq!(result, Err("no run with id 99".to_string()));
+    }
+
+    #[test]
+    fn resolve_run_log_resolves_the_runs_recorded_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let log = dir.path().join("gh-2.log");
+        std::fs::write(&log, "hello\n").unwrap();
+        let id = start_run_with_log(&store, Some(log.to_string_lossy().to_string()));
+        let result = resolve_run_log(&store, id, dir.path());
+        assert_eq!(result, Ok((log, "GH-2".to_string())));
+    }
+
+    #[test]
+    fn resolve_run_log_with_a_missing_log_file_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let log = dir.path().join("gone.log");
+        let id = start_run_with_log(&store, Some(log.to_string_lossy().to_string()));
+        let result = resolve_run_log(&store, id, dir.path());
+        assert_eq!(
+            result,
+            Err(format!("log file {} does not exist", log.display()))
+        );
     }
 
     // --- Cmd::LaunchCleanup / launch_cleanup_cmd ---
