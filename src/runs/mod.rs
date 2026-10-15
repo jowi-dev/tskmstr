@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+pub mod cpu;
 pub mod footprint;
 pub mod overview;
 pub mod pid;
