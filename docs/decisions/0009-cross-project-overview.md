@@ -163,7 +163,19 @@ actions, and read-only actions land before ones that change state.
      snapshots each tick, `r`, the stale strip marker, and resolving repo
      roots for targets) once slices 1 and 2 land.
 4. **Lifecycle-columns toggle (#85).** Layout (1) over the same rows.
-5. **System resource header (#86).** Decision 7.
+5. **System resource header (#86).** Decision 7. Notes from the
+   implementation:
+   - CPU lives in `runs::cpu`. It reads macOS's `proc_pid_rusage`, plus
+     Linux's `/proc`, which footprint has no counterpart for. A percentage
+     needs two readings, so the header shows `?` until the second sample
+     (~2s after the overview opens).
+   - Lane memory is the latest footprint the reaper recorded (every ~30s),
+     not a fresh sample.
+   - The budget figure reuses admission's `running_lane_estimate`, so the
+     header and a refused launch always agree.
+   - Build slots in use are counted by probing each lock file with a
+     non-blocking `flock` that is released at once. Budget and slot totals
+     come from the invoking repo's config.
 6. **Scope-aware read actions: `v`, `L`, `B` (#87).**
 7. **Scope-aware write actions: `V`, `F`, `M`, `Space` (#88).** Per-repo batch
    queues.
