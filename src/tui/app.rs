@@ -908,6 +908,20 @@ pub struct App {
     /// are never open at once, since each overlay makes every other key
     /// inert.
     pub lane_confirm: Option<LaneConfirm>,
+    /// Tickets queued on [`Screen::Overview`] for a batch merge (`Space`,
+    /// GitHub issue #88), each with the repo root its `tm merge` runs in.
+    /// Separate from the board's [`App::merge_queue`]: the overview spans
+    /// repos, so entries are keyed by `(scope, ticket)` and confirming
+    /// fires one `tm merge` per scope. See
+    /// [`crate::tui::overview_actions`].
+    pub overview_merge_queue:
+        std::collections::BTreeMap<crate::runs::overview::TicketKey, std::path::PathBuf>,
+    /// The overview's merge confirmation (`M`), or `None` when closed.
+    /// Shares the confirm/cancel keys with the board's overlays.
+    pub overview_merge_confirm: Option<crate::tui::overview_actions::OverviewMergeConfirm>,
+    /// Tickets with an overview-launched `tm merge` child in flight, keyed
+    /// by `(scope, ticket)`. Cleared by [`Msg::OverviewMergeResult`].
+    pub overview_pending_merges: std::collections::HashSet<crate::runs::overview::TicketKey>,
     /// The configured `status_on_merge` target (see
     /// [`crate::config::Config::status_on_merge`]), threaded in at
     /// construction via [`App::with_status_on_merge`] so
@@ -980,6 +994,7 @@ impl App {
         self.merge_confirm.is_some()
             || self.batch_merge_confirm.is_some()
             || self.lane_confirm.is_some()
+            || self.overview_merge_confirm.is_some()
     }
 
     /// The currently selected ticket, if any.
@@ -1187,6 +1202,20 @@ pub enum Msg {
         /// Ticket keys the merge was for (more than one for a batch).
         keys: Vec<String>,
         /// Whether the merge itself succeeded.
+        merged: bool,
+        /// The status-line outcome text.
+        message: String,
+    },
+    /// The outcome of an overview-launched [`Cmd::LaunchMergeIn`] (GitHub
+    /// issue #88): [`Msg::MergePrResult`] plus the scope, since the
+    /// overview's in-flight set is keyed by `(scope, ticket)`. A merge
+    /// reloads the overview.
+    OverviewMergeResult {
+        /// The scope the merged tickets belong to.
+        scope: String,
+        /// Ticket keys the `tm merge` child was given.
+        keys: Vec<String>,
+        /// Whether the merge succeeded.
         merged: bool,
         /// The status-line outcome text.
         message: String,
@@ -1702,6 +1731,36 @@ pub enum Cmd {
         /// (GitHub issue #68).
         keys: Vec<String>,
     },
+    /// [`Cmd::ViewDiff`] for [`Screen::Overview`] (GitHub issue #88): the
+    /// latest run's worktree is looked up under the row's own `scope`
+    /// rather than the invoking repo's.
+    ViewDiffInScope {
+        /// The row's scope.
+        scope: String,
+        /// Ticket key.
+        key: String,
+    },
+    /// [`Cmd::LaunchReviewFix`] for [`Screen::Overview`] (GitHub issue
+    /// #88): `tm review fix <key>` spawned with `repo_root` as its cwd.
+    /// Reports back as [`Msg::ReviewFixLaunchResult`].
+    LaunchReviewFixIn {
+        /// Ticket key.
+        key: String,
+        /// The row's repo root.
+        repo_root: std::path::PathBuf,
+    },
+    /// [`Cmd::LaunchMerge`] for [`Screen::Overview`] (GitHub issue #88):
+    /// `tm merge <keys...>` spawned with `repo_root` as its cwd, one per
+    /// scope. Only emitted by accepting the overview's merge confirmation.
+    /// Reports back as [`Msg::OverviewMergeResult`].
+    LaunchMergeIn {
+        /// The scope every key belongs to.
+        scope: String,
+        /// That scope's repo root.
+        repo_root: std::path::PathBuf,
+        /// Ticket keys in argv order.
+        keys: Vec<String>,
+    },
     /// Resolve whether `key` has an open GitHub pull request, for
     /// [`Msg::OpenBrowserAction`]'s picker-or-direct-open decision. Reports
     /// back as [`Msg::BrowserOptionsResolved`]. One `gh` call, made only on
@@ -2007,6 +2066,12 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             }
             (app, Vec::new())
         }
+        Msg::MergePrAction if app.screen == Screen::Overview => {
+            crate::tui::overview_actions::merge(app)
+        }
+        Msg::ToggleMergeQueue if app.screen == Screen::Overview => {
+            crate::tui::overview_actions::toggle_merge_queue(app)
+        }
         Msg::MergePrAction => merge_pr_action(app),
         Msg::ToggleMergeQueue => toggle_merge_queue(app),
         Msg::MergePrResolved {
@@ -2018,6 +2083,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmAccept => {
             if let Some(confirm) = app.lane_confirm.take() {
                 launch_lane(app, confirm.key)
+            } else if let Some(confirm) = app.overview_merge_confirm.take() {
+                crate::tui::overview_actions::confirm_accept(app, confirm)
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
                 batch_merge_confirm_accept(app, confirm.keys)
             } else {
@@ -2027,6 +2094,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmCancel => {
             if let Some(confirm) = app.lane_confirm.take() {
                 app.status_line = format!("lane run for {} cancelled", confirm.key);
+            } else if let Some(confirm) = app.overview_merge_confirm.take() {
+                app.status_line = format!("merge of {} cancelled", confirm.label());
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
                 app.status_line = format!("batch merge of {} cancelled", confirm.keys.join(", "));
             } else if let Some(confirm) = app.merge_confirm.take() {
@@ -2249,6 +2318,18 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = message;
             (app, Vec::new())
         }
+        Msg::ViewDiffAction if app.screen == Screen::Overview => {
+            crate::tui::overview_actions::view_diff(app)
+        }
+        Msg::ReviewFixAction if app.screen == Screen::Overview => {
+            crate::tui::overview_actions::review_fix(app)
+        }
+        Msg::OverviewMergeResult {
+            scope,
+            keys,
+            merged,
+            message,
+        } => crate::tui::overview_actions::merge_result(app, scope, keys, merged, message),
         Msg::ViewDiffAction => view_diff_action(app),
         Msg::DiffActionResult(message) => {
             app.status_line = message;

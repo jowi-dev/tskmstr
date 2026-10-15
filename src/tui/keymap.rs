@@ -245,10 +245,18 @@ pub fn map_key(
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
         KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
-        KeyCode::Char('V') if *screen == Screen::Board => Some(Msg::ViewDiffAction),
-        KeyCode::Char('F') if *screen == Screen::Board => Some(Msg::ReviewFixAction),
-        KeyCode::Char('M') if *screen == Screen::Board => Some(Msg::MergePrAction),
-        KeyCode::Char(' ') if *screen == Screen::Board => Some(Msg::ToggleMergeQueue),
+        KeyCode::Char('V') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ViewDiffAction)
+        }
+        KeyCode::Char('F') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ReviewFixAction)
+        }
+        KeyCode::Char('M') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::MergePrAction)
+        }
+        KeyCode::Char(' ') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ToggleMergeQueue)
+        }
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('d') if *screen == Screen::Retro => Some(Msg::RetroDefectStart),
@@ -2850,10 +2858,31 @@ mod tests {
         );
     }
 
-    /// The watch screen's view filters don't apply to the overview.
+    /// The watch screen's view filters don't apply to the overview. `F`
+    /// is the overview's fix pass instead (GitHub issue #88).
     #[test]
     fn watch_filter_keys_are_inert_on_overview() {
         assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('f')), None);
-        assert_eq!(plain_key(&Screen::Overview, KeyCode::Char('F')), None);
+        assert_ne!(
+            plain_key(&Screen::Overview, KeyCode::Char('F')),
+            Some(Msg::CycleRunScopeFilter)
+        );
+    }
+
+    /// GitHub issue #88: the board's write actions `V`/`F`/`M`/`Space`
+    /// work on the overview too, routed by the row's repo.
+    #[test]
+    fn board_write_action_keys_work_on_overview() {
+        let cases = [
+            (KeyCode::Char('V'), Msg::ViewDiffAction),
+            (KeyCode::Char('F'), Msg::ReviewFixAction),
+            (KeyCode::Char('M'), Msg::MergePrAction),
+            (KeyCode::Char(' '), Msg::ToggleMergeQueue),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(plain_key(&Screen::Overview, key), Some(expected));
+        }
+        assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('M')), None);
+        assert_eq!(plain_key(&Screen::Runs, KeyCode::Char(' ')), None);
     }
 }

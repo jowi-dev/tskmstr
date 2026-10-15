@@ -154,6 +154,10 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         draw_batch_merge_confirm(frame, app);
     }
 
+    if app.overview_merge_confirm.is_some() {
+        draw_overview_merge_confirm(frame, app);
+    }
+
     if app.lane_confirm.is_some() {
         draw_lane_confirm(frame, app);
     }
@@ -262,7 +266,9 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
         Screen::Retro => {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
-        Screen::Overview => "j/k: move  s: attach  Tab: watch  r: refresh  q: quit",
+        Screen::Overview => {
+            "j/k: move  s: attach  V: vdiff  F: fix  M: merge  Space: queue  Tab: watch  r: refresh  q: quit"
+        }
     }
 }
 
@@ -857,12 +863,20 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
                     "  {:<project_width$}  ",
                     project_label(&row.key.scope)
                 )),
+                Span::styled(row.key.ticket.clone(), theme::CARD_KEY),
+                // A fixed two-cell slot for the batch-merge glyph (GitHub
+                // issue #88), so queued rows stay aligned with the rest.
+                if app.overview_merge_queue.contains_key(&row.key) {
+                    Span::styled(
+                        format!(" {}", theme::MERGE_QUEUED_GLYPH),
+                        theme::MERGE_QUEUED,
+                    )
+                } else {
+                    Span::raw("  ")
+                },
+                Span::raw(" ".repeat(ticket_width.saturating_sub(row.key.ticket.chars().count()))),
                 Span::styled(
-                    format!("{:<ticket_width$}", row.key.ticket),
-                    theme::CARD_KEY,
-                ),
-                Span::styled(
-                    format!("  {run}  {}", format_age(row.stage_age_secs)),
+                    format!("{run}  {}", format_age(row.stage_age_secs)),
                     theme::DIM,
                 ),
             ];
@@ -1893,6 +1907,40 @@ fn draw_batch_merge_confirm(frame: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(bold_title("Merge queue")),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+/// A centered floating window asking to confirm the overview's merge
+/// ([`crate::tui::overview_actions::OverviewMergeConfirm`], `M` on
+/// [`Screen::Overview`] -- GitHub issue #88): one line per repo naming the
+/// `tm merge` it will run there, so a cross-repo batch reads as the
+/// separate merges it is. Same paragraph shape as
+/// [`draw_batch_merge_confirm`].
+fn draw_overview_merge_confirm(frame: &mut Frame, app: &App) {
+    let Some(confirm) = &app.overview_merge_confirm else {
+        return;
+    };
+    let area = centered_rect(60, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from("Merge via tm merge, one run per repo?"),
+        Line::from(""),
+    ];
+    lines.extend(confirm.batches.iter().map(|batch| {
+        Line::from(format!(
+            "  {}: tm merge {}",
+            project_label(&batch.scope),
+            batch.keys.join(" ")
+        ))
+    }));
+    lines.push(Line::from(""));
+    lines.push(Line::from("y/Enter merge   n/Esc cancel"));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(bold_title("Merge")),
     );
     frame.render_widget(paragraph, area);
 }
@@ -4192,6 +4240,66 @@ mod tests {
         assert!(hint_for(Screen::Overview, false).contains("Tab: watch"));
         assert!(hint_for(Screen::Overview, false).contains("s: attach"));
         assert!(hint_for(Screen::Runs, false).contains("Tab: overview"));
+    }
+
+    /// GitHub issue #88.
+    #[test]
+    fn overview_hint_names_the_write_actions() {
+        let hint = hint_for(Screen::Overview, false);
+        for key in ["V: vdiff", "F: fix", "M: merge", "Space: queue"] {
+            assert!(hint.contains(key), "{hint}");
+        }
+    }
+
+    /// A row queued for a batch merge carries the board's queued glyph,
+    /// matched by `(scope, ticket)`: the same key in another repo isn't
+    /// queued.
+    #[test]
+    fn overview_marks_only_the_queued_scopes_row() {
+        let mut app = overview_app(vec![
+            overview_row("github:me/alpha", "GH-1", Stage::ReadyToMerge),
+            overview_row("github:me/beta", "GH-1", Stage::ReadyToMerge),
+        ]);
+        app.overview_merge_queue.insert(
+            crate::runs::overview::TicketKey::new("github:me/beta", "GH-1"),
+            std::path::PathBuf::from("/repos/beta"),
+        );
+        let text = buffer_text(&render_with_size(&app, 100, 24));
+        let alpha = text
+            .lines()
+            .find(|l| l.contains("alpha ") && l.contains("GH-1"));
+        let beta = text
+            .lines()
+            .find(|l| l.contains("beta ") && l.contains("GH-1"));
+        let marker = format!("GH-1 {}", theme::MERGE_QUEUED_GLYPH);
+        assert!(!alpha.unwrap().contains(&marker), "{text}");
+        assert!(beta.unwrap().contains(&marker), "{text}");
+    }
+
+    #[test]
+    fn overview_merge_confirm_lists_each_repos_tm_merge() {
+        use crate::tui::overview_actions::{OverviewMergeBatch, OverviewMergeConfirm};
+        let mut app = overview_app(Vec::new());
+        app.overview_merge_confirm = Some(OverviewMergeConfirm {
+            batches: vec![
+                OverviewMergeBatch {
+                    scope: "github:me/alpha".to_string(),
+                    repo_root: std::path::PathBuf::from("/repos/alpha"),
+                    keys: vec!["GH-1".to_string(), "GH-2".to_string()],
+                },
+                OverviewMergeBatch {
+                    scope: "github:me/beta".to_string(),
+                    repo_root: std::path::PathBuf::from("/repos/beta"),
+                    keys: vec!["GH-7".to_string()],
+                },
+            ],
+        });
+        let text = buffer_text(&render_with_size(&app, 100, 30));
+        assert!(text.contains("Merge"), "{text}");
+        assert!(text.contains("alpha: tm merge GH-1 GH-2"), "{text}");
+        assert!(text.contains("beta: tm merge GH-7"), "{text}");
+        assert!(text.contains("y/Enter merge"), "{text}");
+        assert!(text.contains("n/Esc cancel"), "{text}");
     }
 
     #[test]
