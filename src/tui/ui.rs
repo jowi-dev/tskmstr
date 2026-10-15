@@ -111,12 +111,12 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
             draw_detail_window(frame, app);
             draw_transition_window(frame, app);
         }
-        Screen::Runs => {
+        Screen::Runs | Screen::Overview => {
             if app.show_run_detail {
                 draw_run_detail_window(frame, app, runner);
             }
         }
-        Screen::Retro | Screen::Overview => {}
+        Screen::Retro => {}
     }
 
     draw_status_bar(
@@ -240,9 +240,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
 }
 
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
-/// picks the detail-window variant on both [`Screen::Board`] and
-/// [`Screen::Runs`] -- the run-detail overlay's keymap (scroll/close/refresh)
-/// is shared between the two hosts (see `docs/plans/board-run-detail.md`'s
+/// picks the detail-window variant on [`Screen::Board`], [`Screen::Runs`]
+/// and [`Screen::Overview`] -- the run-detail overlay's keymap
+/// (scroll/close/refresh) is shared between the hosts (see `docs/plans/board-run-detail.md`'s
 /// "Key gating" decision).
 fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
@@ -255,14 +255,16 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
         Screen::Rank => {
             "j/k move  Enter/Space grab-drop  r refresh  o browser  O jira  Esc back  ? help  q quit"
         }
-        Screen::Runs if show_run_detail => "j/k scroll  Esc/q close  r refresh  q quit",
+        Screen::Runs | Screen::Overview if show_run_detail => {
+            "j/k scroll  Esc/q close  r refresh  q quit"
+        }
         Screen::Runs => {
             "h/l/j/k: move  enter: detail  s: attach  f/F: kind/scope filter  Tab: overview  r: refresh  q: quit"
         }
         Screen::Retro => {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
-        Screen::Overview => "j/k: move  s: attach  Tab: watch  r: refresh  q: quit",
+        Screen::Overview => "j/k: move  s: attach  v: view run  Tab: watch  r: refresh  q: quit",
     }
 }
 
@@ -4192,6 +4194,29 @@ mod tests {
         assert!(hint_for(Screen::Overview, false).contains("Tab: watch"));
         assert!(hint_for(Screen::Overview, false).contains("s: attach"));
         assert!(hint_for(Screen::Runs, false).contains("Tab: overview"));
+    }
+
+    /// GitHub issue #87: `v` opens the same run detail window the watch
+    /// screen uses, over the overview.
+    #[test]
+    fn run_detail_overlay_draws_over_the_overview() {
+        let app = App {
+            show_run_detail: true,
+            run_detail: None,
+            ..overview_app(vec![overview_row("github:me/alpha", "GH-1", Stage::Stuck)])
+        };
+        let text = buffer_text(&render_with_size(&app, 100, 24));
+        assert!(text.contains("Loading..."));
+    }
+
+    #[test]
+    fn overview_hints_name_the_read_actions() {
+        let hint = hint_for(Screen::Overview, false);
+        assert!(hint.contains("v: view run"));
+        assert_eq!(
+            hint_for(Screen::Overview, true),
+            hint_for(Screen::Runs, true)
+        );
     }
 
     #[test]

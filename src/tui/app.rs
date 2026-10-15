@@ -1299,7 +1299,8 @@ pub enum Msg {
     /// The `v` key was pressed on [`Screen::Board`] for the selected ticket:
     /// open the run detail overlay on its latest run (any `kind`), per
     /// `docs/plans/board-run-detail.md`'s "Decisions" section. A no-op when
-    /// no ticket is selected.
+    /// no ticket is selected. On [`Screen::Overview`] (GitHub issue #87) it
+    /// opens the highlighted row's run instead, by id.
     ViewRunAction,
     /// The `L` key was pressed on [`Screen::Board`] for the selected ticket:
     /// open its latest run's log file (see [`Cmd::ViewLogs`]). A no-op when
@@ -3033,6 +3034,9 @@ fn manual_session_action(app: App) -> (App, Vec<Cmd>) {
 /// solely on that gating, unlike [`audit_action`]/[`lane_run_action`]) so
 /// this stays independently testable.
 fn view_run_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.screen == Screen::Overview {
+        return view_overview_run_action(app);
+    }
     if app.screen != Screen::Board {
         return (app, Vec::new());
     }
@@ -3044,6 +3048,24 @@ fn view_run_action(mut app: App) -> (App, Vec<Cmd>) {
     app.run_detail = None;
     app.run_detail_scroll = 0;
     (app, vec![Cmd::LoadTicketRunDetail { key }])
+}
+
+/// [`view_run_action`] on [`Screen::Overview`] (GitHub issue #87, ADR-0009
+/// decision 6): open the run detail overlay on the highlighted row's own
+/// run, by id, so it needs no repo root. A not-started row has no run, so
+/// the status line says so instead.
+fn view_overview_run_action(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(row) = app.selected_overview_row() else {
+        return (app, Vec::new());
+    };
+    let Some(run_id) = row.run_id else {
+        app.status_line = format!("no run recorded for {}", row.key.ticket);
+        return (app, Vec::new());
+    };
+    app.show_run_detail = true;
+    app.run_detail = None;
+    app.run_detail_scroll = 0;
+    (app, vec![Cmd::LoadRunDetail { run_id }])
 }
 
 /// Handle [`Msg::ViewLogsAction`]: open the selected ticket's latest run's
@@ -3157,6 +3179,11 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             let mut cmds = Vec::new();
             if app.watch_tick.is_multiple_of(2) {
                 cmds.push(Cmd::LoadOverview);
+                if app.show_run_detail
+                    && let Some(run_id) = app.selected_overview_row().and_then(|row| row.run_id)
+                {
+                    cmds.push(Cmd::LoadRunDetail { run_id });
+                }
             }
             if app.watch_tick.is_multiple_of(120) {
                 cmds.push(Cmd::ReapRuns);
@@ -3655,7 +3682,8 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
         // drill into here, kept as a no-op so `Screen` stays exhaustively
         // matched.
         Screen::Retro => (app, Vec::new()),
-        // Run detail from the overview is slice 6 of ADR-0009 (`v`).
+        // The overview opens run detail with `v` (GitHub issue #87), not
+        // `Enter`, matching the board.
         Screen::Overview => (app, Vec::new()),
     }
 }
@@ -3699,8 +3727,16 @@ fn back(app: &mut App) {
         // `Msg::RetroNoteCancel` while either overlay is open, so `Back`
         // only ever fires here with both closed.
         Screen::Retro => app.screen = Screen::Board,
-        // `tm overview` has no screen to fall back to.
-        Screen::Overview => app.quit = true,
+        // `tm overview` has no screen to fall back to: like the runs
+        // screen, it closes an open run detail window first.
+        Screen::Overview => {
+            if app.show_run_detail {
+                app.show_run_detail = false;
+                app.run_detail = None;
+            } else {
+                app.quit = true;
+            }
+        }
     }
 }
 
@@ -3738,7 +3774,11 @@ fn move_up(app: &mut App) {
             app.retro_selected = app.retro_selected.saturating_sub(1);
         }
         Screen::Overview => {
-            app.overview_selected = app.overview_selected.saturating_sub(1);
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_sub(1);
+            } else {
+                app.overview_selected = app.overview_selected.saturating_sub(1);
+            }
         }
     }
 }
@@ -3785,7 +3825,9 @@ fn move_down(app: &mut App) {
             }
         }
         Screen::Overview => {
-            if !app.overview_rows.is_empty() {
+            if app.show_run_detail {
+                app.run_detail_scroll = app.run_detail_scroll.saturating_add(1);
+            } else if !app.overview_rows.is_empty() {
                 app.overview_selected =
                     (app.overview_selected + 1).min(app.overview_rows.len() - 1);
             }
@@ -8552,6 +8594,89 @@ mod tests {
         target.scope = "github:a/b".to_string();
         let (app, _) = update(app, Msg::RunsLoaded(vec![other, target]));
         assert_eq!(app.selected_run_card().unwrap().id, 7);
+    }
+
+    // --- Screen::Overview read actions (GitHub issue #87) ---
+
+    #[test]
+    fn view_run_action_on_overview_opens_the_rows_run_detail() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::Stuck, Some(7))],
+            0,
+        );
+        let (app, cmds) = update(app, Msg::ViewRunAction);
+        assert!(app.show_run_detail);
+        assert_eq!(cmds, vec![Cmd::LoadRunDetail { run_id: 7 }]);
+    }
+
+    #[test]
+    fn view_run_action_on_a_not_started_row_explains_why_on_the_status_line() {
+        use crate::runs::overview::Stage;
+        let app = overview_app(
+            vec![overview_row("github:a/b", "GH-2", Stage::NotStarted, None)],
+            0,
+        );
+        let (app, cmds) = update(app, Msg::ViewRunAction);
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "no run recorded for GH-2");
+    }
+
+    #[test]
+    fn view_run_action_on_an_empty_overview_is_a_noop() {
+        let (app, cmds) = update(overview_app(Vec::new(), 0), Msg::ViewRunAction);
+        assert!(!app.show_run_detail);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn back_on_overview_closes_an_open_run_detail_instead_of_quitting() {
+        let app = App {
+            show_run_detail: true,
+            ..overview_app(Vec::new(), 0)
+        };
+        let (app, _) = update(app, Msg::Back);
+        assert!(!app.show_run_detail);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn up_down_on_overview_scroll_an_open_run_detail() {
+        use crate::runs::overview::Stage;
+        let app = App {
+            show_run_detail: true,
+            ..overview_app(
+                vec![
+                    overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                    overview_row("github:a/b", "GH-2", Stage::Running, Some(2)),
+                ],
+                0,
+            )
+        };
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.run_detail_scroll, 1);
+        assert_eq!(app.overview_selected, 0);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.run_detail_scroll, 0);
+    }
+
+    #[test]
+    fn tick_on_overview_refreshes_an_open_run_detail() {
+        use crate::runs::overview::Stage;
+        let app = App {
+            show_run_detail: true,
+            watch_tick: 1,
+            ..overview_app(
+                vec![overview_row("github:a/b", "GH-2", Stage::Running, Some(7))],
+                0,
+            )
+        };
+        let (_, cmds) = update(app, Msg::Tick);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadOverview, Cmd::LoadRunDetail { run_id: 7 }]
+        );
     }
 
     /// The focus is a one-shot hand-off: once a load has tried to honor it,
