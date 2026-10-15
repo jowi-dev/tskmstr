@@ -1563,8 +1563,9 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // worker thread before `execute` is reached, so they're unreachable
         // here too.
         //
-        // The Jira board never enters `Screen::Runs`, so `update` can never
-        // produce `Cmd::LoadRuns`/`Cmd::LoadRunDetail` for `run`/`execute`
+        // The Jira board never enters `Screen::Runs` or `Screen::Overview`,
+        // so `update` can never produce `Cmd::LoadRuns`/`Cmd::LoadRunDetail`
+        // or the overview's scope-routed `*In` commands for `run`/`execute`
         // to handle either. (`Cmd::ReapRuns` *is* a board cmd since GitHub
         // issue #26 — the board reaps dead runs on its own poll — so it's
         // handled above.)
@@ -1580,6 +1581,9 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         | Cmd::ViewLogs { .. }
         | Cmd::ViewDiff { .. }
         | Cmd::LaunchReviewFix { .. }
+        | Cmd::ViewDiffInScope { .. }
+        | Cmd::LaunchReviewFixIn { .. }
+        | Cmd::LaunchMergeIn { .. }
         | Cmd::FetchTickets { .. }
         | Cmd::FetchAssignableUsers { .. }
         | Cmd::FetchTransitions { .. }
