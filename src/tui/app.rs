@@ -241,6 +241,21 @@ pub struct RunCard {
     pub scope: String,
 }
 
+/// How [`Screen::Overview`] lays out its rows (ADR-0009 decision 1), toggled
+/// by `c` ([`Msg::ToggleOverviewLayout`]). Both render the same
+/// [`App::overview_rows`] and share [`App::overview_selected`], so the
+/// toggle is presentation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverviewLayout {
+    /// One list in attention-queue order (the default).
+    #[default]
+    Queue,
+    /// One column per stage in lifecycle order
+    /// ([`crate::runs::overview::LIFECYCLE_COLUMNS`]), with project-tagged
+    /// cards (GitHub issue #85).
+    Columns,
+}
+
 /// The ticket [`Msg::ToggleOverview`] hands from one view to the other: its
 /// `(scope, ticket)`, plus the run the overview row stood for, which the
 /// watch screen prefers when the ticket has several run cards.
@@ -795,6 +810,9 @@ pub struct App {
     /// Index into `overview_rows` of the highlighted row. Always clamped
     /// into bounds (`0` when the queue is empty).
     pub overview_selected: usize,
+    /// Whether [`Screen::Overview`] shows the queue or lifecycle columns.
+    /// Kept across `Tab` switches to watch and back.
+    pub overview_layout: OverviewLayout,
     /// The ticket to highlight on the next load after [`Msg::ToggleOverview`]
     /// switched between [`Screen::Runs`] and [`Screen::Overview`], so the
     /// operator keeps their place across the switch. Consumed by that load
@@ -1051,6 +1069,14 @@ impl App {
                     .as_deref()
                     .is_none_or(|scope| c.scope == scope)
             })
+            .collect()
+    }
+
+    /// Indices into [`App::overview_rows`] of the rows in `stage`, in queue
+    /// order: one column of [`OverviewLayout::Columns`].
+    pub fn overview_rows_in_stage(&self, stage: crate::runs::overview::Stage) -> Vec<usize> {
+        (0..self.overview_rows.len())
+            .filter(|&i| self.overview_rows[i].stage == stage)
             .collect()
     }
 
@@ -1361,6 +1387,9 @@ pub enum Msg {
     /// `Tab` on [`Screen::Runs`] or [`Screen::Overview`]: switch to the
     /// other one, keeping the highlighted ticket (ADR-0009 decision 2).
     ToggleOverview,
+    /// `c` on [`Screen::Overview`]: switch between the attention queue and
+    /// lifecycle columns, keeping the highlighted ticket (GitHub issue #85).
+    ToggleOverviewLayout,
     /// [`Screen::Overview`]'s rows finished loading. A load failure
     /// reuses [`Msg::RunsFailed`]: both read the same run store.
     OverviewLoaded(Vec<crate::runs::overview::OverviewRow>),
@@ -2273,6 +2302,13 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ManualSessionAction => manual_session_action(app),
         Msg::RunSessionAction => run_session_action(app),
         Msg::ToggleOverview => toggle_overview(app),
+        Msg::ToggleOverviewLayout => {
+            app.overview_layout = match app.overview_layout {
+                OverviewLayout::Queue => OverviewLayout::Columns,
+                OverviewLayout::Columns => OverviewLayout::Queue,
+            };
+            (app, Vec::new())
+        }
         Msg::OverviewLoaded(rows) => {
             overview_loaded(&mut app, rows);
             (app, Vec::new())
@@ -3737,9 +3773,12 @@ fn move_up(app: &mut App) {
         Screen::Retro => {
             app.retro_selected = app.retro_selected.saturating_sub(1);
         }
-        Screen::Overview => {
-            app.overview_selected = app.overview_selected.saturating_sub(1);
-        }
+        Screen::Overview => match app.overview_layout {
+            OverviewLayout::Queue => {
+                app.overview_selected = app.overview_selected.saturating_sub(1);
+            }
+            OverviewLayout::Columns => move_overview_in_column(app, -1),
+        },
     }
 }
 
@@ -3784,12 +3823,15 @@ fn move_down(app: &mut App) {
                 app.retro_selected = (app.retro_selected + 1).min(app.retro_tickets.len() - 1);
             }
         }
-        Screen::Overview => {
-            if !app.overview_rows.is_empty() {
-                app.overview_selected =
-                    (app.overview_selected + 1).min(app.overview_rows.len() - 1);
+        Screen::Overview => match app.overview_layout {
+            OverviewLayout::Queue => {
+                if !app.overview_rows.is_empty() {
+                    app.overview_selected =
+                        (app.overview_selected + 1).min(app.overview_rows.len() - 1);
+                }
             }
-        }
+            OverviewLayout::Columns => move_overview_in_column(app, 1),
+        },
     }
 }
 
@@ -3828,6 +3870,9 @@ fn move_left(app: &mut App) {
             app.runs_selected_col = app.runs_selected_col.saturating_sub(1);
             clamp_runs_row(app);
         }
+        Screen::Overview if app.overview_layout == OverviewLayout::Columns => {
+            move_overview_column(app, -1);
+        }
         _ => {}
     }
 }
@@ -3845,7 +3890,54 @@ fn move_right(app: &mut App) {
             app.runs_selected_col = (app.runs_selected_col + 1).min(RUN_COLUMNS.len() - 1);
             clamp_runs_row(app);
         }
+        Screen::Overview if app.overview_layout == OverviewLayout::Columns => {
+            move_overview_column(app, 1);
+        }
         _ => {}
+    }
+}
+
+/// [`OverviewLayout::Columns`]' `j`/`k`: move the selection `step` cards
+/// within the highlighted row's column, clamping at its ends.
+fn move_overview_in_column(app: &mut App, step: isize) {
+    let Some(stage) = app.selected_overview_row().map(|row| row.stage) else {
+        return;
+    };
+    let column = app.overview_rows_in_stage(stage);
+    let Some(pos) = column.iter().position(|&i| i == app.overview_selected) else {
+        return;
+    };
+    let target = pos.saturating_add_signed(step).min(column.len() - 1);
+    app.overview_selected = column[target];
+}
+
+/// [`OverviewLayout::Columns`]' `h`/`l`: move the selection to the nearest
+/// non-empty column in direction `step` (`-1` left, `1` right), keeping the
+/// card position where that column has one and clamping to its last card
+/// otherwise. A no-op at the outermost non-empty column.
+fn move_overview_column(app: &mut App, step: isize) {
+    use crate::runs::overview::LIFECYCLE_COLUMNS;
+    let Some(stage) = app.selected_overview_row().map(|row| row.stage) else {
+        return;
+    };
+    let pos = app
+        .overview_rows_in_stage(stage)
+        .iter()
+        .position(|&i| i == app.overview_selected)
+        .unwrap_or(0);
+    let Some(mut col) = LIFECYCLE_COLUMNS.iter().position(|&s| s == stage) else {
+        return;
+    };
+    while let Some(next) = col
+        .checked_add_signed(step)
+        .filter(|&c| c < LIFECYCLE_COLUMNS.len())
+    {
+        col = next;
+        let column = app.overview_rows_in_stage(LIFECYCLE_COLUMNS[col]);
+        if let Some(&index) = column.get(pos).or(column.last()) {
+            app.overview_selected = index;
+            return;
+        }
     }
 }
 
@@ -8572,5 +8664,102 @@ mod tests {
         let (app, _) = update(app, Msg::Down);
         let (app, _) = update(app, Msg::OverviewLoaded(rows));
         assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
+    }
+
+    // --- Screen::Overview lifecycle columns (GitHub issue #85) ---
+
+    /// Rows in queue order: two needs-input, one stuck, one running.
+    fn columns_app(selected: usize) -> App {
+        use crate::runs::overview::Stage;
+        App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(
+                vec![
+                    overview_row("github:a/b", "GH-1", Stage::NeedsInput, Some(1)),
+                    overview_row("github:a/b", "GH-2", Stage::NeedsInput, Some(2)),
+                    overview_row("github:a/b", "GH-3", Stage::Stuck, Some(3)),
+                    overview_row("github:a/b", "GH-4", Stage::Running, Some(4)),
+                ],
+                selected,
+            )
+        }
+    }
+
+    #[test]
+    fn toggle_overview_layout_flips_between_queue_and_columns() {
+        let app = overview_app(Vec::new(), 0);
+        assert_eq!(app.overview_layout, OverviewLayout::Queue);
+        let (app, cmds) = update(app, Msg::ToggleOverviewLayout);
+        assert_eq!(app.overview_layout, OverviewLayout::Columns);
+        assert!(cmds.is_empty(), "the toggle is presentation only");
+        let (app, _) = update(app, Msg::ToggleOverviewLayout);
+        assert_eq!(app.overview_layout, OverviewLayout::Queue);
+    }
+
+    #[test]
+    fn toggle_overview_layout_keeps_the_selected_ticket() {
+        let app = App {
+            overview_layout: OverviewLayout::Queue,
+            ..columns_app(2)
+        };
+        let (app, _) = update(app, Msg::ToggleOverviewLayout);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-3");
+    }
+
+    #[test]
+    fn columns_up_down_stay_within_the_selected_column() {
+        let (app, _) = update(columns_app(0), Msg::Down);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-2");
+        let (app, _) = update(app, Msg::Up);
+        let (app, _) = update(app, Msg::Up);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-1");
+    }
+
+    /// Columns run in lifecycle order (not started, running, needs input,
+    /// needs review, conflicted, ready to merge, stuck); left/right skip
+    /// empty columns and stop at the outermost non-empty one.
+    #[test]
+    fn columns_left_right_move_between_non_empty_columns() {
+        let (app, _) = update(columns_app(0), Msg::Left);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-4");
+        let (app, _) = update(app, Msg::Left);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-4");
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-1");
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-3");
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-3");
+    }
+
+    /// Moving across keeps the row position where the target column has
+    /// one, and clamps to its last card otherwise.
+    #[test]
+    fn columns_left_right_clamp_the_row_to_the_target_column() {
+        let (app, _) = update(columns_app(1), Msg::Right);
+        assert_eq!(app.selected_overview_row().unwrap().key.ticket, "GH-3");
+    }
+
+    #[test]
+    fn queue_layout_ignores_left_right() {
+        let app = App {
+            overview_layout: OverviewLayout::Queue,
+            ..columns_app(1)
+        };
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.overview_selected, 1);
+    }
+
+    #[test]
+    fn columns_navigation_on_an_empty_overview_is_a_no_op() {
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(Vec::new(), 0)
+        };
+        let (app, _) = update(app, Msg::Right);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(app.overview_selected, 0);
     }
 }
