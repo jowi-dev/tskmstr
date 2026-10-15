@@ -78,10 +78,11 @@ fn is_inert_while_rank_grabbed(key: KeyCode) -> bool {
 /// inert: refreshing would silently discard the pending, undropped reorder.
 /// `rank_grabbed` is ignored on every other screen.
 ///
-/// While the run detail overlay is shown on [`Screen::Runs`] or
-/// [`Screen::Board`] (`show_run_detail`), only `j`/`k`/arrows (scroll),
-/// `Esc`/`q` (close the overlay), and `r` (refresh) are bound; every other
-/// key is inert. `show_run_detail` is ignored on every other screen.
+/// While the run detail overlay is shown on [`Screen::Runs`],
+/// [`Screen::Board`] or [`Screen::Overview`] (`show_run_detail`), only
+/// `j`/`k`/arrows (scroll), `Esc`/`q` (close the overlay), and `r` (refresh)
+/// are bound; every other key is inert. `show_run_detail` is ignored on
+/// every other screen.
 ///
 /// `o` and `O` (shift-`o`) both open a browser, but differ in what: on
 /// [`Screen::Board`], lowercase `o` maps to [`Msg::OpenBrowserAction`], which
@@ -196,7 +197,7 @@ pub fn map_key(
         };
     }
 
-    if matches!(screen, Screen::Runs | Screen::Board) && show_run_detail {
+    if matches!(screen, Screen::Runs | Screen::Board | Screen::Overview) && show_run_detail {
         return match key {
             KeyCode::Char('j') | KeyCode::Down => Some(Msg::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::Up),
@@ -243,7 +244,9 @@ pub fn map_key(
         KeyCode::Char('m') if *screen == Screen::Board => Some(Msg::ManualSessionAction),
         KeyCode::Char('w') if *screen == Screen::Board => Some(Msg::LaneRunAction),
         KeyCode::Char('b') if *screen == Screen::Board => Some(Msg::BotsAction),
-        KeyCode::Char('v') if *screen == Screen::Board => Some(Msg::ViewRunAction),
+        KeyCode::Char('v') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ViewRunAction)
+        }
         KeyCode::Char('L') if *screen == Screen::Board => Some(Msg::ViewLogsAction),
         KeyCode::Char('V') if matches!(screen, Screen::Board | Screen::Overview) => {
             Some(Msg::ViewDiffAction)
@@ -2116,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn v_maps_to_view_run_action_on_board_only() {
+    fn v_maps_to_view_run_action_on_board_and_overview_only() {
         assert_eq!(
             map_key(
                 &Screen::Board,
@@ -2159,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_l_maps_to_view_logs_action_on_board_only() {
+    fn capital_l_maps_to_view_logs_action_on_board_and_overview_only() {
         assert_eq!(
             map_key(
                 &Screen::Board,
@@ -2884,5 +2887,37 @@ mod tests {
         }
         assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('M')), None);
         assert_eq!(plain_key(&Screen::Runs, KeyCode::Char(' ')), None);
+    }
+
+    /// GitHub issue #87: the overview's read actions reuse the board's keys.
+    #[test]
+    fn read_action_keys_on_overview() {
+        assert_eq!(
+            plain_key(&Screen::Overview, KeyCode::Char('v')),
+            Some(Msg::ViewRunAction)
+        );
+    }
+
+    #[test]
+    fn run_detail_gating_is_active_on_overview() {
+        let detail_key = |key| {
+            map_key(
+                &Screen::Overview,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                RetroOverlay::None,
+                key,
+            )
+        };
+        assert_eq!(detail_key(KeyCode::Char('j')), Some(Msg::Down));
+        assert_eq!(detail_key(KeyCode::Char('q')), Some(Msg::Back));
+        assert_eq!(detail_key(KeyCode::Tab), None);
+        assert_eq!(detail_key(KeyCode::Char('s')), None);
     }
 }
