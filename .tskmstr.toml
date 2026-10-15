@@ -1,6 +1,7 @@
 schema_version = 2
 status_on_run_start = "In Progress"
 status_on_pr = "In Review"
+status_on_merge = "Done"
 [backend]
 provider = "github"
 
