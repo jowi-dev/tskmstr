@@ -401,6 +401,31 @@ project counts its rows by stage. Only projects still in flight are shown:
 one with a live run, or a run that ended in the last 7 days, so a repo you
 stopped working in drops out on its own.
 
+The top line is a system header (GitHub issue #86) that answers "can I
+launch another lane":
+
+```
+8 lanes · cpu 240% of 10 cores · mem 6.2 GB of 32.0 GB · pressure normal · budget 9.0 GB of 24.0 GB · build slots 1/2
+```
+
+- **cpu**: the running lanes' summed CPU use, measured across each lane's
+  whole process tree every ~2 seconds, in percent of one core, against the
+  host's core count
+- **mem**: the running lanes' summed memory footprint (the latest sample the
+  reaper recorded), against the host's memory
+- **pressure**: the kernel's memory-pressure level
+- **budget**: what the running lanes count against `[work]
+  memory_budget_gb`, computed the same way launch admission computes it
+  (`off` with no budget configured)
+- **build slots**: `[work] build_slots` held right now out of the total
+  (`off` when unset or `0`)
+
+A figure that can't be read on this platform shows as `?`. Footprint and
+memory pressure are macOS-only, and CPU is read on macOS and Linux. The
+line turns red when a new lane would be refused: warn or critical pressure,
+or a budget the running lanes already fill. Budget and build slots come
+from the config of the repo you launched `tm overview` from.
+
 `j`/`k` move, `s` attaches to the highlighted ticket's session exactly as
 watch's `s` does (routed by the row's own scope), `r` refreshes, and `q`
 quits. `Tab` switches to `tm runs watch` in place and back again, keeping
