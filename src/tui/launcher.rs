@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 /// Maximum length (bytes) of the stderr snippet surfaced on a nonzero exit,
@@ -42,7 +43,22 @@ pub trait LaneLauncher {
     /// means the launcher process could not be spawned at all (e.g.
     /// `current_exe()` failed) -- distinct from the *launched* process later
     /// exiting nonzero, which [`LaunchHandle::try_finish`] reports instead.
-    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String>;
+    ///
+    /// The child inherits this process's working directory; see
+    /// [`LaneLauncher::spawn_in`] to pick another.
+    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String> {
+        self.spawn_in(argv, None)
+    }
+
+    /// [`LaneLauncher::spawn`], but run in `cwd` when it is `Some`. `tm
+    /// overview` routes its write actions this way: each child runs in the
+    /// row's own repo root, since `tm` resolves its config from the cwd
+    /// (ADR-0009 decision 6, GitHub issue #88).
+    fn spawn_in(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<Box<dyn LaunchHandle>, String>;
 }
 
 /// A launcher child in flight, polled non-blockingly for completion.
@@ -59,16 +75,31 @@ pub trait LaunchHandle {
 pub struct RealLaneLauncher;
 
 impl LaneLauncher for RealLaneLauncher {
-    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String> {
+    fn spawn_in(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<Box<dyn LaunchHandle>, String> {
         let program = std::env::current_exe().map_err(|err| err.to_string())?;
-        let child = Command::new(program)
-            .args(argv)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let child = launcher_command(&program, argv, cwd)
             .spawn()
             .map_err(|err| err.to_string())?;
         Ok(Box::new(RealLaunchHandle { child }))
     }
+}
+
+/// The [`Command`] [`RealLaneLauncher`] spawns: `program <argv...>` with
+/// piped stdout/stderr, run in `cwd` when given.
+fn launcher_command(program: &Path, argv: &[String], cwd: Option<&Path>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
 }
 
 /// Production [`LaunchHandle`]: wraps a real [`Child`], reading its captured
@@ -151,6 +182,7 @@ pub struct FakeLaneLauncher {
     spawn_result: RefCell<Result<(), String>>,
     finish_sequence: Vec<Option<Result<(), String>>>,
     calls: RefCell<Vec<Vec<String>>>,
+    cwds: RefCell<Vec<Option<std::path::PathBuf>>>,
 }
 
 impl FakeLaneLauncher {
@@ -161,6 +193,7 @@ impl FakeLaneLauncher {
             spawn_result: RefCell::new(Ok(())),
             finish_sequence: vec![Some(Ok(()))],
             calls: RefCell::new(Vec::new()),
+            cwds: RefCell::new(Vec::new()),
         }
     }
 
@@ -182,6 +215,12 @@ impl FakeLaneLauncher {
     pub fn calls(&self) -> Vec<Vec<String>> {
         self.calls.borrow().clone()
     }
+
+    /// The `cwd` of every spawn, in call order (`None` for
+    /// [`LaneLauncher::spawn`]).
+    pub fn cwds(&self) -> Vec<Option<std::path::PathBuf>> {
+        self.cwds.borrow().clone()
+    }
 }
 
 impl Default for FakeLaneLauncher {
@@ -191,8 +230,13 @@ impl Default for FakeLaneLauncher {
 }
 
 impl LaneLauncher for FakeLaneLauncher {
-    fn spawn(&self, argv: &[String]) -> Result<Box<dyn LaunchHandle>, String> {
+    fn spawn_in(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<Box<dyn LaunchHandle>, String> {
         self.calls.borrow_mut().push(argv.to_vec());
+        self.cwds.borrow_mut().push(cwd.map(Path::to_path_buf));
         self.spawn_result.borrow().clone()?;
         Ok(Box::new(FakeLaunchHandle {
             sequence: self.finish_sequence.clone(),
@@ -305,6 +349,32 @@ mod tests {
             .collect();
         let _ = fake.spawn(&argv);
         assert_eq!(fake.calls(), vec![argv]);
+    }
+
+    /// GitHub issue #88: the overview spawns its children in the row's
+    /// repo root, and the fake records where each one ran.
+    #[test]
+    fn fake_spawn_in_records_the_cwd() {
+        let fake = FakeLaneLauncher::new();
+        let _ = fake.spawn(&lane_argv());
+        let _ = fake.spawn_in(&lane_argv(), Some(std::path::Path::new("/repo")));
+        assert_eq!(
+            fake.cwds(),
+            vec![None, Some(std::path::PathBuf::from("/repo"))]
+        );
+        assert_eq!(fake.calls(), vec![lane_argv(), lane_argv()]);
+    }
+
+    #[test]
+    fn launcher_command_runs_in_the_given_cwd() {
+        let cmd = launcher_command(
+            std::path::Path::new("/bin/tm"),
+            &lane_argv(),
+            Some(std::path::Path::new("/repo")),
+        );
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/repo")));
+        let cmd = launcher_command(std::path::Path::new("/bin/tm"), &lane_argv(), None);
+        assert_eq!(cmd.get_current_dir(), None);
     }
 
     #[test]
