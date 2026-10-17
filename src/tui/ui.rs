@@ -20,11 +20,11 @@ use ratatui::widgets::{
 
 use crate::agent::AgentRunner;
 use crate::cli::runs::format_age;
-use crate::runs::overview::{OverviewRow, Stage};
+use crate::runs::overview::{LIFECYCLE_COLUMNS, OverviewRow, Stage};
 use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
-    App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column,
+    App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, OverviewLayout,
     RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator, Screen, TicketSummary,
 };
 use crate::tui::theme;
@@ -270,7 +270,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
         Screen::Overview => {
-            "j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  Tab: watch  r: refresh  q: quit"
+            "h/l/j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  c: columns/queue  Tab: watch  r: refresh  q: quit"
         }
     }
 }
@@ -848,6 +848,11 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let strip: Vec<Line> = strip.into_iter().map(Line::from).collect();
     frame.render_widget(Paragraph::new(strip).block(block("Projects")), strip_area);
 
+    if app.overview_layout == OverviewLayout::Columns {
+        draw_overview_columns(frame, app, queue_area);
+        return;
+    }
+
     let project_width = column_width(
         app.overview_rows
             .iter()
@@ -916,6 +921,72 @@ fn system_header_line(header: Option<&SystemHeader>) -> Paragraph<'static> {
         Some(header) => Span::styled(format!(" {}", header.summary()), theme::DIM),
     };
     Paragraph::new(Line::from(span))
+}
+
+/// [`OverviewLayout::Columns`] (GitHub issue #85, ADR-0009 layout 1): one
+/// bordered column per [`LIFECYCLE_COLUMNS`] stage, always all of them,
+/// each a list of two-line cards (ticket and project, then run and age) in
+/// queue order. The selected row's column gets the selected border.
+fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
+    let count = LIFECYCLE_COLUMNS.len() as u32;
+    let areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints((0..count).map(|_| Constraint::Ratio(1, count)))
+        .split(area);
+    let selected_stage = app.selected_overview_row().map(|row| row.stage);
+
+    for (stage, &column_area) in LIFECYCLE_COLUMNS.iter().zip(areas.iter()) {
+        let indices = app.overview_rows_in_stage(*stage);
+        let label = stage_label(*stage);
+        let mut chars = label.chars();
+        let title = chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+            .unwrap_or_default();
+        let is_selected_column = selected_stage == Some(*stage);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Line::from(Span::styled(
+                format!("{title} ({})", indices.len()),
+                theme::stage_style(*stage).add_modifier(Modifier::BOLD),
+            )))
+            .border_style(if is_selected_column {
+                theme::SELECTED_COLUMN_BORDER
+            } else {
+                Style::default()
+            });
+
+        let items: Vec<ListItem> = indices
+            .iter()
+            .map(|&i| {
+                let row = &app.overview_rows[i];
+                let run = match (&row.kind, row.run_status) {
+                    (Some(kind), Some(status)) => format!("{kind} {}", status.as_str()),
+                    _ => "-".to_string(),
+                };
+                let mut detail = format!("{run}  {}", format_age(row.stage_age_secs));
+                if row.pr_url.is_some() {
+                    detail.push_str("  PR");
+                }
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(row.key.ticket.clone(), theme::CARD_KEY),
+                        Span::raw(format!(" {}", project_label(&row.key.scope))),
+                    ]),
+                    Line::from(Span::styled(detail, theme::DIM)),
+                ])
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut state = ListState::default();
+        if is_selected_column {
+            state.select(indices.iter().position(|&i| i == app.overview_selected));
+        }
+        frame.render_stateful_widget(list, column_area, &mut state);
+    }
 }
 
 /// The overview's project strip: one `"{project}  {counts}"` line per scope,
@@ -4412,5 +4483,79 @@ mod tests {
         );
         assert_eq!(project_label(""), "(unscoped)");
         assert_eq!(project_label("other"), "other");
+    }
+
+    // --- Screen::Overview lifecycle columns (GitHub issue #85) ---
+
+    fn columns_app(rows: Vec<OverviewRow>) -> App {
+        App {
+            overview_layout: crate::tui::app::OverviewLayout::Columns,
+            ..overview_app(rows)
+        }
+    }
+
+    #[test]
+    fn overview_columns_title_every_stage_in_lifecycle_order() {
+        let app = columns_app(vec![overview_row(
+            "github:me/alpha",
+            "GH-1",
+            Stage::Running,
+        )]);
+        let text = buffer_text(&render_with_size(&app, 210, 24));
+        let titles = text
+            .lines()
+            .find(|line| line.contains("Not started"))
+            .expect("column titles render");
+        let order = [
+            "Not started",
+            "Running",
+            "Needs input",
+            "Needs review",
+            "Conflicted",
+            "Ready to merge",
+            "Stuck",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|t| titles.find(t).unwrap_or_else(|| panic!("{t} in {titles}")))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{titles}");
+    }
+
+    #[test]
+    fn overview_columns_put_project_tagged_cards_under_their_stage() {
+        let app = columns_app(vec![
+            overview_row("github:me/alpha", "GH-1", Stage::NeedsInput),
+            overview_row("github:me/beta", "GH-2", Stage::Stuck),
+        ]);
+        let text = buffer_text(&render_with_size(&app, 210, 24));
+        let titles = text.lines().find(|l| l.contains("Not started")).unwrap();
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
+        let needs_input_x = column(titles, "Needs input");
+        let stuck_x = column(titles, "Stuck");
+
+        let card = text.lines().find(|l| l.contains("GH-1")).unwrap();
+        let x = column(card, "GH-1");
+        assert!(needs_input_x <= x && x < stuck_x, "{text}");
+        assert!(card.contains("alpha"), "{card}");
+        let card = text.lines().find(|l| l.contains("GH-2")).unwrap();
+        assert!(column(card, "GH-2") >= stuck_x, "{text}");
+        assert!(card.contains("beta"), "{card}");
+    }
+
+    #[test]
+    fn overview_columns_keep_the_project_strip() {
+        let app = columns_app(vec![overview_row(
+            "github:me/alpha",
+            "GH-1",
+            Stage::Running,
+        )]);
+        let text = buffer_text(&render_with_size(&app, 210, 24));
+        assert!(text.contains("alpha  1 running"), "{text}");
+    }
+
+    #[test]
+    fn overview_hint_names_the_layout_key() {
+        assert!(hint_for(Screen::Overview, false).contains("c: columns/queue"));
     }
 }
