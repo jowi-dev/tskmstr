@@ -86,6 +86,10 @@ pub fn memory_pressure() -> MemoryPressure {
     imp::memory_pressure()
 }
 
+/// The direct children of a pid, shared with [`super::cpu`]'s tree walk.
+#[cfg(target_os = "macos")]
+pub(crate) use imp::child_pids;
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::MemoryPressure;
@@ -120,7 +124,7 @@ mod imp {
         Some(unsafe { info.assume_init() }.ri_phys_footprint)
     }
 
-    fn child_pids(pid: u32) -> Vec<u32> {
+    pub fn child_pids(pid: u32) -> Vec<u32> {
         let mut capacity = 64usize;
         loop {
             let mut buf: Vec<libc::pid_t> = vec![0; capacity];

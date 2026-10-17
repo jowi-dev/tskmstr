@@ -1189,6 +1189,19 @@ pub struct WatchDeps {
     /// GitHub issue #88) as watched `tm` children in each row's repo root.
     /// See [`TuiDeps::launcher`].
     pub launcher: Box<dyn crate::tui::launcher::LaneLauncher>,
+    /// The invoking repo's `[work]` memory budget, shown against the
+    /// running lanes' estimated cost in the overview's system header
+    /// (GitHub issue #86). Off without a loaded config.
+    pub memory: crate::config::MemoryConfig,
+    /// The invoking repo's `[work] build_slots`, the header's slot total.
+    /// `None` or `0` shows build slots as off.
+    pub build_slots: Option<u32>,
+    /// Where the build-slot lock files live (see
+    /// [`crate::work::build_slots::root_dir`]), probed for slots in use.
+    pub build_slot_lock_dir: std::path::PathBuf,
+    /// Keeps each lane's previous CPU reading between header samples. A
+    /// `RefCell` because commands run against `&WatchDeps`.
+    pub cpu_sampler: std::cell::RefCell<crate::runs::cpu::CpuSampler>,
 }
 
 /// Run the live runs kanban board until the user quits.
@@ -1214,7 +1227,7 @@ pub fn run_overview(deps: WatchDeps) -> Result<(), TuiError> {
     run_watch_loop(
         deps,
         crate::tui::app::Screen::Overview,
-        vec![Cmd::ReapRuns, Cmd::LoadOverview],
+        vec![Cmd::ReapRuns, Cmd::LoadOverview, Cmd::LoadSystem],
     )
 }
 
@@ -1389,6 +1402,7 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
     match cmd {
         Cmd::LoadRuns => load_runs(deps),
         Cmd::LoadOverview => load_overview(deps),
+        Cmd::LoadSystem => load_system(deps),
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
         other => {
@@ -1449,6 +1463,52 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
         }
         Err(err) => vec![Msg::RunsFailed(err.to_string())],
     }
+}
+
+/// Run `Cmd::LoadSystem`: sample the overview's system header (GitHub issue
+/// #86, ADR-0009 decision 7). Lane memory is the latest footprint the
+/// reaper recorded, CPU is sampled here per lane process tree, and the
+/// budget figure is what admission would count (see
+/// [`crate::work::admission::running_lane_estimate`]). A probe that can't
+/// read on this platform shows as unknown, never as an error.
+fn load_system(deps: &WatchDeps) -> Vec<Msg> {
+    use crate::runs::system::{BudgetUse, SlotUse, SystemHeader, lane_totals};
+    let lanes = match deps.store.running_lanes() {
+        Ok(lanes) => lanes,
+        Err(err) => return vec![Msg::RunsFailed(err.to_string())],
+    };
+    let (lane_cpu_percent, lane_mem_bytes) = lane_totals(
+        &lanes,
+        &mut deps.cpu_sampler.borrow_mut(),
+        std::time::Instant::now(),
+        &crate::runs::cpu::tree_cpu_time,
+    );
+    let budget = match deps.memory.budget_bytes {
+        Some(budget_bytes) => {
+            match crate::work::admission::running_lane_estimate(&deps.store, &deps.memory) {
+                Ok(running) => Some(BudgetUse {
+                    committed_bytes: running.bytes,
+                    budget_bytes,
+                }),
+                Err(err) => return vec![Msg::RunsFailed(err.to_string())],
+            }
+        }
+        None => None,
+    };
+    let build_slots = deps.build_slots.filter(|&n| n > 0).map(|total| SlotUse {
+        in_use: crate::work::build_slots::slots_in_use(&deps.build_slot_lock_dir, total),
+        total,
+    });
+    vec![Msg::SystemLoaded(SystemHeader {
+        lanes: lanes.len(),
+        lane_cpu_percent,
+        lane_mem_bytes,
+        host_cores: crate::runs::cpu::host_cores(),
+        host_mem_bytes: crate::runs::cpu::host_memory_bytes(),
+        pressure: crate::runs::footprint::memory_pressure(),
+        budget,
+        build_slots,
+    })]
 }
 
 /// Map a [`crate::runs::RunSummary`] to a [`crate::tui::app::RunCard`],
@@ -1672,6 +1732,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         // handled above.)
         other @ (Cmd::LoadRuns
         | Cmd::LoadOverview
+        | Cmd::LoadSystem
         | Cmd::LoadRunDetail { .. }
         | Cmd::AttachSession { .. }
         | Cmd::LaunchCreate
@@ -4015,6 +4076,10 @@ mod tests {
             idle_hibernate_mins: 0,
             kill_pid: |_| {},
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
+            memory: crate::config::MemoryConfig::default(),
+            build_slots: None,
+            build_slot_lock_dir: std::path::PathBuf::from("/nonexistent/locks"),
+            cpu_sampler: std::cell::RefCell::new(crate::runs::cpu::CpuSampler::new()),
         }
     }
 
@@ -4367,6 +4432,65 @@ mod tests {
                 assert_eq!(rows[0].stage, crate::runs::overview::Stage::Running);
             }
             other => panic!("expected OverviewLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_system_reports_lanes_budget_and_slots() {
+        use crate::runs::footprint::GIB;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&start_params("GH-1")).unwrap();
+        let deps = WatchDeps {
+            memory: crate::config::MemoryConfig {
+                budget_bytes: Some(8 * GIB),
+                default_lane_estimate_bytes: 2 * GIB,
+            },
+            build_slots: Some(3),
+            build_slot_lock_dir: dir.path().join("locks"),
+            ..watch_deps(store)
+        };
+
+        let msgs = execute_watch(&deps, Cmd::LoadSystem);
+        match msgs.as_slice() {
+            [Msg::SystemLoaded(header)] => {
+                assert_eq!(header.lanes, 1);
+                assert_eq!(
+                    header.budget,
+                    Some(crate::runs::system::BudgetUse {
+                        committed_bytes: 2 * GIB,
+                        budget_bytes: 8 * GIB,
+                    })
+                );
+                assert_eq!(
+                    header.build_slots,
+                    Some(crate::runs::system::SlotUse {
+                        in_use: 0,
+                        total: 3
+                    })
+                );
+                assert!(header.host_cores >= 1);
+            }
+            other => panic!("expected SystemLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_watch_load_system_leaves_off_settings_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let deps = WatchDeps {
+            build_slots: Some(0),
+            ..watch_deps(store)
+        };
+
+        match execute_watch(&deps, Cmd::LoadSystem).as_slice() {
+            [Msg::SystemLoaded(header)] => {
+                assert_eq!(header.lanes, 0);
+                assert_eq!(header.budget, None);
+                assert_eq!(header.build_slots, None);
+            }
+            other => panic!("expected SystemLoaded, got {other:?}"),
         }
     }
 

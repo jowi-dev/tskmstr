@@ -800,6 +800,9 @@ pub struct App {
     /// operator keeps their place across the switch. Consumed by that load
     /// whether or not the ticket is there.
     pub view_focus: Option<ViewFocus>,
+    /// [`Screen::Overview`]'s system header (GitHub issue #86), from the
+    /// latest [`Msg::SystemLoaded`]; `None` until the first sample lands.
+    pub system_header: Option<crate::runs::system::SystemHeader>,
     /// Whether the run detail floating window is shown.
     pub show_run_detail: bool,
     /// Detail for the run shown in the floating window, `None` while it's
@@ -1393,6 +1396,8 @@ pub enum Msg {
     /// [`Screen::Overview`]'s rows finished loading. A load failure
     /// reuses [`Msg::RunsFailed`]: both read the same run store.
     OverviewLoaded(Vec<crate::runs::overview::OverviewRow>),
+    /// [`Screen::Overview`]'s system header was sampled (GitHub issue #86).
+    SystemLoaded(crate::runs::system::SystemHeader),
     /// The `f` key was pressed on [`Screen::Runs`]: advance the kind view
     /// filter to the next distinct kind among the loaded runs (then back to
     /// unfiltered). See [`cycle_run_kind_filter`].
@@ -1594,6 +1599,8 @@ pub enum Cmd {
     LoadRuns,
     /// Reload [`Screen::Overview`]'s rows from the run store.
     LoadOverview,
+    /// Sample [`Screen::Overview`]'s system header (GitHub issue #86).
+    LoadSystem,
     /// Load the full detail (including its event timeline) of one run, for
     /// the run detail floating window.
     LoadRunDetail {
@@ -2017,7 +2024,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::Refresh => {
             app.status_line = "Refreshing...".to_string();
             if app.screen == Screen::Overview {
-                (app, vec![Cmd::LoadOverview])
+                (app, vec![Cmd::LoadOverview, Cmd::LoadSystem])
             } else if app.screen == Screen::Runs {
                 let mut cmds = vec![Cmd::LoadRuns];
                 if app.show_run_detail
@@ -2354,6 +2361,10 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ManualSessionAction => manual_session_action(app),
         Msg::RunSessionAction => run_session_action(app),
         Msg::ToggleOverview => toggle_overview(app),
+        Msg::SystemLoaded(header) => {
+            app.system_header = Some(header);
+            (app, Vec::new())
+        }
         Msg::OverviewLoaded(rows) => {
             overview_loaded(&mut app, rows);
             (app, Vec::new())
@@ -2979,18 +2990,18 @@ fn run_session_action(mut app: App) -> (App, Vec<Cmd>) {
 /// [`Screen::Overview`] (ADR-0009 decision 2), handing the highlighted
 /// ticket over as [`App::view_focus`] and loading the target view fresh, so
 /// the focus lands on current data rather than whatever the target view
-/// last showed. Closes the run detail window if one is open. A no-op on any
-/// other screen.
+/// last showed (the overview also samples its system header). Closes the
+/// run detail window if one is open. A no-op on any other screen.
 fn toggle_overview(mut app: App) -> (App, Vec<Cmd>) {
     use crate::runs::overview::TicketKey;
-    let (screen, focus, cmd) = match app.screen {
+    let (screen, focus, cmds) = match app.screen {
         Screen::Runs => (
             Screen::Overview,
             app.selected_run_card().map(|card| ViewFocus {
                 key: TicketKey::new(&card.scope, &card.ticket),
                 run_id: Some(card.id),
             }),
-            Cmd::LoadOverview,
+            vec![Cmd::LoadOverview, Cmd::LoadSystem],
         ),
         Screen::Overview => (
             Screen::Runs,
@@ -2998,7 +3009,7 @@ fn toggle_overview(mut app: App) -> (App, Vec<Cmd>) {
                 key: row.key.clone(),
                 run_id: row.run_id,
             }),
-            Cmd::LoadRuns,
+            vec![Cmd::LoadRuns],
         ),
         _ => return (app, Vec::new()),
     };
@@ -3006,7 +3017,7 @@ fn toggle_overview(mut app: App) -> (App, Vec<Cmd>) {
     app.view_focus = focus;
     app.show_run_detail = false;
     app.run_detail = None;
-    (app, vec![cmd])
+    (app, cmds)
 }
 
 /// Handle [`Msg::OverviewLoaded`]: replace `app.overview_rows`, keeping the
@@ -3238,6 +3249,11 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             let mut cmds = Vec::new();
             if app.watch_tick.is_multiple_of(2) {
                 cmds.push(Cmd::LoadOverview);
+            }
+            // ~2s: long enough for a steady CPU percentage, and the tree
+            // walk behind it stays cheap.
+            if app.watch_tick.is_multiple_of(8) {
+                cmds.push(Cmd::LoadSystem);
             }
             if app.watch_tick.is_multiple_of(120) {
                 cmds.push(Cmd::ReapRuns);
@@ -8480,7 +8496,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_on_overview_loads_every_second_tick_and_reaps_every_120th() {
+    fn tick_on_overview_loads_every_second_tick_samples_every_eighth_and_reaps_every_120th() {
         let app = overview_app(Vec::new(), 0);
         let (app, cmds) = update(app, Msg::Tick);
         assert!(cmds.is_empty());
@@ -8492,13 +8508,48 @@ mod tests {
             ..app
         };
         let (_, cmds) = update(app, Msg::Tick);
-        assert_eq!(cmds, vec![Cmd::LoadOverview, Cmd::ReapRuns]);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadOverview, Cmd::LoadSystem, Cmd::ReapRuns]
+        );
     }
 
     #[test]
     fn refresh_on_overview_reloads_the_overview() {
         let (_, cmds) = update(overview_app(Vec::new(), 0), Msg::Refresh);
-        assert_eq!(cmds, vec![Cmd::LoadOverview]);
+        assert_eq!(cmds, vec![Cmd::LoadOverview, Cmd::LoadSystem]);
+    }
+
+    #[test]
+    fn tick_on_overview_samples_the_system_header_every_eighth_tick() {
+        let app = App {
+            watch_tick: 7,
+            ..overview_app(Vec::new(), 0)
+        };
+        let (_, cmds) = update(app, Msg::Tick);
+        assert_eq!(cmds, vec![Cmd::LoadOverview, Cmd::LoadSystem]);
+    }
+
+    #[test]
+    fn system_loaded_replaces_the_header() {
+        use crate::runs::footprint::MemoryPressure;
+        use crate::runs::system::SystemHeader;
+        let header = SystemHeader {
+            lanes: 2,
+            lane_cpu_percent: None,
+            lane_mem_bytes: None,
+            host_cores: 4,
+            host_mem_bytes: None,
+            pressure: MemoryPressure::Unknown,
+            budget: None,
+            build_slots: None,
+        };
+        let (app, cmds) = update(
+            overview_app(Vec::new(), 0),
+            Msg::SystemLoaded(header.clone()),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(app.system_header, Some(header));
     }
 
     #[test]
@@ -8603,7 +8654,7 @@ mod tests {
 
         let (app, cmds) = update(app, Msg::ToggleOverview);
         assert_eq!(app.screen, Screen::Overview);
-        assert_eq!(cmds, vec![Cmd::LoadOverview]);
+        assert_eq!(cmds, vec![Cmd::LoadOverview, Cmd::LoadSystem]);
 
         let (app, _) = update(
             app,
