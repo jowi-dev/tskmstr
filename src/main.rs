@@ -2133,6 +2133,20 @@ fn watch_deps(
         build_slots: config.and_then(|cfg| cfg.work.build_slots),
         build_slot_lock_dir: tskmstr::work::build_slots::root_dir(&home).join("locks"),
         cpu_sampler: std::cell::RefCell::new(tskmstr::runs::cpu::CpuSampler::new()),
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~")),
+        repo_roots: tskmstr::tui::event::RepoRootCache::new(Box::new(|worktree| {
+            use tskmstr::work::git::GitOps;
+            worktree
+                .is_dir()
+                .then(|| {
+                    tskmstr::work::git::ShellGitOps::new()
+                        .repo_root(worktree)
+                        .ok()
+                })
+                .flatten()
+        })),
     }
 }
 
