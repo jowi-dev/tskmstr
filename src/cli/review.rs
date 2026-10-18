@@ -34,22 +34,28 @@
 //!      supervisor only reads back a [`crate::work::run::PreparedRun`], so it
 //!      has no notion of "lane" vs. "review-fix" runs at all.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentRunner, RunMode};
+use crate::config::AutoReviewConfig;
 use crate::github::gh_cli::GhCli;
-use crate::runs::{RunStore, RunStoreError};
+use crate::runs::{RunStatus, RunStore, RunStoreError};
+use crate::work::auto_review::{
+    AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LoopOutcome, run_loop,
+};
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
-use crate::work::git::GitOps;
+use crate::work::git::{GitError, GitOps};
 use crate::work::interactive::{
     FIX_WINDOW_NAME, InteractiveLaunchError, launch_interactive_run, resolve_action_window,
 };
+use crate::work::prompt::{PromptFileError, read_prompt_file};
 use crate::work::run::{
-    Clock, PreparedRun, RunLaneError, RunLanePaths, prepare_review_fix, run_agent_and_finish,
-    run_log_path,
+    Clock, ExistingBranchRun, PreparedRun, RunLaneError, RunLanePaths, prepare_existing_branch_run,
+    prepare_review_fix, run_agent_and_finish, run_log_path,
 };
 use crate::work::runner::ProcessSpawner;
 use crate::work::tmux::{TmuxError, TmuxOps};
@@ -125,6 +131,28 @@ pub enum ReviewCliError {
     /// the refusal to dispatch a second concurrent fix pass.
     #[error(transparent)]
     Interactive(#[from] InteractiveLaunchError),
+
+    /// `tm review auto`: an auto-review round for this ticket is already
+    /// running; a second loop would race it over the same comment store.
+    #[error("an auto-review round for {ticket} is already running (run {run_id})")]
+    AutoReviewRunning {
+        /// The ticket key.
+        ticket: String,
+        /// The running round's run id.
+        run_id: i64,
+    },
+
+    /// `tm review auto`: `[work.auto_review].prompt_file` couldn't be read.
+    #[error(transparent)]
+    PromptFile(#[from] PromptFileError),
+
+    /// `tm review auto`: resolving the worktree's git dir failed.
+    #[error(transparent)]
+    Git(#[from] GitError),
+
+    /// `tm review auto`: a round step failed.
+    #[error(transparent)]
+    AutoReview(#[from] AutoReviewError),
 }
 
 /// The result of one `tm review fix` dispatch attempt.
@@ -373,6 +401,242 @@ pub fn fix(
     Ok(FixOutcome::Dispatched { succeeded: true })
 }
 
+/// How a `tm review auto` invocation ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoOutcome {
+    /// The loop was handed to a detached `--foreground` child logging to
+    /// `log_path`.
+    Detached {
+        /// The child's log file.
+        log_path: PathBuf,
+    },
+    /// The loop ran here, to completion.
+    Finished(LoopOutcome),
+}
+
+/// The detached auto-review loop's log file for `key`:
+/// `~/.local/state/tskmstr/auto-review/<key>.log`, one per ticket.
+pub fn auto_review_log_path(home: &Path, key: &str) -> PathBuf {
+    home.join(".local")
+        .join("state")
+        .join("tskmstr")
+        .join("auto-review")
+        .join(format!("{}.log", key.to_lowercase()))
+}
+
+/// The argv a detached auto-review loop for `key` is re-exec'd with.
+pub fn detached_auto_review_argv(key: &str) -> Vec<String> {
+    vec![
+        "review".to_string(),
+        "auto".to_string(),
+        key.to_string(),
+        "--foreground".to_string(),
+    ]
+}
+
+/// The PR number at the end of a GitHub pull-request URL.
+fn pr_number_from_url(url: &str) -> Option<u64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
+/// `tm review auto <KEY> [--foreground]` (GitHub issue #124): see
+/// `docs/plans/gh-124-auto-review.md`.
+///
+/// Without `foreground`, refuses if an auto-review round for KEY is already
+/// running, then re-execs a detached `tm review auto <KEY> --foreground` in
+/// the ticket's worktree, the same shape as `tm pr watch`. With it, runs
+/// [`run_loop`] here: each review round is a headless `auto-review` run on
+/// the ticket's lane worktree and branch, and each fix round is [`fix`]
+/// with [`Dispatch::HeadlessForeground`].
+///
+/// # Errors
+///
+/// [`ReviewCliError::Runs`]/[`ReviewCliError::MissingBranch`] as for
+/// [`fix`]; [`ReviewCliError::AutoReviewRunning`] for a second loop;
+/// [`ReviewCliError::PromptFile`] for an unreadable `prompt_file`;
+/// [`ReviewCliError::AutoReview`] if any round step fails.
+pub fn auto(
+    deps: &ReviewFixDeps<'_>,
+    paths: &RunLanePaths,
+    cfg: &AutoReviewConfig,
+    key: &str,
+    foreground: bool,
+    out: &mut dyn Write,
+) -> Result<AutoOutcome, ReviewCliError> {
+    let scope = deps.backend_identity.scope();
+    let run = resolve_run(deps.run_store, Some(&scope), key, Some("lane"))?;
+    let branch = run
+        .branch
+        .clone()
+        .ok_or_else(|| ReviewCliError::MissingBranch {
+            ticket: run.ticket.clone(),
+        })?;
+    let worktree = PathBuf::from(&run.worktree);
+
+    if !foreground {
+        let live = deps.run_store.latest_run_for_ticket_kind(
+            Some(&scope),
+            &run.ticket,
+            Some(AUTO_REVIEW_KIND),
+        )?;
+        if let Some(live) = live.filter(|r| r.status == RunStatus::Running) {
+            return Err(ReviewCliError::AutoReviewRunning {
+                ticket: run.ticket.clone(),
+                run_id: live.id,
+            });
+        }
+        let log_path = auto_review_log_path(&paths.home, &run.ticket);
+        if let Some(dir) = log_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        deps.detach.spawn_detached(
+            deps.current_exe,
+            &detached_auto_review_argv(&run.ticket),
+            &worktree,
+            &log_path,
+        )?;
+        writeln!(out, "started   auto-review {} on {branch}", run.ticket)?;
+        writeln!(out, "log       {}", log_path.display())?;
+        return Ok(AutoOutcome::Detached { log_path });
+    }
+
+    let template = match (&cfg.prompt, &cfg.prompt_file) {
+        (Some(prompt), _) => prompt.clone(),
+        (None, Some(file)) => {
+            read_prompt_file(file, &paths.home, "[work.auto_review].prompt_file")?
+        }
+        (None, None) => DEFAULT_PROMPT.to_string(),
+    };
+    let git_dir = deps.git.git_dir(&worktree)?;
+    let ops = CliAutoReviewOps {
+        deps,
+        paths,
+        scope: &scope,
+        ticket: &run.ticket,
+        lane: &run.lane,
+        worktree: &worktree,
+        branch: &branch,
+        out: RefCell::new(out),
+    };
+    let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir)?;
+    let out = ops.out.into_inner();
+    writeln!(
+        out,
+        "auto-review {} finished after {} round(s): {}",
+        run.ticket,
+        outcome.rounds,
+        outcome.verdict.as_str()
+    )?;
+    Ok(AutoOutcome::Finished(outcome))
+}
+
+/// [`AutoReviewOps`] over the real run store, agent runner and `vdiff`.
+struct CliAutoReviewOps<'a, 'o> {
+    deps: &'a ReviewFixDeps<'a>,
+    paths: &'a RunLanePaths,
+    scope: &'a str,
+    ticket: &'a str,
+    lane: &'a str,
+    worktree: &'a Path,
+    branch: &'a str,
+    out: RefCell<&'o mut dyn Write>,
+}
+
+impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
+    fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
+        let deps = self.deps;
+        let prepared = prepare_existing_branch_run(
+            deps.git,
+            deps.run_store,
+            deps.clock,
+            self.paths,
+            ExistingBranchRun {
+                kind: AUTO_REVIEW_KIND,
+                scope: self.scope,
+                ticket: self.ticket,
+                lane: self.lane,
+                worktree: self.worktree,
+                branch: self.branch,
+                prompt,
+                pid: Some(std::process::id()),
+                mode: RunMode::Headless,
+            },
+            deps.runner,
+        )
+        .map_err(|e| AutoReviewError::step("review", e))?;
+        let mut out = self.out.borrow_mut();
+        writeln!(out, "auto-review round {round}: run {}", prepared.run_id)
+            .map_err(|e| AutoReviewError::step("review", e))?;
+        let outcome = run_agent_and_finish(
+            deps.spawner,
+            deps.gh,
+            deps.run_store,
+            None,
+            &prepared,
+            deps.runner,
+            &mut **out,
+        )
+        .map_err(|e| AutoReviewError::step("review", e))?;
+        if outcome.is_error {
+            return Err(AutoReviewError::step(
+                "review",
+                format!("round {round}'s agent run {} failed", prepared.run_id),
+            ));
+        }
+        Ok(prepared.run_id)
+    }
+
+    fn fix(&self) -> Result<bool, AutoReviewError> {
+        let mut out = self.out.borrow_mut();
+        match fix(
+            self.deps,
+            self.paths,
+            self.ticket,
+            Dispatch::HeadlessForeground,
+            &mut **out,
+        ) {
+            Ok(FixOutcome::Dispatched { succeeded }) => Ok(succeeded),
+            Ok(FixOutcome::NoComments) => Ok(true),
+            Err(err) => Err(AutoReviewError::step("fix", err)),
+        }
+    }
+
+    fn publish(&self) -> Result<(), AutoReviewError> {
+        let url = self
+            .deps
+            .gh
+            .pr_url_for_branch(self.branch)
+            .map_err(|e| AutoReviewError::step("publish", e))?
+            .ok_or_else(|| {
+                AutoReviewError::step("publish", format!("no PR is open for {}", self.branch))
+            })?;
+        let pr = pr_number_from_url(&url)
+            .ok_or_else(|| AutoReviewError::step("publish", format!("no PR number in {url}")))?;
+        self.deps
+            .vdiff
+            .publish_comments(self.worktree, pr)
+            .map_err(|e| AutoReviewError::step("publish", e))
+    }
+
+    fn record(&self, run_id: i64, kind: &str, detail: &str) -> Result<(), AutoReviewError> {
+        self.deps
+            .run_store
+            .add_event(run_id, kind, Some(detail))
+            .map(|_| ())
+            .map_err(|e| AutoReviewError::step("record", e))
+    }
+
+    fn flag(&self, run_id: i64) -> Result<(), AutoReviewError> {
+        self.deps
+            .run_store
+            .flag_for_review(run_id)
+            .map_err(|e| AutoReviewError::step("record", e))
+    }
+
+    fn now_unix_secs(&self) -> i64 {
+        self.deps.clock.now_unix_secs()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,5 +1260,235 @@ mod tests {
         assert!(detach.recorded.lock().unwrap().is_empty());
         // Only the seeded lane run -- no review-fix row was created.
         assert_eq!(run_store.list_runs().unwrap().len(), 1);
+    }
+
+    // --- tm review auto (GitHub issue #124) ---
+
+    /// A fake agent: writes `findings` to `findings_file` (round 1's), then
+    /// defers to a [`FakeProcessSpawner`] for the result JSON.
+    struct FindingsWritingSpawner {
+        inner: FakeProcessSpawner,
+        findings_file: PathBuf,
+        findings: &'static str,
+    }
+
+    impl ProcessSpawner for FindingsWritingSpawner {
+        fn spawn(
+            &self,
+            request: crate::work::runner::SpawnRequest<'_>,
+        ) -> Result<std::process::ExitStatus, crate::work::runner::SpawnError> {
+            std::fs::write(&self.findings_file, self.findings).unwrap();
+            self.inner.spawn(request)
+        }
+    }
+
+    struct AutoFakes {
+        git: FakeGitOps,
+        gh: FakeGhCli,
+        clock: FakeClock,
+        vdiff: FakeVdiffOps,
+        detach: FakeDetachSpawner,
+        tmux: FakeTmuxOps,
+        current_exe: PathBuf,
+        run_db_path: PathBuf,
+    }
+
+    fn auto_fakes(tmp: &TempDir) -> AutoFakes {
+        AutoFakes {
+            git: FakeGitOps::new(),
+            gh: FakeGhCli::new(),
+            clock: FakeClock((2026, 8, 18, 10, 0, 0)),
+            vdiff: FakeVdiffOps::with_export(Ok("## src/a.rs\n\ncomment".to_string())),
+            detach: FakeDetachSpawner::new(4242),
+            tmux: FakeTmuxOps::new(),
+            current_exe: PathBuf::from("/usr/local/bin/tm"),
+            run_db_path: tmp.path().join("runs.db"),
+        }
+    }
+
+    fn auto_deps<'a>(
+        fakes: &'a AutoFakes,
+        run_store: &'a RunStore,
+        spawner: &'a dyn ProcessSpawner,
+    ) -> ReviewFixDeps<'a> {
+        ReviewFixDeps {
+            git: &fakes.git,
+            gh: &fakes.gh,
+            spawner,
+            run_store,
+            clock: &fakes.clock,
+            vdiff: &fakes.vdiff,
+            detach: &fakes.detach,
+            current_exe: &fakes.current_exe,
+            run_db_path: &fakes.run_db_path,
+            tmux: &fakes.tmux,
+            backend_identity: test_identity(),
+            runner: &ClaudeRunner,
+        }
+    }
+
+    #[test]
+    fn auto_detaches_a_foreground_child_in_the_worktree() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let paths = paths(&tmp);
+        let mut out = Vec::new();
+
+        let outcome = auto(
+            &deps,
+            &paths,
+            &AutoReviewConfig::default(),
+            "proj-1",
+            false,
+            &mut out,
+        )
+        .unwrap();
+
+        let log_path = auto_review_log_path(&paths.home, "PROJ-1");
+        assert_eq!(
+            outcome,
+            AutoOutcome::Detached {
+                log_path: log_path.clone()
+            }
+        );
+        let recorded = fakes.detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].argv,
+            vec!["review", "auto", "PROJ-1", "--foreground"]
+        );
+        assert_eq!(recorded[0].working_dir, worktree);
+        assert_eq!(recorded[0].log_path, log_path);
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_refuses_a_second_loop_while_a_round_is_running() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        run_store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: Some("jowi-dev/proj-1-slug".to_string()),
+                pid: None,
+                kind: AUTO_REVIEW_KIND.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let err = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ReviewCliError::AutoReviewRunning { .. }));
+        assert!(fakes.detach.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_foreground_runs_a_clean_round_and_records_it() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = auto_fakes(&tmp);
+        let git_dir = worktree.join(".git");
+        let findings_file = crate::work::auto_review::findings_path(&git_dir, 1);
+        let spawner = FindingsWritingSpawner {
+            inner: FakeProcessSpawner::success(canned_json()),
+            findings_file,
+            findings: r#"[{"path": "src/a.rs", "start_line": 2,
+                "severity": "LOW", "specialist": "pedantic", "body": "typo"}]"#,
+        };
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoOutcome::Finished(LoopOutcome {
+                rounds: 1,
+                verdict: crate::work::auto_review::RoundVerdict::Clean,
+            })
+        );
+        let round = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(round.worktree, worktree.to_string_lossy());
+        assert_eq!(round.branch, Some("jowi-dev/proj-1-slug".to_string()));
+        let events = run_store.events_for_run(round.id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "auto_review_round" && e.detail.as_deref() == Some("1/2 clean"))
+        );
+        let args = &spawner.inner.recorded.lock().unwrap()[0].args;
+        assert!(args.iter().any(|a| a.contains("thatch-code-review")));
+        let store = crate::work::comment_store::load(&git_dir).unwrap();
+        assert_eq!(store[0]["text"], "[auto-review · pedantic · LOW] typo");
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none(),
+            "a LOW finding never triggers a fix"
+        );
+    }
+
+    #[test]
+    fn auto_foreground_errors_when_the_agent_writes_no_findings() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let err = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ReviewCliError::AutoReview(AutoReviewError::Findings { .. })
+        ));
+    }
+
+    #[test]
+    fn pr_number_from_url_takes_the_trailing_number() {
+        assert_eq!(
+            pr_number_from_url("https://github.com/o/r/pull/131"),
+            Some(131)
+        );
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/"), None);
     }
 }
