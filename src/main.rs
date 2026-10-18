@@ -1309,6 +1309,8 @@ fn run_ticket(
                 body,
                 status,
                 no_transition,
+                audited,
+                audit_notes,
             }),
         ) => {
             let config = config::load(paths)?;
@@ -1322,6 +1324,8 @@ fn run_ticket(
                 body,
                 status,
                 no_transition,
+                audited,
+                audit_notes,
             };
             let mut prompter = RealPrompter;
             let mut stdout = std::io::stdout();

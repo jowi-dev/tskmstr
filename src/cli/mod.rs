@@ -499,6 +499,16 @@ pub enum TicketCmd {
         /// `status_on_create` is configured. Conflicts with `--status`.
         #[arg(long)]
         no_transition: bool,
+        /// Record a passing (`ready`) audit for the new ticket, so `tm ready`
+        /// can pick it up without a separate `tm ticket audit --record
+        /// ready`. Pass only once a human has confirmed the ticket is
+        /// well-defined.
+        #[arg(long)]
+        audited: bool,
+        /// Notes for the `--audited` audit row. Defaults to "audited at
+        /// creation".
+        #[arg(long, requires = "audited")]
+        audit_notes: Option<String>,
     },
     /// Move a ticket to a workflow status, or list its available
     /// transitions.
@@ -1444,6 +1454,7 @@ mod tests {
                         body,
                         status,
                         no_transition,
+                        ..
                     }) => {
                         assert_eq!(title, Some("Fix it".to_string()));
                         assert_eq!(body, Some("Details".to_string()));
@@ -1458,6 +1469,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_ticket_create_audited_with_notes() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "ticket",
+            "create",
+            "--audited",
+            "--audit-notes",
+            "looks right",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Ticket {
+                cmd:
+                    Some(TicketCmd::Create {
+                        audited,
+                        audit_notes,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert!(audited);
+                assert_eq!(audit_notes.as_deref(), Some("looks right"));
+            }
+            other => panic!("expected Ticket Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_create_audit_notes_requires_audited() {
+        let err = Cli::try_parse_from(["tm", "ticket", "create", "--audit-notes", "x"])
+            .expect_err("--audit-notes without --audited");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn parses_ticket_create_with_no_flags() {
         let cli = Cli::try_parse_from(["tm", "ticket", "create"]).expect("should parse");
         match cli.command {
@@ -1469,6 +1515,7 @@ mod tests {
                         body,
                         status,
                         no_transition,
+                        ..
                     }),
             }) => {
                 assert_eq!(title, None);
