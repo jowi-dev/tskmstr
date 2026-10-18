@@ -19,6 +19,13 @@ bold/italic emphasis for scanning, and no invented requirements.
 Record the detailed plan and background you gathered in thatch memory so a later
 session can recall it. Keep the ticket body itself concise and readable.
 
+## File it, audited only on sign-off
+
+`tm ready` only offers a ticket with a passing audit. Pass `--audited` to
+`tm ticket create` only when the human confirms the draft is well-defined; never
+certify a ticket you drafted on your own. Without that confirmation, file it
+without `--audited` and it waits for `tm ticket audit`.
+
 ## Repo-specific context
 
 This is **tskmstr** (`tm`), a Rust CLI + ratatui TUI that links Jira/GitHub
@@ -81,6 +88,9 @@ keys look like `GH-56`). Default branch is `main`; PR branches are named
    `status_on_create = "In Progress"`, and a board-created ticket belongs in
    the backlog so `tm ready` and a lane run can pick it up. Do not pass
    `--no-transition`; that leaves the issue with no `tm:status/*` label.
+
+   Add `--audited` (and optionally `--audit-notes "<why>"`) only once the
+   operator has confirmed the draft is well-defined; see above.
 2. Label and assign after filing (`tm ticket create` has no label flag):
 
    ```

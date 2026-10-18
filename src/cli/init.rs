@@ -652,6 +652,13 @@ bold/italic emphasis for scanning, and no invented requirements.
 Record the detailed plan and background you gathered in thatch memory so a later
 session can recall it. Keep the ticket body itself concise and readable.
 
+## File it, audited only on sign-off
+
+`tm ready` only offers a ticket with a passing audit. Pass `--audited` to
+`tm ticket create` only when the human confirms the draft is well-defined; never
+certify a ticket you drafted on your own. Without that confirmation, file it
+without `--audited` and it waits for `tm ticket audit`.
+
 ## Repo-specific context
 
 <!-- TODO: fill in this repo's ticket conventions, labels, templates, and any
@@ -3334,6 +3341,10 @@ mod tests {
         assert!(
             create.contains("## Repo-specific context"),
             "create.md must have the context marker: {create}"
+        );
+        assert!(
+            create.contains("--audited") && create.contains("confirms"),
+            "create.md must gate --audited on human confirmation: {create}"
         );
 
         // audit.md: thatch memory recall + write-back + thatch-ticket-description skill
