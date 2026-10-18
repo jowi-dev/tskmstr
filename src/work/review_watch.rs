@@ -120,6 +120,15 @@ pub trait CleanupLauncher {
     fn launch_cleanup(&self, key: &str);
 }
 
+/// Seam for chaining `tm review auto` (GitHub issue #124) once a tick finds
+/// every bot done with nothing unresolved. Same failure contract as
+/// [`CleanupLauncher`]: the run is already finished, so the implementation
+/// reports its own failures.
+pub trait AutoReviewLauncher {
+    /// Launch the auto-review loop for ticket `key`.
+    fn launch_auto_review(&self, key: &str);
+}
+
 /// Dependencies [`poll_once`]/[`run_poll_loop`] need, gathered so callers
 /// don't have to thread five separate parameters through every call, mirroring
 /// [`crate::work::run::RunLaneDeps`]'s shape.
@@ -134,6 +143,9 @@ pub struct PollDeps<'a> {
     pub sleeper: &'a dyn Sleeper,
     /// Cleanup-session launch seam, invoked when `on_bots_done == Launch`.
     pub cleanup_launcher: &'a dyn CleanupLauncher,
+    /// Auto-review launch seam, invoked after a clean bots-done tick. `None`
+    /// unless `[work.auto_review].auto` is on.
+    pub auto_review_launcher: Option<&'a dyn AutoReviewLauncher>,
 }
 
 /// Everything one tick (or the driving loop) needs to know about *this*
@@ -273,6 +285,9 @@ pub fn poll_once(
                 ..FinishRun::default()
             },
         )?;
+        if let Some(launcher) = deps.auto_review_launcher {
+            launcher.launch_auto_review(req.ticket);
+        }
         return Ok(TickOutcome::Finished(PollOutcome::Handled));
     }
 
@@ -620,6 +635,25 @@ impl CleanupLauncher for FakeCleanupLauncher {
     }
 }
 
+/// An [`AutoReviewLauncher`] test double that records calls.
+#[derive(Debug, Default)]
+pub struct FakeAutoReviewLauncher {
+    calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeAutoReviewLauncher {
+    /// The ticket keys passed to `launch_auto_review`, in call order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl AutoReviewLauncher for FakeAutoReviewLauncher {
+    fn launch_auto_review(&self, key: &str) {
+        self.calls.borrow_mut().push(key.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +697,7 @@ mod tests {
         clock: FakeClock,
         sleeper: FakeSleeper,
         cleanup: FakeCleanupLauncher,
+        auto_review: FakeAutoReviewLauncher,
         home: PathBuf,
         run_id: i64,
         cfg: ReviewWatchConfig,
@@ -680,6 +715,7 @@ mod tests {
                 clock: FakeClock::at(1_000),
                 sleeper: FakeSleeper::default(),
                 cleanup: FakeCleanupLauncher::default(),
+                auto_review: FakeAutoReviewLauncher::default(),
                 home: PathBuf::from("/Users/jowi"),
                 run_id,
                 cfg: config(),
@@ -693,6 +729,7 @@ mod tests {
                 clock: &self.clock,
                 sleeper: &self.sleeper,
                 cleanup_launcher: &self.cleanup,
+                auto_review_launcher: Some(&self.auto_review),
             }
         }
 
@@ -999,6 +1036,65 @@ mod tests {
         poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
 
         assert_eq!(fx.cleanup.calls(), vec!["PROJ-1".to_string()]);
+    }
+
+    // --- auto-review chaining (GitHub issue #124) ---
+
+    fn bots_reviewed(fx: &mut Fixture, threads: Vec<crate::github::bot_findings::ReviewThread>) {
+        fx.gh = std::mem::take(&mut fx.gh)
+            .with_pr_state(42, Ok(PrLifecycle::Open))
+            .with_pr_reviews(
+                42,
+                Ok(vec![PrReview {
+                    author_login: Some("cursor[bot]".to_string()),
+                }]),
+            )
+            .with_review_threads(42, Ok(threads))
+            .with_pr_bot_finding_details(42, Ok(vec![finding_detail(false, "cursor", "fix this")]));
+    }
+
+    #[test]
+    fn poll_once_clean_bots_done_launches_auto_review() {
+        let bots = cursor_bot();
+        let mut fx = Fixture::new();
+        bots_reviewed(&mut fx, vec![]);
+        let mut req = fx.req();
+        req.bot_logins = &bots;
+
+        poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
+
+        assert_eq!(fx.auto_review.calls(), vec!["PROJ-1".to_string()]);
+    }
+
+    #[test]
+    fn poll_once_with_unresolved_findings_does_not_launch_auto_review() {
+        let bots = cursor_bot();
+        let mut fx = Fixture::new();
+        bots_reviewed(
+            &mut fx,
+            vec![crate::github::bot_findings::ReviewThread {
+                is_resolved: false,
+                author_login: Some("cursor".to_string()),
+            }],
+        );
+        let home_dir = tempdir().unwrap();
+        let mut req = fx.req();
+        req.bot_logins = &bots;
+        req.home = home_dir.path();
+
+        poll_once(&fx.deps(), &req, &mut Vec::new()).unwrap();
+
+        assert!(fx.auto_review.calls().is_empty());
+    }
+
+    #[test]
+    fn poll_once_merged_pr_does_not_launch_auto_review() {
+        let mut fx = Fixture::new();
+        fx.gh = std::mem::take(&mut fx.gh).with_pr_state(42, Ok(PrLifecycle::Merged));
+
+        poll_once(&fx.deps(), &fx.req(), &mut Vec::new()).unwrap();
+
+        assert!(fx.auto_review.calls().is_empty());
     }
 
     // --- run_poll_loop: backoff / give-up ---

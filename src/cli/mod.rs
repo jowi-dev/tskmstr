@@ -316,6 +316,23 @@ pub enum ReviewCmd {
         #[arg(long)]
         fg: bool,
     },
+    /// Run thatch auto-review rounds over KEY's PR branch.
+    ///
+    /// Each round reviews the branch headlessly (`thatch-code-review`, then
+    /// `thatch-review-followup`), writes the confirmed findings into the
+    /// worktree's vdiff comment store, and runs `tm review fix` when any
+    /// finding is at or above `[work.auto_review].fix_threshold`. Stops when
+    /// a round is clean, or flags the ticket for review at
+    /// `max_review_rounds`. Detaches by default, logging to
+    /// `~/.local/state/tskmstr/auto-review/<key>.log`.
+    Auto {
+        /// Ticket key whose lane-run worktree to review, e.g. `GH-124`
+        /// (case-insensitive).
+        key: String,
+        /// Run the loop in this process instead of detaching it.
+        #[arg(long)]
+        foreground: bool,
+    },
 }
 
 /// `tm work` subcommands.
@@ -3037,6 +3054,21 @@ mod tests {
                 assert!(!fg, "--headless alone does not wait for the run");
             }
             other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_auto_with_foreground() {
+        let cli = Cli::try_parse_from(["tm", "review", "auto", "GH-124", "--foreground"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Review {
+                cmd: ReviewCmd::Auto { key, foreground },
+            }) => {
+                assert_eq!(key, "GH-124");
+                assert!(foreground);
+            }
+            other => panic!("expected Review Auto, got {other:?}"),
         }
     }
 

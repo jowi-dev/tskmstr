@@ -1563,6 +1563,76 @@ pub fn prepare_review_fix(
     mode: RunMode,
     runner: &dyn AgentRunner,
 ) -> Result<PreparedRun, ReviewFixError> {
+    prepare_existing_branch_run(
+        git,
+        run_store,
+        clock,
+        paths,
+        ExistingBranchRun {
+            kind: "review-fix",
+            scope,
+            ticket,
+            lane,
+            worktree,
+            branch,
+            prompt,
+            pid,
+            mode,
+        },
+        runner,
+    )
+}
+
+/// What [`prepare_existing_branch_run`] starts: an agent run of `kind` on
+/// a ticket's existing worktree and branch.
+pub struct ExistingBranchRun<'a> {
+    /// The run row's `kind`, e.g. `review-fix` or `auto-review`.
+    pub kind: &'a str,
+    /// See [`crate::runs::Run::scope`].
+    pub scope: &'a str,
+    /// The ticket key.
+    pub ticket: &'a str,
+    /// The ticket's lane.
+    pub lane: &'a str,
+    /// The ticket's existing worktree.
+    pub worktree: &'a Path,
+    /// The ticket's existing branch.
+    pub branch: &'a str,
+    /// The agent's prompt.
+    pub prompt: String,
+    /// See [`prepare_review_fix`]'s `pid`.
+    pub pid: Option<u32>,
+    /// Headless or interactive.
+    pub mode: RunMode,
+}
+
+/// [`prepare_review_fix`]'s body for any run `kind`: the same clean-worktree
+/// check, hook deployment, run row and invocation, with no worktree
+/// provisioning and no branch cut. `tm review auto` (GitHub issue #124)
+/// starts its review rounds through this as `kind = "auto-review"`.
+///
+/// # Errors
+///
+/// See [`prepare_review_fix`].
+pub fn prepare_existing_branch_run(
+    git: &dyn GitOps,
+    run_store: &RunStore,
+    clock: &dyn Clock,
+    paths: &RunLanePaths,
+    run: ExistingBranchRun<'_>,
+    runner: &dyn AgentRunner,
+) -> Result<PreparedRun, ReviewFixError> {
+    let ExistingBranchRun {
+        kind,
+        scope,
+        ticket,
+        lane,
+        worktree,
+        branch,
+        prompt,
+        pid,
+        mode,
+    } = run;
     if !git.status_is_clean(worktree)? {
         return Err(ReviewFixError::WorktreeDirty(worktree.to_path_buf()));
     }
@@ -1576,7 +1646,7 @@ pub fn prepare_review_fix(
         worktree: worktree.to_string_lossy().into_owned(),
         branch: Some(branch.to_string()),
         pid,
-        kind: "review-fix".to_string(),
+        kind: kind.to_string(),
         log_path: None,
     })?;
 
@@ -1584,7 +1654,7 @@ pub fn prepare_review_fix(
     // pre-registered row by running `tm runs register` itself.
     let prompt = match mode {
         RunMode::Headless => prompt,
-        RunMode::Interactive => interactive_prompt("review-fix", ticket, &prompt),
+        RunMode::Interactive => interactive_prompt(kind, ticket, &prompt),
     };
 
     let invocation = runner.build_invocation(InvocationInputs {
@@ -1600,7 +1670,7 @@ pub fn prepare_review_fix(
     let (year, month, day, hour, min, sec) = clock.now_parts();
     let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);
     std::fs::create_dir_all(&paths.state_dir)?;
-    let wt_name = format!("{}-review-fix", ticket.to_lowercase());
+    let wt_name = format!("{}-{kind}", ticket.to_lowercase());
     let out_json_path = paths.state_dir.join(format!("{wt_name}-{timestamp}.json"));
 
     Ok(PreparedRun {
@@ -2235,6 +2305,7 @@ mod tests {
             create: crate::config::CreateConfig::default(),
             merge: crate::config::MergeConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
+            auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),
             memory: crate::config::MemoryConfig::default(),
         }
@@ -6934,6 +7005,43 @@ mod tests {
         // No worktree provisioning and no branch cut -- this is the whole
         // point of prepare_review_fix over prepare_run_lane.
         assert!(git.provision_worktree_calls().is_empty());
+        assert!(git.switch_new_branch_calls().is_empty());
+    }
+
+    #[test]
+    fn prepare_existing_branch_run_records_the_given_kind() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let prepared = prepare_existing_branch_run(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            ExistingBranchRun {
+                kind: "auto-review",
+                scope: "",
+                ticket: "PROJ-1",
+                lane: "mylane",
+                worktree: &worktree,
+                branch: "jowi-dev/proj-1-slug",
+                prompt: "review it".to_string(),
+                pid: Some(77),
+                mode: RunMode::Headless,
+            },
+            &ClaudeRunner,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.kind, "auto-review");
+        assert_eq!(run.pid, Some(77));
+        assert_eq!(prepared.wt_name, "proj-1-auto-review");
         assert!(git.switch_new_branch_calls().is_empty());
     }
 

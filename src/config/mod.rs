@@ -411,6 +411,9 @@ pub struct RawWorkConfig {
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
+    /// `[work.auto_review]` settings for `tm review auto` (GitHub issue
+    /// #124). See [`RawAutoReviewConfig`].
+    pub auto_review: Option<RawAutoReviewConfig>,
     /// `[work.manual]` settings for the board's manual-session key. See
     /// [`RawManualConfig`].
     ///
@@ -626,6 +629,32 @@ pub struct RawReviewWatchConfig {
     pub auto_arm: Option<bool>,
 }
 
+/// Raw, partially-specified `[work.auto_review]` subsection as parsed
+/// directly from TOML. See `docs/plans/gh-124-auto-review.md`.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawAutoReviewConfig {
+    /// Prompt template for each review round, with `{key}`, `{round}`,
+    /// `{skill}`, `{findings_file}` and `{archive}` replaced. Defaults to
+    /// the built-in `crate::work::auto_review::DEFAULT_PROMPT` when unset.
+    pub prompt: Option<String>,
+    /// File form of [`RawAutoReviewConfig::prompt`], resolved like
+    /// [`RawReviewWatchConfig::prompt_file`]. Setting both is a
+    /// [`ConfigError::PromptSourceConflict`].
+    pub prompt_file: Option<String>,
+    /// Lowest finding severity that triggers a `tm review fix` round:
+    /// `"low"`, `"medium"`, `"high"` or `"blocking"`. Defaults to
+    /// `"medium"`; an unrecognized value is a [`ConfigError`].
+    pub fix_threshold: Option<String>,
+    /// Review rounds before the loop stops and flags the row. Defaults to 2.
+    pub max_review_rounds: Option<u32>,
+    /// Whether each round's comments are posted to the PR with
+    /// `vdiff --publish-comments <pr>`. Defaults to `false`.
+    pub publish: Option<bool>,
+    /// Whether a finished `tm pr watch` launches `tm review auto` on its
+    /// own. Defaults to `false`.
+    pub auto: Option<bool>,
+}
+
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
 /// directly from TOML.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -788,6 +817,8 @@ pub struct WorkConfig {
     pub merge: MergeConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
+    /// Validated `[work.auto_review]` settings. See [`AutoReviewConfig`].
+    pub auto_review: AutoReviewConfig,
     /// Validated `[work.manual]` settings. See [`ManualConfig`]; empty (no
     /// windows, action disabled) when the `[work.manual]` section is absent
     /// from both global and repo config.
@@ -991,6 +1022,75 @@ impl Default for ReviewWatchConfig {
     }
 }
 
+/// Validated `[work.auto_review]` settings. Every field but the prompt
+/// source carries a concrete value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReviewConfig {
+    /// See [`RawAutoReviewConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawAutoReviewConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// See [`RawAutoReviewConfig::fix_threshold`]. Defaults to
+    /// [`Severity::Medium`].
+    pub fix_threshold: Severity,
+    /// See [`RawAutoReviewConfig::max_review_rounds`]. Defaults to 2.
+    pub max_review_rounds: u32,
+    /// See [`RawAutoReviewConfig::publish`]. Defaults to `false`.
+    pub publish: bool,
+    /// See [`RawAutoReviewConfig::auto`]. Defaults to `false`.
+    pub auto: bool,
+}
+
+impl Default for AutoReviewConfig {
+    fn default() -> Self {
+        AutoReviewConfig {
+            prompt: None,
+            prompt_file: None,
+            fix_threshold: Severity::Medium,
+            max_review_rounds: 2,
+            publish: false,
+            auto: false,
+        }
+    }
+}
+
+/// A review finding's severity, thatch's synthesizer scale, ordered low to
+/// high so a threshold is a plain `>=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Worth seeing, never worth a fix round on its own by default.
+    Low,
+    /// The default fix threshold.
+    Medium,
+    /// A real defect.
+    High,
+    /// Must be fixed before merge.
+    Blocking,
+}
+
+impl Severity {
+    /// Upper-case label, as written into comment text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Low => "LOW",
+            Severity::Medium => "MEDIUM",
+            Severity::High => "HIGH",
+            Severity::Blocking => "BLOCKING",
+        }
+    }
+
+    /// Parses a severity name, ignoring case. `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(Severity::Low),
+            "medium" => Some(Severity::Medium),
+            "high" => Some(Severity::High),
+            "blocking" => Some(Severity::Blocking),
+            _ => None,
+        }
+    }
+}
+
 /// What to do once a `tm pr watch` run finds every configured bot has
 /// reviewed and left unresolved findings. See [`RawReviewWatchConfig::on_bots_done`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1112,6 +1212,15 @@ pub enum ConfigError {
         "invalid [work.review_watch].on_bots_done value `{value}`; expected \"notify\" or \"launch\""
     )]
     InvalidOnBotsDone {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[work.auto_review] fix_threshold` was not a known severity.
+    #[error(
+        "invalid [work.auto_review].fix_threshold value `{value}`; expected \"low\", \"medium\", \"high\" or \"blocking\""
+    )]
+    InvalidFixThreshold {
         /// The unrecognized value as written in config.
         value: String,
     },
@@ -1720,6 +1829,7 @@ fn merge_work(
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
+    let auto_review = merge_auto_review(global.auto_review, repo.auto_review, repo_dir)?;
     // Fallbacks applied here, not inside merge_review_watch: [work.audit] and
     // [work.review_watch] are otherwise merged independently, field by
     // field, within their own section; only `dir` and `model` reach across
@@ -1785,6 +1895,7 @@ fn merge_work(
         create,
         merge,
         review_watch,
+        auto_review,
         manual,
         memory,
     })
@@ -2042,6 +2153,53 @@ fn merge_review_watch(
             .unwrap_or(ReviewWatchConfig::default().max_wait_mins),
         on_bots_done,
         auto_arm: repo.auto_arm.or(global.auto_arm).unwrap_or(false),
+    })
+}
+
+/// Merge a repo-local `[work.auto_review]` section on top of a global one,
+/// field by field, with the same `prompt`/`prompt_file` rules as
+/// [`merge_review_watch`].
+fn merge_auto_review(
+    global: Option<RawAutoReviewConfig>,
+    repo: Option<RawAutoReviewConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<AutoReviewConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+    let defaults = AutoReviewConfig::default();
+
+    let fix_threshold = match repo.fix_threshold.or(global.fix_threshold) {
+        Some(value) => Severity::parse(&value).ok_or_else(|| ConfigError::InvalidFixThreshold {
+            value: value.clone(),
+        })?,
+        None => defaults.fix_threshold,
+    };
+
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = prompt_file
+        .map(|value| resolve_repo_path(&value, prompt_file_dir, "work.auto_review.prompt_file"))
+        .transpose()?;
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.auto_review",
+        });
+    }
+
+    Ok(AutoReviewConfig {
+        prompt,
+        prompt_file,
+        fix_threshold,
+        max_review_rounds: repo
+            .max_review_rounds
+            .or(global.max_review_rounds)
+            .unwrap_or(defaults.max_review_rounds),
+        publish: repo.publish.or(global.publish).unwrap_or(defaults.publish),
+        auto: repo.auto.or(global.auto).unwrap_or(defaults.auto),
     })
 }
 
@@ -4160,6 +4318,104 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidOnBotsDone { .. }));
     }
 
+    fn load_global_toml(body: &str) -> Result<Config, ConfigError> {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            format!(
+                r#"
+                jira_base_url = "https://global.atlassian.net"
+                jira_email = "global@example.com"
+                default_project_key = "GLOBAL"
+                {body}
+                "#
+            ),
+        )
+        .unwrap();
+        load(&ConfigPaths {
+            global: global_path,
+            repo: None,
+        })
+    }
+
+    #[test]
+    fn load_auto_review_section_absent_uses_defaults() {
+        let cfg = load_global_toml("").expect("should load");
+
+        let auto = &cfg.work.auto_review;
+        assert_eq!(auto, &AutoReviewConfig::default());
+        assert_eq!(auto.fix_threshold, Severity::Medium);
+        assert_eq!(auto.max_review_rounds, 2);
+        assert!(!auto.publish);
+        assert!(!auto.auto);
+        assert_eq!(auto.prompt, None);
+        assert_eq!(auto.prompt_file, None);
+    }
+
+    #[test]
+    fn load_auto_review_section_parses_every_field() {
+        let cfg = load_global_toml(
+            r#"
+            [work.auto_review]
+            prompt = "review {key}"
+            fix_threshold = "high"
+            max_review_rounds = 3
+            publish = true
+            auto = true
+            "#,
+        )
+        .expect("should load");
+
+        let auto = &cfg.work.auto_review;
+        assert_eq!(auto.prompt.as_deref(), Some("review {key}"));
+        assert_eq!(auto.fix_threshold, Severity::High);
+        assert_eq!(auto.max_review_rounds, 3);
+        assert!(auto.publish);
+        assert!(auto.auto);
+    }
+
+    #[test]
+    fn load_auto_review_bad_fix_threshold_is_a_config_error() {
+        let err = load_global_toml(
+            r#"
+            [work.auto_review]
+            fix_threshold = "spicy"
+            "#,
+        )
+        .expect_err("should reject an unknown severity");
+        assert!(matches!(err, ConfigError::InvalidFixThreshold { value } if value == "spicy"));
+    }
+
+    #[test]
+    fn load_auto_review_prompt_and_prompt_file_conflict() {
+        let err = load_global_toml(
+            r#"
+            [work.auto_review]
+            prompt = "review {key}"
+            prompt_file = "/abs/auto-review.md"
+            "#,
+        )
+        .expect_err("prompt and prompt_file together are ambiguous");
+        assert!(matches!(
+            err,
+            ConfigError::PromptSourceConflict {
+                section: "work.auto_review"
+            }
+        ));
+    }
+
+    #[test]
+    fn severity_parses_case_insensitively_and_orders_low_to_blocking() {
+        assert_eq!(Severity::parse("MEDIUM"), Some(Severity::Medium));
+        assert_eq!(Severity::parse("blocking"), Some(Severity::Blocking));
+        assert_eq!(Severity::parse("nope"), None);
+        assert!(Severity::Low < Severity::Medium);
+        assert!(Severity::Medium < Severity::High);
+        assert!(Severity::High < Severity::Blocking);
+        assert_eq!(Severity::High.as_str(), "HIGH");
+    }
+
     #[test]
     fn lane_with_repo_present_is_valid() {
         let mut lanes = BTreeMap::new();
@@ -4269,6 +4525,7 @@ mod tests {
             create: None,
             merge: None,
             review_watch: None,
+            auto_review: None,
             manual: None,
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
@@ -4287,6 +4544,7 @@ mod tests {
             create: None,
             merge: None,
             review_watch: None,
+            auto_review: None,
             manual: None,
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,

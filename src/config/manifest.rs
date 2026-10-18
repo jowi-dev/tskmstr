@@ -198,6 +198,38 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #124. `tm review auto` is opt-in and every key has a
+    // built-in default, so none is suggested and none is ever reported.
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "prompt_file"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "fix_threshold"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "max_review_rounds"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "publish"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "auto"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -257,6 +289,22 @@ mod tests {
     fn default_value_renders_as_a_toml_literal() {
         assert_eq!(DefaultValue::Str("In Review").to_string(), "\"In Review\"");
         assert_eq!(DefaultValue::Bool(true).to_string(), "true");
+    }
+
+    #[test]
+    fn auto_review_keys_are_registered_without_defaults() {
+        for key in [
+            "prompt_file",
+            "fix_threshold",
+            "max_review_rounds",
+            "publish",
+            "auto",
+        ] {
+            let key = expected(&["work", "auto_review", key]);
+            assert_eq!(key.severity, KeySeverity::Recommended);
+            assert_eq!((key.suggested_default)(BackendKind::Github), None);
+            assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+        }
     }
 
     #[test]
