@@ -27,7 +27,7 @@ use std::path::Path;
 
 use crate::agent::{AgentInvocation, AgentRunner};
 use crate::config::ConfigPaths;
-use crate::config::manifest;
+use crate::config::manifest::{self, DefaultValue};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::Prompter;
@@ -219,14 +219,14 @@ fn reconcile_config_keys(
     prompter: &mut dyn Prompter,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let suggestions: Vec<(&str, &str)> = findings
+    let suggestions: Vec<(&str, DefaultValue)> = findings
         .iter()
         .filter_map(|finding| match finding {
             DriftFinding::MissingConfigKey {
                 key,
                 suggested_default: Some(default),
                 ..
-            } => Some((key.as_str(), default.as_str())),
+            } => Some((key.as_str(), *default)),
             _ => None,
         })
         .collect();
@@ -237,7 +237,7 @@ fn reconcile_config_keys(
     if !yes {
         writeln!(out, "Missing config keys with suggested defaults:")?;
         for (key, default) in &suggestions {
-            writeln!(out, "  {key} = \"{default}\"")?;
+            writeln!(out, "  {key} = {default}")?;
         }
         if !prompter.confirm_with_default("Write these to .tskmstr.toml?", true)? {
             return Ok(());
@@ -247,18 +247,18 @@ fn reconcile_config_keys(
     for (key, default) in suggestions {
         let path: Vec<&str> = key.split('.').collect();
         if set_missing_key(doc, &path, default) {
-            writeln!(out, "Set {key} = \"{default}\"")?;
+            writeln!(out, "Set {key} = {default}")?;
         }
     }
     Ok(())
 }
 
-/// Set the string `val` at `path` (tables, then the key) in `doc` when no
+/// Set `val` at `path` (tables, then the key) in `doc` when no
 /// value is there yet, creating missing tables as implicit parents (so a
 /// nested key renders as a `[work.merge]` header, not `[work]` +
 /// `[work.merge]`). Returns `false` and leaves `doc` untouched when the key
 /// already has a value or a parent on the path isn't a table.
-fn set_missing_key(doc: &mut DocumentMut, path: &[&str], val: &str) -> bool {
+fn set_missing_key(doc: &mut DocumentMut, path: &[&str], val: DefaultValue) -> bool {
     let Some((last, tables)) = path.split_last() else {
         return false;
     };
@@ -291,7 +291,13 @@ fn set_missing_key(doc: &mut DocumentMut, path: &[&str], val: &str) -> bool {
         return false;
     }
     table.set_implicit(false);
-    table.insert(last, value(val));
+    table.insert(
+        last,
+        match val {
+            DefaultValue::Str(s) => value(s),
+            DefaultValue::Bool(b) => value(b),
+        },
+    );
     true
 }
 
@@ -840,6 +846,10 @@ mod tests {
             "suggested defaults written: {written}"
         );
         assert!(
+            written.contains("[ready]\nrequire_audit = true\n"),
+            "bool default written as a TOML bool: {written}"
+        );
+        assert!(
             written.contains("provider = \"github\""),
             "existing config kept: {written}"
         );
@@ -888,7 +898,7 @@ mod tests {
             run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
 
         assert_eq!(read_repo_config(&env), GITHUB_CONFIG, "nothing written");
-        assert_eq!(remaining.len(), 2, "both keys remain: {remaining:?}");
+        assert_eq!(remaining.len(), 3, "every key remains: {remaining:?}");
         assert!(
             !check::has_drift(&remaining),
             "recommended keys are advisory: {remaining:?}"
@@ -928,7 +938,7 @@ mod tests {
         assert!(!set_missing_key(
             &mut doc,
             &["work", "merge", "model"],
-            "opus"
+            DefaultValue::Str("opus")
         ));
         assert_eq!(doc.to_string(), "work = 3\n");
 
@@ -936,7 +946,7 @@ mod tests {
         assert!(set_missing_key(
             &mut doc,
             &["work", "merge", "model"],
-            "opus"
+            DefaultValue::Str("opus")
         ));
         assert!(
             doc.to_string().contains("[work.merge]\nmodel = \"opus\""),

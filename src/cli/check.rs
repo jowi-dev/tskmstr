@@ -35,7 +35,7 @@ use toml_edit::{DocumentMut, Item};
 use crate::agent::AgentRunner;
 use crate::config::BackendKind;
 use crate::config::ConfigPaths;
-use crate::config::manifest::{self, ExpectedConfigKey, KeySeverity, StampStatus};
+use crate::config::manifest::{self, DefaultValue, ExpectedConfigKey, KeySeverity, StampStatus};
 
 use super::init::{existing_lane_prompt_path, resolve_repo_relative, str_at};
 
@@ -151,7 +151,7 @@ pub enum DriftFinding {
         key: String,
         since_schema_version: i64,
         severity: KeySeverity,
-        suggested_default: Option<String>,
+        suggested_default: Option<DefaultValue>,
     },
 }
 
@@ -243,7 +243,7 @@ impl std::fmt::Display for DriftFinding {
                     severity.as_str()
                 )?;
                 match suggested_default {
-                    Some(default) => write!(f, "suggested: {key} = \"{default}\""),
+                    Some(default) => write!(f, "suggested: {key} = {default}"),
                     None => write!(f, "set it in .tskmstr.toml"),
                 }
             }
@@ -386,9 +386,7 @@ fn config_key_findings(
     keys.iter()
         .filter(|key| !has_key(doc, key.path) && !global.is_some_and(|g| has_key(g, key.path)))
         .filter_map(|key| {
-            let suggested_default = backend
-                .and_then(|backend| (key.suggested_default)(backend))
-                .map(str::to_string);
+            let suggested_default = backend.and_then(|backend| (key.suggested_default)(backend));
             if suggested_default.is_none() && key.severity == KeySeverity::Recommended {
                 return None;
             }
@@ -1401,7 +1399,7 @@ mod tests {
             since_schema_version: 1,
             severity: KeySeverity::Recommended,
             suggested_default: |backend| match backend {
-                BackendKind::Github => Some("In Review"),
+                BackendKind::Github => Some(DefaultValue::Str("In Review")),
                 BackendKind::Jira => None,
             },
         },
@@ -1429,13 +1427,19 @@ mod tests {
                     key: "status_on_pr".to_string(),
                     since_schema_version: 2,
                     severity: KeySeverity::Recommended,
-                    suggested_default: Some("In Review".to_string()),
+                    suggested_default: Some(DefaultValue::Str("In Review")),
                 },
                 DriftFinding::MissingConfigKey {
                     key: "status_on_run_start".to_string(),
                     since_schema_version: 2,
                     severity: KeySeverity::Recommended,
-                    suggested_default: Some("In Progress".to_string()),
+                    suggested_default: Some(DefaultValue::Str("In Progress")),
+                },
+                DriftFinding::MissingConfigKey {
+                    key: "ready.require_audit".to_string(),
+                    since_schema_version: 2,
+                    severity: KeySeverity::Recommended,
+                    suggested_default: Some(DefaultValue::Bool(true)),
                 },
             ]
         );
@@ -1448,6 +1452,10 @@ mod tests {
         assert!(
             rendered.contains("recommended since schema_version 2"),
             "severity and version named in: {rendered}"
+        );
+        assert!(
+            rendered.contains("suggested: ready.require_audit = true"),
+            "a bool default renders unquoted: {rendered}"
         );
     }
 
@@ -1481,7 +1489,7 @@ mod tests {
                 key: "status_on_pr".to_string(),
                 since_schema_version: 1,
                 severity: KeySeverity::Recommended,
-                suggested_default: Some("In Review".to_string()),
+                suggested_default: Some(DefaultValue::Str("In Review")),
             }]
         );
     }
@@ -1526,7 +1534,7 @@ mod tests {
             key: "status_on_pr".to_string(),
             since_schema_version: 2,
             severity: KeySeverity::Recommended,
-            suggested_default: Some("In Review".to_string()),
+            suggested_default: Some(DefaultValue::Str("In Review")),
         };
         assert!(!has_drift(&[]));
         assert!(!has_drift(std::slice::from_ref(&recommended)));
