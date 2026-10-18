@@ -1757,6 +1757,25 @@ impl RunStore {
         Ok(())
     }
 
+    /// Mark run `run_id` as [`RunStatus::Review`], leaving `ended_at` as it
+    /// is: `tm review auto` (GitHub issue #124) flags a finished review
+    /// round this way when it hits its round cap, so the overview shows the
+    /// ticket as needing a human.
+    ///
+    /// # Errors
+    ///
+    /// [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn flag_for_review(&self, run_id: i64) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET status = ?1 WHERE id = ?2",
+            params![RunStatus::Review.as_str(), run_id],
+        )?;
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Reopens a finished run, moving it back to `to` so it can be worked
     /// (or resumed) again.
     ///
@@ -4376,6 +4395,30 @@ mod tests {
             assert_eq!(run.pid, None);
             assert_eq!(run.heartbeat_at, None);
         }
+    }
+
+    #[test]
+    fn flag_for_review_moves_a_finished_run_to_review_and_keeps_it_ended() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = finished_run(&store, RunStatus::Done);
+        let ended_at = store.run_by_id(id).unwrap().unwrap().ended_at;
+
+        store.flag_for_review(id).unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Review);
+        assert_eq!(run.ended_at, ended_at);
+    }
+
+    #[test]
+    fn flag_for_review_errors_on_an_unknown_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        assert!(matches!(
+            store.flag_for_review(999),
+            Err(RunStoreError::RunNotFound(999))
+        ));
     }
 
     #[test]
