@@ -292,6 +292,7 @@ mod tests {
             pr_url: Some(format!("https://github.com/{scope}/pull/1")),
             worktree: Some(format!("/wt/{ticket}")),
             repo_root: RepoRoot::Recorded(root(scope)),
+            auto_review_round: None,
         }
     }
 

@@ -897,6 +897,12 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
             if row.pr_url.is_some() {
                 spans.push(Span::styled("  PR", theme::DIM));
             }
+            if let Some(round) = &row.auto_review_round {
+                spans.push(Span::styled(
+                    format!("  review {round}"),
+                    auto_review_style(round),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -907,6 +913,17 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.overview_selected.min(app.overview_rows.len() - 1)));
     frame.render_stateful_widget(list, queue_area, &mut state);
+}
+
+/// An overview row's auto-review round detail (GitHub issue #124): drawn
+/// as a warning once the loop stopped short of clean (`capped` or
+/// `fix-failed`), dim otherwise.
+fn auto_review_style(round: &str) -> Style {
+    if round.ends_with("capped") || round.ends_with("fix-failed") {
+        theme::STALE_MARKER
+    } else {
+        theme::DIM
+    }
 }
 
 /// The overview's system header (GitHub issue #86): the
@@ -967,6 +984,9 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
                 let mut detail = format!("{run}  {}", format_age(row.stage_age_secs));
                 if row.pr_url.is_some() {
                     detail.push_str("  PR");
+                }
+                if let Some(round) = &row.auto_review_round {
+                    detail.push_str(&format!("  review {round}"));
                 }
                 ListItem::new(vec![
                     Line::from(vec![
@@ -4266,6 +4286,7 @@ mod tests {
             pr_url: None,
             worktree: None,
             repo_root: crate::runs::overview::RepoRoot::Unresolved,
+            auto_review_round: None,
         }
     }
 
@@ -4295,6 +4316,25 @@ mod tests {
         let first_line = text.lines().nth(first).unwrap();
         assert!(first_line.contains("needs input"), "{first_line}");
         assert!(first_line.contains("alpha"), "{first_line}");
+    }
+
+    #[test]
+    fn overview_rows_show_the_auto_review_round_in_both_layouts() {
+        let row = OverviewRow {
+            auto_review_round: Some("2/2 capped".to_string()),
+            ..overview_row("github:me/alpha", "GH-1", Stage::NeedsReview)
+        };
+        let app = overview_app(vec![row.clone()]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(line.contains("review 2/2 capped"), "{line}");
+
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(vec![row])
+        };
+        let text = buffer_text(&render_with_size(&app, 240, 24));
+        assert!(text.contains("review 2/2"), "{text}");
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub struct OverviewRun {
     pub pr_url: Option<String>,
     /// See [`super::Run::repo_root`].
     pub repo_root: Option<String>,
+    /// The detail of the run's latest `auto_review_round` event (GitHub
+    /// issue #124), e.g. `1/2 fix`; `None` for a run with none.
+    pub auto_review_round: Option<String>,
 }
 
 /// A ticket's identity across projects: GitHub issue numbers restart per
@@ -269,6 +272,11 @@ pub struct OverviewRow {
     pub worktree: Option<String>,
     /// Where the row's actions run.
     pub repo_root: RepoRoot,
+    /// The newest auto-review round detail any of the ticket's runs
+    /// recorded (see [`OverviewRun::auto_review_round`]), so the round count
+    /// stays visible while a fix round, not the review round, is the row's
+    /// run.
+    pub auto_review_round: Option<String>,
 }
 
 /// Joins `runs` (newest first, as [`super::RunStore::overview_runs`]
@@ -321,6 +329,7 @@ pub fn join_rows(
                 pr_url: None,
                 worktree: None,
                 repo_root: RepoRoot::Recorded(ready.repo_root.clone()),
+                auto_review_round: None,
             }),
     );
 
@@ -372,6 +381,7 @@ fn ticket_row(
         pr_url: runs.iter().find_map(|run| run.pr_url.clone()),
         worktree: Some(run.worktree.clone()),
         repo_root: resolve_repo_root(recorded_root, &run.worktree, from_worktree),
+        auto_review_round: runs.iter().find_map(|run| run.auto_review_round.clone()),
     })
 }
 
@@ -446,6 +456,7 @@ mod tests {
             worktree: format!("/wt/{}", ticket.to_lowercase()),
             pr_url: None,
             repo_root: None,
+            auto_review_round: None,
         }
     }
 
@@ -669,6 +680,40 @@ mod tests {
     }
 
     #[test]
+    fn the_row_carries_the_newest_auto_review_rounds_detail() {
+        let mut fix = run(4, "GH-1", RunStatus::Running);
+        fix.kind = "review-fix".to_string();
+        let mut newer_round = run(3, "GH-1", RunStatus::Done);
+        newer_round.kind = "auto-review".to_string();
+        newer_round.auto_review_round = Some("2/2 capped".to_string());
+        let mut older_round = run(2, "GH-1", RunStatus::Done);
+        older_round.kind = "auto-review".to_string();
+        older_round.auto_review_round = Some("1/2 fix".to_string());
+        let runs = vec![
+            fix,
+            newer_round,
+            older_round,
+            run(1, "GH-1", RunStatus::Done),
+        ];
+
+        let rows = join_rows(&runs, &TrackerSignals::default(), 600, &no_worktree);
+
+        assert_eq!(rows[0].run_id, Some(4));
+        assert_eq!(rows[0].auto_review_round.as_deref(), Some("2/2 capped"));
+    }
+
+    #[test]
+    fn a_ticket_never_auto_reviewed_has_no_round_detail() {
+        let rows = join_rows(
+            &[run(1, "GH-1", RunStatus::Running)],
+            &TrackerSignals::default(),
+            600,
+            &no_worktree,
+        );
+        assert_eq!(rows[0].auto_review_round, None);
+    }
+
+    #[test]
     fn the_same_ticket_in_two_scopes_is_two_rows() {
         let mut other = run(2, "GH-1", RunStatus::Running);
         other.scope = "gh:me/other".to_string();
@@ -877,6 +922,7 @@ mod tests {
             pr_url: None,
             worktree: None,
             repo_root: RepoRoot::Unresolved,
+            auto_review_round: None,
         }
     }
 

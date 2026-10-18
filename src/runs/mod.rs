@@ -2678,7 +2678,11 @@ impl RunStore {
                     AS last_event_kind,
                 (SELECT CAST((julianday('now') - julianday(e.at)) * 86400 AS INTEGER)
                     FROM run_events e WHERE e.run_id = r.id ORDER BY e.at DESC, e.id DESC LIMIT 1)
-                    AS last_event_age_secs
+                    AS last_event_age_secs,
+                (SELECT e.detail FROM run_events e
+                    WHERE e.run_id = r.id AND e.kind = 'auto_review_round'
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1)
+                    AS auto_review_round
              FROM runs r
              ORDER BY r.started_at DESC, r.id DESC";
 
@@ -2701,6 +2705,7 @@ impl RunStore {
                 pr_url: row.get(6)?,
                 repo_root: row.get(7)?,
                 heartbeat_age_secs: row.get(8)?,
+                auto_review_round: row.get(12)?,
                 awaiting_input,
                 state_age_secs: match last_event_age {
                     Some(age) if awaiting_input => age,
@@ -8438,6 +8443,32 @@ mod tests {
             run.heartbeat_age_secs, None,
             "an ended run has no heartbeat age"
         );
+    }
+
+    #[test]
+    fn overview_runs_carries_the_latest_auto_review_round_detail() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store
+            .start_run(&StartRun {
+                kind: "auto-review".to_string(),
+                ..start_params("GH-1")
+            })
+            .unwrap();
+        let plain = start_lane_with_pid(&store, "GH-2", None);
+        store
+            .add_event(id, "auto_review_round", Some("1/2 fix"))
+            .unwrap();
+        store
+            .add_event(id, "auto_review_round", Some("1/2 fix-failed"))
+            .unwrap();
+
+        let runs = store.overview_runs().unwrap();
+
+        let round = runs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(round.auto_review_round.as_deref(), Some("1/2 fix-failed"));
+        let plain = runs.iter().find(|r| r.id == plain).unwrap();
+        assert_eq!(plain.auto_review_round, None);
     }
 
     #[test]
