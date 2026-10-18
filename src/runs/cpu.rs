@@ -35,6 +35,11 @@ pub fn host_cores() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
+/// Every live process's direct children, from one `/proc` scan, shared
+/// with [`super::footprint`]'s tree walk.
+#[cfg(target_os = "linux")]
+pub(crate) use imp::children_by_parent;
+
 /// Turns successive [`tree_cpu_time`] readings into CPU percentages. Each
 /// pid's previous reading is kept between calls to [`CpuSampler::sample`].
 #[derive(Debug, Default)]
@@ -181,6 +186,21 @@ mod imp {
             }
         }
         Some(ticks_to_duration(total))
+    }
+
+    /// Maps each parent pid to its direct children, from one `/proc` scan of
+    /// every process's parent. `None` when `/proc` can't be listed.
+    pub fn children_by_parent() -> Option<HashMap<u32, Vec<u32>>> {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            if let Some((ppid, _)) = read_stat(pid) {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+        Some(children)
     }
 
     /// A process's parent pid and its user plus system time in clock ticks,
