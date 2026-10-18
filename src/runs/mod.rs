@@ -215,6 +215,16 @@ const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (agent, window)
     );
     "#,
+    // GitHub issue #114: when usage admission last claimed a probe for an
+    // agent, in unix seconds. Concurrent `tm` processes (dispatch ticks,
+    // manual runs) race on this row so only one of them probes per
+    // snapshot max-age window. See `RunStore::claim_usage_probe`.
+    r#"
+    CREATE TABLE usage_probes (
+      agent      TEXT    PRIMARY KEY,
+      claimed_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -3210,6 +3220,49 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Claims the right to probe `agent`'s usage at `now` (unix seconds).
+    /// Returns `true` when no claim exists for `agent` or the last one is at
+    /// least `min_gap_secs` old, recording `now` as the new claim. One SQL
+    /// statement, so of two processes racing for the same gap exactly one
+    /// wins (GitHub issue #114).
+    pub fn claim_usage_probe(
+        &self,
+        agent: &str,
+        now: i64,
+        min_gap_secs: i64,
+    ) -> Result<bool, RunStoreError> {
+        let changed = self.conn.execute(
+            "INSERT INTO usage_probes (agent, claimed_at) VALUES (?1, ?2)
+             ON CONFLICT(agent) DO UPDATE SET claimed_at = excluded.claimed_at
+             WHERE excluded.claimed_at >= usage_probes.claimed_at + ?3",
+            params![agent, now, min_gap_secs],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Sums the input and output tokens recorded in `model_usage` across
+    /// `agent`'s runs that started at or after `since` (unix seconds), for
+    /// usage admission's token budget (GitHub issue #114). Cache reads and
+    /// writes are left out. Runs with no recorded usage count as zero.
+    pub fn agent_tokens_since(&self, agent: &str, since: i64) -> Result<u64, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_usage FROM runs
+              WHERE agent = ?1 AND model_usage IS NOT NULL
+                AND started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', ?2, 'unixepoch')",
+        )?;
+        let rows = stmt.query_map(params![agent, since], |row| row.get::<_, String>(0))?;
+        let mut total = 0u64;
+        for json in rows {
+            if let Some(map) = parse_model_usage(&json?) {
+                total += map
+                    .values()
+                    .map(|usage| usage.input_tokens + usage.output_tokens)
+                    .sum::<u64>();
+            }
+        }
+        Ok(total)
+    }
+
     /// Returns cost aggregates grouped by retro verdict (clean / defect),
     /// restricted to `kind` when given (same filter as
     /// [`RunStore::list_runs_filtered`]), for `tm runs --by-retro`.
@@ -3456,7 +3509,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_15() {
+    fn open_migrates_a_fresh_db_to_user_version_16() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3464,7 +3517,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -6880,6 +6933,58 @@ mod tests {
         assert_eq!(
             store.usage_snapshots("claude").unwrap(),
             vec![snapshot("five_hour", 0.31, 100)]
+        );
+    }
+
+    // --- usage admission support (GitHub issue #114) ---
+
+    #[test]
+    fn claim_usage_probe_grants_one_claim_per_gap() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.claim_usage_probe("claude", 1_000, 600).unwrap());
+        assert!(
+            !store.claim_usage_probe("claude", 1_000, 600).unwrap(),
+            "a concurrent caller loses the claim"
+        );
+        assert!(!store.claim_usage_probe("claude", 1_599, 600).unwrap());
+        assert!(
+            store.claim_usage_probe("other", 1_000, 600).unwrap(),
+            "claims are per agent"
+        );
+        assert!(store.claim_usage_probe("claude", 1_600, 600).unwrap());
+    }
+
+    #[test]
+    fn agent_tokens_since_sums_input_and_output_of_runs_started_in_the_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let usage = r#"{"m":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":5000}}"#;
+        for agent in ["opencode", "opencode", "claude"] {
+            let id = store.start_run(&start_params("GH-1")).unwrap();
+            store.update_agent_repo(id, agent, "repo").unwrap();
+            store
+                .finish_run(
+                    id,
+                    &FinishRun {
+                        status: RunStatus::Done,
+                        model_usage: Some(usage.to_string()),
+                        ..FinishRun::default()
+                    },
+                )
+                .unwrap();
+        }
+        // A run with no recorded usage counts as zero.
+        let id = store.start_run(&start_params("GH-2")).unwrap();
+        store.update_agent_repo(id, "opencode", "repo").unwrap();
+
+        assert_eq!(store.agent_tokens_since("opencode", 0).unwrap(), 240);
+        assert_eq!(store.agent_tokens_since("claude", 0).unwrap(), 120);
+        assert_eq!(
+            store.agent_tokens_since("opencode", 4_102_444_800).unwrap(),
+            0,
+            "nothing started after 2100-01-01"
         );
     }
 
