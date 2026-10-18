@@ -951,10 +951,8 @@ pub struct ReadyListing {
     /// blockers, in rank order.
     pub ready: Vec<Issue>,
     /// Candidates excluded because [`open_blockers`] found at least one, in
-    /// rank order. `tm ready`'s CLI layer (`crate::cli::ready`) re-examines
-    /// each of these against `crate::blocker_stacking` to tell a genuinely
-    /// stuck ticket apart from a stackable one — this module stays Jira-only
-    /// and doesn't make that call itself.
+    /// rank order. Jira status only: a ticket `crate::blocker_stacking` would
+    /// call stackable, or cleared by a merged PR, still lands here.
     pub blocked: Vec<Issue>,
 }
 
@@ -967,22 +965,31 @@ impl ReadyListing {
     }
 }
 
-/// `tm ready` (no key): search the current user's "To Do" tickets (via
-/// [`TicketQuery::ReadyCandidates`]) and keep only those with no open blockers.
+/// The current user's "To Do" tickets (via [`TicketQuery::ReadyCandidates`]),
+/// in rank order, with blockers hydrated but nothing filtered out. `tm ready`
+/// (`crate::cli::ready`) classifies these itself via `crate::blocker_stacking`;
+/// [`ready_tickets`] applies the Jira-status filter instead.
 ///
-/// Rank order from the search is preserved in both [`ReadyListing::ready`]
-/// and [`ReadyListing::blocked`].
-///
-/// Candidates are run through [`TicketProvider::hydrate_blockers`] first,
-/// since a backend's search may omit dependencies (the github backend does,
-/// GitHub issue #70). A hydration failure is returned as an error rather
-/// than listing tickets whose blockers are unknown as ready.
-pub fn ready_tickets(jira: &dyn TicketProvider) -> Result<ReadyListing, TicketingError> {
+/// Candidates are run through [`TicketProvider::hydrate_blockers`], since a
+/// backend's search may omit dependencies (the github backend does, GitHub
+/// issue #70). A hydration failure is returned as an error rather than
+/// handing back tickets whose blockers are unknown.
+pub fn ready_candidates(jira: &dyn TicketProvider) -> Result<Vec<Issue>, TicketingError> {
     let mut result = jira.search(&TicketQuery::ReadyCandidates)?;
     jira.hydrate_blockers(&mut result.issues)?;
+    Ok(result.issues)
+}
+
+/// Split [`ready_candidates`] into those with no open blockers and those with
+/// at least one, by Jira status alone ([`open_blockers`]).
+///
+/// Rank order from the search is preserved in both [`ReadyListing::ready`]
+/// and [`ReadyListing::blocked`]. A hydration failure is an error, as in
+/// [`ready_candidates`].
+pub fn ready_tickets(jira: &dyn TicketProvider) -> Result<ReadyListing, TicketingError> {
     let mut ready = Vec::new();
     let mut blocked = Vec::new();
-    for issue in result.issues {
+    for issue in ready_candidates(jira)? {
         if open_blockers(&issue).is_empty() {
             ready.push(issue);
         } else {
