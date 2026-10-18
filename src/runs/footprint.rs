@@ -1,18 +1,29 @@
 //! Memory measurement for running lanes (GitHub issue #66): the footprint
 //! of a run's whole process tree, and the kernel's memory-pressure verdict.
 //!
-//! **Footprint** is the macOS measure of a process's real memory cost. It
-//! counts compressed and swapped-out pages, which resident set size leaves
-//! out, so it stays honest on a machine that is already under pressure. It
-//! is the number Activity Monitor and `footprint -p` show.
+//! **Footprint** is a process's real memory cost. On macOS it is the
+//! number Activity Monitor and `footprint -p` show: it counts compressed and
+//! swapped-out pages, which resident set size leaves out, so it stays honest
+//! on a machine that is already under pressure. On Linux (GitHub issue
+//! #108) it is the proportional set size from `/proc/<pid>/smaps_rollup`,
+//! which splits shared pages among the processes mapping them, so a tree of
+//! `rustc`s sharing libraries isn't counted twice. Where the rollup can't be
+//! read it falls back to resident set size from `/proc/<pid>/statm`.
 //!
-//! Both probes are macOS-only. Elsewhere they report "unknown"
-//! ([`tree_footprint`] returns `None`, [`memory_pressure`] returns
-//! [`MemoryPressure::Unknown`]), which callers treat as "no data" rather
-//! than as an error.
+//! **Pressure** comes from `kern.memorystatus_vm_pressure_level` on macOS.
+//! On Linux it comes from the `some avg10` stall share in
+//! `/proc/pressure/memory` (PSI), mapped by [`PSI_WARN_AVG10`] and
+//! [`PSI_CRITICAL_AVG10`]. Kernels without PSI fall back to the share of
+//! `MemTotal` still `MemAvailable` in `/proc/meminfo`, mapped by
+//! [`MEMINFO_WARN_AVAILABLE_PCT`] and [`MEMINFO_CRITICAL_AVAILABLE_PCT`].
+//!
+//! On other platforms both probes report "unknown" ([`tree_footprint`]
+//! returns `None`, [`memory_pressure`] returns [`MemoryPressure::Unknown`]),
+//! which callers treat as "no data" rather than as an error.
 
-/// The kernel's memory-pressure verdict, read from
-/// `kern.memorystatus_vm_pressure_level`.
+/// The kernel's memory-pressure verdict: from
+/// `kern.memorystatus_vm_pressure_level` on macOS, from PSI or
+/// `/proc/meminfo` on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryPressure {
     /// No pressure.
@@ -21,7 +32,8 @@ pub enum MemoryPressure {
     Warn,
     /// The kernel is close to killing processes.
     Critical,
-    /// The level could not be read (non-macOS, or the sysctl failed).
+    /// The level could not be read (unsupported platform, or every source
+    /// failed).
     Unknown,
 }
 
@@ -76,7 +88,8 @@ pub fn format_bytes(bytes: u64) -> String {
 /// `rustc`, language servers, and test binaries, and most of a lane's
 /// memory spike comes from those children. Descendants that exit between
 /// listing and measuring are skipped. A child that outlives its parent is
-/// reparented to `launchd` and drops out of the tree.
+/// reparented to `launchd` (or `init` or a subreaper on Linux) and drops
+/// out of the tree.
 pub fn tree_footprint(root: u32) -> Option<u64> {
     imp::tree_footprint(root)
 }
@@ -175,23 +188,19 @@ mod imp {
 /// task stalled waiting on memory) at or above which Linux reports
 /// [`MemoryPressure::Warn`]. A tenth of wall time lost to reclaim is a
 /// machine already struggling to give a new lane room.
-#[cfg(any(target_os = "linux", test))]
 pub const PSI_WARN_AVG10: f64 = 10.0;
 
 /// PSI `some avg10` at or above which Linux reports
 /// [`MemoryPressure::Critical`]: tasks stall on memory for 40% of the time,
 /// the territory where the OOM killer or systemd-oomd steps in.
-#[cfg(any(target_os = "linux", test))]
 pub const PSI_CRITICAL_AVG10: f64 = 40.0;
 
 /// Percent of `MemTotal` still `MemAvailable` below which the meminfo
 /// fallback reports [`MemoryPressure::Warn`].
-#[cfg(any(target_os = "linux", test))]
 pub const MEMINFO_WARN_AVAILABLE_PCT: u64 = 10;
 
 /// Percent of `MemTotal` still `MemAvailable` below which the meminfo
 /// fallback reports [`MemoryPressure::Critical`].
-#[cfg(any(target_os = "linux", test))]
 pub const MEMINFO_CRITICAL_AVAILABLE_PCT: u64 = 5;
 
 /// Reads `some avg10` out of `/proc/pressure/memory`.

@@ -420,8 +420,8 @@ launch another lane":
 - **build slots**: `[work] build_slots` held right now out of the total
   (`off` when unset or `0`)
 
-A figure that can't be read on this platform shows as `?`. Footprint and
-memory pressure are macOS-only, and CPU is read on macOS and Linux. The
+A figure that can't be read on this platform shows as `?`. Footprint,
+memory pressure, and CPU are read on macOS and Linux. The
 line turns red when a new lane would be refused: warn or critical pressure,
 or a budget the running lanes already fill. Budget and build slots come
 from the config of the repo you launched `tm overview` from.
@@ -842,7 +842,10 @@ tm records the memory footprint of every run that has a recorded pid
 (GitHub issue #66). **Footprint** is the macOS measure Activity Monitor and
 `footprint -p` show: unlike resident set size, it counts compressed and
 swapped-out pages, so it stays accurate on a machine that is already under
-pressure. tm measures the run's whole process tree, because most of a
+pressure. On Linux it is the proportional set size (PSS) from
+`/proc/<pid>/smaps_rollup`, which splits shared pages among the processes
+that map them, with resident set size from `/proc/<pid>/statm` as the
+fallback. tm measures the run's whole process tree, because most of a
 lane's memory goes to the `cargo`, `rustc`, language-server, and test
 processes the agent starts, not to the agent itself.
 
@@ -850,8 +853,8 @@ There is no sampling daemon. A sample is taken whenever something already
 looks at the run: bare `tm runs`, every `tm runs event` a hook sends, the
 board's status poll, and `tm runs watch`'s reap. Each run keeps its latest
 sample and its peak. `tm runs` shows them in its `MEM` column, and the run
-detail overlay shows a `mem` line. Tracking is always on, and macOS-only for
-now; on other platforms the column stays `-`.
+detail overlay shows a `mem` line. Tracking is always on, on macOS and
+Linux; on other platforms the column stays `-`.
 
 Memory admission is off until you set a budget:
 
@@ -865,7 +868,11 @@ With a budget set, `tm work run` (and so the board's `w` key, which runs
 it) checks two things before provisioning anything:
 
 - **Memory pressure.** If the kernel reports warn or critical pressure, the
-  launch is refused, whatever the budget says.
+  launch is refused, whatever the budget says. On Linux the level comes
+  from PSI (`/proc/pressure/memory`): warn once tasks stall on memory for
+  10% of the last ten seconds (`some avg10`), critical at 40%. Kernels
+  without PSI fall back to `/proc/meminfo`: warn below 10% of memory
+  available, critical below 5%.
 - **The budget.** The new lane is estimated at the largest peak among the
   last five finished lanes for the same agent and repo, or at
   `lane_memory_estimate_gb` when there are none. Each running lane counts at
