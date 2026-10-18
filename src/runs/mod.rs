@@ -196,6 +196,25 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN repo_root TEXT;
     "#,
+    // GitHub issue #129: the latest observed subscription utilization per
+    // agent and window (`five_hour`, `seven_day`, ...). `utilization` is a
+    // fraction that may exceed 1.0 under overage; `resets_at` and
+    // `observed_at` are unix seconds; `source` is `stream` | `probe` |
+    // `statusline`; `status` is the server's verdict (stream/probe only).
+    // One row per window, newest observation wins. See
+    // `docs/plans/gh-113-proactive-usage-signal.md`.
+    r#"
+    CREATE TABLE usage_snapshots (
+      agent       TEXT    NOT NULL,
+      window      TEXT    NOT NULL,
+      utilization REAL    NOT NULL,
+      resets_at   INTEGER NOT NULL,
+      observed_at INTEGER NOT NULL,
+      source      TEXT    NOT NULL,
+      status      TEXT,
+      PRIMARY KEY (agent, window)
+    );
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -381,6 +400,27 @@ pub struct StartRun {
     /// `tm work run --fg`) or wherever the caller doesn't yet know the path
     /// at `start_run` time — see [`RunStore::update_log_path`] for that case.
     pub log_path: Option<String>,
+}
+
+/// One `usage_snapshots` row: the latest observed utilization of one usage
+/// window for one agent. Written by [`RunStore::upsert_usage_snapshot`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSnapshotRow {
+    /// `AgentRunner::name()`, e.g. `claude`.
+    pub agent: String,
+    /// The window's name, e.g. `five_hour` or `seven_day`.
+    pub window: String,
+    /// Fraction of the window used; may exceed 1.0 under overage.
+    pub utilization: f64,
+    /// Unix seconds the window resets at.
+    pub resets_at: i64,
+    /// Unix seconds tm observed the value at.
+    pub observed_at: i64,
+    /// Where the value came from: `stream`, `probe` or `statusline`.
+    pub source: String,
+    /// The server's verdict (`allowed`, `allowed_warning`, `rejected`), when
+    /// the source reports one.
+    pub status: Option<String>,
 }
 
 /// Outcome fields recorded when a run finishes.
@@ -3090,6 +3130,57 @@ impl RunStore {
         Ok(())
     }
 
+    /// Upserts one `usage_snapshots` row, but only when `row.observed_at` is
+    /// strictly newer than the stored row for the same agent and window.
+    /// Concurrent runs finish out of order, so the last writer may hold the
+    /// older observation. Returns whether the row was written.
+    pub fn upsert_usage_snapshot(&self, row: &UsageSnapshotRow) -> Result<bool, RunStoreError> {
+        let changed = self.conn.execute(
+            "INSERT INTO usage_snapshots
+                (agent, window, utilization, resets_at, observed_at, source, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent, window) DO UPDATE SET
+                utilization = excluded.utilization,
+                resets_at = excluded.resets_at,
+                observed_at = excluded.observed_at,
+                source = excluded.source,
+                status = excluded.status
+             WHERE excluded.observed_at > usage_snapshots.observed_at",
+            params![
+                row.agent,
+                row.window,
+                row.utilization,
+                row.resets_at,
+                row.observed_at,
+                row.source,
+                row.status,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Returns `agent`'s stored usage snapshots, one per window, ordered by
+    /// window name.
+    pub fn usage_snapshots(&self, agent: &str) -> Result<Vec<UsageSnapshotRow>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, window, utilization, resets_at, observed_at, source, status
+             FROM usage_snapshots WHERE agent = ?1 ORDER BY window",
+        )?;
+        let rows = stmt.query_map(params![agent], |row| {
+            Ok(UsageSnapshotRow {
+                agent: row.get(0)?,
+                window: row.get(1)?,
+                utilization: row.get(2)?,
+                resets_at: row.get(3)?,
+                observed_at: row.get(4)?,
+                source: row.get(5)?,
+                status: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Returns cost aggregates grouped by retro verdict (clean / defect),
     /// restricted to `kind` when given (same filter as
     /// [`RunStore::list_runs_filtered`]), for `tm runs --by-retro`.
@@ -3322,7 +3413,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_14() {
+    fn open_migrates_a_fresh_db_to_user_version_15() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3330,7 +3421,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -6608,6 +6699,121 @@ mod tests {
         store.clear_agent_window("claude").unwrap();
 
         assert!(store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    // --- usage_snapshots (GitHub issue #129) ---
+
+    fn snapshot(window: &str, utilization: f64, observed_at: i64) -> UsageSnapshotRow {
+        UsageSnapshotRow {
+            agent: "claude".to_string(),
+            window: window.to_string(),
+            utilization,
+            resets_at: 1_792_365_600,
+            observed_at,
+            source: "stream".to_string(),
+            status: Some("allowed".to_string()),
+        }
+    }
+
+    #[test]
+    fn usage_snapshots_are_empty_before_any_upsert() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.usage_snapshots("claude").unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_usage_snapshot_round_trips_one_row_per_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(
+            store
+                .upsert_usage_snapshot(&snapshot("seven_day", 0.07, 100))
+                .unwrap()
+        );
+        assert!(
+            store
+                .upsert_usage_snapshot(&snapshot("five_hour", 0.31, 100))
+                .unwrap()
+        );
+
+        assert_eq!(
+            store.usage_snapshots("claude").unwrap(),
+            vec![
+                snapshot("five_hour", 0.31, 100),
+                snapshot("seven_day", 0.07, 100)
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_usage_snapshot_replaces_an_older_observation() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .upsert_usage_snapshot(&snapshot("five_hour", 0.31, 100))
+            .unwrap();
+        assert!(
+            store
+                .upsert_usage_snapshot(&snapshot("five_hour", 0.5, 200))
+                .unwrap()
+        );
+
+        assert_eq!(
+            store.usage_snapshots("claude").unwrap(),
+            vec![snapshot("five_hour", 0.5, 200)]
+        );
+    }
+
+    #[test]
+    fn upsert_usage_snapshot_never_overwrites_a_newer_observation() {
+        // Concurrent runs finish out of order: the one that finishes last
+        // may carry the older observation.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .upsert_usage_snapshot(&snapshot("five_hour", 0.5, 200))
+            .unwrap();
+        assert!(
+            !store
+                .upsert_usage_snapshot(&snapshot("five_hour", 0.31, 100))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .upsert_usage_snapshot(&snapshot("five_hour", 0.4, 200))
+                .unwrap()
+        );
+
+        assert_eq!(
+            store.usage_snapshots("claude").unwrap(),
+            vec![snapshot("five_hour", 0.5, 200)]
+        );
+    }
+
+    #[test]
+    fn usage_snapshots_are_kept_per_agent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .upsert_usage_snapshot(&snapshot("five_hour", 0.31, 100))
+            .unwrap();
+        store
+            .upsert_usage_snapshot(&UsageSnapshotRow {
+                agent: "other".to_string(),
+                ..snapshot("five_hour", 0.9, 100)
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.usage_snapshots("claude").unwrap(),
+            vec![snapshot("five_hour", 0.31, 100)]
+        );
     }
 
     #[test]

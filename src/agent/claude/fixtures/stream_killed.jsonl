@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/work/repo","session_id":"sess-killed","model":"claude-fable-5","uuid":"u-1"}
+not json: some stray noise on stdout
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1792365600,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":1.02,"resetsAt":1792365600}}},"uuid":"u-2","session_id":"sess-killed"}
+{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"partial

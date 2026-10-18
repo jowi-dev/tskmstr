@@ -150,7 +150,7 @@ pub struct RecordedSpawn {
 /// Test double for [`ProcessSpawner`]: records the [`SpawnRequest`] it was
 /// given (for assertions on argv/env/cwd) and writes a canned JSON string to
 /// `stdout_path`, standing in for what a real `claude -p --output-format
-/// json` invocation would have written there.
+/// stream-json` (or legacy `json`) invocation would have written there.
 pub struct FakeProcessSpawner {
     /// The canned JSON to write to `stdout_path` on every call.
     pub canned_json: String,
