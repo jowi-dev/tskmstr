@@ -69,9 +69,8 @@ fn main() -> ExitCode {
     // `tm review fix <KEY>` is special-cased the same way: it needs a
     // three-way exit code (0 dispatched, 1 error or a failed `--fg` run, 3
     // no comments captured) rather than dispatch's uniform 0/1 — see
-    // `REVIEW_FIX_EXIT_NO_COMMENTS`'s doc comment. `ReviewCmd::Fix` is
-    // `tm review`'s only subcommand today, so every `Command::Review` ends
-    // up here.
+    // `REVIEW_FIX_EXIT_NO_COMMENTS`'s doc comment. `tm review auto` goes
+    // through `dispatch` as usual.
     if let Command::Review {
         cmd: ReviewCmd::Fix { key, headless, fg },
     } = command
@@ -420,15 +419,14 @@ fn run_ticket_provider(
     ticket_provider_for(config, keychain, env_token).map_err(|err| err.to_string())
 }
 
-/// `tm review fix <KEY>` is always special-cased in `main` as
-/// [`run_review_fix`] instead (see the comment above that early-return),
-/// since `ReviewCmd::Fix` is `tm review`'s only subcommand and always needs
-/// the non-uniform exit code `run_review_fix` provides. This arm exists only
-/// so `dispatch`'s match stays exhaustive over [`Command`]; it is never
-/// actually reached.
+/// Dispatch `tm review`. `tm review fix <KEY>` is always special-cased in
+/// `main` as [`run_review_fix`] instead (see the comment above that
+/// early-return), since it needs a non-uniform exit code; its arm here only
+/// keeps the match exhaustive and is never reached.
 fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ReviewCmd::Fix { .. } => unreachable!("tm review fix is handled by run_review_fix"),
+        ReviewCmd::Auto { key, foreground } => run_review_auto(key, foreground),
     }
 }
 
@@ -1895,21 +1893,63 @@ const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
 /// [`REVIEW_FIX_EXIT_NO_COMMENTS`]'s doc comment for why this needs its own
 /// scheme rather than `dispatch`'s uniform 0/1.
 fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
+    let result = with_review_deps(|deps, run_paths, _config| {
+        let mut stdout = std::io::stdout();
+        tskmstr::cli::review::fix(deps, run_paths, &key, dispatch, &mut stdout)
+    });
+    match result {
+        Ok(Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true })) => {
+            ExitCode::SUCCESS
+        }
+        Ok(Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: false })) => {
+            ExitCode::FAILURE
+        }
+        Ok(Ok(tskmstr::cli::review::FixOutcome::NoComments)) => {
+            eprintln!("No comments captured for {key}'s worktree — nothing to fix yet.");
+            ExitCode::from(REVIEW_FIX_EXIT_NO_COMMENTS)
+        }
+        Ok(Err(err)) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tm review auto <KEY> [--foreground]` (GitHub issue #124): build real
+/// dependencies and run [`tskmstr::cli::review::auto`] with the invoking
+/// repo's `[work.auto_review]` settings (defaults when config can't load).
+fn run_review_auto(key: String, foreground: bool) -> Result<(), Box<dyn std::error::Error>> {
+    with_review_deps(|deps, run_paths, config| {
+        let default_cfg = tskmstr::config::AutoReviewConfig::default();
+        let cfg = config.map_or(&default_cfg, |c| &c.work.auto_review);
+        let mut stdout = std::io::stdout();
+        tskmstr::cli::review::auto(deps, run_paths, cfg, &key, foreground, &mut stdout).map(|_| ())
+    })??;
+    Ok(())
+}
+
+/// Builds the real [`tskmstr::cli::review::ReviewFixDeps`] `tm review fix`
+/// and `tm review auto` share, and hands them to `f` with the run paths and
+/// the leniently loaded config.
+///
+/// # Errors
+///
+/// A rendered error if the run store or the current executable can't be
+/// resolved.
+fn with_review_deps<T>(
+    f: impl FnOnce(
+        &tskmstr::cli::review::ReviewFixDeps<'_>,
+        &tskmstr::work::run::RunLanePaths,
+        Option<&tskmstr::config::Config>,
+    ) -> T,
+) -> Result<T, String> {
     let run_db_path = resolve_run_db_path();
-    let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
-        Ok(store) => store,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let current_exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let run_store = tskmstr::runs::RunStore::open(&run_db_path).map_err(|e| e.to_string())?;
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
@@ -1946,20 +1986,7 @@ fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
         backend_identity: &backend_identity,
         runner: agent_runner_or_default(full_config.as_ref()),
     };
-    let mut stdout = std::io::stdout();
-
-    match tskmstr::cli::review::fix(&deps, &run_paths, &key, dispatch, &mut stdout) {
-        Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true }) => ExitCode::SUCCESS,
-        Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: false }) => ExitCode::FAILURE,
-        Ok(tskmstr::cli::review::FixOutcome::NoComments) => {
-            eprintln!("No comments captured for {key}'s worktree — nothing to fix yet.");
-            ExitCode::from(REVIEW_FIX_EXIT_NO_COMMENTS)
-        }
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
-    }
+    Ok(f(&deps, &run_paths, full_config.as_ref()))
 }
 
 /// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.
