@@ -18,6 +18,13 @@
 //!   > '<out_json>' 2>> '<log>'
 //! ```
 //!
+//! One deliberate divergence: GitHub issue #129 replaced `--output-format
+//! json` with `--output-format stream-json --verbose`, the only output that
+//! carries the subscription's usage windows (`rate_limit_event`). The final
+//! `result` line has the same shape the single `json` object had, so
+//! [`ClaudeRunner::parse_outcome`] reads the same fields from it. The output
+//! file is still named `<out_json>` but now holds JSONL.
+//!
 //! `work.ml` builds this as one shell string and reads the prompt via
 //! `"$(cat prompt_tmp)"` command substitution — a shell-level way of
 //! inlining a file's contents into one argv slot. This port builds a
@@ -62,7 +69,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, shell_quote,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, UsageSnapshot, UsageWindow, shell_quote,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -202,7 +209,7 @@ impl AgentRunner for ClaudeRunner {
     /// | | [`RunMode::Headless`] | [`RunMode::Interactive`] |
     /// |---|---|---|
     /// | prompt | `-p <prompt>` | positional, `args[0]` |
-    /// | `--output-format json` | yes (parsed by [`AgentRunner::parse_outcome`]) | no — nothing parses an interactive session's stdout |
+    /// | `--output-format stream-json --verbose` | yes (JSONL, parsed by [`AgentRunner::parse_outcome`]) | no — nothing parses an interactive session's stdout |
     /// | `--max-turns` | yes | no — meaningless for a steerable session |
     /// | run id travels as | `TSKMSTR_RUN_ID` | `TSKMSTR_SESSION_RUN_ID` |
     ///
@@ -244,7 +251,8 @@ impl AgentRunner for ClaudeRunner {
                 .max_turns
                 .unwrap_or_else(|| DEFAULT_MAX_TURNS.to_string());
             args.push("--output-format".to_string());
-            args.push("json".to_string());
+            args.push("stream-json".to_string());
+            args.push("--verbose".to_string());
             args.push("--max-turns".to_string());
             args.push(max_turns);
         }
@@ -283,8 +291,8 @@ impl AgentRunner for ClaudeRunner {
         }
     }
 
-    /// Parses a `claude -p --output-format json` result (`raw`, the raw
-    /// stdout contents) into a [`RunOutcome`]. The single parsing path §4 of
+    /// Parses a `claude -p` result (`raw`, the raw stdout contents) into a
+    /// [`RunOutcome`]. The single parsing path §4 of
     /// `docs/plans/runner-port.md` calls for: both the foreground and
     /// detached run paths go through [`crate::work::run::run_agent_and_finish`],
     /// which calls this instead of duplicating `jq`-style field extraction.
@@ -315,12 +323,27 @@ impl AgentRunner for ClaudeRunner {
     /// empty string, so this treats a missing or empty `session_id` as a
     /// hard [`OutcomeParseError`] instead — a run with no session id to
     /// resume isn't a usable outcome, only an unparseable one.
+    ///
+    /// ## stream-json (GitHub issue #129)
+    ///
+    /// Headless runs now write `--output-format stream-json --verbose`, one
+    /// JSON object per line. The last `{"type":"result"}` line has exactly
+    /// the shape above, and the last `rate_limit_event` becomes
+    /// [`RunOutcome::usage`] (see [`RawRateLimitInfo`]). Lines that aren't
+    /// JSON are skipped, so a killed run's truncated final line or stray
+    /// stdout noise never fails the parse. A stream with no `result` line at
+    /// all still yields a best-effort outcome: the session id from any other
+    /// line, every other field `None` (so the run classifies as
+    /// `Interrupted`). Output that is one JSON object, the old
+    /// `--output-format json` shape, still parses as before.
     fn parse_outcome(&self, raw: &str) -> Result<RunOutcome, OutcomeParseError> {
-        let parsed: RawResult = serde_json::from_str(raw)?;
+        let stream = scan_stream(raw)?;
+        let parsed = stream.result.unwrap_or_default();
 
         let session_id = parsed
             .session_id
             .filter(|id| !id.is_empty())
+            .or(stream.session_id)
             .ok_or(OutcomeParseError::MissingSessionId)?;
 
         let model_usage = parsed.model_usage.filter(|models| !models.is_empty());
@@ -334,6 +357,7 @@ impl AgentRunner for ClaudeRunner {
             result: parsed.result,
             model_usage,
             rate_limit,
+            usage: stream.rate_limit_info.map(RawRateLimitInfo::into_snapshot),
         })
     }
 
@@ -539,11 +563,140 @@ fn classify_rate_limit(result: &str) -> Option<RateLimitInfo> {
     Some(RateLimitInfo { reset_at })
 }
 
-/// Raw shape of the `claude -p --output-format json` result, deserialized
-/// leniently: every field is optional at this layer so that any one missing
-/// field doesn't fail the whole parse. [`ClaudeRunner::parse_outcome`] is the
-/// only place that decides which absences are fatal.
+/// What [`scan_stream`] pulls out of claude's stdout.
+#[derive(Debug, Default)]
+struct Stream {
+    /// The last `result` object.
+    result: Option<RawResult>,
+    /// The last `rate_limit_event`'s `rate_limit_info`.
+    rate_limit_info: Option<RawRateLimitInfo>,
+    /// The last non-empty `session_id` on any line, for a stream that was
+    /// killed before its `result` line.
+    session_id: Option<String>,
+}
+
+/// Reads `raw` as JSONL, keeping the last of each object
+/// [`ClaudeRunner::parse_outcome`] needs. `raw` that is one JSON object
+/// (the old `--output-format json` output, possibly pretty-printed) is read
+/// as that single object, and one with no `type` counts as the result.
+/// Errors only when not a single line is JSON.
+fn scan_stream(raw: &str) -> Result<Stream, serde_json::Error> {
+    let values: Vec<serde_json::Value> = match serde_json::from_str(raw) {
+        Ok(value) => vec![value],
+        Err(whole_err) => {
+            let values: Vec<_> = raw
+                .lines()
+                .filter_map(|line| serde_json::from_str(line.trim()).ok())
+                .collect();
+            if values.is_empty() {
+                return Err(whole_err);
+            }
+            values
+        }
+    };
+
+    let mut stream = Stream::default();
+    for value in values {
+        if let Some(id) = value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            stream.session_id = Some(id.to_string());
+        }
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("result") | None => {
+                if let Ok(result) = serde_json::from_value(value) {
+                    stream.result = Some(result);
+                }
+            }
+            Some("rate_limit_event") => {
+                if let Some(info) = value
+                    .get("rate_limit_info")
+                    .and_then(|info| serde_json::from_value(info.clone()).ok())
+                {
+                    stream.rate_limit_info = Some(info);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(stream)
+}
+
+/// Raw `rate_limit_info` of a stream-json `rate_limit_event`. The top-level
+/// fields describe only the "representative" window. `unifiedWindows`
+/// carries every window but is marked `@internal` in the CLI's schema and is
+/// absent before ~2.1.161, so it is preferred when present and the
+/// top-level fields are the fallback. See
+/// `docs/plans/gh-113-proactive-usage-signal.md`.
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRateLimitInfo {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    resets_at: Option<i64>,
+    #[serde(default)]
+    rate_limit_type: Option<String>,
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    unified_windows: Option<std::collections::BTreeMap<String, RawUsageWindow>>,
+}
+
+/// One entry of [`RawRateLimitInfo::unified_windows`].
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawUsageWindow {
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<i64>,
+}
+
+impl RawRateLimitInfo {
+    /// Windows come from `unifiedWindows` when it names any, else from the
+    /// top-level `rateLimitType`/`utilization`/`resetsAt`. A window missing
+    /// its utilization or reset time is dropped rather than guessed.
+    fn into_snapshot(self) -> UsageSnapshot {
+        let mut windows: Vec<UsageWindow> = self
+            .unified_windows
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(window, raw)| {
+                Some(UsageWindow {
+                    window,
+                    utilization: raw.utilization?,
+                    resets_at: raw.resets_at?,
+                })
+            })
+            .collect();
+        if windows.is_empty()
+            && let (Some(window), Some(utilization), Some(resets_at)) =
+                (self.rate_limit_type, self.utilization, self.resets_at)
+        {
+            windows.push(UsageWindow {
+                window,
+                utilization,
+                resets_at,
+            });
+        }
+        UsageSnapshot {
+            status: self.status,
+            resets_at: self.resets_at,
+            windows,
+        }
+    }
+}
+
+/// Raw shape of the `claude -p` result object (the whole output under
+/// `--output-format json`, the last `result` line under `stream-json`),
+/// deserialized leniently: every field is optional at this layer so that
+/// any one missing field doesn't fail the whole parse.
+/// [`ClaudeRunner::parse_outcome`] is the only place that decides which
+/// absences are fatal.
+#[derive(Debug, Default, serde::Deserialize)]
 struct RawResult {
     session_id: Option<String>,
     #[serde(default)]
@@ -752,7 +905,8 @@ mod tests {
                 "--permission-mode",
                 "plan",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--max-turns",
                 "300",
             ]
@@ -1148,6 +1302,108 @@ mod tests {
     fn parse_outcome_treats_empty_model_usage_map_as_none() {
         let json = r#"{"session_id": "sess-abc", "modelUsage": {}}"#;
         assert_eq!(ClaudeRunner.parse_outcome(json).unwrap().model_usage, None);
+    }
+
+    // --- stream-json (GitHub issue #129) ---
+
+    const STREAM_UNIFIED: &str = include_str!("fixtures/stream_unified.jsonl");
+    const STREAM_TOP_LEVEL_ONLY: &str = include_str!("fixtures/stream_top_level_only.jsonl");
+    const STREAM_KILLED: &str = include_str!("fixtures/stream_killed.jsonl");
+
+    #[test]
+    fn parse_outcome_reads_a_stream_exactly_like_the_single_json_result() {
+        let from_stream = ClaudeRunner.parse_outcome(STREAM_UNIFIED).unwrap();
+        let from_json = ClaudeRunner.parse_outcome(&full_canned_json()).unwrap();
+
+        assert_eq!(
+            RunOutcome {
+                usage: None,
+                ..from_stream
+            },
+            from_json
+        );
+    }
+
+    #[test]
+    fn parse_outcome_takes_the_last_rate_limit_event_with_unified_windows() {
+        let outcome = ClaudeRunner.parse_outcome(STREAM_UNIFIED).unwrap();
+
+        assert_eq!(
+            outcome.usage,
+            Some(UsageSnapshot {
+                status: Some("allowed_warning".to_string()),
+                resets_at: Some(1792365600),
+                windows: vec![
+                    UsageWindow {
+                        window: "five_hour".to_string(),
+                        utilization: 0.82,
+                        resets_at: 1792365600,
+                    },
+                    UsageWindow {
+                        window: "seven_day".to_string(),
+                        utilization: 0.09,
+                        resets_at: 1792735200,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_outcome_falls_back_to_the_top_level_window_without_unified_windows() {
+        let outcome = ClaudeRunner.parse_outcome(STREAM_TOP_LEVEL_ONLY).unwrap();
+
+        assert_eq!(outcome.session_id, "sess-old");
+        assert_eq!(
+            outcome.usage,
+            Some(UsageSnapshot {
+                status: Some("allowed".to_string()),
+                resets_at: Some(1792365600),
+                windows: vec![UsageWindow {
+                    window: "five_hour".to_string(),
+                    utilization: 0.4,
+                    resets_at: 1792365600,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_outcome_gives_a_best_effort_outcome_for_a_killed_stream() {
+        let outcome = ClaudeRunner.parse_outcome(STREAM_KILLED).unwrap();
+
+        assert_eq!(outcome.session_id, "sess-killed");
+        assert_eq!(outcome.is_error, None, "no result line: suspicious, not Done");
+        assert_eq!(outcome.result, None);
+        assert_eq!(outcome.cost_usd, None);
+        let usage = outcome.usage.expect("the rate_limit_event survived");
+        assert!(usage.is_rejected());
+        assert_eq!(usage.windows[0].utilization, 1.02);
+    }
+
+    #[test]
+    fn parse_outcome_errors_on_a_stream_with_no_session_id() {
+        let raw = "noise\n{\"type\":\"assistant\"}\n";
+        let err = ClaudeRunner.parse_outcome(raw).unwrap_err();
+        assert!(matches!(err, OutcomeParseError::MissingSessionId));
+    }
+
+    #[test]
+    fn parse_outcome_errors_on_empty_output() {
+        let err = ClaudeRunner.parse_outcome("").unwrap_err();
+        assert!(matches!(err, OutcomeParseError::Malformed(_)));
+    }
+
+    #[test]
+    fn headless_mode_asks_for_verbose_stream_json() {
+        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let at = invocation
+            .args
+            .iter()
+            .position(|a| a == "--output-format")
+            .unwrap();
+        assert_eq!(invocation.args[at + 1], "stream-json");
+        assert!(invocation.args.contains(&"--verbose".to_string()));
     }
 
     // --- rate-limit classification ---

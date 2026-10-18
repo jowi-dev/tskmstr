@@ -478,6 +478,8 @@ impl AgentRunner for OpencodeRunner {
             // comment.
             model_usage: None,
             rate_limit,
+            // opencode reports no usage windows.
+            usage: None,
         })
     }
 

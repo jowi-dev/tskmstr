@@ -416,7 +416,7 @@ impl InstallReport {
 
 /// The typed result of one finished headless agent invocation, parsed from
 /// whatever raw result text the adapter's process wrote (e.g. `claude -p
-/// --output-format json`'s stdout). The exact raw shape is adapter-owned —
+/// --output-format stream-json`'s stdout). The exact raw shape is adapter-owned —
 /// see [`crate::agent::claude::ClaudeRunner`]'s `parse_outcome` for the
 /// `claude`-specific field mapping this shape mirrors today — but this
 /// struct itself is runner-agnostic: it's what every caller downstream of
@@ -458,6 +458,48 @@ pub struct RunOutcome {
     /// [`RateLimitInfo`]'s doc comment for why this exists and how
     /// `run_agent_and_finish` (`src/work/run.rs`) is meant to react to it.
     pub rate_limit: Option<RateLimitInfo>,
+    /// The last subscription-usage snapshot the adapter's output carried
+    /// (claude's stream-json `rate_limit_event`, GitHub issue #129), or
+    /// `None` when it carried none. Unlike [`RunOutcome::rate_limit`], this
+    /// is proactive: it reports utilization on every run, not just one that
+    /// hit the limit. `run_agent_and_finish` upserts it into runs.db's
+    /// `usage_snapshots` table.
+    pub usage: Option<UsageSnapshot>,
+}
+
+/// One observation of a subscription's usage windows, as reported by the
+/// agent CLI itself. See `docs/plans/gh-113-proactive-usage-signal.md`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSnapshot {
+    /// The server's verdict for the representative window: `allowed`,
+    /// `allowed_warning` or `rejected`. `None` when the event omitted it.
+    pub status: Option<String>,
+    /// Unix-seconds reset time of the representative window, the one
+    /// [`UsageSnapshot::status`] describes. `None` when the event omitted it.
+    pub resets_at: Option<i64>,
+    /// Every window the event reported a utilization for, sorted by name.
+    /// Empty when the event carried a status but no utilization.
+    pub windows: Vec<UsageWindow>,
+}
+
+impl UsageSnapshot {
+    /// Whether the server is rejecting requests. A rejected snapshot marks
+    /// the agent exhausted until [`UsageSnapshot::resets_at`].
+    pub fn is_rejected(&self) -> bool {
+        self.status.as_deref() == Some("rejected")
+    }
+}
+
+/// One usage window inside a [`UsageSnapshot`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageWindow {
+    /// The window's name, e.g. `five_hour` or `seven_day`.
+    pub window: String,
+    /// Fraction of the window used. Usually 0–1, but may exceed 1.0 under
+    /// overage.
+    pub utilization: f64,
+    /// Unix-seconds timestamp the window resets at.
+    pub resets_at: i64,
 }
 
 /// Signals that an [`AgentRunner::parse_outcome`] call classified its raw
