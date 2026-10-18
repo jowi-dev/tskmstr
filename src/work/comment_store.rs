@@ -153,11 +153,10 @@ pub fn append(
     created_at: &str,
 ) -> Result<Vec<String>, CommentStoreError> {
     let mut comments = load(git_dir)?;
-    let mut next = comments.iter().filter_map(id_number).max().unwrap_or(0) + 1;
+    let first = comments.iter().filter_map(id_number).max().unwrap_or(0) + 1;
     let mut ids = Vec::with_capacity(new.len());
-    for comment in new {
-        let id = format!("c{next}");
-        next += 1;
+    for (n, comment) in (first..).zip(new) {
+        let id = format!("c{n}");
         let Value::Object(map) = json!({
             "id": id,
             "path": comment.path,
