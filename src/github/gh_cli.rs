@@ -3232,6 +3232,7 @@ pub struct FakeGhCli {
     pr_list_merged_into_results: RefCell<HashMap<String, Result<Vec<PrInfo>, GhError>>>,
     pr_list_merged_into_calls: RefCell<Vec<(PathBuf, String)>>,
     pr_merge_result: RefCell<Result<(), GhError>>,
+    pr_merge_sequence: RefCell<std::collections::VecDeque<Result<(), GhError>>>,
     pr_merge_calls: RefCell<Vec<(PathBuf, u64)>>,
     issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
     issue_view_calls: RefCell<Vec<(String, u64)>>,
@@ -3295,6 +3296,7 @@ impl Default for FakeGhCli {
             pr_list_calls: RefCell::new(Vec::new()),
             pr_list_bounded_result: RefCell::new(None),
             pr_merge_result: RefCell::new(Ok(())),
+            pr_merge_sequence: RefCell::new(std::collections::VecDeque::new()),
             pr_merge_calls: RefCell::new(Vec::new()),
             pr_list_bounded_calls: RefCell::new(Vec::new()),
             pr_list_review_state_result: RefCell::new(Ok(Vec::new())),
@@ -3494,6 +3496,19 @@ impl FakeGhCli {
     /// succeeds trivially.
     pub fn with_pr_merge_result(self, result: Result<(), GhError>) -> Self {
         *self.pr_merge_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `pr_merge` to return each element of `sequence` in order,
+    /// one per call, repeating the last element once exhausted. Takes
+    /// precedence over [`Self::with_pr_merge_result`]; lets a test reject a
+    /// merge for a stale base and then accept the retry.
+    pub fn with_pr_merge_sequence(self, sequence: Vec<Result<(), GhError>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_pr_merge_sequence requires a non-empty sequence"
+        );
+        *self.pr_merge_sequence.borrow_mut() = sequence.into();
         self
     }
 
@@ -3848,7 +3863,12 @@ impl GhCli for FakeGhCli {
         self.pr_merge_calls
             .borrow_mut()
             .push((dir.to_path_buf(), number));
-        self.pr_merge_result.borrow().clone()
+        let mut sequence = self.pr_merge_sequence.borrow_mut();
+        match sequence.len() {
+            0 => self.pr_merge_result.borrow().clone(),
+            1 => sequence[0].clone(),
+            _ => sequence.pop_front().expect("non-empty"),
+        }
     }
 
     fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError> {
