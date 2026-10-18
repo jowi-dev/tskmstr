@@ -3184,6 +3184,47 @@ mod tests {
     }
 
     #[test]
+    fn batch_member_rejected_for_a_stale_base_is_rebased_and_retried() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean; 2]);
+        // PROJ-1 merges, moving main under PROJ-2, whose first merge
+        // attempt is then rejected.
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Ok(()), Err(stale_base_error()), Ok(())]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, keys(2), "{out}");
+        assert!(report.failed.is_empty(), "{out}");
+        let merged: Vec<u64> = fx.gh.pr_merge_calls().iter().map(|(_, n)| *n).collect();
+        assert_eq!(merged, vec![11, 12, 12]);
+        assert_eq!(
+            fx.git.rebase_onto_calls().len(),
+            3,
+            "one prepare rebase per ticket plus PROJ-2's retry"
+        );
+    }
+
+    #[test]
+    fn batch_member_still_stale_after_the_retry_is_reported_failed() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean; 2]);
+        fx.gh = fx.gh.with_pr_merge_sequence(vec![
+            Ok(()),
+            Err(stale_base_error()),
+            Err(stale_base_error()),
+        ]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1"], "{out}");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "PROJ-2");
+        assert_eq!(fx.gh.pr_merge_calls().len(), 3, "exactly one retry");
+    }
+
+    #[test]
     fn batch_ticket_error_is_recorded_and_the_rest_still_merge() {
         let fx = batch_fixture(&[BatchTicket::Clean; 2]);
         let keys = vec![
