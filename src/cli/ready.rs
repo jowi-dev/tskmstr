@@ -47,6 +47,9 @@ pub struct ReadyContext<'a> {
     pub gh: &'a dyn GhCli,
     /// Bot logins configured as [`crate::config::Config::review_bots`].
     pub review_bots: &'a [String],
+    /// Each ticket's live lane run (see [`blocker_stacking::in_flight_lanes`]):
+    /// a no-PR blocker with one reads as waiting rather than blocked.
+    pub in_flight: blocker_stacking::InFlight,
 }
 
 /// Errors surfaced by `tm ready`.
@@ -116,15 +119,19 @@ fn normalize(key: &str) -> Result<String, ReadyCliError> {
 
 /// `tm ready` (no key): print every candidate assigned to the current user
 /// (see [`ready_candidates`]) with its [`ListDecision`], grouped as ready,
-/// then stackable, then blocked, each group in rank order:
+/// then stackable, then waiting, then blocked, each group in rank order:
 ///
 /// - ready: `KEY  Summary`
 /// - stackable: `KEY  Summary  [stackable on <branch> — blocked by
 ///   <BLOCKER>, PR #<N> open]`
+/// - waiting: `KEY  Summary  [waiting on <BLOCKER> (<run status>)]`
 /// - blocked: `KEY  Summary  [<reason>]`, e.g. `[blocked by PROJ-9 (In
 ///   Progress), no PR yet]`
 ///
-/// Prints `No ready tickets.` ahead of any blocked rows if nothing is ready
+/// Any row whose ticket blocks other candidates (see
+/// [`blocker_stacking::unblock_counts`]) ends with `  [unblocks N]`.
+///
+/// Prints `No ready tickets.` ahead of any other rows if nothing is ready
 /// or stackable. Any warnings (see [`list_json`]) print first as `warning:
 /// ...` lines. Always exits 0.
 ///
@@ -141,56 +148,60 @@ pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError
         writeln!(out, "warning: {warning}")?;
     }
 
-    let any_workable = report
-        .tickets
-        .iter()
-        .any(|t| !matches!(t.decision, ListDecision::Blocked { .. }));
+    let any_workable = report.tickets.iter().any(|t| {
+        matches!(
+            t.decision,
+            ListDecision::Ready | ListDecision::Stackable { .. }
+        )
+    });
     if !any_workable {
         writeln!(out, "No ready tickets.")?;
     }
 
-    for ticket in &report.tickets {
-        if let (ListDecision::Ready, unresolved) =
-            (&ticket.decision, ticket.unresolved_bot_findings)
-        {
-            match unresolved {
-                Some(unresolved) => {
-                    let noun = if unresolved == 1 {
-                        "finding"
-                    } else {
-                        "findings"
-                    };
-                    writeln!(
-                        out,
-                        "{}  {}  [{unresolved} unresolved bot {noun}]",
-                        ticket.key, ticket.summary
-                    )?;
-                }
-                None => writeln!(out, "{}  {}", ticket.key, ticket.summary)?,
+    for group in 0..4 {
+        for ticket in report.tickets.iter().filter(|t| list_group(t) == group) {
+            write!(out, "{}  {}", ticket.key, ticket.summary)?;
+            if let Some(note) = list_note(ticket) {
+                write!(out, "  [{note}]")?;
             }
-        }
-    }
-    for ticket in &report.tickets {
-        if let ListDecision::Stackable {
-            base,
-            blocker_key,
-            pr_number,
-        } = &ticket.decision
-        {
-            writeln!(
-                out,
-                "{}  {}  [stackable on {base} — blocked by {blocker_key}, PR #{pr_number} open]",
-                ticket.key, ticket.summary
-            )?;
-        }
-    }
-    for ticket in &report.tickets {
-        if let ListDecision::Blocked { reason, .. } = &ticket.decision {
-            writeln!(out, "{}  {}  [{reason}]", ticket.key, ticket.summary)?;
+            if ticket.unblocks > 0 {
+                write!(out, "  [unblocks {}]", ticket.unblocks)?;
+            }
+            writeln!(out)?;
         }
     }
 
     Ok(())
+}
+
+/// [`list`]'s print order: ready, stackable, waiting, then blocked.
+fn list_group(ticket: &ListEntry) -> u8 {
+    match ticket.decision {
+        ListDecision::Ready => 0,
+        ListDecision::Stackable { .. } => 1,
+        ListDecision::Waiting { .. } => 2,
+        ListDecision::Blocked { .. } => 3,
+    }
+}
+
+/// The bracketed note [`list`] prints after `ticket`'s summary, if any.
+fn list_note(ticket: &ListEntry) -> Option<String> {
+    match &ticket.decision {
+        ListDecision::Ready => ticket.unresolved_bot_findings.map(|n| {
+            let noun = if n == 1 { "finding" } else { "findings" };
+            format!("{n} unresolved bot {noun}")
+        }),
+        ListDecision::Stackable {
+            base,
+            blocker_key,
+            pr_number,
+        } => Some(format!(
+            "stackable on {base} — blocked by {blocker_key}, PR #{pr_number} open"
+        )),
+        ListDecision::Waiting { reason, .. } | ListDecision::Blocked { reason, .. } => {
+            Some(reason.clone())
+        }
+    }
 }
 
 /// `tm ready --json`: the same classification as [`list`], as one JSON
@@ -200,21 +211,26 @@ pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError
 /// {
 ///   "tickets": [
 ///     {"key": "AX-1", "summary": "...", "decision": "ready",
-///      "unresolved_bot_findings": 2},
+///      "unresolved_bot_findings": 2, "unblocks": 1},
 ///     {"key": "AX-409", "summary": "...", "decision": "stackable",
 ///      "base": "origin/jowi-dev/ax-408-...", "blocker_key": "AX-408",
-///      "pr_number": 490},
+///      "pr_number": 490, "unblocks": 0},
+///     {"key": "AX-3", "summary": "...", "decision": "waiting",
+///      "blocker_key": "AX-7", "run_id": 12, "run_status": "running",
+///      "reason": "waiting on AX-7 (running)", "unblocks": 0},
 ///     {"key": "AX-2", "summary": "...", "decision": "blocked",
-///      "blocker_keys": ["AX-9"], "reason": "blocked by AX-9 (To Do), no PR yet"}
+///      "blocker_keys": ["AX-9"], "reason": "blocked by AX-9 (To Do), no PR yet",
+///      "unblocks": 0}
 ///   ],
-///   "warnings": ["could not check stackability: ..."]
+///   "warnings": ["could not check stackability: ...",
+///                "blocker cycle among AX-5, AX-6 — ..."]
 /// }
 /// ```
 ///
 /// `tickets` is in rank order (not grouped). `unresolved_bot_findings` is
-/// present only on a ready ticket with at least one. `warnings` carries what
-/// [`list`] would print as `warning:` lines, so stdout stays valid JSON when
-/// a `gh` lookup degrades.
+/// present only on a ready ticket with at least one; `unblocks` is always
+/// present. `warnings` carries what [`list`] would print as `warning:`
+/// lines, so stdout stays valid JSON when a `gh` lookup degrades.
 pub fn list_json(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError> {
     let report = list_report(ctx)?;
     serde_json::to_writer_pretty(&mut *out, &report).map_err(std::io::Error::from)?;
@@ -239,6 +255,18 @@ pub enum ListDecision {
         /// The blocker's open PR number.
         pr_number: u64,
     },
+    /// One unmerged blocker with no PR yet, but a live lane run working it:
+    /// re-check later rather than dispatch the blocker.
+    Waiting {
+        /// The blocker's issue key.
+        blocker_key: String,
+        /// The blocker's live lane run.
+        run_id: i64,
+        /// That run's status: `running`, `queued`, or `hibernated`.
+        run_status: String,
+        /// Human-readable explanation, e.g. `waiting on PROJ-9 (running)`.
+        reason: String,
+    },
     /// Nothing to stack on: one unmerged blocker with no PR, two or more
     /// unmerged blockers, or (when the PR lookup failed) any blocker still
     /// open in the tracker.
@@ -260,6 +288,8 @@ struct ListEntry {
     decision: ListDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
     unresolved_bot_findings: Option<usize>,
+    /// How many other candidates this one blocks, transitively.
+    unblocks: usize,
 }
 
 /// What both [`list`] and [`list_json`] render.
@@ -299,9 +329,18 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
         None
     };
 
+    let unblocks = blocker_stacking::unblock_counts(&candidates);
+    if !unblocks.cycle_members.is_empty() {
+        let members: Vec<&str> = unblocks.cycle_members.iter().map(String::as_str).collect();
+        warnings.push(format!(
+            "blocker cycle among {} — none of them can become ready until it is broken",
+            members.join(", ")
+        ));
+    }
+
     let decisions: Vec<ListDecision> = candidates
         .iter()
-        .map(|issue| list_decision(issue, prs.as_deref()))
+        .map(|issue| list_decision(issue, prs.as_deref(), &ctx.in_flight))
         .collect();
 
     let ready: Vec<Issue> = candidates
@@ -321,6 +360,7 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
         .zip(decisions)
         .map(|(issue, decision)| ListEntry {
             unresolved_bot_findings: annotations.get(&issue.key).copied(),
+            unblocks: unblocks.counts.get(&issue.key).copied().unwrap_or(0),
             key: issue.key,
             summary: issue.fields.summary,
             decision,
@@ -334,7 +374,11 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
 /// repo PR list, or `None` when that lookup failed (or was skipped because no
 /// candidate had a blocker); a ticket with no direct blockers is ready
 /// without consulting it, matching [`check`].
-fn list_decision(issue: &Issue, prs: Option<&[PrSummary]>) -> ListDecision {
+fn list_decision(
+    issue: &Issue,
+    prs: Option<&[PrSummary]>,
+    in_flight: &blocker_stacking::InFlight,
+) -> ListDecision {
     if blocker_stacking::direct_blockers(issue).is_empty() {
         return ListDecision::Ready;
     }
@@ -353,7 +397,10 @@ fn list_decision(issue: &Issue, prs: Option<&[PrSummary]>) -> ListDecision {
         };
     };
 
-    match blocker_stacking::decide(blocker_stacking::unmerged_direct_blockers(issue, prs)) {
+    match blocker_stacking::decide(
+        blocker_stacking::unmerged_direct_blockers(issue, prs),
+        in_flight,
+    ) {
         StackDecision::Ready => ListDecision::Ready,
         StackDecision::Stackable {
             blocker_key,
@@ -363,6 +410,12 @@ fn list_decision(issue: &Issue, prs: Option<&[PrSummary]>) -> ListDecision {
             base: format!("origin/{head_ref_name}"),
             blocker_key,
             pr_number,
+        },
+        StackDecision::WaitingOnInFlight { blocker, run } => ListDecision::Waiting {
+            reason: format!("waiting on {} ({})", blocker.key, run.status.as_str()),
+            blocker_key: blocker.key,
+            run_id: run.run_id,
+            run_status: run.status.as_str().to_string(),
         },
         StackDecision::BlockedNoPr { blocker } => ListDecision::Blocked {
             reason: format!(
@@ -411,7 +464,8 @@ pub enum ReadyOutcome {
 /// - Exactly one, with an open PR → prints `KEY is stackable on
 ///   <branch> (blocked by <BLOCKER>, PR #<N> open)`, returns
 ///   `Ok(ReadyOutcome::Stackable)`.
-/// - Exactly one, with no PR yet, or two or more → returns
+/// - Exactly one, with no PR yet (whether waiting on a live lane run in
+///   [`ReadyContext::in_flight`] or not), or two or more → returns
 ///   [`ReadyCliError::NotReady`], whose `Display` prints a `KEY is blocked
 ///   by:` header followed by one line per unmerged blocker — `main.rs`'s
 ///   existing error path turns this into a non-zero exit.
@@ -468,7 +522,7 @@ pub fn check(
     };
 
     let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
-    match blocker_stacking::decide(unmerged) {
+    match blocker_stacking::decide(unmerged, &ctx.in_flight) {
         StackDecision::Ready => {
             writeln!(out, "{normalized} is ready ({status_name})")?;
             print_bot_finding_note(ctx, &normalized, out)?;
@@ -491,6 +545,17 @@ pub fn check(
             blockers: format!(
                 "  {} ({}): {} — blocked, no PR found yet to stack on",
                 blocker.key, blocker.status_name, blocker.summary
+            ),
+        }),
+        StackDecision::WaitingOnInFlight { blocker, run } => Err(ReadyCliError::NotReady {
+            key: normalized,
+            blockers: format!(
+                "  {} ({}): {} — waiting on lane run #{} ({}), no PR yet",
+                blocker.key,
+                blocker.status_name,
+                blocker.summary,
+                run.run_id,
+                run.status.as_str()
             ),
         }),
         StackDecision::BlockedMultiple { blockers } => {
@@ -706,6 +771,7 @@ mod tests {
             jira,
             gh,
             review_bots,
+            in_flight: blocker_stacking::InFlight::new(),
         }
     }
 
@@ -833,6 +899,140 @@ mod tests {
             })
             .collect();
         i
+    }
+
+    /// `key`'s blocker has a live lane run `run_id` in `status`.
+    fn in_flight(
+        key: &str,
+        run_id: i64,
+        status: crate::runs::RunStatus,
+    ) -> blocker_stacking::InFlight {
+        blocker_stacking::InFlight::from([(
+            key.to_string(),
+            blocker_stacking::InFlightRun { run_id, status },
+        )])
+    }
+
+    #[test]
+    fn list_shows_a_blocker_with_a_live_lane_run_as_waiting() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            blocked_issue("PROJ-2", &[("PROJ-9", "In Progress", "indeterminate")]),
+            blocked_issue("PROJ-3", &[("PROJ-8", "In Progress", "indeterminate")]),
+        ]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            in_flight: in_flight("PROJ-9", 5, crate::runs::RunStatus::Running),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        list(&ctx, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No ready tickets.\n\
+             PROJ-2  Summary for PROJ-2  [waiting on PROJ-9 (running)]\n\
+             PROJ-3  Summary for PROJ-3  [blocked by PROJ-8 (In Progress), no PR yet]\n"
+        );
+    }
+
+    #[test]
+    fn list_json_reports_a_waiting_candidate_with_its_run() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked_issue(
+            "PROJ-2",
+            &[("PROJ-9", "In Progress", "indeterminate")],
+        )]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            in_flight: in_flight("PROJ-9", 5, crate::runs::RunStatus::Hibernated),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        list_json(&ctx, &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(
+            value["tickets"][0],
+            serde_json::json!({
+                "key": "PROJ-2",
+                "summary": "Summary for PROJ-2",
+                "decision": "waiting",
+                "blocker_key": "PROJ-9",
+                "run_id": 5,
+                "run_status": "hibernated",
+                "reason": "waiting on PROJ-9 (hibernated)",
+                "unblocks": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn list_shows_how_many_candidates_each_ticket_unblocks() {
+        // PROJ-1 blocks PROJ-2, which blocks PROJ-3: PROJ-1 frees two.
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("PROJ-1"),
+            blocked_issue("PROJ-2", &[("PROJ-1", "To Do", "new")]),
+            blocked_issue("PROJ-3", &[("PROJ-2", "To Do", "new")]),
+        ]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-1  Summary for PROJ-1  [unblocks 2]\n\
+             PROJ-2  Summary for PROJ-2  [blocked by PROJ-1 (To Do), no PR yet]  [unblocks 1]\n\
+             PROJ-3  Summary for PROJ-3  [blocked by PROJ-2 (To Do), no PR yet]\n"
+        );
+    }
+
+    #[test]
+    fn list_json_carries_unblock_counts_and_warns_about_a_cycle() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            blocked_issue("PROJ-1", &[("PROJ-2", "To Do", "new")]),
+            blocked_issue("PROJ-2", &[("PROJ-1", "To Do", "new")]),
+            issue("PROJ-3"),
+        ]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list_json(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(value["tickets"][0]["unblocks"], 1);
+        assert_eq!(value["tickets"][2]["unblocks"], 0);
+        assert_eq!(
+            value["warnings"],
+            serde_json::json!([
+                "blocker cycle among PROJ-1, PROJ-2 — none of them can become ready until it is broken"
+            ])
+        );
+    }
+
+    #[test]
+    fn check_reports_a_blocker_with_a_live_lane_run_as_waiting() {
+        let ticket = blocked_issue("AX-409", &[("AX-408", "In Progress", "indeterminate")]);
+        let jira = FakeJiraClient::new().with_issue("AX-409", ticket);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            in_flight: in_flight("AX-408", 12, crate::runs::RunStatus::Queued),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        let err = check(&ctx, "AX-409", &mut out).expect_err("waiting is not ready");
+
+        assert_eq!(
+            err.to_string(),
+            "AX-409 is blocked by:\n  AX-408 (In Progress): Summary for AX-408 — waiting on lane run #12 (queued), no PR yet"
+        );
     }
 
     #[test]
@@ -991,11 +1191,13 @@ mod tests {
                         "base": "origin/jowi-dev/ax-408-20260810-131418",
                         "blocker_key": "AX-408",
                         "pr_number": 490,
+                        "unblocks": 0,
                     },
                     {
                         "key": "AX-1",
                         "summary": "Summary for AX-1",
                         "decision": "ready",
+                        "unblocks": 0,
                     },
                     {
                         "key": "AX-2",
@@ -1003,6 +1205,7 @@ mod tests {
                         "decision": "blocked",
                         "blocker_keys": ["AX-9"],
                         "reason": "blocked by AX-9 (To Do), no PR yet",
+                        "unblocks": 0,
                     },
                 ],
                 "warnings": [],
@@ -1546,6 +1749,7 @@ mod tests {
             &gh,
             std::path::Path::new("/repo"),
             Some("AX-409"),
+            &crate::blocker_stacking::InFlight::new(),
         )
         .expect("resolve_blocker_stacking should also treat this as stackable, not refuse");
         assert_eq!(
@@ -1582,6 +1786,7 @@ mod tests {
             &gh,
             std::path::Path::new("/repo"),
             Some("AX-409"),
+            &crate::blocker_stacking::InFlight::new(),
         )
         .expect("resolve_blocker_stacking should also treat this as ready, not refuse");
         assert_eq!(

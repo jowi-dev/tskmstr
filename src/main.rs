@@ -1604,6 +1604,17 @@ fn default_xdg_run_db_path() -> PathBuf {
     tskmstr::runs::default_db_path(&home, xdg_data_home.as_deref())
 }
 
+/// Live lane runs in this config's scope, for `tm ready`'s waiting-on-blocker
+/// decision. Best-effort: an unreadable run store just means no blocker reads
+/// as in flight (it shows as blocked instead), never a failed `tm ready`.
+fn ready_in_flight(config: &Config) -> tskmstr::blocker_stacking::InFlight {
+    let scope = tskmstr::config::BackendIdentity::from_config(config).scope();
+    tskmstr::runs::RunStore::open(&run_db_path_from_config(config))
+        .and_then(|store| store.list_runs_filtered(Some(&scope), Some("lane")))
+        .map(|runs| tskmstr::blocker_stacking::in_flight_lanes(&runs))
+        .unwrap_or_default()
+}
+
 /// `tm ready` (no key): needs a Jira client + config, same as the
 /// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
 /// `review_bots` for the best-effort bot-findings/stackability annotations
@@ -1629,6 +1640,7 @@ fn run_ready(
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
+        in_flight: ready_in_flight(&config),
     };
     let mut stdout = std::io::stdout();
     if json {
@@ -1680,6 +1692,7 @@ fn run_ready_check(key: String) -> ExitCode {
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
+        in_flight: ready_in_flight(&config),
     };
     let mut stdout = std::io::stdout();
 
