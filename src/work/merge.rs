@@ -7,8 +7,10 @@
 //! rebase (opening a conflict-resolution tmux session and polling it to
 //! completion when the rebase stops on conflicts), merge the PR via `gh`,
 //! fast-forward the local base branch, best-effort clean up the worktree,
-//! branch, and ticket tmux session (its scrollback archived first, see
-//! [`crate::work::session_gc`]; GitHub issue #78), apply the configured
+//! branch, the ticket's live runs (finished as `done`, their agents
+//! stopped; GitHub issue #107), and ticket tmux session (its scrollback
+//! archived first, see [`crate::work::session_gc`]; GitHub issue #78),
+//! apply the configured
 //! `status_on_merge` transition, clear any `tm:status/*` label GitHub left
 //! on an issue the PR's closing keyword closed (GitHub issue #75), and
 //! finally move the tickets of stacked PRs already merged into the branch,
@@ -211,6 +213,11 @@ pub struct MergeDeps<'a> {
     /// `tm work run`/`tm review fix` use for their own interactive prompt
     /// files. Created (via `create_dir_all`) if it doesn't exist yet.
     pub state_dir: &'a Path,
+    /// Stops a merged ticket's still-running agent by pid (see
+    /// [`finish_ticket_runs`]); production passes
+    /// [`crate::runs::pid::kill_pid`], the same `SIGKILL` sender idle
+    /// hibernation uses.
+    pub kill_pid: &'a dyn Fn(u32),
 }
 
 /// Substitutes `{key}`, `{branch}`, and `{base}` in `template`, producing
@@ -1112,9 +1119,10 @@ fn prepare_merge(
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
 /// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
 /// merge`, sync the local base, best-effort clean up (worktree, local
-/// branch, then the ticket's tmux session via
-/// [`session_gc::archive_and_kill`]), and apply `status_on_merge`, then
-/// sweep stale status labels off a closed ticket.
+/// branch, the ticket's live runs via [`finish_ticket_runs`], then its tmux
+/// session via [`session_gc::archive_and_kill`]), and apply
+/// `status_on_merge`, then sweep stale status labels off a closed ticket
+/// and close out stacked children.
 ///
 /// `kept_session` names a tmux session that must survive this ticket's
 /// cleanup even if it is the ticket's own: a batch's shared conflict
@@ -1232,6 +1240,7 @@ fn finish_merge(
         }
     }
 
+    finish_ticket_runs(deps, key, out)?;
     cleanup_ticket_session(deps, key, kept_session, out)?;
 
     if let Some(target_status) = deps.status_on_merge {
@@ -1258,7 +1267,7 @@ fn finish_merge(
         )?,
     }
 
-    reconcile_stacked_children(deps, repo_root, branch, out)?;
+    reconcile_stacked_children(deps, repo_root, branch, kept_session, out)?;
 
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
     Ok(())
@@ -1271,12 +1280,15 @@ fn finish_merge(
 ///
 /// GitHub only honours a closing keyword on a PR into the default branch,
 /// so a stacked PR merged into its blocker's branch outside `tm merge`
-/// never moves its ticket; merging the blocker is when that work lands.
-/// Advisory like the rest of the cleanup: never fails the merge.
+/// never moves its ticket; merging the blocker is when that work lands —
+/// so each child's runs and session are closed out here too, exactly as
+/// the merged ticket's are (GitHub issue #107). Advisory like the rest of
+/// the cleanup: never fails the merge.
 fn reconcile_stacked_children(
     deps: &MergeDeps<'_>,
     repo_root: &Path,
     branch: &str,
+    kept_session: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), MergeError> {
     let target = deps.status_on_merge.unwrap_or("Done");
@@ -1317,6 +1329,93 @@ fn reconcile_stacked_children(
                     "warning: failed to clear stale status labels from {key}: {err} (run: tm backend clean-status-labels)"
                 )?;
             }
+            finish_ticket_runs(deps, &key, out)?;
+            cleanup_ticket_session(deps, &key, kept_session, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// The run close-out step of [`finish_merge`] (GitHub issue #107): finish
+/// every live (`queued`, `running`, `hibernated`) run recorded for `key`
+/// as `done`, so [`session_gc::archive_and_kill`]'s live-run guard stops
+/// holding the merged ticket's session open — only another ticket's live
+/// run hosted there still does.
+///
+/// A `running` run whose recorded pid is still alive has that agent
+/// stopped via [`MergeDeps::kill_pid`], after its row is marked done (the
+/// order idle hibernation uses, so nothing reads the dying process as a
+/// crash). A hibernated run's agent is already gone, so its pid — possibly
+/// reused since — is never signalled. When tm is itself running inside
+/// `key`'s session (or that cannot be told), no agent is stopped: the one
+/// hosting tm is likely among them. Never fails the merge; only writing to
+/// `out` can error.
+fn finish_ticket_runs(
+    deps: &MergeDeps<'_>,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    use crate::runs::{FinishRun, RunStatus};
+
+    let Some(store) = deps.run_store else {
+        return Ok(());
+    };
+    let runs = match store.runs_for_ticket(Some(&deps.identity.scope()), key) {
+        Ok(runs) => runs,
+        Err(err) => {
+            writeln!(
+                out,
+                "warning: failed to read {key}'s runs: {err}; left them unfinished (run: tm runs finish <id> --status done)"
+            )?;
+            return Ok(());
+        }
+    };
+    let live: Vec<_> = runs
+        .into_iter()
+        .filter(|run| {
+            matches!(
+                run.status,
+                RunStatus::Queued | RunStatus::Running | RunStatus::Hibernated
+            )
+        })
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+
+    let session = ticket_session_name(&deps.identity.session_slug(), key);
+    let inside_session = !matches!(
+        deps.tmux.current_session_name(),
+        Ok(ref current) if current.as_deref() != Some(session.as_str())
+    );
+    let done = FinishRun {
+        status: RunStatus::Done,
+        ..Default::default()
+    };
+    for run in live {
+        if let Err(err) = store.finish_run(run.id, &done) {
+            writeln!(
+                out,
+                "warning: failed to finish run {} ({} {key}): {err} (run: tm runs finish {} --status done)",
+                run.id, run.kind, run.id
+            )?;
+            continue;
+        }
+        writeln!(out, "finished run {} ({} {key}) as done", run.id, run.kind)?;
+        if run.status != RunStatus::Running {
+            continue;
+        }
+        let Some(pid) = run.pid.filter(|pid| pid_alive(*pid)) else {
+            continue;
+        };
+        if inside_session {
+            writeln!(
+                out,
+                "warning: run {} left its agent (pid {pid}) running; tm is running inside {session} (run: kill {pid} once you leave it)",
+                run.id
+            )?;
+        } else {
+            (deps.kill_pid)(pid);
         }
     }
     Ok(())
@@ -1427,6 +1526,9 @@ mod tests {
         _worktree_dirs: Vec<tempfile::TempDir>,
         _state_dir: tempfile::TempDir,
         state_dir: PathBuf,
+        /// Every pid [`MergeDeps::kill_pid`] was asked to stop, in order.
+        killed_pids: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+        kill_pid: Box<dyn Fn(u32)>,
     }
 
     impl Fixture {
@@ -1435,7 +1537,11 @@ mod tests {
             let store = open_store(db_dir.path());
             let state_tmp = tempdir().unwrap();
             let state_dir = state_tmp.path().join("state");
+            let killed_pids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let recorder = killed_pids.clone();
             Fixture {
+                killed_pids,
+                kill_pid: Box::new(move |pid| recorder.borrow_mut().push(pid)),
                 _db_dir: db_dir,
                 store,
                 git: FakeGitOps::new()
@@ -1513,6 +1619,7 @@ mod tests {
                 merge_cfg: &self.merge_cfg,
                 status_on_merge: self.status_on_merge.as_deref(),
                 state_dir: &self.state_dir,
+                kill_pid: &*self.kill_pid,
             }
         }
     }
@@ -2989,27 +3096,109 @@ mod tests {
         assert!(out.contains("tmux kill-session -t tm-proj-proj-1"), "{out}");
     }
 
-    #[test]
-    fn merge_leaves_a_session_hosting_a_running_run() {
-        let fx = session_fixture();
+    // --- finishing the merged ticket's live runs (GitHub issue #107) ---
+
+    /// Starts a `kind` run for `key` in the fixture's scope with `pid`.
+    fn start(fx: &Fixture, key: &str, kind: &str, pid: Option<u32>) -> i64 {
         fx.store
             .start_run(&StartRun {
                 scope: fx.identity.scope(),
-                ticket: "PROJ-1".to_string(),
-                lane: "audit".to_string(),
+                ticket: key.to_string(),
+                lane: kind.to_string(),
                 worktree: "/repo".to_string(),
                 branch: None,
-                pid: None,
-                kind: "audit".to_string(),
+                pid,
+                kind: kind.to_string(),
                 log_path: None,
             })
+            .unwrap()
+    }
+
+    fn status_of(fx: &Fixture, id: i64) -> crate::runs::RunStatus {
+        fx.store
+            .all_runs()
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == id)
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn merge_finishes_the_tickets_live_runs_and_stops_their_agents() {
+        let fx = session_fixture();
+        // The test process itself: a pid guaranteed to probe alive.
+        let lane = start(&fx, "PROJ-1", "lane", Some(std::process::id()));
+        let audit = start(&fx, "PROJ-1", "audit", None);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(status_of(&fx, lane), crate::runs::RunStatus::Done);
+        assert_eq!(status_of(&fx, audit), crate::runs::RunStatus::Done);
+        assert_eq!(*fx.killed_pids.borrow(), vec![std::process::id()]);
+        assert!(out.contains(&format!("finished run {lane}")), "{out}");
+        assert!(killed(&fx, "PROJ-1"), "{out}");
+    }
+
+    #[test]
+    fn a_hibernated_lane_of_the_merged_ticket_no_longer_blocks_the_kill() {
+        let fx = session_fixture();
+        let lane = start(&fx, "PROJ-1", "lane", Some(std::process::id()));
+        assert!(fx.store.hibernate_run(lane).unwrap());
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(status_of(&fx, lane), crate::runs::RunStatus::Done);
+        // Hibernation already stopped its agent; the pid may since be reused.
+        assert!(fx.killed_pids.borrow().is_empty());
+        assert!(killed(&fx, "PROJ-1"), "{out}");
+    }
+
+    #[test]
+    fn merge_leaves_a_session_hosting_another_tickets_live_run() {
+        let fx = session_fixture();
+        let other = start(&fx, "PROJ-2", "lane", None);
+        fx.store
+            .update_tmux_session(other, "tm-proj-proj-1")
             .unwrap();
 
         let (result, out) = run(&fx.deps(), "PROJ-1");
 
         assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(status_of(&fx, other), crate::runs::RunStatus::Running);
         assert!(!killed(&fx, "PROJ-1"));
         assert!(out.contains("is still running"), "{out}");
+    }
+
+    #[test]
+    fn merge_inside_the_ticket_session_finishes_runs_without_stopping_agents() {
+        // The agent hosting tm is likely the one that would be stopped.
+        let mut fx = session_fixture();
+        fx.tmux = std::mem::take(&mut fx.tmux)
+            .with_current_session_name(Ok(Some("tm-proj-proj-1".to_string())));
+        let lane = start(&fx, "PROJ-1", "lane", Some(std::process::id()));
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(status_of(&fx, lane), crate::runs::RunStatus::Done);
+        assert!(fx.killed_pids.borrow().is_empty());
+        assert!(out.contains("left its agent (pid"), "{out}");
+    }
+
+    #[test]
+    fn merge_closes_out_a_stacked_childs_runs_and_session() {
+        let mut fx = stacked_fixture();
+        fx.tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let child = start(&fx, "PROJ-2", "lane", None);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(status_of(&fx, child), crate::runs::RunStatus::Done);
+        assert!(killed(&fx, "PROJ-2"), "{out}");
     }
 
     #[test]
