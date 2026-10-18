@@ -196,7 +196,7 @@ tm auth status
 | `tm ticket retro <KEY> --clean` | Record that `<KEY>` shipped clean, with no known production defect (offline; never touches Jira) |
 | `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
-| `tm ready` | List tickets assigned to you that are ready to pick up (To Do, no open blockers), in rank order, plus any blocked ticket that's stackable |
+| `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), or blocked (and why); `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, or blocked. Exits `0` (ready), `3` (stackable), or `1` (blocked/error) |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
@@ -2293,14 +2293,12 @@ check. Any other Jira/config failure is a hard error, same as every other
 
 ### Readiness
 
-A ticket is a *candidate* for readiness when it has no open `Blocks`-type
-blockers: a `Blocks` link where the linked issue isn't yet Done. A Done
-blocker doesn't count at this stage, and a ticket that merely blocks
-something else is never "blocked" by that relationship. Every ticket that
-fails this first, Jira-only check is then re-examined by the **stack
-decision** below before being reported ready, stackable, or blocked — this
-is what tells the difference between "genuinely stuck" and "safe to build
-on top of, without waiting for the blocker to merge".
+Only a ticket's direct `Blocks`-type blockers matter; a ticket that merely
+blocks something else is never "blocked" by that relationship. Both `tm
+ready` forms run every ticket with a blocker through the **stack decision**
+below and report it ready, stackable, or blocked. This is what tells the
+difference between "genuinely stuck" and "safe to build on top of, without
+waiting for the blocker to merge".
 
 #### The stack decision
 
@@ -2339,14 +2337,28 @@ Then, across the ticket's unmerged blockers:
 - **two or more** → **blocked**: a single branch can only be stacked on one
   dependency at a time, so this refuses rather than guessing which one.
 
-`tm ready` (no key) lists tickets assigned to you that are ready, further
-restricted to your "To Do" tickets (something already In Progress has
-already been picked up) and printed in Jira's native backlog rank order,
-`KEY  Summary` per line, followed by any candidate found stackable as `KEY
-Summary  [stackable on <branch> — blocked by <BLOCKER>, PR #<N> open]`. If
-any remaining candidates were excluded for being blocked (per the stack
-decision above), a final `(N blocked tickets hidden)` line says so, so a
-filtered list doesn't read as "this is everything assigned to you".
+`tm ready` (no key) lists your "To Do" tickets (something already In
+Progress has already been picked up), each classified by the stack decision
+above. Ready tickets come first, then stackable, then blocked, each group in
+Jira's native backlog rank order:
+
+```
+PROJ-1  Fix the thing
+AX-409  Add the connector  [stackable on origin/jowi-dev/ax-408-... — blocked by AX-408, PR #490 open]
+PROJ-2  Add the widget  [blocked by PROJ-9 (In Progress), no PR yet]
+PROJ-3  Wire it up  [blocked by PROJ-8 (PR #3 open), PROJ-9 (no PR) — can't stack on more than one]
+```
+
+`No ready tickets.` heads the list when nothing is ready or stackable. The
+PR list is fetched once per invocation, and only if some candidate has a
+blocker.
+
+`tm ready --json` prints the same classification as one JSON object for
+scripts: `tickets` (rank order, each with `key`, `summary`, and `decision`
+of `ready`, `stackable` (plus `base`, `blocker_key`, `pr_number`), or
+`blocked` (plus `blocker_keys`, `reason`); a ready ticket with unresolved bot
+findings also has `unresolved_bot_findings`) and `warnings` (what the text
+form prints as `warning:` lines). `--json` is for the list form only.
 
 `tm ready <KEY>` checks one specific ticket, regardless of assignee or
 status:
@@ -2366,13 +2378,14 @@ shells out. A **transient** `gh` failure (network error, rate limit, `gh`
 missing, expired auth) degrades quietly to the pre-stacking, Jira-status-only
 answer, printing a `warning: could not resolve blocker PRs for KEY (...) —
 falling back to Jira-only readiness check` line first (`list`'s equivalent
-warning is `warning: could not check stackability: ...`, and it hides every
-remaining blocked candidate rather than guessing). A **permanent** `gh`
+warning is `warning: could not check stackability: ...`; it falls back the
+same way, listing a candidate with a still-open blocker as `[blocked by KEY
+(<status>) — blocker PRs unresolved]` rather than guessing). A **permanent** `gh`
 failure — `gh` telling `tm` it asked for something nonsensical, e.g. an
 invalid `--json` field — is not swallowed: `tm ready <KEY>` fails loudly with
 `bug in tm itself while resolving blockers for KEY: ... (this will not
 resolve on retry)` instead of silently misreporting the ticket's real
-stackability.
+stackability (the list form records it as a `warning` flagged as a tm bug and falls back as above).
 
 Both forms also carry a best-effort, advisory annotation of unresolved
 GitHub bot review findings (see `review_bots` above and `Bot findings`
