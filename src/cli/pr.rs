@@ -16,6 +16,7 @@ use crate::ticketing::{
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
 use crate::work::review_watch::{self, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper};
+use crate::work::run::WatchArmer;
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
 #[derive(Debug, Error)]
@@ -328,6 +329,52 @@ pub(crate) fn watch_log_dir(home: &Path) -> PathBuf {
         .join("review-watch")
 }
 
+/// The detached watcher's log file for `key`: one per ticket, under
+/// [`watch_log_dir`].
+fn watch_log_path(home: &Path, key: &str) -> PathBuf {
+    watch_log_dir(home).join(format!("{}.log", key.to_lowercase()))
+}
+
+/// The argv a detached watcher for `key` is re-exec'd with: the same
+/// command, run in the foreground of its own detached process.
+fn detached_watch_argv(key: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "watch".to_string(),
+        key.to_string(),
+        "--foreground".to_string(),
+    ]
+}
+
+/// Production [`WatchArmer`] (GitHub issue #118): re-execs the same
+/// detached `tm pr watch <KEY> --foreground` child that [`watch`] spawns,
+/// logging to the same per-ticket file, so an auto-armed watcher is
+/// indistinguishable from one started by hand. The child resolves the PR
+/// and repeats the running-watcher dedup itself.
+pub struct DetachedWatchArmer<'a> {
+    /// Detached-child process spawning (real or fake).
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path, i.e. `tm`.
+    pub current_exe: &'a Path,
+    /// The invoking user's home directory, for the log file location.
+    pub home: &'a Path,
+}
+
+impl WatchArmer for DetachedWatchArmer<'_> {
+    fn arm(&self, ticket: &str, working_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(watch_log_dir(self.home)).map_err(|e| e.to_string())?;
+        self.detach
+            .spawn_detached(
+                self.current_exe,
+                &detached_watch_argv(ticket),
+                working_dir,
+                &watch_log_path(self.home, ticket),
+            )
+            .map(|_pid| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// `tm pr watch <KEY> [--foreground]`: resolve `KEY`'s open pull request,
 /// refuse to double-watch, then either re-exec a detached `--foreground`
 /// child or run the poll loop synchronously.
@@ -393,15 +440,9 @@ pub fn watch(
     }
 
     if !foreground {
-        let log_dir = watch_log_dir(deps.home);
-        std::fs::create_dir_all(&log_dir)?;
-        let log_path = log_dir.join(format!("{}.log", key.to_lowercase()));
-        let argv = vec![
-            "pr".to_string(),
-            "watch".to_string(),
-            key.to_string(),
-            "--foreground".to_string(),
-        ];
+        std::fs::create_dir_all(watch_log_dir(deps.home))?;
+        let log_path = watch_log_path(deps.home, key);
+        let argv = detached_watch_argv(key);
         // The detached `--foreground` child's cwd is `repo_root`, not
         // `deps.home`: it re-derives its own `repo_root` via
         // `resolve_watch_repo_root` the same way this invocation just did,
@@ -424,9 +465,9 @@ pub fn watch(
     // above: that branch runs in a *different process* than this one when
     // detached (the re-exec'd `--foreground` child never sees the parent's
     // locals), and a direct `tm pr watch KEY --foreground` invocation never
-    // runs that branch at all. `watch_log_dir`/the filename convention are
-    // the single source of truth both branches derive from.
-    let log_path = watch_log_dir(deps.home).join(format!("{}.log", key.to_lowercase()));
+    // runs that branch at all. `watch_log_path` is the single source of
+    // truth both branches derive from.
+    let log_path = watch_log_path(deps.home, key);
 
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: key.to_string(),
@@ -1409,6 +1450,45 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("watching PROJ-372"));
+    }
+
+    #[test]
+    fn detached_watch_armer_spawns_the_same_watcher_tm_pr_watch_detaches() {
+        use crate::work::run::WatchArmer;
+        let tmp = tempfile::tempdir().unwrap();
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let armer = DetachedWatchArmer {
+            detach: &detach,
+            current_exe: &current_exe,
+            home: tmp.path(),
+        };
+
+        armer
+            .arm("PROJ-372", Path::new("/worktrees/proj-372"))
+            .expect("arm should succeed");
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].program, current_exe);
+        assert_eq!(
+            recorded[0].argv,
+            vec![
+                "pr".to_string(),
+                "watch".to_string(),
+                "PROJ-372".to_string(),
+                "--foreground".to_string(),
+            ]
+        );
+        assert_eq!(
+            recorded[0].working_dir,
+            PathBuf::from("/worktrees/proj-372")
+        );
+        assert_eq!(
+            recorded[0].log_path,
+            watch_log_dir(tmp.path()).join("proj-372.log")
+        );
+        assert!(watch_log_dir(tmp.path()).is_dir(), "log dir is created");
     }
 
     #[test]
