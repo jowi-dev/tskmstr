@@ -5,8 +5,10 @@
 //! [`run_merge`] is the whole flow, staged roughly as: resolve the ticket's
 //! open PR, locate a local checkout of its branch (if any), fetch and
 //! rebase (opening a conflict-resolution tmux session and polling it to
-//! completion when the rebase stops on conflicts), merge the PR via `gh`,
-//! fast-forward the local base branch, best-effort clean up the worktree,
+//! completion when the rebase stops on conflicts), merge the PR via `gh`
+//! (rebasing and retrying once when GitHub rejects a stale base; GitHub
+//! issue #109), fast-forward the local base branch, best-effort clean up
+//! the worktree,
 //! branch, the ticket's live runs (finished as `done`, their agents
 //! stopped; GitHub issue #107), and ticket tmux session (its scrollback
 //! archived first, see [`crate::work::session_gc`]; GitHub issue #78),
@@ -590,8 +592,7 @@ pub fn run_merge(
             ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
         }
     }
-    finish_merge(deps, &prepared, None, out)?;
-    Ok(MergeFlowOutcome::Merged)
+    finish_merge(deps, &prepared, None, out)
 }
 
 /// What [`run_merge_batch`] accomplished, ticket by ticket.
@@ -647,7 +648,9 @@ impl BatchMergeReport {
 /// together until each resolves, is abandoned, the window dies, or
 /// [`CONFLICT_TIMEOUT_SECS`] per set-aside ticket elapses. Tickets that
 /// resolved are then pushed and merged in their original order; the rest
-/// are handed back.
+/// are handed back. A ticket an earlier merge left behind its base is
+/// rebased and retried once (see [`merge_pr_with_retry`]); one whose retry
+/// rebase conflicts and never resolves is handed back too.
 ///
 /// Returns `Err` only when writing to `out` fails between tickets;
 /// per-ticket failures land in the report instead.
@@ -783,8 +786,12 @@ fn finish_into_report(
     out: &mut dyn Write,
 ) -> Result<(), MergeError> {
     match finish_merge(deps, prepared, kept_session, out) {
-        Ok(()) => {
+        Ok(MergeFlowOutcome::Merged) => {
             report.merged.push(prepared.key.clone());
+            Ok(())
+        }
+        Ok(MergeFlowOutcome::ConflictsHandedBack) => {
+            report.handed_back.push(prepared.key.clone());
             Ok(())
         }
         Err(err) => record_failure(report, &prepared.key, &err, out),
@@ -1118,7 +1125,10 @@ fn prepare_merge(
 
 /// Stages 3-7 of the flow for a ticket whose rebase (if any) is complete:
 /// push the local tip when [`PreparedMerge::needs_push`] says to, `gh pr
-/// merge`, sync the local base, best-effort clean up (worktree, local
+/// merge` (rebasing and retrying once on a stale-base rejection, see
+/// [`merge_pr_with_retry`] — the only way this returns
+/// [`MergeFlowOutcome::ConflictsHandedBack`], before any cleanup), sync
+/// the local base, best-effort clean up (worktree, local
 /// branch, the ticket's live runs via [`finish_ticket_runs`], then its tmux
 /// session via [`session_gc::archive_and_kill`]), and apply
 /// `status_on_merge`, then sweep stale status labels off a closed ticket
@@ -1132,7 +1142,7 @@ fn finish_merge(
     prepared: &PreparedMerge,
     kept_session: Option<&str>,
     out: &mut dyn Write,
-) -> Result<(), MergeError> {
+) -> Result<MergeFlowOutcome, MergeError> {
     let PreparedMerge {
         key,
         repo_root,
@@ -1150,8 +1160,9 @@ fn finish_merge(
         deps.git.push_force_with_lease(dir, branch)?;
     }
 
-    writeln!(out, "merging PR #{number}...")?;
-    deps.gh.pr_merge(repo_root, number, MERGE_TIMEOUT)?;
+    if merge_pr_with_retry(deps, prepared, out)? == MergeFlowOutcome::ConflictsHandedBack {
+        return Ok(MergeFlowOutcome::ConflictsHandedBack);
+    }
 
     writeln!(out, "syncing local {base}...")?;
     deps.git.fetch_origin(repo_root)?;
@@ -1270,7 +1281,78 @@ fn finish_merge(
     reconcile_stacked_children(deps, repo_root, branch, kept_session, out)?;
 
     writeln!(out, "merged PR #{number} for {key}; local {base} synced")?;
-    Ok(())
+    Ok(MergeFlowOutcome::Merged)
+}
+
+/// The `gh pr merge` step of [`finish_merge`], retried once when GitHub
+/// rejects the merge because the base moved (GitHub issue #109; see
+/// [`GhError::is_out_of_date_base`]) — typically an earlier ticket in the
+/// same batch merging first, which branch protection's "require branches
+/// to be up to date" then refuses.
+///
+/// The retry fetches, rebases the checkout onto the current
+/// `origin/<base>`, force-pushes with lease, and merges again. A rebase
+/// that stops on conflicts goes through [`run_conflict_session`] like the
+/// first rebase did; if that session never resolves, the rebase is left
+/// in progress on disk and [`MergeFlowOutcome::ConflictsHandedBack`] is
+/// returned without merging. Without a local checkout there is nothing to
+/// rebase, so the rejection is returned as-is; any other rejection, or a
+/// second one after the retry, is an ordinary error.
+fn merge_pr_with_retry(
+    deps: &MergeDeps<'_>,
+    prepared: &PreparedMerge,
+    out: &mut dyn Write,
+) -> Result<MergeFlowOutcome, MergeError> {
+    let PreparedMerge {
+        key,
+        repo_root,
+        number,
+        branch,
+        base,
+        checkout_dir,
+        ..
+    } = prepared;
+
+    writeln!(out, "merging PR #{number}...")?;
+    let rejection = match deps.gh.pr_merge(repo_root, *number, MERGE_TIMEOUT) {
+        Ok(()) => return Ok(MergeFlowOutcome::Merged),
+        Err(err) => err,
+    };
+    let Some(dir) = checkout_dir
+        .as_deref()
+        .filter(|_| rejection.is_out_of_date_base())
+    else {
+        return Err(rejection.into());
+    };
+
+    writeln!(
+        out,
+        "PR #{number} rejected: {branch} is behind {base}; rebasing and retrying once"
+    )?;
+    deps.git.fetch_origin(dir)?;
+    let pre_rebase_rev = deps.git.rev_parse(dir, branch)?;
+    if !deps.git.status_is_clean(dir)? {
+        return Err(MergeError::DirtyWorktree {
+            dir: dir.to_path_buf(),
+        });
+    }
+    let origin_base_ref = format!("origin/{base}");
+    writeln!(out, "rebasing {branch} onto {origin_base_ref}...")?;
+    match deps.git.rebase_onto(dir, &origin_base_ref)? {
+        RebaseOutcome::Completed => writeln!(out, "rebase complete")?,
+        RebaseOutcome::Conflicted => {
+            match run_conflict_session(deps, key, branch, base, dir, &pre_rebase_rev, out)? {
+                ConflictOutcome::Resolved => {}
+                ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
+            }
+        }
+    }
+
+    writeln!(out, "pushing {branch} (force-with-lease)...")?;
+    deps.git.push_force_with_lease(dir, branch)?;
+    writeln!(out, "retrying merge of PR #{number}...")?;
+    deps.gh.pr_merge(repo_root, *number, MERGE_TIMEOUT)?;
+    Ok(MergeFlowOutcome::Merged)
 }
 
 /// The stacked-children step of [`finish_merge`] (GitHub issue #94): move
@@ -1902,6 +1984,166 @@ mod tests {
         assert!(out.contains("timed out after 900s"));
         assert!(out.contains("attach: tmux attach -t dev"));
         assert!(out.contains("rebase --abort"));
+    }
+
+    // --- stale-base rejection: rebase and retry once (GitHub issue #109) ---
+
+    fn stale_base_error() -> GhError {
+        GhError::Command {
+            command: "gh pr merge".to_string(),
+            exit_code: Some(1),
+            stderr: "X Pull request o/r#7 is not mergeable: the head branch is not up to date with the base branch.".to_string(),
+        }
+    }
+
+    /// A checkout of `proj-1-fix` at the repo root that needs no rebase at
+    /// prepare time, so any rebase recorded came from the merge retry.
+    fn up_to_date_fixture() -> Fixture {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("proj-1-fix".to_string()))
+            .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
+            .with_rev_parse_result("proj-1-fix", Ok("aaa".to_string()))
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(true))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Completed))
+            .with_branch_exists_local(Ok(false));
+        fx
+    }
+
+    #[test]
+    fn stale_base_rejection_rebases_pushes_and_retries_the_merge_once() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Err(stale_base_error()), Ok(())]);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert_eq!(
+            fx.git.rebase_onto_calls(),
+            vec![(PathBuf::from("/repo"), "origin/main".to_string())]
+        );
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+        assert_eq!(fx.gh.pr_merge_calls().len(), 2);
+        assert_eq!(
+            &fx.git.call_log()[..4],
+            &[
+                "fetch_origin",
+                "fetch_origin",
+                "rebase_onto",
+                "push_force_with_lease"
+            ],
+            "the retry fetches, rebases, then pushes before merging again"
+        );
+        assert!(out.contains("rebasing and retrying"), "{out}");
+    }
+
+    #[test]
+    fn stale_base_rejection_twice_fails_after_a_single_retry() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = fx.gh.with_pr_merge_result(Err(stale_base_error()));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Err(MergeError::Gh(_))));
+        assert_eq!(fx.gh.pr_merge_calls().len(), 2, "exactly one retry");
+    }
+
+    #[test]
+    fn other_merge_rejections_are_not_retried() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = fx.gh.with_pr_merge_result(Err(GhError::Command {
+            command: "gh pr merge".to_string(),
+            exit_code: Some(1),
+            stderr:
+                "X Pull request o/r#7 is not mergeable: the base branch policy prohibits the merge."
+                    .to_string(),
+        }));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Err(MergeError::Gh(_))));
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+        assert!(fx.git.rebase_onto_calls().is_empty());
+    }
+
+    #[test]
+    fn stale_base_rejection_without_a_checkout_fails_without_retrying() {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]))
+            .with_pr_merge_result(Err(stale_base_error()));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Err(MergeError::Gh(_))));
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1);
+    }
+
+    #[test]
+    fn stale_base_retry_conflict_goes_through_the_conflict_session() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Err(stale_base_error()), Ok(())]);
+        fx.git = fx
+            .git
+            // "aaa" at prepare and before the retry rebase, "bbb" once the
+            // conflict session completes it.
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![
+                    Ok("aaa".to_string()),
+                    Ok("aaa".to_string()),
+                    Ok("bbb".to_string()),
+                ],
+            )
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(false)]);
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        assert!(
+            fx.tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+            "the retry's conflicts should open a conflict session"
+        );
+        assert!(out.contains("conflicts resolved; rebase complete"), "{out}");
+        assert_eq!(fx.git.push_force_with_lease_calls().len(), 1);
+        assert_eq!(fx.gh.pr_merge_calls().len(), 2);
+    }
+
+    #[test]
+    fn stale_base_retry_conflict_left_unresolved_hands_back() {
+        let mut fx = up_to_date_fixture();
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Err(stale_base_error()), Ok(())]);
+        fx.git = fx
+            .git
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(true)])
+            .with_conflicted_files_sequence(vec![Ok(vec!["a.rs".to_string()])]);
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows(Ok(vec![]));
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        assert!(fx.git.push_force_with_lease_calls().is_empty());
+        assert_eq!(fx.gh.pr_merge_calls().len(), 1, "no retry until resolved");
     }
 
     // --- dirty worktree ---
@@ -2943,6 +3185,47 @@ mod tests {
             names.iter().any(|n| n.starts_with("merge-PROJ-2-")),
             "expected the single-ticket prompt file, got {names:?}"
         );
+    }
+
+    #[test]
+    fn batch_member_rejected_for_a_stale_base_is_rebased_and_retried() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean; 2]);
+        // PROJ-1 merges, moving main under PROJ-2, whose first merge
+        // attempt is then rejected.
+        fx.gh = fx
+            .gh
+            .with_pr_merge_sequence(vec![Ok(()), Err(stale_base_error()), Ok(())]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, keys(2), "{out}");
+        assert!(report.failed.is_empty(), "{out}");
+        let merged: Vec<u64> = fx.gh.pr_merge_calls().iter().map(|(_, n)| *n).collect();
+        assert_eq!(merged, vec![11, 12, 12]);
+        assert_eq!(
+            fx.git.rebase_onto_calls().len(),
+            3,
+            "one prepare rebase per ticket plus PROJ-2's retry"
+        );
+    }
+
+    #[test]
+    fn batch_member_still_stale_after_the_retry_is_reported_failed() {
+        let mut fx = batch_fixture(&[BatchTicket::Clean; 2]);
+        fx.gh = fx.gh.with_pr_merge_sequence(vec![
+            Ok(()),
+            Err(stale_base_error()),
+            Err(stale_base_error()),
+        ]);
+
+        let (result, out) = run_batch(&fx.deps(), &keys(2));
+
+        let report = result.expect("batch should succeed");
+        assert_eq!(report.merged, vec!["PROJ-1"], "{out}");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "PROJ-2");
+        assert_eq!(fx.gh.pr_merge_calls().len(), 3, "exactly one retry");
     }
 
     #[test]

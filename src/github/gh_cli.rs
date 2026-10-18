@@ -116,6 +116,29 @@ impl GhError {
             GhError::Spawn { .. } | GhError::Parse { .. } | GhError::Timeout { .. } => false,
         }
     }
+
+    /// Whether this is a `gh pr merge` rejection because the PR's head is
+    /// behind its base (GitHub issue #109): branch protection's "require
+    /// branches to be up to date", or the base moving between `gh`'s
+    /// mergeability check and the merge itself. Unlike every other merge
+    /// failure, a rebase onto the current base fixes it, which is what
+    /// [`crate::work::merge`] does before retrying once.
+    ///
+    /// Narrow and stderr-driven like [`GhError::is_permanent`]: only
+    /// [`GhError::Command`] is inspected, and only `gh`'s own `BEHIND`
+    /// wording or GitHub's out-of-date/base-modified GraphQL rejections
+    /// match. Anything else stays an ordinary failure.
+    pub fn is_out_of_date_base(&self) -> bool {
+        match self {
+            GhError::Command { stderr, .. } => {
+                let lower = stderr.to_lowercase();
+                lower.contains("head branch is not up to date with the base branch")
+                    || lower.contains("head branch is out of date")
+                    || lower.contains("base branch was modified")
+            }
+            GhError::Spawn { .. } | GhError::Parse { .. } | GhError::Timeout { .. } => false,
+        }
+    }
 }
 
 /// Narrow, case-insensitive check for the specific wording `gh` uses when
@@ -3209,6 +3232,7 @@ pub struct FakeGhCli {
     pr_list_merged_into_results: RefCell<HashMap<String, Result<Vec<PrInfo>, GhError>>>,
     pr_list_merged_into_calls: RefCell<Vec<(PathBuf, String)>>,
     pr_merge_result: RefCell<Result<(), GhError>>,
+    pr_merge_sequence: RefCell<std::collections::VecDeque<Result<(), GhError>>>,
     pr_merge_calls: RefCell<Vec<(PathBuf, u64)>>,
     issue_view_results: RefCell<HashMap<u64, Result<IssueInfo, GhError>>>,
     issue_view_calls: RefCell<Vec<(String, u64)>>,
@@ -3272,6 +3296,7 @@ impl Default for FakeGhCli {
             pr_list_calls: RefCell::new(Vec::new()),
             pr_list_bounded_result: RefCell::new(None),
             pr_merge_result: RefCell::new(Ok(())),
+            pr_merge_sequence: RefCell::new(std::collections::VecDeque::new()),
             pr_merge_calls: RefCell::new(Vec::new()),
             pr_list_bounded_calls: RefCell::new(Vec::new()),
             pr_list_review_state_result: RefCell::new(Ok(Vec::new())),
@@ -3471,6 +3496,19 @@ impl FakeGhCli {
     /// succeeds trivially.
     pub fn with_pr_merge_result(self, result: Result<(), GhError>) -> Self {
         *self.pr_merge_result.borrow_mut() = result;
+        self
+    }
+
+    /// Configure `pr_merge` to return each element of `sequence` in order,
+    /// one per call, repeating the last element once exhausted. Takes
+    /// precedence over [`Self::with_pr_merge_result`]; lets a test reject a
+    /// merge for a stale base and then accept the retry.
+    pub fn with_pr_merge_sequence(self, sequence: Vec<Result<(), GhError>>) -> Self {
+        assert!(
+            !sequence.is_empty(),
+            "with_pr_merge_sequence requires a non-empty sequence"
+        );
+        *self.pr_merge_sequence.borrow_mut() = sequence.into();
         self
     }
 
@@ -3825,7 +3863,12 @@ impl GhCli for FakeGhCli {
         self.pr_merge_calls
             .borrow_mut()
             .push((dir.to_path_buf(), number));
-        self.pr_merge_result.borrow().clone()
+        let mut sequence = self.pr_merge_sequence.borrow_mut();
+        match sequence.len() {
+            0 => self.pr_merge_result.borrow().clone(),
+            1 => sequence[0].clone(),
+            _ => sequence.pop_front().expect("non-empty"),
+        }
     }
 
     fn issue_view(&self, repo: &str, number: u64) -> Result<IssueInfo, GhError> {
@@ -4032,6 +4075,73 @@ mod tests {
     // gh something nonsensical, and always will" apart from "the network/gh
     // itself hiccuped", so a permanent bug can't masquerade as a retryable
     // blip ever again.
+
+    // --- GhError::is_out_of_date_base: GitHub issue #109 ---
+    //
+    // The stderr fixtures below are the exact text `gh pr merge` prints
+    // (non-TTY, so the failure icon renders as `X`) and the GraphQL
+    // rejections GitHub returns when the base moved under a merge.
+
+    fn merge_error(stderr: &str) -> GhError {
+        GhError::Command {
+            command: "gh pr merge".to_string(),
+            exit_code: Some(1),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn is_out_of_date_base_true_for_gh_behind_merge_state() {
+        let err = merge_error(
+            "X Pull request jowi-dev/tskmstr#42 is not mergeable: the head branch is not up to date with the base branch.\n\
+             To have the pull request merged after all the requirements have been met, add the `--auto` flag.\n\
+             To use administrator privileges to immediately merge the pull request, add the `--admin` flag.",
+        );
+        assert!(err.is_out_of_date_base());
+    }
+
+    #[test]
+    fn is_out_of_date_base_true_for_graphql_head_out_of_date() {
+        let err = merge_error(
+            "GraphQL: Head branch is out of date. Review and try the merge again. (mergePullRequest)",
+        );
+        assert!(err.is_out_of_date_base());
+    }
+
+    #[test]
+    fn is_out_of_date_base_true_for_graphql_base_modified() {
+        let err = merge_error(
+            "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)",
+        );
+        assert!(err.is_out_of_date_base());
+    }
+
+    #[test]
+    fn is_out_of_date_base_false_for_other_merge_rejections() {
+        for stderr in [
+            "X Pull request jowi-dev/tskmstr#42 is not mergeable: the base branch policy prohibits the merge.",
+            "X Pull request jowi-dev/tskmstr#42 is not mergeable: the merge commit cannot be cleanly created.",
+            "GraphQL: At least 1 approving review is required by reviewers with write access. (mergePullRequest)",
+            "GraphQL: Required status check \"test\" is expected. (mergePullRequest)",
+            "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+        ] {
+            assert!(!merge_error(stderr).is_out_of_date_base(), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn is_out_of_date_base_false_for_non_command_errors() {
+        let timeout = GhError::Timeout {
+            command: "gh pr merge".to_string(),
+            seconds: 30,
+        };
+        let spawn = GhError::Spawn {
+            command: "gh pr merge".to_string(),
+            message: "the head branch is not up to date with the base branch".to_string(),
+        };
+        assert!(!timeout.is_out_of_date_base());
+        assert!(!spawn.is_out_of_date_base());
+    }
 
     #[test]
     fn is_permanent_true_for_unknown_json_field() {

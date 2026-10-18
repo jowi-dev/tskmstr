@@ -1561,7 +1561,14 @@ these stages:
 4. **Merge.** `gh pr merge`, using the repository's default merge method —
    the same "first enabled of merge commit, squash, rebase" order the
    board's `M` key and GitHub's own merge button use. No per-invocation
-   override in v1.
+   override in v1. If GitHub rejects the merge because the branch is
+   behind its base (branch protection's "require branches to be up to
+   date", or the base moving mid-merge), `tm merge` fetches, rebases the
+   checkout onto the current `origin/<base>`, force-pushes with lease, and
+   retries the merge once. Conflicts in that rebase go through the same
+   conflict session as stage 3 (and hand back the same way, exit `2`). A
+   second rejection, or a stale-base rejection with no local checkout to
+   rebase, is an error. Other rejections are never retried.
 5. **Sync the local base.** `git fetch origin` again, then fast-forward the
    repo root's checkout of the base branch if it's currently on that
    branch and clean (or fetch it straight to the ref if the repo root is
@@ -1604,7 +1611,7 @@ these stages:
 
 Exit codes: `0` merged (steps 4-9 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
-3), `1` any other error (no open PR, a diverged branch, a dirty worktree,
+3, or the step 4 retry), `1` any other error (no open PR, a diverged branch, a dirty worktree,
 a `gh`/`git` failure).
 
 V1 boundaries, matched to the board's `M` key and worth knowing before you
@@ -1657,11 +1664,14 @@ Two boundaries worth knowing:
 - **The board's `M` key batches only what you queue.** Queue tickets with
   `Space` first (see "Queueing several tickets for one batch merge" above);
   with nothing queued, `M` merges just the selected ticket.
-- **A resolved ticket merges onto the base it was rebased onto.** If a
-  later ticket in the same batch merged into that base in the meantime,
-  `gh pr merge` may refuse an out-of-date branch, depending on the repo's
-  branch protection. That ticket is then reported as failed; rerun
-  `tm merge <KEY>` for it.
+- **Earlier merges can leave a later ticket behind its base.** A ticket
+  that resolved in the shared session was rebased onto the base as it was
+  then; if another batch ticket merged into that base since, branch
+  protection may refuse it. The stage-4 retry covers this: the ticket is
+  rebased and merged again once. Conflicts in that rebase open a
+  single-ticket conflict session; if it never resolves, the ticket is
+  handed back. A ticket still rejected after the retry is reported as
+  failed; rerun `tm merge <KEY>` for it.
 
 ### `[work.merge]`: conflict-resolution session settings
 
