@@ -141,6 +141,7 @@ fn bootstrap_config(
         work: config::WorkConfig::default(),
         agent: config::AgentKind::default(),
         agent_fallbacks: Vec::new(),
+        require_audit: true,
     })
 }
 

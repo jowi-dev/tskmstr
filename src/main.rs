@@ -2259,6 +2259,7 @@ mod tests {
             work: tskmstr::config::WorkConfig::default(),
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
+            require_audit: true,
         }
     }
 
@@ -2280,6 +2281,7 @@ mod tests {
             work: tskmstr::config::WorkConfig::default(),
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
+            require_audit: true,
         }
     }
 
