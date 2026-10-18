@@ -1,12 +1,15 @@
 //! `tm ready` and `tm ready <KEY>`.
 //!
-//! `tm ready` (no key) lists tickets assigned to the current user that are
-//! ready to pick up: see [`crate::ticketing::ready_tickets`] for the exact
-//! candidate query and Jira-status blocker filter. `tm ready <KEY>` checks
-//! one specific ticket (any assignee, any status), classifying it as
-//! ready, **stackable**, or blocked via [`crate::blocker_stacking::decide`]
-//! — the same decision table [`crate::work::run::resolve_blocker_stacking`]
-//! uses to actually cut a stacked branch, so the two can't disagree. Ready
+//! Both forms classify a ticket as ready, **stackable**, or blocked via
+//! [`crate::blocker_stacking::decide`] — the same decision table
+//! [`crate::work::run::resolve_blocker_stacking`] uses to actually cut a
+//! stacked branch, so none of the three can disagree.
+//!
+//! `tm ready` (no key, [`list`] / [`list_json`]) classifies every candidate
+//! from [`crate::ticketing::ready_candidates`] (the current user's "To Do"
+//! tickets) and reports each with its decision: ready, stackable on a
+//! branch, or blocked with a reason. `tm ready <KEY>` ([`check`]) checks one
+//! specific ticket (any assignee, any status). Ready
 //! and stackable are both `Ok(`[`ReadyOutcome`]`)`, distinguished so `main.rs`
 //! can give each its own exit code (see [`ReadyOutcome`]'s doc comment);
 //! blocked is [`ReadyCliError::NotReady`], turned into a non-zero exit by
@@ -23,15 +26,16 @@
 use std::collections::HashMap;
 use std::io::Write;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::blocker_stacking::{self, StackDecision};
 use crate::github::bot_findings::count_bot_findings;
-use crate::github::gh_cli::{GhCli, GhError};
+use crate::github::gh_cli::{GhCli, GhError, PrSummary};
 use crate::github::pr::{PrInfo, find_issue_key};
 use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::types::Issue;
-use crate::ticketing::{TicketingError, open_blockers, ready_tickets};
+use crate::ticketing::{TicketingError, open_blockers, ready_candidates};
 
 /// Dependencies `tm ready`'s bot-findings annotation needs, alongside the
 /// ticket provider, bundled to keep `list`/`check`'s arity within this project's
@@ -110,39 +114,48 @@ fn normalize(key: &str) -> Result<String, ReadyCliError> {
     })
 }
 
-/// `tm ready` (no key): print tickets assigned to the current user that are
-/// ready to pick up, one per line as `KEY  Summary`, in rank order, followed
-/// by any candidate that's blocked but stackable (see
-/// [`crate::blocker_stacking`]), as `KEY  Summary  [stackable on <branch> —
-/// blocked by <BLOCKER>, PR #<N> open]`.
+/// `tm ready` (no key): print every candidate assigned to the current user
+/// (see [`ready_candidates`]) with its [`ListDecision`], grouped as ready,
+/// then stackable, then blocked, each group in rank order:
 ///
-/// Prints `No ready tickets.` if none are ready or stackable. If any
-/// remaining candidates were excluded for having an unmerged blocker with
-/// nothing to stack on (or more than one unmerged blocker), appends a final
-/// `(N blocked tickets hidden)` line so a filtered list doesn't read as
-/// "this is everything assigned to you". Always exits 0.
+/// - ready: `KEY  Summary`
+/// - stackable: `KEY  Summary  [stackable on <branch> — blocked by
+///   <BLOCKER>, PR #<N> open]`
+/// - blocked: `KEY  Summary  [<reason>]`, e.g. `[blocked by PROJ-9 (In
+///   Progress), no PR yet]`
+///
+/// Prints `No ready tickets.` ahead of any blocked rows if nothing is ready
+/// or stackable. Any warnings (see [`list_json`]) print first as `warning:
+/// ...` lines. Always exits 0.
 ///
 /// Each ready line also carries a best-effort, advisory bot-findings
 /// annotation: when a ready ticket has an open PR (matched by title) with
 /// unresolved bot review findings, the line becomes `KEY  Summary  [N
 /// unresolved bot findings]` (singular "finding" when `N == 1`). Zero
 /// unresolved or no matching PR leaves the line unchanged. See
-/// [`bot_finding_annotations`] for how that lookup degrades if `gh` fails;
-/// see [`stackable_and_hidden`] for how the separate stackability lookup
-/// degrades (every blocked ticket stays hidden, same as before this state
-/// existed).
+/// [`bot_finding_annotations`] for how that lookup degrades if `gh` fails.
 pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError> {
-    let listing = ready_tickets(ctx.jira)?;
-    let (stackable, hidden_count) = stackable_and_hidden(ctx, &listing.blocked, out)?;
+    let report = list_report(ctx)?;
 
-    if listing.ready.is_empty() && stackable.is_empty() {
+    for warning in &report.warnings {
+        writeln!(out, "warning: {warning}")?;
+    }
+
+    let any_workable = report
+        .tickets
+        .iter()
+        .any(|t| !matches!(t.decision, ListDecision::Blocked { .. }));
+    if !any_workable {
         writeln!(out, "No ready tickets.")?;
-    } else {
-        let annotations = bot_finding_annotations(ctx, &listing.ready, out)?;
-        for issue in &listing.ready {
-            match annotations.get(&issue.key) {
-                Some(unresolved) if *unresolved > 0 => {
-                    let noun = if *unresolved == 1 {
+    }
+
+    for ticket in &report.tickets {
+        if let (ListDecision::Ready, unresolved) =
+            (&ticket.decision, ticket.unresolved_bot_findings)
+        {
+            match unresolved {
+                Some(unresolved) => {
+                    let noun = if unresolved == 1 {
                         "finding"
                     } else {
                         "findings"
@@ -150,105 +163,226 @@ pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError
                     writeln!(
                         out,
                         "{}  {}  [{unresolved} unresolved bot {noun}]",
-                        issue.key, issue.fields.summary
+                        ticket.key, ticket.summary
                     )?;
                 }
-                _ => writeln!(out, "{}  {}", issue.key, issue.fields.summary)?,
+                None => writeln!(out, "{}  {}", ticket.key, ticket.summary)?,
             }
         }
-        for ticket in &stackable {
+    }
+    for ticket in &report.tickets {
+        if let ListDecision::Stackable {
+            base,
+            blocker_key,
+            pr_number,
+        } = &ticket.decision
+        {
             writeln!(
                 out,
-                "{}  {}  [stackable on {} — blocked by {}, PR #{} open]",
-                ticket.issue.key,
-                ticket.issue.fields.summary,
-                ticket.base,
-                ticket.blocker_key,
-                ticket.pr_number
+                "{}  {}  [stackable on {base} — blocked by {blocker_key}, PR #{pr_number} open]",
+                ticket.key, ticket.summary
             )?;
         }
     }
-
-    if hidden_count > 0 {
-        let noun = if hidden_count == 1 {
-            "ticket"
-        } else {
-            "tickets"
-        };
-        writeln!(out, "({hidden_count} blocked {noun} hidden)")?;
+    for ticket in &report.tickets {
+        if let ListDecision::Blocked { reason, .. } = &ticket.decision {
+            writeln!(out, "{}  {}  [{reason}]", ticket.key, ticket.summary)?;
+        }
     }
 
     Ok(())
 }
 
-/// A [`list`] candidate found stackable by [`stackable_and_hidden`].
-struct StackableTicket {
-    issue: Issue,
-    base: String,
-    blocker_key: String,
-    pr_number: u64,
+/// `tm ready --json`: the same classification as [`list`], as one JSON
+/// object on `out`:
+///
+/// ```json
+/// {
+///   "tickets": [
+///     {"key": "AX-1", "summary": "...", "decision": "ready",
+///      "unresolved_bot_findings": 2},
+///     {"key": "AX-409", "summary": "...", "decision": "stackable",
+///      "base": "origin/jowi-dev/ax-408-...", "blocker_key": "AX-408",
+///      "pr_number": 490},
+///     {"key": "AX-2", "summary": "...", "decision": "blocked",
+///      "blocker_keys": ["AX-9"], "reason": "blocked by AX-9 (To Do), no PR yet"}
+///   ],
+///   "warnings": ["could not check stackability: ..."]
+/// }
+/// ```
+///
+/// `tickets` is in rank order (not grouped). `unresolved_bot_findings` is
+/// present only on a ready ticket with at least one. `warnings` carries what
+/// [`list`] would print as `warning:` lines, so stdout stays valid JSON when
+/// a `gh` lookup degrades.
+pub fn list_json(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError> {
+    let report = list_report(ctx)?;
+    serde_json::to_writer_pretty(&mut *out, &report).map_err(std::io::Error::from)?;
+    writeln!(out)?;
+    Ok(())
 }
 
-/// For [`list`]: split `blocked` (candidates [`ready_tickets`] excluded for
-/// having an open Jira blocker) into tickets that are stackable — an open PR
-/// to build on, per [`crate::blocker_stacking::decide`] — versus tickets
-/// that remain genuinely hidden (no PR yet, or two or more unmerged
-/// blockers). This is the same rule [`check`] and
-/// [`crate::work::run::resolve_blocker_stacking`] use, so a ticket `list`
-/// reports stackable is never one `tm ready <KEY>` would separately call
-/// blocked.
+/// A `tm ready` (no key) candidate's decision: [`blocker_stacking::decide`]'s
+/// verdict, shaped for display. Serialized as the `decision` tag of a
+/// [`list_json`] ticket, with the variant's fields alongside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ListDecision {
+    /// No unmerged direct blockers.
+    Ready,
+    /// Exactly one unmerged direct blocker, with an open PR to stack on.
+    Stackable {
+        /// The branch to stack on, `origin/<blocker's PR head branch>`.
+        base: String,
+        /// The blocker's issue key.
+        blocker_key: String,
+        /// The blocker's open PR number.
+        pr_number: u64,
+    },
+    /// Nothing to stack on: one unmerged blocker with no PR, two or more
+    /// unmerged blockers, or (when the PR lookup failed) any blocker still
+    /// open in the tracker.
+    Blocked {
+        /// Every blocker still in the way.
+        blocker_keys: Vec<String>,
+        /// Human-readable explanation, e.g. `blocked by PROJ-9 (In
+        /// Progress), no PR yet`.
+        reason: String,
+    },
+}
+
+/// One [`list_json`] ticket.
+#[derive(Debug, Serialize)]
+struct ListEntry {
+    key: String,
+    summary: String,
+    #[serde(flatten)]
+    decision: ListDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unresolved_bot_findings: Option<usize>,
+}
+
+/// What both [`list`] and [`list_json`] render.
+#[derive(Debug, Serialize)]
+struct ListReport {
+    tickets: Vec<ListEntry>,
+    warnings: Vec<String>,
+}
+
+/// Classify every [`ready_candidates`] entry for [`list`]/[`list_json`].
 ///
-/// Calls [`GhCli::pr_list_all`] once for every blocked candidate, same
-/// one-call-per-listing shape as [`bot_finding_annotations`]. On failure,
-/// prints `warning: could not check stackability: {err}` (permanent errors
-/// flagged via [`crate::github::gh_cli::permanence_note`]) and treats every
-/// blocked candidate as hidden — today's pre-stacking behavior — since a
-/// `gh` hiccup must never mislabel a genuinely-blocked ticket as pickable,
-/// and a whole-listing hard failure would be disproportionate for a
-/// best-effort annotation.
-fn stackable_and_hidden(
-    ctx: &ReadyContext,
-    blocked: &[Issue],
-    out: &mut dyn Write,
-) -> Result<(Vec<StackableTicket>, usize), ReadyCliError> {
-    if blocked.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
+/// [`GhCli::pr_list_all`] is called at most once per invocation, and only if
+/// some candidate has a direct blocker. If it fails, a `could not check
+/// stackability` warning is recorded (permanent errors flagged via
+/// [`crate::github::gh_cli::permanence_note`]) and candidates fall back to
+/// [`open_blockers`]' tracker-status answer, as [`check`]'s transient
+/// fallback does: a `gh` hiccup must never mislabel a blocked ticket as
+/// pickable, and failing the whole listing would be disproportionate.
+fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
+    let candidates = ready_candidates(ctx.jira)?;
+    let mut warnings = Vec::new();
 
-    let cwd = std::env::current_dir()?;
-    let prs = match ctx.gh.pr_list_all(&cwd) {
-        Ok(prs) => prs,
-        Err(err) => {
-            let note = crate::github::gh_cli::permanence_note(&err);
-            writeln!(out, "warning: could not check stackability: {err}{note}")?;
-            return Ok((Vec::new(), blocked.len()));
-        }
-    };
-
-    let mut stackable = Vec::new();
-    let mut hidden_count = 0;
-    for issue in blocked {
-        let unmerged = blocker_stacking::unmerged_direct_blockers(issue, &prs);
-        match blocker_stacking::decide(unmerged) {
-            StackDecision::Stackable {
-                blocker_key,
-                pr_number,
-                head_ref_name,
-            } => stackable.push(StackableTicket {
-                issue: issue.clone(),
-                base: format!("origin/{head_ref_name}"),
-                blocker_key,
-                pr_number,
-            }),
-            StackDecision::Ready
-            | StackDecision::BlockedNoPr { .. }
-            | StackDecision::BlockedMultiple { .. } => {
-                hidden_count += 1;
+    let prs = if candidates
+        .iter()
+        .any(|issue| !blocker_stacking::direct_blockers(issue).is_empty())
+    {
+        let cwd = std::env::current_dir()?;
+        match ctx.gh.pr_list_all(&cwd) {
+            Ok(prs) => Some(prs),
+            Err(err) => {
+                let note = crate::github::gh_cli::permanence_note(&err);
+                warnings.push(format!("could not check stackability: {err}{note}"));
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
-    Ok((stackable, hidden_count))
+    let decisions: Vec<ListDecision> = candidates
+        .iter()
+        .map(|issue| list_decision(issue, prs.as_deref()))
+        .collect();
+
+    let ready: Vec<Issue> = candidates
+        .iter()
+        .zip(&decisions)
+        .filter(|(_, decision)| **decision == ListDecision::Ready)
+        .map(|(issue, _)| issue.clone())
+        .collect();
+    let annotations = if ready.is_empty() {
+        HashMap::new()
+    } else {
+        bot_finding_annotations(ctx, &ready, &mut warnings)?
+    };
+
+    let tickets = candidates
+        .into_iter()
+        .zip(decisions)
+        .map(|(issue, decision)| ListEntry {
+            unresolved_bot_findings: annotations.get(&issue.key).copied(),
+            key: issue.key,
+            summary: issue.fields.summary,
+            decision,
+        })
+        .collect();
+
+    Ok(ListReport { tickets, warnings })
+}
+
+/// Classify `issue` via [`blocker_stacking::decide`]. `prs` is the blockers'
+/// repo PR list, or `None` when that lookup failed (or was skipped because no
+/// candidate had a blocker); a ticket with no direct blockers is ready
+/// without consulting it, matching [`check`].
+fn list_decision(issue: &Issue, prs: Option<&[PrSummary]>) -> ListDecision {
+    if blocker_stacking::direct_blockers(issue).is_empty() {
+        return ListDecision::Ready;
+    }
+    let Some(prs) = prs else {
+        let open = open_blockers(issue);
+        if open.is_empty() {
+            return ListDecision::Ready;
+        }
+        let named: Vec<String> = open
+            .iter()
+            .map(|b| format!("{} ({})", b.key, b.fields.status.name))
+            .collect();
+        return ListDecision::Blocked {
+            blocker_keys: open.iter().map(|b| b.key.clone()).collect(),
+            reason: format!("blocked by {} — blocker PRs unresolved", named.join(", ")),
+        };
+    };
+
+    match blocker_stacking::decide(blocker_stacking::unmerged_direct_blockers(issue, prs)) {
+        StackDecision::Ready => ListDecision::Ready,
+        StackDecision::Stackable {
+            blocker_key,
+            pr_number,
+            head_ref_name,
+        } => ListDecision::Stackable {
+            base: format!("origin/{head_ref_name}"),
+            blocker_key,
+            pr_number,
+        },
+        StackDecision::BlockedNoPr { blocker } => ListDecision::Blocked {
+            reason: format!(
+                "blocked by {} ({}), no PR yet",
+                blocker.key, blocker.status_name
+            ),
+            blocker_keys: vec![blocker.key],
+        },
+        StackDecision::BlockedMultiple { blockers } => ListDecision::Blocked {
+            reason: format!(
+                "blocked by {} — can't stack on more than one",
+                blockers
+                    .iter()
+                    .map(blocker_stacking::format_unmerged_blocker)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            blocker_keys: blockers.into_iter().map(|b| b.key).collect(),
+        },
+    }
 }
 
 /// Outcome of `tm ready <KEY>` on the non-blocked path: distinguishes plain
@@ -426,22 +560,22 @@ fn jira_only_fallback(
     })
 }
 
-/// For `list`: compute unresolved bot-finding counts for every ticket in
-/// `tickets` that has a matching open PR, degrading to a printed warning
+/// For [`list_report`]: compute unresolved bot-finding counts for every ticket in
+/// `tickets` that has a matching open PR, degrading to a recorded warning
 /// (once) rather than an error if `gh` fails.
 ///
-/// Calls `gh.pr_list()` once. If it fails, prints
-/// `warning: could not check bot findings: {err}` and returns an empty map —
+/// Calls `gh.pr_list()` once. If it fails, pushes
+/// `could not check bot findings: {err}` onto `warnings` and returns an empty map —
 /// the listing is then printed unannotated. Otherwise, for each ticket
 /// matched to an open PR (by [`find_issue_key`] against the PR title), calls
-/// `gh.pr_review_threads`; a failure there prints the same warning line
+/// `gh.pr_review_threads`; a failure there records the same warning
 /// exactly once (not once per ticket) and simply omits that ticket (and any
 /// ticket whose lookup fails afterward) from the returned map, without
 /// aborting the remaining lookups.
 fn bot_finding_annotations(
     ctx: &ReadyContext,
     tickets: &[Issue],
-    out: &mut dyn Write,
+    warnings: &mut Vec<String>,
 ) -> Result<HashMap<String, usize>, ReadyCliError> {
     let mut annotations = HashMap::new();
 
@@ -455,7 +589,7 @@ fn bot_finding_annotations(
         Ok(prs) => prs,
         Err(err) => {
             let note = crate::github::gh_cli::permanence_note(&err);
-            writeln!(out, "warning: could not check bot findings: {err}{note}")?;
+            warnings.push(format!("could not check bot findings: {err}{note}"));
             return Ok(annotations);
         }
     };
@@ -475,7 +609,7 @@ fn bot_finding_annotations(
             Err(err) => {
                 if !warned {
                     let note = crate::github::gh_cli::permanence_note(&err);
-                    writeln!(out, "warning: could not check bot findings: {err}{note}")?;
+                    warnings.push(format!("could not check bot findings: {err}{note}"));
                     warned = true;
                 }
             }
@@ -684,15 +818,26 @@ mod tests {
         assert_eq!(output, "No ready tickets.\n");
     }
 
+    /// `issue(key)` with one direct `Blocks` link per `(blocker_key,
+    /// status_name, status_category_key)`.
+    fn blocked_issue(key: &str, blockers: &[(&str, &str, &str)]) -> Issue {
+        let mut i = issue(key);
+        i.fields.issue_links = blockers
+            .iter()
+            .enumerate()
+            .map(|(n, (blocker, status, category))| IssueLink {
+                id: format!("1000{n}"),
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue(blocker, status, category)),
+                outward_issue: None,
+            })
+            .collect();
+        i
+    }
+
     #[test]
-    fn list_appends_hidden_count_when_candidates_are_blocked() {
-        let mut blocked = issue("PROJ-2");
-        blocked.fields.issue_links = vec![IssueLink {
-            id: "10001".to_string(),
-            link_type: blocks_link_type(),
-            inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
-            outward_issue: None,
-        }];
+    fn list_shows_a_blocked_candidate_with_its_reason() {
+        let blocked = blocked_issue("PROJ-2", &[("PROJ-9", "In Progress", "indeterminate")]);
         let jira =
             FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1"), blocked]));
         let gh = FakeGhCli::new();
@@ -704,19 +849,14 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
             output,
-            "PROJ-1  Summary for PROJ-1\n(1 blocked ticket hidden)\n"
+            "PROJ-1  Summary for PROJ-1\n\
+             PROJ-2  Summary for PROJ-2  [blocked by PROJ-9 (In Progress), no PR yet]\n"
         );
     }
 
     #[test]
-    fn list_all_blocked_prints_no_ready_tickets_then_hidden_count() {
-        let mut blocked = issue("PROJ-1");
-        blocked.fields.issue_links = vec![IssueLink {
-            id: "10001".to_string(),
-            link_type: blocks_link_type(),
-            inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
-            outward_issue: None,
-        }];
+    fn list_all_blocked_prints_no_ready_tickets_then_the_blocked_rows() {
+        let blocked = blocked_issue("PROJ-1", &[("PROJ-9", "In Progress", "indeterminate")]);
         let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked]));
         let gh = FakeGhCli::new();
         let bots = cursor_bot();
@@ -725,23 +865,65 @@ mod tests {
         list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert_eq!(output, "No ready tickets.\n(1 blocked ticket hidden)\n");
+        assert_eq!(
+            output,
+            "No ready tickets.\n\
+             PROJ-1  Summary for PROJ-1  [blocked by PROJ-9 (In Progress), no PR yet]\n"
+        );
     }
 
     #[test]
-    fn list_hidden_count_pluralizes_above_one() {
-        let blocked = |key: &str| {
-            let mut i = issue(key);
-            i.fields.issue_links = vec![IssueLink {
-                id: "10001".to_string(),
-                link_type: blocks_link_type(),
-                inward_issue: Some(linked_issue("PROJ-9", "In Progress", "indeterminate")),
-                outward_issue: None,
-            }];
-            i
-        };
-        let jira = FakeJiraClient::new()
-            .with_search_result(search_result(vec![blocked("PROJ-1"), blocked("PROJ-2")]));
+    fn list_names_every_blocker_when_there_are_two_or_more() {
+        let blocked = blocked_issue(
+            "PROJ-1",
+            &[
+                ("PROJ-8", "In Review", "indeterminate"),
+                ("PROJ-9", "To Do", "new"),
+            ],
+        );
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_all_summary(
+            3,
+            "jowi-dev/proj-8-thing",
+            crate::github::gh_cli::PrLifecycle::Open,
+        )]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(
+            output.contains(
+                "PROJ-1  Summary for PROJ-1  [blocked by PROJ-8 (PR #3 open), PROJ-9 (no PR) \
+                 — can't stack on more than one]\n"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn list_clears_a_blocker_whose_pr_is_merged_even_if_its_status_lags() {
+        let ticket = blocked_issue("PROJ-2", &[("PROJ-9", "In Review", "indeterminate")]);
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![ticket]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_all_summary(
+            7,
+            "jowi-dev/proj-9-thing",
+            crate::github::gh_cli::PrLifecycle::Merged,
+        )]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "PROJ-2  Summary for PROJ-2\n");
+    }
+
+    #[test]
+    fn list_clears_a_blocker_that_is_done_in_the_tracker() {
+        let ticket = blocked_issue("PROJ-2", &[("PROJ-9", "Done", "done")]);
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![ticket]));
         let gh = FakeGhCli::new();
         let bots = cursor_bot();
         let mut out = Vec::new();
@@ -749,7 +931,115 @@ mod tests {
         list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert_eq!(output, "No ready tickets.\n(2 blocked tickets hidden)\n");
+        assert_eq!(output, "PROJ-2  Summary for PROJ-2\n");
+    }
+
+    #[test]
+    fn list_fetches_the_pr_list_once_however_many_candidates_have_blockers() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            blocked_issue("PROJ-1", &[("PROJ-7", "In Progress", "indeterminate")]),
+            blocked_issue("PROJ-2", &[("PROJ-8", "In Progress", "indeterminate")]),
+            blocked_issue("PROJ-3", &[("PROJ-9", "In Progress", "indeterminate")]),
+        ]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        assert_eq!(gh.pr_list_all_calls().len(), 1);
+    }
+
+    #[test]
+    fn list_with_no_blocked_candidates_never_fetches_the_pr_list() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        assert!(gh.pr_list_all_calls().is_empty());
+    }
+
+    #[test]
+    fn list_json_carries_each_candidates_decision_in_rank_order() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            blocked_issue("AX-409", &[("AX-408", "Code Review", "indeterminate")]),
+            issue("AX-1"),
+            blocked_issue("AX-2", &[("AX-9", "To Do", "new")]),
+        ]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_all_summary(
+            490,
+            "jowi-dev/ax-408-20260810-131418",
+            crate::github::gh_cli::PrLifecycle::Open,
+        )]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list_json(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "tickets": [
+                    {
+                        "key": "AX-409",
+                        "summary": "Summary for AX-409",
+                        "decision": "stackable",
+                        "base": "origin/jowi-dev/ax-408-20260810-131418",
+                        "blocker_key": "AX-408",
+                        "pr_number": 490,
+                    },
+                    {
+                        "key": "AX-1",
+                        "summary": "Summary for AX-1",
+                        "decision": "ready",
+                    },
+                    {
+                        "key": "AX-2",
+                        "summary": "Summary for AX-2",
+                        "decision": "blocked",
+                        "blocker_keys": ["AX-9"],
+                        "reason": "blocked by AX-9 (To Do), no PR yet",
+                    },
+                ],
+                "warnings": [],
+            })
+        );
+    }
+
+    #[test]
+    fn list_json_reports_warnings_and_bot_findings_without_corrupting_stdout() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("PROJ-1"),
+            blocked_issue("PROJ-2", &[("PROJ-9", "In Progress", "indeterminate")]),
+        ]));
+        let gh = FakeGhCli::new()
+            .with_pr_list_all(Err(GhError::Command {
+                command: "gh pr list".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            }))
+            .with_pr_list(Ok(vec![pr_summary(42, "[PROJ-1] Fix the thing")]))
+            .with_review_threads(42, Ok(vec![review_thread(false, "cursor")]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list_json(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(value["tickets"][0]["unresolved_bot_findings"], 1);
+        assert_eq!(value["tickets"][1]["decision"], "blocked");
+        let warnings = value["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .starts_with("could not check stackability")
+        );
     }
 
     #[test]
@@ -1336,16 +1626,12 @@ mod tests {
     }
 
     #[test]
-    fn list_stackability_lookup_failure_degrades_to_hiding_the_blocked_ticket() {
-        let mut blocked = issue("AX-409");
-        blocked.fields.issue_links = vec![IssueLink {
-            id: "1".to_string(),
-            link_type: blocks_link_type(),
-            inward_issue: Some(linked_issue("AX-408", "Code Review", "indeterminate")),
-            outward_issue: None,
-        }];
-        let jira =
-            FakeJiraClient::new().with_search_result(search_result(vec![issue("AX-1"), blocked]));
+    fn list_stackability_lookup_failure_degrades_to_the_tracker_only_answer() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("AX-1"),
+            blocked_issue("AX-409", &[("AX-408", "Code Review", "indeterminate")]),
+            blocked_issue("AX-410", &[("AX-408", "Done", "done")]),
+        ]));
         let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
             command: "gh pr list".to_string(),
             exit_code: Some(1),
@@ -1357,8 +1643,91 @@ mod tests {
         list(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should still succeed");
 
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("warning: could not check stackability"));
-        assert!(output.contains("(1 blocked ticket hidden)"));
-        assert!(!output.contains("stackable"));
+        assert!(output.starts_with("warning: could not check stackability"));
+        assert!(output.contains("AX-1  Summary for AX-1\n"));
+        assert!(output.contains("AX-410  Summary for AX-410\n"));
+        assert!(output.contains(
+            "AX-409  Summary for AX-409  [blocked by AX-408 (Code Review) — blocker PRs unresolved]\n"
+        ));
+        assert!(!output.contains("stackable on"));
+    }
+
+    // --- List/check parity ---
+
+    /// What `check` concluded, collapsed to the `decision` tag `list_json`
+    /// emits, so the two forms can be compared directly.
+    fn check_decision(ctx: &ReadyContext, key: &str) -> &'static str {
+        match check(ctx, key, &mut Vec::new()) {
+            Ok(ReadyOutcome::Ready) => "ready",
+            Ok(ReadyOutcome::Stackable) => "stackable",
+            Err(ReadyCliError::NotReady { .. }) => "blocked",
+            Err(other) => panic!("unexpected check error for {key}: {other}"),
+        }
+    }
+
+    #[test]
+    fn list_and_check_agree_on_every_decision_table_row() {
+        use crate::github::gh_cli::PrLifecycle;
+        let fixtures = vec![
+            issue("AX-1"),
+            blocked_issue("AX-2", &[("AX-90", "Done", "done")]),
+            blocked_issue("AX-3", &[("AX-91", "In Review", "indeterminate")]),
+            blocked_issue("AX-4", &[("AX-92", "Code Review", "indeterminate")]),
+            blocked_issue("AX-5", &[("AX-93", "To Do", "new")]),
+            blocked_issue(
+                "AX-6",
+                &[
+                    ("AX-92", "Code Review", "indeterminate"),
+                    ("AX-93", "To Do", "new"),
+                ],
+            ),
+            blocked_issue("AX-7", &[("AX-94", "In Progress", "indeterminate")]),
+        ];
+        let prs = vec![
+            pr_all_summary(91, "jowi-dev/ax-91-merged", PrLifecycle::Merged),
+            pr_all_summary(92, "jowi-dev/ax-92-open", PrLifecycle::Open),
+            pr_all_summary(94, "jowi-dev/ax-94-closed", PrLifecycle::Closed),
+        ];
+        let mut jira = FakeJiraClient::new().with_search_result(search_result(fixtures.clone()));
+        for fixture in &fixtures {
+            jira = jira.with_issue(&fixture.key, fixture.clone());
+        }
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(prs));
+        let bots = cursor_bot();
+        let ctx = ready_ctx(&jira, &gh, &bots);
+        let mut out = Vec::new();
+
+        list_json(&ctx, &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        let listed: Vec<(String, String)> = value["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["key"].as_str().unwrap().to_string(),
+                    t["decision"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let checked: Vec<(String, String)> = fixtures
+            .iter()
+            .map(|f| (f.key.clone(), check_decision(&ctx, &f.key).to_string()))
+            .collect();
+        assert_eq!(listed, checked);
+        assert_eq!(
+            checked.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>(),
+            vec![
+                "ready",
+                "ready",
+                "ready",
+                "stackable",
+                "blocked",
+                "blocked",
+                "blocked"
+            ],
+            "fixtures should cover every decision"
+        );
     }
 }
