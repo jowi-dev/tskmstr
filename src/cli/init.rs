@@ -304,7 +304,17 @@ pub fn run_init(
             section,
             fresh,
         )?;
+        let scaffolded_review = section.table == "review_watch" && outcome.scaffold.is_some();
         if let Some((path, contents)) = outcome.scaffold {
+            session_prompt_paths.push(path.clone());
+            lane_scaffolds.prompts.push((path, contents));
+        }
+        // GitHub issue #124: accepting the thatch review prompt also wires
+        // the auto-review round prompt, with no extra question; `tm review
+        // auto` stays opt-in through `[work.auto_review].auto`.
+        if scaffolded_review
+            && let Some((path, contents)) = auto_review_scaffold(ctx, &mut doc, &repo_config_path)?
+        {
             session_prompt_paths.push(path.clone());
             lane_scaffolds.prompts.push((path, contents));
         }
@@ -729,6 +739,72 @@ Record the detailed review reasoning and any follow-up plan in thatch memory.
 <!-- TODO: fill in this repo's review conventions and any checks the review
      session must always run. -->
 ";
+
+/// Thatch scaffold for `[work.auto_review]` (GitHub issue #124): one review
+/// round of `tm review auto`. `{key}`, `{round}`, `{skill}`, `{prior}` and
+/// `{findings_file}` are substituted per round (see
+/// `crate::work::auto_review::render_prompt`).
+const AUTO_REVIEW_THATCH_TEMPLATE: &str = "\
+# Auto-review {key}, round {round}
+
+Review the changes on this branch for ticket {key} with the `{skill}` skill.
+This session is unattended: do not ask questions, do not post anything to
+GitHub, and do not change any code.
+
+## Recall thatch memory first
+
+Search thatch memory for context on {key} and this repo before reviewing, so
+findings agree with prior decisions and deferred work.
+
+## Review
+
+{prior}Run `{skill}` against this branch.
+
+## Write the findings file
+
+Write every CONFIRMED finding to `{findings_file}` as a JSON array, one object
+per finding:
+
+    {\"path\": \"src/lib.rs\", \"start_line\": 10, \"end_line\": 12,
+     \"severity\": \"MEDIUM\", \"specialist\": \"state-flow\",
+     \"body\": \"What is wrong, why, and what to change.\"}
+
+`path` is repo-relative; lines are 1-based and inclusive, anchored to the head
+SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. Write `[]` when there
+are no findings; always write the file.
+
+## Write the review outcome back to thatch memory
+
+Record the detailed review reasoning in thatch memory.
+
+## Repo-specific context
+
+<!-- TODO: fill in this repo's review conventions. -->
+";
+
+/// Wires `[work.auto_review].prompt_file` to `.tskmstr/prompts/auto-review.md`
+/// and returns the file to scaffold, when the section has no prompt source
+/// of its own. An existing file is wired but not rewritten.
+fn auto_review_scaffold(
+    ctx: &InitContext,
+    doc: &mut DocumentMut,
+    repo_config_path: &Path,
+) -> Result<Option<(PathBuf, String)>, InitCliError> {
+    let keys = ["work", "auto_review"];
+    if str_at(doc, &["work", "auto_review", "prompt"]).is_some()
+        || str_at(doc, &["work", "auto_review", "prompt_file"]).is_some()
+    {
+        return Ok(None);
+    }
+    let repo_dir = repo_config_path.parent().unwrap_or_else(|| Path::new("."));
+    let rel = ".tskmstr/prompts/auto-review.md";
+    let resolved = resolve_repo_relative(rel, repo_dir, ctx.home);
+    set_str(doc, &keys, "prompt_file", rel, repo_config_path)?;
+    if resolved.exists() {
+        return Ok(None);
+    }
+    Ok(Some((resolved, AUTO_REVIEW_THATCH_TEMPLATE.to_string())))
+}
 
 /// One of the optional `[work.create]` / `[work.review_watch]` /
 /// `[work.audit]` sections the wizard can fill in.
@@ -3312,6 +3388,38 @@ mod tests {
                 .contains("audit"),
             "audit prompt_file should reference audit.md"
         );
+    }
+
+    #[test]
+    fn fresh_yes_init_scaffolds_the_auto_review_prompt_alongside_review() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut prompter, &mut out).expect("init should succeed");
+
+        let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
+        let path = repo_dir.join(".tskmstr/prompts/auto-review.md");
+        let body = std::fs::read_to_string(&path).expect("auto-review.md is scaffolded");
+        for placeholder in ["{key}", "{round}", "{skill}", "{prior}", "{findings_file}"] {
+            assert!(body.contains(placeholder), "{placeholder} missing: {body}");
+        }
+        assert!(body.contains("thatch memory"), "{body}");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert!(
+            config
+                .work
+                .auto_review
+                .prompt_file
+                .as_deref()
+                .is_some_and(|p| p.ends_with("auto-review.md")),
+            "[work.auto_review].prompt_file must be wired"
+        );
+        assert!(!config.work.auto_review.auto, "chaining stays opt-in");
     }
 
     #[test]
