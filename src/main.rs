@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     // `READY_EXIT_STACKABLE`'s doc comment. `tm ready` with no
     // key (the list form) never errors and stays on the uniform 0/1 path
     // via `dispatch`/`run_ready`.
-    if let Command::Ready { key: Some(key) } = command {
+    if let Command::Ready { key: Some(key), .. } = command {
         return run_ready_check(key);
     }
 
@@ -203,7 +203,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Auth { cmd } => run_auth(cmd, &paths, &keychain, env_token),
         Command::Ticket { key, cmd } => run_ticket(key, cmd, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
-        Command::Ready { key } => run_ready(key, &paths, &keychain, env_token),
+        Command::Ready { key, json } => run_ready(key, json, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Overview => run_overview(),
         Command::Runs {
@@ -1607,11 +1607,13 @@ fn default_xdg_run_db_path() -> PathBuf {
 /// `tm ready` (no key): needs a Jira client + config, same as the
 /// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
 /// `review_bots` for the best-effort bot-findings/stackability annotations
-/// both forms now carry (see [`tskmstr::cli::ready::ReadyContext`]). `tm
+/// both forms now carry (see [`tskmstr::cli::ready::ReadyContext`]). `json`
+/// selects [`tskmstr::cli::ready::list_json`] over the text listing. `tm
 /// ready <KEY>` is special-cased in `main` as [`run_ready_check`] instead —
 /// see its doc comment for why.
 fn run_ready(
     key: Option<String>,
+    json: bool,
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
@@ -1629,7 +1631,11 @@ fn run_ready(
         review_bots: &config.review_bots,
     };
     let mut stdout = std::io::stdout();
-    tskmstr::cli::ready::list(&ctx, &mut stdout)?;
+    if json {
+        tskmstr::cli::ready::list_json(&ctx, &mut stdout)?;
+    } else {
+        tskmstr::cli::ready::list(&ctx, &mut stdout)?;
+    }
     Ok(())
 }
 

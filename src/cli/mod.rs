@@ -111,17 +111,23 @@ pub enum Command {
     /// whether a specific ticket is ready.
     ///
     /// With no `KEY`, lists tickets assigned to the current user that are in
-    /// the "To Do" status category and have no open `Blocks`-type blockers,
-    /// in Jira's native backlog rank order. With `KEY` (any assignee, any
-    /// status), reports whether that one ticket is ready, exiting non-zero
-    /// if it's blocked. Both forms also carry a best-effort, advisory
-    /// annotation of unresolved GitHub bot review findings on a ready
-    /// ticket's associated pull request, if any; this never blocks
-    /// claimability or changes the exit code.
+    /// the "To Do" status category, in Jira's native backlog rank order, each
+    /// classified as ready, stackable on a blocker's open PR, or blocked
+    /// (with the reason). With `KEY` (any assignee, any status), reports
+    /// whether that one ticket is ready (exit 0), stackable (exit 3), or
+    /// blocked (non-zero). Both forms use the same blocker rule as `tm work
+    /// run`'s stacking. Both also carry a best-effort, advisory annotation
+    /// of unresolved GitHub bot review findings on a ready ticket's
+    /// associated pull request, if any; this never blocks claimability or
+    /// changes the exit code.
     Ready {
         /// Jira issue key to check, e.g. `PROJ-372` (case-insensitive). Omit
         /// to list your ready tickets instead.
         key: Option<String>,
+        /// Print the list form as JSON (each ticket's decision, plus any
+        /// warnings) instead of text.
+        #[arg(long, conflicts_with = "key")]
+        json: bool,
     },
     /// Open the interactive terminal board.
     Board,
@@ -2065,7 +2071,7 @@ mod tests {
     fn parses_ready_with_no_key() {
         let cli = Cli::try_parse_from(["tm", "ready"]).expect("should parse");
         match cli.command {
-            Some(Command::Ready { key }) => assert!(key.is_none()),
+            Some(Command::Ready { key, .. }) => assert!(key.is_none()),
             other => panic!("expected Ready, got {other:?}"),
         }
     }
@@ -2074,9 +2080,27 @@ mod tests {
     fn parses_ready_with_key() {
         let cli = Cli::try_parse_from(["tm", "ready", "proj-20"]).expect("should parse");
         match cli.command {
-            Some(Command::Ready { key }) => assert_eq!(key, Some("proj-20".to_string())),
+            Some(Command::Ready { key, .. }) => assert_eq!(key, Some("proj-20".to_string())),
             other => panic!("expected Ready, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ready_json_flag() {
+        let cli = Cli::try_parse_from(["tm", "ready", "--json"]).expect("should parse");
+        match cli.command {
+            Some(Command::Ready { key, json }) => {
+                assert!(key.is_none());
+                assert!(json);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ready_json_conflicts_with_key() {
+        Cli::try_parse_from(["tm", "ready", "proj-20", "--json"])
+            .expect_err("--json is for the list form only");
     }
 
     #[test]
