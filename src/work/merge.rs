@@ -5,8 +5,10 @@
 //! [`run_merge`] is the whole flow, staged roughly as: resolve the ticket's
 //! open PR, locate a local checkout of its branch (if any), fetch and
 //! rebase (opening a conflict-resolution tmux session and polling it to
-//! completion when the rebase stops on conflicts), merge the PR via `gh`,
-//! fast-forward the local base branch, best-effort clean up the worktree,
+//! completion when the rebase stops on conflicts), merge the PR via `gh`
+//! (rebasing and retrying once when GitHub rejects a stale base; GitHub
+//! issue #109), fast-forward the local base branch, best-effort clean up
+//! the worktree,
 //! branch, the ticket's live runs (finished as `done`, their agents
 //! stopped; GitHub issue #107), and ticket tmux session (its scrollback
 //! archived first, see [`crate::work::session_gc`]; GitHub issue #78),
@@ -646,7 +648,9 @@ impl BatchMergeReport {
 /// together until each resolves, is abandoned, the window dies, or
 /// [`CONFLICT_TIMEOUT_SECS`] per set-aside ticket elapses. Tickets that
 /// resolved are then pushed and merged in their original order; the rest
-/// are handed back.
+/// are handed back. A ticket an earlier merge left behind its base is
+/// rebased and retried once (see [`merge_pr_with_retry`]); one whose retry
+/// rebase conflicts and never resolves is handed back too.
 ///
 /// Returns `Err` only when writing to `out` fails between tickets;
 /// per-ticket failures land in the report instead.
