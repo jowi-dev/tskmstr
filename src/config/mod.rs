@@ -115,6 +115,9 @@ pub struct RawConfig {
     /// column. When unset in both global and repo config, the board uses
     /// the default ordering for every column.
     pub board_column_order: Option<Vec<String>>,
+    /// `[ready]` settings: what `tm ready` requires of a ticket beyond
+    /// having no blockers. See [`RawReadyConfig`].
+    pub ready: Option<RawReadyConfig>,
     /// `tm work` settings: worktree/session defaults and per-lane
     /// definitions. See [`RawWorkConfig`].
     ///
@@ -149,6 +152,18 @@ pub struct RawConfig {
     /// [`crate::config::manifest::stamp_status`] to decide whether a repo is
     /// up to date with the tskmstr binary running against it.
     pub schema_version: Option<i64>,
+}
+
+/// Raw, partially-specified `[ready]` section as parsed directly from TOML
+/// (GitHub issue #112).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawReadyConfig {
+    /// Whether `tm ready` only counts a ticket as ready once its latest
+    /// recorded audit verdict is `ready` (see `tm ticket audit --record` and
+    /// `tm ticket create --audited`). Audits live in the local runs DB, so
+    /// the gate is per-machine. Defaults to `true`; `false` restores the
+    /// blockers-only check.
+    pub require_audit: Option<bool>,
 }
 
 /// Raw, partially-specified `[backend]` section as parsed directly from
@@ -724,6 +739,10 @@ pub struct Config {
     /// Empty in single-runner mode. See GitHub issue #54 and
     /// `docs/plans/gh-54-priority-routing.md`.
     pub agent_fallbacks: Vec<AgentKind>,
+    /// Whether `tm ready` requires a passing audit verdict. See
+    /// [`RawReadyConfig::require_audit`]; defaults to `true` when `[ready]`
+    /// is absent from both global and repo config.
+    pub require_audit: bool,
 }
 
 /// Fully validated `[work]` section.
@@ -1311,6 +1330,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         run_db_path: None,
         review_bots: None,
         board_column_order: None,
+        ready: None,
         work: None,
         backend: None,
         agent: None,
@@ -1460,6 +1480,12 @@ fn merge_with_repo_dir(
         .clone()
         .or(global.board_column_order.clone())
         .unwrap_or_default();
+    let require_audit = repo
+        .ready
+        .as_ref()
+        .and_then(|ready| ready.require_audit)
+        .or(global.ready.as_ref().and_then(|ready| ready.require_audit))
+        .unwrap_or(true);
     let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
 
     let expected_path = default_global_config_path();
@@ -1490,6 +1516,7 @@ fn merge_with_repo_dir(
             work,
             agent,
             agent_fallbacks,
+            require_audit,
         }),
         BackendKind::Github => {
             let configured_repo = repo
@@ -1527,6 +1554,7 @@ fn merge_with_repo_dir(
                 work,
                 agent,
                 agent_fallbacks,
+                require_audit,
             })
         }
     }
@@ -2178,6 +2206,7 @@ mod tests {
             run_db_path: Some("/global/runs.db".into()),
             review_bots: Some(vec!["cursor[bot]".into()]),
             board_column_order: Some(vec!["To Do".into(), "In Progress".into()]),
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2208,6 +2237,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2223,6 +2253,25 @@ mod tests {
         assert_eq!(cfg.status_on_pr, Some("In Review".into()));
         assert_eq!(cfg.status_on_create, Some("In Progress".into()));
         assert_eq!(cfg.status_on_merge, Some("Done".into()));
+    }
+
+    #[test]
+    fn merge_require_audit_defaults_to_true() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert!(cfg.require_audit);
+    }
+
+    #[test]
+    fn merge_repo_ready_require_audit_overrides_global() {
+        let global = RawConfig {
+            ready: Some(RawReadyConfig {
+                require_audit: Some(true),
+            }),
+            ..raw_full()
+        };
+        let repo: RawConfig = toml::from_str("[ready]\nrequire_audit = false\n").expect("toml");
+        let cfg = merge(global, Some(repo)).expect("should merge");
+        assert!(!cfg.require_audit);
     }
 
     #[test]
@@ -2286,6 +2335,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2319,6 +2369,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: None,
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2352,6 +2403,7 @@ mod tests {
             run_db_path: Some("/repo/runs.db".into()),
             review_bots: None,
             board_column_order: None,
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2385,6 +2437,7 @@ mod tests {
             run_db_path: None,
             review_bots: Some(vec!["repo-bot[bot]".into()]),
             board_column_order: None,
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2418,6 +2471,7 @@ mod tests {
             run_db_path: None,
             review_bots: None,
             board_column_order: Some(vec!["Code Review".into()]),
+            ready: None,
             work: None,
             backend: None,
             agent: None,
@@ -2431,6 +2485,7 @@ mod tests {
     fn merge_board_column_order_absent_from_both_is_empty() {
         let global = RawConfig {
             board_column_order: None,
+            ready: None,
             ..raw_full()
         };
         let cfg = merge(global, None).expect("should merge");

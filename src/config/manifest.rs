@@ -115,13 +115,33 @@ pub struct ExpectedConfigKey {
     pub since_schema_version: i64,
     /// Whether a missing key is drift or advisory. See [`KeySeverity`].
     pub severity: KeySeverity,
-    /// The string value `tm update` writes for a repo on the given backend,
+    /// The value `tm update` writes for a repo on the given backend,
     /// or `None` when there is no safe value to assume (e.g. a Jira
     /// workflow's status names are arbitrary). A recommended key with no
     /// default for the repo's backend isn't reported at all — there is
     /// nothing actionable to suggest; a required one is reported for the
     /// operator to set by hand.
-    pub suggested_default: fn(super::BackendKind) -> Option<&'static str>,
+    pub suggested_default: fn(super::BackendKind) -> Option<DefaultValue>,
+}
+
+/// A typed [`ExpectedConfigKey::suggested_default`], so `tm update` writes a
+/// boolean key as `true` rather than the string `"true"`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DefaultValue {
+    /// A TOML string.
+    Str(&'static str),
+    /// A TOML boolean.
+    Bool(bool),
+}
+
+impl std::fmt::Display for DefaultValue {
+    /// Renders the value as a TOML literal: `"In Review"`, `true`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefaultValue::Str(s) => write!(f, "\"{s}\""),
+            DefaultValue::Bool(b) => write!(f, "{b}"),
+        }
+    }
 }
 
 impl ExpectedConfigKey {
@@ -143,7 +163,7 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         since_schema_version: 2,
         severity: KeySeverity::Recommended,
         suggested_default: |backend| match backend {
-            super::BackendKind::Github => Some("In Review"),
+            super::BackendKind::Github => Some(DefaultValue::Str("In Review")),
             super::BackendKind::Jira => None,
         },
     },
@@ -152,7 +172,19 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         since_schema_version: 2,
         severity: KeySeverity::Recommended,
         suggested_default: |backend| match backend {
-            super::BackendKind::Github => Some("In Progress"),
+            super::BackendKind::Github => Some(DefaultValue::Str("In Progress")),
+            super::BackendKind::Jira => None,
+        },
+    },
+    // GitHub issue #112: absent means `true` already; writing it makes the
+    // audit gate visible in the repo's config. The gate defaults on for
+    // Jira too; only the nag is GitHub-only, matching the keys above.
+    ExpectedConfigKey {
+        path: &["ready", "require_audit"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |backend| match backend {
+            super::BackendKind::Github => Some(DefaultValue::Bool(true)),
             super::BackendKind::Jira => None,
         },
     },
@@ -186,7 +218,7 @@ mod tests {
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!(
             (key.suggested_default)(BackendKind::Github),
-            Some("In Review")
+            Some(DefaultValue::Str("In Review"))
         );
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
     }
@@ -197,7 +229,7 @@ mod tests {
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!(
             (key.suggested_default)(BackendKind::Github),
-            Some("In Progress")
+            Some(DefaultValue::Str("In Progress"))
         );
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
     }
@@ -208,6 +240,23 @@ mod tests {
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn ready_require_audit_is_recommended_true_on_github_only() {
+        let key = expected(&["ready", "require_audit"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!(
+            (key.suggested_default)(BackendKind::Github),
+            Some(DefaultValue::Bool(true))
+        );
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn default_value_renders_as_a_toml_literal() {
+        assert_eq!(DefaultValue::Str("In Review").to_string(), "\"In Review\"");
+        assert_eq!(DefaultValue::Bool(true).to_string(), "true");
     }
 
     #[test]

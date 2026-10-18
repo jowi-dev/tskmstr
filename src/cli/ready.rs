@@ -14,7 +14,10 @@
 //! can give each its own exit code (see [`ReadyOutcome`]'s doc comment);
 //! blocked is [`ReadyCliError::NotReady`], turned into a non-zero exit by
 //! `main.rs`'s existing error path without special-casing `tm ready` for
-//! that case.
+//! that case. A ticket that would be ready or stackable but fails the
+//! audit gate ([`AuditGate`], GitHub issue #112: no passing `tm ticket
+//! audit` verdict in the local runs DB) is "needs audit" in the list and
+//! [`ReadyCliError::NotAudited`] from [`check`].
 //!
 //! Both forms also carry a best-effort, ADVISORY annotation of GitHub bot
 //! review findings (see [`crate::github::bot_findings`]) on a ready ticket's
@@ -50,6 +53,63 @@ pub struct ReadyContext<'a> {
     /// Each ticket's live lane run (see [`blocker_stacking::in_flight_lanes`]):
     /// a no-PR blocker with one reads as waiting rather than blocked.
     pub in_flight: blocker_stacking::InFlight,
+    /// The audit gate (GitHub issue #112): what a ticket with no blockers
+    /// still needs before it counts as ready or stackable.
+    pub audit: AuditGate<'a>,
+}
+
+/// The verdict `tm ticket audit --record` stores for a ticket that passes
+/// [`AuditGate`] (see [`crate::cli::AuditVerdict::Ready`]).
+pub const PASSING_AUDIT_VERDICT: &str = "ready";
+
+/// `tm ready`'s audit gate (GitHub issue #112): with the gate on, a ticket
+/// is only ready or stackable once its latest recorded audit verdict is
+/// [`PASSING_AUDIT_VERDICT`]. Audits live in the local runs DB, so the gate
+/// is per-machine.
+pub enum AuditGate<'a> {
+    /// `[ready] require_audit = false`: blockers alone decide.
+    Off,
+    /// Read each ticket's latest audit for `scope` from `store`.
+    Store {
+        /// The runs DB holding `ticket_audits`.
+        store: &'a crate::runs::RunStore,
+        /// [`crate::config::BackendIdentity::scope`] of this repo.
+        scope: String,
+    },
+    /// The gate is on but the runs DB couldn't be opened (the error text):
+    /// nothing passes. Fails closed, since an unattended dispatcher acts on
+    /// whatever `tm ready` returns.
+    Unavailable(String),
+}
+
+impl AuditGate<'_> {
+    /// Why `key` fails the gate, or `None` if it passes. A store read error
+    /// fails closed, like [`AuditGate::Unavailable`].
+    fn needs_audit(&self, key: &str) -> Option<String> {
+        match self {
+            AuditGate::Off => None,
+            AuditGate::Unavailable(err) => Some(format!("audit store unavailable: {err}")),
+            AuditGate::Store { store, scope } => {
+                match store.latest_audit_for_ticket(Some(scope), key) {
+                    Ok(Some(audit)) if audit.verdict == PASSING_AUDIT_VERDICT => None,
+                    Ok(Some(audit)) => Some(format!("last audit was {}", audit.verdict)),
+                    Ok(None) => Some("not audited".to_string()),
+                    Err(err) => Some(format!("could not read audit: {err}")),
+                }
+            }
+        }
+    }
+
+    /// [`check`]'s gate: `Err(NotAudited)` if `key` fails it.
+    fn require(&self, key: &str) -> Result<(), ReadyCliError> {
+        match self.needs_audit(key) {
+            None => Ok(()),
+            Some(reason) => Err(ReadyCliError::NotAudited {
+                key: key.to_string(),
+                reason,
+            }),
+        }
+    }
 }
 
 /// Errors surfaced by `tm ready`.
@@ -74,6 +134,18 @@ pub enum ReadyCliError {
         key: String,
         /// Pre-formatted, newline-joined list of open blocker lines.
         blockers: String,
+    },
+
+    /// `tm ready <KEY>` found `key` would be ready or stackable, but it fails
+    /// the [`AuditGate`]: never audited, a latest verdict other than
+    /// [`PASSING_AUDIT_VERDICT`], or an unreadable audit store. `main.rs`
+    /// gives this its own exit code.
+    #[error("{key} needs audit ({reason}); record one with `tm ticket audit {key} --record ready`")]
+    NotAudited {
+        /// The issue key that was checked.
+        key: String,
+        /// Why it fails the gate, e.g. `not audited`.
+        reason: String,
     },
 
     /// A Jira API call failed.
@@ -124,6 +196,9 @@ fn normalize(key: &str) -> Result<String, ReadyCliError> {
 /// - ready: `KEY  Summary`
 /// - stackable: `KEY  Summary  [stackable on <branch> — blocked by
 ///   <BLOCKER>, PR #<N> open]`
+/// - needs audit (would be ready or stackable, but fails
+///   [`ReadyContext::audit`]): `KEY  Summary  [needs audit: <reason>]`, e.g.
+///   `[needs audit: not audited]`
 /// - waiting: `KEY  Summary  [waiting on <BLOCKER> (<run status>)]`
 /// - blocked: `KEY  Summary  [<reason>]`, e.g. `[blocked by PROJ-9 (In
 ///   Progress), no PR yet]`
@@ -158,7 +233,7 @@ pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError
         writeln!(out, "No ready tickets.")?;
     }
 
-    for group in 0..4 {
+    for group in 0..5 {
         for ticket in report.tickets.iter().filter(|t| list_group(t) == group) {
             write!(out, "{}  {}", ticket.key, ticket.summary)?;
             if let Some(note) = list_note(ticket) {
@@ -174,13 +249,15 @@ pub fn list(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCliError
     Ok(())
 }
 
-/// [`list`]'s print order: ready, stackable, waiting, then blocked.
+/// [`list`]'s print order: ready, stackable, needs audit, waiting, then
+/// blocked.
 fn list_group(ticket: &ListEntry) -> u8 {
     match ticket.decision {
         ListDecision::Ready => 0,
         ListDecision::Stackable { .. } => 1,
-        ListDecision::Waiting { .. } => 2,
-        ListDecision::Blocked { .. } => 3,
+        ListDecision::NeedsAudit { .. } => 2,
+        ListDecision::Waiting { .. } => 3,
+        ListDecision::Blocked { .. } => 4,
     }
 }
 
@@ -198,6 +275,7 @@ fn list_note(ticket: &ListEntry) -> Option<String> {
         } => Some(format!(
             "stackable on {base} — blocked by {blocker_key}, PR #{pr_number} open"
         )),
+        ListDecision::NeedsAudit { reason } => Some(format!("needs audit: {reason}")),
         ListDecision::Waiting { reason, .. } | ListDecision::Blocked { reason, .. } => {
             Some(reason.clone())
         }
@@ -215,6 +293,8 @@ fn list_note(ticket: &ListEntry) -> Option<String> {
 ///     {"key": "AX-409", "summary": "...", "decision": "stackable",
 ///      "base": "origin/jowi-dev/ax-408-...", "blocker_key": "AX-408",
 ///      "pr_number": 490, "unblocks": 0},
+///     {"key": "AX-5", "summary": "...", "decision": "needs_audit",
+///      "reason": "not audited", "unblocks": 0},
 ///     {"key": "AX-3", "summary": "...", "decision": "waiting",
 ///      "blocker_key": "AX-7", "run_id": 12, "run_status": "running",
 ///      "reason": "waiting on AX-7 (running)", "unblocks": 0},
@@ -254,6 +334,11 @@ pub enum ListDecision {
         blocker_key: String,
         /// The blocker's open PR number.
         pr_number: u64,
+    },
+    /// Would be ready or stackable, but fails the [`AuditGate`].
+    NeedsAudit {
+        /// Why, e.g. `not audited` or `last audit was needs-work`.
+        reason: String,
     },
     /// One unmerged blocker with no PR yet, but a live lane run working it:
     /// re-check later rather than dispatch the blocker.
@@ -340,7 +425,18 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
 
     let decisions: Vec<ListDecision> = candidates
         .iter()
-        .map(|issue| list_decision(issue, prs.as_deref(), &ctx.in_flight))
+        .map(|issue| {
+            let decision = list_decision(issue, prs.as_deref(), &ctx.in_flight);
+            match decision {
+                ListDecision::Ready | ListDecision::Stackable { .. } => {
+                    match ctx.audit.needs_audit(&issue.key) {
+                        Some(reason) => ListDecision::NeedsAudit { reason },
+                        None => decision,
+                    }
+                }
+                _ => decision,
+            }
+        })
         .collect();
 
     let ready: Vec<Issue> = candidates
@@ -502,6 +598,7 @@ pub fn check(
     let status_name = issue.fields.status.name.clone();
 
     if blocker_stacking::direct_blockers(&issue).is_empty() {
+        ctx.audit.require(&normalized)?;
         writeln!(out, "{normalized} is ready ({status_name})")?;
         print_bot_finding_note(ctx, &normalized, out)?;
         return Ok(ReadyOutcome::Ready);
@@ -524,6 +621,7 @@ pub fn check(
     let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
     match blocker_stacking::decide(unmerged, &ctx.in_flight) {
         StackDecision::Ready => {
+            ctx.audit.require(&normalized)?;
             writeln!(out, "{normalized} is ready ({status_name})")?;
             print_bot_finding_note(ctx, &normalized, out)?;
             Ok(ReadyOutcome::Ready)
@@ -533,6 +631,7 @@ pub fn check(
             pr_number,
             head_ref_name,
         } => {
+            ctx.audit.require(&normalized)?;
             let base = format!("origin/{head_ref_name}");
             writeln!(
                 out,
@@ -603,6 +702,7 @@ fn jira_only_fallback(
 
     let blockers = open_blockers(issue);
     if blockers.is_empty() {
+        ctx.audit.require(normalized)?;
         writeln!(out, "{normalized} is ready ({status_name})")?;
         print_bot_finding_note(ctx, normalized, out)?;
         return Ok(ReadyOutcome::Ready);
@@ -772,6 +872,7 @@ mod tests {
             gh,
             review_bots,
             in_flight: blocker_stacking::InFlight::new(),
+            audit: AuditGate::Off,
         }
     }
 
@@ -1934,5 +2035,218 @@ mod tests {
             ],
             "fixtures should cover every decision"
         );
+    }
+
+    // --- Audit gate (GitHub issue #112) ---
+
+    /// A temp-dir run store holding each `(key, verdict)` audit, in order.
+    fn audit_store(audits: &[(&str, &str)]) -> (tempfile::TempDir, crate::runs::RunStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        for (key, verdict) in audits {
+            store.record_audit("scope", key, verdict, None).unwrap();
+        }
+        (dir, store)
+    }
+
+    fn gated<'a>(ctx: ReadyContext<'a>, store: &'a crate::runs::RunStore) -> ReadyContext<'a> {
+        ReadyContext {
+            audit: AuditGate::Store {
+                store,
+                scope: "scope".to_string(),
+            },
+            ..ctx
+        }
+    }
+
+    #[test]
+    fn list_shows_unaudited_and_failed_audit_tickets_as_needing_audit() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("PROJ-1"),
+            issue("PROJ-2"),
+            issue("PROJ-3"),
+        ]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[("PROJ-1", "ready"), ("PROJ-3", "needs-work")]);
+        let mut out = Vec::new();
+
+        list(&gated(ready_ctx(&jira, &gh, &bots), &store), &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-1  Summary for PROJ-1\n\
+             PROJ-2  Summary for PROJ-2  [needs audit: not audited]\n\
+             PROJ-3  Summary for PROJ-3  [needs audit: last audit was needs-work]\n"
+        );
+    }
+
+    #[test]
+    fn list_with_only_unaudited_tickets_prints_no_ready_tickets() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[]);
+        let mut out = Vec::new();
+
+        list(&gated(ready_ctx(&jira, &gh, &bots), &store), &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No ready tickets.\nPROJ-1  Summary for PROJ-1  [needs audit: not audited]\n"
+        );
+    }
+
+    #[test]
+    fn a_later_failing_audit_removes_a_ticket_from_ready() {
+        let jira = FakeJiraClient::new()
+            .with_search_result(search_result(vec![issue("PROJ-1")]))
+            .with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[("PROJ-1", "ready")]);
+        // Same-millisecond rows tie on `audited_at`; `id` breaks the tie.
+        store
+            .record_audit("scope", "PROJ-1", "needs-work", None)
+            .unwrap();
+        let ctx = gated(ready_ctx(&jira, &gh, &bots), &store);
+        let mut out = Vec::new();
+
+        list_json(&ctx, &mut out).expect("should succeed");
+        let err = check(&ctx, "PROJ-1", &mut Vec::new()).expect_err("failed audit");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(
+            value["tickets"][0],
+            serde_json::json!({
+                "key": "PROJ-1",
+                "summary": "Summary for PROJ-1",
+                "decision": "needs_audit",
+                "reason": "last audit was needs-work",
+                "unblocks": 0,
+            })
+        );
+        assert!(matches!(err, ReadyCliError::NotAudited { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn list_keeps_a_blocked_tickets_blocker_reason_over_its_audit() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked_issue(
+            "PROJ-2",
+            &[("PROJ-9", "In Progress", "indeterminate")],
+        )]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[]);
+        let mut out = Vec::new();
+
+        list(&gated(ready_ctx(&jira, &gh, &bots), &store), &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No ready tickets.\n\
+             PROJ-2  Summary for PROJ-2  [blocked by PROJ-9 (In Progress), no PR yet]\n"
+        );
+    }
+
+    #[test]
+    fn list_treats_every_ticket_as_needing_audit_when_the_store_is_unavailable() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            audit: AuditGate::Unavailable("disk on fire".to_string()),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        list(&ctx, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No ready tickets.\n\
+             PROJ-1  Summary for PROJ-1  [needs audit: audit store unavailable: disk on fire]\n"
+        );
+    }
+
+    #[test]
+    fn check_reports_an_unaudited_ticket_as_not_audited() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[]);
+        let mut out = Vec::new();
+
+        let err = check(
+            &gated(ready_ctx(&jira, &gh, &bots), &store),
+            "proj-1",
+            &mut out,
+        )
+        .expect_err("unaudited is not ready");
+
+        assert_eq!(
+            err.to_string(),
+            "PROJ-1 needs audit (not audited); record one with `tm ticket audit PROJ-1 --record ready`"
+        );
+        assert!(out.is_empty(), "nothing printed as ready: {out:?}");
+    }
+
+    #[test]
+    fn check_passes_a_ticket_whose_latest_audit_is_ready() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1"));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[("PROJ-1", "needs-work"), ("PROJ-1", "ready")]);
+        let mut out = Vec::new();
+
+        let outcome = check(
+            &gated(ready_ctx(&jira, &gh, &bots), &store),
+            "PROJ-1",
+            &mut out,
+        )
+        .expect("audited ticket is ready");
+
+        assert_eq!(outcome, ReadyOutcome::Ready);
+        assert_eq!(String::from_utf8(out).unwrap(), "PROJ-1 is ready (To Do)\n");
+    }
+
+    #[test]
+    fn check_gates_a_stackable_ticket_on_its_audit_too() {
+        let ticket = blocked_issue("AX-409", &[("AX-408", "Code Review", "indeterminate")]);
+        let jira = FakeJiraClient::new().with_issue("AX-409", ticket);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_all_summary(
+            490,
+            "jowi-dev/ax-408-thing",
+            crate::github::gh_cli::PrLifecycle::Open,
+        )]));
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[]);
+
+        let err = check(
+            &gated(ready_ctx(&jira, &gh, &bots), &store),
+            "AX-409",
+            &mut Vec::new(),
+        )
+        .expect_err("unaudited stackable is not workable");
+
+        assert!(matches!(err, ReadyCliError::NotAudited { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn check_keeps_a_blocked_ticket_blocked_whatever_its_audit() {
+        let ticket = blocked_issue("AX-409", &[("AX-408", "In Progress", "indeterminate")]);
+        let jira = FakeJiraClient::new().with_issue("AX-409", ticket);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let (_dir, store) = audit_store(&[]);
+
+        let err = check(
+            &gated(ready_ctx(&jira, &gh, &bots), &store),
+            "AX-409",
+            &mut Vec::new(),
+        )
+        .expect_err("blocked");
+
+        assert!(matches!(err, ReadyCliError::NotReady { .. }), "{err:?}");
     }
 }

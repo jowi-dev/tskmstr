@@ -322,6 +322,7 @@ mod tests {
             work: crate::config::WorkConfig::default(),
             agent: crate::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
+            require_audit: true,
         }
     }
 

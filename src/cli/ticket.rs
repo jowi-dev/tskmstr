@@ -113,6 +113,12 @@ pub struct CreateOptions {
     /// even if `Config::status_on_create` is set. Mutually exclusive with
     /// `status` at the clap level.
     pub no_transition: bool,
+    /// `--audited`: record a passing audit for the new ticket (GitHub issue
+    /// #112), so it clears `tm ready`'s audit gate immediately.
+    pub audited: bool,
+    /// `--audit-notes`: notes for the `audited` row; `"audited at
+    /// creation"` when `None`.
+    pub audit_notes: Option<String>,
 }
 
 /// `tm ticket create`: create a new ticket in the configured default
@@ -133,6 +139,12 @@ pub struct CreateOptions {
 /// `None` when the caller couldn't open the runs DB at all (main.rs opens
 /// it leniently for exactly this reason) or on a plain terminal invocation
 /// with no session id — either way, `create` still succeeds.
+///
+/// With `opts.audited` (GitHub issue #112), also records a passing audit
+/// for the new ticket in `session_store`, so it clears `tm ready`'s audit
+/// gate at once. If that can't be recorded (no store, or a write error),
+/// prints a `warning:` line naming the `tm ticket audit` command that
+/// finishes the job; the create itself still succeeds.
 pub fn create(
     ctx: &CreateTicketContext,
     opts: &CreateOptions,
@@ -179,6 +191,38 @@ pub fn create(
     )?;
     super::print_status_transition(&outcome.issue_key, &outcome.status_transition, out)?;
 
+    if opts.audited {
+        record_creation_audit(ctx, opts, session_store, &outcome.issue_key, out)?;
+    }
+
+    Ok(())
+}
+
+/// [`create`]'s `--audited`: record a passing audit for the just-created
+/// `key`. The ticket already exists, so a failure here warns with the
+/// command that finishes the job rather than failing the create.
+fn record_creation_audit(
+    ctx: &CreateTicketContext,
+    opts: &CreateOptions,
+    store: Option<&RunStore>,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let verdict = crate::cli::ready::PASSING_AUDIT_VERDICT;
+    let notes = opts.audit_notes.as_deref().unwrap_or("audited at creation");
+    let scope = crate::config::BackendIdentity::from_config(ctx.config).scope();
+    let failure = match store.map(|store| store.record_audit(&scope, key, verdict, Some(notes))) {
+        Some(Ok(())) => {
+            writeln!(out, "Recorded audit for {key}: {verdict}")?;
+            return Ok(());
+        }
+        Some(Err(err)) => err.to_string(),
+        None => "runs DB unavailable".to_string(),
+    };
+    writeln!(
+        out,
+        "warning: could not record audit for {key} ({failure}); run `tm ticket audit {key} --record {verdict}`"
+    )?;
     Ok(())
 }
 
@@ -893,6 +937,7 @@ mod tests {
             work: crate::config::WorkConfig::default(),
             agent: crate::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
+            require_audit: true,
         }
     }
 
@@ -1285,6 +1330,7 @@ mod tests {
             body: None,
             status: Some("In Review".to_string()),
             no_transition: false,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -1326,6 +1372,7 @@ mod tests {
             body: None,
             status: None,
             no_transition: true,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -1357,6 +1404,7 @@ mod tests {
             body: None,
             status: Some("In Review".to_string()),
             no_transition: false,
+            ..Default::default()
         };
         let mut prompter = crate::cli::FakePrompter::new();
         let mut out = Vec::new();
@@ -3058,5 +3106,96 @@ mod tests {
 
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Created ticket PROJ-9"));
+    }
+
+    /// Run [`create`] for `PROJ-9` with `opts`' audit flags against `store`.
+    fn create_audited(
+        audited: bool,
+        audit_notes: Option<&str>,
+        store: Option<&RunStore>,
+    ) -> String {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+        let ctx = create_ctx(&jira, &cfg);
+        let opts = CreateOptions {
+            title: Some("Add the widget".to_string()),
+            audited,
+            audit_notes: audit_notes.map(str::to_string),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        create(
+            &ctx,
+            &opts,
+            &mut crate::cli::FakePrompter::new(),
+            store,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect("should succeed");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn create_audited_records_a_passing_audit_for_the_new_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+
+        let output = create_audited(true, None, Some(&store));
+
+        let audit = store
+            .latest_audit_for_ticket(None, "PROJ-9")
+            .unwrap()
+            .expect("audit recorded");
+        assert_eq!(audit.verdict, crate::cli::ready::PASSING_AUDIT_VERDICT);
+        assert_eq!(audit.notes.as_deref(), Some("audited at creation"));
+        assert!(
+            output.contains("Recorded audit for PROJ-9: ready\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn create_audited_uses_audit_notes_when_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+
+        create_audited(true, Some("operator signed off"), Some(&store));
+
+        let audit = store
+            .latest_audit_for_ticket(None, "PROJ-9")
+            .unwrap()
+            .expect("audit recorded");
+        assert_eq!(audit.notes.as_deref(), Some("operator signed off"));
+    }
+
+    #[test]
+    fn create_without_audited_records_no_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+
+        create_audited(false, None, Some(&store));
+
+        assert!(
+            store
+                .latest_audit_for_ticket(None, "PROJ-9")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn create_audited_with_no_store_warns_with_the_fix() {
+        let output = create_audited(true, None, None);
+
+        assert!(output.contains("Created ticket PROJ-9"), "{output}");
+        assert!(
+            output.contains(
+                "warning: could not record audit for PROJ-9 (runs DB unavailable); \
+                 run `tm ticket audit PROJ-9 --record ready`"
+            ),
+            "{output}"
+        );
     }
 }
