@@ -1373,7 +1373,10 @@ mod tests {
         let outcome = ClaudeRunner.parse_outcome(STREAM_KILLED).unwrap();
 
         assert_eq!(outcome.session_id, "sess-killed");
-        assert_eq!(outcome.is_error, None, "no result line: suspicious, not Done");
+        assert_eq!(
+            outcome.is_error, None,
+            "no result line: suspicious, not Done"
+        );
         assert_eq!(outcome.result, None);
         assert_eq!(outcome.cost_usd, None);
         let usage = outcome.usage.expect("the rate_limit_event survived");
