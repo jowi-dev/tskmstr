@@ -24,6 +24,9 @@
 //! the same [`StackDecision`] back — they cannot independently drift because
 //! there is no second copy of the rule left to drift.
 //!
+//! [`unblock_counts`] sits alongside: across a whole candidate set, how much
+//! downstream work each ticket frees, for ordering dispatch.
+//!
 //! # The rule
 //!
 //! For each of a ticket's *direct* `Blocks`-type Jira links, a blocker is
@@ -44,13 +47,21 @@
 //! - **zero** → [`StackDecision::Ready`].
 //! - **exactly one, with an open PR** → [`StackDecision::Stackable`]: name
 //!   the branch to stack on.
-//! - **exactly one, with no PR** → [`StackDecision::BlockedNoPr`]: nothing to
-//!   build on yet.
+//! - **exactly one, with no PR, but a live lane run working it** →
+//!   [`StackDecision::WaitingOnInFlight`]: its PR is probably on the way, so
+//!   re-check later. [`decide`] stays pure: the caller passes the live runs
+//!   ([`in_flight_lanes`]).
+//! - **exactly one, with no PR and no live run** →
+//!   [`StackDecision::BlockedNoPr`]: nothing to build on yet, and nobody is
+//!   building it.
 //! - **two or more** → [`StackDecision::BlockedMultiple`]: a single run
 //!   branch can only be stacked on one dependency at a time, so this refuses
 //!   rather than guessing which one.
 
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use crate::github::gh_cli::{PrLifecycle, PrSummary};
+use crate::runs::{RunStatus, RunSummary};
 use crate::ticketing::types::{Issue, LinkedIssue};
 
 /// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
@@ -181,11 +192,20 @@ pub enum StackDecision {
         /// The blocker's PR head branch — stack on `origin/<this>`.
         head_ref_name: String,
     },
-    /// Exactly one unmerged direct blocker, but it has no PR yet: nothing
-    /// exists to stack on.
+    /// Exactly one unmerged direct blocker, with no PR and no live lane run
+    /// working it: nothing exists to stack on, and nothing is about to.
     BlockedNoPr {
         /// The unsatisfied blocker.
         blocker: UnmergedBlocker,
+    },
+    /// Exactly one unmerged direct blocker with no PR yet, but a live lane
+    /// run is working it (see [`in_flight_lanes`]): its PR is likely on the
+    /// way, so re-check later rather than treating the blocker as unworked.
+    WaitingOnInFlight {
+        /// The unsatisfied blocker.
+        blocker: UnmergedBlocker,
+        /// The live lane run working it.
+        run: InFlightRun,
     },
     /// Two or more unmerged direct blockers: a single branch can only be
     /// stacked on one dependency at a time, so this refuses rather than
@@ -199,8 +219,10 @@ pub enum StackDecision {
 
 /// Classify a ticket's unmerged direct blockers per this module's decision
 /// table (see the module doc comment). `unmerged` is normally the result of
-/// [`unmerged_direct_blockers`].
-pub fn decide(unmerged: Vec<UnmergedBlocker>) -> StackDecision {
+/// [`unmerged_direct_blockers`]; `in_flight` is normally
+/// [`in_flight_lanes`] over the run store, and only matters for a lone
+/// blocker with no PR.
+pub fn decide(unmerged: Vec<UnmergedBlocker>, in_flight: &InFlight) -> StackDecision {
     match unmerged.len() {
         0 => StackDecision::Ready,
         1 => {
@@ -211,11 +233,103 @@ pub fn decide(unmerged: Vec<UnmergedBlocker>) -> StackDecision {
                     pr_number: *pr_number,
                     head_ref_name: head_ref_name.clone(),
                 },
-                None => StackDecision::BlockedNoPr { blocker },
+                None => match in_flight.get(&blocker.key) {
+                    Some(run) => StackDecision::WaitingOnInFlight { run: *run, blocker },
+                    None => StackDecision::BlockedNoPr { blocker },
+                },
             }
         }
         _ => StackDecision::BlockedMultiple { blockers: unmerged },
     }
+}
+
+/// A live lane run working a blocker: what turns [`decide`]'s
+/// [`StackDecision::BlockedNoPr`] into [`StackDecision::WaitingOnInFlight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightRun {
+    /// The run's row id in the run store.
+    pub run_id: i64,
+    /// `running`, `queued`, or `hibernated`.
+    pub status: RunStatus,
+}
+
+/// Ticket key → its live lane run, as [`in_flight_lanes`] builds it.
+pub type InFlight = HashMap<String, InFlightRun>;
+
+/// Project `runs` (newest first, as [`crate::runs::RunStore::list_runs_filtered`]
+/// returns them) down to each ticket's newest live `lane` run. Live means
+/// `running`, `queued`, or `hibernated`: a run that can still open a PR on
+/// its own or once resumed. `review` is not live, since that run has already
+/// handed off.
+pub fn in_flight_lanes(runs: &[RunSummary]) -> InFlight {
+    let mut in_flight = InFlight::new();
+    for run in runs {
+        let live = matches!(
+            run.status,
+            RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
+        );
+        if run.kind == "lane" && live {
+            in_flight.entry(run.ticket.clone()).or_insert(InFlightRun {
+                run_id: run.id,
+                status: run.status,
+            });
+        }
+    }
+    in_flight
+}
+
+/// What [`unblock_counts`] returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnblockCounts {
+    /// Every candidate's key → how many *other* candidates it blocks,
+    /// directly or transitively.
+    pub counts: HashMap<String, usize>,
+    /// Candidates that (transitively) block themselves via a `Blocks` cycle,
+    /// sorted. None of them can ever become ready until the cycle is broken.
+    pub cycle_members: BTreeSet<String>,
+}
+
+/// For each of `issues`, count the other issues in the same set it blocks,
+/// following `Blocks` links transitively, so a dispatcher can prefer the
+/// ticket that frees the most downstream work.
+///
+/// Only links between two members of `issues` count: a blocker outside the
+/// set gets no entry, and its own downstream is unknown anyway. A diamond's
+/// bottom is counted once. A cycle terminates (each search tracks what it has
+/// visited); a member counts the rest of its cycle but never itself, and is
+/// listed in [`UnblockCounts::cycle_members`].
+pub fn unblock_counts(issues: &[Issue]) -> UnblockCounts {
+    let keys: HashSet<&str> = issues.iter().map(|i| i.key.as_str()).collect();
+    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
+    for issue in issues {
+        for blocker in direct_blockers(issue) {
+            if keys.contains(blocker.key.as_str()) {
+                blocks
+                    .entry(blocker.key.as_str())
+                    .or_default()
+                    .push(issue.key.as_str());
+            }
+        }
+    }
+
+    let mut result = UnblockCounts::default();
+    for issue in issues {
+        let start = issue.key.as_str();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = blocks.get(start).cloned().unwrap_or_default();
+        while let Some(key) = stack.pop() {
+            if seen.insert(key)
+                && let Some(next) = blocks.get(key)
+            {
+                stack.extend(next);
+            }
+        }
+        if seen.remove(start) {
+            result.cycle_members.insert(start.to_string());
+        }
+        result.counts.insert(start.to_string(), seen.len());
+    }
+    result
 }
 
 /// A ticket's worker-lane readiness as the board reports it (GitHub issue
@@ -230,7 +344,9 @@ pub enum Readiness {
         /// The one unmerged blocker whose open PR a run would stack on.
         blocker_key: String,
     },
-    /// [`StackDecision::BlockedNoPr`] or [`StackDecision::BlockedMultiple`].
+    /// [`StackDecision::BlockedNoPr`], [`StackDecision::WaitingOnInFlight`],
+    /// or [`StackDecision::BlockedMultiple`]: the board draws one glyph for
+    /// all three.
     Blocked {
         /// Every unmerged blocker, in [`unmerged_direct_blockers`] order.
         blocker_keys: Vec<String>,
@@ -253,10 +369,12 @@ pub fn readiness(issue: &Issue, prs: Option<&[PrSummary]>) -> Readiness {
     let Some(prs) = prs else {
         return Readiness::Unknown;
     };
-    match decide(unmerged_direct_blockers(issue, prs)) {
+    // The board shows waiting and blocked alike, so live runs are moot here.
+    match decide(unmerged_direct_blockers(issue, prs), &InFlight::new()) {
         StackDecision::Ready => Readiness::Ready,
         StackDecision::Stackable { blocker_key, .. } => Readiness::Stackable { blocker_key },
-        StackDecision::BlockedNoPr { blocker } => Readiness::Blocked {
+        StackDecision::BlockedNoPr { blocker }
+        | StackDecision::WaitingOnInFlight { blocker, .. } => Readiness::Blocked {
             blocker_keys: vec![blocker.key],
         },
         StackDecision::BlockedMultiple { blockers } => Readiness::Blocked {
@@ -342,7 +460,7 @@ mod tests {
     fn decide_ready_with_no_blockers() {
         let issue = issue_blocked_by(vec![]);
         let unmerged = unmerged_direct_blockers(&issue, &[]);
-        assert_eq!(decide(unmerged), StackDecision::Ready);
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
     #[test]
@@ -350,7 +468,7 @@ mod tests {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "Done")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
-        assert_eq!(decide(unmerged), StackDecision::Ready);
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
     /// A blocker that's genuinely Done in Jira but has no discoverable PR at
@@ -364,7 +482,7 @@ mod tests {
     fn decide_ready_when_the_only_blocker_is_done_in_jira_with_no_pr_at_all() {
         let issue = issue_blocked_by(vec![linked_issue_with_category("AX-408", "Done", "done")]);
         let unmerged = unmerged_direct_blockers(&issue, &[]);
-        assert_eq!(decide(unmerged), StackDecision::Ready);
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
     /// Pins the exact incident this module's doc comment describes: AX-408
@@ -383,7 +501,7 @@ mod tests {
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
         assert_eq!(
-            decide(unmerged),
+            decide(unmerged, &no_runs()),
             StackDecision::Stackable {
                 blocker_key: "AX-408".to_string(),
                 pr_number: 490,
@@ -398,7 +516,7 @@ mod tests {
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
         assert_eq!(
-            decide(unmerged),
+            decide(unmerged, &no_runs()),
             StackDecision::Stackable {
                 blocker_key: "AX-408".to_string(),
                 pr_number: 490,
@@ -411,7 +529,7 @@ mod tests {
     fn decide_blocked_no_pr_with_one_unmerged_blocker_and_no_pr() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
         let unmerged = unmerged_direct_blockers(&issue, &[]);
-        match decide(unmerged) {
+        match decide(unmerged, &no_runs()) {
             StackDecision::BlockedNoPr { blocker } => assert_eq!(blocker.key, "AX-408"),
             other => panic!("expected BlockedNoPr, got {other:?}"),
         }
@@ -425,7 +543,7 @@ mod tests {
         ]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
-        match decide(unmerged) {
+        match decide(unmerged, &no_runs()) {
             StackDecision::BlockedMultiple { blockers } => {
                 assert_eq!(blockers.len(), 2);
                 assert_eq!(blockers[0].key, "AX-408");
@@ -440,7 +558,7 @@ mod tests {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Closed)];
         let unmerged = unmerged_direct_blockers(&issue, &prs);
-        match decide(unmerged) {
+        match decide(unmerged, &no_runs()) {
             StackDecision::BlockedNoPr { blocker } => assert!(blocker.open_pr.is_none()),
             other => panic!("expected BlockedNoPr, got {other:?}"),
         }
@@ -491,6 +609,164 @@ mod tests {
         let merged = issue_blocked_by(vec![linked_issue("AX-408", "Done")]);
         let merged_prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
         assert_eq!(readiness(&merged, Some(&merged_prs)), Readiness::Ready);
+    }
+
+    fn no_runs() -> InFlight {
+        InFlight::new()
+    }
+
+    fn in_flight(key: &str, run_id: i64, status: RunStatus) -> InFlight {
+        InFlight::from([(key.to_string(), InFlightRun { run_id, status })])
+    }
+
+    #[test]
+    fn decide_waits_on_a_no_pr_blocker_with_a_live_lane_run() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
+        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let runs = in_flight("AX-408", 7, RunStatus::Running);
+        match decide(unmerged, &runs) {
+            StackDecision::WaitingOnInFlight { blocker, run } => {
+                assert_eq!(blocker.key, "AX-408");
+                assert_eq!(
+                    run,
+                    InFlightRun {
+                        run_id: 7,
+                        status: RunStatus::Running
+                    }
+                );
+            }
+            other => panic!("expected WaitingOnInFlight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_stays_blocked_no_pr_when_another_ticket_is_in_flight() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
+        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let runs = in_flight("AX-999", 7, RunStatus::Running);
+        assert!(matches!(
+            decide(unmerged, &runs),
+            StackDecision::BlockedNoPr { .. }
+        ));
+    }
+
+    #[test]
+    fn decide_prefers_stacking_over_waiting_once_the_blocker_has_an_open_pr() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-408", "Code Review")]);
+        let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
+        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let runs = in_flight("AX-408", 7, RunStatus::Running);
+        assert!(matches!(
+            decide(unmerged, &runs),
+            StackDecision::Stackable { .. }
+        ));
+    }
+
+    fn summary(id: i64, ticket: &str, kind: &str, status: RunStatus) -> RunSummary {
+        RunSummary {
+            id,
+            ticket: ticket.to_string(),
+            lane: "default".to_string(),
+            kind: kind.to_string(),
+            status,
+            age_secs: 0,
+            heartbeat_age_secs: None,
+            last_event_kind: None,
+            last_event_age_secs: None,
+            awaiting_input: false,
+            scope: String::new(),
+            mem_current_bytes: None,
+            mem_peak_bytes: None,
+        }
+    }
+
+    #[test]
+    fn in_flight_lanes_keeps_live_lane_runs_only() {
+        let runs = vec![
+            summary(1, "AX-1", "lane", RunStatus::Running),
+            summary(2, "AX-2", "lane", RunStatus::Queued),
+            summary(3, "AX-3", "lane", RunStatus::Hibernated),
+            summary(4, "AX-4", "lane", RunStatus::Done),
+            summary(5, "AX-5", "lane", RunStatus::Review),
+            summary(6, "AX-6", "audit", RunStatus::Running),
+        ];
+        let live = in_flight_lanes(&runs);
+        let mut keys: Vec<&str> = live.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["AX-1", "AX-2", "AX-3"]);
+        assert_eq!(live["AX-3"].status, RunStatus::Hibernated);
+    }
+
+    #[test]
+    fn in_flight_lanes_keeps_the_newest_live_run_per_ticket() {
+        // `list_runs_filtered` orders newest first.
+        let runs = vec![
+            summary(9, "AX-1", "lane", RunStatus::Running),
+            summary(4, "AX-1", "lane", RunStatus::Hibernated),
+        ];
+        assert_eq!(in_flight_lanes(&runs)["AX-1"].run_id, 9);
+    }
+
+    /// An issue keyed `key` blocked by each of `blockers`.
+    fn keyed(key: &str, blockers: &[&str]) -> Issue {
+        let mut issue =
+            issue_blocked_by(blockers.iter().map(|b| linked_issue(b, "To Do")).collect());
+        issue.key = key.to_string();
+        issue
+    }
+
+    #[test]
+    fn unblock_counts_follows_a_chain_transitively() {
+        let issues = vec![keyed("A", &[]), keyed("B", &["A"]), keyed("C", &["B"])];
+        let counts = unblock_counts(&issues);
+        assert_eq!(counts.counts["A"], 2);
+        assert_eq!(counts.counts["B"], 1);
+        assert_eq!(counts.counts["C"], 0);
+        assert!(counts.cycle_members.is_empty());
+    }
+
+    #[test]
+    fn unblock_counts_counts_a_diamond_bottom_once() {
+        let issues = vec![
+            keyed("A", &[]),
+            keyed("B", &["A"]),
+            keyed("C", &["A"]),
+            keyed("D", &["B", "C"]),
+        ];
+        let counts = unblock_counts(&issues);
+        assert_eq!(counts.counts["A"], 3);
+        assert_eq!(counts.counts["B"], 1);
+        assert_eq!(counts.counts["D"], 0);
+    }
+
+    #[test]
+    fn unblock_counts_ignores_blockers_outside_the_candidate_set() {
+        let issues = vec![keyed("A", &["OUTSIDE"]), keyed("B", &["A"])];
+        let counts = unblock_counts(&issues);
+        assert_eq!(counts.counts["A"], 1);
+        assert!(!counts.counts.contains_key("OUTSIDE"));
+    }
+
+    #[test]
+    fn unblock_counts_terminates_on_a_cycle_and_reports_its_members() {
+        let issues = vec![
+            keyed("A", &["C"]),
+            keyed("B", &["A"]),
+            keyed("C", &["B"]),
+            keyed("D", &["C"]),
+        ];
+        let counts = unblock_counts(&issues);
+        // Each cycle member unblocks the other two plus D, never itself.
+        assert_eq!(counts.counts["A"], 3);
+        assert_eq!(counts.counts["D"], 0);
+        assert_eq!(
+            counts
+                .cycle_members
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["A", "B", "C"]
+        );
     }
 
     #[test]

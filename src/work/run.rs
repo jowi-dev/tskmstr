@@ -86,7 +86,7 @@ use thiserror::Error;
 
 use crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS;
 use crate::agent::{AgentError, AgentInvocation, AgentRunner, InvocationInputs, RunMode};
-use crate::blocker_stacking::{self, StackDecision};
+use crate::blocker_stacking::{self, InFlight, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
@@ -151,6 +151,25 @@ pub enum RunLaneError {
         "could not resolve a base branch for `{0}` (no --from, lane base_branch, or origin/HEAD)"
     )]
     NoBaseBranch(String),
+
+    /// The run's ticket has one unmerged blocker with no PR yet, but a live
+    /// lane run is working that blocker (see [`resolve_blocker_stacking`]).
+    /// Launching now would branch from the normal base and miss the
+    /// blocker's work, so this refuses until the blocker's PR opens (then
+    /// the run stacks on it) or merges. `--from` overrides.
+    #[error(
+        "{ticket} is blocked by {blocker}, which has a lane in flight (run #{run_id} ({status})) but no PR yet — retry once its PR opens, or pass --from <base> to override"
+    )]
+    BlockerInFlight {
+        /// The ticket the run was requested for.
+        ticket: String,
+        /// The blocker being worked.
+        blocker: String,
+        /// The blocker's live lane run.
+        run_id: i64,
+        /// That run's status: `running`, `queued`, or `hibernated`.
+        status: &'static str,
+    },
 
     /// The run's ticket has two or more direct `Blocks` blockers (per the
     /// configured ticket provider) that are not yet merged (see
@@ -712,21 +731,27 @@ impl BlockerResolution {
 /// - [`StackDecision::Ready`] → `stacked_base: None` (normal base).
 /// - [`StackDecision::Stackable`] → `stacked_base:
 ///   Some("origin/<head_ref_name>")`, plus an announcement line.
+/// - [`StackDecision::WaitingOnInFlight`] →
+///   `Err(RunLaneError::BlockerInFlight)`: the blocker has no PR yet but a
+///   live lane run (per `in_flight`, normally
+///   [`blocker_stacking::in_flight_lanes`] over the run store) is about to
+///   open one, so the run is not yet runnable rather than cut from a base
+///   that lacks the blocker's work.
 /// - [`StackDecision::BlockedNoPr`] → `stacked_base: None`, plus a warning
 ///   line (nothing to stack on yet).
 /// - [`StackDecision::BlockedMultiple`] →
 ///   `Err(RunLaneError::MultipleUnmergedBlockers)`, naming every unmerged
 ///   blocker and its PR state — two parallel unmerged dependencies can't
-///   both be stacked on, and this is the one case where blocker resolution
-///   refuses the run outright rather than falling back.
+///   both be stacked on, so blocker resolution refuses the run outright
+///   rather than falling back (as it does for the in-flight case above).
 ///
 /// Any ticket-provider failure while resolving blockers (a bad `get_issue`), or a
 /// **transient** `gh` failure from [`GhCli::pr_list_all`] (network error,
 /// rate limit, a `5xx`, expired auth, `gh` missing, a timeout — see
 /// [`GhError::is_permanent`]), short-circuits to `stacked_base: None` plus a
 /// warning — a network hiccup must never fail a run; refusal is otherwise
-/// reserved for the confirmed ≥2-unmerged case above, which only fires once
-/// every blocker resolved cleanly.
+/// reserved for the confirmed in-flight and ≥2-unmerged cases above, which
+/// only fire once every blocker resolved cleanly.
 ///
 /// A **permanent** `gh` failure from [`GhCli::pr_list_all`] — `gh` telling us
 /// tm itself asked it something nonsensical, e.g. an invalid `--json` field —
@@ -755,6 +780,7 @@ pub fn resolve_blocker_stacking(
     gh: &dyn GhCli,
     repo_root: &Path,
     ticket: Option<&str>,
+    in_flight: &InFlight,
 ) -> Result<BlockerResolution, RunLaneError> {
     let Some(ticket_provider) = ticket_provider else {
         return Ok(BlockerResolution::default());
@@ -798,7 +824,7 @@ pub fn resolve_blocker_stacking(
     };
 
     let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
-    match blocker_stacking::decide(unmerged) {
+    match blocker_stacking::decide(unmerged, in_flight) {
         StackDecision::Ready => Ok(BlockerResolution::default()),
         StackDecision::Stackable {
             blocker_key,
@@ -817,6 +843,12 @@ pub fn resolve_blocker_stacking(
             "warning: blocked by {} but no PR found to stack on yet — using normal base",
             blocker.key
         ))),
+        StackDecision::WaitingOnInFlight { blocker, run } => Err(RunLaneError::BlockerInFlight {
+            ticket: ticket.to_string(),
+            blocker: blocker.key,
+            run_id: run.run_id,
+            status: run.status.as_str(),
+        }),
         StackDecision::BlockedMultiple { blockers } => {
             Err(RunLaneError::MultipleUnmergedBlockers {
                 ticket: ticket.to_string(),
@@ -1094,11 +1126,19 @@ pub fn prepare_run_lane(
     // `Err`, since prepare_run_lane's caller has no other opportunity to
     // record it anywhere durable.
     let blocker_resolution = if request.from_base.is_none() {
+        // A run-store read failure only loses the in-flight refinement: the
+        // blocker then reads as plain BlockedNoPr, which warns and proceeds.
+        let in_flight = deps
+            .run_store
+            .list_runs_filtered(Some(&deps.current_backend_identity.scope()), Some("lane"))
+            .map(|runs| blocker_stacking::in_flight_lanes(&runs))
+            .unwrap_or_default();
         match resolve_blocker_stacking(
             deps.ticket_provider,
             deps.gh,
             &repo_root,
             request.ticket.as_deref(),
+            &in_flight,
         ) {
             Ok(resolution) => resolution,
             Err(err) => {
@@ -1906,6 +1946,7 @@ mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
     use crate::agent::opencode::OpencodeRunner;
+    use crate::blocker_stacking::InFlightRun;
     use crate::config::LaneConfig;
     use crate::github::gh_cli::FakeGhCli;
     use crate::github::gh_cli::{PrLifecycle, PrSummary};
@@ -5764,7 +5805,8 @@ mod tests {
         let gh = FakeGhCli::new();
 
         let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), None).unwrap();
+            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), None, &InFlight::new())
+                .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
         assert!(gh.pr_list_all_calls().is_empty());
@@ -5774,8 +5816,14 @@ mod tests {
     fn resolve_blocker_stacking_no_jira_client_never_calls_gh() {
         let gh = FakeGhCli::new();
 
-        let resolution =
-            resolve_blocker_stacking(None, &gh, Path::new("/repo"), Some("AX-1")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            None,
+            &gh,
+            Path::new("/repo"),
+            Some("AX-1"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
         assert!(gh.pr_list_all_calls().is_empty());
@@ -5786,8 +5834,14 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
         let gh = FakeGhCli::new();
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-1")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-1"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
     }
@@ -5803,8 +5857,14 @@ mod tests {
             PrLifecycle::Merged,
         )]));
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
     }
@@ -5820,8 +5880,14 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
         let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
     }
@@ -5839,7 +5905,8 @@ mod tests {
 
         let repo_root = Path::new("/repo");
         let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, repo_root, Some("AX-2")).unwrap();
+            resolve_blocker_stacking(Some(&jira), &gh, repo_root, Some("AX-2"), &InFlight::new())
+                .unwrap();
         assert_eq!(gh.pr_list_all_calls(), vec![repo_root.to_path_buf()]);
 
         assert_eq!(
@@ -5863,13 +5930,52 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
         let gh = FakeGhCli::new(); // no PR configured -> pr_list_all returns []
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
         assert!(resolution.messages[0].contains("warning"));
         assert!(resolution.messages[0].contains("AX-410"));
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_refuses_while_the_no_pr_blocker_has_a_live_lane_run() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "new")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new();
+        let in_flight = InFlight::from([(
+            "AX-410".to_string(),
+            InFlightRun {
+                run_id: 42,
+                status: RunStatus::Hibernated,
+            },
+        )]);
+
+        let err = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &in_flight,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, RunLaneError::BlockerInFlight { ticket, blocker, run_id: 42, .. }
+                if ticket == "AX-2" && blocker == "AX-410"),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("run #42 (hibernated)"), "{message}");
+        assert!(message.contains("--from"), "{message}");
     }
 
     #[test]
@@ -5886,8 +5992,14 @@ mod tests {
         // AX-411 has no matching PR at all; AX-410 has an open one — either
         // way both are unmerged, so this must refuse.
 
-        let err = resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2"))
-            .unwrap_err();
+        let err = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap_err();
 
         match err {
             RunLaneError::MultipleUnmergedBlockers { ticket, blockers } => {
@@ -5905,8 +6017,14 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue_not_found("AX-2");
         let gh = FakeGhCli::new();
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
@@ -5925,8 +6043,14 @@ mod tests {
             stderr: "not authenticated".to_string(),
         }));
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2")).unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap();
 
         assert_eq!(resolution.stacked_base, None);
         assert_eq!(resolution.messages.len(), 1);
@@ -5950,8 +6074,14 @@ mod tests {
             stderr: r#"Unknown JSON field: "merged""#.to_string(),
         }));
 
-        let err = resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), Some("AX-2"))
-            .unwrap_err();
+        let err = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+        )
+        .unwrap_err();
 
         match err {
             RunLaneError::Gh(gh_err) => assert!(gh_err.is_permanent()),
