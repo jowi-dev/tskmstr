@@ -1641,6 +1641,60 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
     pr_url_regex().find(text).map(|m| m.as_str().to_string())
 }
 
+/// Records `usage`, the last usage snapshot one attempt's output carried, as
+/// observed at `now`: upserts each window into `usage_snapshots` (source
+/// `stream`), logs a `usage_snapshot` event on the run, and, when the server
+/// said `rejected`, marks `agent` exhausted until the representative
+/// window resets. That last step reuses `agent_windows`, so ADR-0008
+/// routing skips the agent with no second code path. GitHub issue #129.
+///
+/// `now` is the finish time, not when claude emitted the event: the event
+/// carries no timestamp of its own.
+fn record_usage_snapshot(
+    run_store: &RunStore,
+    run_id: i64,
+    agent: &str,
+    usage: &crate::agent::UsageSnapshot,
+    now: i64,
+) -> Result<(), RunStoreError> {
+    for window in &usage.windows {
+        run_store.upsert_usage_snapshot(&crate::runs::UsageSnapshotRow {
+            agent: agent.to_string(),
+            window: window.window.clone(),
+            utilization: window.utilization,
+            resets_at: window.resets_at,
+            observed_at: now,
+            source: "stream".to_string(),
+            status: usage.status.clone(),
+        })?;
+    }
+
+    let windows: serde_json::Map<String, serde_json::Value> = usage
+        .windows
+        .iter()
+        .map(|w| {
+            (
+                w.window.clone(),
+                serde_json::json!({ "utilization": w.utilization, "resets_at": w.resets_at }),
+            )
+        })
+        .collect();
+    let detail = serde_json::json!({
+        "agent": agent,
+        "status": usage.status,
+        "resets_at": usage.resets_at,
+        "windows": windows,
+    });
+    run_store.add_event(run_id, "usage_snapshot", Some(&detail.to_string()))?;
+
+    if usage.is_rejected()
+        && let Some(until) = usage.resets_at
+    {
+        run_store.set_agent_exhausted_until(agent, until)?;
+    }
+    Ok(())
+}
+
 /// Steps 10-13 of the module doc's ported sequence: spawn the agent, wait,
 /// parse its result, [`RunStore::finish_run`], and print the summary to
 /// `out`. The one tail both `--fg` ([`run_lane_fg`]) and the detached
@@ -1660,6 +1714,10 @@ fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Op
 /// moved there via [`crate::ticketing::reconcile_status`], after the run row
 /// is finished, so a provider failure prints a warning but never fails the
 /// run (GitHub issue #92). `None` skips the transition.
+///
+/// Every attempt whose outcome carries a usage snapshot has it recorded via
+/// [`record_usage_snapshot`] (GitHub issue #129), before the rate-limit
+/// fallback decision.
 pub fn run_agent_and_finish(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
@@ -1722,6 +1780,15 @@ pub fn run_agent_and_finish(
         })?;
         let raw_result = std::fs::read_to_string(&prepared.out_json_path).unwrap_or_default();
         let attempt_parsed = attempt.runner.parse_outcome(&raw_result).ok();
+        if let Some(usage) = attempt_parsed.as_ref().and_then(|o| o.usage.as_ref()) {
+            record_usage_snapshot(
+                run_store,
+                prepared.run_id,
+                attempt.runner.name(),
+                usage,
+                SystemClock.now_unix_secs(),
+            )?;
+        }
         let rate_limit = attempt_parsed.as_ref().and_then(|o| o.rate_limit.clone());
 
         if let Some(rate_limit) = rate_limit {
@@ -3189,6 +3256,110 @@ mod tests {
 
         assert!(!outcome.is_error);
         assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    // --- usage snapshots (GitHub issue #129) ---
+
+    #[test]
+    fn run_agent_and_finish_records_the_streams_last_usage_snapshot() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+        let stream = include_str!("../agent/claude/fixtures/stream_unified.jsonl");
+        let spawner = FakeProcessSpawner::sequence(vec![(stream.to_string(), 0)]);
+        let mut out = Vec::new();
+
+        let outcome = run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            None,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(!outcome.is_error);
+        let rows = run_store.usage_snapshots("claude").unwrap();
+        let windows: Vec<_> = rows
+            .iter()
+            .map(|r| (r.window.as_str(), r.utilization, r.resets_at))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                ("five_hour", 0.82, 1792365600),
+                ("seven_day", 0.09, 1792735200)
+            ]
+        );
+        assert!(rows.iter().all(|r| r.source == "stream"));
+        assert!(
+            rows.iter()
+                .all(|r| r.status.as_deref() == Some("allowed_warning"))
+        );
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        let usage: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "usage_snapshot")
+            .collect();
+        assert_eq!(usage.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(usage[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["status"], "allowed_warning");
+        assert_eq!(detail["windows"]["five_hour"]["utilization"], 0.82);
+        assert!(run_store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    #[test]
+    fn run_agent_and_finish_marks_the_agent_exhausted_on_a_rejected_snapshot() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+        // The result text names no limit, so only the snapshot says so.
+        let stream = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1792365600,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1792365600}}},"session_id":"sess-claude"}"#,
+            "\n",
+            r#"{"type":"result","is_error":true,"result":"request failed","session_id":"sess-claude"}"#,
+            "\n",
+        );
+        let spawner = FakeProcessSpawner::sequence(vec![(stream.to_string(), 0)]);
+        let mut out = Vec::new();
+
+        run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            None,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_store.agent_exhausted_until("claude").unwrap(),
+            Some(1792365600)
+        );
+        assert_eq!(spawner.recorded.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_agent_and_finish_records_nothing_without_a_rate_limit_event() {
+        let (_tmp, gh, run_store, prepared) = prepare_run_with_opencode_fallback();
+        let spawner = FakeProcessSpawner::sequence(vec![(canned_json(), 0)]);
+        let mut out = Vec::new();
+
+        run_agent_and_finish(
+            &spawner,
+            &gh,
+            &run_store,
+            None,
+            &prepared,
+            &ClaudeRunner,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(run_store.usage_snapshots("claude").unwrap().is_empty());
+        let events = run_store.events_for_run(prepared.run_id).unwrap();
+        assert!(!events.iter().any(|e| e.kind == "usage_snapshot"));
     }
 
     #[test]
