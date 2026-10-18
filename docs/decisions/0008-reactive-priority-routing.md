@@ -114,6 +114,22 @@ usage availability, building on ADR-0004's seam and the opencode adapter
    context would require a shared session format across adapters that
    doesn't exist and isn't likely to.
 
+## Amendment (2026-10-18, GH-113)
+
+Decision 1's premise, that there is no quota signal to poll, no longer
+holds. Claude Code exposes the 5-hour and 7-day subscription utilization
+in two places. Interactive sessions get it in the statusline input's
+`rate_limits`. Headless runs get it in the `rate_limit_event` lines of
+`--output-format stream-json --verbose`. A one-turn Haiku probe refreshes
+it on demand. See `docs/plans/gh-113-proactive-usage-signal.md`.
+
+The reactive classification above stays as the backstop: the
+`unifiedWindows` field is marked internal, and API-key sessions carry no
+signal. Proactive gating is layered on top by GH-114/GH-115. A
+`rejected` status read from a snapshot should set
+`agent_windows.exhausted_until`, so it flows through this ADR's existing
+routing.
+
 ## What this does not change
 
 `runs` gets no new runner column — `run_events` records the rate-limit and
