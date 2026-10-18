@@ -75,9 +75,20 @@ The severities, low to high, are `low`, `medium`, `high` and `blocking`
 ## Chaining
 
 With `auto = true`, a `tm pr watch` that ends because every bot finished
-clean, or because its cleanup session launched, spawns a detached
-`tm review auto <KEY>`. #119 ("Awaiting review") will key off the
+with nothing unresolved spawns a detached `tm review auto <KEY>` in the
+watched repo. A watch that hands off to a bugbot cleanup session does not
+chain: the cleanup is an interactive session, and nothing observes it
+finish. That is the same `tm runs finish` gap that `auto_arm` and
+`status_on_pr` have. #119 ("Awaiting review") will key off the
 auto-review run's outcome.
+
+## `tm init`
+
+When `tm init` scaffolds the thatch review prompt (`review.md`), it also
+scaffolds `.tskmstr/prompts/auto-review.md` and wires
+`[work.auto_review].prompt_file`. It asks no extra question. There is no
+schema bump (ADR-0007): the asset is opt-in, and `tm review auto` falls back
+to a built-in prompt without it. Chaining stays off until `auto = true`.
 
 ## Runner decision
 
@@ -101,3 +112,12 @@ The skill's "opencode only" note should be relaxed upstream in thatch.
   landed, so review rounds are not admission-gated yet.
 - **The `max_fix_rounds` bound.** The cap's bound by #120's
   `max_fix_rounds` arrives with #120.
+
+## Found along the way
+
+`tm review fix` treats an empty store as "no comments" only when
+`vdiff --export-comments` prints exactly `No comments.`. Current vdiff
+prints a `# vdiff review comments — ...` header first, so an empty store
+would dispatch a no-op fix pass. Auto-review never hits this, because it
+only runs a fix when the store holds findings at or above the threshold.
+It needs its own ticket.

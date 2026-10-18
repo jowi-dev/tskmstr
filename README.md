@@ -230,6 +230,7 @@ tm auth status
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 
 ## Ticket/run status drift (`tm drift`)
 
@@ -1484,6 +1485,52 @@ lane run sets a status-line message immediately; one with a lane run but no
 captured comments launches the child, which resolves quickly (like every
 watched-child launch) and reports "no comments captured" (or similar) in the
 status line without leaving a `review-fix` run behind.
+
+### Auto-review
+
+`tm review auto <KEY>` reviews a ticket's PR branch with thatch before a
+human does, and writes what it finds where `V` and `F` already look: the
+worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
+
+1. Runs a headless `auto-review` agent run in the ticket's lane worktree.
+   Round 1 uses the `thatch-code-review` skill. Later rounds use
+   `thatch-review-followup` and are pointed at the previous round's
+   archived comments. The agent writes its confirmed findings to
+   `<git-dir>/vdiff/auto-review/findings-<round>.json`.
+2. Appends the findings to the comment store with vdiff schema v1's rules
+   (`c<n>` ids after the existing ones, `created_at`, sorted by
+   `(path, start_line)`, pretty-printed). Your own comments are kept. Each
+   finding's text starts with `[auto-review · <specialist> · <SEVERITY>]`.
+3. With `publish = true`, runs `vdiff --publish-comments <pr>`.
+4. Stops if no finding is at or above `fix_threshold`. LOW findings stay in
+   the store for you to read in `V`.
+5. Otherwise runs `tm review fix <KEY> --fg`, then moves the consumed store
+   to `<git-dir>/vdiff/archive/<round>.json` so the next round never re-reads
+   comments with stale line anchors.
+
+At `max_review_rounds` with findings still above the threshold, the loop
+stops and marks that round's run `review` instead of fixing again. Each
+round records an `auto_review_round` event (`1/2 fix`, `2/2 clean`,
+`2/2 capped`, `1/2 fix-failed`), and the overview row shows the newest one as
+`review 2/2 capped`, drawn as a warning when the loop stopped short of
+clean.
+
+```toml
+[work.auto_review]
+# prompt_file = ".tskmstr/prompts/auto-review.md"  # tm init scaffolds this with the review prompt
+# prompt = "..."                  # or a string template; not both
+# fix_threshold = "medium"        # low | medium | high | blocking
+# max_review_rounds = 2
+# publish = false                 # post each round with vdiff --publish-comments
+# auto = false                    # chain from a clean tm pr watch
+```
+
+The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
+`{findings_file}`, `{archive}` and `{prior}` (a sentence pointing a
+follow-up round at the archive). With `auto = true`, a `tm pr watch` that
+finds every bot done with nothing unresolved launches `tm review auto` for
+the ticket. A watch that hands off to a bugbot cleanup session does not
+chain, because tm can't see that interactive session finish.
 
 ### Merging from the board
 
