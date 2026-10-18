@@ -182,6 +182,13 @@ pub trait GitOps {
     /// instead of silently resolving to something unexpected.
     fn rev_parse(&self, dir: &Path, rev: &str) -> Result<String, GitError>;
 
+    /// The absolute git directory of the working tree at `dir`
+    /// (`git rev-parse --absolute-git-dir`). In a linked worktree that is
+    /// the worktree's own `.git/worktrees/<name>` directory, not
+    /// `<dir>/.git`, which is a gitlink file there. vdiff's comment store
+    /// lives under it (see [`crate::work::comment_store`]).
+    fn git_dir(&self, dir: &Path) -> Result<PathBuf, GitError>;
+
     /// Whether `ancestor` is an ancestor of (or equal to) `descendant`
     /// (`git merge-base --is-ancestor <ancestor> <descendant>`). Exit code 0
     /// means yes, exit code 1 means no (and is `Ok(false)`, not an error —
@@ -547,6 +554,26 @@ impl GitOps for ShellGitOps {
             Some(0) => Ok(String::from_utf8_lossy(&output.stdout).trim().to_string()),
             code => Err(GitError::Command {
                 command: "git rev-parse --verify".to_string(),
+                exit_code: code,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    fn git_dir(&self, dir: &Path) -> Result<PathBuf, GitError> {
+        let command = "git rev-parse --absolute-git-dir";
+        let output = run_git(
+            dir,
+            &["rev-parse".to_string(), "--absolute-git-dir".to_string()],
+            command,
+        )?;
+
+        match output.status.code() {
+            Some(0) => Ok(PathBuf::from(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            )),
+            code => Err(GitError::Command {
+                command: command.to_string(),
                 exit_code: code,
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             }),
@@ -1650,6 +1677,12 @@ impl GitOps for FakeGitOps {
             })
     }
 
+    /// Always `<dir>/.git`: tests point it at a temp dir to get a real,
+    /// writable comment store.
+    fn git_dir(&self, dir: &Path) -> Result<PathBuf, GitError> {
+        Ok(dir.join(".git"))
+    }
+
     fn is_ancestor(&self, _dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
         if let Some(result) = self
             .is_ancestor_overrides
@@ -2421,6 +2454,47 @@ mod tests {
         assert_eq!(
             root.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn shell_git_ops_git_dir_resolves_a_linked_worktrees_own_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let wt = tmp.path().join("wt");
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-q", "-b", "lane"])
+            .arg(&wt)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let ops = ShellGitOps::new();
+        let main_dir = ops.git_dir(&repo).unwrap();
+        let wt_dir = ops.git_dir(&wt).unwrap();
+
+        assert_eq!(
+            main_dir.canonicalize().unwrap(),
+            repo.join(".git").canonicalize().unwrap()
+        );
+        assert!(wt_dir.is_absolute());
+        assert!(
+            wt_dir.is_dir(),
+            "a linked worktree's git dir is a directory"
+        );
+        assert_ne!(wt_dir, main_dir);
+    }
+
+    #[test]
+    fn fake_git_ops_git_dir_defaults_to_dot_git_under_dir() {
+        let fake = FakeGitOps::new();
+        assert_eq!(
+            fake.git_dir(Path::new("/wt")).unwrap(),
+            PathBuf::from("/wt/.git")
         );
     }
 
