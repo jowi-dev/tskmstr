@@ -15,7 +15,9 @@ use crate::ticketing::{
 };
 use crate::work::detach::{DetachError, DetachSpawner};
 use crate::work::git::{GitError, GitOps};
-use crate::work::review_watch::{self, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper};
+use crate::work::review_watch::{
+    self, AutoReviewLauncher, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper,
+};
 use crate::work::run::WatchArmer;
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
@@ -375,6 +377,44 @@ impl WatchArmer for DetachedWatchArmer<'_> {
     }
 }
 
+/// [`AutoReviewLauncher`] that spawns a detached `tm review auto <KEY>` in
+/// the watched repo (GitHub issue #124), logging to the ticket's auto-review
+/// log. The plain (non-`--foreground`) form runs its own dedup against a
+/// running round before detaching the loop itself.
+pub struct DetachedAutoReviewLauncher<'a> {
+    /// Detached-child process spawning (real or fake).
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path, i.e. `tm`.
+    pub current_exe: &'a Path,
+    /// The invoking user's home directory, for the log file location.
+    pub home: &'a Path,
+    /// Where the child runs, so it loads the watched repo's config.
+    pub working_dir: &'a Path,
+}
+
+impl AutoReviewLauncher for DetachedAutoReviewLauncher<'_> {
+    fn launch_auto_review(&self, key: &str) {
+        let log_path = crate::cli::review::auto_review_log_path(self.home, key);
+        let spawned = log_path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                self.detach
+                    .spawn_detached(
+                        self.current_exe,
+                        &["review".to_string(), "auto".to_string(), key.to_string()],
+                        self.working_dir,
+                        &log_path,
+                    )
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(err) = spawned {
+            eprintln!("tm pr watch: could not launch tm review auto {key}: {err}");
+        }
+    }
+}
+
 /// `tm pr watch <KEY> [--foreground]`: resolve `KEY`'s open pull request,
 /// refuse to double-watch, then either re-exec a detached `--foreground`
 /// child or run the poll loop synchronously.
@@ -480,6 +520,19 @@ pub fn watch(
         log_path: Some(log_path.to_string_lossy().into_owned()),
     })?;
 
+    // GitHub issue #124: a clean watch chains `tm review auto` when
+    // `[work.auto_review].auto` is on.
+    let auto_review_launcher =
+        ctx.config
+            .work
+            .auto_review
+            .auto
+            .then_some(DetachedAutoReviewLauncher {
+                detach: deps.detach,
+                current_exe: deps.current_exe,
+                home: deps.home,
+                working_dir: &repo_root,
+            });
     let started_at_unix = deps.clock.now_unix_secs();
     let poll_deps = PollDeps {
         gh: ctx.gh,
@@ -487,6 +540,9 @@ pub fn watch(
         clock: deps.clock,
         sleeper: deps.sleeper,
         cleanup_launcher: deps.cleanup_launcher,
+        auto_review_launcher: auto_review_launcher
+            .as_ref()
+            .map(|l| l as &dyn AutoReviewLauncher),
     };
     let poll_req = PollRequest {
         run_id,
@@ -1490,6 +1546,81 @@ mod tests {
             watch_log_dir(tmp.path()).join("proj-372.log")
         );
         assert!(watch_log_dir(tmp.path()).is_dir(), "log dir is created");
+    }
+
+    #[test]
+    fn detached_auto_review_launcher_spawns_tm_review_auto_in_the_repo() {
+        let tmp = tempdir().unwrap();
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let launcher = DetachedAutoReviewLauncher {
+            detach: &detach,
+            current_exe: &current_exe,
+            home: tmp.path(),
+            working_dir: Path::new("/repo"),
+        };
+
+        launcher.launch_auto_review("PROJ-372");
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/repo"));
+        assert_eq!(
+            recorded[0].log_path,
+            crate::cli::review::auto_review_log_path(tmp.path(), "PROJ-372")
+        );
+    }
+
+    #[test]
+    fn watch_foreground_clean_bots_chain_auto_review_when_auto_is_on() {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]))
+            .with_pr_state(42, Ok(PrLifecycle::Open))
+            .with_pr_reviews(
+                42,
+                Ok(vec![crate::github::bot_findings::PrReview {
+                    author_login: Some("cursor[bot]".to_string()),
+                }]),
+            )
+            .with_review_threads(42, Ok(vec![]));
+        let mut cfg = config();
+        cfg.work.auto_review.auto = true;
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+            &git,
+            &cwd,
+        );
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", true, &mut Vec::new()).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::Handled);
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
     }
 
     #[test]
