@@ -323,6 +323,8 @@ mod tests {
             agent: crate::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            usage: Default::default(),
+            dispatch: Default::default(),
         }
     }
 

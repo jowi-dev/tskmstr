@@ -140,6 +140,9 @@ pub struct RawConfig {
     /// at all keeps working unchanged. See GitHub issue #17 and
     /// `docs/plans/agent-runner.md`.
     pub agent: Option<RawAgentConfig>,
+    /// `[dispatch]` settings for unattended launches. See
+    /// [`RawDispatchConfig`] and GitHub issue #114.
+    pub dispatch: Option<RawDispatchConfig>,
     /// The asset/config schema revision this file was last stamped with by
     /// `tm init`, i.e. what [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]
     /// was when `tm init` last wrote this file.
@@ -282,6 +285,41 @@ pub struct RawAgentConfig {
     /// `strategy = "priority"` is [`ConfigError::OrderRequiresPriorityStrategy`]
     /// — the key must not be silently inert.
     pub order: Option<Vec<String>>,
+    /// `[agent.claude]`: usage-admission settings for the claude runner.
+    /// See [`RawRunnerUsageConfig`] and GitHub issue #114. Independent of
+    /// the routing mode above: setting only these keys selects no mode.
+    pub claude: Option<RawRunnerUsageConfig>,
+    /// `[agent.opencode]`: usage-admission settings for the opencode
+    /// runner. See [`RawRunnerUsageConfig`].
+    pub opencode: Option<RawRunnerUsageConfig>,
+}
+
+/// Raw `[agent.<runner>]` usage-admission settings (GitHub issue #114).
+/// Each key merges repo-over-global on its own. See [`RunnerUsageConfig`]
+/// for what each one means once validated.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawRunnerUsageConfig {
+    /// See [`RunnerUsageConfig::five_hour_ceiling`].
+    pub five_hour_ceiling: Option<f64>,
+    /// See [`RunnerUsageConfig::seven_day_ceiling`].
+    pub seven_day_ceiling: Option<f64>,
+    /// See [`RunnerUsageConfig::snapshot_max_age_secs`].
+    pub snapshot_max_age_secs: Option<u64>,
+    /// `"subscription"` or `"metered"`. See [`Billing`].
+    pub billing: Option<String>,
+    /// Tokens allowed per rolling window. See [`TokenBudget`].
+    pub token_budget: Option<u64>,
+    /// The token budget's rolling window, in hours. Defaults to
+    /// [`DEFAULT_TOKEN_BUDGET_WINDOW_HOURS`]; ignored without
+    /// `token_budget`.
+    pub token_budget_window_hours: Option<u64>,
+}
+
+/// Raw `[dispatch]` section (GitHub issue #114).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawDispatchConfig {
+    /// See [`DispatchConfig::allow_paid_fallback`].
+    pub allow_paid_fallback: Option<bool>,
 }
 
 /// Which AI coding agent a config selects.
@@ -329,6 +367,16 @@ impl AgentKind {
     /// [`AgentKind::parse`]: every entry must parse.
     pub fn names() -> &'static [&'static str] {
         &["claude", "opencode"]
+    }
+
+    /// How this runner is paid for unless `[agent.<runner>] billing` says
+    /// otherwise: claude rides a subscription, and opencode is
+    /// pay-per-token (ADR-0008's Venice fallback).
+    pub fn default_billing(self) -> Billing {
+        match self {
+            AgentKind::Claude => Billing::Subscription,
+            AgentKind::Opencode => Billing::Metered,
+        }
     }
 }
 
@@ -772,6 +820,156 @@ pub struct Config {
     /// [`RawReadyConfig::require_audit`]; defaults to `true` when `[ready]`
     /// is absent from both global and repo config.
     pub require_audit: bool,
+    /// Validated `[agent.<runner>]` usage-admission settings. See
+    /// [`UsageConfig`] and GitHub issue #114.
+    pub usage: UsageConfig,
+    /// Validated `[dispatch]` settings. See [`DispatchConfig`].
+    pub dispatch: DispatchConfig,
+}
+
+/// How a runner is paid for (GitHub issue #114). Unattended dispatch never
+/// routes to a [`Billing::Metered`] runner unless
+/// [`DispatchConfig::allow_paid_fallback`] is set, so a used-up subscription
+/// window can't silently turn into real spend. Defaults per runner come
+/// from [`AgentKind::default_billing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Billing {
+    /// A flat subscription with usage windows.
+    Subscription,
+    /// Pay-per-token.
+    Metered,
+}
+
+impl Billing {
+    /// Parses a config `billing` string. Returns `None` for unrecognized
+    /// values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "subscription" => Some(Billing::Subscription),
+            "metered" => Some(Billing::Metered),
+            _ => None,
+        }
+    }
+}
+
+/// A usage-window ceiling: the utilization fraction at or above which
+/// usage admission refuses a launch. [`merge`] only builds finite,
+/// positive ceilings, which keeps the `Eq` impl sound. It may exceed 1.0,
+/// since utilization can under overage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsageCeiling(f64);
+
+impl Eq for UsageCeiling {}
+
+impl UsageCeiling {
+    /// The ceiling as a fraction.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// An opt-in token budget per rolling window for runners that report no
+/// usage signal (GitHub issue #114). Usage admission sums the tokens of
+/// the runner's runs that started within the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenBudget {
+    /// Input plus output tokens allowed per window.
+    pub tokens: u64,
+    /// The rolling window, in seconds.
+    pub window_secs: i64,
+}
+
+/// Default for [`RunnerUsageConfig::five_hour_ceiling`]: leaves 20% of the
+/// window for interactive work.
+pub const DEFAULT_FIVE_HOUR_CEILING: f64 = 0.80;
+/// Default for [`RunnerUsageConfig::seven_day_ceiling`].
+pub const DEFAULT_SEVEN_DAY_CEILING: f64 = 0.90;
+/// Default for [`RunnerUsageConfig::snapshot_max_age_secs`]: ten minutes.
+pub const DEFAULT_SNAPSHOT_MAX_AGE_SECS: u64 = 600;
+/// Default for [`RawRunnerUsageConfig::token_budget_window_hours`].
+pub const DEFAULT_TOKEN_BUDGET_WINDOW_HOURS: u64 = 5;
+
+/// One runner's validated usage-admission settings (GitHub issue #114).
+/// See `crate::work::admission::check_usage_admission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerUsageConfig {
+    /// Refuse while the `five_hour` window is at or above this fraction.
+    pub five_hour_ceiling: UsageCeiling,
+    /// Refuse while the `seven_day` window is at or above this fraction.
+    pub seven_day_ceiling: UsageCeiling,
+    /// A snapshot older than this is stale, and admission probes for a
+    /// fresh one. Also the minimum gap between two probes.
+    pub snapshot_max_age_secs: u64,
+    /// How this runner is paid for.
+    pub billing: Billing,
+    /// The token budget for when the runner reports no usage signal, or
+    /// `None` when unset (no budget check).
+    pub token_budget: Option<TokenBudget>,
+}
+
+impl RunnerUsageConfig {
+    /// The defaults for `kind`.
+    pub fn defaults_for(kind: AgentKind) -> Self {
+        RunnerUsageConfig {
+            five_hour_ceiling: UsageCeiling(DEFAULT_FIVE_HOUR_CEILING),
+            seven_day_ceiling: UsageCeiling(DEFAULT_SEVEN_DAY_CEILING),
+            snapshot_max_age_secs: DEFAULT_SNAPSHOT_MAX_AGE_SECS,
+            billing: kind.default_billing(),
+            token_budget: None,
+        }
+    }
+
+    /// The ceiling configured for usage window `window` (`five_hour`,
+    /// `seven_day`), or `None` for a window with no ceiling.
+    pub fn ceiling_for(&self, window: &str) -> Option<UsageCeiling> {
+        match window {
+            "five_hour" => Some(self.five_hour_ceiling),
+            "seven_day" => Some(self.seven_day_ceiling),
+            _ => None,
+        }
+    }
+}
+
+/// Validated usage-admission settings for every runner (GitHub issue #114).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageConfig {
+    /// `[agent.claude]`.
+    pub claude: RunnerUsageConfig,
+    /// `[agent.opencode]`.
+    pub opencode: RunnerUsageConfig,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        UsageConfig {
+            claude: RunnerUsageConfig::defaults_for(AgentKind::Claude),
+            opencode: RunnerUsageConfig::defaults_for(AgentKind::Opencode),
+        }
+    }
+}
+
+impl UsageConfig {
+    /// The settings for `kind`.
+    pub fn for_kind(&self, kind: AgentKind) -> &RunnerUsageConfig {
+        match kind {
+            AgentKind::Claude => &self.claude,
+            AgentKind::Opencode => &self.opencode,
+        }
+    }
+
+    /// The settings for the runner named `name` (`AgentRunner::name()`), or
+    /// `None` for a name no [`AgentKind`] parses.
+    pub fn for_agent(&self, name: &str) -> Option<&RunnerUsageConfig> {
+        AgentKind::parse(name).map(|kind| self.for_kind(kind))
+    }
+}
+
+/// Validated `[dispatch]` settings (GitHub issue #114).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchConfig {
+    /// Whether unattended dispatch may route to a [`Billing::Metered`]
+    /// runner. Off by default.
+    pub allow_paid_fallback: bool,
 }
 
 /// Fully validated `[work]` section.
@@ -1235,6 +1433,24 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// An `[agent.<runner>]` usage ceiling was not a positive number
+    /// (GitHub issue #114).
+    #[error("invalid [agent] {field} `{value}`; expected a positive fraction such as 0.8")]
+    InvalidUsageCeiling {
+        /// The offending key.
+        field: &'static str,
+        /// The value as parsed.
+        value: String,
+    },
+
+    /// An `[agent.<runner>] billing` value was not recognized (GitHub issue
+    /// #114).
+    #[error("invalid [agent] billing `{value}`; expected \"subscription\" or \"metered\"")]
+    InvalidBilling {
+        /// The value as parsed.
+        value: String,
+    },
+
     /// `[backend].provider` was set to a value that isn't a recognized
     /// provider name at all (contrast [`ConfigError::ProviderNotImplemented`],
     /// for a recognized name with no adapter yet).
@@ -1443,6 +1659,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         work: None,
         backend: None,
         agent: None,
+        dispatch: None,
         schema_version: None,
     }
 }
@@ -1596,6 +1813,15 @@ fn merge_with_repo_dir(
         .or(global.ready.as_ref().and_then(|ready| ready.require_audit))
         .unwrap_or(true);
     let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
+    let usage = merge_usage(global.agent.as_ref(), repo.agent.as_ref())?;
+    let dispatch = DispatchConfig {
+        allow_paid_fallback: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.allow_paid_fallback)
+            .or(global.dispatch.as_ref().and_then(|d| d.allow_paid_fallback))
+            .unwrap_or(false),
+    };
 
     let expected_path = default_global_config_path();
 
@@ -1626,6 +1852,8 @@ fn merge_with_repo_dir(
             agent,
             agent_fallbacks,
             require_audit,
+            usage,
+            dispatch,
         }),
         BackendKind::Github => {
             let configured_repo = repo
@@ -1664,9 +1892,75 @@ fn merge_with_repo_dir(
                 agent,
                 agent_fallbacks,
                 require_audit,
+                usage,
+                dispatch,
             })
         }
     }
+}
+
+/// Merges `[agent.<runner>]` usage settings key by key, repo over global,
+/// then validates them (GitHub issue #114).
+fn merge_usage(
+    global: Option<&RawAgentConfig>,
+    repo: Option<&RawAgentConfig>,
+) -> Result<UsageConfig, ConfigError> {
+    let pick = |kind: AgentKind, raw: Option<&RawAgentConfig>| {
+        raw.and_then(|agent| match kind {
+            AgentKind::Claude => agent.claude.clone(),
+            AgentKind::Opencode => agent.opencode.clone(),
+        })
+        .unwrap_or_default()
+    };
+    let ceiling = |field: &'static str, value: Option<f64>, default: UsageCeiling| match value {
+        Some(value) if value.is_finite() && value > 0.0 => Ok(UsageCeiling(value)),
+        Some(value) => Err(ConfigError::InvalidUsageCeiling {
+            field,
+            value: value.to_string(),
+        }),
+        None => Ok(default),
+    };
+    let merge_one = |kind: AgentKind| -> Result<RunnerUsageConfig, ConfigError> {
+        let global = pick(kind, global);
+        let repo = pick(kind, repo);
+        let defaults = RunnerUsageConfig::defaults_for(kind);
+        let billing = match repo.billing.or(global.billing) {
+            Some(value) => Billing::parse(&value).ok_or(ConfigError::InvalidBilling { value })?,
+            None => defaults.billing,
+        };
+        let window_hours = repo
+            .token_budget_window_hours
+            .or(global.token_budget_window_hours)
+            .unwrap_or(DEFAULT_TOKEN_BUDGET_WINDOW_HOURS);
+        Ok(RunnerUsageConfig {
+            five_hour_ceiling: ceiling(
+                "five_hour_ceiling",
+                repo.five_hour_ceiling.or(global.five_hour_ceiling),
+                defaults.five_hour_ceiling,
+            )?,
+            seven_day_ceiling: ceiling(
+                "seven_day_ceiling",
+                repo.seven_day_ceiling.or(global.seven_day_ceiling),
+                defaults.seven_day_ceiling,
+            )?,
+            snapshot_max_age_secs: repo
+                .snapshot_max_age_secs
+                .or(global.snapshot_max_age_secs)
+                .unwrap_or(defaults.snapshot_max_age_secs),
+            billing,
+            token_budget: repo
+                .token_budget
+                .or(global.token_budget)
+                .map(|tokens| TokenBudget {
+                    tokens,
+                    window_secs: (window_hours * 3600) as i64,
+                }),
+        })
+    };
+    Ok(UsageConfig {
+        claude: merge_one(AgentKind::Claude)?,
+        opencode: merge_one(AgentKind::Opencode)?,
+    })
 }
 
 /// Merge a repo-local `[backend]` section on top of a global one, field by
@@ -1738,6 +2032,7 @@ fn merge_agent(
         runner,
         strategy,
         order,
+        ..
     } = if repo_declares_mode { repo } else { global };
 
     match strategy {
@@ -2368,6 +2663,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         }
     }
@@ -2399,6 +2695,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2497,6 +2794,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2531,6 +2829,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2565,6 +2864,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2599,6 +2899,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2633,6 +2934,7 @@ mod tests {
             work: None,
             backend: None,
             agent: None,
+            dispatch: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -3975,6 +4277,7 @@ mod tests {
                 runner: Some("claude".to_string()),
                 strategy: Some("priority".to_string()),
                 order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
             }),
             ..raw_full()
         };
@@ -5703,6 +6006,127 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    // --- usage admission: `[agent.<runner>]` and `[dispatch]` (GitHub
+    // issue #114) ---
+
+    /// Loads a global config holding the required Jira fields plus `extra`,
+    /// and a repo config of `repo_toml` when given.
+    fn load_with(extra: &str, repo_toml: Option<&str>) -> Result<Config, ConfigError> {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            format!(
+                "jira_base_url = \"https://global.atlassian.net\"\n\
+                 jira_email = \"global@example.com\"\n\
+                 default_project_key = \"GLOBAL\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        let repo = repo_toml.map(|toml| {
+            let path = dir.path().join(".tskmstr.toml");
+            fs::write(&path, toml).unwrap();
+            path
+        });
+        load(&ConfigPaths {
+            global: global_path,
+            repo,
+        })
+    }
+
+    #[test]
+    fn usage_settings_default_to_the_documented_ceilings_and_billing() {
+        let cfg = load_with("", None).expect("should load");
+
+        let claude = cfg.usage.for_agent("claude").unwrap();
+        assert_eq!(claude.five_hour_ceiling.get(), 0.80);
+        assert_eq!(claude.seven_day_ceiling.get(), 0.90);
+        assert_eq!(claude.snapshot_max_age_secs, 600);
+        assert_eq!(claude.billing, Billing::Subscription);
+        assert_eq!(claude.token_budget, None);
+
+        let opencode = cfg.usage.for_agent("opencode").unwrap();
+        assert_eq!(opencode.billing, Billing::Metered);
+        assert_eq!(opencode.token_budget, None);
+
+        assert!(!cfg.dispatch.allow_paid_fallback);
+    }
+
+    #[test]
+    fn usage_settings_are_read_per_runner_and_merged_repo_over_global() {
+        let cfg = load_with(
+            "[agent.claude]\n\
+             five_hour_ceiling = 0.7\n\
+             seven_day_ceiling = 0.95\n\
+             snapshot_max_age_secs = 300\n\
+             [agent.opencode]\n\
+             billing = \"subscription\"\n\
+             token_budget = 2000000\n\
+             token_budget_window_hours = 5\n\
+             [dispatch]\n\
+             allow_paid_fallback = true\n",
+            Some("[agent.claude]\nfive_hour_ceiling = 0.6\n"),
+        )
+        .expect("should load");
+
+        let claude = cfg.usage.for_agent("claude").unwrap();
+        assert_eq!(claude.five_hour_ceiling.get(), 0.6, "repo wins");
+        assert_eq!(claude.seven_day_ceiling.get(), 0.95, "global kept");
+        assert_eq!(claude.snapshot_max_age_secs, 300);
+
+        let opencode = cfg.usage.for_agent("opencode").unwrap();
+        assert_eq!(opencode.billing, Billing::Subscription);
+        assert_eq!(
+            opencode.token_budget,
+            Some(TokenBudget {
+                tokens: 2_000_000,
+                window_secs: 5 * 3600,
+            })
+        );
+
+        assert!(cfg.dispatch.allow_paid_fallback);
+    }
+
+    #[test]
+    fn a_token_budget_window_defaults_to_five_hours() {
+        let cfg = load_with("[agent.opencode]\ntoken_budget = 1000\n", None).expect("should load");
+        assert_eq!(
+            cfg.usage.for_agent("opencode").unwrap().token_budget,
+            Some(TokenBudget {
+                tokens: 1000,
+                window_secs: 5 * 3600,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_usage_settings_are_config_errors() {
+        let err = load_with("[agent.claude]\nbilling = \"free\"\n", None).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidBilling { ref value } if value == "free"),
+            "{err:?}"
+        );
+
+        let err = load_with("[agent.claude]\nfive_hour_ceiling = 0\n", None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidUsageCeiling {
+                    field: "five_hour_ceiling",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_table_with_only_usage_keys_keeps_the_default_runner() {
+        let cfg = load_with("[agent.opencode]\nbilling = \"metered\"\n", None).expect("loads");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert!(cfg.agent_fallbacks.is_empty());
     }
 
     // --- relative lane `repo` / `[work.audit].dir` paths (GitHub issue #5
