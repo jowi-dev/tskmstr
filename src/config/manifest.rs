@@ -156,6 +156,16 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
             super::BackendKind::Jira => None,
         },
     },
+    // GitHub issue #118. Opt-in, so there is no default to suggest: an
+    // unattended watcher (and, with `on_bots_done = "launch"`, a cleanup
+    // session) is a choice, not drift. With no default it is never reported;
+    // it is registered so the key is declared in one place.
+    ExpectedConfigKey {
+        path: &["work", "review_watch", "auto_arm"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -189,6 +199,14 @@ mod tests {
             (key.suggested_default)(BackendKind::Github),
             Some("In Progress")
         );
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn review_watch_auto_arm_is_registered_without_a_default() {
+        let key = expected(&["work", "review_watch", "auto_arm"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
     }
 
