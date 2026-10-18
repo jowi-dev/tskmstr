@@ -49,7 +49,7 @@ fn main() -> ExitCode {
 
     // `tm ready <KEY>` is special-cased the same way, ahead of `dispatch`'s
     // uniform `Result<(), _>` plumbing, because it now needs a three-way
-    // exit code (0 ready, 3 stackable, 1 blocked/error) rather than the
+    // exit code (0 ready, 3 stackable, 4 not audited, 1 blocked/error) rather than the
     // uniform 0/1 every other command produces — see
     // `READY_EXIT_STACKABLE`'s doc comment. `tm ready` with no
     // key (the list form) never errors and stays on the uniform 0/1 path
@@ -1628,6 +1628,34 @@ fn ready_in_flight(config: &Config) -> tskmstr::blocker_stacking::InFlight {
         .unwrap_or_default()
 }
 
+/// The runs DB `tm ready`'s audit gate reads, opened only when `[ready]
+/// require_audit` is on (`None` when it's off). Pass to [`ready_audit_gate`],
+/// which borrows it.
+fn open_ready_audit_store(
+    config: &Config,
+) -> Option<Result<tskmstr::runs::RunStore, tskmstr::runs::RunStoreError>> {
+    config
+        .require_audit
+        .then(|| tskmstr::runs::RunStore::open(&run_db_path_from_config(config)))
+}
+
+/// `tm ready`'s audit gate (GitHub issue #112) over the store
+/// [`open_ready_audit_store`] opened. A store that failed to open fails the
+/// gate closed rather than failing `tm ready` itself.
+fn ready_audit_gate<'a>(
+    config: &Config,
+    store: &'a Option<Result<tskmstr::runs::RunStore, tskmstr::runs::RunStoreError>>,
+) -> tskmstr::cli::ready::AuditGate<'a> {
+    match store {
+        None => tskmstr::cli::ready::AuditGate::Off,
+        Some(Ok(store)) => tskmstr::cli::ready::AuditGate::Store {
+            store,
+            scope: tskmstr::config::BackendIdentity::from_config(config).scope(),
+        },
+        Some(Err(err)) => tskmstr::cli::ready::AuditGate::Unavailable(err.to_string()),
+    }
+}
+
 /// `tm ready` (no key): needs a Jira client + config, same as the
 /// `TicketCmd::Transition` arm above, plus a `gh` client and the configured
 /// `review_bots` for the best-effort bot-findings/stackability annotations
@@ -1649,11 +1677,13 @@ fn run_ready(
     let config = config::load(paths)?;
     let jira = ticket_provider_for(&config, keychain, env_token)?;
     let gh = ShellGhCli::new();
+    let audit_store = open_ready_audit_store(&config);
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
         in_flight: ready_in_flight(&config),
+        audit: ready_audit_gate(&config, &audit_store),
     };
     let mut stdout = std::io::stdout();
     if json {
@@ -1675,12 +1705,20 @@ fn run_ready(
 /// README.md's `tm ready` section.
 const READY_EXIT_STACKABLE: u8 = 3;
 
+/// Exit code for `tm ready <KEY>` reporting a ticket that would be ready or
+/// stackable but fails the audit gate (see
+/// [`tskmstr::cli::ready::ReadyCliError::NotAudited`], GitHub issue #112) —
+/// distinct from `1` (blocked) so an autonomous agent can tell "needs a
+/// human to audit it" from "wait for a blocker". Documented in README.md's
+/// `tm ready` section.
+const READY_EXIT_NOT_AUDITED: u8 = 4;
+
 /// `tm ready <KEY>`: build real dependencies and run
 /// [`tskmstr::cli::ready::check`], mapping its
 /// [`tskmstr::cli::ready::ReadyOutcome`] to an exit code (`0` ready, `3`
-/// stackable, `1` blocked or any other error) — see
+/// stackable, `4` not audited, `1` blocked or any other error) — see
 /// [`READY_EXIT_STACKABLE`]'s doc comment for why this needs its own
-/// three-way scheme rather than `dispatch`'s uniform 0/1.
+/// scheme rather than `dispatch`'s uniform 0/1.
 fn run_ready_check(key: String) -> ExitCode {
     let paths = default_config_paths();
     let env_token = std::env::var("JIRA_API_TOKEN").ok();
@@ -1701,17 +1739,23 @@ fn run_ready_check(key: String) -> ExitCode {
         }
     };
     let gh = ShellGhCli::new();
+    let audit_store = open_ready_audit_store(&config);
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
         in_flight: ready_in_flight(&config),
+        audit: ready_audit_gate(&config, &audit_store),
     };
     let mut stdout = std::io::stdout();
 
     match tskmstr::cli::ready::check(&ctx, &key, &mut stdout) {
         Ok(tskmstr::cli::ready::ReadyOutcome::Ready) => ExitCode::SUCCESS,
         Ok(tskmstr::cli::ready::ReadyOutcome::Stackable) => ExitCode::from(READY_EXIT_STACKABLE),
+        Err(err @ tskmstr::cli::ready::ReadyCliError::NotAudited { .. }) => {
+            eprintln!("{err}");
+            ExitCode::from(READY_EXIT_NOT_AUDITED)
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::FAILURE
@@ -1845,7 +1889,7 @@ const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
 /// completed successfully, `3` no comments captured, `1` any other error or
 /// a `--fg` run that finished failed) — see
 /// [`REVIEW_FIX_EXIT_NO_COMMENTS`]'s doc comment for why this needs its own
-/// three-way scheme rather than `dispatch`'s uniform 0/1.
+/// scheme rather than `dispatch`'s uniform 0/1.
 fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
     let run_db_path = resolve_run_db_path();
     let run_store = match tskmstr::runs::RunStore::open(&run_db_path) {
