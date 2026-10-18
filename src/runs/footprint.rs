@@ -171,7 +171,165 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// PSI `some avg10` (percent of the last ten seconds in which at least one
+/// task stalled waiting on memory) at or above which Linux reports
+/// [`MemoryPressure::Warn`]. A tenth of wall time lost to reclaim is a
+/// machine already struggling to give a new lane room.
+#[cfg(any(target_os = "linux", test))]
+pub const PSI_WARN_AVG10: f64 = 10.0;
+
+/// PSI `some avg10` at or above which Linux reports
+/// [`MemoryPressure::Critical`]: tasks stall on memory for 40% of the time,
+/// the territory where the OOM killer or systemd-oomd steps in.
+#[cfg(any(target_os = "linux", test))]
+pub const PSI_CRITICAL_AVG10: f64 = 40.0;
+
+/// Percent of `MemTotal` still `MemAvailable` below which the meminfo
+/// fallback reports [`MemoryPressure::Warn`].
+#[cfg(any(target_os = "linux", test))]
+pub const MEMINFO_WARN_AVAILABLE_PCT: u64 = 10;
+
+/// Percent of `MemTotal` still `MemAvailable` below which the meminfo
+/// fallback reports [`MemoryPressure::Critical`].
+#[cfg(any(target_os = "linux", test))]
+pub const MEMINFO_CRITICAL_AVAILABLE_PCT: u64 = 5;
+
+/// Reads `some avg10` out of `/proc/pressure/memory`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_psi_some_avg10(psi: &str) -> Option<f64> {
+    psi.lines()
+        .find_map(|line| line.strip_prefix("some "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("avg10="))?
+        .parse()
+        .ok()
+}
+
+/// Maps a PSI `some avg10` percentage to a pressure level using
+/// [`PSI_WARN_AVG10`] and [`PSI_CRITICAL_AVG10`].
+#[cfg(any(target_os = "linux", test))]
+fn pressure_from_psi(avg10: f64) -> MemoryPressure {
+    if avg10 >= PSI_CRITICAL_AVG10 {
+        MemoryPressure::Critical
+    } else if avg10 >= PSI_WARN_AVG10 {
+        MemoryPressure::Warn
+    } else {
+        MemoryPressure::Normal
+    }
+}
+
+/// Reads a `<Key>:   <n> kB` line's value, in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn kib_field(text: &str, key: &str) -> Option<u64> {
+    let kib: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
+/// Reads `(MemAvailable, MemTotal)` in bytes out of `/proc/meminfo`. `None`
+/// when either is missing or the total is zero.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo(meminfo: &str) -> Option<(u64, u64)> {
+    let available = kib_field(meminfo, "MemAvailable")?;
+    let total = kib_field(meminfo, "MemTotal")?;
+    (total > 0).then_some((available, total))
+}
+
+/// Maps the share of memory still available to a pressure level using
+/// [`MEMINFO_WARN_AVAILABLE_PCT`] and [`MEMINFO_CRITICAL_AVAILABLE_PCT`].
+#[cfg(any(target_os = "linux", test))]
+fn pressure_from_available(available: u64, total: u64) -> MemoryPressure {
+    let scaled = available.saturating_mul(100);
+    if scaled < total.saturating_mul(MEMINFO_CRITICAL_AVAILABLE_PCT) {
+        MemoryPressure::Critical
+    } else if scaled < total.saturating_mul(MEMINFO_WARN_AVAILABLE_PCT) {
+        MemoryPressure::Warn
+    } else {
+        MemoryPressure::Normal
+    }
+}
+
+/// Reads the `Pss:` total, in bytes, out of `/proc/<pid>/smaps_rollup`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_smaps_rollup_pss(rollup: &str) -> Option<u64> {
+    kib_field(rollup, "Pss")
+}
+
+/// Reads the resident page count (second field) out of `/proc/<pid>/statm`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_statm_rss_pages(statm: &str) -> Option<u64> {
+    statm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::MemoryPressure;
+
+    /// Walks the tree from one `/proc` scan (shared with
+    /// [`crate::runs::cpu`]), summing each process's footprint.
+    pub fn tree_footprint(root: u32) -> Option<u64> {
+        let mut total = process_footprint(root)?;
+        let children = crate::runs::cpu::children_by_parent().unwrap_or_default();
+        let mut pending = vec![root];
+        while let Some(pid) = pending.pop() {
+            for &child in children.get(&pid).into_iter().flatten() {
+                if let Some(bytes) = process_footprint(child) {
+                    total += bytes;
+                    pending.push(child);
+                }
+            }
+        }
+        Some(total)
+    }
+
+    /// PSS from `smaps_rollup` (shared pages split among their users, so a
+    /// tree of `rustc`s sharing libraries isn't double counted), falling
+    /// back to RSS from `statm` where the rollup is unreadable (old kernels,
+    /// or ptrace restrictions).
+    fn process_footprint(pid: u32) -> Option<u64> {
+        if let Some(pss) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+            .ok()
+            .and_then(|rollup| super::parse_smaps_rollup_pss(&rollup))
+        {
+            return Some(pss);
+        }
+        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        let pages = super::parse_statm_rss_pages(&statm)?;
+        // SAFETY: sysconf has no preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page_size = if page_size > 0 {
+            page_size as u64
+        } else {
+            4096
+        };
+        Some(pages * page_size)
+    }
+
+    /// PSI first; `MemAvailable`/`MemTotal` where PSI is absent (kernels
+    /// without `CONFIG_PSI`, or booted with `psi=0`).
+    pub fn memory_pressure() -> MemoryPressure {
+        if let Some(avg10) = std::fs::read_to_string("/proc/pressure/memory")
+            .ok()
+            .and_then(|psi| super::parse_psi_some_avg10(&psi))
+        {
+            return super::pressure_from_psi(avg10);
+        }
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| super::parse_meminfo(&meminfo))
+            .map_or(MemoryPressure::Unknown, |(available, total)| {
+                super::pressure_from_available(available, total)
+            })
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::MemoryPressure;
 
@@ -212,6 +370,101 @@ mod tests {
         assert_eq!(format_bytes(2560 * MIB), "2.5 GB");
     }
 
+    const PSI: &str = "some avg10=12.50 avg60=3.00 avg300=1.00 total=154046\n\
+                       full avg10=4.00 avg60=1.00 avg300=0.20 total=144424\n";
+
+    #[test]
+    fn psi_some_avg10_is_parsed() {
+        assert_eq!(parse_psi_some_avg10(PSI), Some(12.5));
+    }
+
+    #[test]
+    fn malformed_psi_has_no_avg10() {
+        assert_eq!(parse_psi_some_avg10(""), None);
+        assert_eq!(parse_psi_some_avg10("full avg10=4.00 avg60=1.00"), None);
+        assert_eq!(parse_psi_some_avg10("some avg10=lots avg60=1.00"), None);
+        assert_eq!(parse_psi_some_avg10("some avg60=1.00 total=3"), None);
+    }
+
+    #[test]
+    fn psi_stall_share_maps_to_pressure_levels() {
+        assert_eq!(pressure_from_psi(0.0), MemoryPressure::Normal);
+        assert_eq!(
+            pressure_from_psi(PSI_WARN_AVG10 - 0.01),
+            MemoryPressure::Normal
+        );
+        assert_eq!(pressure_from_psi(PSI_WARN_AVG10), MemoryPressure::Warn);
+        assert_eq!(
+            pressure_from_psi(PSI_CRITICAL_AVG10),
+            MemoryPressure::Critical
+        );
+        assert_eq!(pressure_from_psi(100.0), MemoryPressure::Critical);
+    }
+
+    const MEMINFO: &str = "MemTotal:       16000000 kB\n\
+                           MemFree:         1000000 kB\n\
+                           MemAvailable:    4000000 kB\n\
+                           Buffers:          100000 kB\n";
+
+    #[test]
+    fn meminfo_available_and_total_are_parsed_as_bytes() {
+        assert_eq!(
+            parse_meminfo(MEMINFO),
+            Some((4_000_000 * 1024, 16_000_000 * 1024))
+        );
+    }
+
+    #[test]
+    fn malformed_meminfo_is_none() {
+        assert_eq!(parse_meminfo(""), None);
+        assert_eq!(parse_meminfo("MemTotal:       16000000 kB\n"), None);
+        assert_eq!(parse_meminfo("MemAvailable:    4000000 kB\n"), None);
+        assert_eq!(
+            parse_meminfo("MemTotal: many kB\nMemAvailable: 4000000 kB\n"),
+            None
+        );
+        assert_eq!(parse_meminfo("MemTotal: 0 kB\nMemAvailable: 0 kB\n"), None);
+    }
+
+    #[test]
+    fn available_share_maps_to_pressure_levels() {
+        assert_eq!(pressure_from_available(50, 100), MemoryPressure::Normal);
+        assert_eq!(pressure_from_available(10, 100), MemoryPressure::Normal);
+        assert_eq!(pressure_from_available(9, 100), MemoryPressure::Warn);
+        assert_eq!(pressure_from_available(5, 100), MemoryPressure::Warn);
+        assert_eq!(pressure_from_available(4, 100), MemoryPressure::Critical);
+        assert_eq!(pressure_from_available(0, 100), MemoryPressure::Critical);
+    }
+
+    #[test]
+    fn smaps_rollup_pss_is_parsed_as_bytes() {
+        let rollup = "62c6cec4c000-7ffe9473f000 ---p 00000000 00:00 0  [rollup]\n\
+                      Rss:                3172 kB\n\
+                      Pss:                1939 kB\n\
+                      Pss_Anon:            512 kB\n";
+        assert_eq!(parse_smaps_rollup_pss(rollup), Some(1939 * 1024));
+    }
+
+    #[test]
+    fn malformed_smaps_rollup_is_none() {
+        assert_eq!(parse_smaps_rollup_pss(""), None);
+        assert_eq!(
+            parse_smaps_rollup_pss("Rss: 3172 kB\nPss_Anon: 512 kB\n"),
+            None
+        );
+        assert_eq!(parse_smaps_rollup_pss("Pss: lots kB\n"), None);
+    }
+
+    #[test]
+    fn statm_rss_is_the_second_field_in_pages() {
+        assert_eq!(
+            parse_statm_rss_pages("2606 772 719 280 0 698 0\n"),
+            Some(772)
+        );
+        assert_eq!(parse_statm_rss_pages("2606"), None);
+        assert_eq!(parse_statm_rss_pages("2606 many"), None);
+    }
+
     #[test]
     fn a_dead_root_has_no_footprint() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -230,6 +483,50 @@ mod tests {
     #[test]
     fn pressure_is_readable_on_macos() {
         assert_ne!(memory_pressure(), MemoryPressure::Unknown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_process_tree_has_a_footprint_on_linux() {
+        assert!(tree_footprint(std::process::id()).unwrap() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pressure_is_readable_on_linux() {
+        assert_ne!(memory_pressure(), MemoryPressure::Unknown);
+    }
+
+    /// Linux counterpart of the macOS child-allocation test: a shell whose
+    /// child holds ~200 MB must measure well above that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_footprint_includes_a_child_that_allocates_memory_on_linux() {
+        const ALLOC: u64 = 200 * 1024 * 1024;
+        let mut root = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"perl -e '$x = "a" x 209715200; sleep 30' & wait"#)
+            .spawn()
+            .unwrap();
+        let pid = root.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = 0;
+        while std::time::Instant::now() < deadline {
+            seen = tree_footprint(pid).unwrap_or(0);
+            if seen > ALLOC {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let _ = std::process::Command::new("pkill")
+            .args(["-P", &pid.to_string()])
+            .status();
+        let _ = root.kill();
+        let _ = root.wait();
+
+        assert!(seen > ALLOC, "tree footprint {seen} should exceed {ALLOC}");
     }
 
     /// The acceptance test for "peak footprint includes child processes":
