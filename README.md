@@ -177,7 +177,7 @@ tm auth status
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
-| `tm ticket create [--title] [--body] [--status <STATUS>\|--no-transition]` | Create a new ticket in the configured default project. No PR required or touched |
+| `tm ticket create [--title] [--body] [--status <STATUS>\|--no-transition] [--audited [--audit-notes]]` | Create a new ticket in the configured default project. No PR required or touched. `--audited` also records a passing audit so `tm ready` can pick it up |
 | `tm ticket transition <KEY> <STATUS>` | Move ticket `<KEY>` to `<STATUS>`. Fails (non-zero exit) if no transition matches or the Jira API call fails |
 | `tm ticket transition <KEY>` | List ticket `<KEY>`'s current status and available transitions |
 | `tm ticket assign <KEY> <NAME>` | Assign ticket `<KEY>` to the assignable user matching `<NAME>` (exact displayName match, else an unambiguous substring match). Fails if no user or more than one matches |
@@ -196,8 +196,8 @@ tm auth status
 | `tm ticket retro <KEY> --clean` | Record that `<KEY>` shipped clean, with no known production defect (offline; never touches Jira) |
 | `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
-| `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
-| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, waiting, or blocked. Exits `0` (ready), `3` (stackable), or `1` (waiting/blocked/error) |
+| `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
+| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -1785,6 +1785,9 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # review_bots = ["cursor[bot]"]       # optional, see below; this is the default
 # board_column_order = ["To Do", "In Progress", "Code Review"]  # optional, see below
 
+# [ready]                             # optional, see below
+# require_audit = true                # the default
+
 # [backend]                           # optional, see below; "jira" is the default
 # provider = "jira"
 
@@ -1798,7 +1801,7 @@ its root; fields it doesn't set fall back to the global config.
 between the two files whenever the Jira backend is selected, or `tm`
 refuses to run; `default_assignee_account_id`, `status_on_pr`,
 `status_on_create`, `status_on_merge`, `status_on_run_start`, `review_bots`,
-`board_column_order`, and `[backend]` are optional.
+`board_column_order`, `[ready]`, and `[backend]` are optional.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
@@ -1993,6 +1996,15 @@ ticket's status.
 `status_on_create`, with the same case-insensitive, warn-and-continue
 matching; `--no-transition` creates the ticket with no transition at all,
 even if `status_on_create` is configured. They're mutually exclusive.
+
+`tm ticket create --audited` also records a passing (`ready`) audit for the
+new ticket, with notes `audited at creation` (or `--audit-notes "..."`),
+so it clears `tm ready`'s audit gate immediately: the one-step form of
+creating and then running `tm ticket audit KEY --record ready`. Pass it only
+when a human has confirmed the ticket is well-defined; the scaffolded create
+prompt tells the drafting agent the same. If the audit can't be recorded,
+the ticket is still created and a `warning:` line names the `tm ticket
+audit` command to finish the job.
 
 `tm ticket transition <KEY> <STATUS>` uses the same case-insensitive
 matching rule (target status name, falling back to the transition's own
@@ -2240,7 +2252,8 @@ that conversation's verdict, timestamped, to the same local SQLite database
 in `config.toml` points instead). Recording never touches Jira and works
 fully offline; every past verdict is kept (no upsert), and the read mode
 above always shows the most recent one. `--notes` only makes sense alongside
-`--record`, so it requires it.
+`--record`, so it requires it. `tm ready` reads the latest verdict as its
+audit gate (see `[ready] require_audit`).
 
 ### Recording ship-defect retros
 
@@ -2371,12 +2384,14 @@ Then, across the ticket's unmerged blockers:
 
 `tm ready` (no key) lists your "To Do" tickets (something already In
 Progress has already been picked up), each classified by the stack decision
-above. Ready tickets come first, then stackable, then waiting, then blocked,
+above and by the audit gate below. Ready tickets come first, then
+stackable, then needs audit, then waiting, then blocked,
 each group in Jira's native backlog rank order:
 
 ```
 PROJ-1  Fix the thing  [unblocks 2]
 AX-409  Add the connector  [stackable on origin/jowi-dev/ax-408-... — blocked by AX-408, PR #490 open]
+PROJ-5  Tidy the config  [needs audit: not audited]
 PROJ-4  Ship the docs  [waiting on PROJ-7 (running)]
 PROJ-2  Add the widget  [blocked by PROJ-9 (In Progress), no PR yet]
 PROJ-3  Wire it up  [blocked by PROJ-8 (PR #3 open), PROJ-9 (no PR) — can't stack on more than one]
@@ -2392,10 +2407,25 @@ them can become ready until the cycle is broken.
 PR list is fetched once per invocation, and only if some candidate has a
 blocker.
 
+**The audit gate.** A ticket that would be ready or stackable is only
+offered once its latest recorded audit verdict is `ready`, so autopilot never
+dispatches a ticket nobody groomed. Record one with `tm ticket audit KEY
+--record ready`, or in one step at creation with `tm ticket create
+--audited`. A ticket never audited, or whose latest verdict is
+`needs-work`, is listed as `[needs audit: not audited]` or `[needs audit:
+last audit was needs-work]` instead, so it doesn't vanish; a later
+`needs-work` verdict takes an audited ticket back out of ready. Blocked and
+waiting tickets keep their blocker reason. If the runs DB can't be opened,
+every such ticket needs audit (the gate fails closed). Audits live in the
+local runs DB (see `tm ticket audit` below), so **the gate is per-machine**:
+a ticket audited on one host is unaudited on another. Set `[ready]
+require_audit = false` to turn the gate off and decide on blockers alone.
+
 `tm ready --json` prints the same classification as one JSON object for
 scripts: `tickets` (rank order, each with `key`, `summary`, `unblocks`, and
 `decision` of `ready`, `stackable` (plus `base`, `blocker_key`,
-`pr_number`), `waiting` (plus `blocker_key`, `run_id`, `run_status`,
+`pr_number`), `needs_audit` (plus `reason`),
+`waiting` (plus `blocker_key`, `run_id`, `run_status`,
 `reason`), or `blocked` (plus `blocker_keys`, `reason`); a ready ticket with
 unresolved bot findings also has `unresolved_bot_findings`) and `warnings`
 (what the text form prints as `warning:` lines). `--json` is for the list
@@ -2414,6 +2444,10 @@ status:
   lane run #<N> (<status>), no PR yet`; when there's more than one blocker,
   a final line explains that two parallel unmerged blockers can't both be
   stacked on), exits `1`.
+- **not audited** — the ticket would be ready or stackable but fails the
+  audit gate: prints ``KEY needs audit (<reason>); record one with `tm
+  ticket audit KEY --record ready` ``, exits `4`. A blocked ticket reports
+  blocked (`1`) whatever its audit says.
 
 Resolving the stack decision needs `gh` (to check each blocker's PR state),
 but only when the ticket actually has a direct blocker — one with none never
