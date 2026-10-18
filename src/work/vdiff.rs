@@ -19,7 +19,7 @@ use std::process::Command;
 
 use thiserror::Error;
 
-/// Errors from [`VdiffOps::export_comments`].
+/// Errors from [`VdiffOps`] calls.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VdiffError {
     /// `vdiff` isn't installed, or isn't on `PATH`. Distinguished from a
@@ -31,14 +31,14 @@ pub enum VdiffError {
 
     /// `vdiff` could not be spawned for a reason other than "not found"
     /// (e.g. permission denied on the binary).
-    #[error("failed to spawn `vdiff --export-comments`: {message}")]
+    #[error("failed to spawn `vdiff`: {message}")]
     Spawn {
         /// The underlying I/O error message.
         message: String,
     },
 
-    /// `vdiff --export-comments` ran but exited nonzero.
-    #[error("`vdiff --export-comments` failed (exit {exit_code:?}): {stderr}")]
+    /// `vdiff` ran but exited nonzero.
+    #[error("`vdiff` failed (exit {exit_code:?}): {stderr}")]
     Command {
         /// The process exit code, if the process was not terminated by a
         /// signal.
@@ -66,6 +66,12 @@ pub trait VdiffOps {
     /// so callers (`crate::cli::review::fix`) are the ones that compare the
     /// returned string against it.
     fn export_comments(&self, dir: &Path) -> Result<String, VdiffError>;
+
+    /// Post the worktree's comment store to GitHub PR `pr` as one review,
+    /// by running `vdiff --publish-comments <pr>` in `dir`. vdiff skips
+    /// comments it already published to that PR, so repeating this is safe
+    /// (`tm review auto`, GitHub issue #124).
+    fn publish_comments(&self, dir: &Path, pr: u64) -> Result<(), VdiffError>;
 }
 
 /// [`VdiffOps`] implementation that shells out to the real `vdiff` binary.
@@ -84,30 +90,44 @@ impl Default for ShellVdiffOps {
     }
 }
 
+/// `vdiff` arguments that post the store to PR `pr` as one GitHub review.
+fn publish_args(pr: u64) -> Vec<String> {
+    vec!["--publish-comments".to_string(), pr.to_string()]
+}
+
+/// Runs `vdiff <args>` in `dir`, returning its stdout on a zero exit.
+fn run_vdiff(dir: &Path, args: &[String]) -> Result<String, VdiffError> {
+    let output = Command::new("vdiff")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                VdiffError::NotFound
+            } else {
+                VdiffError::Spawn {
+                    message: err.to_string(),
+                }
+            }
+        })?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(VdiffError::Command {
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
 impl VdiffOps for ShellVdiffOps {
     fn export_comments(&self, dir: &Path) -> Result<String, VdiffError> {
-        let output = Command::new("vdiff")
-            .arg("--export-comments")
-            .current_dir(dir)
-            .output()
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    VdiffError::NotFound
-                } else {
-                    VdiffError::Spawn {
-                        message: err.to_string(),
-                    }
-                }
-            })?;
+        run_vdiff(dir, &["--export-comments".to_string()])
+    }
 
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(VdiffError::Command {
-                exit_code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            })
-        }
+    fn publish_comments(&self, dir: &Path, pr: u64) -> Result<(), VdiffError> {
+        run_vdiff(dir, &publish_args(pr)).map(|_| ())
     }
 }
 
@@ -121,6 +141,8 @@ impl VdiffOps for ShellVdiffOps {
 pub struct FakeVdiffOps {
     result: Result<String, VdiffError>,
     calls: std::cell::RefCell<Vec<PathBuf>>,
+    publish_result: Result<(), VdiffError>,
+    publish_calls: std::cell::RefCell<Vec<(PathBuf, u64)>>,
 }
 
 impl FakeVdiffOps {
@@ -129,6 +151,8 @@ impl FakeVdiffOps {
         Self {
             result,
             calls: std::cell::RefCell::new(Vec::new()),
+            publish_result: Ok(()),
+            publish_calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -136,12 +160,30 @@ impl FakeVdiffOps {
     pub fn calls(&self) -> Vec<PathBuf> {
         self.calls.borrow().clone()
     }
+
+    /// Makes `publish_comments` return `result` (it returns `Ok` by default).
+    pub fn with_publish(mut self, result: Result<(), VdiffError>) -> Self {
+        self.publish_result = result;
+        self
+    }
+
+    /// Every `(dir, pr)` `publish_comments` was called with, in call order.
+    pub fn publish_calls(&self) -> Vec<(PathBuf, u64)> {
+        self.publish_calls.borrow().clone()
+    }
 }
 
 impl VdiffOps for FakeVdiffOps {
     fn export_comments(&self, dir: &Path) -> Result<String, VdiffError> {
         self.calls.borrow_mut().push(dir.to_path_buf());
         self.result.clone()
+    }
+
+    fn publish_comments(&self, dir: &Path, pr: u64) -> Result<(), VdiffError> {
+        self.publish_calls
+            .borrow_mut()
+            .push((dir.to_path_buf(), pr));
+        self.publish_result.clone()
     }
 }
 
@@ -166,6 +208,22 @@ mod tests {
         let result = fake.export_comments(Path::new("/Worktrees/axiom/proj-1"));
 
         assert_eq!(result, Err(VdiffError::NotFound));
+    }
+
+    #[test]
+    fn fake_vdiff_ops_records_publish_calls_and_returns_the_canned_result() {
+        let fake =
+            FakeVdiffOps::with_export(Ok(String::new())).with_publish(Err(VdiffError::NotFound));
+
+        let result = fake.publish_comments(Path::new("/wt"), 42);
+
+        assert_eq!(result, Err(VdiffError::NotFound));
+        assert_eq!(fake.publish_calls(), vec![(PathBuf::from("/wt"), 42)]);
+    }
+
+    #[test]
+    fn publish_args_name_the_pr_number() {
+        assert_eq!(publish_args(42), vec!["--publish-comments", "42"]);
     }
 
     #[test]
