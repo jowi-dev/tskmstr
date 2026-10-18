@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod audit;
+pub mod auto_review;
 pub mod bugbot;
 pub mod build_slots;
 pub mod comment_store;
