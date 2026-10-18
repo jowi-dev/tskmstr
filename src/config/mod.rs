@@ -604,6 +604,11 @@ pub struct RawReviewWatchConfig {
     /// unresolved findings: `"notify"` or `"launch"`. Defaults to
     /// `"notify"` when unset; an unrecognized value is a [`ConfigError`].
     pub on_bots_done: Option<String>,
+    /// Whether a lane run, or a `tm review fix` pass, that finishes with a
+    /// PR arms `tm pr watch` for its ticket on its own (GitHub issue #118).
+    /// Defaults to `false` when unset: the watcher then only starts when
+    /// someone runs `tm pr watch` or presses `b` on the board.
+    pub auto_arm: Option<bool>,
 }
 
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
@@ -948,6 +953,8 @@ pub struct ReviewWatchConfig {
     /// See [`RawReviewWatchConfig::on_bots_done`]. Defaults to
     /// [`OnBotsDone::Notify`].
     pub on_bots_done: OnBotsDone,
+    /// See [`RawReviewWatchConfig::auto_arm`]. Defaults to `false`.
+    pub auto_arm: bool,
 }
 
 impl Default for ReviewWatchConfig {
@@ -960,6 +967,7 @@ impl Default for ReviewWatchConfig {
             poll_secs: 45,
             max_wait_mins: 1440,
             on_bots_done: OnBotsDone::Notify,
+            auto_arm: false,
         }
     }
 }
@@ -2005,6 +2013,7 @@ fn merge_review_watch(
             .or(global.max_wait_mins)
             .unwrap_or(ReviewWatchConfig::default().max_wait_mins),
         on_bots_done,
+        auto_arm: repo.auto_arm.or(global.auto_arm).unwrap_or(false),
     })
 }
 
@@ -4014,6 +4023,7 @@ mod tests {
             poll_secs = 30
             max_wait_mins = 600
             on_bots_done = "launch"
+            auto_arm = true
             "#,
         )
         .unwrap();
@@ -4035,6 +4045,7 @@ mod tests {
         assert_eq!(cfg.work.review_watch.poll_secs, 30);
         assert_eq!(cfg.work.review_watch.max_wait_mins, 600);
         assert_eq!(cfg.work.review_watch.on_bots_done, OnBotsDone::Launch);
+        assert!(cfg.work.review_watch.auto_arm);
     }
 
     #[test]
@@ -4063,6 +4074,10 @@ mod tests {
         assert_eq!(cfg.work.review_watch.on_bots_done, OnBotsDone::Notify);
         assert_eq!(cfg.work.review_watch.prompt, None);
         assert_eq!(cfg.work.review_watch.dir, None);
+        assert!(
+            !cfg.work.review_watch.auto_arm,
+            "auto_arm is off by default"
+        );
     }
 
     #[test]
@@ -4393,6 +4408,7 @@ mod tests {
                 poll_secs: Some(30),
                 max_wait_mins: Some(600),
                 on_bots_done: Some("launch".to_string()),
+                auto_arm: Some(true),
             }),
             ..Default::default()
         };
@@ -4405,6 +4421,7 @@ mod tests {
                 poll_secs: None,
                 max_wait_mins: Some(120),
                 on_bots_done: None,
+                auto_arm: Some(false),
             }),
             ..Default::default()
         };
@@ -4412,6 +4429,7 @@ mod tests {
         // Overridden fields win.
         assert_eq!(cfg.review_watch.dir, Some("/repo-local/axiom".to_string()));
         assert_eq!(cfg.review_watch.max_wait_mins, 120);
+        assert!(!cfg.review_watch.auto_arm, "repo auto_arm overrides global");
         // Non-overridden fields fall back to global.
         assert_eq!(
             cfg.review_watch.prompt,

@@ -1407,7 +1407,8 @@ dir = "~/Projects/axiom"          # optional; falls back to [work.audit].dir
 # model = "fable"                 # optional; falls back to [work.audit].model
 # poll_secs = 45                  # optional, default 45
 # max_wait_mins = 1440            # optional, default 1440 (24h)
-# on_bots_done = "notify"         # optional, "notify" | "launch"; default "notify"
+# on_bots_done = "notify"         # optional, "notify" # auto_arm = false               # optional; arm the watch when a run ends with a PR
+| "launch"; default "notify"
 ```
 
 `poll_secs` is the cadence `tm pr watch`'s foreground loop sleeps between
@@ -1418,6 +1419,19 @@ leaves the card at `bots: ready` for you to launch by hand; `"launch"`
 launches the cleanup session itself the moment the watcher sees
 unresolved findings. Zero unresolved findings always goes straight to
 `bots: clean` — no cleanup session either way.
+
+`auto_arm = true` arms the watcher without the `b` press. When a
+detached lane run (`tm work run <lane> --headless`) or a detached `tm
+review fix` pass finishes and its branch has a PR, its supervisor starts
+the same detached `tm pr watch <KEY>`, unless a watcher for the ticket is
+already running. A fix pass therefore re-arms bot review for the commits
+it pushed. Each attempt is recorded as an `auto_arm` event on the run
+(`armed tm pr watch`, `already watching (run N)`, or `failed: ...`); a
+failure only warns and never fails the run. Interactive runs and `--fg`
+runs are not covered: an interactive run ends through `tm runs finish`,
+which is not hooked, the same gap `status_on_pr` has. Combined with
+`on_bots_done = "launch"`, a run can go from PR to cleanup session
+unattended, so it is off by default.
 
 When there are findings, the watcher writes them to
 `${XDG_DATA_HOME:-~/.local/share}/tskmstr/findings/<key>.json` before

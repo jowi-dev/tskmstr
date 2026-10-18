@@ -665,12 +665,14 @@ fn run_interactive(
 /// `run` (above) wrote, opens the run store it points at, and runs
 /// [`crate::work::run::supervise_run`] — record this process's own pid, then
 /// spawn `claude`, wait, parse, and finish the tracked run.
+/// `watch_armer` is passed straight through to it (GitHub issue #118).
 ///
 /// Split from the thin `main.rs`-level dispatch (which owns reading the
 /// state file, opening the real [`RunStore`], and picking
 /// [`crate::work::runner::StdProcessSpawner`]) so the actual supervision
 /// logic here is exercised with injected fakes in tests, exactly like
 /// [`run`] above.
+#[allow(clippy::too_many_arguments)]
 pub fn supervise(
     spawner: &dyn ProcessSpawner,
     gh: &dyn GhCli,
@@ -678,6 +680,7 @@ pub fn supervise(
     ticket_provider: Option<&dyn TicketProvider>,
     state: &crate::work::detach::SupervisorState,
     runner: &dyn AgentRunner,
+    watch_armer: Option<&dyn crate::work::run::WatchArmer>,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let outcome = crate::work::run::supervise_run(
@@ -688,6 +691,7 @@ pub fn supervise(
         &state.prepared,
         std::process::id(),
         runner,
+        watch_armer,
         out,
     )?;
     Ok(!outcome.is_error)
@@ -3501,6 +3505,7 @@ mod tests {
             None,
             &state,
             &ClaudeRunner,
+            None,
             &mut out,
         )
         .unwrap();

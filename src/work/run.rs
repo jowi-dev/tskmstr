@@ -1918,6 +1918,15 @@ pub fn run_agent_and_finish(
 /// factored out here (rather than living in `detach.rs`) so it can be
 /// exercised with fakes exactly like [`run_lane_fg`], with no process
 /// re-exec, setsid, or file I/O involved in the test.
+///
+/// `watch_armer` is `Some` when `[work.review_watch].auto_arm` is on (GitHub
+/// issue #118): a ticketed run that finished with a PR then gets its
+/// `tm pr watch` started here, the same point `status_on_pr` is applied —
+/// see [`auto_arm_watch`]. This covers lane runs and `tm review fix` passes
+/// alike, since both are supervised by this one function, so a fix pass
+/// re-arms bot review on its new push. `--fg` runs and interactive runs
+/// never reach it: an interactive run ends through `tm runs finish`, which
+/// is not hooked, the same gap `status_on_pr` has (GitHub issue #92).
 #[allow(clippy::too_many_arguments)]
 pub fn supervise_run(
     spawner: &dyn ProcessSpawner,
@@ -1927,10 +1936,11 @@ pub fn supervise_run(
     prepared: &PreparedRun,
     supervisor_pid: u32,
     runner: &dyn AgentRunner,
+    watch_armer: Option<&dyn WatchArmer>,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
-    run_agent_and_finish(
+    let outcome = run_agent_and_finish(
         spawner,
         gh,
         run_store,
@@ -1938,7 +1948,69 @@ pub fn supervise_run(
         prepared,
         runner,
         out,
-    )
+    )?;
+    if let Some(armer) = watch_armer {
+        auto_arm_watch(run_store, armer, prepared, out)?;
+    }
+    Ok(outcome)
+}
+
+/// Starts a detached `tm pr watch` for a ticket (GitHub issue #118). Behind
+/// a trait so [`supervise_run`] can be tested without spawning anything; the
+/// production implementation is `crate::cli::pr::DetachedWatchArmer`.
+pub trait WatchArmer {
+    /// Start watching `ticket`'s PR from `working_dir`, without waiting for
+    /// the watcher. The error is only ever shown to a human, so it is a
+    /// message rather than a typed error.
+    fn arm(&self, ticket: &str, working_dir: &Path) -> Result<(), String>;
+}
+
+/// Arm `tm pr watch` for a finished, ticketed run whose row has a PR,
+/// recording an `auto_arm` event on the run either way it goes. Skipped,
+/// with an event, when a `review-watch` run for the ticket is already
+/// running. `tm pr watch` dedups too, but checking here keeps a duplicate
+/// spawn from appending a refusal to the watcher's log. A failed arm only
+/// warns: the run itself is already recorded.
+fn auto_arm_watch(
+    run_store: &RunStore,
+    armer: &dyn WatchArmer,
+    prepared: &PreparedRun,
+    out: &mut dyn Write,
+) -> Result<(), RunLaneError> {
+    let Some(ticket) = prepared.ticket.as_deref() else {
+        return Ok(());
+    };
+    let Some(run) = run_store.run_by_id(prepared.run_id)? else {
+        return Ok(());
+    };
+    if run.pr_url.is_none() {
+        return Ok(());
+    }
+
+    if let Some(existing) =
+        run_store.latest_run_for_ticket_kind(Some(&run.scope), ticket, Some("review-watch"))?
+        && existing.status == RunStatus::Running
+    {
+        let detail = format!("already watching (run {})", existing.id);
+        run_store.add_event(prepared.run_id, "auto_arm", Some(&detail))?;
+        return Ok(());
+    }
+
+    match armer.arm(ticket, &prepared.worktree) {
+        Ok(()) => {
+            run_store.add_event(prepared.run_id, "auto_arm", Some("armed tm pr watch"))?;
+            writeln!(out, "armed tm pr watch for {ticket}")?;
+        }
+        Err(message) => {
+            let detail = format!("failed: {message}");
+            run_store.add_event(prepared.run_id, "auto_arm", Some(&detail))?;
+            writeln!(
+                out,
+                "warning: could not arm tm pr watch for {ticket}: {message}"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5712,6 +5784,7 @@ mod tests {
             &prepared,
             9999,
             &ClaudeRunner,
+            None,
             &mut supervisor_out,
         )
         .unwrap();
@@ -5723,6 +5796,221 @@ mod tests {
 
         let printed = String::from_utf8(supervisor_out).unwrap();
         assert!(printed.contains("session   sess-1"));
+    }
+
+    /// Records every [`WatchArmer::arm`] call and answers with `result`.
+    struct FakeWatchArmer {
+        calls: std::cell::RefCell<Vec<(String, PathBuf)>>,
+        result: Result<(), String>,
+    }
+
+    impl FakeWatchArmer {
+        fn new(result: Result<(), String>) -> Self {
+            FakeWatchArmer {
+                calls: std::cell::RefCell::new(Vec::new()),
+                result,
+            }
+        }
+    }
+
+    impl WatchArmer for FakeWatchArmer {
+        fn arm(&self, ticket: &str, working_dir: &Path) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push((ticket.to_string(), working_dir.to_path_buf()));
+            self.result.clone()
+        }
+    }
+
+    /// Prepare a detached `ABC-123` lane run (or a ticketless one, when
+    /// `ticket` is `None`), then supervise it with `gh` reporting `pr_url`
+    /// for its branch and `armer` as the watch armer. Returns the store, the
+    /// prepared run, and everything the supervisor printed.
+    fn supervise_ticketed_run(
+        ticket: Option<&str>,
+        pr_url: Option<&str>,
+        armer: Option<&dyn WatchArmer>,
+        before_supervise: &dyn Fn(&RunStore),
+    ) -> (TempDir, RunStore, PreparedRun, String) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new().with_pr_url_for_branch(Ok(pr_url.map(str::to_string)));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let prepare_spawner = FakeProcessSpawner::success(canned_json());
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &prepare_spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: ticket.map(str::to_string),
+            ..Default::default()
+        };
+        let mut prepare_out = Vec::new();
+        let prepared = prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut prepare_out,
+        )
+        .unwrap();
+        before_supervise(&run_store);
+
+        let supervisor_spawner = FakeProcessSpawner::success(
+            // No PR URL in the result text, so `pr_url` alone decides.
+            r#"{"session_id":"sess-1","is_error":false,"result":"done"}"#.to_string(),
+        );
+        let mut out = Vec::new();
+        supervise_run(
+            &supervisor_spawner,
+            &gh,
+            &run_store,
+            None,
+            &prepared,
+            9999,
+            &ClaudeRunner,
+            armer,
+            &mut out,
+        )
+        .unwrap();
+        (tmp, run_store, prepared, String::from_utf8(out).unwrap())
+    }
+
+    fn auto_arm_events(run_store: &RunStore, run_id: i64) -> Vec<Option<String>> {
+        run_store
+            .events_for_run(run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "auto_arm")
+            .map(|e| e.detail)
+            .collect()
+    }
+
+    const PR_URL: &str = "https://github.com/example/repo/pull/7";
+
+    #[test]
+    fn supervise_run_arms_the_pr_watch_when_the_run_finishes_with_a_pr() {
+        let armer = FakeWatchArmer::new(Ok(()));
+
+        let (_tmp, run_store, prepared, printed) =
+            supervise_ticketed_run(Some("ABC-123"), Some(PR_URL), Some(&armer), &|_| {});
+
+        assert_eq!(
+            *armer.calls.borrow(),
+            vec![("ABC-123".to_string(), prepared.worktree.clone())]
+        );
+        assert_eq!(
+            auto_arm_events(&run_store, prepared.run_id),
+            vec![Some("armed tm pr watch".to_string())]
+        );
+        assert!(
+            printed.contains("armed tm pr watch for ABC-123"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn supervise_run_does_not_arm_without_an_armer() {
+        let (_tmp, run_store, prepared, printed) =
+            supervise_ticketed_run(Some("ABC-123"), Some(PR_URL), None, &|_| {});
+
+        assert!(auto_arm_events(&run_store, prepared.run_id).is_empty());
+        assert!(!printed.contains("tm pr watch"), "{printed}");
+    }
+
+    #[test]
+    fn supervise_run_does_not_arm_when_the_run_has_no_pr() {
+        let armer = FakeWatchArmer::new(Ok(()));
+
+        let (_tmp, run_store, prepared, _) =
+            supervise_ticketed_run(Some("ABC-123"), None, Some(&armer), &|_| {});
+
+        assert!(armer.calls.borrow().is_empty());
+        assert!(auto_arm_events(&run_store, prepared.run_id).is_empty());
+    }
+
+    #[test]
+    fn supervise_run_does_not_arm_a_ticketless_run() {
+        let armer = FakeWatchArmer::new(Ok(()));
+
+        supervise_ticketed_run(None, Some(PR_URL), Some(&armer), &|_| {});
+
+        assert!(armer.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn supervise_run_skips_arming_when_a_watch_is_already_running() {
+        let armer = FakeWatchArmer::new(Ok(()));
+        let watch_id = std::cell::Cell::new(0);
+
+        let (_tmp, run_store, prepared, _) =
+            supervise_ticketed_run(Some("ABC-123"), Some(PR_URL), Some(&armer), &|store| {
+                let scope = compatible_test_identity().scope();
+                watch_id.set(
+                    store
+                        .start_run(&StartRun {
+                            ticket: "ABC-123".to_string(),
+                            scope,
+                            lane: "review-watch".to_string(),
+                            worktree: "/repo".to_string(),
+                            branch: None,
+                            pid: Some(4242),
+                            kind: "review-watch".to_string(),
+                            log_path: None,
+                        })
+                        .unwrap(),
+                );
+            });
+
+        assert!(armer.calls.borrow().is_empty());
+        assert_eq!(
+            auto_arm_events(&run_store, prepared.run_id),
+            vec![Some(format!("already watching (run {})", watch_id.get()))]
+        );
+    }
+
+    #[test]
+    fn supervise_run_arm_failure_warns_and_still_finishes_the_run() {
+        let armer = FakeWatchArmer::new(Err("spawn failed".to_string()));
+
+        let (_tmp, run_store, prepared, printed) =
+            supervise_ticketed_run(Some("ABC-123"), Some(PR_URL), Some(&armer), &|_| {});
+
+        assert!(
+            printed.contains("warning: could not arm tm pr watch for ABC-123: spawn failed"),
+            "{printed}"
+        );
+        assert_eq!(
+            auto_arm_events(&run_store, prepared.run_id),
+            vec![Some("failed: spawn failed".to_string())]
+        );
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Done);
     }
 
     #[test]
@@ -5786,6 +6074,7 @@ mod tests {
             &prepared,
             4321,
             &ClaudeRunner,
+            None,
             &mut supervisor_out,
         )
         .unwrap();

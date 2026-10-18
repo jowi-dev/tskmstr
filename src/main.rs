@@ -612,6 +612,18 @@ fn run_work(
             let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
                 .as_ref()
                 .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()).ok());
+            // GitHub issue #118: start `tm pr watch` once the run has a PR,
+            // only when `[work.review_watch].auto_arm` opts in.
+            let current_exe = std::env::current_exe()?;
+            let detach = tskmstr::work::detach::RealDetachSpawner;
+            let watch_armer = tskmstr::cli::pr::DetachedWatchArmer {
+                detach: &detach,
+                current_exe: &current_exe,
+                home: &home,
+            };
+            let auto_arm = full_config
+                .as_ref()
+                .is_some_and(|cfg| cfg.work.review_watch.auto_arm);
             let succeeded = tskmstr::cli::work::supervise(
                 &spawner,
                 &gh,
@@ -619,6 +631,7 @@ fn run_work(
                 ticket_provider.as_deref(),
                 &state,
                 agent_runner_or_default(full_config.as_ref()),
+                auto_arm.then_some(&watch_armer as &dyn tskmstr::work::run::WatchArmer),
                 &mut stdout,
             )?;
             // The state file has served its one-shot handoff purpose; a
