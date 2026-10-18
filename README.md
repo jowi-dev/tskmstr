@@ -196,8 +196,8 @@ tm auth status
 | `tm ticket retro <KEY> --clean` | Record that `<KEY>` shipped clean, with no known production defect (offline; never touches Jira) |
 | `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
-| `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), or blocked (and why); `--json` for scripts |
-| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, or blocked. Exits `0` (ready), `3` (stackable), or `1` (blocked/error) |
+| `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
+| `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, waiting, or blocked. Exits `0` (ready), `3` (stackable), or `1` (waiting/blocked/error) |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -2343,32 +2343,49 @@ Then, across the ticket's unmerged blockers:
   instead of the normal base, rather than waiting for it to merge; `tm
   ready <KEY>` reports the same branch so a human or an autonomous agent can
   do the equivalent by hand.
-- **exactly one, with no PR yet** → **blocked**: nothing exists to build on.
+- **exactly one, with no PR yet, but a live lane run working it** (a `lane`
+  run for the blocker that is `running`, `queued`, or `hibernated` in the
+  run store) → **waiting**: its PR is probably on the way, so check again
+  later instead of treating the blocker as unworked. `tm work run` refuses
+  the run with a message naming the blocker's run (pass `--from <base>` to
+  override); it does not cut the branch from a base that lacks the
+  blocker's work.
+- **exactly one, with no PR yet and no live run** → **blocked**: nothing
+  exists to build on, and nobody is building it.
 - **two or more** → **blocked**: a single branch can only be stacked on one
   dependency at a time, so this refuses rather than guessing which one.
 
 `tm ready` (no key) lists your "To Do" tickets (something already In
 Progress has already been picked up), each classified by the stack decision
-above. Ready tickets come first, then stackable, then blocked, each group in
-Jira's native backlog rank order:
+above. Ready tickets come first, then stackable, then waiting, then blocked,
+each group in Jira's native backlog rank order:
 
 ```
-PROJ-1  Fix the thing
+PROJ-1  Fix the thing  [unblocks 2]
 AX-409  Add the connector  [stackable on origin/jowi-dev/ax-408-... — blocked by AX-408, PR #490 open]
+PROJ-4  Ship the docs  [waiting on PROJ-7 (running)]
 PROJ-2  Add the widget  [blocked by PROJ-9 (In Progress), no PR yet]
 PROJ-3  Wire it up  [blocked by PROJ-8 (PR #3 open), PROJ-9 (no PR) — can't stack on more than one]
 ```
+
+`[unblocks N]` counts the other listed tickets this one blocks, directly or
+through a chain. A ticket two others both depend on counts once. Only links
+between listed tickets count. If the listed tickets block each other in a
+cycle, a `warning: blocker cycle among ...` line names them, since none of
+them can become ready until the cycle is broken.
 
 `No ready tickets.` heads the list when nothing is ready or stackable. The
 PR list is fetched once per invocation, and only if some candidate has a
 blocker.
 
 `tm ready --json` prints the same classification as one JSON object for
-scripts: `tickets` (rank order, each with `key`, `summary`, and `decision`
-of `ready`, `stackable` (plus `base`, `blocker_key`, `pr_number`), or
-`blocked` (plus `blocker_keys`, `reason`); a ready ticket with unresolved bot
-findings also has `unresolved_bot_findings`) and `warnings` (what the text
-form prints as `warning:` lines). `--json` is for the list form only.
+scripts: `tickets` (rank order, each with `key`, `summary`, `unblocks`, and
+`decision` of `ready`, `stackable` (plus `base`, `blocker_key`,
+`pr_number`), `waiting` (plus `blocker_key`, `run_id`, `run_status`,
+`reason`), or `blocked` (plus `blocker_keys`, `reason`); a ready ticket with
+unresolved bot findings also has `unresolved_bot_findings`) and `warnings`
+(what the text form prints as `warning:` lines). `--json` is for the list
+form only.
 
 `tm ready <KEY>` checks one specific ticket, regardless of assignee or
 status:
@@ -2378,9 +2395,11 @@ status:
   <BLOCKER>, PR #<N> open)`, exits `3` — a distinct code from both `0` and
   `1` so a script or an autonomous lane prompt can branch on "safe to
   proceed by stacking" without parsing stdout.
-- **blocked** — prints `KEY is blocked by:` followed by one line per
-  unmerged blocker (plus, when there's more than one, a line explaining
-  that two parallel unmerged blockers can't both be stacked on), exits `1`.
+- **waiting** or **blocked** — prints `KEY is blocked by:` followed by one
+  line per unmerged blocker (a waiting blocker's line ends `— waiting on
+  lane run #<N> (<status>), no PR yet`; when there's more than one blocker,
+  a final line explains that two parallel unmerged blockers can't both be
+  stacked on), exits `1`.
 
 Resolving the stack decision needs `gh` (to check each blocker's PR state),
 but only when the ticket actually has a direct blocker — one with none never
