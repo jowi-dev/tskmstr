@@ -1764,6 +1764,7 @@ fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
         merge_cfg: &config.work.merge,
         status_on_merge: config.status_on_merge.as_deref(),
         state_dir: &state_dir,
+        kill_pid: &tskmstr::runs::pid::kill_pid,
     };
     let mut stdout = std::io::stdout();
 
