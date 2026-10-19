@@ -69,6 +69,8 @@ pub fn toggled(
             running_lanes: 0,
             max_lanes: 0,
             last_refusal: None,
+            blocked_age_secs: None,
+            last_launch_age_secs: None,
         }),
     }
     if !enabled {
@@ -231,6 +233,8 @@ mod tests {
             running_lanes: 1,
             max_lanes: 2,
             last_refusal: None,
+            blocked_age_secs: None,
+            last_launch_age_secs: None,
         }
     }
 

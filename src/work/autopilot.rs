@@ -25,8 +25,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cli::runs::format_age;
 use crate::runs::{RunStore, RunStoreError};
-use crate::work::dispatch::{REFUSED_EVENT, TickReport};
+use crate::work::dispatch::{TickReport, dispatch_state};
 
 /// How often the host thread wakes to check for due scopes when no command
 /// arrives. Matches the TUI loop's 250 ms tick.
@@ -194,11 +195,19 @@ pub struct AutopilotStatus {
     /// The refusal reason of the scope's newest dispatch event, when that
     /// event is a refusal. `None` once a later tick launched something.
     pub last_refusal: Option<String>,
+    /// How long refusals for [`AutopilotStatus::last_refusal`]'s reason had
+    /// lasted when the status was loaded, in seconds (GitHub issue #121).
+    pub blocked_age_secs: Option<i64>,
+    /// How long ago the scope last launched a lane when the status was
+    /// loaded, in seconds. `None` when it never has.
+    pub last_launch_age_secs: Option<i64>,
 }
 
 impl AutopilotStatus {
     /// One line for a status bar or header, e.g. `autopilot on · lanes 1/2
-    /// · not launching: …`. A tick error, when given, replaces the refusal.
+    /// · launched 12m ago · not launching: … (5m)`, where the trailing age is
+    /// how long the refusal has lasted. A tick error, when given, replaces
+    /// the refusal.
     pub fn summary(&self, tick_error: Option<&str>) -> String {
         if !self.enabled {
             return "autopilot off".to_string();
@@ -207,16 +216,23 @@ impl AutopilotStatus {
             "autopilot on · lanes {}/{}",
             self.running_lanes, self.max_lanes
         );
+        if let Some(age) = self.last_launch_age_secs {
+            line.push_str(&format!(" · launched {} ago", format_age(age)));
+        }
         if let Some(error) = tick_error {
             line.push_str(&format!(" · tick failed: {error}"));
         } else if let Some(refusal) = &self.last_refusal {
             line.push_str(&format!(" · {refusal}"));
+            if let Some(age) = self.blocked_age_secs {
+                line.push_str(&format!(" ({})", format_age(age)));
+            }
         }
         line
     }
 }
 
-/// Reads each of `scopes`' autopilot status from `store`, in order.
+/// Reads each of `scopes`' autopilot status from `store`, in order, with
+/// ages measured from `now` (unix seconds).
 ///
 /// # Errors
 ///
@@ -225,23 +241,21 @@ pub fn load_status(
     store: &RunStore,
     scopes: &[String],
     max_lanes: usize,
+    now: i64,
 ) -> Result<Vec<AutopilotStatus>, RunStoreError> {
     let running_lanes = store.running_lanes()?.len();
     scopes
         .iter()
         .map(|scope| {
-            let last_refusal = store
-                .dispatch_events(scope, 1)?
-                .into_iter()
-                .next()
-                .filter(|event| event.kind == REFUSED_EVENT)
-                .map(|event| event.detail);
+            let state = dispatch_state(store, scope)?;
             Ok(AutopilotStatus {
                 scope: scope.clone(),
                 enabled: store.autopilot_enabled(scope)?,
                 running_lanes,
                 max_lanes,
-                last_refusal,
+                blocked_age_secs: state.blocked.as_ref().map(|b| now - b.since_unix),
+                last_refusal: state.blocked.map(|b| b.detail),
+                last_launch_age_secs: state.last_launch_unix.map(|at| now - at),
             })
         })
         .collect()
@@ -254,7 +268,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::work::dispatch::LAUNCH_EVENT;
+    use crate::work::dispatch::{LAUNCH_EVENT, REFUSED_EVENT};
 
     fn target(scope: &str) -> AutopilotTarget {
         AutopilotTarget {
@@ -392,11 +406,13 @@ mod tests {
         store
             .record_dispatch_event("github:o/r", None, REFUSED_EVENT, "paused: usage 87%")
             .unwrap();
+        let now = store.dispatch_events("github:o/r", 1).unwrap()[0].created_unix + 90;
 
         let status = load_status(
             &store,
             &["github:o/r".to_string(), "github:o/off".to_string()],
             2,
+            now,
         )
         .unwrap();
 
@@ -409,6 +425,8 @@ mod tests {
                     running_lanes: 0,
                     max_lanes: 2,
                     last_refusal: Some("paused: usage 87%".to_string()),
+                    blocked_age_secs: Some(90),
+                    last_launch_age_secs: None,
                 },
                 AutopilotStatus {
                     scope: "github:o/off".to_string(),
@@ -416,6 +434,8 @@ mod tests {
                     running_lanes: 0,
                     max_lanes: 2,
                     last_refusal: None,
+                    blocked_age_secs: None,
+                    last_launch_age_secs: None,
                 },
             ]
         );
@@ -432,33 +452,40 @@ mod tests {
             .record_dispatch_event("s", Some("GH-1"), LAUNCH_EVENT, "lane a")
             .unwrap();
 
-        let status = load_status(&store, &["s".to_string()], 1).unwrap();
+        let now = store.dispatch_events("s", 1).unwrap()[0].created_unix + 120;
+        let status = load_status(&store, &["s".to_string()], 1, now).unwrap();
 
         assert_eq!(status[0].last_refusal, None);
+        assert_eq!(status[0].blocked_age_secs, None);
+        assert_eq!(status[0].last_launch_age_secs, Some(120));
     }
 
     #[test]
-    fn summary_shows_lanes_and_the_refusal_or_tick_error() {
+    fn summary_shows_lanes_last_launch_and_the_refusal_or_tick_error() {
         let mut status = AutopilotStatus {
             scope: "s".to_string(),
             enabled: false,
             running_lanes: 1,
             max_lanes: 2,
             last_refusal: Some("paused: usage 87% ≥ 85%".to_string()),
+            blocked_age_secs: Some(300),
+            last_launch_age_secs: Some(720),
         };
         assert_eq!(status.summary(None), "autopilot off");
 
         status.enabled = true;
         assert_eq!(
             status.summary(None),
-            "autopilot on · lanes 1/2 · paused: usage 87% ≥ 85%"
+            "autopilot on · lanes 1/2 · launched 12m ago · paused: usage 87% ≥ 85% (5m)"
         );
         assert_eq!(
             status.summary(Some("gh: timed out")),
-            "autopilot on · lanes 1/2 · tick failed: gh: timed out"
+            "autopilot on · lanes 1/2 · launched 12m ago · tick failed: gh: timed out"
         );
 
         status.last_refusal = None;
+        status.blocked_age_secs = None;
+        status.last_launch_age_secs = None;
         assert_eq!(status.summary(None), "autopilot on · lanes 1/2");
     }
 }

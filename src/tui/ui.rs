@@ -4480,6 +4480,8 @@ mod tests {
             running_lanes: 1,
             max_lanes: 2,
             last_refusal: refusal.map(str::to_string),
+            blocked_age_secs: None,
+            last_launch_age_secs: None,
         }
     }
 
