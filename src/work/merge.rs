@@ -1422,7 +1422,8 @@ fn reconcile_stacked_children(
 /// every live (`queued`, `running`, `hibernated`) run recorded for `key`
 /// as `done`, so [`session_gc::archive_and_kill`]'s live-run guard stops
 /// holding the merged ticket's session open — only another ticket's live
-/// run hosted there still does.
+/// run hosted there still does. The ticket's latest `review-watch` run also
+/// gets a `pr_closed` event via [`close_out_watch`] (GitHub issue #119).
 ///
 /// A `running` run whose recorded pid is still alive has that agent
 /// stopped via [`MergeDeps::kill_pid`], after its row is marked done (the
@@ -1452,6 +1453,9 @@ fn finish_ticket_runs(
             return Ok(());
         }
     };
+    if let Some(watch) = runs.iter().rev().find(|run| run.kind == "review-watch") {
+        close_out_watch(store, watch.id, key, out)?;
+    }
     let live: Vec<_> = runs
         .into_iter()
         .filter(|run| {
@@ -1499,6 +1503,36 @@ fn finish_ticket_runs(
         } else {
             (deps.kill_pid)(pid);
         }
+    }
+    Ok(())
+}
+
+/// Records the `pr_closed` event `tm pr watch` records when it sees its PR
+/// merged on watch run `run_id`, unless the watch already did (GitHub issue
+/// #119). A watch that finished before the merge never sees it, and the
+/// overview reads a finished watch with no `pr_closed` as
+/// [`crate::runs::overview::Stage::AwaitingReview`]. Never fails the merge;
+/// only writing to `out` can error.
+fn close_out_watch(
+    store: &crate::runs::RunStore,
+    run_id: i64,
+    key: &str,
+    out: &mut dyn Write,
+) -> Result<(), MergeError> {
+    let recorded = store
+        .events_for_run(run_id)
+        .map(|events| events.iter().any(|event| event.kind == "pr_closed"))
+        .and_then(|closed| {
+            if !closed {
+                store.add_event(run_id, "pr_closed", Some(r#"{"reason":"merged"}"#))?;
+            }
+            Ok(())
+        });
+    if let Err(err) = recorded {
+        writeln!(
+            out,
+            "warning: failed to record {key}'s merge on watch run {run_id}: {err}; tm overview may still show it awaiting review"
+        )?;
     }
     Ok(())
 }
@@ -3422,6 +3456,60 @@ mod tests {
         assert_eq!(*fx.killed_pids.borrow(), vec![std::process::id()]);
         assert!(out.contains(&format!("finished run {lane}")), "{out}");
         assert!(killed(&fx, "PROJ-1"), "{out}");
+    }
+
+    /// A watch that already finished never sees the merge itself, so `tm
+    /// merge` records the `pr_closed` it would have (GitHub issue #119):
+    /// otherwise the overview keeps showing the ticket as awaiting review.
+    #[test]
+    fn merge_records_pr_closed_on_the_tickets_latest_finished_watch() {
+        let fx = session_fixture();
+        let older = start(&fx, "PROJ-1", "review-watch", None);
+        let watch = start(&fx, "PROJ-1", "review-watch", None);
+        for id in [older, watch] {
+            fx.store
+                .finish_run(
+                    id,
+                    &crate::runs::FinishRun {
+                        status: crate::runs::RunStatus::Done,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let closed = |id| {
+            fx.store
+                .events_for_run(id)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "pr_closed")
+                .map(|e| e.detail)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            closed(watch),
+            vec![Some(r#"{"reason":"merged"}"#.to_string())]
+        );
+        assert!(closed(older).is_empty());
+    }
+
+    #[test]
+    fn merge_does_not_repeat_a_pr_closed_the_watch_already_recorded() {
+        let fx = session_fixture();
+        let watch = start(&fx, "PROJ-1", "review-watch", None);
+        fx.store
+            .add_event(watch, "pr_closed", Some(r#"{"reason":"merged"}"#))
+            .unwrap();
+
+        let (result, out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)), "{out}");
+        let events = fx.store.events_for_run(watch).unwrap();
+        assert_eq!(events.iter().filter(|e| e.kind == "pr_closed").count(), 1);
     }
 
     #[test]
