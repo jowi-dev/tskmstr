@@ -318,13 +318,15 @@ pub struct RawRunnerUsageConfig {
     pub token_budget_window_hours: Option<u64>,
 }
 
-/// Raw `[dispatch]` section (GitHub issue #114).
+/// Raw `[dispatch]` section (GitHub issues #114 and #115).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawDispatchConfig {
     /// See [`DispatchConfig::allow_paid_fallback`].
     pub allow_paid_fallback: Option<bool>,
     /// See [`DispatchConfig::max_fix_rounds`].
     pub max_fix_rounds: Option<u32>,
+    /// See [`DispatchConfig::max_lanes`].
+    pub max_lanes: Option<usize>,
 }
 
 /// Raw `[review]` section (GitHub issue #120).
@@ -981,7 +983,10 @@ impl UsageConfig {
 /// Default for [`DispatchConfig::max_fix_rounds`].
 pub const DEFAULT_MAX_FIX_ROUNDS: u32 = 3;
 
-/// Validated `[dispatch]` settings (GitHub issues #114, #120).
+/// [`DispatchConfig::max_lanes`] when `[dispatch] max_lanes` is unset.
+pub const DEFAULT_DISPATCH_MAX_LANES: usize = 1;
+
+/// Validated `[dispatch]` settings (GitHub issues #114, #115 and #120).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchConfig {
     /// Whether unattended dispatch may route to a [`Billing::Metered`]
@@ -993,6 +998,10 @@ pub struct DispatchConfig {
     /// or `F`), but only the automatic triggers stop at it. Defaults to
     /// [`DEFAULT_MAX_FIX_ROUNDS`].
     pub max_fix_rounds: u32,
+    /// The most lane runs the autopilot dispatcher lets run at once
+    /// (`crate::work::dispatch::tick`). Every running lane counts, however
+    /// it was launched. Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
+    pub max_lanes: usize,
 }
 
 impl Default for DispatchConfig {
@@ -1000,6 +1009,7 @@ impl Default for DispatchConfig {
         Self {
             allow_paid_fallback: false,
             max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
+            max_lanes: DEFAULT_DISPATCH_MAX_LANES,
         }
     }
 }
@@ -1868,6 +1878,12 @@ fn merge_with_repo_dir(
             .and_then(|d| d.max_fix_rounds)
             .or(global.dispatch.as_ref().and_then(|d| d.max_fix_rounds))
             .unwrap_or(DEFAULT_MAX_FIX_ROUNDS),
+        max_lanes: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.max_lanes)
+            .or(global.dispatch.as_ref().and_then(|d| d.max_lanes))
+            .unwrap_or(DEFAULT_DISPATCH_MAX_LANES),
     };
     let review = ReviewConfig {
         resolve_imported: repo
@@ -6174,6 +6190,26 @@ mod tests {
 
         assert_eq!(cfg.dispatch.max_fix_rounds, 1, "repo wins");
         assert!(cfg.review.resolve_imported, "global kept");
+    }
+
+    #[test]
+    fn dispatch_max_lanes_defaults_to_one() {
+        let cfg = load_with("", None).expect("should load");
+        assert_eq!(cfg.dispatch.max_lanes, DEFAULT_DISPATCH_MAX_LANES);
+        assert_eq!(DEFAULT_DISPATCH_MAX_LANES, 1);
+    }
+
+    #[test]
+    fn dispatch_max_lanes_is_merged_repo_over_global() {
+        let cfg = load_with(
+            "[dispatch]\nmax_lanes = 3\n",
+            Some("[dispatch]\nmax_lanes = 2\n"),
+        )
+        .expect("should load");
+        assert_eq!(cfg.dispatch.max_lanes, 2);
+
+        let cfg = load_with("[dispatch]\nmax_lanes = 3\n", None).expect("should load");
+        assert_eq!(cfg.dispatch.max_lanes, 3);
     }
 
     #[test]
