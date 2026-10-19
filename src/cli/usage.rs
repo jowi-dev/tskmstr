@@ -324,11 +324,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stamp = dir.path().join("stamp");
 
-        let outcome =
-            record_statusline(NO_RATE_LIMITS.as_bytes(), 1000, &stamp, || {
-                panic!("the store must not be opened")
-            })
-            .unwrap();
+        let outcome = record_statusline(NO_RATE_LIMITS.as_bytes(), 1000, &stamp, || {
+            panic!("the store must not be opened")
+        })
+        .unwrap();
 
         assert_eq!(outcome, RecordOutcome::NoRateLimits);
         assert!(!stamp.exists());
@@ -345,9 +344,12 @@ mod tests {
             RecordOutcome::Written
         );
         assert_eq!(
-            record_statusline(later.as_bytes(), 1000 + WRITE_INTERVAL_SECS - 1, &stamp, || {
-                panic!("a throttled write must not open the store")
-            })
+            record_statusline(
+                later.as_bytes(),
+                1000 + WRITE_INTERVAL_SECS - 1,
+                &stamp,
+                || { panic!("a throttled write must not open the store") }
+            )
             .unwrap(),
             RecordOutcome::Throttled
         );
@@ -481,10 +483,24 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
         assert!(lines[0].starts_with("AGENT"), "{text}");
-        for needle in ["claude", "five_hour", "34%", "statusline", "2m ago", "in 3h12m"] {
+        for needle in [
+            "claude",
+            "five_hour",
+            "34%",
+            "statusline",
+            "2m ago",
+            "in 3h12m",
+        ] {
             assert!(lines[1].contains(needle), "{needle} missing: {}", lines[1]);
         }
-        for needle in ["seven_day", "105%", "stream", "allowed", "2h00m ago", "in 2d0h"] {
+        for needle in [
+            "seven_day",
+            "105%",
+            "stream",
+            "allowed",
+            "2h00m ago",
+            "in 2d0h",
+        ] {
             assert!(lines[2].contains(needle), "{needle} missing: {}", lines[2]);
         }
     }
