@@ -277,6 +277,9 @@ pub struct TuiDeps {
     /// ([`crate::work::merge::run_merge`]), spawned as a watched child --
     /// see [`Cmd::LaunchMerge`] (GitHub issue #61).
     pub status_on_merge: Option<String>,
+    /// The autopilot host thread ticking the board's own scope, and
+    /// `max_lanes` (GitHub issue #116).
+    pub autopilot: AutopilotDeps,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, `tm review fix`,
@@ -380,6 +383,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
         project_key: deps.project_key.clone(),
         session_slug: deps.backend_identity.session_slug(),
         board_column_order: deps.board_column_order.clone(),
+        autopilot_scope: Some(deps.backend_identity.scope()),
         ..App::new()
     }
     .with_lane_names(deps.lane_names.clone())
@@ -398,6 +402,9 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
             Cmd::LoadLaneRunStatus,
             Cmd::LoadBotWatchStatus,
             Cmd::LoadCleanupStatus,
+            Cmd::LoadAutopilotStatus {
+                scopes: vec![deps.backend_identity.scope()],
+            },
         ],
     );
     app = run_cmds(app, initial, &deps, &net_tx, &mut terminal, &mut launches);
@@ -431,6 +438,11 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
         }
 
         while let Ok(msg) = msg_rx.try_recv() {
+            let (next_app, cmds) = update(app, msg);
+            app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
+        }
+
+        for msg in drain_autopilot(&deps.autopilot) {
             let (next_app, cmds) = update(app, msg);
             app = run_cmds(next_app, cmds, &deps, &net_tx, &mut terminal, &mut launches);
         }
@@ -1241,6 +1253,81 @@ pub struct WatchDeps {
     /// Resolves an overview row's repo root from its worktree when its runs
     /// predate `runs.repo_root` (ADR-0009 decision 5), for `B`.
     pub repo_roots: RepoRootCache,
+    /// The autopilot host thread and `max_lanes` (GitHub issue #116). The
+    /// overview hands the host its rows' scopes; `tm runs watch` shares
+    /// the loop, so `Tab` keeps ticking whatever the overview last set.
+    pub autopilot: AutopilotDeps,
+}
+
+/// The autopilot host a board or overview runs (GitHub issue #116).
+#[derive(Default)]
+pub struct AutopilotDeps {
+    /// The background thread that ticks the view's scopes. `None` when the
+    /// view's config didn't load, or in tests that don't tick.
+    pub host: Option<crate::work::autopilot::AutopilotHost>,
+    /// `[dispatch] max_lanes`, shown against the running lane count.
+    pub max_lanes: usize,
+}
+
+/// Run an autopilot [`Cmd`] against `store` and the host. `store` is
+/// `None` when the board's runs DB failed to open.
+fn execute_autopilot(
+    store: Option<&crate::runs::RunStore>,
+    autopilot: &AutopilotDeps,
+    cmd: Cmd,
+) -> Vec<Msg> {
+    const NO_STORE: &str = "the runs DB is unavailable";
+    match cmd {
+        Cmd::LoadAutopilotStatus { scopes } => {
+            let result = match store {
+                Some(store) => {
+                    crate::work::autopilot::load_status(store, &scopes, autopilot.max_lanes)
+                        .map_err(|err| err.to_string())
+                }
+                None => Err(NO_STORE.to_string()),
+            };
+            vec![Msg::AutopilotStatusLoaded(result)]
+        }
+        Cmd::ToggleAutopilot { scope, enabled } => {
+            let result = match store {
+                Some(store) => store
+                    .set_autopilot(&scope, enabled)
+                    .map_err(|err| err.to_string()),
+                None => Err(NO_STORE.to_string()),
+            };
+            if result.is_ok()
+                && enabled
+                && let Some(host) = &autopilot.host
+            {
+                host.tick_now();
+            }
+            vec![Msg::AutopilotToggled {
+                scope,
+                enabled,
+                result,
+            }]
+        }
+        Cmd::SetAutopilotTargets(targets) => {
+            if let Some(host) = &autopilot.host {
+                host.set_targets(targets);
+            }
+            Vec::new()
+        }
+        other => {
+            debug_assert!(false, "execute_autopilot: not an autopilot Cmd: {other:?}");
+            Vec::new()
+        }
+    }
+}
+
+/// Every tick the autopilot host finished since the last call, as
+/// [`Msg::AutopilotTicked`]s. Called once per loop iteration.
+fn drain_autopilot(autopilot: &AutopilotDeps) -> Vec<Msg> {
+    autopilot
+        .host
+        .as_ref()
+        .map(|host| host.drain().into_iter().map(Msg::AutopilotTicked).collect())
+        .unwrap_or_default()
 }
 
 /// The worktree-to-repo-root lookup a [`RepoRootCache`] memoises.
@@ -1354,6 +1441,11 @@ fn run_watch_loop(
             }
         } else {
             let (next_app, cmds) = update(app, Msg::Tick);
+            app = run_watch_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
+        }
+
+        for msg in drain_autopilot(&deps.autopilot) {
+            let (next_app, cmds) = update(app, msg);
             app = run_watch_cmds(next_app, cmds, &deps, &mut terminal, &mut launches);
         }
 
@@ -1488,6 +1580,11 @@ fn execute_watch(deps: &WatchDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadRuns => load_runs(deps),
         Cmd::LoadOverview => load_overview(deps),
         Cmd::LoadSystem => load_system(deps),
+        cmd @ (Cmd::LoadAutopilotStatus { .. }
+        | Cmd::ToggleAutopilot { .. }
+        | Cmd::SetAutopilotTargets(_)) => {
+            execute_autopilot(Some(&deps.store), &deps.autopilot, cmd)
+        }
         Cmd::LoadRunDetail { run_id } => load_run_detail(deps, run_id),
         Cmd::ReapRuns => reap_runs(deps),
         Cmd::OpenBoardWindow { repo_root } => match std::env::current_exe() {
@@ -1832,6 +1929,11 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
         Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
+        cmd @ (Cmd::LoadAutopilotStatus { .. }
+        | Cmd::ToggleAutopilot { .. }
+        | Cmd::SetAutopilotTargets(_)) => {
+            execute_autopilot(deps.store.as_ref(), &deps.autopilot, cmd)
+        }
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
         Cmd::RecordRetro {
@@ -2864,6 +2966,7 @@ mod tests {
             },
             runner: &crate::agent::claude::ClaudeRunner,
             status_on_merge: None,
+            autopilot: AutopilotDeps::default(),
         }
     }
 
@@ -4211,6 +4314,7 @@ mod tests {
             cpu_sampler: std::cell::RefCell::new(crate::runs::cpu::CpuSampler::new()),
             home: std::path::PathBuf::new(),
             repo_roots: RepoRootCache::new(Box::new(|_| None)),
+            autopilot: AutopilotDeps::default(),
         }
     }
 
@@ -4593,6 +4697,165 @@ mod tests {
             ),
             other => panic!("expected OverviewLoaded, got {other:?}"),
         }
+    }
+
+    // --- autopilot (GitHub issue #116) ---
+
+    /// A host whose ticker records each scope it ticks, never ticking a
+    /// scope twice inside an hour on its own.
+    fn recording_host() -> (
+        crate::work::autopilot::AutopilotHost,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&calls);
+        let host = crate::work::autopilot::AutopilotHost::spawn(
+            move || {
+                move |target: &crate::work::autopilot::AutopilotTarget| {
+                    seen.lock().unwrap().push(target.scope.clone());
+                    Ok(crate::work::dispatch::TickReport::default())
+                }
+            },
+            Duration::from_secs(3600),
+        );
+        (host, calls)
+    }
+
+    /// Drain `host` until it has reported `count` ticks in total.
+    fn drain_ticks(
+        host: &crate::work::autopilot::AutopilotHost,
+        count: usize,
+    ) -> Vec<crate::work::autopilot::TickOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut outcomes = Vec::new();
+        while outcomes.len() < count {
+            assert!(std::time::Instant::now() < deadline, "{outcomes:?}");
+            outcomes.extend(host.drain());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        outcomes
+    }
+
+    #[test]
+    fn toggling_autopilot_writes_runs_db_so_it_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("runs.db");
+        let deps = watch_deps(crate::runs::RunStore::open(&db).unwrap());
+
+        let msgs = execute_watch(
+            &deps,
+            Cmd::ToggleAutopilot {
+                scope: "github:o/r".to_string(),
+                enabled: true,
+            },
+        );
+
+        assert_eq!(
+            msgs,
+            [Msg::AutopilotToggled {
+                scope: "github:o/r".to_string(),
+                enabled: true,
+                result: Ok(()),
+            }]
+        );
+        let reopened = crate::runs::RunStore::open(&db).unwrap();
+        assert!(reopened.autopilot_enabled("github:o/r").unwrap());
+    }
+
+    #[test]
+    fn loading_autopilot_status_reads_the_flag_and_max_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.set_autopilot("s", true).unwrap();
+        let mut deps = watch_deps(store);
+        deps.autopilot.max_lanes = 3;
+
+        match execute_watch(
+            &deps,
+            Cmd::LoadAutopilotStatus {
+                scopes: vec!["s".to_string()],
+            },
+        )
+        .as_slice()
+        {
+            [Msg::AutopilotStatusLoaded(Ok(status))] => {
+                assert!(status[0].enabled);
+                assert_eq!(status[0].max_lanes, 3);
+            }
+            other => panic!("expected AutopilotStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn targets_go_to_the_host_and_turning_autopilot_on_ticks_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let (host, calls) = recording_host();
+        let mut deps = watch_deps(store);
+        deps.autopilot.host = Some(host);
+        let target = crate::work::autopilot::AutopilotTarget {
+            scope: "s".to_string(),
+            repo_root: std::path::PathBuf::from("/src/s"),
+        };
+
+        assert!(execute_watch(&deps, Cmd::SetAutopilotTargets(vec![target])).is_empty());
+        drain_ticks(deps.autopilot.host.as_ref().unwrap(), 1);
+
+        execute_watch(
+            &deps,
+            Cmd::ToggleAutopilot {
+                scope: "s".to_string(),
+                enabled: true,
+            },
+        );
+        drain_ticks(deps.autopilot.host.as_ref().unwrap(), 1);
+        assert_eq!(*calls.lock().unwrap(), ["s", "s"]);
+    }
+
+    #[test]
+    fn the_board_without_a_runs_db_cannot_toggle_autopilot() {
+        let msgs = execute(
+            &deps(),
+            Cmd::ToggleAutopilot {
+                scope: "s".to_string(),
+                enabled: true,
+            },
+        );
+        match msgs.as_slice() {
+            [
+                Msg::AutopilotToggled {
+                    result: Err(err), ..
+                },
+            ] => assert!(err.contains("runs DB"), "{err}"),
+            other => panic!("expected a failed AutopilotToggled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_ticks_drain_into_autopilot_ticked_msgs() {
+        let (host, _calls) = recording_host();
+        let deps = AutopilotDeps {
+            host: Some(host),
+            max_lanes: 1,
+        };
+        deps.host
+            .as_ref()
+            .unwrap()
+            .set_targets(vec![crate::work::autopilot::AutopilotTarget {
+                scope: "s".to_string(),
+                repo_root: std::path::PathBuf::from("/src/s"),
+            }]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut msgs = Vec::new();
+        while msgs.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            msgs = drain_autopilot(&deps);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            msgs.as_slice(),
+            [Msg::AutopilotTicked(outcome)] if outcome.scope == "s"
+        ));
     }
 
     /// The overview reloads every ~500ms; the worktree fallback spawns a

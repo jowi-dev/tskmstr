@@ -327,6 +327,8 @@ pub struct RawDispatchConfig {
     pub max_fix_rounds: Option<u32>,
     /// See [`DispatchConfig::max_lanes`].
     pub max_lanes: Option<usize>,
+    /// See [`DispatchConfig::tick_secs`].
+    pub tick_secs: Option<u64>,
 }
 
 /// Raw `[review]` section (GitHub issue #120).
@@ -986,6 +988,13 @@ pub const DEFAULT_MAX_FIX_ROUNDS: u32 = 3;
 /// [`DispatchConfig::max_lanes`] when `[dispatch] max_lanes` is unset.
 pub const DEFAULT_DISPATCH_MAX_LANES: usize = 1;
 
+/// [`DispatchConfig::tick_secs`] when `[dispatch] tick_secs` is unset.
+pub const DEFAULT_DISPATCH_TICK_SECS: u64 = 60;
+
+/// The shortest [`DispatchConfig::tick_secs`]. Every tick asks the tracker
+/// for ready tickets, so a smaller configured value is raised to this one.
+pub const MIN_DISPATCH_TICK_SECS: u64 = 10;
+
 /// Validated `[dispatch]` settings (GitHub issues #114, #115 and #120).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchConfig {
@@ -1002,6 +1011,11 @@ pub struct DispatchConfig {
     /// (`crate::work::dispatch::tick`). Every running lane counts, however
     /// it was launched. Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
     pub max_lanes: usize,
+    /// How often a TUI host runs a dispatch tick for each scope it shows
+    /// (GitHub issue #116), in seconds. Defaults to
+    /// [`DEFAULT_DISPATCH_TICK_SECS`]; never less than
+    /// [`MIN_DISPATCH_TICK_SECS`].
+    pub tick_secs: u64,
 }
 
 impl Default for DispatchConfig {
@@ -1010,6 +1024,7 @@ impl Default for DispatchConfig {
             allow_paid_fallback: false,
             max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
             max_lanes: DEFAULT_DISPATCH_MAX_LANES,
+            tick_secs: DEFAULT_DISPATCH_TICK_SECS,
         }
     }
 }
@@ -1884,6 +1899,13 @@ fn merge_with_repo_dir(
             .and_then(|d| d.max_lanes)
             .or(global.dispatch.as_ref().and_then(|d| d.max_lanes))
             .unwrap_or(DEFAULT_DISPATCH_MAX_LANES),
+        tick_secs: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.tick_secs)
+            .or(global.dispatch.as_ref().and_then(|d| d.tick_secs))
+            .unwrap_or(DEFAULT_DISPATCH_TICK_SECS)
+            .max(MIN_DISPATCH_TICK_SECS),
     };
     let review = ReviewConfig {
         resolve_imported: repo
@@ -6210,6 +6232,29 @@ mod tests {
 
         let cfg = load_with("[dispatch]\nmax_lanes = 3\n", None).expect("should load");
         assert_eq!(cfg.dispatch.max_lanes, 3);
+    }
+
+    #[test]
+    fn dispatch_tick_secs_defaults_to_a_minute() {
+        let cfg = load_with("", None).expect("should load");
+        assert_eq!(cfg.dispatch.tick_secs, DEFAULT_DISPATCH_TICK_SECS);
+        assert_eq!(DEFAULT_DISPATCH_TICK_SECS, 60);
+    }
+
+    #[test]
+    fn dispatch_tick_secs_is_merged_repo_over_global() {
+        let cfg = load_with(
+            "[dispatch]\ntick_secs = 300\n",
+            Some("[dispatch]\ntick_secs = 120\n"),
+        )
+        .expect("should load");
+        assert_eq!(cfg.dispatch.tick_secs, 120);
+    }
+
+    #[test]
+    fn dispatch_tick_secs_below_the_floor_is_raised_to_it() {
+        let cfg = load_with("[dispatch]\ntick_secs = 0\n", None).expect("should load");
+        assert_eq!(cfg.dispatch.tick_secs, MIN_DISPATCH_TICK_SECS);
     }
 
     #[test]

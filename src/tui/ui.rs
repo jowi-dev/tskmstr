@@ -20,7 +20,7 @@ use ratatui::widgets::{
 
 use crate::agent::AgentRunner;
 use crate::cli::runs::format_age;
-use crate::runs::overview::{LIFECYCLE_COLUMNS, OverviewRow, Stage};
+use crate::runs::overview::{LIFECYCLE_COLUMNS, Stage};
 use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
@@ -178,7 +178,7 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
 /// the pending indicator for in-flight network actions (GitHub issue #56)
 /// appended after both.
 fn status_line_text(app: &App) -> String {
-    let base = status_line_with_filter(app);
+    let base = with_autopilot(app, status_line_with_filter(app));
     if app.in_flight.is_empty() {
         return base;
     }
@@ -192,6 +192,20 @@ fn status_line_text(app: &App) -> String {
         pending
     } else {
         format!("{base}  |  {pending}")
+    }
+}
+
+/// `base` with the board's autopilot summary in front (GitHub issue #116),
+/// once its status has loaded.
+fn with_autopilot(app: &App, base: String) -> String {
+    let summary = match (&app.screen, &app.autopilot_scope) {
+        (Screen::Board, Some(scope)) => crate::tui::autopilot::summary_for(app, scope),
+        _ => None,
+    };
+    match summary {
+        Some(summary) if base.is_empty() => summary,
+        Some(summary) => format!("{summary}  |  {base}"),
+        None => base,
     }
 }
 
@@ -253,7 +267,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -270,7 +284,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
             "j/k move  d defect  c clean  r refresh  o browser  Esc back  ? help  q quit"
         }
         Screen::Overview => {
-            "h/l/j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  c: columns/queue  Tab: watch  r: refresh  q: quit"
+            "h/l/j/k: move  s: attach  v: view run  L: logs  B: board  V: vdiff  F: fix  M: merge  Space: queue  c: columns/queue  P: autopilot  Tab: watch  r: refresh  q: quit"
         }
     }
 }
@@ -815,7 +829,7 @@ fn draw_retro_note_entry(frame: &mut Frame, app: &App) {
 /// counts strip above the attention queue, one row per `(scope, ticket)` in
 /// [`App::overview_rows`]' order (already the queue order).
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
-    let strip = project_strip_lines(&app.overview_rows);
+    let strip = project_strip_lines(app);
     let strip_height = u16::try_from(strip.len().max(1))
         .unwrap_or(u16::MAX)
         .saturating_add(2);
@@ -828,7 +842,11 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .areas(area);
 
-    frame.render_widget(system_header_line(app.system_header.as_ref()), header_area);
+    let autopilot_on = app.autopilot.iter().filter(|status| status.enabled).count();
+    frame.render_widget(
+        system_header_line(app.system_header.as_ref(), autopilot_on),
+        header_area,
+    );
 
     let block = |title: &'static str| {
         Block::default()
@@ -948,15 +966,23 @@ fn auto_review_style(round: &str) -> Style {
 /// The overview's system header (GitHub issue #86): the
 /// [`SystemHeader::summary`] line, dim normally and drawn as a warning when
 /// [`SystemHeader::launch_blocked`] says a new lane would be refused.
-fn system_header_line(header: Option<&SystemHeader>) -> Paragraph<'static> {
-    let span = match header {
+/// When `autopilot_on` scopes have autopilot on (GitHub issue #116), the
+/// line ends with that count; each scope's detail is on its strip line.
+fn system_header_line(header: Option<&SystemHeader>, autopilot_on: usize) -> Paragraph<'static> {
+    let mut spans = vec![match header {
         None => Span::styled(" sampling system…", theme::DIM),
         Some(header) if header.launch_blocked() => {
             Span::styled(format!(" {}", header.summary()), theme::STALE_MARKER)
         }
         Some(header) => Span::styled(format!(" {}", header.summary()), theme::DIM),
-    };
-    Paragraph::new(Line::from(span))
+    }];
+    if autopilot_on > 0 {
+        spans.push(Span::styled(
+            format!(" · autopilot on: {autopilot_on}"),
+            theme::DIM,
+        ));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 /// [`OverviewLayout::Columns`] (GitHub issue #85, ADR-0009 layout 1): one
@@ -1037,7 +1063,10 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
 /// The overview's project strip: one `"{project}  {counts}"` line per scope,
 /// sorted by scope, labels padded to a common width. Counts list each stage
 /// the project has rows in, in queue order, e.g. `1 needs input · 2 running`.
-fn project_strip_lines(rows: &[OverviewRow]) -> Vec<String> {
+/// A scope with autopilot on ends with its autopilot summary (GitHub issue
+/// #116).
+fn project_strip_lines(app: &App) -> Vec<String> {
+    let rows = &app.overview_rows;
     let mut by_scope: std::collections::BTreeMap<&str, Vec<Stage>> =
         std::collections::BTreeMap::new();
     for row in rows {
@@ -1059,7 +1088,12 @@ fn project_strip_lines(rows: &[OverviewRow]) -> Vec<String> {
                 .into_iter()
                 .map(|(stage, n)| format!("{n} {}", stage_label(stage)))
                 .collect();
-            format!("{:<width$}  {}", project_label(scope), counts.join(" · "))
+            let line = format!("{:<width$}  {}", project_label(scope), counts.join(" · "));
+            let on = crate::tui::autopilot::status_for(app, scope).is_some_and(|s| s.enabled);
+            match crate::tui::autopilot::summary_for(app, scope) {
+                Some(summary) if on => format!("{line}  · {summary}"),
+                _ => line,
+            }
         })
         .collect()
 }
@@ -1779,6 +1813,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("M       merge PR / merge queue"),
         Line::from("Space   toggle merge queue"),
         Line::from("R       retro verdict"),
+        Line::from("P       toggle autopilot"),
     ];
     frame.render_widget(Paragraph::new(navigation), columns[0]);
     frame.render_widget(Paragraph::new(actions), columns[1]);
@@ -2138,6 +2173,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::runs::RetroSeverity;
+    use crate::runs::overview::OverviewRow;
     use crate::ticketing::types::{Status, StatusCategory, Transition};
     use crate::tui::app::BrowserPickerOption;
     use crate::tui::app::{
@@ -4429,6 +4465,94 @@ mod tests {
 
         assert!(text.contains("alpha  1 needs input · 2 running"), "{text}");
         assert!(text.contains("beta   1 stuck"), "{text}");
+    }
+
+    // --- autopilot (GitHub issue #116) ---
+
+    fn autopilot_status(
+        scope: &str,
+        enabled: bool,
+        refusal: Option<&str>,
+    ) -> crate::work::autopilot::AutopilotStatus {
+        crate::work::autopilot::AutopilotStatus {
+            scope: scope.to_string(),
+            enabled,
+            running_lanes: 1,
+            max_lanes: 2,
+            last_refusal: refusal.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn overview_strip_shows_each_scopes_autopilot_and_its_refusal() {
+        let mut app = overview_app(vec![
+            overview_row("github:me/alpha", "GH-1", Stage::Running),
+            overview_row("github:me/beta", "GH-4", Stage::Stuck),
+        ]);
+        app.autopilot = vec![
+            autopilot_status("github:me/alpha", true, Some("paused: usage 87%")),
+            autopilot_status("github:me/beta", false, None),
+        ];
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+
+        let alpha = text.lines().find(|l| l.contains("alpha  1 running"));
+        assert!(
+            alpha
+                .unwrap()
+                .contains("autopilot on · lanes 1/2 · paused: usage 87%"),
+            "{text}"
+        );
+        let beta = text.lines().find(|l| l.contains("beta   1 stuck"));
+        assert!(!beta.unwrap().contains("autopilot"), "{text}");
+    }
+
+    #[test]
+    fn overview_header_counts_the_scopes_with_autopilot_on() {
+        let mut app = App {
+            system_header: Some(system_header(
+                crate::runs::footprint::MemoryPressure::Normal,
+            )),
+            ..overview_app(vec![overview_row(
+                "github:me/alpha",
+                "GH-1",
+                Stage::Running,
+            )])
+        };
+        app.autopilot = vec![autopilot_status("github:me/alpha", true, None)];
+        let text = buffer_text(&render_with_size(&app, 160, 24));
+        let header = text.lines().next().unwrap();
+        assert!(header.contains("autopilot on: 1"), "{header}");
+    }
+
+    #[test]
+    fn board_status_bar_shows_its_scopes_autopilot() {
+        let mut app = App {
+            autopilot_scope: Some("github:me/alpha".to_string()),
+            ..App::new()
+        };
+        app.autopilot = vec![autopilot_status("github:me/alpha", false, None)];
+        assert!(status_line_text(&app).starts_with("autopilot off"));
+
+        app.autopilot = vec![autopilot_status("github:me/alpha", true, None)];
+        app.autopilot_errors
+            .insert("github:me/alpha".to_string(), "gh: timed out".to_string());
+        app.status_line = "loaded".to_string();
+        assert_eq!(
+            status_line_text(&app),
+            "autopilot on · lanes 1/2 · tick failed: gh: timed out  |  loaded"
+        );
+    }
+
+    #[test]
+    fn help_and_hints_name_the_autopilot_key() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(text.contains("toggle autopilot"), "{text}");
+        assert!(hint_for(Screen::Board, false).contains("P autopilot"));
+        assert!(hint_for(Screen::Overview, false).contains("P: autopilot"));
     }
 
     fn system_header(pressure: crate::runs::footprint::MemoryPressure) -> SystemHeader {
