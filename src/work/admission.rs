@@ -15,6 +15,15 @@
 //! Admission is off unless a budget is configured. Off means no check at
 //! all, the pressure gate included, so launches behave as they did before
 //! this module existed.
+//!
+//! Usage admission (GitHub issue #114), [`check_usage_admission`], sits
+//! beside it. It refuses a launch while the agent's subscription usage
+//! windows are at their configured ceilings, as read from runs.db's
+//! `usage_snapshots`, and probes for a fresh value through a
+//! [`UsageProber`] when the snapshot is stale. [`apply_usage_gate`] decides
+//! whether a refusal only warns (a manual `tm work run`) or blocks
+//! (unattended dispatch). See `docs/plans/gh-113-proactive-usage-signal.md`
+//! and ADR-0008's GH-114 amendment.
 
 use std::collections::HashMap;
 use std::fmt;

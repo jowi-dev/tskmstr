@@ -955,6 +955,56 @@ Only `running` lane runs count, so a finished run frees its share at once.
 Gigabytes here are GiB, the same unit Activity Monitor labels "GB". A
 refused launch is not queued; launch it again once memory frees up.
 
+### Usage admission
+
+Before a lane launches, tm also checks how much of the subscription's usage
+windows are used (GitHub issue #114). It reads the `usage_snapshots` table,
+which claude lane runs fill from the `rate_limit_event` in their stream-json
+output. The check:
+
+- **refuses** while the agent is marked exhausted (ADR-0008's
+  `exhausted_until`, also set when the server reports `rejected`).
+- **refuses** when the `five_hour` or `seven_day` window is at or above its
+  ceiling. A window past its `resets_at` counts as 0. The reason reads like
+  `not launching: claude 5h usage at 83% >= 80% ceiling, resets in 1h 12m`.
+- **probes** when there is no snapshot, or a window's snapshot is older than
+  `snapshot_max_age_secs` and the window hasn't reset. The probe is one
+  Haiku turn (`claude -p 'ok' --model haiku --max-turns 1 --output-format
+  stream-json --verbose`). It runs in an empty temp directory with the same
+  billing-safety env stripping as a lane run, and its result is stored with
+  source `probe`. Concurrent `tm` processes share one probe per max-age
+  window. If the probe fails, the launch isn't refused for staleness: the
+  verdict says `usage unknown`, and ADR-0008's reactive fallback still
+  catches an exhausted window at run time.
+
+A manual `tm work run` only warns (`warning: not launching: ... (launching
+anyway)`), because you chose to launch. The dispatcher (GitHub issue #115)
+enforces the same check as a hard gate.
+
+```toml
+[agent.claude]
+five_hour_ceiling = 0.80       # default; leaves headroom for interactive work
+seven_day_ceiling = 0.90       # default
+snapshot_max_age_secs = 600    # default; also the minimum gap between probes
+# billing = "subscription"     # default for claude; "metered" for opencode
+
+[agent.opencode]
+# A runner with no usage signal (opencode, or claude under an API key) can
+# have a token budget per rolling window instead, summed from runs.db
+# (input + output tokens). Off unless set; never used while snapshots exist.
+# token_budget = 5000000
+# token_budget_window_hours = 5
+
+[dispatch]
+# Unattended dispatch never routes to a metered (pay-per-token) runner
+# unless this is set, so a used-up subscription window can't silently
+# become real spend.
+allow_paid_fallback = false
+```
+
+These keys only set limits. They don't select a runner, so `[agent]`'s
+`runner`/`strategy`/`order` work as before.
+
 ### Limiting concurrent cargo builds (`[work] build_slots`)
 
 Parallel lanes each run `cargo` from inside their agent, and cargo starts
