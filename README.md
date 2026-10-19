@@ -452,6 +452,13 @@ row, placed in the most urgent stage its runs reach and sorted by that
 stage, oldest first within it:
 
 - **needs input**: a running session awaiting input, or a hibernated one
+- **awaiting review** (GitHub issue #119): the machine is done and it is
+  your turn. A run recorded the PR, the latest `tm pr watch` finished clean
+  (or with findings whose bugbot-cleanup session has finished), nothing is
+  live for the ticket, and nothing failed since the watch. `V` reads the
+  diff, `F` sends it back for a fix pass, `M`/`Space` accepts it into the
+  merge queue. The row shows how many fix passes it has had (`2 fixes`).
+  `tm merge` records the merge on the watch, so a merged ticket drops out.
 - **stuck**: the latest run failed, was interrupted, or is blocked, or a
   running run's heartbeat is more than 10 minutes stale
 - **running**: a live run that needs nothing from you
@@ -497,10 +504,10 @@ lands on the card's ticket.
 
 `c` switches the queue to lifecycle columns and back (GitHub issue #85):
 one column per stage, left to right in the order a ticket lives through
-them (not started, running, needs input, needs review, conflicted, ready
-to merge, stuck), each card tagged with its project. It is the same rows
-as the queue, so nothing is refetched and the highlighted ticket stays
-highlighted. In columns, `h`/`l` move between non-empty columns and
+them (not started, running, needs input, awaiting review, needs review,
+conflicted, ready to merge, stuck), each card tagged with its project. It
+is the same rows as the queue, so nothing is refetched and the highlighted
+ticket stays highlighted. In columns, `h`/`l` move between non-empty columns and
 `j`/`k` within one. The layout is kept across `Tab` to watch and back.
 
 The read actions route by the row itself (GitHub issue #87). `v` opens the

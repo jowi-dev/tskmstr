@@ -61,6 +61,14 @@ as the follow-up tickets listed under **Slices**.
    Ties break by age in current stage, oldest first. A ticket appears
    exactly once, in its highest-ranked stage.
 
+   *Amended by GitHub issue #119:* an **Awaiting review** stage sits at
+   rank 2, pushing the others down one. It is the autopilot's human stop:
+   a PR is recorded, the latest `review-watch` finished (`done`, or
+   `review` with its bugbot-cleanup run finished), the watch has no
+   `pr_closed` event, no run of the ticket is live, and no run since the
+   watch failed. It is derived from the run db alone, and gets its own
+   lifecycle column between Needs input and Needs review.
+
 2. **New entry point `tm overview`; `tm runs watch` stays as it is.**
    The two views have different nouns. Watch is per **run**: it shows
    audit, retro, review-fix and bot-watch runs, several runs per ticket,
