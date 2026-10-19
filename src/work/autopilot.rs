@@ -40,17 +40,18 @@ pub struct AutopilotTarget {
     pub repo_root: PathBuf,
 }
 
-/// Runs one dispatch tick for a target. Production builds the tick's
-/// dependencies inside the call, since a ticket provider and a run store
-/// can't cross threads; tests use a closure.
-pub trait ScopeTicker: Send + 'static {
+/// Runs one dispatch tick for a target. It is built on the host thread
+/// ([`AutopilotHost::spawn`]) and never leaves it, so it needn't be `Send`:
+/// production keeps a ticket provider per repo, which can't cross threads.
+/// Tests use a closure.
+pub trait ScopeTicker {
     /// Tick `target`, rendering any error as a message for the view.
     fn tick(&self, target: &AutopilotTarget) -> Result<TickReport, String>;
 }
 
 impl<F> ScopeTicker for F
 where
-    F: Fn(&AutopilotTarget) -> Result<TickReport, String> + Send + 'static,
+    F: Fn(&AutopilotTarget) -> Result<TickReport, String>,
 {
     fn tick(&self, target: &AutopilotTarget) -> Result<TickReport, String> {
         self(target)
@@ -81,12 +82,16 @@ pub struct AutopilotHost {
 
 impl AutopilotHost {
     /// Start the host thread, ticking each target at most once per
-    /// `interval`. It ticks nothing until [`AutopilotHost::set_targets`] is
-    /// called.
-    pub fn spawn(ticker: impl ScopeTicker, interval: Duration) -> Self {
+    /// `interval`. The thread first builds its ticker with `build`. It ticks
+    /// nothing until [`AutopilotHost::set_targets`] is called.
+    pub fn spawn<T, B>(build: B, interval: Duration) -> Self
+    where
+        T: ScopeTicker,
+        B: FnOnce() -> T + Send + 'static,
+    {
         let (commands, command_rx) = mpsc::channel();
         let (result_tx, results) = mpsc::channel();
-        thread::spawn(move || run(ticker, interval, command_rx, result_tx));
+        thread::spawn(move || run(build(), interval, command_rx, result_tx));
         Self { commands, results }
     }
 
@@ -283,7 +288,7 @@ mod tests {
     #[test]
     fn ticks_each_target_once_per_interval_and_again_on_tick_now() {
         let (calls, ticker) = recording_ticker("");
-        let host = AutopilotHost::spawn(ticker, Duration::from_secs(60));
+        let host = AutopilotHost::spawn(move || ticker, Duration::from_secs(60));
 
         host.set_targets(vec![target("a"), target("b")]);
         drain_until(&host, 2);
@@ -302,7 +307,7 @@ mod tests {
     #[test]
     fn a_failing_tick_is_reported_and_the_loop_keeps_ticking() {
         let (calls, ticker) = recording_ticker("a");
-        let host = AutopilotHost::spawn(ticker, Duration::from_millis(1));
+        let host = AutopilotHost::spawn(move || ticker, Duration::from_millis(1));
 
         host.set_targets(vec![target("a"), target("b")]);
         let outcomes = drain_until(&host, 4);
@@ -320,7 +325,7 @@ mod tests {
     #[test]
     fn a_dropped_target_stops_being_ticked() {
         let (calls, ticker) = recording_ticker("");
-        let host = AutopilotHost::spawn(ticker, Duration::from_millis(1));
+        let host = AutopilotHost::spawn(move || ticker, Duration::from_millis(1));
 
         host.set_targets(vec![target("a")]);
         drain_until(&host, 1);

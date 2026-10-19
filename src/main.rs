@@ -975,6 +975,15 @@ fn run_board(
         },
     )?;
 
+    // The board ticks its own repo (GitHub issue #116).
+    let autopilot = autopilot_deps(
+        Some(&config),
+        vec![tskmstr::work::autopilot::AutopilotTarget {
+            scope: current_backend_identity.scope(),
+            repo_root: git_common_repo_root().unwrap_or_else(|| cwd.clone()),
+        }],
+    );
+
     // Audit-dir fallback (GitHub issue #5 phase 2): fall back to the
     // current repo, rather than refuse, when the configured audit dir's
     // backend is incompatible -- see `resolve_audit_host_dir`'s doc
@@ -1034,6 +1043,7 @@ fn run_board(
             backend_identity: current_backend_identity,
             runner,
             status_on_merge: config.status_on_merge,
+            autopilot,
         },
         net,
     )?;
@@ -2570,6 +2580,171 @@ fn watch_deps(
                 })
                 .flatten()
         })),
+        autopilot: autopilot_deps(config, Vec::new()),
+    }
+}
+
+/// The production [`tskmstr::work::autopilot::ScopeTicker`] (GitHub issue
+/// #116): one `dispatch::tick` per call, with its dependencies built from
+/// the target repo's own config, which is re-read every tick.
+///
+/// It lives on the host thread for the life of the view. It keeps one
+/// ticket provider per repo root because the GitHub provider leaks a
+/// run-store connection each time one is built (see
+/// [`ticket_provider_for`]); building one per tick would leak a connection
+/// a minute.
+struct AutopilotTicker {
+    env_token: Option<String>,
+    home: PathBuf,
+    providers: std::cell::RefCell<std::collections::HashMap<PathBuf, Box<dyn TicketProvider>>>,
+}
+
+impl tskmstr::work::autopilot::ScopeTicker for AutopilotTicker {
+    fn tick(
+        &self,
+        target: &tskmstr::work::autopilot::AutopilotTarget,
+    ) -> Result<tskmstr::work::dispatch::TickReport, String> {
+        self.try_tick(target).map_err(|err| err.to_string())
+    }
+}
+
+impl AutopilotTicker {
+    fn try_tick(
+        &self,
+        target: &tskmstr::work::autopilot::AutopilotTarget,
+    ) -> Result<tskmstr::work::dispatch::TickReport, Box<dyn std::error::Error>> {
+        use tskmstr::work::dispatch;
+
+        let config = config::load(&config::default_paths(&self.home, Some(&target.repo_root)))?;
+        let identity = tskmstr::config::BackendIdentity::from_config(&config);
+        let scope = identity.scope();
+        if scope != target.scope {
+            return Err(format!(
+                "{} is configured for {scope}, not {}",
+                target.repo_root.display(),
+                target.scope
+            )
+            .into());
+        }
+        let db_path = run_db_path_from_config(&config);
+        let store = tskmstr::runs::RunStore::open(&db_path)?;
+        // `tick` reads the flag too, but checking first means a scope with
+        // autopilot off never builds a ticket provider or touches the
+        // keychain.
+        if !store.autopilot_enabled(&scope)? {
+            return Ok(dispatch::TickReport {
+                skipped: Some(dispatch::Skip::Disabled),
+                ..Default::default()
+            });
+        }
+
+        let mut providers = self.providers.borrow_mut();
+        let jira =
+            match providers.entry(target.repo_root.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    ticket_provider_for(&config, &MacosKeychain::new(), self.env_token.clone())?,
+                ),
+            };
+        let gh = ShellGhCli::new();
+        let audit_store = open_ready_audit_store(&config);
+        let candidates = tskmstr::cli::ready::ReadyContext {
+            jira: jira.as_ref(),
+            gh: &gh,
+            review_bots: &config.review_bots,
+            in_flight: ready_in_flight(&config),
+            audit: ready_audit_gate(&config, &audit_store),
+        };
+
+        let (lane_names, _hidden) = tskmstr::config::compatible_lane_names(
+            &identity,
+            &config.work.lanes,
+            &tskmstr::config::FsBackendIdentityResolver {
+                home: self.home.clone(),
+            },
+        );
+        let lanes: Vec<dispatch::LaneChoice> = lane_names
+            .into_iter()
+            .map(|name| dispatch::LaneChoice {
+                repo: tskmstr::work::run::lane_repo_key(&name, &config.work.lanes[&name]),
+                name,
+            })
+            .collect();
+        let runner = tskmstr::agent::routing::configured_unattended_order(
+            config.agent,
+            &config.agent_fallbacks,
+            &config.usage,
+            &config.dispatch,
+        )
+        .first()
+        .map(|kind| tskmstr::agent::routing::runner_for(*kind));
+        let spawner = tskmstr::work::runner::StdProcessSpawner;
+        let usage_prober = tskmstr::work::admission::SpawnUsageProber {
+            runners: runner.into_iter().collect(),
+            spawner: &spawner,
+        };
+        let launcher = dispatch::CommandLauncher {
+            program: std::env::current_exe()?,
+            cwd: target.repo_root.clone(),
+        };
+        let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let lock = dispatch::FileScopeLock {
+            dir: dispatch::default_lock_dir(
+                xdg_runtime_dir.as_deref(),
+                db_path.parent().unwrap_or(Path::new(".")),
+            ),
+        };
+
+        let deps = dispatch::TickDeps {
+            store: &store,
+            lock: &lock,
+            candidates: &candidates,
+            launcher: &launcher,
+            memory_pressure: &tskmstr::runs::footprint::memory_pressure,
+            usage_prober: &usage_prober,
+            now: unix_now(),
+        };
+        let cfg = dispatch::TickConfig {
+            scope: &scope,
+            max_lanes: config.dispatch.max_lanes,
+            lanes: &lanes,
+            agent: runner.map(|runner| runner.name()),
+            memory: &config.work.memory,
+            usage: &config.usage,
+        };
+        Ok(dispatch::tick(&deps, &cfg)?)
+    }
+}
+
+/// The autopilot host for a board or overview started with `config`
+/// (GitHub issue #116): a host thread ticking every `[dispatch] tick_secs`,
+/// already pointed at `targets`. No host without a config, since a tick
+/// can't route without one.
+fn autopilot_deps(
+    config: Option<&Config>,
+    targets: Vec<tskmstr::work::autopilot::AutopilotTarget>,
+) -> tskmstr::tui::event::AutopilotDeps {
+    let Some(config) = config else {
+        return tskmstr::tui::event::AutopilotDeps::default();
+    };
+    let env_token = std::env::var("JIRA_API_TOKEN").ok();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let host = tskmstr::work::autopilot::AutopilotHost::spawn(
+        move || AutopilotTicker {
+            env_token,
+            home,
+            providers: Default::default(),
+        },
+        std::time::Duration::from_secs(config.dispatch.tick_secs),
+    );
+    if !targets.is_empty() {
+        host.set_targets(targets);
+    }
+    tskmstr::tui::event::AutopilotDeps {
+        host: Some(host),
+        max_lanes: config.dispatch.max_lanes,
     }
 }
 

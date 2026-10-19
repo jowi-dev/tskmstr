@@ -3,6 +3,7 @@
 //! final terminal wiring is testable without a real terminal.
 
 pub mod app;
+pub mod autopilot;
 pub mod event;
 pub mod keymap;
 pub mod launcher;

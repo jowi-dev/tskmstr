@@ -821,6 +821,19 @@ pub struct App {
     /// [`Screen::Overview`]'s system header (GitHub issue #86), from the
     /// latest [`Msg::SystemLoaded`]; `None` until the first sample lands.
     pub system_header: Option<crate::runs::system::SystemHeader>,
+    /// The scope `P` toggles autopilot for on [`Screen::Board`] (GitHub
+    /// issue #116): the board's own repo. `None` on the overview, where `P`
+    /// uses the highlighted row's scope.
+    pub autopilot_scope: Option<String>,
+    /// Each shown scope's autopilot state, from the latest
+    /// [`Msg::AutopilotStatusLoaded`]. See [`crate::tui::autopilot`].
+    pub autopilot: Vec<crate::work::autopilot::AutopilotStatus>,
+    /// The error of each scope's newest tick, when that tick failed.
+    /// Cleared by the scope's next tick that succeeds.
+    pub autopilot_errors: std::collections::BTreeMap<String, String>,
+    /// The scopes last handed to the autopilot host thread, so the overview
+    /// only sends [`Cmd::SetAutopilotTargets`] when they change.
+    pub autopilot_targets: Vec<crate::work::autopilot::AutopilotTarget>,
     /// Whether the run detail floating window is shown.
     pub show_run_detail: bool,
     /// Detail for the run shown in the floating window, `None` while it's
@@ -1436,6 +1449,23 @@ pub enum Msg {
     OverviewLoaded(Vec<crate::runs::overview::OverviewRow>),
     /// [`Screen::Overview`]'s system header was sampled (GitHub issue #86).
     SystemLoaded(crate::runs::system::SystemHeader),
+    /// `P` on [`Screen::Board`] or [`Screen::Overview`]: flip autopilot for
+    /// the board's scope or the highlighted row's (GitHub issue #116).
+    ToggleAutopilot,
+    /// [`Cmd::ToggleAutopilot`] finished.
+    AutopilotToggled {
+        /// The scope whose flag was written.
+        scope: String,
+        /// The value written.
+        enabled: bool,
+        /// The store error, if the write failed.
+        result: Result<(), String>,
+    },
+    /// [`Cmd::LoadAutopilotStatus`] finished, or failed with the store
+    /// error.
+    AutopilotStatusLoaded(Result<Vec<crate::work::autopilot::AutopilotStatus>, String>),
+    /// The autopilot host thread finished one tick.
+    AutopilotTicked(crate::work::autopilot::TickOutcome),
     /// The `f` key was pressed on [`Screen::Runs`]: advance the kind view
     /// filter to the next distinct kind among the loaded runs (then back to
     /// unfiltered). See [`cycle_run_kind_filter`].
@@ -1639,6 +1669,21 @@ pub enum Cmd {
     LoadOverview,
     /// Sample [`Screen::Overview`]'s system header (GitHub issue #86).
     LoadSystem,
+    /// Read each scope's autopilot status from runs.db (GitHub issue #116).
+    LoadAutopilotStatus {
+        /// The scopes to read, in display order.
+        scopes: Vec<String>,
+    },
+    /// Write `scope`'s runs.db autopilot flag. Turning it on also asks the
+    /// host thread to tick now rather than at its next interval.
+    ToggleAutopilot {
+        /// The scope to write.
+        scope: String,
+        /// The value to write.
+        enabled: bool,
+    },
+    /// Replace the scopes the autopilot host thread ticks.
+    SetAutopilotTargets(Vec<crate::work::autopilot::AutopilotTarget>),
     /// Load the full detail (including its event timeline) of one run, for
     /// the run detail floating window.
     LoadRunDetail {
@@ -2423,6 +2468,17 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.system_header = Some(header);
             (app, Vec::new())
         }
+        Msg::ToggleAutopilot => crate::tui::autopilot::toggle(app),
+        Msg::AutopilotToggled {
+            scope,
+            enabled,
+            result,
+        } => crate::tui::autopilot::toggled(app, scope, enabled, result),
+        Msg::AutopilotStatusLoaded(result) => (
+            crate::tui::autopilot::status_loaded(app, result),
+            Vec::new(),
+        ),
+        Msg::AutopilotTicked(outcome) => crate::tui::autopilot::ticked(app, outcome),
         Msg::ToggleOverviewLayout => {
             app.overview_layout = match app.overview_layout {
                 OverviewLayout::Queue => OverviewLayout::Columns,
@@ -2432,7 +2488,10 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::OverviewLoaded(rows) => {
             overview_loaded(&mut app, rows);
-            (app, Vec::new())
+            let cmds = crate::tui::autopilot::sync_targets(&mut app)
+                .into_iter()
+                .collect();
+            (app, cmds)
         }
         Msg::CycleRunKindFilter => cycle_run_kind_filter(app),
         Msg::CycleRunScopeFilter => cycle_run_scope_filter(app),
@@ -3388,6 +3447,7 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
             // walk behind it stays cheap.
             if app.watch_tick.is_multiple_of(8) {
                 cmds.push(Cmd::LoadSystem);
+                cmds.extend(crate::tui::autopilot::status_cmd(&app));
             }
             if app.watch_tick.is_multiple_of(120) {
                 cmds.push(Cmd::ReapRuns);
@@ -3426,6 +3486,7 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
                 cmds.push(Cmd::LoadLaneRunStatus);
                 cmds.push(Cmd::LoadBotWatchStatus);
                 cmds.push(Cmd::LoadCleanupStatus);
+                cmds.extend(crate::tui::autopilot::status_cmd(&app));
             }
             if app.watch_tick.is_multiple_of(2)
                 && app.show_run_detail
