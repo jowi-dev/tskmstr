@@ -1059,6 +1059,7 @@ is set. It also refuses, rather than warns, when usage admission says no.
 [dispatch]
 max_lanes = 1               # default; the most lane runs at once
 allow_paid_fallback = false # default; see "Usage admission" above
+tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
 ```
 
 ### Running autopilot without a TUI (`tm dispatch`)
