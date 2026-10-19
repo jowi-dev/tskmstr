@@ -810,6 +810,11 @@ fn classify_rate_limit_error(error: &RawErrorEvent) -> Option<RateLimitInfo> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn opencode_has_no_usage_probe() {
+        assert!(OpencodeRunner.usage_probe_invocation().is_none());
+    }
+
     fn base_inputs() -> InvocationInputs {
         InvocationInputs {
             prompt: "do the thing".to_string(),

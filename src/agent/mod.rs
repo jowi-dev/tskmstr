@@ -644,6 +644,15 @@ pub trait AgentRunner: Sync {
     /// positional argument. Replaces `work::audit::claude_command`.
     fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String;
 
+    /// The cheapest headless invocation whose output carries a usage
+    /// snapshot ([`RunOutcome::usage`]), for usage admission to refresh a
+    /// stale one (GitHub issue #114). `None` for a runner that reports no
+    /// usage signal, which is never probed. The invocation must strip the
+    /// same billing-safety env vars as a lane run.
+    fn usage_probe_invocation(&self) -> Option<AgentInvocation> {
+        None
+    }
+
     /// The prompt text of an [`AgentInvocation`] built for
     /// [`RunMode::Interactive`] — the string a caller like
     /// `crate::work::interactive::launch_interactive_run` writes to the
