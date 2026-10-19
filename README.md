@@ -541,6 +541,11 @@ A row needs its repo root. Runs started before the `runs.repo_root` column
 existed don't have one, so their actions stay disabled and the status line
 says why.
 
+`P` turns autopilot on or off for the highlighted row's repo (GitHub issue
+#116). A project with autopilot on ends its strip line with its state, and
+the system header counts those projects. See "Running autopilot from the
+TUI" below.
+
 ### `Interrupted` vs. `Failed`, and recovering a run
 
 `Failed` means the agent ran and reported failure (a non-zero `claude` exit,
@@ -1062,6 +1067,40 @@ allow_paid_fallback = false # default; see "Usage admission" above
 tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
 ```
 
+#### Running autopilot from the TUI
+
+`P` on `tm board` turns autopilot on or off for the board's repo. On `tm
+overview` it does the same for the highlighted row's repo. It writes
+runs.db's `autopilot` flag, so the setting survives a restart and every
+host sees it.
+
+While `tm board` or `tm overview` is open, a background thread runs a tick
+for each repo it shows, every `tick_secs`. The board ticks its own repo.
+The overview ticks each project in its strip that it has a repo root for.
+Turning autopilot on ticks at once. A tick reads the tracker, so it never
+runs on the thread that draws the screen. Each tick loads that repo's own
+config, so `max_lanes`, the lanes and the runners all come from it.
+
+A tick whose scope has autopilot off does nothing. Two open TUIs (or a TUI
+and `tm dispatch`) take the same per-scope lock, so they never launch the
+same ticket.
+
+The board's status bar starts with its repo's state. On the overview, a
+project with autopilot on shows it at the end of its strip line:
+
+```
+autopilot on · lanes 1/2 · not launching: 2 lanes running, [dispatch] max_lanes is 2
+```
+
+- **lanes**: lane runs running now, across every repo, against `max_lanes`
+  from the config you started the TUI from
+- the last part is the newest tick's refusal, from `dispatch_events`. It
+  clears once a later tick launches something. A tick that failed outright,
+  such as a tracker timeout, shows `tick failed: <error>` instead until a
+  tick succeeds. The thread keeps ticking either way.
+
+When a tick launches lanes, the status line names them.
+
 ### Running autopilot without a TUI (`tm dispatch`)
 
 `tm dispatch` hosts the dispatcher from the command line (GitHub issue
@@ -1192,6 +1231,7 @@ to" windows.
 | `M` | Merge the selected ticket's open PR, after a confirmation prompt naming the PR and the post-merge status: runs the full `tm merge <KEY>` flow in the background, board stays responsive (board only); with tickets queued via `Space`, confirms and merges the whole queue in one `tm merge KEY1 KEY2 ...` instead; see "Merging from the board" below |
 | `Space` | Toggle the selected ticket in or out of the merge queue, marked `+` on its card (board only; on the priority screen `Space` grabs/drops instead) |
 | `R` | Open the retro board (board only); see "Retro board" below |
+| `P` | Turn autopilot on or off for the board's repo, or for the highlighted row's repo on `tm overview`; see "Running autopilot from the TUI" below |
 | `?` | Toggle the help overlay (any other key closes it; `q` still quits) |
 
 ### Filtering the board by assignee
