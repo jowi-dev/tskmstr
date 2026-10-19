@@ -88,6 +88,34 @@ pub trait Launcher {
     fn launch(&self, lane: &str, ticket: &str) -> Result<(), String>;
 }
 
+/// Production [`Launcher`]: runs `<program> work run --unattended <lane>
+/// <ticket>` in `cwd` and waits for it. `tm work run --unattended` is
+/// headless, so it returns once it has started the run row and handed the
+/// agent to a detached supervisor. It also re-checks memory and usage
+/// admission, and keeps metered runners out of the fallback chain.
+pub struct CommandLauncher {
+    /// The `tm` binary, normally `std::env::current_exe()`.
+    pub program: PathBuf,
+    /// Where to run it: the scope's repo, so `tm` loads its config.
+    pub cwd: PathBuf,
+}
+
+impl Launcher for CommandLauncher {
+    fn launch(&self, lane: &str, ticket: &str) -> Result<(), String> {
+        let output = std::process::Command::new(&self.program)
+            .args(["work", "run", "--unattended", lane, ticket])
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|err| format!("could not run {}: {err}", self.program.display()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{}: {}", output.status, stderr.trim()))
+    }
+}
+
 /// Held for as long as a tick runs; dropping it releases the scope lock.
 pub struct ScopeGuard {
     _file: Option<File>,
@@ -1088,6 +1116,56 @@ mod tests {
         assert_eq!(busy.get("GH-2"), Some(&InHand::Attempted));
         assert_eq!(busy.get("GH-3"), Some(&InHand::OpenPr));
         assert_eq!(busy.get("GH-4"), Some(&InHand::FixRoundCap));
+    }
+
+    /// A stand-in `tm` that logs its argv and cwd, then exits `code`.
+    fn fake_tm(dir: &Path, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("tm");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$PWD $*\" > \"{}\"\necho 'lane mylane is dirty' >&2\nexit {code}\n",
+                dir.join("argv").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_command_launcher_runs_tm_work_run_unattended_and_waits() {
+        let dir = tempdir().unwrap();
+        let launcher = CommandLauncher {
+            program: fake_tm(dir.path(), 0),
+            cwd: dir.path().to_path_buf(),
+        };
+
+        launcher.launch("backend", "GH-7").unwrap();
+
+        let logged = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        assert_eq!(
+            logged.trim(),
+            format!(
+                "{} work run --unattended backend GH-7",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn the_command_launcher_reports_a_failed_launch_with_its_stderr() {
+        let dir = tempdir().unwrap();
+        let launcher = CommandLauncher {
+            program: fake_tm(dir.path(), 3),
+            cwd: dir.path().to_path_buf(),
+        };
+
+        let err = launcher.launch("backend", "GH-7").unwrap_err();
+
+        assert!(err.contains("exit status: 3"), "{err}");
+        assert!(err.contains("lane mylane is dirty"), "{err}");
     }
 
     #[test]
