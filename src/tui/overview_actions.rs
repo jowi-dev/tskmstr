@@ -293,6 +293,7 @@ mod tests {
             worktree: Some(format!("/wt/{ticket}")),
             repo_root: RepoRoot::Recorded(root(scope)),
             auto_review_round: None,
+            fix_rounds: 0,
         }
     }
 

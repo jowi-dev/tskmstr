@@ -897,6 +897,9 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
             if row.pr_url.is_some() {
                 spans.push(Span::styled("  PR", theme::DIM));
             }
+            if let Some(fixes) = fix_rounds_label(row.fix_rounds) {
+                spans.push(Span::styled(format!("  {fixes}"), theme::DIM));
+            }
             if let Some(round) = &row.auto_review_round {
                 spans.push(Span::styled(
                     format!("  review {round}"),
@@ -913,6 +916,16 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.overview_selected.min(app.overview_rows.len() - 1)));
     frame.render_stateful_widget(list, queue_area, &mut state);
+}
+
+/// An overview row's fix-round count (GitHub issue #119), e.g. `2 fixes`;
+/// `None` for a ticket that has had no `review-fix` pass.
+fn fix_rounds_label(fix_rounds: usize) -> Option<String> {
+    match fix_rounds {
+        0 => None,
+        1 => Some("1 fix".to_string()),
+        n => Some(format!("{n} fixes")),
+    }
 }
 
 /// An overview row's auto-review round detail (GitHub issue #124): drawn
@@ -985,6 +998,9 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
                 if row.pr_url.is_some() {
                     detail.push_str("  PR");
                 }
+                if let Some(fixes) = fix_rounds_label(row.fix_rounds) {
+                    detail.push_str(&format!("  {fixes}"));
+                }
                 if let Some(round) = &row.auto_review_round {
                     detail.push_str(&format!("  review {round}"));
                 }
@@ -1043,6 +1059,7 @@ fn project_strip_lines(rows: &[OverviewRow]) -> Vec<String> {
 fn stage_label(stage: Stage) -> &'static str {
     match stage {
         Stage::NeedsInput => "needs input",
+        Stage::AwaitingReview => "awaiting review",
         Stage::ReadyToMerge => "ready to merge",
         Stage::NeedsReview => "needs review",
         Stage::Conflicted => "conflicted",
@@ -4287,6 +4304,7 @@ mod tests {
             worktree: None,
             repo_root: crate::runs::overview::RepoRoot::Unresolved,
             auto_review_round: None,
+            fix_rounds: 0,
         }
     }
 
@@ -4316,6 +4334,39 @@ mod tests {
         let first_line = text.lines().nth(first).unwrap();
         assert!(first_line.contains("needs input"), "{first_line}");
         assert!(first_line.contains("alpha"), "{first_line}");
+    }
+
+    #[test]
+    fn awaiting_review_rows_show_the_stage_and_fix_rounds_in_both_layouts() {
+        let row = OverviewRow {
+            fix_rounds: 2,
+            ..overview_row("github:me/alpha", "GH-1", Stage::AwaitingReview)
+        };
+        let app = overview_app(vec![row.clone()]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(line.contains("awaiting review"), "{line}");
+        assert!(line.contains("2 fixes"), "{line}");
+
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(vec![row])
+        };
+        let text = buffer_text(&render_with_size(&app, 320, 24));
+        assert!(text.contains("Awaiting review (1)"), "{text}");
+        assert!(text.contains("2 fixes"), "{text}");
+    }
+
+    #[test]
+    fn rows_without_fix_rounds_show_no_fix_count() {
+        let app = overview_app(vec![overview_row(
+            "github:me/alpha",
+            "GH-1",
+            Stage::AwaitingReview,
+        )]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(!line.contains("fix"), "{line}");
     }
 
     #[test]

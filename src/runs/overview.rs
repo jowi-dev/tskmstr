@@ -51,6 +51,10 @@ pub struct OverviewRun {
     /// The detail of the run's latest `auto_review_round` event (GitHub
     /// issue #124), e.g. `1/2 fix`; `None` for a run with none.
     pub auto_review_round: Option<String>,
+    /// Whether the run recorded a `pr_closed` event: a `review-watch` that
+    /// saw its PR merged or closed, or one `tm merge` closed out (GitHub
+    /// issue #119).
+    pub pr_closed: bool,
 }
 
 /// A ticket's identity across projects: GitHub issue numbers restart per
@@ -80,6 +84,10 @@ impl TicketKey {
 pub enum Stage {
     /// A live session is waiting on the operator.
     NeedsInput,
+    /// The machine is done and it is the operator's turn (GitHub issue
+    /// #119): PR open, bots reviewed, any cleanup finished, nothing live.
+    /// See [`awaiting_review`].
+    AwaitingReview,
     /// PR open, approved/mergeable, checks green.
     ReadyToMerge,
     /// PR open with no approving review yet.
@@ -99,10 +107,11 @@ pub enum Stage {
 /// overview's lifecycle layout (ADR-0009 layout 1, GitHub issue #85). The
 /// same stages as the queue, ordered by where a ticket is in its life
 /// rather than by how urgently it needs the operator.
-pub const LIFECYCLE_COLUMNS: [Stage; 7] = [
+pub const LIFECYCLE_COLUMNS: [Stage; 8] = [
     Stage::NotStarted,
     Stage::Running,
     Stage::NeedsInput,
+    Stage::AwaitingReview,
     Stage::NeedsReview,
     Stage::Conflicted,
     Stage::ReadyToMerge,
@@ -143,6 +152,8 @@ pub struct StageSignals {
     pub drifted: bool,
     /// Whether the ticket is in the operator's ready list.
     pub in_ready_list: bool,
+    /// See [`awaiting_review`].
+    pub awaiting_review: bool,
 }
 
 /// The highest-ranked [`Stage`] `signals` reach, or `None` when the ticket
@@ -156,12 +167,17 @@ pub struct StageSignals {
 /// [`Stage::NeedsReview`] until a PR state says otherwise; a `queued` run
 /// reads as [`Stage::Running`]. Awaiting input outranks a stale heartbeat,
 /// since a session waiting on the operator emits no heartbeats.
+/// [`StageSignals::awaiting_review`] reads as [`Stage::AwaitingReview`],
+/// outranking every PR state.
 pub fn derive_stage(signals: &StageSignals) -> Option<Stage> {
     use RunStatus::*;
 
     let status = signals.run_status;
     if (status == Some(Running) && signals.awaiting_input) || status == Some(Hibernated) {
         return Some(Stage::NeedsInput);
+    }
+    if signals.awaiting_review {
+        return Some(Stage::AwaitingReview);
     }
     match signals.pr {
         Some(PrState::ReadyToMerge) => return Some(Stage::ReadyToMerge),
@@ -277,6 +293,8 @@ pub struct OverviewRow {
     /// stays visible while a fix round, not the review round, is the row's
     /// run.
     pub auto_review_round: Option<String>,
+    /// How many `review-fix` runs the ticket has had (GitHub issue #119).
+    pub fix_rounds: usize,
 }
 
 /// Joins `runs` (newest first, as [`super::RunStore::overview_runs`]
@@ -330,6 +348,7 @@ pub fn join_rows(
                 worktree: None,
                 repo_root: RepoRoot::Recorded(ready.repo_root.clone()),
                 auto_review_round: None,
+                fix_rounds: 0,
             }),
     );
 
@@ -352,9 +371,11 @@ fn ticket_row(
         .filter(|(i, run)| *i == 0 || is_live(run.status))
         .map(|(_, run)| *run);
 
+    let awaiting_review = awaiting_review(runs);
     let (stage, run) = standing
         .filter_map(|run| {
             let signals = StageSignals {
+                awaiting_review,
                 run_status: Some(run.status),
                 awaiting_input: run.awaiting_input,
                 heartbeat_stale: run.status == RunStatus::Running
@@ -382,7 +403,54 @@ fn ticket_row(
         worktree: Some(run.worktree.clone()),
         repo_root: resolve_repo_root(recorded_root, &run.worktree, from_worktree),
         auto_review_round: runs.iter().find_map(|run| run.auto_review_round.clone()),
+        fix_rounds: runs
+            .iter()
+            .filter(|run| run.kind == REVIEW_FIX_KIND)
+            .count(),
     })
+}
+
+/// `kind` of the `tm pr watch` run (see [`crate::work::review_watch`]).
+const REVIEW_WATCH_KIND: &str = "review-watch";
+/// `kind` of the bugbot-cleanup session a watch with findings launches.
+const CLEANUP_KIND: &str = "bugbot-cleanup";
+/// `kind` of a `tm review fix` pass.
+const REVIEW_FIX_KIND: &str = "review-fix";
+
+/// Whether a ticket's `runs` (newest first) say the machine is done and it
+/// is the operator's turn (GitHub issue #119, [`Stage::AwaitingReview`]):
+///
+/// - some run recorded a PR URL;
+/// - the newest `review-watch` run finished `done` (bots reviewed, nothing
+///   unresolved), or `review` (findings) with a `bugbot-cleanup` run started
+///   after it that has finished;
+/// - that watch has no `pr_closed` event (the PR was merged or closed);
+/// - no run is live (lane, fix, cleanup, auto-review, anything); and
+/// - no run started after the watch ended `failed`, `interrupted` or
+///   `blocked`, which is [`Stage::Stuck`]'s to show.
+pub fn awaiting_review(runs: &[&OverviewRun]) -> bool {
+    use RunStatus::*;
+
+    if !runs.iter().any(|run| run.pr_url.is_some()) || runs.iter().any(|run| is_live(run.status)) {
+        return false;
+    }
+    let Some(watch_at) = runs.iter().position(|run| run.kind == REVIEW_WATCH_KIND) else {
+        return false;
+    };
+    let watch = runs[watch_at];
+    let after_watch = &runs[..watch_at];
+    if watch.pr_closed
+        || after_watch
+            .iter()
+            .any(|run| matches!(run.status, Failed | Interrupted | Blocked))
+    {
+        return false;
+    }
+    match watch.status {
+        Done => true,
+        Review => after_watch.iter().any(|run| run.kind == CLEANUP_KIND),
+        _ => false,
+    }
 }
 
 /// How recently a scope must have had a run end to stay in the overview
@@ -457,6 +525,7 @@ mod tests {
             pr_url: None,
             repo_root: None,
             auto_review_round: None,
+            pr_closed: false,
         }
     }
 
@@ -470,6 +539,7 @@ mod tests {
     fn ranks_follow_the_adr_table() {
         let ranks: Vec<u8> = [
             Stage::NeedsInput,
+            Stage::AwaitingReview,
             Stage::ReadyToMerge,
             Stage::NeedsReview,
             Stage::Conflicted,
@@ -480,7 +550,7 @@ mod tests {
         .iter()
         .map(|s| s.rank())
         .collect();
-        assert_eq!(ranks, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ranks, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(Stage::NeedsInput < Stage::NotStarted);
     }
 
@@ -659,6 +729,168 @@ mod tests {
     fn an_empty_worktree_is_not_resolved() {
         let root = resolve_repo_root(None, "", &|_| panic!("must not resolve ''"));
         assert_eq!(root, RepoRoot::Unresolved);
+    }
+
+    // --- awaiting_review: the autopilot's human stop (GitHub issue #119) ---
+
+    fn kind_run(id: i64, kind: &str, status: RunStatus) -> OverviewRun {
+        OverviewRun {
+            kind: kind.to_string(),
+            ..run(id, "GH-1", status)
+        }
+    }
+
+    fn lane_with_pr(id: i64) -> OverviewRun {
+        OverviewRun {
+            pr_url: Some("https://github.com/me/proj/pull/1".to_string()),
+            ..run(id, "GH-1", RunStatus::Done)
+        }
+    }
+
+    fn awaiting(runs: &[OverviewRun]) -> bool {
+        awaiting_review(&runs.iter().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_clean_finished_watch_on_an_open_pr_awaits_review() {
+        let runs = vec![
+            kind_run(2, "review-watch", RunStatus::Done),
+            lane_with_pr(1),
+        ];
+        assert!(awaiting(&runs));
+    }
+
+    #[test]
+    fn bots_still_pending_is_not_awaiting_review() {
+        let runs = vec![
+            kind_run(2, "review-watch", RunStatus::Running),
+            lane_with_pr(1),
+        ];
+        assert!(!awaiting(&runs));
+    }
+
+    #[test]
+    fn no_watch_or_no_pr_is_not_awaiting_review() {
+        assert!(!awaiting(&[lane_with_pr(1)]));
+        assert!(!awaiting(&[
+            kind_run(2, "review-watch", RunStatus::Done),
+            run(1, "GH-1", RunStatus::Done),
+        ]));
+    }
+
+    #[test]
+    fn a_watch_with_findings_awaits_review_only_once_its_cleanup_finished() {
+        let watch = || kind_run(2, "review-watch", RunStatus::Review);
+        assert!(!awaiting(&[watch(), lane_with_pr(1)]), "no cleanup yet");
+        assert!(!awaiting(&[
+            kind_run(3, "bugbot-cleanup", RunStatus::Running),
+            watch(),
+            lane_with_pr(1),
+        ]));
+        assert!(awaiting(&[
+            kind_run(3, "bugbot-cleanup", RunStatus::Done),
+            watch(),
+            lane_with_pr(1),
+        ]));
+    }
+
+    #[test]
+    fn a_cleanup_from_an_older_watch_does_not_count() {
+        let runs = vec![
+            kind_run(3, "review-watch", RunStatus::Review),
+            kind_run(2, "bugbot-cleanup", RunStatus::Done),
+            lane_with_pr(1),
+        ];
+        assert!(!awaiting(&runs));
+    }
+
+    #[test]
+    fn a_live_fix_lane_or_auto_review_run_is_not_awaiting_review() {
+        for kind in ["review-fix", "lane", "auto-review"] {
+            let runs = vec![
+                kind_run(3, kind, RunStatus::Running),
+                kind_run(2, "review-watch", RunStatus::Done),
+                lane_with_pr(1),
+            ];
+            assert!(!awaiting(&runs), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_finished_fix_after_the_watch_still_awaits_review() {
+        let runs = vec![
+            kind_run(3, "review-fix", RunStatus::Done),
+            kind_run(2, "review-watch", RunStatus::Done),
+            lane_with_pr(1),
+        ];
+        assert!(awaiting(&runs));
+    }
+
+    #[test]
+    fn a_failed_run_after_the_watch_is_not_awaiting_review() {
+        for status in [
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+            RunStatus::Blocked,
+        ] {
+            let runs = vec![
+                kind_run(3, "review-fix", status),
+                kind_run(2, "review-watch", RunStatus::Done),
+                lane_with_pr(1),
+            ];
+            assert!(!awaiting(&runs), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_merged_or_closed_pr_is_not_awaiting_review() {
+        let runs = vec![
+            OverviewRun {
+                pr_closed: true,
+                ..kind_run(2, "review-watch", RunStatus::Done)
+            },
+            lane_with_pr(1),
+        ];
+        assert!(!awaiting(&runs));
+    }
+
+    #[test]
+    fn only_the_latest_watch_counts() {
+        let runs = vec![
+            kind_run(3, "review-watch", RunStatus::Running),
+            kind_run(2, "review-watch", RunStatus::Done),
+            lane_with_pr(1),
+        ];
+        assert!(!awaiting(&runs));
+    }
+
+    #[test]
+    fn awaiting_review_ranks_just_below_needs_input() {
+        let s = StageSignals {
+            awaiting_review: true,
+            ..signals(RunStatus::Done)
+        };
+        assert_eq!(derive_stage(&s), Some(Stage::AwaitingReview));
+        assert!(Stage::NeedsInput < Stage::AwaitingReview);
+        assert!(Stage::AwaitingReview < Stage::ReadyToMerge);
+    }
+
+    #[test]
+    fn an_awaiting_ticket_joins_into_an_awaiting_review_row_with_its_fix_rounds() {
+        let runs = vec![
+            kind_run(4, "review-fix", RunStatus::Done),
+            kind_run(3, "review-fix", RunStatus::Done),
+            kind_run(2, "review-watch", RunStatus::Done),
+            lane_with_pr(1),
+        ];
+
+        let rows = join_rows(&runs, &TrackerSignals::default(), 600, &no_worktree);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stage, Stage::AwaitingReview);
+        assert_eq!(rows[0].run_id, Some(4));
+        assert_eq!(rows[0].fix_rounds, 2);
+        assert!(rows[0].pr_url.is_some());
     }
 
     // --- join_rows ---
@@ -923,6 +1155,7 @@ mod tests {
             worktree: None,
             repo_root: RepoRoot::Unresolved,
             auto_review_round: None,
+            fix_rounds: 0,
         }
     }
 
