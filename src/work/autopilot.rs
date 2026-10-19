@@ -17,7 +17,9 @@
 //! the flag, the running lane count against `max_lanes`, and the reason the
 //! newest tick stopped short, if it did.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -115,8 +117,8 @@ impl AutopilotHost {
 }
 
 /// The host thread: wait for a command or the next wake, then tick every
-/// due target in turn. A failed tick is reported and the loop carries on.
-/// Exits once the [`AutopilotHost`] is dropped.
+/// due target in turn. A failed or panicking tick is reported and the loop
+/// carries on. Exits once the [`AutopilotHost`] is dropped.
 fn run(
     ticker: impl ScopeTicker,
     interval: Duration,
@@ -142,7 +144,10 @@ fn run(
             if !due {
                 continue;
             }
-            let result = ticker.tick(target);
+            // A panic would end the thread and stop autopilot with nothing on
+            // screen, so it is reported as a failed tick instead.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| ticker.tick(target)))
+                .unwrap_or_else(|payload| Err(format!("tick panicked: {}", panic_text(&*payload))));
             last_tick.insert(target.scope.clone(), Instant::now());
             let outcome = TickOutcome {
                 scope: target.scope.clone(),
@@ -153,6 +158,15 @@ fn run(
             }
         }
     }
+}
+
+/// A panic payload's message, when it is the usual `&str` or `String`.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
 }
 
 fn apply(
@@ -320,6 +334,29 @@ mod tests {
             calls.lock().unwrap().iter().filter(|s| *s == "a").count() >= 2,
             "the failing scope is ticked again"
         );
+    }
+
+    #[test]
+    fn a_panicking_tick_is_reported_and_the_loop_keeps_ticking() {
+        let host = AutopilotHost::spawn(
+            || {
+                |target: &AutopilotTarget| -> Result<TickReport, String> {
+                    if target.scope == "a" {
+                        panic!("index out of bounds");
+                    }
+                    Ok(TickReport::default())
+                }
+            },
+            Duration::from_millis(1),
+        );
+
+        host.set_targets(vec![target("a"), target("b")]);
+        let outcomes = drain_until(&host, 4);
+
+        let panicked = outcomes[0].result.as_ref().unwrap_err();
+        assert!(panicked.contains("index out of bounds"), "{panicked}");
+        assert!(outcomes[1].result.is_ok());
+        assert_eq!(outcomes[2].scope, "a", "a is ticked again after panicking");
     }
 
     #[test]
