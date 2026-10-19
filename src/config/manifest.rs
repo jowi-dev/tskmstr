@@ -241,6 +241,21 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #120. The fix-round cap has a built-in default, and
+    // resolving imported threads on GitHub is opt-in, so neither is ever
+    // reported.
+    ExpectedConfigKey {
+        path: &["dispatch", "max_fix_rounds"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["review", "resolve_imported"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]

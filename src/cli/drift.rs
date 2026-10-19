@@ -325,6 +325,7 @@ mod tests {
             require_audit: true,
             usage: Default::default(),
             dispatch: Default::default(),
+            review: Default::default(),
         }
     }
 
