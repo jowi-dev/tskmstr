@@ -220,6 +220,7 @@ mod unattended_tests {
             &UsageConfig::default(),
             &DispatchConfig {
                 allow_paid_fallback: true,
+                ..DispatchConfig::default()
             },
         );
         assert_eq!(order, ORDER.to_vec());

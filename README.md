@@ -233,6 +233,7 @@ tm auth status
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
+| `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
 ## Ticket/run status drift (`tm drift`)
 
@@ -1649,6 +1650,41 @@ follow-up round at the archive). With `auto = true`, a `tm pr watch` that
 finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
+
+Every automatic fix pass, from `tm review auto` or `tm review import --fix`,
+stops at `[dispatch] max_fix_rounds` (default 3). The cap counts every
+`review-fix` run the ticket has had, including ones you started with `F`.
+
+### Importing a GitHub review
+
+**`tm review import <KEY>` copies the unresolved human review threads on a
+ticket's PR into the same comment store**, so a review left on github.com
+shows in `V` and feeds `F` like a local comment. Each thread becomes one
+comment whose text starts with `[github · @author]`, with the replies
+folded in and the thread URL at the end. A thread whose code moved since
+the review is anchored at its original line and marked
+`(outdated: was L<n> @ <sha>)`.
+
+Review-bot threads (`review_bots`) are skipped, and so are comments tm or
+vdiff posted, such as a published auto-review finding. Each GitHub comment
+is imported once: `<git-dir>/vdiff/imported-threads.json` records what was
+imported. An import that added anything records a `review_import` event,
+and the overview row shows it as `gh 2 imported`.
+
+With `--fix`, tm then runs `tm review fix <KEY> --fg` over the store,
+unless the ticket is at `max_fix_rounds`. A successful pass archives the
+store to `<git-dir>/vdiff/archive/import-<n>.json`.
+
+```toml
+[dispatch]
+# max_fix_rounds = 3        # automatic fix passes per ticket, every source
+
+[review]
+# resolve_imported = false  # after a fix pass that pushed, reply
+#                           # "Addressed in <sha>." and resolve each thread
+```
+
+See `docs/plans/gh-120-import-github-review.md` for the details.
 
 ### Merging from the board
 

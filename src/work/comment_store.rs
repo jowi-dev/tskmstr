@@ -183,11 +183,34 @@ pub fn append(
 ///
 /// See [`load`]; also [`CommentStoreError::Io`] if a write fails.
 pub fn archive(git_dir: &Path, round: u32) -> Result<Option<PathBuf>, CommentStoreError> {
+    archive_to(git_dir, archive_path(git_dir, round))
+}
+
+/// `<git_dir>/vdiff/archive/<name>.json`, where [`archive_named`] moves the
+/// store.
+pub fn named_archive_path(git_dir: &Path, name: &str) -> PathBuf {
+    git_dir
+        .join("vdiff")
+        .join("archive")
+        .join(format!("{name}.json"))
+}
+
+/// Same as [`archive`], to [`named_archive_path`] for `name`, so a writer
+/// other than `tm review auto` (whose round numbers restart with every
+/// loop) never overwrites one of its archives.
+///
+/// # Errors
+///
+/// See [`archive`].
+pub fn archive_named(git_dir: &Path, name: &str) -> Result<Option<PathBuf>, CommentStoreError> {
+    archive_to(git_dir, named_archive_path(git_dir, name))
+}
+
+fn archive_to(git_dir: &Path, path: PathBuf) -> Result<Option<PathBuf>, CommentStoreError> {
     let comments = load(git_dir)?;
     if comments.is_empty() {
         return Ok(None);
     }
-    let path = archive_path(git_dir, round);
     let dir = path.parent().expect("archive path has a parent");
     std::fs::create_dir_all(dir).map_err(io_err(dir))?;
     let body = serde_json::to_string_pretty(&Value::Array(

@@ -358,6 +358,24 @@ pub enum ReviewCmd {
         #[arg(long)]
         foreground: bool,
     },
+    /// Import the unresolved GitHub review threads on KEY's pull request
+    /// into the worktree's vdiff comment store.
+    ///
+    /// Review-bot threads and comments tm or vdiff published are skipped,
+    /// and a thread is imported once (`<git-dir>/vdiff/imported-threads.json`
+    /// records what was). The imported comments show in `V` and feed an
+    /// unchanged `tm review fix`. With `--fix`, runs that fix pass now, in
+    /// the foreground, unless the ticket already has `[dispatch]
+    /// max_fix_rounds` fix passes; `[review] resolve_imported` then resolves
+    /// the threads once the pass has pushed.
+    Import {
+        /// Ticket key whose PR to import from, e.g. `GH-120`
+        /// (case-insensitive).
+        key: String,
+        /// Run `tm review fix` over the store after importing.
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 /// `tm work` subcommands.
@@ -3124,6 +3142,21 @@ mod tests {
                 assert!(foreground);
             }
             other => panic!("expected Review Auto, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_import_with_fix() {
+        let cli = Cli::try_parse_from(["tm", "review", "import", "GH-120", "--fix"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Review {
+                cmd: ReviewCmd::Import { key, fix },
+            }) => {
+                assert_eq!(key, "GH-120");
+                assert!(fix);
+            }
+            other => panic!("expected Review Import, got {other:?}"),
         }
     }
 

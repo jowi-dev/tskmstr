@@ -213,6 +213,9 @@ pub trait AutoReviewOps {
     fn record(&self, run_id: i64, kind: &str, detail: &str) -> Result<(), AutoReviewError>;
     /// Flags run `run_id` for a human: the loop hit its cap.
     fn flag(&self, run_id: i64) -> Result<(), AutoReviewError>;
+    /// Whether the ticket has used up `[dispatch] max_fix_rounds`, the fix
+    /// cap shared by every automatic trigger (GitHub issue #120).
+    fn fix_cap_reached(&self) -> Result<bool, AutoReviewError>;
     /// Seconds since the Unix epoch, for comments' `created_at`.
     fn now_unix_secs(&self) -> i64;
 }
@@ -293,6 +296,7 @@ pub fn run_loop(
         let verdict = match (needs_fix, round == max) {
             (false, _) => RoundVerdict::Clean,
             (true, true) => RoundVerdict::Capped,
+            (true, false) if ops.fix_cap_reached()? => RoundVerdict::Capped,
             (true, false) => RoundVerdict::Fix,
         };
         if verdict != RoundVerdict::Fix {
@@ -343,6 +347,7 @@ mod tests {
         log: RefCell<Vec<String>>,
         prompts: RefCell<Vec<String>>,
         store_at_fix: RefCell<Vec<usize>>,
+        fix_cap_reached: bool,
     }
 
     impl FakeOps {
@@ -354,6 +359,7 @@ mod tests {
                 log: RefCell::new(Vec::new()),
                 prompts: RefCell::new(Vec::new()),
                 store_at_fix: RefCell::new(Vec::new()),
+                fix_cap_reached: false,
             }
         }
 
@@ -399,6 +405,10 @@ mod tests {
         fn flag(&self, run_id: i64) -> Result<(), AutoReviewError> {
             self.log.borrow_mut().push(format!("flag {run_id}"));
             Ok(())
+        }
+
+        fn fix_cap_reached(&self) -> Result<bool, AutoReviewError> {
+            Ok(self.fix_cap_reached)
         }
 
         fn now_unix_secs(&self) -> i64 {
@@ -570,6 +580,32 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_fix_round_cap_stops_the_loop_before_a_fix() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM]);
+        ops.fix_cap_reached = true;
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(
+            outcome,
+            LoopOutcome {
+                rounds: 1,
+                verdict: RoundVerdict::Capped
+            }
+        );
+        assert_eq!(
+            ops.log(),
+            [
+                "review 1",
+                "flag 101",
+                "record 101 auto_review_round 1/2 capped"
+            ]
+        );
+        assert_eq!(comment_store::load(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
     fn existing_human_comments_are_kept_and_fed_to_the_fix() {
         let tmp = TempDir::new().unwrap();
         comment_store::append(
@@ -665,6 +701,9 @@ mod tests {
                 unreachable!()
             }
             fn flag(&self, _: i64) -> Result<(), AutoReviewError> {
+                unreachable!()
+            }
+            fn fix_cap_reached(&self) -> Result<bool, AutoReviewError> {
                 unreachable!()
             }
             fn now_unix_secs(&self) -> i64 {

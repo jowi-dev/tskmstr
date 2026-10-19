@@ -143,6 +143,9 @@ pub struct RawConfig {
     /// `[dispatch]` settings for unattended launches. See
     /// [`RawDispatchConfig`] and GitHub issue #114.
     pub dispatch: Option<RawDispatchConfig>,
+    /// `[review]` settings for importing GitHub review threads. See
+    /// [`RawReviewConfig`] and GitHub issue #120.
+    pub review: Option<RawReviewConfig>,
     /// The asset/config schema revision this file was last stamped with by
     /// `tm init`, i.e. what [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]
     /// was when `tm init` last wrote this file.
@@ -320,6 +323,15 @@ pub struct RawRunnerUsageConfig {
 pub struct RawDispatchConfig {
     /// See [`DispatchConfig::allow_paid_fallback`].
     pub allow_paid_fallback: Option<bool>,
+    /// See [`DispatchConfig::max_fix_rounds`].
+    pub max_fix_rounds: Option<u32>,
+}
+
+/// Raw `[review]` section (GitHub issue #120).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawReviewConfig {
+    /// See [`ReviewConfig::resolve_imported`].
+    pub resolve_imported: Option<bool>,
 }
 
 /// Which AI coding agent a config selects.
@@ -825,6 +837,8 @@ pub struct Config {
     pub usage: UsageConfig,
     /// Validated `[dispatch]` settings. See [`DispatchConfig`].
     pub dispatch: DispatchConfig,
+    /// Validated `[review]` settings. See [`ReviewConfig`].
+    pub review: ReviewConfig,
 }
 
 /// How a runner is paid for (GitHub issue #114). Unattended dispatch never
@@ -964,12 +978,38 @@ impl UsageConfig {
     }
 }
 
-/// Validated `[dispatch]` settings (GitHub issue #114).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Default for [`DispatchConfig::max_fix_rounds`].
+pub const DEFAULT_MAX_FIX_ROUNDS: u32 = 3;
+
+/// Validated `[dispatch]` settings (GitHub issues #114, #120).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchConfig {
     /// Whether unattended dispatch may route to a [`Billing::Metered`]
     /// runner. Off by default.
     pub allow_paid_fallback: bool,
+    /// How many `review-fix` runs a ticket may have before tm stops
+    /// starting fix passes for it on its own. It counts every fix pass,
+    /// whatever triggered it (`tm review auto`, an imported GitHub review,
+    /// or `F`), but only the automatic triggers stop at it. Defaults to
+    /// [`DEFAULT_MAX_FIX_ROUNDS`].
+    pub max_fix_rounds: u32,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            allow_paid_fallback: false,
+            max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
+        }
+    }
+}
+
+/// Validated `[review]` settings (GitHub issue #120).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewConfig {
+    /// After a fix pass over imported GitHub review threads succeeds, reply
+    /// "Addressed in <sha>" on each thread and resolve it. Off by default.
+    pub resolve_imported: bool,
 }
 
 /// Fully validated `[work]` section.
@@ -1660,6 +1700,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         backend: None,
         agent: None,
         dispatch: None,
+        review: None,
         schema_version: None,
     }
 }
@@ -1821,6 +1862,20 @@ fn merge_with_repo_dir(
             .and_then(|d| d.allow_paid_fallback)
             .or(global.dispatch.as_ref().and_then(|d| d.allow_paid_fallback))
             .unwrap_or(false),
+        max_fix_rounds: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.max_fix_rounds)
+            .or(global.dispatch.as_ref().and_then(|d| d.max_fix_rounds))
+            .unwrap_or(DEFAULT_MAX_FIX_ROUNDS),
+    };
+    let review = ReviewConfig {
+        resolve_imported: repo
+            .review
+            .as_ref()
+            .and_then(|r| r.resolve_imported)
+            .or(global.review.as_ref().and_then(|r| r.resolve_imported))
+            .unwrap_or(false),
     };
 
     let expected_path = default_global_config_path();
@@ -1854,6 +1909,7 @@ fn merge_with_repo_dir(
             require_audit,
             usage,
             dispatch,
+            review,
         }),
         BackendKind::Github => {
             let configured_repo = repo
@@ -1894,6 +1950,7 @@ fn merge_with_repo_dir(
                 require_audit,
                 usage,
                 dispatch,
+                review,
             })
         }
     }
@@ -2664,6 +2721,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         }
     }
@@ -2696,6 +2754,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2795,6 +2854,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2830,6 +2890,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2865,6 +2926,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2900,6 +2962,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -2935,6 +2998,7 @@ mod tests {
             backend: None,
             agent: None,
             dispatch: None,
+            review: None,
             schema_version: None,
         };
         let cfg = merge(raw_full(), Some(repo)).expect("should merge");
@@ -6087,6 +6151,29 @@ mod tests {
         );
 
         assert!(cfg.dispatch.allow_paid_fallback);
+    }
+
+    // --- review import: `[dispatch] max_fix_rounds`, `[review]` (GitHub
+    // issue #120) ---
+
+    #[test]
+    fn fix_round_cap_and_resolve_imported_default_to_three_and_off() {
+        let cfg = load_with("", None).expect("should load");
+
+        assert_eq!(cfg.dispatch.max_fix_rounds, 3);
+        assert!(!cfg.review.resolve_imported);
+    }
+
+    #[test]
+    fn fix_round_cap_and_resolve_imported_merge_repo_over_global() {
+        let cfg = load_with(
+            "[dispatch]\nmax_fix_rounds = 5\n[review]\nresolve_imported = true\n",
+            Some("[dispatch]\nmax_fix_rounds = 1\n"),
+        )
+        .expect("should load");
+
+        assert_eq!(cfg.dispatch.max_fix_rounds, 1, "repo wins");
+        assert!(cfg.review.resolve_imported, "global kept");
     }
 
     #[test]

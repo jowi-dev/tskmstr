@@ -25,6 +25,10 @@ use thiserror::Error;
 
 use super::bot_findings::{FindingDetail, PrReview, ReviewThread};
 use super::pr::PrInfo;
+use super::review_threads::{
+    ADD_THREAD_REPLY_MUTATION, PrReviewThreads, RESOLVE_THREAD_MUTATION, REVIEW_THREADS_FULL_QUERY,
+    parse_review_threads_full,
+};
 
 /// Errors that can occur while shelling out to `gh` or `git`.
 #[derive(Debug, Clone, Error)]
@@ -393,6 +397,28 @@ pub trait GhCli {
         dir: &Path,
         number: u64,
     ) -> Result<Vec<FindingDetail>, GhError>;
+
+    /// Every review thread on pull request `number` with all of its
+    /// comments, ids and anchors, plus the PR's author, for importing a
+    /// GitHub review into the vdiff comment store (GitHub issue #120). See
+    /// [`super::review_threads`] for why this is its own query.
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn pr_review_threads_full(&self, dir: &Path, number: u64) -> Result<PrReviewThreads, GhError>;
+
+    /// Reply `body` on review thread `thread_id` (a GraphQL node id), then
+    /// resolve it. Two `gh api graphql` mutations, in that order, so a
+    /// failed resolve still leaves the reply explaining what happened.
+    ///
+    /// `dir` is an explicit repo root, same rationale as
+    /// [`GhCli::pr_review_threads`]'s doc comment.
+    fn reply_and_resolve_thread(
+        &self,
+        dir: &Path,
+        thread_id: &str,
+        body: &str,
+    ) -> Result<(), GhError>;
 
     /// List open pull requests in the repository rooted at `dir`, fetching
     /// the same fields as [`GhCli::pr_view`] (`gh pr list --state open
@@ -1428,6 +1454,44 @@ impl GhCli for ShellGhCli {
         )
     }
 
+    fn pr_review_threads_full(&self, dir: &Path, number: u64) -> Result<PrReviewThreads, GhError> {
+        let repo = self.resolve_repo(dir)?;
+        let stdout = run_graphql(
+            dir,
+            REVIEW_THREADS_FULL_QUERY,
+            "-F",
+            &[
+                ("owner", &repo.owner),
+                ("name", &repo.name),
+                ("number", &number.to_string()),
+            ],
+        )?;
+        parse_review_threads_full(&stdout, number)
+    }
+
+    fn reply_and_resolve_thread(
+        &self,
+        dir: &Path,
+        thread_id: &str,
+        body: &str,
+    ) -> Result<(), GhError> {
+        // `-f` (raw string), not `-F`: `-F` would type-convert a body that
+        // happens to read as a number or `true`.
+        run_graphql(
+            dir,
+            ADD_THREAD_REPLY_MUTATION,
+            "-f",
+            &[("threadId", thread_id), ("body", body)],
+        )?;
+        run_graphql(
+            dir,
+            RESOLVE_THREAD_MUTATION,
+            "-f",
+            &[("threadId", thread_id)],
+        )?;
+        Ok(())
+    }
+
     fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError> {
         let output = Command::new("gh")
             .args([
@@ -1962,6 +2026,44 @@ fn interpret_repo_view_output(
             exit_code: None,
             stderr: stderr.trim().to_string(),
         }),
+    }
+}
+
+/// Runs `gh api graphql` in `dir` with `query`, passing each of `vars` as
+/// `<var_flag> name=value` (`-F` typed, `-f` raw string), and returns stdout
+/// on exit `0`.
+fn run_graphql(
+    dir: &Path,
+    query: &str,
+    var_flag: &str,
+    vars: &[(&str, &str)],
+) -> Result<String, GhError> {
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+    ];
+    for (name, value) in vars {
+        args.push(var_flag.to_string());
+        args.push(format!("{name}={value}"));
+    }
+    let output = Command::new("gh")
+        .args(&args)
+        .current_dir(dir)
+        .output()
+        .map_err(|err| GhError::Spawn {
+            command: "gh api graphql".to_string(),
+            message: err.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
     }
 }
 
@@ -3218,6 +3320,10 @@ pub struct FakeGhCli {
     pr_state_calls: RefCell<Vec<u64>>,
     finding_details_results: RefCell<HashMap<u64, Result<Vec<FindingDetail>, GhError>>>,
     finding_details_calls: RefCell<Vec<u64>>,
+    full_threads_results: RefCell<HashMap<u64, Result<PrReviewThreads, GhError>>>,
+    full_threads_calls: RefCell<Vec<u64>>,
+    resolve_thread_result: RefCell<Result<(), GhError>>,
+    resolve_thread_calls: RefCell<Vec<(String, String)>>,
     pr_list_result: RefCell<Result<Vec<PrInfo>, GhError>>,
     pr_list_calls: RefCell<Vec<PathBuf>>,
     pr_list_bounded_result: RefCell<Option<Result<Vec<PrInfo>, GhError>>>,
@@ -3292,6 +3398,10 @@ impl Default for FakeGhCli {
             pr_state_calls: RefCell::new(Vec::new()),
             finding_details_results: RefCell::new(HashMap::new()),
             finding_details_calls: RefCell::new(Vec::new()),
+            full_threads_results: RefCell::new(HashMap::new()),
+            full_threads_calls: RefCell::new(Vec::new()),
+            resolve_thread_result: RefCell::new(Ok(())),
+            resolve_thread_calls: RefCell::new(Vec::new()),
             pr_list_result: RefCell::new(Ok(Vec::new())),
             pr_list_calls: RefCell::new(Vec::new()),
             pr_list_bounded_result: RefCell::new(None),
@@ -3467,6 +3577,37 @@ impl FakeGhCli {
     /// order.
     pub fn pr_bot_finding_details_calls(&self) -> Vec<u64> {
         self.finding_details_calls.borrow().clone()
+    }
+
+    /// Set the result `pr_review_threads_full` will return for pull request
+    /// `number`. An unconfigured number returns no threads and no author.
+    pub fn with_pr_review_threads_full(
+        self,
+        number: u64,
+        result: Result<PrReviewThreads, GhError>,
+    ) -> Self {
+        self.full_threads_results
+            .borrow_mut()
+            .insert(number, result);
+        self
+    }
+
+    /// The pull request numbers passed to `pr_review_threads_full`, in call
+    /// order.
+    pub fn pr_review_threads_full_calls(&self) -> Vec<u64> {
+        self.full_threads_calls.borrow().clone()
+    }
+
+    /// Set the result every `reply_and_resolve_thread` call returns.
+    pub fn with_reply_and_resolve_thread(self, result: Result<(), GhError>) -> Self {
+        *self.resolve_thread_result.borrow_mut() = result;
+        self
+    }
+
+    /// Every `(thread_id, body)` passed to `reply_and_resolve_thread`, in
+    /// call order.
+    pub fn reply_and_resolve_thread_calls(&self) -> Vec<(String, String)> {
+        self.resolve_thread_calls.borrow().clone()
     }
 
     /// Set the result `pr_list` will return.
@@ -3805,6 +3946,29 @@ impl GhCli for FakeGhCli {
             Some(result) => result.clone(),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn pr_review_threads_full(&self, _dir: &Path, number: u64) -> Result<PrReviewThreads, GhError> {
+        self.full_threads_calls.borrow_mut().push(number);
+        match self.full_threads_results.borrow().get(&number) {
+            Some(result) => result.clone(),
+            None => Ok(PrReviewThreads {
+                pr_author: None,
+                threads: Vec::new(),
+            }),
+        }
+    }
+
+    fn reply_and_resolve_thread(
+        &self,
+        _dir: &Path,
+        thread_id: &str,
+        body: &str,
+    ) -> Result<(), GhError> {
+        self.resolve_thread_calls
+            .borrow_mut()
+            .push((thread_id.to_string(), body.to_string()));
+        self.resolve_thread_result.borrow().clone()
     }
 
     fn pr_list(&self, dir: &Path) -> Result<Vec<PrInfo>, GhError> {

@@ -51,6 +51,9 @@ pub struct OverviewRun {
     /// The detail of the run's latest `auto_review_round` event (GitHub
     /// issue #124), e.g. `1/2 fix`; `None` for a run with none.
     pub auto_review_round: Option<String>,
+    /// The detail of the run's latest `review_import` event (GitHub issue
+    /// #120), e.g. `2 imported`; `None` for a run with none.
+    pub review_import: Option<String>,
     /// Whether the run recorded a `pr_closed` event: a `review-watch` that
     /// saw its PR merged or closed, or one `tm merge` closed out (GitHub
     /// issue #119).
@@ -293,6 +296,10 @@ pub struct OverviewRow {
     /// stays visible while a fix round, not the review round, is the row's
     /// run.
     pub auto_review_round: Option<String>,
+    /// The newest `tm review import` detail any of the ticket's runs
+    /// recorded (see [`OverviewRun::review_import`]): the badge saying
+    /// GitHub review threads were imported, fixed, or hit the fix cap.
+    pub review_import: Option<String>,
     /// How many `review-fix` runs the ticket has had (GitHub issue #119).
     pub fix_rounds: usize,
 }
@@ -348,6 +355,7 @@ pub fn join_rows(
                 worktree: None,
                 repo_root: RepoRoot::Recorded(ready.repo_root.clone()),
                 auto_review_round: None,
+                review_import: None,
                 fix_rounds: 0,
             }),
     );
@@ -403,6 +411,7 @@ fn ticket_row(
         worktree: Some(run.worktree.clone()),
         repo_root: resolve_repo_root(recorded_root, &run.worktree, from_worktree),
         auto_review_round: runs.iter().find_map(|run| run.auto_review_round.clone()),
+        review_import: runs.iter().find_map(|run| run.review_import.clone()),
         fix_rounds: runs
             .iter()
             .filter(|run| run.kind == REVIEW_FIX_KIND)
@@ -415,7 +424,7 @@ const REVIEW_WATCH_KIND: &str = "review-watch";
 /// `kind` of the bugbot-cleanup session a watch with findings launches.
 const CLEANUP_KIND: &str = "bugbot-cleanup";
 /// `kind` of a `tm review fix` pass.
-const REVIEW_FIX_KIND: &str = "review-fix";
+pub const REVIEW_FIX_KIND: &str = "review-fix";
 
 /// Whether a ticket's `runs` (newest first) say the machine is done and it
 /// is the operator's turn (GitHub issue #119, [`Stage::AwaitingReview`]):
@@ -525,6 +534,7 @@ mod tests {
             pr_url: None,
             repo_root: None,
             auto_review_round: None,
+            review_import: None,
             pr_closed: false,
         }
     }
@@ -935,6 +945,24 @@ mod tests {
     }
 
     #[test]
+    fn the_row_carries_the_newest_review_import_detail() {
+        let fix = run(3, "GH-1", RunStatus::Running);
+        let mut newer = run(2, "GH-1", RunStatus::Done);
+        newer.review_import = Some("capped".to_string());
+        let mut older = run(1, "GH-1", RunStatus::Done);
+        older.review_import = Some("2 imported".to_string());
+
+        let rows = join_rows(
+            &[fix, newer, older],
+            &TrackerSignals::default(),
+            600,
+            &no_worktree,
+        );
+
+        assert_eq!(rows[0].review_import.as_deref(), Some("capped"));
+    }
+
+    #[test]
     fn a_ticket_never_auto_reviewed_has_no_round_detail() {
         let rows = join_rows(
             &[run(1, "GH-1", RunStatus::Running)],
@@ -1155,6 +1183,7 @@ mod tests {
             worktree: None,
             repo_root: RepoRoot::Unresolved,
             auto_review_round: None,
+            review_import: None,
             fix_rounds: 0,
         }
     }
