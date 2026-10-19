@@ -225,6 +225,27 @@ const MIGRATIONS: &[&str] = &[
       claimed_at INTEGER NOT NULL
     );
     "#,
+    // GitHub issue #115: the autopilot dispatcher's per-scope on/off flag,
+    // shared by every host that runs `dispatch::tick` (the TUI toggle, the
+    // `tm dispatch` timer), and its log: one `launch` row per lane it
+    // started and one `refused` row per tick that stopped short, for
+    // display. `ticket` is NULL on a refusal that isn't about one ticket.
+    r#"
+    CREATE TABLE autopilot (
+      scope      TEXT    PRIMARY KEY,
+      enabled    INTEGER NOT NULL,
+      updated_at TEXT    NOT NULL
+    );
+    CREATE TABLE dispatch_events (
+      id         INTEGER PRIMARY KEY,
+      scope      TEXT    NOT NULL,
+      ticket     TEXT,
+      kind       TEXT    NOT NULL,
+      detail     TEXT    NOT NULL,
+      created_at TEXT    NOT NULL
+    );
+    CREATE INDEX idx_dispatch_events_scope ON dispatch_events(scope, id);
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -410,6 +431,24 @@ pub struct StartRun {
     /// `tm work run --fg`) or wherever the caller doesn't yet know the path
     /// at `start_run` time — see [`RunStore::update_log_path`] for that case.
     pub log_path: Option<String>,
+}
+
+/// One `dispatch_events` row (GitHub issue #115), written by
+/// [`RunStore::record_dispatch_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchEvent {
+    /// Row id; higher is newer.
+    pub id: i64,
+    /// The scope the tick ran for.
+    pub scope: String,
+    /// The ticket the event is about, if any.
+    pub ticket: Option<String>,
+    /// `launch` or `refused`.
+    pub kind: String,
+    /// Human-readable detail, e.g. the lane launched or the refusal reason.
+    pub detail: String,
+    /// When the row was written, as [`NOW_SQL`] renders it.
+    pub created_at: String,
 }
 
 /// One `usage_snapshots` row: the latest observed utilization of one usage
@@ -3245,6 +3284,77 @@ impl RunStore {
         Ok(changed > 0)
     }
 
+    /// Turns the autopilot dispatcher on or off for `scope` (GitHub issue
+    /// #115). Upserts: a scope has one current flag.
+    pub fn set_autopilot(&self, scope: &str, enabled: bool) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO autopilot (scope, enabled, updated_at) VALUES (?1, ?2, {NOW_SQL})
+                 ON CONFLICT(scope) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at"
+            ),
+            params![scope, enabled],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the autopilot dispatcher is on for `scope`. Off for a scope
+    /// that was never set.
+    pub fn autopilot_enabled(&self, scope: &str) -> Result<bool, RunStoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT enabled FROM autopilot WHERE scope = ?1",
+                params![scope],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Appends one `dispatch_events` row for `scope` (GitHub issue #115).
+    pub fn record_dispatch_event(
+        &self,
+        scope: &str,
+        ticket: Option<&str>,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO dispatch_events (scope, ticket, kind, detail, created_at)
+                 VALUES (?1, ?2, ?3, ?4, {NOW_SQL})"
+            ),
+            params![scope, ticket, kind, detail],
+        )?;
+        Ok(())
+    }
+
+    /// The newest `limit` `dispatch_events` rows for `scope`, newest first.
+    pub fn dispatch_events(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<DispatchEvent>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, ticket, kind, detail, created_at FROM dispatch_events
+              WHERE scope = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![scope, limit as i64], |row| {
+            Ok(DispatchEvent {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                ticket: row.get(2)?,
+                kind: row.get(3)?,
+                detail: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Sums the input and output tokens recorded in `model_usage` across
     /// `agent`'s runs that started at or after `since` (unix seconds), for
     /// usage admission's token budget (GitHub issue #114). Cache reads and
@@ -3514,7 +3624,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_16() {
+    fn open_migrates_a_fresh_db_to_user_version_17() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3522,7 +3632,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -6824,6 +6934,59 @@ mod tests {
         store.clear_agent_window("claude").unwrap();
 
         assert!(store.agent_exhausted_until("claude").unwrap().is_none());
+    }
+
+    // --- autopilot + dispatch_events (GitHub issue #115) ---
+
+    #[test]
+    fn autopilot_is_off_for_a_scope_never_set() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(!store.autopilot_enabled("github:o/r").unwrap());
+    }
+
+    #[test]
+    fn set_autopilot_toggles_one_scope_only() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store.set_autopilot("github:o/r", true).unwrap();
+        assert!(store.autopilot_enabled("github:o/r").unwrap());
+        assert!(!store.autopilot_enabled("github:o/other").unwrap());
+
+        store.set_autopilot("github:o/r", false).unwrap();
+        assert!(!store.autopilot_enabled("github:o/r").unwrap());
+    }
+
+    #[test]
+    fn dispatch_events_are_listed_newest_first_per_scope() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_dispatch_event("s", Some("GH-1"), "launch", "lane backend")
+            .unwrap();
+        store
+            .record_dispatch_event("s", None, "refused", "max lanes")
+            .unwrap();
+        store
+            .record_dispatch_event("other", Some("GH-9"), "launch", "lane x")
+            .unwrap();
+
+        let events = store.dispatch_events("s", 10).unwrap();
+        let summary: Vec<(Option<&str>, &str, &str)> = events
+            .iter()
+            .map(|e| (e.ticket.as_deref(), e.kind.as_str(), e.detail.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (None, "refused", "max lanes"),
+                (Some("GH-1"), "launch", "lane backend"),
+            ]
+        );
+        assert_eq!(store.dispatch_events("s", 1).unwrap().len(), 1);
     }
 
     // --- usage_snapshots (GitHub issue #129) ---
