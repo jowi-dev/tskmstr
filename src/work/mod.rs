@@ -20,6 +20,7 @@ pub mod manual;
 pub mod merge;
 pub mod naming;
 pub mod prompt;
+pub mod review_import;
 pub mod review_watch;
 pub mod run;
 pub mod runner;
