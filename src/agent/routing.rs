@@ -12,7 +12,7 @@
 use crate::agent::AgentRunner;
 use crate::agent::claude::ClaudeRunner;
 use crate::agent::opencode::OpencodeRunner;
-use crate::config::AgentKind;
+use crate::config::{AgentKind, Billing, DispatchConfig, UsageConfig};
 
 /// Build an [`AgentRunner`] for `kind`, mirroring
 /// `crate::ticketing::ticket_provider_for`: the one factory that turns
@@ -87,6 +87,27 @@ pub fn plan_attempts(
         .copied()
         .min_by_key(|kind| exhausted_until(runner_for(*kind).name()).unwrap_or(i64::MIN))
         .into_iter()
+        .collect()
+}
+
+/// Filters `order` down to the runners an unattended launch may use
+/// (GitHub issue #114): a [`Billing::Metered`] runner is dropped unless
+/// `[dispatch] allow_paid_fallback` is set, so a used-up subscription
+/// window never silently turns into pay-per-token spend. Order is kept.
+/// An empty result means nothing may launch unattended. The dispatcher
+/// (GitHub issue #115) applies this before [`plan_attempts`]; a manual `tm
+/// work run` doesn't, since a human chose to launch.
+pub fn unattended_order(
+    order: &[AgentKind],
+    usage: &UsageConfig,
+    dispatch: &DispatchConfig,
+) -> Vec<AgentKind> {
+    order
+        .iter()
+        .copied()
+        .filter(|kind| {
+            dispatch.allow_paid_fallback || usage.for_kind(*kind).billing != Billing::Metered
+        })
         .collect()
 }
 
@@ -176,5 +197,51 @@ mod tests {
         let order = vec![AgentKind::Claude];
         let attempts = plan_attempts(&order, |_agent| Some(500), 1_000);
         assert_eq!(attempts, vec![AgentKind::Claude]);
+    }
+}
+
+#[cfg(test)]
+mod unattended_tests {
+    use super::*;
+    use crate::config::{Billing, DispatchConfig, UsageConfig};
+
+    const ORDER: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Opencode];
+
+    #[test]
+    fn unattended_order_drops_metered_runners_by_default() {
+        let order = unattended_order(&ORDER, &UsageConfig::default(), &DispatchConfig::default());
+        assert_eq!(order, vec![AgentKind::Claude]);
+    }
+
+    #[test]
+    fn allow_paid_fallback_keeps_metered_runners() {
+        let order = unattended_order(
+            &ORDER,
+            &UsageConfig::default(),
+            &DispatchConfig {
+                allow_paid_fallback: true,
+            },
+        );
+        assert_eq!(order, ORDER.to_vec());
+    }
+
+    #[test]
+    fn a_metered_preferred_runner_leaves_nothing_to_dispatch() {
+        let mut usage = UsageConfig::default();
+        usage.claude.billing = Billing::Metered;
+
+        let order = unattended_order(&ORDER, &usage, &DispatchConfig::default());
+
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn a_runner_configured_as_subscription_stays() {
+        let mut usage = UsageConfig::default();
+        usage.opencode.billing = Billing::Subscription;
+
+        let order = unattended_order(&ORDER, &usage, &DispatchConfig::default());
+
+        assert_eq!(order, ORDER.to_vec());
     }
 }
