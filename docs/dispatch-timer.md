@@ -15,14 +15,14 @@ files, and the recommended cadence (GitHub issue #117).
 | `tm dispatch off --all` | The kill switch: every scope off, so the next tick launches nothing |
 | `tm dispatch tick` | One pass for the current repo |
 | `tm dispatch tick --all [--json]` | One pass for every scope that is on. This is what the timer runs |
-| `tm dispatch status` | Per scope: on or off, running lanes, last tick, last refusal |
+| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now |
 
 Every command except `status` takes `--scope S` (a scope as `status` prints
 it, such as `github:o/r`) or `--all` instead of the current repo.
 
 `tick` exits 0 when every scope ticked, including a scope that was off,
-locked by another host, or refused by a gate (lane cap, memory, usage). It
-exits 1 only when a scope could not tick at all, for example because its
+locked by another host, or refused by a gate (lane cap, daily launch cap,
+memory, usage). It exits 1 only when a scope could not tick at all, for example because its
 config no longer loads. The other scopes still tick.
 
 `--json` prints one array with one object per scope:
@@ -32,8 +32,11 @@ config no longer loads. The other scopes still tick.
   "launched": [{"ticket": "GH-7", "lane": "backend", "stacked_on": null}],
   "refused": "not launching: 1 lanes running, [dispatch] max_lanes is 1",
   "skipped": null,
+  "notified": ["tm: GH-3 is awaiting your review"],
   "error": null}]
 ```
+
+`notified` lists the desktop notifications the tick sent.
 
 `skipped` is `"locked"` or `"disabled"` when the tick did nothing.
 
@@ -94,6 +97,12 @@ Three settings in `tm-dispatch.service` matter:
 
 The service also runs a tick when it starts, so `systemctl --user start
 tm-dispatch.service` is a manual tick under the same environment.
+
+A tick shows desktop notifications with `notify-send`, which needs your
+session bus. A user service normally inherits `DBUS_SESSION_BUS_ADDRESS`
+from the systemd user manager. If no notifications appear, check
+`systemctl --user show-environment`. Without `notify-send` the tick sends
+no notifications and still runs.
 
 ## Cadence: every 5 minutes
 

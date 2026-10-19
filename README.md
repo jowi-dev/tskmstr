@@ -207,7 +207,7 @@ tm auth status
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
 | `tm dispatch tick [--scope S \| --all] [--json]` | Run one autopilot dispatch pass for the current repo, one scope, or every scope that is on. Exits `0` even when a scope is off, locked, or refused by a gate; `1` only when a scope can't tick. See "Running autopilot without a TUI" below |
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
-| `tm dispatch status` | Per scope: on or off, running lanes, last tick, and last refusal |
+| `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1046,6 +1046,8 @@ it. A tick:
    itself. Launching stops at the first of these refusals:
    - `max_lanes` lanes are running (every running lane counts, however it
      was launched);
+   - the repo launched `max_launches_per_day` lanes in the last 24 hours, a
+     backstop against a runaway dispatcher;
    - no lane matches the repo;
    - every runner is metered and `allow_paid_fallback` is off;
    - memory admission refuses;
@@ -1054,7 +1056,25 @@ it. A tick:
    A launch that fails, such as a dirty worktree, is recorded and the tick
    moves on to the next ticket.
 6. **Records what it did** in runs.db's `dispatch_events`: a `launch` row
-   per launch, and a `refused` row with the first refusal's reason.
+   per launch, and a `refused` row with the first refusal's reason and a
+   short reason code (`max_lanes`, `daily_cap`, `memory`, `usage`, ...).
+7. **Sends desktop notifications** (GitHub issue #121,
+   `src/work/notify.rs`) when:
+   - a ticket enters "awaiting review": its PR is open, the bots have
+     reviewed, and nothing is running;
+   - a ticket hits the fix-round cap: auto-review stopped at its round cap,
+     or the ticket has `max_fix_rounds` fix passes;
+   - the dispatcher has refused for the same reason code for longer than
+     `stall_notify_mins`.
+
+   Each of these fires once per transition, not once per tick. runs.db's
+   `notifications` table remembers, per ticket and reason, the transition
+   it last notified. A ticket that goes back to work and returns to the
+   same state notifies again. A tick sends nothing while the scope's
+   autopilot is off, and only tickets active in the last 7 days notify.
+
+   Notifications use `notify-send` on Linux and `osascript` on macOS. If
+   the command is not installed, the tick sends nothing and carries on.
 
 `--unattended` is a hidden `tm work run` flag. It implies `--headless`. It
 drops metered runners from the fallback chain unless `allow_paid_fallback`
@@ -1065,6 +1085,8 @@ is set. It also refuses, rather than warns, when usage admission says no.
 max_lanes = 1               # default; the most lane runs at once
 allow_paid_fallback = false # default; see "Usage admission" above
 tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
+max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
+stall_notify_mins = 30      # default; refusing this long for one reason notifies
 ```
 
 #### Running autopilot from the TUI
@@ -1089,12 +1111,15 @@ The board's status bar starts with its repo's state. On the overview, a
 project with autopilot on shows it at the end of its strip line:
 
 ```
-autopilot on · lanes 1/2 · not launching: 2 lanes running, [dispatch] max_lanes is 2
+autopilot on · lanes 1/2 · launched 12m ago · not launching: 2 lanes running, [dispatch] max_lanes is 2 (5m)
 ```
 
 - **lanes**: lane runs running now, across every repo, against `max_lanes`
   from the config you started the TUI from
-- the last part is the newest tick's refusal, from `dispatch_events`. It
+- **launched**: how long ago this repo last launched a lane. It is left out
+  when the repo has never launched one.
+- the last part is the newest tick's refusal, from `dispatch_events`, and
+  how long refusals for that reason have lasted. It
   clears once a later tick launches something. A tick that failed outright,
   such as a tracker timeout, shows `tick failed: <error>` instead until a
   tick succeeds. The thread keeps ticking either way.
@@ -1110,11 +1135,22 @@ Then let a systemd user timer run `tm dispatch tick --all` every 5 minutes.
 
 ```sh
 tm dispatch on              # this repo on; records its checkout
-tm dispatch status          # per scope: on/off, running lanes, last tick, last refusal
+tm dispatch status          # per scope: on/off, lanes, last tick, last launch, current block
 tm dispatch tick [--json]   # one pass for this repo
 tm dispatch tick --all      # one pass for every scope that is on
 tm dispatch off --all       # kill switch: the next tick launches nothing
 ```
+
+`status` prints, for example:
+
+```
+github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
+  repo: /home/me/r
+  blocked for 45m: not launching: 1 lanes running, [dispatch] max_lanes is 1
+```
+
+The `blocked` line appears only while the newest tick refused.
+`tick` also prints a `notified:` line for each notification it sent.
 
 `tick` exits 0 when a scope is off, locked by another host, or refused by a
 gate. It exits 1 only when a scope can't tick at all. The flag and the lock
