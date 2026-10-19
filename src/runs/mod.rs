@@ -2682,7 +2682,9 @@ impl RunStore {
                 (SELECT e.detail FROM run_events e
                     WHERE e.run_id = r.id AND e.kind = 'auto_review_round'
                     ORDER BY e.at DESC, e.id DESC LIMIT 1)
-                    AS auto_review_round
+                    AS auto_review_round,
+                EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = r.id AND e.kind = 'pr_closed')
+                    AS pr_closed
              FROM runs r
              ORDER BY r.started_at DESC, r.id DESC";
 
@@ -2706,6 +2708,7 @@ impl RunStore {
                 repo_root: row.get(7)?,
                 heartbeat_age_secs: row.get(8)?,
                 auto_review_round: row.get(12)?,
+                pr_closed: row.get(13)?,
                 awaiting_input,
                 state_age_secs: match last_event_age {
                     Some(age) if awaiting_input => age,
@@ -8514,6 +8517,22 @@ mod tests {
         assert_eq!(round.auto_review_round.as_deref(), Some("1/2 fix-failed"));
         let plain = runs.iter().find(|r| r.id == plain).unwrap();
         assert_eq!(plain.auto_review_round, None);
+    }
+
+    #[test]
+    fn overview_runs_flags_a_run_with_a_pr_closed_event() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let closed = start_lane_with_pid(&store, "GH-1", None);
+        let open = start_lane_with_pid(&store, "GH-2", None);
+        store
+            .add_event(closed, "pr_closed", Some(r#"{"reason":"merged"}"#))
+            .unwrap();
+
+        let runs = store.overview_runs().unwrap();
+
+        assert!(runs.iter().find(|r| r.id == closed).unwrap().pr_closed);
+        assert!(!runs.iter().find(|r| r.id == open).unwrap().pr_closed);
     }
 
     #[test]

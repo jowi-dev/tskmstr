@@ -87,12 +87,16 @@ pub const fn run_status_style(status: RunStatus) -> Style {
 }
 
 /// An overview row's stage label (GitHub issue #83, ADR-0009): the stages
-/// the operator acts on get the loud colors (needs input yellow bold, the
+/// the operator acts on get the loud colors (needs input yellow bold,
+/// awaiting review light green bold, the
 /// PR stages green/magenta/red, stuck red), a running row the same cyan as
 /// a running run, and a not-started row recedes.
 pub const fn stage_style(stage: Stage) -> Style {
     match stage {
         Stage::NeedsInput => AWAITING_INPUT,
+        Stage::AwaitingReview => Style::new()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
         Stage::ReadyToMerge => Style::new().fg(Color::Green),
         Stage::NeedsReview => Style::new().fg(Color::Magenta),
         Stage::Conflicted => Style::new().fg(Color::LightRed),
