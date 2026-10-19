@@ -153,6 +153,22 @@ pub enum ReviewCliError {
     /// `tm review auto`: a round step failed.
     #[error(transparent)]
     AutoReview(#[from] AutoReviewError),
+
+    /// `tm review import`: no pull request is open for the lane's branch.
+    #[error("no pull request is open for {branch} — nothing to import a review from")]
+    NoPullRequest {
+        /// The lane run's branch.
+        branch: String,
+    },
+
+    /// `tm review import`: a `gh` call failed.
+    #[error(transparent)]
+    Gh(#[from] crate::github::gh_cli::GhError),
+
+    /// `tm review import`: reading or writing the comment store or the
+    /// import sidecar failed.
+    #[error(transparent)]
+    CommentStore(#[from] crate::work::comment_store::CommentStoreError),
 }
 
 /// The result of one `tm review fix` dispatch attempt.
@@ -652,6 +668,201 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
         self.deps.clock.now_unix_secs()
     }
 }
+
+/// The settings `tm review import` reads from config.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportSettings<'a> {
+    /// `review_bots`: their threads are `tm pr watch`'s, never imported.
+    pub review_bots: &'a [String],
+    /// `[dispatch] max_fix_rounds`; see [`crate::work::fix_cap`].
+    pub max_fix_rounds: u32,
+    /// `[review] resolve_imported`.
+    pub resolve_imported: bool,
+}
+
+/// What `tm review import --fix` did after importing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportFix {
+    /// `--fix` wasn't given.
+    NotRequested,
+    /// The store holds no imported GitHub comment, so there was nothing to
+    /// fix.
+    NothingToFix,
+    /// The ticket already has `max_fix_rounds` fix passes; none was
+    /// started and the lane run was flagged for review.
+    Capped,
+    /// The fix pass ran and failed. The store is left in place.
+    Failed,
+    /// The fix pass succeeded and the store was archived. `resolved` is how
+    /// many threads were replied to and resolved on GitHub.
+    Fixed {
+        /// Threads resolved (always `0` unless `resolve_imported`).
+        resolved: usize,
+    },
+}
+
+/// How one `tm review import` went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportOutcome {
+    /// Threads imported by this pass.
+    pub imported: usize,
+    /// What `--fix` did.
+    pub fix: ImportFix,
+}
+
+/// `tm review import <KEY> [--fix]` (GitHub issue #120): see
+/// `docs/plans/gh-120-import-github-review.md`.
+///
+/// Imports the unresolved human review threads on the PR for KEY's lane
+/// branch into the worktree's comment store
+/// ([`crate::work::review_import::import`]) and records an
+/// [`IMPORT_EVENT`](crate::work::review_import::IMPORT_EVENT) on the lane
+/// run when any were imported. With `fix`, and when the store holds any
+/// imported comment, it then runs an unchanged [`fix`] in the foreground,
+/// unless the ticket has used up `max_fix_rounds`. A successful fix pass
+/// archives the store, and with `resolve_imported` replies "Addressed in
+/// <sha>" on each imported thread and resolves it, but only once the fix
+/// pass has pushed (HEAD moved and matches its upstream).
+///
+/// # Errors
+///
+/// [`ReviewCliError::Runs`]/[`ReviewCliError::MissingBranch`] as for
+/// [`fix`]; [`ReviewCliError::NoPullRequest`] when no PR is open for the
+/// branch; [`ReviewCliError::Gh`] if fetching the threads fails;
+/// [`ReviewCliError::CommentStore`] for a store or sidecar failure; any
+/// [`fix`] error. A failed reply or resolve is reported, not returned.
+pub fn import(
+    deps: &ReviewFixDeps<'_>,
+    paths: &RunLanePaths,
+    settings: &ImportSettings<'_>,
+    key: &str,
+    fix_requested: bool,
+    out: &mut dyn Write,
+) -> Result<ImportOutcome, ReviewCliError> {
+    use crate::work::{comment_store, fix_cap, review_import};
+
+    let scope = deps.backend_identity.scope();
+    let run = resolve_run(deps.run_store, Some(&scope), key, Some("lane"))?;
+    let branch = run
+        .branch
+        .clone()
+        .ok_or_else(|| ReviewCliError::MissingBranch {
+            ticket: run.ticket.clone(),
+        })?;
+    let worktree = PathBuf::from(&run.worktree);
+    let no_pr = || ReviewCliError::NoPullRequest {
+        branch: branch.clone(),
+    };
+    let url = deps.gh.pr_url_for_branch(&branch)?.ok_or_else(no_pr)?;
+    let pr = pr_number_from_url(&url).ok_or_else(no_pr)?;
+
+    let threads = deps.gh.pr_review_threads_full(&worktree, pr)?;
+    let git_dir = deps.git.git_dir(&worktree)?;
+    let created_at = comment_store::iso8601_utc(deps.clock.now_unix_secs());
+    let report = review_import::import(
+        &git_dir,
+        &threads.threads,
+        settings.review_bots,
+        &created_at,
+    )?;
+    let imported = report.imported.len();
+    writeln!(
+        out,
+        "imported  {imported} GitHub review thread(s) from PR #{pr}"
+    )?;
+    let record = |detail: &str| {
+        deps.run_store
+            .add_event(run.id, review_import::IMPORT_EVENT, Some(detail))
+            .map(|_| ())
+    };
+    if imported > 0 {
+        record(&format!("{imported} imported"))?;
+    }
+
+    let done = |fix| Ok(ImportOutcome { imported, fix });
+    if !fix_requested {
+        return done(ImportFix::NotRequested);
+    }
+    if !review_import::store_has_imports(&git_dir)? {
+        return done(ImportFix::NothingToFix);
+    }
+    if fix_cap::fix_cap_reached(deps.run_store, &scope, &run.ticket, settings.max_fix_rounds)? {
+        if run.status.is_terminal() {
+            deps.run_store.flag_for_review(run.id)?;
+        }
+        record("capped")?;
+        writeln!(
+            out,
+            "capped    {} has {} fix pass(es) already; not starting another",
+            run.ticket, settings.max_fix_rounds
+        )?;
+        return done(ImportFix::Capped);
+    }
+
+    let head_before = deps.git.rev_parse(&worktree, "HEAD").ok();
+    match fix(deps, paths, &run.ticket, Dispatch::HeadlessForeground, out)? {
+        FixOutcome::NoComments => done(ImportFix::NothingToFix),
+        FixOutcome::Dispatched { succeeded: false } => {
+            record("fix-failed")?;
+            done(ImportFix::Failed)
+        }
+        FixOutcome::Dispatched { succeeded: true } => {
+            let round = fix_cap::fix_rounds_used(deps.run_store, &scope, &run.ticket)?;
+            comment_store::archive_named(&git_dir, &format!("import-{round}"))?;
+            record("fix")?;
+            let resolved = if settings.resolve_imported {
+                resolve_imported_threads(deps, &worktree, &git_dir, head_before, out)?
+            } else {
+                0
+            };
+            done(ImportFix::Fixed { resolved })
+        }
+    }
+}
+
+/// Replies "Addressed in <sha>" on, and resolves, every imported thread the
+/// sidecar hasn't marked resolved, when the fix pass pushed: HEAD moved off
+/// `head_before` and equals its upstream. Returns how many were resolved.
+fn resolve_imported_threads(
+    deps: &ReviewFixDeps<'_>,
+    worktree: &Path,
+    git_dir: &Path,
+    head_before: Option<String>,
+    out: &mut dyn Write,
+) -> Result<usize, ReviewCliError> {
+    use crate::work::review_import;
+
+    let head = deps.git.rev_parse(worktree, "HEAD").ok();
+    let upstream = deps.git.rev_parse(worktree, "@{upstream}").ok();
+    let Some(sha) =
+        head.filter(|h| Some(h) != head_before.as_ref() && Some(h) == upstream.as_ref())
+    else {
+        writeln!(
+            out,
+            "not resolving imported threads: the fix pass didn't push a new commit"
+        )?;
+        return Ok(0);
+    };
+    let mut sidecar = review_import::load_sidecar(git_dir)?;
+    let short = &sha[..sha.len().min(7)];
+    let mut resolved = 0;
+    for thread in sidecar.unresolved_threads() {
+        match deps
+            .gh
+            .reply_and_resolve_thread(worktree, &thread, &format!("Addressed in {short}."))
+        {
+            Ok(()) => {
+                sidecar.mark_resolved(&thread);
+                resolved += 1;
+            }
+            Err(err) => writeln!(out, "warning: could not resolve thread {thread}: {err}")?,
+        }
+    }
+    review_import::save_sidecar(git_dir, &sidecar)?;
+    writeln!(out, "resolved  {resolved} imported thread(s) at {short}")?;
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,5 +1720,281 @@ mod tests {
             Some(131)
         );
         assert_eq!(pr_number_from_url("https://github.com/o/r/pull/"), None);
+    }
+
+    // --- tm review import (GitHub issue #120) ---
+
+    const RECORDED_THREADS: &str = include_str!("../github/fixtures/review_threads_import.json");
+
+    fn import_fakes(tmp: &TempDir, git: FakeGitOps) -> AutoFakes {
+        let threads =
+            crate::github::review_threads::parse_review_threads_full(RECORDED_THREADS, 140)
+                .unwrap();
+        AutoFakes {
+            git,
+            gh: FakeGhCli::new()
+                .with_pr_url_for_branch(Ok(Some(
+                    "https://github.com/jowi-dev/tskmstr/pull/140".to_string(),
+                )))
+                .with_pr_review_threads_full(140, Ok(threads)),
+            ..auto_fakes(tmp)
+        }
+    }
+
+    fn import_settings(max_fix_rounds: u32, resolve_imported: bool) -> ImportSettings<'static> {
+        static BOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        ImportSettings {
+            review_bots: BOTS.get_or_init(|| vec!["cursor[bot]".to_string()]),
+            max_fix_rounds,
+            resolve_imported,
+        }
+    }
+
+    fn lane_run_id(run_store: &RunStore) -> i64 {
+        run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    fn import_events(run_store: &RunStore) -> Vec<String> {
+        run_store
+            .events_for_run(lane_run_id(run_store))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == crate::work::review_import::IMPORT_EVENT)
+            .filter_map(|e| e.detail)
+            .collect()
+    }
+
+    fn finish_lane_run(run_store: &RunStore) {
+        run_store
+            .finish_run(
+                lane_run_id(run_store),
+                &crate::runs::FinishRun {
+                    status: RunStatus::Done,
+                    exit_code: Some(0),
+                    session_id: None,
+                    cost_usd: None,
+                    num_turns: None,
+                    blocker: None,
+                    pr_url: None,
+                    transcript: None,
+                    model_usage: None,
+                    findings_count: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn import_without_fix_imports_once_badges_and_starts_no_fix() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = import_fakes(&tmp, FakeGitOps::new());
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let settings = import_settings(3, false);
+        let mut out = Vec::new();
+
+        let first = import(&deps, &paths(&tmp), &settings, "PROJ-1", false, &mut out).unwrap();
+        let again = import(&deps, &paths(&tmp), &settings, "PROJ-1", false, &mut out).unwrap();
+
+        assert_eq!(
+            first,
+            ImportOutcome {
+                imported: 3,
+                fix: ImportFix::NotRequested
+            }
+        );
+        assert_eq!(again.imported, 0);
+        assert_eq!(import_events(&run_store), ["3 imported"]);
+        let git_dir = worktree.join(".git");
+        assert_eq!(crate::work::comment_store::load(&git_dir).unwrap().len(), 3);
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn import_errors_when_no_pr_is_open_for_the_branch() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = AutoFakes {
+            gh: FakeGhCli::new().with_pr_url_for_branch(Ok(None)),
+            ..auto_fakes(&tmp)
+        };
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let err = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, false),
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ReviewCliError::NoPullRequest { .. }), "{err}");
+    }
+
+    #[test]
+    fn import_fix_runs_an_unchanged_fix_pass_and_archives_the_store() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = import_fakes(&tmp, FakeGitOps::new());
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, false),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.fix, ImportFix::Fixed { resolved: 0 });
+        let fix_run = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fix_run.status, RunStatus::Done);
+        let git_dir = worktree.join(".git");
+        assert!(
+            crate::work::comment_store::load(&git_dir)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(crate::work::comment_store::named_archive_path(&git_dir, "import-1").exists());
+        assert_eq!(import_events(&run_store), ["3 imported", "fix"]);
+        assert!(fakes.gh.reply_and_resolve_thread_calls().is_empty());
+    }
+
+    #[test]
+    fn import_fix_at_the_cap_flags_the_lane_and_starts_nothing() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        finish_lane_run(&run_store);
+        run_store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: Some("jowi-dev/proj-1-slug".to_string()),
+                pid: None,
+                kind: "review-fix".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let fakes = import_fakes(&tmp, FakeGitOps::new());
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(1, false),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.fix, ImportFix::Capped);
+        assert!(
+            spawner.recorded.lock().unwrap().is_empty(),
+            "no fix agent ran"
+        );
+        let lane = run_store
+            .run_by_id(lane_run_id(&run_store))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lane.status, RunStatus::Review);
+        assert_eq!(import_events(&run_store), ["3 imported", "capped"]);
+        let git_dir = worktree.join(".git");
+        assert_eq!(
+            crate::work::comment_store::load(&git_dir).unwrap().len(),
+            3,
+            "the store is left for the human"
+        );
+    }
+
+    #[test]
+    fn import_fix_resolves_threads_once_the_fix_pass_pushed() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let git = FakeGitOps::new()
+            .with_rev_parse_sequence(
+                "HEAD",
+                vec![Ok("aaaaaaa1111".to_string()), Ok("bbbbbbb2222".to_string())],
+            )
+            .with_rev_parse_result("@{upstream}", Ok("bbbbbbb2222".to_string()));
+        let fakes = import_fakes(&tmp, git);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, true),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.fix, ImportFix::Fixed { resolved: 3 });
+        let calls = fakes.gh.reply_and_resolve_thread_calls();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|(_, body)| body == "Addressed in bbbbbbb.")
+        );
+        let sidecar = crate::work::review_import::load_sidecar(&worktree.join(".git")).unwrap();
+        assert!(sidecar.unresolved_threads().is_empty());
+    }
+
+    #[test]
+    fn import_fix_leaves_threads_open_when_the_fix_pass_did_not_push() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let git = FakeGitOps::new()
+            .with_rev_parse_sequence(
+                "HEAD",
+                vec![Ok("aaaaaaa1111".to_string()), Ok("bbbbbbb2222".to_string())],
+            )
+            .with_rev_parse_result("@{upstream}", Ok("aaaaaaa1111".to_string()));
+        let fakes = import_fakes(&tmp, git);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, true),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.fix, ImportFix::Fixed { resolved: 0 });
+        assert!(fakes.gh.reply_and_resolve_thread_calls().is_empty());
     }
 }

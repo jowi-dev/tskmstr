@@ -38,6 +38,11 @@ use crate::work::comment_store::{self, CommentStoreError, NewComment};
 /// Text prefix of every imported comment, followed by the author's login.
 pub const IMPORT_PREFIX: &str = "[github · @";
 
+/// Event kind `tm review import` records on the ticket's lane run. Its
+/// detail is `<n> imported`, `fix`, `fix-failed` or `capped`, and the
+/// overview shows the newest one on the ticket's row.
+pub const IMPORT_EVENT: &str = "review_import";
+
 /// Text prefix `tm review auto` gives its findings (see
 /// [`crate::work::auto_review::Finding::to_comment`]).
 const AUTO_REVIEW_PREFIX: &str = "[auto-review ·";
@@ -168,6 +173,20 @@ pub fn local_texts(git_dir: &Path) -> Result<HashSet<String>, CommentStoreError>
         }
     }
     Ok(texts)
+}
+
+/// Whether the store holds any imported GitHub comment, which is what makes
+/// a `tm review import --fix` start a fix pass.
+///
+/// # Errors
+///
+/// See [`comment_store::load`].
+pub fn store_has_imports(git_dir: &Path) -> Result<bool, CommentStoreError> {
+    Ok(comment_store::load(git_dir)?.iter().any(|c| {
+        c.get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with(IMPORT_PREFIX))
+    }))
 }
 
 /// Is `body` a comment tm or vdiff published, rather than a human's?
