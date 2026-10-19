@@ -486,6 +486,7 @@ fn run_review(cmd: ReviewCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ReviewCmd::Fix { .. } => unreachable!("tm review fix is handled by run_review_fix"),
         ReviewCmd::Auto { key, foreground } => run_review_auto(key, foreground),
+        ReviewCmd::Import { key, fix } => run_review_import(key, fix),
     }
 }
 
@@ -2012,6 +2013,26 @@ fn run_review_auto(key: String, foreground: bool) -> Result<(), Box<dyn std::err
             &mut stdout,
         )
         .map(|_| ())
+    })??;
+    Ok(())
+}
+
+/// `tm review import <KEY> [--fix]` (GitHub issue #120): build real
+/// dependencies and run [`tskmstr::cli::review::import`] with the invoking
+/// repo's `review_bots`, `[dispatch] max_fix_rounds` and `[review]
+/// resolve_imported` (defaults when config can't load).
+fn run_review_import(key: String, fix: bool) -> Result<(), Box<dyn std::error::Error>> {
+    with_review_deps(|deps, run_paths, config| {
+        let default_bots = vec!["cursor[bot]".to_string()];
+        let settings = tskmstr::cli::review::ImportSettings {
+            review_bots: config.map_or(&default_bots, |c| &c.review_bots),
+            max_fix_rounds: config.map_or(tskmstr::config::DEFAULT_MAX_FIX_ROUNDS, |c| {
+                c.dispatch.max_fix_rounds
+            }),
+            resolve_imported: config.is_some_and(|c| c.review.resolve_imported),
+        };
+        let mut stdout = std::io::stdout();
+        tskmstr::cli::review::import(deps, run_paths, &settings, &key, fix, &mut stdout).map(|_| ())
     })??;
     Ok(())
 }
