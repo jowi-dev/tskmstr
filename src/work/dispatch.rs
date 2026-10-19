@@ -744,7 +744,18 @@ mod tests {
 
         fx.tick(&[], &launcher);
 
-        assert!(fx.lock().try_lock(SCOPE).unwrap().is_some());
+        // Another test thread that forks a child while the tick's lock file
+        // is open hands the child a copy of the descriptor, and with it the
+        // `flock`, until the child execs and close-on-exec drops it. So
+        // retry briefly instead of failing on that window.
+        let released = (0..100).any(|_| {
+            let taken = fx.lock().try_lock(SCOPE).unwrap().is_some();
+            if !taken {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            taken
+        });
+        assert!(released, "the scope lock is still held after the tick");
     }
 
     #[test]
