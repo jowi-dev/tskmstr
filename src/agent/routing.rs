@@ -111,6 +111,23 @@ pub fn unattended_order(
         .collect()
 }
 
+/// [`unattended_order`] over a config's whole runner order: the preferred
+/// `agent` (`Config::agent`), then its `fallbacks`
+/// (`Config::agent_fallbacks`). The first survivor is the runner an
+/// unattended launch prefers; the rest are its fallbacks (GitHub issue
+/// #115).
+pub fn configured_unattended_order(
+    agent: AgentKind,
+    fallbacks: &[AgentKind],
+    usage: &UsageConfig,
+    dispatch: &DispatchConfig,
+) -> Vec<AgentKind> {
+    let order: Vec<AgentKind> = std::iter::once(agent)
+        .chain(fallbacks.iter().copied())
+        .collect();
+    unattended_order(&order, usage, dispatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +223,33 @@ mod unattended_tests {
     use crate::config::{Billing, DispatchConfig, UsageConfig};
 
     const ORDER: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Opencode];
+
+    #[test]
+    fn configured_unattended_order_puts_the_preferred_runner_first() {
+        let mut usage = UsageConfig::default();
+        usage.opencode.billing = Billing::Subscription;
+
+        let order = configured_unattended_order(
+            AgentKind::Opencode,
+            &[AgentKind::Claude],
+            &usage,
+            &DispatchConfig::default(),
+        );
+
+        assert_eq!(order, vec![AgentKind::Opencode, AgentKind::Claude]);
+    }
+
+    #[test]
+    fn configured_unattended_order_drops_a_metered_preferred_runner() {
+        let order = configured_unattended_order(
+            AgentKind::Opencode,
+            &[AgentKind::Claude],
+            &UsageConfig::default(),
+            &DispatchConfig::default(),
+        );
+
+        assert_eq!(order, vec![AgentKind::Claude]);
+    }
 
     #[test]
     fn unattended_order_drops_metered_runners_by_default() {

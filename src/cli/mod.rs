@@ -485,6 +485,13 @@ pub enum WorkCmd {
         /// session has no outcome to report back synchronously.
         #[arg(long)]
         fg: bool,
+        /// Hidden: launched by the autopilot dispatcher (GitHub issue #115).
+        /// Implies `--headless`, routes only to runners an unattended launch
+        /// may use (no metered runner unless `[dispatch]
+        /// allow_paid_fallback`), and refuses instead of warning when usage
+        /// admission says no.
+        #[arg(long, hide = true)]
+        unattended: bool,
     },
     /// Hidden: the detached run supervisor's own re-exec target. Not a
     /// user-facing command — `tm work run --headless` spawns this
@@ -3020,10 +3027,12 @@ mod tests {
                         prompt,
                         headless,
                         fg,
+                        unattended,
                     },
             }) => {
                 assert_eq!(lane, "my-lane");
                 assert_eq!(ticket, None);
+                assert!(!unattended);
                 assert_eq!(from, None);
                 assert_eq!(model, None);
                 assert_eq!(max_turns, None);
@@ -3177,6 +3186,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_work_run_with_hidden_unattended() {
+        let cli = Cli::try_parse_from(["tm", "work", "run", "my-lane", "GH-1", "--unattended"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::Run { unattended, .. },
+            }) => assert!(unattended),
+            other => panic!("expected Work Run, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_work_run_with_fg() {
         let cli =
             Cli::try_parse_from(["tm", "work", "run", "my-lane", "--fg"]).expect("should parse");
@@ -3222,6 +3243,7 @@ mod tests {
                         prompt,
                         headless,
                         fg,
+                        ..
                     },
             }) => {
                 assert_eq!(lane, "my-lane");

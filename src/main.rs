@@ -585,6 +585,7 @@ fn run_work(
             prompt,
             headless,
             fg,
+            unattended,
         } => {
             let gh = ShellGhCli::new();
             let spawner = tskmstr::work::runner::StdProcessSpawner;
@@ -620,8 +621,23 @@ fn run_work(
                 .as_ref()
                 .map(|cfg| cfg.usage.clone())
                 .unwrap_or_default();
+            // `--unattended` (GitHub issue #115) routes only to runners an
+            // unattended launch may use and enforces usage admission.
+            let (runner, fallback_runners) = if unattended {
+                unattended_runners(full_config.as_ref())?
+            } else {
+                (
+                    agent_runner_or_default(full_config.as_ref()),
+                    agent_fallback_runners_for(full_config.as_ref()),
+                )
+            };
+            let usage_gate = if unattended {
+                tskmstr::work::admission::UsageGateMode::Enforce
+            } else {
+                tskmstr::work::admission::UsageGateMode::Warn
+            };
             let usage_prober = tskmstr::work::admission::SpawnUsageProber {
-                runners: vec![agent_runner_or_default(full_config.as_ref())],
+                runners: vec![runner],
                 spawner: &spawner,
             };
             let run_deps = tskmstr::cli::work::RunDeps {
@@ -636,7 +652,7 @@ fn run_work(
                 current_repo_dir: &cwd,
                 current_backend_identity: &current_backend_identity,
                 backend_identity_resolver: &backend_identity_resolver,
-                runner: agent_runner_or_default(full_config.as_ref()),
+                runner,
                 status_on_run_start: full_config
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_run_start.as_deref()),
@@ -644,10 +660,11 @@ fn run_work(
                     .as_ref()
                     .and_then(|cfg| cfg.status_on_pr.as_deref()),
                 ticket_provider_error: ticket_provider_error.as_deref(),
-                fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
+                fallback_runners,
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
                 usage: &usage,
                 usage_prober: &usage_prober,
+                usage_gate,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -664,7 +681,7 @@ fn run_work(
                 &run_deps,
                 &lane,
                 request,
-                Dispatch::from_flags(headless, fg),
+                Dispatch::from_flags(headless || unattended, fg),
                 &mut stdout,
             )?;
             if !succeeded {
@@ -983,6 +1000,34 @@ fn agent_fallback_runners_for(config: Option<&Config>) -> Vec<&'static dyn Agent
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A preferred runner and its fallbacks.
+type RunnerChoice = (&'static dyn AgentRunner, Vec<&'static dyn AgentRunner>);
+
+/// The preferred runner and fallbacks for `tm work run --unattended`
+/// (GitHub issue #115): the configured order with every metered runner
+/// dropped unless `[dispatch] allow_paid_fallback` is set (see
+/// [`tskmstr::agent::routing::configured_unattended_order`]). Errors when
+/// no config loaded or no runner survives, since an unattended launch must
+/// never guess its way onto a paid runner.
+fn unattended_runners(config: Option<&Config>) -> Result<RunnerChoice, Box<dyn std::error::Error>> {
+    let cfg = config.ok_or("--unattended needs a loadable config")?;
+    let order = tskmstr::agent::routing::configured_unattended_order(
+        cfg.agent,
+        &cfg.agent_fallbacks,
+        &cfg.usage,
+        &cfg.dispatch,
+    );
+    let (first, rest) = order.split_first().ok_or(
+        "no runner may launch unattended: every configured runner is metered and [dispatch] allow_paid_fallback is off",
+    )?;
+    Ok((
+        tskmstr::agent::routing::runner_for(*first),
+        rest.iter()
+            .map(|kind| tskmstr::agent::routing::runner_for(*kind))
+            .collect(),
+    ))
 }
 
 /// The default global/repo config paths for this machine and working

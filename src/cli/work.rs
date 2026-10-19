@@ -128,6 +128,12 @@ pub enum WorkCliError {
     #[error(transparent)]
     MemoryAdmission(#[from] crate::work::admission::AdmissionRefusal),
 
+    /// Usage admission refused an unattended lane (GitHub issues #114 and
+    /// #115): see [`RunDeps::usage_gate`]. Checked before anything is
+    /// provisioned.
+    #[error(transparent)]
+    UsageAdmission(#[from] crate::work::admission::UsageRefusal),
+
     /// `tm work new`/`remove` was given an empty (or all-whitespace) name.
     /// See [`worktree_path_for`]'s doc comment for why this is rejected
     /// before ever calling `naming::worktree_path`.
@@ -410,6 +416,10 @@ pub struct RunDeps<'a> {
     /// Refreshes a stale usage snapshot for usage admission; production
     /// passes a [`crate::work::admission::SpawnUsageProber`].
     pub usage_prober: &'a dyn crate::work::admission::UsageProber,
+    /// How a usage refusal is acted on: [`crate::work::admission::UsageGateMode::Warn`]
+    /// for a manual run, [`crate::work::admission::UsageGateMode::Enforce`] for
+    /// `--unattended` (the autopilot dispatcher, GitHub issue #115).
+    pub usage_gate: crate::work::admission::UsageGateMode,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -492,8 +502,9 @@ pub fn run(
     }
 
     // Usage admission (GitHub issue #114), keyed by the preferred runner
-    // like memory admission. A human chose to launch, so this only warns;
-    // the dispatcher (GitHub issue #115) enforces it instead.
+    // like memory admission. A manual run only warns, since a human chose
+    // to launch; an `--unattended` run from the dispatcher (GitHub issue
+    // #115) is refused. See `RunDeps::usage_gate`.
     if let Some(usage) = deps.usage.for_agent(deps.runner.name()) {
         let verdict = crate::work::admission::check_usage_admission(
             deps.run_store,
@@ -502,11 +513,7 @@ pub fn run(
             deps.clock.now_unix_secs(),
             deps.usage_prober,
         )?;
-        let _ = crate::work::admission::apply_usage_gate(
-            verdict,
-            crate::work::admission::UsageGateMode::Warn,
-            out,
-        );
+        crate::work::admission::apply_usage_gate(verdict, deps.usage_gate, out)?;
     }
 
     match dispatch {
@@ -2596,6 +2603,24 @@ mod tests {
         Vec<crate::runs::RunSummary>,
         String,
     ) {
+        run_with_admission(
+            memory,
+            pressure,
+            seed,
+            crate::work::admission::UsageGateMode::Warn,
+        )
+    }
+
+    fn run_with_admission(
+        memory: crate::config::MemoryConfig,
+        pressure: &dyn Fn() -> crate::runs::footprint::MemoryPressure,
+        seed: &dyn Fn(&RunStore),
+        usage_gate: crate::work::admission::UsageGateMode,
+    ) -> (
+        Result<bool, WorkCliError>,
+        Vec<crate::runs::RunSummary>,
+        String,
+    ) {
         let (tmp, home, repo_root, _prompt_path) = run_setup();
         let mut lanes = BTreeMap::new();
         lanes.insert(
@@ -2645,6 +2670,7 @@ mod tests {
             memory_pressure: pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2730,6 +2756,28 @@ mod tests {
     }
 
     #[test]
+    fn an_enforced_usage_gate_refuses_before_creating_a_run_row() {
+        let (result, runs, _) = run_with_admission(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &|store| store.set_agent_exhausted_until("claude", i64::MAX).unwrap(),
+            crate::work::admission::UsageGateMode::Enforce,
+        );
+
+        let err = result.expect_err("an unattended run is refused");
+        assert!(
+            matches!(
+                err,
+                WorkCliError::UsageAdmission(
+                    crate::work::admission::UsageRefusal::Exhausted { .. }
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(runs.is_empty(), "no run row may be left behind: {runs:?}");
+    }
+
+    #[test]
     fn run_launches_as_before_with_no_memory_budget() {
         let (result, runs, _) = run_with_memory_config(
             crate::config::MemoryConfig::default(),
@@ -2791,6 +2839,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2926,6 +2975,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3001,6 +3051,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let mut out = Vec::new();
 
@@ -3164,6 +3215,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let mut out = Vec::new();
 
@@ -3245,6 +3297,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let mut out = Vec::new();
 
@@ -3312,6 +3365,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3429,6 +3483,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3497,6 +3552,7 @@ mod tests {
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Warn,
         };
         let mut out = Vec::new();
 
