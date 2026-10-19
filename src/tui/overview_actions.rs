@@ -525,6 +525,33 @@ mod tests {
         assert_eq!(app.status_line, "merge of GH-2 cancelled");
     }
 
+    // --- Awaiting review (GitHub issue #119) ---
+
+    /// The autopilot's human stop offers the existing review actions: `V`
+    /// to read the diff, `F` to send it back, `M`/`Space` to accept it.
+    #[test]
+    fn an_awaiting_review_row_supports_v_f_m_and_space() {
+        let awaiting = || app_with(vec![row(SCOPE_A, "GH-1", Stage::AwaitingReview)], 0);
+
+        let (_, cmds) = update(awaiting(), Msg::ViewDiffAction);
+        assert!(
+            matches!(cmds[..], [Cmd::ViewDiffInScope { .. }]),
+            "{cmds:?}"
+        );
+        let (_, cmds) = update(awaiting(), Msg::ReviewFixAction);
+        assert!(
+            matches!(cmds[..], [Cmd::LaunchReviewFixIn { .. }]),
+            "{cmds:?}"
+        );
+        let (app, _) = update(awaiting(), Msg::MergePrAction);
+        assert!(app.overview_merge_confirm.is_some());
+        let (app, _) = update(awaiting(), Msg::ToggleMergeQueue);
+        assert!(
+            app.overview_merge_queue
+                .contains_key(&TicketKey::new(SCOPE_A, "GH-1"))
+        );
+    }
+
     // --- Space / batch ---
 
     #[test]
