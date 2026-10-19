@@ -12,6 +12,7 @@ pub mod build_slots;
 pub mod comment_store;
 pub mod create;
 pub mod detach;
+pub mod fix_cap;
 pub mod git;
 pub mod hibernate;
 pub mod interactive;

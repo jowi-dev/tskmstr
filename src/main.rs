@@ -1998,8 +1998,20 @@ fn run_review_auto(key: String, foreground: bool) -> Result<(), Box<dyn std::err
     with_review_deps(|deps, run_paths, config| {
         let default_cfg = tskmstr::config::AutoReviewConfig::default();
         let cfg = config.map_or(&default_cfg, |c| &c.work.auto_review);
+        let max_fix_rounds = config.map_or(tskmstr::config::DEFAULT_MAX_FIX_ROUNDS, |c| {
+            c.dispatch.max_fix_rounds
+        });
         let mut stdout = std::io::stdout();
-        tskmstr::cli::review::auto(deps, run_paths, cfg, &key, foreground, &mut stdout).map(|_| ())
+        tskmstr::cli::review::auto(
+            deps,
+            run_paths,
+            cfg,
+            max_fix_rounds,
+            &key,
+            foreground,
+            &mut stdout,
+        )
+        .map(|_| ())
     })??;
     Ok(())
 }

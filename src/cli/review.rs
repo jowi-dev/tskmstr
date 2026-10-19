@@ -447,7 +447,9 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 /// the ticket's worktree, the same shape as `tm pr watch`. With it, runs
 /// [`run_loop`] here: each review round is a headless `auto-review` run on
 /// the ticket's lane worktree and branch, and each fix round is [`fix`]
-/// with [`Dispatch::HeadlessForeground`].
+/// with [`Dispatch::HeadlessForeground`]. A round that needs a fix after the
+/// ticket already has `max_fix_rounds` `review-fix` runs (`[dispatch]`,
+/// see [`crate::work::fix_cap`]) ends the loop as capped instead.
 ///
 /// # Errors
 ///
@@ -459,6 +461,7 @@ pub fn auto(
     deps: &ReviewFixDeps<'_>,
     paths: &RunLanePaths,
     cfg: &AutoReviewConfig,
+    max_fix_rounds: u32,
     key: &str,
     foreground: bool,
     out: &mut dyn Write,
@@ -516,6 +519,7 @@ pub fn auto(
         lane: &run.lane,
         worktree: &worktree,
         branch: &branch,
+        max_fix_rounds,
         out: RefCell::new(out),
     };
     let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir)?;
@@ -539,6 +543,7 @@ struct CliAutoReviewOps<'a, 'o> {
     lane: &'a str,
     worktree: &'a Path,
     branch: &'a str,
+    max_fix_rounds: u32,
     out: RefCell<&'o mut dyn Write>,
 }
 
@@ -631,6 +636,16 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
             .run_store
             .flag_for_review(run_id)
             .map_err(|e| AutoReviewError::step("record", e))
+    }
+
+    fn fix_cap_reached(&self) -> Result<bool, AutoReviewError> {
+        crate::work::fix_cap::fix_cap_reached(
+            self.deps.run_store,
+            self.scope,
+            self.ticket,
+            self.max_fix_rounds,
+        )
+        .map_err(|e| AutoReviewError::step("fix", e))
     }
 
     fn now_unix_secs(&self) -> i64 {
@@ -1341,6 +1356,7 @@ mod tests {
             &deps,
             &paths,
             &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
             "proj-1",
             false,
             &mut out,
@@ -1390,6 +1406,7 @@ mod tests {
             &deps,
             &paths(&tmp),
             &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
             "PROJ-1",
             false,
             &mut out,
@@ -1420,6 +1437,7 @@ mod tests {
             &deps,
             &paths(&tmp),
             &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
             "PROJ-1",
             true,
             &mut out,
@@ -1471,6 +1489,7 @@ mod tests {
             &deps,
             &paths(&tmp),
             &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
             "PROJ-1",
             true,
             &mut out,
