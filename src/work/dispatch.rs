@@ -19,11 +19,14 @@
 //! 4. Orders them by how many other candidates each unblocks, most first,
 //!    keeping the tracker's rank order within a tie.
 //! 5. Launches them in that order through a [`Launcher`] while the running
-//!    lane count is under `max_lanes` and memory and usage admission pass.
+//!    lane count is under `max_lanes`, the scope launched fewer than
+//!    `max_launches_per_day` lanes in the last 24 hours, and memory and
+//!    usage admission pass.
 //!    The first refusal ends the tick; a failed launch is recorded and the
 //!    tick moves on to the next ticket.
 //! 6. Records a `launch` row in `dispatch_events` per launch, and a
-//!    `refused` row for the tick's first refusal.
+//!    `refused` row, with its [`Refusal::code`], for the tick's first
+//!    refusal.
 //!
 //! Every dependency is injected, so tests drive [`tick`] with a real
 //! [`RunStore`] in a temp dir and fake candidates and launchers.
@@ -51,6 +54,9 @@ use crate::work::auto_review::RoundVerdict;
 pub const LAUNCH_EVENT: &str = "launch";
 /// `dispatch_events.kind` of a tick's first refusal.
 pub const REFUSED_EVENT: &str = "refused";
+
+/// The daily launch cap's rolling window, in seconds.
+const DAY_SECS: i64 = 24 * 60 * 60;
 
 /// One `tm ready` ticket as the dispatcher reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +212,9 @@ pub struct TickConfig<'a> {
     pub scope: &'a str,
     /// `[dispatch] max_lanes`.
     pub max_lanes: usize,
+    /// `[dispatch] max_launches_per_day`: the most launches in any rolling
+    /// 24 hours for this scope.
+    pub max_launches_per_day: usize,
     /// The lanes compatible with this scope, in board order. The board
     /// launches directly when there is one and asks when there are more; a
     /// tick can't ask, so it takes the first.
@@ -258,6 +267,14 @@ pub enum Refusal {
         /// `[dispatch] max_lanes`.
         max: usize,
     },
+    /// The scope launched `[dispatch] max_launches_per_day` lanes in the
+    /// last 24 hours.
+    DailyCap {
+        /// Launches recorded for the scope in the last 24 hours.
+        launched: usize,
+        /// `[dispatch] max_launches_per_day`.
+        max: usize,
+    },
     /// No configured lane is compatible with the scope.
     NoLane,
     /// Every runner is metered and `[dispatch] allow_paid_fallback` is off.
@@ -282,6 +299,10 @@ impl fmt::Display for Refusal {
                 f,
                 "not launching: {running} lanes running, [dispatch] max_lanes is {max}"
             ),
+            Refusal::DailyCap { launched, max } => write!(
+                f,
+                "not launching: {launched} lanes launched in the last 24h, [dispatch] max_launches_per_day is {max}"
+            ),
             Refusal::NoLane => write!(f, "not launching: no configured lane matches this repo"),
             Refusal::NoUnattendedRunner => write!(
                 f,
@@ -292,6 +313,23 @@ impl fmt::Display for Refusal {
             Refusal::LaunchFailed { ticket, error } => {
                 write!(f, "launching {ticket} failed: {error}")
             }
+        }
+    }
+}
+
+impl Refusal {
+    /// A stable code for the refusal's kind, recorded in
+    /// `dispatch_events.reason`. Two refusals with one code are "the same
+    /// reason" for stall notifications, whatever their detail says.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refusal::MaxLanes { .. } => "max_lanes",
+            Refusal::DailyCap { .. } => "daily_cap",
+            Refusal::NoLane => "no_lane",
+            Refusal::NoUnattendedRunner => "no_unattended_runner",
+            Refusal::Memory(_) => "memory",
+            Refusal::Usage(_) => "usage",
+            Refusal::LaunchFailed { .. } => "launch_failed",
         }
     }
 }
@@ -416,10 +454,10 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     }
 
     if let Some(refusal) = &report.refused {
-        deps.store.record_dispatch_event(
+        deps.store.record_dispatch_refusal(
             cfg.scope,
             refused_ticket.as_deref(),
-            REFUSED_EVENT,
+            refusal.code(),
             &refusal.to_string(),
         )?;
     }
@@ -445,6 +483,15 @@ fn admit<'c>(
         return Ok(Err(Refusal::MaxLanes {
             running,
             max: cfg.max_lanes,
+        }));
+    }
+    let launched = deps
+        .store
+        .dispatch_launches_since(cfg.scope, deps.now - DAY_SECS)?;
+    if launched >= cfg.max_launches_per_day {
+        return Ok(Err(Refusal::DailyCap {
+            launched,
+            max: cfg.max_launches_per_day,
         }));
     }
     let Some(lane) = cfg.lanes.first() else {
@@ -615,6 +662,8 @@ mod tests {
         max_lanes: usize,
         agent: Option<&'static str>,
         pressure: MemoryPressure,
+        max_launches_per_day: usize,
+        now: i64,
     }
 
     impl Fixture {
@@ -634,6 +683,8 @@ mod tests {
                 max_lanes: 5,
                 agent: Some("claude"),
                 pressure: MemoryPressure::Normal,
+                max_launches_per_day: 20,
+                now: NOW,
             }
         }
 
@@ -655,11 +706,12 @@ mod tests {
                 launcher,
                 memory_pressure: &pressure_fn,
                 usage_prober: &NoProbe,
-                now: NOW,
+                now: self.now,
             };
             let cfg = TickConfig {
                 scope: SCOPE,
                 max_lanes: self.max_lanes,
+                max_launches_per_day: self.max_launches_per_day,
                 lanes: &self.lanes,
                 agent: self.agent,
                 memory: &self.memory,
@@ -933,6 +985,68 @@ mod tests {
                 "not launching: 2 lanes running, [dispatch] max_lanes is 2".to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_refusal_event_carries_its_reason_code() {
+        let mut fx = Fixture::new();
+        fx.max_lanes = 0;
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        let event = fx.store.dispatch_events(SCOPE, 1).unwrap().remove(0);
+        assert_eq!(event.reason.as_deref(), Some("max_lanes"));
+    }
+
+    #[test]
+    fn the_daily_launch_cap_refuses_with_its_own_reason() {
+        let mut fx = Fixture::new();
+        fx.max_launches_per_day = 2;
+        fx.now = unix_now();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(
+            &[ready("GH-1", 0), ready("GH-2", 0), ready("GH-3", 0)],
+            &launcher,
+        );
+
+        assert_eq!(launcher.tickets(), vec!["GH-1", "GH-2"]);
+        assert_eq!(
+            report.refused,
+            Some(Refusal::DailyCap {
+                launched: 2,
+                max: 2
+            })
+        );
+        let event = fx.store.dispatch_events(SCOPE, 1).unwrap().remove(0);
+        assert_eq!(event.reason.as_deref(), Some("daily_cap"));
+        assert_eq!(
+            event.detail,
+            "not launching: 2 lanes launched in the last 24h, [dispatch] max_launches_per_day is 2"
+        );
+    }
+
+    #[test]
+    fn launches_older_than_a_day_leave_the_daily_cap() {
+        let mut fx = Fixture::new();
+        fx.max_launches_per_day = 1;
+        fx.now = unix_now();
+        let launcher = FakeLauncher::new(&fx.store);
+        fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        fx.now += 24 * 60 * 60 + 60;
+        let report = fx.tick(&[ready("GH-2", 0)], &launcher);
+
+        assert_eq!(launcher.tickets(), vec!["GH-1", "GH-2"]);
+        assert_eq!(report.refused, None);
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     #[test]

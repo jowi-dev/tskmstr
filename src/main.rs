@@ -451,6 +451,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
             max_lanes: config.dispatch.max_lanes,
+            max_launches_per_day: config.dispatch.max_launches_per_day,
             lanes: &lanes,
             agent,
             memory: &config.work.memory,
@@ -2707,6 +2708,7 @@ impl AutopilotTicker {
         let cfg = dispatch::TickConfig {
             scope: &scope,
             max_lanes: config.dispatch.max_lanes,
+            max_launches_per_day: config.dispatch.max_launches_per_day,
             lanes: &lanes,
             agent: runner.map(|runner| runner.name()),
             memory: &config.work.memory,

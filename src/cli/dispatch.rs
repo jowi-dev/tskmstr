@@ -730,6 +730,7 @@ mod tests {
             let cfg = TickConfig {
                 scope,
                 max_lanes: 10,
+                max_launches_per_day: 100,
                 lanes: &lanes,
                 agent: Some("claude"),
                 memory: &memory,
