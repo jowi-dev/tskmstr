@@ -208,6 +208,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             })).collect::<Vec<_>>(),
             "refused": report.refused.as_ref().map(ToString::to_string),
             "skipped": report.skipped.map(skip_name),
+            "notified": report.notified,
             "error": null,
         }),
         TickOutcome::Failed(err) => json!({
@@ -215,6 +216,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "launched": [],
             "refused": null,
             "skipped": null,
+            "notified": [],
             "error": err,
         }),
     }
@@ -250,6 +252,9 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
         writeln!(out, "{scope}: {refusal}")?;
     } else if report.launched.is_empty() {
         writeln!(out, "{scope}: nothing to launch")?;
+    }
+    for title in &report.notified {
+        writeln!(out, "{scope}: notified: {title}")?;
     }
     Ok(())
 }
@@ -531,6 +536,7 @@ mod tests {
             ],
             refused: Some(Refusal::MaxLanes { running: 2, max: 2 }),
             skipped: None,
+            notified: vec!["tm: GH-0 is awaiting your review".to_string()],
         }
     }
 
@@ -568,6 +574,7 @@ mod tests {
             "github:o/one: launched GH-1 in lane backend\n\
              github:o/one: launched GH-2 in lane backend (stacked on gh-1-branch)\n\
              github:o/one: not launching: 2 lanes running, [dispatch] max_lanes is 2\n\
+             github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
              github:o/broken: error: config did not load\n\
@@ -630,6 +637,7 @@ mod tests {
                     ],
                     "refused": "not launching: 2 lanes running, [dispatch] max_lanes is 2",
                     "skipped": null,
+                    "notified": ["tm: GH-0 is awaiting your review"],
                     "error": null,
                 },
                 {
@@ -637,6 +645,7 @@ mod tests {
                     "launched": [],
                     "refused": null,
                     "skipped": null,
+                    "notified": [],
                     "error": "no repo recorded for github:o/two; run `tm dispatch on` inside it once",
                 },
             ])
@@ -720,6 +729,7 @@ mod tests {
                 memory_pressure: &pressure,
                 usage_prober: &NoProbe,
                 now: 1_000_000,
+                notifier: &crate::work::notify::NoNotifier,
             };
             let lanes = [LaneChoice {
                 name: "backend".to_string(),
@@ -731,6 +741,8 @@ mod tests {
                 scope,
                 max_lanes: 10,
                 max_launches_per_day: 100,
+                max_fix_rounds: 3,
+                stall_notify_mins: 30,
                 lanes: &lanes,
                 agent: Some("claude"),
                 memory: &memory,
