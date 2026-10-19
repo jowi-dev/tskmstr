@@ -11,7 +11,8 @@ use clap::Parser;
 use tskmstr::agent::AgentRunner;
 use tskmstr::cli::work::Dispatch;
 use tskmstr::cli::{
-    AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd, WorkCmd,
+    AuthCmd, BackendCmd, Cli, Command, PrCmd, RealPrompter, ReviewCmd, RunsCmd, TicketCmd,
+    UsageCmd, WorkCmd,
 };
 use tskmstr::config::{self, AgentKind, BackendKind, Config, ConfigPaths};
 use tskmstr::github::gh_cli::{GhCli, ShellGhCli};
@@ -91,6 +92,16 @@ fn main() -> ExitCode {
     // cannot fix remains, 2 on error.
     if let Command::Update { yes } = command {
         return run_update_cmd(yes);
+    }
+
+    // `tm usage statusline` is special-cased too: its exit code is the
+    // passthrough command's, and nothing tm does may fail the statusline,
+    // so it never goes through dispatch's error printing.
+    if let Command::Usage {
+        cmd: Some(UsageCmd::Statusline { command }),
+    } = command
+    {
+        return run_usage_statusline(&command);
     }
 
     match dispatch(command) {
@@ -233,7 +244,55 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             stall_hours,
             keys,
         } => run_drift(fix, stall_hours, &keys, &keychain, env_token),
+        Command::Usage { cmd: None } => run_usage_list(),
+        Command::Usage { cmd: Some(_) } => {
+            unreachable!("tm usage statusline is special-cased in main() before dispatch")
+        }
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `tm usage`: list every agent's stored usage snapshots (GitHub issue #130).
+fn run_usage_list() -> Result<(), Box<dyn std::error::Error>> {
+    let store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
+    let rows = store.all_usage_snapshots()?;
+    tskmstr::cli::usage::list(&rows, unix_now(), &mut std::io::stdout())?;
+    Ok(())
+}
+
+/// `tm usage statusline [-- <command...>]`: read the statusline payload from
+/// stdin, record it, and pass it through (GitHub issue #130). The throttle
+/// stamp lives next to the run store. Recording errors go to stderr only
+/// when `TM_DEBUG` is set.
+fn run_usage_statusline(command: &[String]) -> ExitCode {
+    use std::io::Read;
+
+    let mut input = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut input);
+    let db_path = resolve_run_db_path();
+    let stamp_path = db_path.with_file_name("usage-statusline.stamp");
+    let mut debug: Box<dyn Write> = if std::env::var_os("TM_DEBUG").is_some() {
+        Box::new(std::io::stderr())
+    } else {
+        Box::new(std::io::sink())
+    };
+
+    let code = tskmstr::cli::usage::statusline(
+        command,
+        &input,
+        unix_now(),
+        &stamp_path,
+        || tskmstr::runs::RunStore::open(&db_path),
+        &mut std::io::stdout(),
+        &mut debug,
+    );
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 /// `tm drift [--fix] [--stall-hours N]`: audit every known project for

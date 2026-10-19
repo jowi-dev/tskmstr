@@ -23,6 +23,7 @@ pub mod review;
 pub mod runs;
 pub mod ticket;
 pub mod update;
+pub mod usage;
 pub mod work;
 
 use crate::ticketing::StatusTransition;
@@ -257,6 +258,30 @@ pub enum Command {
         /// Only list (and, with `--fix`, only move) these ticket keys
         /// (case-insensitive); omit to cover every drifted ticket.
         keys: Vec<String>,
+    },
+    /// Print the stored usage snapshots (5-hour / 7-day utilization per
+    /// agent) with their age and reset time — what the usage gate sees.
+    /// See `docs/plans/gh-113-proactive-usage-signal.md`.
+    Usage {
+        /// Which usage action to perform. Omit to list the snapshots.
+        #[command(subcommand)]
+        cmd: Option<UsageCmd>,
+    },
+}
+
+/// `tm usage` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum UsageCmd {
+    /// Claude Code statusline shim: save the stdin payload's `rate_limits`
+    /// as usage snapshots (at most every 30s), then run the real statusline
+    /// command with the same stdin and print its output. Recording errors
+    /// never change the output or exit code; set `TM_DEBUG=1` to see them
+    /// on stderr.
+    Statusline {
+        /// The real statusline command and its arguments, after `--`.
+        /// Omit to print nothing.
+        #[arg(last = true)]
+        command: Vec<String>,
     },
 }
 
@@ -2177,6 +2202,36 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["tm"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_bare_usage_as_list() {
+        let cli = Cli::try_parse_from(["tm", "usage"]).expect("should parse");
+        assert!(matches!(cli.command, Some(Command::Usage { cmd: None })));
+    }
+
+    #[test]
+    fn parses_usage_statusline_with_a_passthrough_command() {
+        let cli =
+            Cli::try_parse_from(["tm", "usage", "statusline", "--", "sh", "-c", "echo --flag"])
+                .expect("should parse");
+        match cli.command {
+            Some(Command::Usage {
+                cmd: Some(UsageCmd::Statusline { command }),
+            }) => assert_eq!(command, ["sh", "-c", "echo --flag"]),
+            other => panic!("expected Usage Statusline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_usage_statusline_without_a_command() {
+        let cli = Cli::try_parse_from(["tm", "usage", "statusline"]).expect("should parse");
+        match cli.command {
+            Some(Command::Usage {
+                cmd: Some(UsageCmd::Statusline { command }),
+            }) => assert!(command.is_empty()),
+            other => panic!("expected Usage Statusline, got {other:?}"),
+        }
     }
 
     #[test]

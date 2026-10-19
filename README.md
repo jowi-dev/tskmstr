@@ -203,6 +203,8 @@ tm auth status
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
 | `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
+| `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
+| `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -256,6 +258,65 @@ its ticket open, so use `tm drift --fix KEY...` to move only the tickets you
 agree with. Stalled tickets are listed but never moved. The full drift
 matrix (every hook, every bypass path) is in
 `docs/plans/gh-80-status-drift.md`.
+
+## Usage snapshots (`tm usage`)
+
+The usage gate reads each agent's latest 5-hour and 7-day utilization from
+the `usage_snapshots` table in the run store. Headless claude lane runs
+record a snapshot when they finish (source `stream`). `tm usage` prints
+what is stored:
+
+```
+$ tm usage
+AGENT    WINDOW      USED  SOURCE     STATUS          OBSERVED   RESETS
+claude   five_hour    34%  statusline -               12s ago    in 3h12m
+claude   seven_day     7%  stream     allowed         2h05m ago  in 4d5h
+```
+
+`USED` can exceed 100% under overage. A `RESETS` of `reset … ago` means the
+window has rolled over since the snapshot was taken.
+
+### Keeping snapshots fresh from your statusline
+
+While you work interactively, Claude Code passes the current utilization
+to your statusline command on every render. `tm usage statusline` saves it
+(source `statusline`) and then runs your real statusline with the same
+stdin bytes. Your statusline's output and exit code stay the same. Wrap the
+existing `statusLine.command` in `~/.claude/settings.json` by putting
+`tm usage statusline --` in front of it:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "tm usage statusline -- ~/.claude/statusline.sh"
+  }
+}
+```
+
+Everything after `--` runs as a program with its arguments, not through
+a shell. If your current command is a shell snippet (pipes, `$(...)`,
+quoting), wrap it in `sh -c`:
+
+```json
+"command": "tm usage statusline -- sh -c 'jq -r .model.display_name'"
+```
+
+With no command after `--`, the shim records the snapshot and prints
+nothing.
+
+- **It never fails the statusline.** A payload that isn't JSON, or a run
+  store that can't be opened, is skipped and your command still runs. Set
+  `TM_DEBUG=1` to see those errors on stderr.
+- **Writes are throttled.** After a write, the shim skips writing for 30
+  seconds and doesn't open the run store at all. The time of the last
+  write is kept in `usage-statusline.stamp` next to `runs.db`.
+- **It does nothing without `rate_limits`.** The payload has no
+  `rate_limits` before the session's first API response, or under an API
+  key, Bedrock or Vertex. Then nothing is recorded.
+
+Writes are newest-wins against lane-run snapshots. See
+`docs/plans/gh-113-proactive-usage-signal.md` for the signal's details.
 
 ## `tm runs`
 

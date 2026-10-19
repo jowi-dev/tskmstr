@@ -3190,17 +3190,19 @@ impl RunStore {
             "SELECT agent, window, utilization, resets_at, observed_at, source, status
              FROM usage_snapshots WHERE agent = ?1 ORDER BY window",
         )?;
-        let rows = stmt.query_map(params![agent], |row| {
-            Ok(UsageSnapshotRow {
-                agent: row.get(0)?,
-                window: row.get(1)?,
-                utilization: row.get(2)?,
-                resets_at: row.get(3)?,
-                observed_at: row.get(4)?,
-                source: row.get(5)?,
-                status: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![agent], usage_snapshot_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
+    }
+
+    /// Returns every agent's stored usage snapshots, ordered by agent then
+    /// window name, for `tm usage`.
+    pub fn all_usage_snapshots(&self) -> Result<Vec<UsageSnapshotRow>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, window, utilization, resets_at, observed_at, source, status
+             FROM usage_snapshots ORDER BY agent, window",
+        )?;
+        let rows = stmt.query_map([], usage_snapshot_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(RunStoreError::from)
     }
@@ -3295,6 +3297,20 @@ impl RunStore {
             })
             .collect())
     }
+}
+
+/// Maps a `usage_snapshots` row selected as `agent, window, utilization,
+/// resets_at, observed_at, source, status` into a [`UsageSnapshotRow`].
+fn usage_snapshot_from_row(row: &rusqlite::Row) -> Result<UsageSnapshotRow, rusqlite::Error> {
+    Ok(UsageSnapshotRow {
+        agent: row.get(0)?,
+        window: row.get(1)?,
+        utilization: row.get(2)?,
+        resets_at: row.get(3)?,
+        observed_at: row.get(4)?,
+        source: row.get(5)?,
+        status: row.get(6)?,
+    })
 }
 
 /// Parses a `ticket_retros` row (`ticket_key, verdict, severity, notes,
@@ -6861,6 +6877,35 @@ mod tests {
         assert_eq!(
             store.usage_snapshots("claude").unwrap(),
             vec![snapshot("five_hour", 0.31, 100)]
+        );
+    }
+
+    #[test]
+    fn all_usage_snapshots_lists_every_agent_ordered_by_agent_then_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let other = |window: &str| UsageSnapshotRow {
+            agent: "aaa".to_string(),
+            ..snapshot(window, 0.9, 100)
+        };
+
+        for row in [
+            snapshot("seven_day", 0.07, 100),
+            other("seven_day"),
+            snapshot("five_hour", 0.31, 100),
+            other("five_hour"),
+        ] {
+            store.upsert_usage_snapshot(&row).unwrap();
+        }
+
+        assert_eq!(
+            store.all_usage_snapshots().unwrap(),
+            vec![
+                other("five_hour"),
+                other("seven_day"),
+                snapshot("five_hour", 0.31, 100),
+                snapshot("seven_day", 0.07, 100),
+            ]
         );
     }
 
