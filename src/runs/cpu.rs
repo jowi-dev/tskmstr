@@ -375,9 +375,12 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn tree_cpu_time_includes_a_busy_child() {
+        use std::os::unix::process::CommandExt;
+
         let mut root = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("(while :; do :; done) & wait")
+            .process_group(0)
             .spawn()
             .unwrap();
         let pid = root.id();
@@ -392,10 +395,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let _ = std::process::Command::new("pkill")
-            .args(["-P", &pid.to_string()])
-            .status();
-        let _ = root.kill();
+        crate::runs::pid::kill_process_group(pid);
         let _ = root.wait();
 
         assert!(

@@ -512,9 +512,12 @@ mod tests {
     #[test]
     fn tree_footprint_includes_a_child_that_allocates_memory_on_linux() {
         const ALLOC: u64 = 200 * 1024 * 1024;
+        use std::os::unix::process::CommandExt;
+
         let mut root = std::process::Command::new("sh")
             .arg("-c")
             .arg(r#"perl -e '$x = "a" x 209715200; sleep 30' & wait"#)
+            .process_group(0)
             .spawn()
             .unwrap();
         let pid = root.id();
@@ -529,10 +532,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        let _ = std::process::Command::new("pkill")
-            .args(["-P", &pid.to_string()])
-            .status();
-        let _ = root.kill();
+        crate::runs::pid::kill_process_group(pid);
         let _ = root.wait();
 
         assert!(seen > ALLOC, "tree footprint {seen} should exceed {ALLOC}");
@@ -545,9 +545,12 @@ mod tests {
     #[test]
     fn tree_footprint_includes_a_child_that_allocates_memory() {
         const ALLOC: u64 = 200 * 1024 * 1024;
+        use std::os::unix::process::CommandExt;
+
         let mut root = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(r#"/usr/bin/perl -e '$x = "a" x 209715200; sleep 30' & wait"#)
+            .process_group(0)
             .spawn()
             .unwrap();
         let pid = root.id();
@@ -563,11 +566,8 @@ mod tests {
         }
         let shell_alone = imp_process_footprint_for_test(pid);
 
-        // Kill the whole group: the perl child first, then the shell.
-        let _ = std::process::Command::new("/usr/bin/pkill")
-            .args(["-P", &pid.to_string()])
-            .status();
-        let _ = root.kill();
+        // Kill the whole group: the shell and its perl child.
+        crate::runs::pid::kill_process_group(pid);
         let _ = root.wait();
 
         assert!(seen > ALLOC, "tree footprint {seen} should exceed {ALLOC}");

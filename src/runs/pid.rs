@@ -25,6 +25,18 @@ pub fn kill_pid(pid: u32) {
     }
 }
 
+/// Sends `SIGKILL` to every process in the group led by `pgid`, ignoring
+/// failure. Test cleanup for children spawned with `process_group(0)`: it
+/// reaches backgrounded grandchildren that killing the root alone would
+/// orphan, without depending on `pkill` (absent from the nix build sandbox,
+/// where a surviving orphan keeps `nix build` waiting forever on macOS).
+#[cfg(test)]
+pub(crate) fn kill_process_group(pgid: u32) {
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +69,35 @@ mod tests {
         let status = child.wait().expect("failed to wait on child");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn kill_process_group_reaches_a_backgrounded_grandchild() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut root = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn shell");
+        let mut line = String::new();
+        std::io::BufReader::new(root.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: u32 = line.trim().parse().unwrap();
+
+        kill_process_group(root.id());
+        root.wait().expect("failed to wait on shell");
+
+        // The orphaned grandchild is reaped by init, not by us; give it a
+        // moment rather than asserting on a possibly unreaped zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(grandchild) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!pid_alive(grandchild), "grandchild {grandchild} survived");
     }
 }
