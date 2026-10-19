@@ -110,8 +110,9 @@ The skill's "opencode only" note should be relaxed upstream in thatch.
   vdiff repo and is a follow-up there.
 - **Usage admission and `max_lanes`.** Usage admission (#114) has not
   landed, so review rounds are not admission-gated yet.
-- **The `max_fix_rounds` bound.** The cap's bound by #120's
-  `max_fix_rounds` arrives with #120.
+- **The `max_fix_rounds` bound.** Landed with #120: before each fix round
+  the loop checks `[dispatch] max_fix_rounds`, and a ticket at the cap ends
+  the loop as `capped`.
 
 ## Found along the way
 
