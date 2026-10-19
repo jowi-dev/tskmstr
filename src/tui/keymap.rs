@@ -252,6 +252,9 @@ pub fn map_key(
             Some(Msg::ViewLogsAction)
         }
         KeyCode::Char('B') if *screen == Screen::Overview => Some(Msg::OpenBoardAction),
+        KeyCode::Char('P') if matches!(screen, Screen::Board | Screen::Overview) => {
+            Some(Msg::ToggleAutopilot)
+        }
         KeyCode::Char('V') if matches!(screen, Screen::Board | Screen::Overview) => {
             Some(Msg::ViewDiffAction)
         }
@@ -2944,5 +2947,23 @@ mod tests {
             Some(Msg::ToggleOverviewLayout)
         );
         assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('c')), None);
+    }
+
+    /// GitHub issue #116: `P` toggles autopilot on the board and the
+    /// overview, and nowhere else.
+    #[test]
+    fn p_toggles_autopilot_on_the_board_and_overview() {
+        for screen in [Screen::Board, Screen::Overview] {
+            assert_eq!(
+                plain_key(&screen, KeyCode::Char('P')),
+                Some(Msg::ToggleAutopilot)
+            );
+        }
+        assert_eq!(plain_key(&Screen::Runs, KeyCode::Char('P')), None);
+        assert_eq!(
+            plain_key(&Screen::Board, KeyCode::Char('p')),
+            Some(Msg::OpenRank),
+            "lowercase p still opens rank"
+        );
     }
 }
