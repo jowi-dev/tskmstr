@@ -244,6 +244,7 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             stall_hours,
             keys,
         } => run_drift(fix, stall_hours, &keys, &keychain, env_token),
+        Command::Dispatch { cmd } => run_dispatch(cmd, &keychain, env_token),
         Command::Usage { cmd: None } => run_usage_list(),
         Command::Usage { cmd: Some(_) } => {
             unreachable!("tm usage statusline is special-cased in main() before dispatch")
@@ -293,6 +294,170 @@ fn run_usage_statusline(command: &[String]) -> ExitCode {
         &mut debug,
     );
     ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
+/// `tm dispatch tick|on|off|status` (GitHub issue #117): host the autopilot
+/// dispatcher without a TUI. The current repo (when there is one) is the
+/// default scope; `--all` covers every scope in runs.db's `autopilot`
+/// table. A tick where some scope failed returns an error, so the exit
+/// code is 1; refusals and skips exit 0.
+fn run_dispatch(
+    cmd: tskmstr::cli::DispatchCmd,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tskmstr::cli::DispatchCmd;
+    use tskmstr::cli::dispatch::ScopeSelector;
+
+    let run_db_path = resolve_run_db_path();
+    let store = tskmstr::runs::RunStore::open(&run_db_path)?;
+    let current = dispatch_current_repo();
+    let selector =
+        |args: tskmstr::cli::DispatchScopeArgs| ScopeSelector::from_flags(args.scope, args.all);
+    let mut stdout = std::io::stdout();
+    match cmd {
+        DispatchCmd::Tick { scope, json } => {
+            let targets = tskmstr::cli::dispatch::tick_targets(
+                &store.autopilot_scopes()?,
+                &selector(scope),
+                current.as_ref(),
+            )?;
+            let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            let data_dir = run_db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let lock = tskmstr::work::dispatch::FileScopeLock {
+                dir: tskmstr::work::dispatch::default_lock_dir(
+                    xdg_runtime_dir.as_deref(),
+                    &data_dir,
+                ),
+            };
+            let ticker = RealScopeTicker {
+                store: &store,
+                lock: &lock,
+                keychain,
+                env_token,
+                home: std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("~")),
+                current_exe: std::env::current_exe()?,
+            };
+            if !tskmstr::cli::dispatch::tick(&targets, &ticker, json, &mut stdout)? {
+                return Err("tm dispatch tick: one or more scopes failed to tick".into());
+            }
+        }
+        DispatchCmd::On { scope } => tskmstr::cli::dispatch::set(
+            &store,
+            &selector(scope),
+            true,
+            current.as_ref(),
+            &mut stdout,
+        )?,
+        DispatchCmd::Off { scope } => tskmstr::cli::dispatch::set(
+            &store,
+            &selector(scope),
+            false,
+            current.as_ref(),
+            &mut stdout,
+        )?,
+        DispatchCmd::Status => tskmstr::cli::dispatch::status(&store, &mut stdout)?,
+    }
+    Ok(())
+}
+
+/// The repo `tm dispatch` runs in, or `None` outside a git repo or when its
+/// config doesn't load (a systemd timer runs in `$HOME`).
+fn dispatch_current_repo() -> Option<tskmstr::cli::dispatch::CurrentRepo> {
+    let repo_dir = git_common_repo_root()?;
+    let config = config::load(&default_config_paths()).ok()?;
+    Some(tskmstr::cli::dispatch::CurrentRepo {
+        scope: tskmstr::config::BackendIdentity::from_config(&config).scope(),
+        repo_dir,
+    })
+}
+
+/// [`tskmstr::cli::dispatch::ScopeTicker`] with real dependencies: loads the
+/// scope's config from its repo, builds `tm ready`'s candidates and the
+/// tick's lanes and runner from it, and launches lanes with `tm work run
+/// --unattended` in that repo.
+struct RealScopeTicker<'a> {
+    store: &'a tskmstr::runs::RunStore,
+    lock: &'a tskmstr::work::dispatch::FileScopeLock,
+    keychain: &'a dyn KeychainStore,
+    env_token: Option<String>,
+    home: PathBuf,
+    current_exe: PathBuf,
+}
+
+impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
+    fn tick(
+        &self,
+        scope: &str,
+        repo_dir: &Path,
+    ) -> Result<tskmstr::work::dispatch::TickReport, String> {
+        let config = config::load(&config::default_paths(&self.home, Some(repo_dir)))
+            .map_err(|err| format!("{}: {err}", repo_dir.display()))?;
+        let actual = tskmstr::config::BackendIdentity::from_config(&config).scope();
+        if actual != scope {
+            return Err(format!(
+                "{} is configured for {actual} now, not {scope}",
+                repo_dir.display()
+            ));
+        }
+        let provider = ticket_provider_for(&config, self.keychain, self.env_token.clone())
+            .map_err(|err| err.to_string())?;
+        let gh = ShellGhCli::new();
+        let audit_store = open_ready_audit_store(&config);
+        let candidates = tskmstr::cli::ready::ReadyContext {
+            jira: provider.as_ref(),
+            gh: &gh,
+            review_bots: &config.review_bots,
+            in_flight: ready_in_flight(&config),
+            audit: ready_audit_gate(&config, &audit_store),
+        };
+        let resolver = tskmstr::config::FsBackendIdentityResolver {
+            home: self.home.clone(),
+        };
+        let lanes = tskmstr::cli::dispatch::lane_choices(&config, &resolver);
+        let agent = tskmstr::cli::dispatch::unattended_agent(&config);
+        let spawner = tskmstr::work::runner::StdProcessSpawner;
+        let usage_prober = tskmstr::work::admission::SpawnUsageProber {
+            runners: tskmstr::agent::routing::configured_unattended_order(
+                config.agent,
+                &config.agent_fallbacks,
+                &config.usage,
+                &config.dispatch,
+            )
+            .first()
+            .map(|kind| tskmstr::agent::routing::runner_for(*kind))
+            .into_iter()
+            .collect(),
+            spawner: &spawner,
+        };
+        let launcher = tskmstr::work::dispatch::CommandLauncher {
+            program: self.current_exe.clone(),
+            cwd: repo_dir.to_path_buf(),
+        };
+        let deps = tskmstr::work::dispatch::TickDeps {
+            store: self.store,
+            lock: self.lock,
+            candidates: &candidates,
+            launcher: &launcher,
+            memory_pressure: &tskmstr::runs::footprint::memory_pressure,
+            usage_prober: &usage_prober,
+            now: unix_now(),
+        };
+        let cfg = tskmstr::work::dispatch::TickConfig {
+            scope,
+            max_lanes: config.dispatch.max_lanes,
+            lanes: &lanes,
+            agent,
+            memory: &config.work.memory,
+            usage: &config.usage,
+        };
+        tskmstr::work::dispatch::tick(&deps, &cfg).map_err(|err| err.to_string())
+    }
 }
 
 /// `tm drift [--fix] [--stall-hours N]`: audit every known project for

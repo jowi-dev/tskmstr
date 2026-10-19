@@ -1,0 +1,11 @@
+# Runs tm-dispatch.service every 5 minutes (GitHub issue #117).
+# See docs/dispatch-timer.md for why 5 minutes.
+[Unit]
+Description=Run the tskmstr autopilot dispatcher every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+
+[Install]
+WantedBy=timers.target

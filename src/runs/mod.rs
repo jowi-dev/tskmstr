@@ -246,6 +246,15 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_dispatch_events_scope ON dispatch_events(scope, id);
     "#,
+    // GitHub issue #117: `tm dispatch` needs to find each scope's repo from
+    // anywhere (a systemd timer runs in $HOME), and to show when a scope
+    // was last ticked. `repo_dir` is the main checkout `tm dispatch on` ran
+    // in; `last_tick_at` is stamped by every tick that got past the lock
+    // and the flag.
+    r#"
+    ALTER TABLE autopilot ADD COLUMN repo_dir TEXT;
+    ALTER TABLE autopilot ADD COLUMN last_tick_at TEXT;
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -449,6 +458,25 @@ pub struct DispatchEvent {
     pub detail: String,
     /// When the row was written, as [`NOW_SQL`] renders it.
     pub created_at: String,
+}
+
+/// One `autopilot` row (GitHub issues #115, #117): a scope's dispatcher
+/// flag and what `tm dispatch` knows about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutopilotScope {
+    /// The scope ([`crate::config::BackendIdentity::scope`]).
+    pub scope: String,
+    /// Whether the dispatcher is on.
+    pub enabled: bool,
+    /// The main checkout `tm dispatch on` ran in, so a tick can load that
+    /// repo's config from anywhere. `None` for a scope only ever toggled
+    /// without one (the TUI, or `tm dispatch on --scope`).
+    pub repo_dir: Option<String>,
+    /// When the flag last changed, as [`NOW_SQL`] renders it.
+    pub updated_at: String,
+    /// When a tick last ran past the lock and the flag, as [`NOW_SQL`]
+    /// renders it.
+    pub last_tick_at: Option<String>,
 }
 
 /// One `usage_snapshots` row: the latest observed utilization of one usage
@@ -3285,18 +3313,63 @@ impl RunStore {
     }
 
     /// Turns the autopilot dispatcher on or off for `scope` (GitHub issue
-    /// #115). Upserts: a scope has one current flag.
+    /// #115). Upserts: a scope has one current flag. Keeps any `repo_dir`
+    /// already recorded; see [`RunStore::set_autopilot_in`].
     pub fn set_autopilot(&self, scope: &str, enabled: bool) -> Result<(), RunStoreError> {
+        self.set_autopilot_in(scope, enabled, None)
+    }
+
+    /// [`RunStore::set_autopilot`] that also records the scope's main
+    /// checkout (GitHub issue #117), so `tm dispatch tick --all` can load
+    /// its config from any directory. `None` keeps the recorded one.
+    pub fn set_autopilot_in(
+        &self,
+        scope: &str,
+        enabled: bool,
+        repo_dir: Option<&str>,
+    ) -> Result<(), RunStoreError> {
         self.conn.execute(
             &format!(
-                "INSERT INTO autopilot (scope, enabled, updated_at) VALUES (?1, ?2, {NOW_SQL})
+                "INSERT INTO autopilot (scope, enabled, updated_at, repo_dir)
+                 VALUES (?1, ?2, {NOW_SQL}, ?3)
                  ON CONFLICT(scope) DO UPDATE SET
                     enabled = excluded.enabled,
-                    updated_at = excluded.updated_at"
+                    updated_at = excluded.updated_at,
+                    repo_dir = COALESCE(excluded.repo_dir, autopilot.repo_dir)"
             ),
-            params![scope, enabled],
+            params![scope, enabled, repo_dir],
         )?;
         Ok(())
+    }
+
+    /// Records that a tick just ran for `scope` (GitHub issue #117). A
+    /// scope with no `autopilot` row is left alone.
+    pub fn stamp_autopilot_tick(&self, scope: &str) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!("UPDATE autopilot SET last_tick_at = {NOW_SQL} WHERE scope = ?1"),
+            params![scope],
+        )?;
+        Ok(())
+    }
+
+    /// Every scope with an `autopilot` row, by scope name (GitHub issue
+    /// #117).
+    pub fn autopilot_scopes(&self) -> Result<Vec<AutopilotScope>, RunStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope, enabled, repo_dir, updated_at, last_tick_at FROM autopilot
+              ORDER BY scope",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AutopilotScope {
+                scope: row.get(0)?,
+                enabled: row.get(1)?,
+                repo_dir: row.get(2)?,
+                updated_at: row.get(3)?,
+                last_tick_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
     }
 
     /// Whether the autopilot dispatcher is on for `scope`. Off for a scope
@@ -3353,6 +3426,33 @@ impl RunStore {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(RunStoreError::from)
+    }
+
+    /// The newest `dispatch_events` row of `kind` for `scope`, e.g. the
+    /// last refusal `tm dispatch status` shows (GitHub issue #117).
+    pub fn last_dispatch_event(
+        &self,
+        scope: &str,
+        kind: &str,
+    ) -> Result<Option<DispatchEvent>, RunStoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, scope, ticket, kind, detail, created_at FROM dispatch_events
+                  WHERE scope = ?1 AND kind = ?2 ORDER BY id DESC LIMIT 1",
+                params![scope, kind],
+                |row| {
+                    Ok(DispatchEvent {
+                        id: row.get(0)?,
+                        scope: row.get(1)?,
+                        ticket: row.get(2)?,
+                        kind: row.get(3)?,
+                        detail: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Sums the input and output tokens recorded in `model_usage` across
@@ -3624,7 +3724,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_17() {
+    fn open_migrates_a_fresh_db_to_user_version_18() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3632,7 +3732,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -6987,6 +7087,78 @@ mod tests {
             ]
         );
         assert_eq!(store.dispatch_events("s", 1).unwrap().len(), 1);
+    }
+
+    // --- autopilot registry for `tm dispatch` (GitHub issue #117) ---
+
+    #[test]
+    fn autopilot_scopes_lists_every_scope_with_its_repo_and_last_tick() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_autopilot_in("github:o/r", true, Some("/repos/r"))
+            .unwrap();
+        store.set_autopilot("github:o/other", false).unwrap();
+        store.stamp_autopilot_tick("github:o/r").unwrap();
+
+        let scopes = store.autopilot_scopes().unwrap();
+        let summary: Vec<(&str, bool, Option<&str>, bool)> = scopes
+            .iter()
+            .map(|s| {
+                (
+                    s.scope.as_str(),
+                    s.enabled,
+                    s.repo_dir.as_deref(),
+                    s.last_tick_at.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("github:o/other", false, None, false),
+                ("github:o/r", true, Some("/repos/r"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_autopilot_keeps_a_registered_repo_dir() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_autopilot_in("github:o/r", true, Some("/repos/r"))
+            .unwrap();
+        store.set_autopilot("github:o/r", false).unwrap();
+
+        let scopes = store.autopilot_scopes().unwrap();
+        assert_eq!(scopes[0].repo_dir.as_deref(), Some("/repos/r"));
+        assert!(!scopes[0].enabled);
+    }
+
+    #[test]
+    fn last_dispatch_event_finds_the_newest_of_one_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(store.last_dispatch_event("s", "refused").unwrap().is_none());
+        store
+            .record_dispatch_event("s", None, "refused", "first")
+            .unwrap();
+        store
+            .record_dispatch_event("s", None, "refused", "second")
+            .unwrap();
+        store
+            .record_dispatch_event("s", Some("GH-1"), "launch", "lane x")
+            .unwrap();
+        store
+            .record_dispatch_event("other", None, "refused", "elsewhere")
+            .unwrap();
+
+        let event = store.last_dispatch_event("s", "refused").unwrap().unwrap();
+        assert_eq!(event.detail, "second");
     }
 
     // --- usage_snapshots (GitHub issue #129) ---

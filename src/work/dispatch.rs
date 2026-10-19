@@ -11,7 +11,8 @@
 //!
 //! 1. Takes the scope lock, or returns [`Skip::Locked`].
 //! 2. Reads the scope's autopilot flag from runs.db, or returns
-//!    [`Skip::Disabled`].
+//!    [`Skip::Disabled`]. Otherwise stamps the scope's `last_tick_at`, which
+//!    `tm dispatch status` shows.
 //! 3. Takes `tm ready`'s ready and stackable tickets (audit gate included)
 //!    from a [`CandidateSource`], and drops every ticket the run store says
 //!    is already in hand ([`in_hand`]).
@@ -348,6 +349,7 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     if !deps.store.autopilot_enabled(cfg.scope)? {
         return Ok(skipped(Skip::Disabled));
     }
+    deps.store.stamp_autopilot_tick(cfg.scope)?;
 
     let busy = in_hand(&deps.store.overview_runs()?, cfg.scope);
     let mut queue: Vec<Candidate> = deps
@@ -805,6 +807,38 @@ mod tests {
         assert_eq!(report.skipped, Some(Skip::Disabled));
         assert!(launcher.tickets().is_empty());
         assert!(fx.events().is_empty());
+    }
+
+    fn last_tick_at(store: &RunStore) -> Option<String> {
+        store
+            .autopilot_scopes()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.scope == SCOPE)
+            .and_then(|s| s.last_tick_at)
+    }
+
+    #[test]
+    fn an_enabled_tick_stamps_the_scope_even_with_nothing_to_launch() {
+        let fx = Fixture::new();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[], &launcher);
+
+        assert!(last_tick_at(&fx.store).is_some());
+    }
+
+    #[test]
+    fn a_skipped_tick_leaves_the_last_tick_alone() {
+        let fx = Fixture::new();
+        let launcher = FakeLauncher::new(&fx.store);
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        fx.tick(&[], &launcher);
+        let _held = fx.lock().try_lock(SCOPE).unwrap().unwrap();
+        fx.store.set_autopilot(SCOPE, true).unwrap();
+        fx.tick(&[], &launcher);
+
+        assert!(last_tick_at(&fx.store).is_none());
     }
 
     #[test]
