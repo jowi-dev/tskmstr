@@ -22,8 +22,8 @@ it, such as `github:o/r`) or `--all` instead of the current repo.
 
 `tick` exits 0 when every scope ticked, including a scope that was off,
 locked by another host, or refused by a gate (lane cap, daily launch cap,
-memory, usage). It exits 1 only when a scope could not tick at all, for example because its
-config no longer loads. The other scopes still tick.
+memory, usage). It exits 1 only when a scope could not tick at all, for
+example because its config no longer loads. The other scopes still tick.
 
 `--json` prints one array with one object per scope:
 
