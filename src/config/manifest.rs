@@ -256,6 +256,14 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #115. The built-in default of one lane applies when
+    // unset, so there is nothing to suggest.
+    ExpectedConfigKey {
+        path: &["dispatch", "max_lanes"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -336,6 +344,14 @@ mod tests {
     #[test]
     fn dispatch_allow_paid_fallback_is_registered_without_a_default() {
         let key = expected(&["dispatch", "allow_paid_fallback"]);
+        assert_eq!(key.severity, KeySeverity::Recommended);
+        assert_eq!((key.suggested_default)(BackendKind::Github), None);
+        assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn dispatch_max_lanes_is_registered_without_a_default() {
+        let key = expected(&["dispatch", "max_lanes"]);
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);

@@ -318,7 +318,25 @@ pub fn list_json(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCli
     Ok(())
 }
 
-/// A `tm ready` (no key) candidate's decision: [`blocker_stacking::decide`]'s
+/// The autopilot dispatcher's view of `tm ready` (GitHub issue #115): the
+/// same classification as [`list`], audit gate included, in rank order.
+/// Warnings are dropped, since each one already degrades the affected
+/// tickets to blocked rather than ready.
+pub fn dispatch_candidates(
+    ctx: &ReadyContext,
+) -> Result<Vec<crate::work::dispatch::Candidate>, ReadyCliError> {
+    Ok(list_report(ctx)?
+        .tickets
+        .into_iter()
+        .map(|entry| crate::work::dispatch::Candidate {
+            key: entry.key,
+            decision: entry.decision,
+            unblocks: entry.unblocks,
+        })
+        .collect())
+}
+
+/// A `tm ready` (no key) candidate's decision:[`blocker_stacking::decide`]'s
 /// verdict, shaped for display. Serialized as the `decision` tag of a
 /// [`list_json`] ticket, with the variant's fields alongside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1113,6 +1131,57 @@ mod tests {
             serde_json::json!([
                 "blocker cycle among PROJ-1, PROJ-2 — none of them can become ready until it is broken"
             ])
+        );
+    }
+
+    #[test]
+    fn dispatch_candidates_carry_each_decision_and_unblock_count_in_rank_order() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![
+            issue("PROJ-1"),
+            blocked_issue("PROJ-2", &[("PROJ-1", "To Do", "new")]),
+        ]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+
+        let candidates = dispatch_candidates(&ready_ctx(&jira, &gh, &bots)).expect("classified");
+
+        assert_eq!(
+            candidates,
+            vec![
+                crate::work::dispatch::Candidate {
+                    key: "PROJ-1".to_string(),
+                    decision: ListDecision::Ready,
+                    unblocks: 1,
+                },
+                crate::work::dispatch::Candidate {
+                    key: "PROJ-2".to_string(),
+                    decision: ListDecision::Blocked {
+                        blocker_keys: vec!["PROJ-1".to_string()],
+                        reason: "blocked by PROJ-1 (To Do), no PR yet".to_string(),
+                    },
+                    unblocks: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_candidates_apply_the_audit_gate() {
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![issue("PROJ-1")]));
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            audit: AuditGate::Unavailable("no db".to_string()),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+
+        let candidates = dispatch_candidates(&ctx).expect("classified");
+
+        assert_eq!(
+            candidates[0].decision,
+            ListDecision::NeedsAudit {
+                reason: "audit store unavailable: no db".to_string()
+            }
         );
     }
 
