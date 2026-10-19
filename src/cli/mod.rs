@@ -268,6 +268,59 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<UsageCmd>,
     },
+    /// Run the autopilot dispatcher without a TUI: one tick per scope, and
+    /// the per-scope on/off flag the TUI toggle shares. Meant for a systemd
+    /// user timer or a launchd agent; see `docs/dispatch-timer.md`.
+    Dispatch {
+        /// Which dispatch action to perform.
+        #[command(subcommand)]
+        cmd: DispatchCmd,
+    },
+}
+
+/// `--scope S` / `--all`, shared by the `tm dispatch` subcommands. Neither
+/// means the current repo's scope.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct DispatchScopeArgs {
+    /// Act on this scope (e.g. `github:o/r`, as `tm dispatch status` prints
+    /// it) instead of the current repo's.
+    #[arg(long, conflicts_with = "all")]
+    pub scope: Option<String>,
+    /// Act on every scope runs.db knows about. `tick --all` visits only the
+    /// scopes that are on.
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// `tm dispatch` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum DispatchCmd {
+    /// Run one dispatch pass: launch ready tickets as lane runs while the
+    /// lane cap, memory, and usage admit them. A refusal or a scope that is
+    /// off or locked by another host still exits 0; only a scope that
+    /// fails to tick (config, run store) exits 1.
+    Tick {
+        #[command(flatten)]
+        scope: DispatchScopeArgs,
+        /// Print one JSON array, one object per scope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Turn autopilot on. Run inside a repo, this also records the repo so
+    /// `tick --all` can find it from anywhere.
+    On {
+        #[command(flatten)]
+        scope: DispatchScopeArgs,
+    },
+    /// Turn autopilot off. `off --all` stops every scope: the next tick
+    /// launches nothing. Running lanes are left alone.
+    Off {
+        #[command(flatten)]
+        scope: DispatchScopeArgs,
+    },
+    /// Show each scope: on or off, running lanes, last tick, and last
+    /// refusal.
+    Status,
 }
 
 /// `tm usage` subcommands.
@@ -2228,6 +2281,60 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["tm"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_dispatch_tick_all_json() {
+        let cli = Cli::try_parse_from(["tm", "dispatch", "tick", "--all", "--json"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Dispatch {
+                cmd: DispatchCmd::Tick { scope, json },
+            }) => {
+                assert!(json);
+                assert!(scope.all);
+                assert_eq!(scope.scope, None);
+            }
+            other => panic!("expected Dispatch Tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dispatch_on_and_off_with_a_scope() {
+        let cli = Cli::try_parse_from(["tm", "dispatch", "on", "--scope", "github:o/r"])
+            .expect("should parse");
+        match cli.command {
+            Some(Command::Dispatch {
+                cmd: DispatchCmd::On { scope },
+            }) => assert_eq!(scope.scope.as_deref(), Some("github:o/r")),
+            other => panic!("expected Dispatch On, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["tm", "dispatch", "off"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dispatch {
+                cmd: DispatchCmd::Off { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn dispatch_rejects_scope_and_all_together() {
+        assert!(
+            Cli::try_parse_from(["tm", "dispatch", "off", "--all", "--scope", "github:o/r"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_dispatch_status() {
+        let cli = Cli::try_parse_from(["tm", "dispatch", "status"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dispatch {
+                cmd: DispatchCmd::Status
+            })
+        ));
     }
 
     #[test]
