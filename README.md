@@ -1006,6 +1006,57 @@ allow_paid_fallback = false
 These keys only set limits. They don't select a runner, so `[agent]`'s
 `runner`/`strategy`/`order` work as before.
 
+### Autopilot dispatcher (`[dispatch]`)
+
+The autopilot dispatcher (GitHub issue #115, `src/work/dispatch.rs`)
+launches lane runs for ready tickets without a human pressing `w`. Each
+call to `dispatch::tick` does one pass for one repo (scope). The TUI toggle
+(#116) and `tm dispatch` with a systemd timer (#117) are the hosts that call
+it. A tick:
+
+1. **Takes a per-scope lock.** It is an exclusive `flock` on
+   `$XDG_RUNTIME_DIR/tskmstr/dispatch/<scope>.lock`, or
+   `~/.local/share/tskmstr/dispatch/` when `XDG_RUNTIME_DIR` is unset. If
+   another host holds it, the tick is skipped. Two hosts therefore never
+   launch the same ticket.
+2. **Reads the scope's autopilot flag** from runs.db's `autopilot` table.
+   It is off until a host turns it on.
+3. **Takes `tm ready`'s ready and stackable tickets.** The audit gate
+   applies. Waiting and blocked tickets are skipped. So is any ticket the
+   run store says is already in hand:
+   - it has a live run of any kind;
+   - it had a lane run before (a tick launches a ticket at most once, so a
+     lane that ended without a PR waits for a human instead of looping);
+   - a run recorded a PR that no run recorded merged or closed;
+   - its newest auto-review round hit the round cap.
+4. **Orders them** by how many other candidates each one unblocks, most
+   first. Ties keep the tracker's rank order.
+5. **Launches them in that order.** Each launch runs `tm work run
+   --unattended <lane> <KEY>`. The lane is the first one the board would
+   offer for this repo. A stackable ticket is stacked by `tm work run`
+   itself. Launching stops at the first of these refusals:
+   - `max_lanes` lanes are running (every running lane counts, however it
+     was launched);
+   - no lane matches the repo;
+   - every runner is metered and `allow_paid_fallback` is off;
+   - memory admission refuses;
+   - usage admission refuses. This is a hard gate here, not a warning.
+
+   A launch that fails, such as a dirty worktree, is recorded and the tick
+   moves on to the next ticket.
+6. **Records what it did** in runs.db's `dispatch_events`: a `launch` row
+   per launch, and a `refused` row with the first refusal's reason.
+
+`--unattended` is a hidden `tm work run` flag. It implies `--headless`. It
+drops metered runners from the fallback chain unless `allow_paid_fallback`
+is set. It also refuses, rather than warns, when usage admission says no.
+
+```toml
+[dispatch]
+max_lanes = 1               # default; the most lane runs at once
+allow_paid_fallback = false # default; see "Usage admission" above
+```
+
 ### Limiting concurrent cargo builds (`[work] build_slots`)
 
 Parallel lanes each run `cargo` from inside their agent, and cargo starts
