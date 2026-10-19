@@ -543,6 +543,55 @@ fn admit<'c>(
     Ok(Ok(lane))
 }
 
+/// What a scope's dispatcher is doing, for `tm dispatch status` and the
+/// TUI autopilot header (GitHub issue #121).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchState {
+    /// When the scope last launched a lane, in unix seconds.
+    pub last_launch_unix: Option<i64>,
+    /// What is stopping launches now: set while the scope's newest dispatch
+    /// event is a refusal.
+    pub blocked: Option<Blocked>,
+}
+
+/// The refusal a scope's dispatcher is stuck on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// When refusals for this reason began, in unix seconds: the start of
+    /// the [`RunStore::refusal_streak`], or the refusal itself when it has
+    /// no reason code.
+    pub since_unix: i64,
+    /// The newest refusal's detail.
+    pub detail: String,
+}
+
+/// Reads `scope`'s [`DispatchState`] from `dispatch_events`.
+///
+/// # Errors
+///
+/// Returns the store's error when a read fails.
+pub fn dispatch_state(store: &RunStore, scope: &str) -> Result<DispatchState, RunStoreError> {
+    let last_launch_unix = store
+        .last_dispatch_event(scope, LAUNCH_EVENT)?
+        .map(|event| event.created_unix);
+    let blocked = match store.dispatch_events(scope, 1)?.into_iter().next() {
+        Some(newest) if newest.kind == REFUSED_EVENT => {
+            let since_unix = store
+                .refusal_streak(scope)?
+                .map_or(newest.created_unix, |streak| streak.since_unix);
+            Some(Blocked {
+                since_unix,
+                detail: newest.detail,
+            })
+        }
+        _ => None,
+    };
+    Ok(DispatchState {
+        last_launch_unix,
+        blocked,
+    })
+}
+
 /// Why the run store says a ticket is already in hand, so a tick leaves it
 /// alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1316,6 +1365,47 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn dispatch_state_reads_the_last_launch_and_the_current_block() {
+        let fx = Fixture::new();
+        assert_eq!(
+            dispatch_state(&fx.store, SCOPE).unwrap(),
+            DispatchState::default()
+        );
+
+        fx.store
+            .record_dispatch_event(SCOPE, Some("GH-1"), LAUNCH_EVENT, "lane backend")
+            .unwrap();
+        let state = dispatch_state(&fx.store, SCOPE).unwrap();
+        let launched_at = state.last_launch_unix.expect("a launch");
+        assert!(launched_at > NOW, "real wall-clock time");
+        assert_eq!(state.blocked, None, "the newest event is a launch");
+
+        fx.store
+            .record_dispatch_refusal(SCOPE, None, "max_lanes", "max lanes 1")
+            .unwrap();
+        fx.store
+            .record_dispatch_refusal(SCOPE, None, "max_lanes", "max lanes 2")
+            .unwrap();
+        let state = dispatch_state(&fx.store, SCOPE).unwrap();
+        assert_eq!(state.last_launch_unix, Some(launched_at));
+        let blocked = state.blocked.expect("blocked");
+        assert_eq!(blocked.detail, "max lanes 2");
+        assert!(blocked.since_unix >= launched_at);
+    }
+
+    #[test]
+    fn a_refusal_without_a_reason_code_still_blocks() {
+        let fx = Fixture::new();
+        fx.store
+            .record_dispatch_event(SCOPE, None, REFUSED_EVENT, "old refusal")
+            .unwrap();
+
+        let blocked = dispatch_state(&fx.store, SCOPE).unwrap().blocked.unwrap();
+
+        assert_eq!(blocked.detail, "old refusal");
     }
 
     #[test]

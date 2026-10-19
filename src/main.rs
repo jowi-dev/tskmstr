@@ -361,7 +361,7 @@ fn run_dispatch(
             current.as_ref(),
             &mut stdout,
         )?,
-        DispatchCmd::Status => tskmstr::cli::dispatch::status(&store, &mut stdout)?,
+        DispatchCmd::Status => tskmstr::cli::dispatch::status(&store, unix_now(), &mut stdout)?,
     }
     Ok(())
 }

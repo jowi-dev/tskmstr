@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::cli::runs::format_age;
 use crate::config::{BackendIdentity, BackendIdentityResolver, Config, compatible_lane_names};
 use crate::runs::{AutopilotScope, RunStatus, RunStore, RunStoreError};
-use crate::work::dispatch::{LaneChoice, REFUSED_EVENT, Skip, TickReport};
+use crate::work::dispatch::{LaneChoice, Skip, TickReport, dispatch_state};
 
 /// Which scopes a `tm dispatch` command acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,8 +298,10 @@ pub fn set(
 }
 
 /// `tm dispatch status`: one line per scope with an `autopilot` row: on or
-/// off, its running lanes, when it last ticked, and its last refusal.
-pub fn status(store: &RunStore, out: &mut dyn Write) -> Result<(), DispatchCliError> {
+/// off, its running lanes, when it last ticked, and how long ago it last
+/// launched. A scope whose newest tick refused also gets the refusal and how
+/// long refusals for that reason have lasted. `now` is unix seconds.
+pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), DispatchCliError> {
     let rows = store.autopilot_scopes()?;
     if rows.is_empty() {
         writeln!(out, "no scopes registered; run `tm dispatch on` in a repo")?;
@@ -316,20 +319,25 @@ pub fn status(store: &RunStore, out: &mut dyn Write) -> Result<(), DispatchCliEr
             .as_deref()
             .map(trim_timestamp)
             .unwrap_or("never");
+        let state_now = dispatch_state(store, &row.scope)?;
+        let last_launch = match state_now.last_launch_unix {
+            Some(at) => format!("last launch {} ago", format_age(now - at)),
+            None => "never launched".to_string(),
+        };
         writeln!(
             out,
-            "{}: {state}, {running} lanes running, last tick {last_tick}",
+            "{}: {state}, {running} lanes running, last tick {last_tick}, {last_launch}",
             row.scope
         )?;
         if let Some(repo_dir) = &row.repo_dir {
             writeln!(out, "  repo: {repo_dir}")?;
         }
-        if let Some(event) = store.last_dispatch_event(&row.scope, REFUSED_EVENT)? {
+        if let Some(blocked) = &state_now.blocked {
             writeln!(
                 out,
-                "  last refusal {}: {}",
-                trim_timestamp(&event.created_at),
-                event.detail
+                "  blocked for {}: {}",
+                format_age(now - blocked.since_unix),
+                blocked.detail
             )?;
         }
     }
@@ -381,8 +389,8 @@ mod tests {
     use crate::runs::StartRun;
     use crate::work::admission::UsageProber;
     use crate::work::dispatch::{
-        Candidate, CandidateSource, FileScopeLock, Launch, Launcher, Refusal, ScopeLock,
-        TickConfig, TickDeps,
+        Candidate, CandidateSource, FileScopeLock, LAUNCH_EVENT, Launch, Launcher, Refusal,
+        ScopeLock, TickConfig, TickDeps,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -890,7 +898,7 @@ mod tests {
     #[test]
     fn status_with_no_scopes_says_how_to_start() {
         let (_dir, store) = store();
-        let out = text(|out| status(&store, out).unwrap());
+        let out = text(|out| status(&store, 0, out).unwrap());
         assert_eq!(
             out,
             "no scopes registered; run `tm dispatch on` in a repo\n"
@@ -898,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn status_lists_each_scope_with_lanes_last_tick_and_last_refusal() {
+    fn status_lists_each_scope_with_lanes_last_tick_last_launch_and_block() {
         let (_dir, store) = store();
         store.set_autopilot_in(ONE, true, Some("/r/one")).unwrap();
         store.set_autopilot(TWO, false).unwrap();
@@ -916,10 +924,14 @@ mod tests {
             })
             .unwrap();
         store
-            .record_dispatch_event(ONE, None, REFUSED_EVENT, "not launching: max lanes")
+            .record_dispatch_event(ONE, Some("GH-1"), LAUNCH_EVENT, "lane backend")
             .unwrap();
+        store
+            .record_dispatch_refusal(ONE, None, "max_lanes", "not launching: max lanes")
+            .unwrap();
+        let now = store.dispatch_events(ONE, 1).unwrap()[0].created_unix + 300;
 
-        let out = text(|out| status(&store, out).unwrap());
+        let out = text(|out| status(&store, now, out).unwrap());
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 4, "{out}");
@@ -927,16 +939,16 @@ mod tests {
             lines[0].starts_with("github:o/one: on, 1 lanes running, last tick 20"),
             "{out}"
         );
+        assert!(lines[0].ends_with(", last launch 5m ago"), "{out}");
         assert!(
             !lines[0].contains('.'),
             "timestamps lose their fraction: {out}"
         );
         assert_eq!(lines[1], "  repo: /r/one");
-        assert!(lines[2].starts_with("  last refusal 20"), "{out}");
-        assert!(lines[2].ends_with(": not launching: max lanes"), "{out}");
+        assert_eq!(lines[2], "  blocked for 5m: not launching: max lanes");
         assert_eq!(
             lines[3],
-            "github:o/two: off, 0 lanes running, last tick never"
+            "github:o/two: off, 0 lanes running, last tick never, never launched"
         );
     }
 
