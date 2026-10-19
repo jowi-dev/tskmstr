@@ -205,6 +205,9 @@ tm auth status
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
+| `tm dispatch tick [--scope S \| --all] [--json]` | Run one autopilot dispatch pass for the current repo, one scope, or every scope that is on. Exits `0` even when a scope is off, locked, or refused by a gate; `1` only when a scope can't tick. See "Running autopilot without a TUI" below |
+| `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
+| `tm dispatch status` | Per scope: on or off, running lanes, last tick, and last refusal |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
 | `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
@@ -1011,7 +1014,7 @@ These keys only set limits. They don't select a runner, so `[agent]`'s
 The autopilot dispatcher (GitHub issue #115, `src/work/dispatch.rs`)
 launches lane runs for ready tickets without a human pressing `w`. Each
 call to `dispatch::tick` does one pass for one repo (scope). The TUI toggle
-(#116) and `tm dispatch` with a systemd timer (#117) are the hosts that call
+(#116) and `tm dispatch` with a systemd timer (#117, see below) are the hosts that call
 it. A tick:
 
 1. **Takes a per-scope lock.** It is an exclusive `flock` on
@@ -1020,7 +1023,8 @@ it. A tick:
    another host holds it, the tick is skipped. Two hosts therefore never
    launch the same ticket.
 2. **Reads the scope's autopilot flag** from runs.db's `autopilot` table.
-   It is off until a host turns it on.
+   It is off until a host turns it on. A tick that gets past this step
+   stamps the scope's `last_tick_at`, which `tm dispatch status` shows.
 3. **Takes `tm ready`'s ready and stackable tickets.** The audit gate
    applies. Waiting and blocked tickets are skipped. So is any ticket the
    run store says is already in hand:
@@ -1056,6 +1060,32 @@ is set. It also refuses, rather than warns, when usage admission says no.
 max_lanes = 1               # default; the most lane runs at once
 allow_paid_fallback = false # default; see "Usage admission" above
 ```
+
+### Running autopilot without a TUI (`tm dispatch`)
+
+`tm dispatch` hosts the dispatcher from the command line (GitHub issue
+#117). Run `tm dispatch on` inside each repo autopilot should work in. It
+sets the scope's flag and records the repo, so a timer can find it later.
+Then let a systemd user timer run `tm dispatch tick --all` every 5 minutes.
+
+```sh
+tm dispatch on              # this repo on; records its checkout
+tm dispatch status          # per scope: on/off, running lanes, last tick, last refusal
+tm dispatch tick [--json]   # one pass for this repo
+tm dispatch tick --all      # one pass for every scope that is on
+tm dispatch off --all       # kill switch: the next tick launches nothing
+```
+
+`tick` exits 0 when a scope is off, locked by another host, or refused by a
+gate. It exits 1 only when a scope can't tick at all. The flag and the lock
+are the ones the TUI uses, so a timer and an open board never launch the
+same ticket.
+
+Example `tm-dispatch.service` and `tm-dispatch.timer` units are in
+[`docs/systemd/`](docs/systemd/). [`docs/dispatch-timer.md`](docs/dispatch-timer.md)
+explains how to install them, why the 5-minute cadence, and the launchd
+setup for macOS. The service must keep `KillMode=process`. Without it,
+systemd kills every lane a tick launched as soon as the tick exits.
 
 ### Limiting concurrent cargo builds (`[work] build_slots`)
 
