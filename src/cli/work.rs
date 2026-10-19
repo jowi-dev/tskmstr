@@ -404,6 +404,12 @@ pub struct RunDeps<'a> {
     /// [`crate::runs::footprint::memory_pressure`]. Only called when
     /// `[work] memory_budget_gb` is set.
     pub memory_pressure: &'a dyn Fn() -> crate::runs::footprint::MemoryPressure,
+    /// The configured `[agent.<runner>]` usage settings, for usage
+    /// admission (GitHub issue #114).
+    pub usage: &'a crate::config::UsageConfig,
+    /// Refreshes a stale usage snapshot for usage admission; production
+    /// passes a [`crate::work::admission::SpawnUsageProber`].
+    pub usage_prober: &'a dyn crate::work::admission::UsageProber,
 }
 
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
@@ -483,6 +489,24 @@ pub fn run(
         )? {
             return Err(refusal.into());
         }
+    }
+
+    // Usage admission (GitHub issue #114), keyed by the preferred runner
+    // like memory admission. A human chose to launch, so this only warns;
+    // the dispatcher (GitHub issue #115) enforces it instead.
+    if let Some(usage) = deps.usage.for_agent(deps.runner.name()) {
+        let verdict = crate::work::admission::check_usage_admission(
+            deps.run_store,
+            deps.runner.name(),
+            usage,
+            deps.clock.now_unix_secs(),
+            deps.usage_prober,
+        )?;
+        let _ = crate::work::admission::apply_usage_gate(
+            verdict,
+            crate::work::admission::UsageGateMode::Warn,
+            out,
+        );
     }
 
     match dispatch {
@@ -2543,6 +2567,20 @@ mod tests {
         assert_eq!(Dispatch::HeadlessForeground.run_mode(), RunMode::Headless);
     }
 
+    /// A usage prober for runs that must never probe: these tests seed no
+    /// snapshots, so admission would otherwise spawn one.
+    struct NoUsageProbe;
+
+    impl crate::work::admission::UsageProber for NoUsageProbe {
+        fn supports(&self, _agent: &str) -> bool {
+            false
+        }
+
+        fn probe(&self, _agent: &str) -> Result<crate::agent::UsageSnapshot, String> {
+            unreachable!("unsupported agents are never probed")
+        }
+    }
+
     fn normal_pressure() -> crate::runs::footprint::MemoryPressure {
         crate::runs::footprint::MemoryPressure::Normal
     }
@@ -2553,7 +2591,11 @@ mod tests {
         memory: crate::config::MemoryConfig,
         pressure: &dyn Fn() -> crate::runs::footprint::MemoryPressure,
         seed: &dyn Fn(&RunStore),
-    ) -> (Result<bool, WorkCliError>, Vec<crate::runs::RunSummary>) {
+    ) -> (
+        Result<bool, WorkCliError>,
+        Vec<crate::runs::RunSummary>,
+        String,
+    ) {
         let (tmp, home, repo_root, _prompt_path) = run_setup();
         let mut lanes = BTreeMap::new();
         lanes.insert(
@@ -2601,6 +2643,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2616,7 +2660,11 @@ mod tests {
             Dispatch::HeadlessForeground,
             &mut out,
         );
-        (result, run_store.list_runs().unwrap())
+        (
+            result,
+            run_store.list_runs().unwrap(),
+            String::from_utf8(out).unwrap(),
+        )
     }
 
     fn one_gig_budget() -> crate::config::MemoryConfig {
@@ -2628,7 +2676,7 @@ mod tests {
 
     #[test]
     fn run_refuses_an_over_budget_lane_before_creating_a_run_row() {
-        let (result, runs) = run_with_memory_config(one_gig_budget(), &normal_pressure, &|_| {});
+        let (result, runs, _) = run_with_memory_config(one_gig_budget(), &normal_pressure, &|_| {});
 
         let err = result.expect_err("a 2 GB default estimate exceeds a 1 GB budget");
         assert!(
@@ -2650,7 +2698,7 @@ mod tests {
             budget_bytes: Some(1000 * crate::runs::footprint::GIB),
             ..Default::default()
         };
-        let (result, runs) = run_with_memory_config(
+        let (result, runs, _) = run_with_memory_config(
             budget,
             &|| crate::runs::footprint::MemoryPressure::Critical,
             &|_| {},
@@ -2665,8 +2713,25 @@ mod tests {
     }
 
     #[test]
+    fn run_warns_about_an_exhausted_usage_window_but_still_launches() {
+        let (result, runs, out) = run_with_memory_config(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &|store| store.set_agent_exhausted_until("claude", i64::MAX).unwrap(),
+        );
+
+        assert!(result.unwrap(), "a manual run only warns");
+        assert_eq!(runs.len(), 1);
+        assert!(
+            out.contains("warning: not launching: claude usage window exhausted"),
+            "{out}"
+        );
+        assert!(out.contains("(launching anyway)"), "{out}");
+    }
+
+    #[test]
     fn run_launches_as_before_with_no_memory_budget() {
-        let (result, runs) = run_with_memory_config(
+        let (result, runs, _) = run_with_memory_config(
             crate::config::MemoryConfig::default(),
             &|| crate::runs::footprint::MemoryPressure::Critical,
             &|_| {},
@@ -2724,6 +2789,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2857,6 +2924,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -2930,6 +2999,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let mut out = Vec::new();
 
@@ -3091,6 +3162,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let mut out = Vec::new();
 
@@ -3170,6 +3243,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let mut out = Vec::new();
 
@@ -3235,6 +3310,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3350,6 +3427,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let request = RunLaneRequest {
             ticket: Some("PROJ-1".to_string()),
@@ -3416,6 +3495,8 @@ mod tests {
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
             memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
         };
         let mut out = Vec::new();
 

@@ -176,6 +176,24 @@ impl AgentRunner for ClaudeRunner {
         "Claude Code"
     }
 
+    /// `claude -p 'ok' --model haiku --max-turns 1 --output-format
+    /// stream-json --verbose`: one Haiku turn (about $0.003 list price when
+    /// measured), whose `rate_limit_event` is the snapshot. Built through
+    /// [`ClaudeRunner::build_invocation`] so it keeps the billing-safety env
+    /// stripping. No settings, so no telemetry hooks fire, and no run id, so
+    /// it is untracked. See `docs/plans/gh-113-proactive-usage-signal.md`.
+    fn usage_probe_invocation(&self) -> Option<AgentInvocation> {
+        Some(self.build_invocation(InvocationInputs {
+            prompt: "ok".to_string(),
+            model: Some("haiku".to_string()),
+            max_turns: Some("1".to_string()),
+            permission_mode: None,
+            settings_path: None,
+            run_id: None,
+            mode: RunMode::Headless,
+        }))
+    }
+
     fn skills_dir(&self, base: &Path) -> PathBuf {
         base.join(".claude/skills")
     }
@@ -1105,6 +1123,37 @@ mod tests {
         assert!(
             !invocation.args.iter().any(|arg| arg == "--max-turns"),
             "--max-turns is meaningless for a steerable interactive session"
+        );
+    }
+
+    #[test]
+    fn usage_probe_is_one_haiku_turn_in_stream_json_with_billing_env_stripped() {
+        let probe = ClaudeRunner
+            .usage_probe_invocation()
+            .expect("claude has a usage probe");
+
+        assert_eq!(probe.program, "claude");
+        assert_eq!(
+            probe.args,
+            vec![
+                "-p",
+                "ok",
+                "--model",
+                "haiku",
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--max-turns",
+                "1",
+            ]
+        );
+        assert!(probe.env_set.is_empty(), "an untracked run");
+        assert_eq!(
+            probe.env_remove,
+            ClaudeRunner.build_invocation(base_inputs()).env_remove,
+            "the same billing-safety stripping as a lane run"
         );
     }
 

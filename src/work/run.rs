@@ -1727,17 +1727,7 @@ fn record_usage_snapshot(
     usage: &crate::agent::UsageSnapshot,
     now: i64,
 ) -> Result<(), RunStoreError> {
-    for window in &usage.windows {
-        run_store.upsert_usage_snapshot(&crate::runs::UsageSnapshotRow {
-            agent: agent.to_string(),
-            window: window.window.clone(),
-            utilization: window.utilization,
-            resets_at: window.resets_at,
-            observed_at: now,
-            source: "stream".to_string(),
-            status: usage.status.clone(),
-        })?;
-    }
+    store_usage_snapshot(run_store, agent, usage, now, "stream")?;
 
     let windows: serde_json::Map<String, serde_json::Value> = usage
         .windows
@@ -1756,7 +1746,32 @@ fn record_usage_snapshot(
         "windows": windows,
     });
     run_store.add_event(run_id, "usage_snapshot", Some(&detail.to_string()))?;
+    Ok(())
+}
 
+/// Upserts each of `usage`'s windows into `usage_snapshots` as observed at
+/// `now` from `source` (`stream`, `probe`), and marks `agent` exhausted
+/// until the reset when the server rejected the request. Shared by lane
+/// runs ([`record_usage_snapshot`]) and usage admission's probe (GitHub
+/// issue #114).
+pub(crate) fn store_usage_snapshot(
+    run_store: &RunStore,
+    agent: &str,
+    usage: &crate::agent::UsageSnapshot,
+    now: i64,
+    source: &str,
+) -> Result<(), RunStoreError> {
+    for window in &usage.windows {
+        run_store.upsert_usage_snapshot(&crate::runs::UsageSnapshotRow {
+            agent: agent.to_string(),
+            window: window.window.clone(),
+            utilization: window.utilization,
+            resets_at: window.resets_at,
+            observed_at: now,
+            source: source.to_string(),
+            status: usage.status.clone(),
+        })?;
+    }
     if usage.is_rejected()
         && let Some(until) = usage.resets_at
     {

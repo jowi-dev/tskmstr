@@ -612,6 +612,17 @@ fn run_work(
             let current_backend_identity = backend_identity_or_placeholder(full_config.as_ref());
             let backend_identity_resolver =
                 tskmstr::config::FsBackendIdentityResolver { home: home.clone() };
+            // Usage admission (GitHub issue #114): the configured ceilings,
+            // and a prober that can refresh a stale snapshot for the
+            // preferred runner.
+            let usage = full_config
+                .as_ref()
+                .map(|cfg| cfg.usage.clone())
+                .unwrap_or_default();
+            let usage_prober = tskmstr::work::admission::SpawnUsageProber {
+                runners: vec![agent_runner_or_default(full_config.as_ref())],
+                spawner: &spawner,
+            };
             let run_deps = tskmstr::cli::work::RunDeps {
                 gh: &gh,
                 spawner: &spawner,
@@ -634,6 +645,8 @@ fn run_work(
                 ticket_provider_error: ticket_provider_error.as_deref(),
                 fallback_runners: agent_fallback_runners_for(full_config.as_ref()),
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
+                usage: &usage,
+                usage_prober: &usage_prober,
             };
             let request = tskmstr::work::run::RunLaneRequest {
                 ticket,
@@ -2394,6 +2407,8 @@ mod tests {
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            usage: Default::default(),
+            dispatch: Default::default(),
         }
     }
 
@@ -2416,6 +2431,8 @@ mod tests {
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            usage: Default::default(),
+            dispatch: Default::default(),
         }
     }
 

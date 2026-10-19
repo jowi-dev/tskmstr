@@ -130,6 +130,29 @@ signal. Proactive gating is layered on top by GH-114/GH-115. A
 `agent_windows.exhausted_until`, so it flows through this ADR's existing
 routing.
 
+## Amendment (2026-10-18, GH-114)
+
+Usage admission (`check_usage_admission` in `src/work/admission.rs`) now
+gates launches proactively, ahead of this ADR's reactive path. It refuses
+while `exhausted_until` is in the future, or while a usage window is at or
+above its `[agent.<runner>]` ceiling. A stale snapshot is refreshed by one
+Haiku probe per max-age window. A failed probe degrades to "usage unknown"
+and leaves this ADR's reactive fallback as the backstop. A `rejected`
+snapshot, from a lane run or a probe, sets `exhausted_until`.
+
+Decision 4 still holds for routing: `runner`/`strategy`/`order` are
+replaced as a whole table. The new `[agent.<runner>]` usage keys are
+limits, not routing, so they merge key by key, repo over global, and
+setting them selects no mode.
+
+The fallback order also changes for unattended launches. Each runner has
+a `billing` attribute (`subscription` | `metered`; claude defaults to
+subscription, opencode to metered). `agent::routing::unattended_order`
+drops metered runners unless `[dispatch] allow_paid_fallback = true`, so
+an unattended dispatcher (GH-115) can't turn a used-up subscription window
+into pay-per-token spend. A manual `tm work run` still falls back as
+described above, and usage admission only warns there.
+
 ## What this does not change
 
 `runs` gets no new runner column — `run_events` records the rate-limit and
