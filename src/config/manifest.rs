@@ -272,6 +272,20 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #121. The daily launch cap and the stall-notification
+    // delay both have built-in defaults.
+    ExpectedConfigKey {
+        path: &["dispatch", "max_launches_per_day"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
+    ExpectedConfigKey {
+        path: &["dispatch", "stall_notify_mins"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
 ];
 
 #[cfg(test)]
@@ -371,6 +385,16 @@ mod tests {
         assert_eq!(key.severity, KeySeverity::Recommended);
         assert_eq!((key.suggested_default)(BackendKind::Github), None);
         assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+    }
+
+    #[test]
+    fn dispatch_guardrails_are_registered_without_a_default() {
+        for name in ["max_launches_per_day", "stall_notify_mins"] {
+            let key = expected(&["dispatch", name]);
+            assert_eq!(key.severity, KeySeverity::Recommended);
+            assert_eq!((key.suggested_default)(BackendKind::Github), None);
+            assert_eq!((key.suggested_default)(BackendKind::Jira), None);
+        }
     }
 
     #[test]
