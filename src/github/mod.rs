@@ -5,3 +5,4 @@
 pub mod bot_findings;
 pub mod gh_cli;
 pub mod pr;
+pub mod review_threads;

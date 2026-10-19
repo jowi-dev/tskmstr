@@ -1,0 +1,109 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "author": { "login": "jowi-dev" },
+        "reviewThreads": {
+          "nodes": [
+            {
+              "id": "PRRT_kwDOTpcxIM5abc001",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "src/work/merge.rs",
+              "line": 42,
+              "startLine": 40,
+              "originalLine": 42,
+              "originalStartLine": 40,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 2401001,
+                    "author": { "login": "teammate" },
+                    "body": "This swallows the rebase error.",
+                    "url": "https://github.com/jowi-dev/tskmstr/pull/140#discussion_r2401001",
+                    "createdAt": "2026-10-18T10:00:00Z",
+                    "originalCommit": { "oid": "1111111aaaaaaa" }
+                  },
+                  {
+                    "databaseId": 2401002,
+                    "author": { "login": "jowi-dev" },
+                    "body": "Good catch, it should bubble up.",
+                    "url": "https://github.com/jowi-dev/tskmstr/pull/140#discussion_r2401002",
+                    "createdAt": "2026-10-18T10:05:00Z",
+                    "originalCommit": { "oid": "1111111aaaaaaa" }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOTpcxIM5abc002",
+              "isResolved": false,
+              "isOutdated": true,
+              "path": "src/cli/review.rs",
+              "line": null,
+              "startLine": null,
+              "originalLine": 118,
+              "originalStartLine": null,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 2401003,
+                    "author": { "login": "teammate" },
+                    "body": "Name this constant.",
+                    "url": "https://github.com/jowi-dev/tskmstr/pull/140#discussion_r2401003",
+                    "createdAt": "2026-10-18T10:10:00Z",
+                    "originalCommit": { "oid": "2222222bbbbbbb" }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOTpcxIM5abc003",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "src/lib.rs",
+              "line": 3,
+              "startLine": null,
+              "originalLine": 3,
+              "originalStartLine": null,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 2401004,
+                    "author": { "login": "teammate" },
+                    "body": "Already fixed.",
+                    "url": "https://github.com/jowi-dev/tskmstr/pull/140#discussion_r2401004",
+                    "createdAt": "2026-10-18T09:00:00Z",
+                    "originalCommit": { "oid": "1111111aaaaaaa" }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOTpcxIM5abc004",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "src/main.rs",
+              "line": 7,
+              "startLine": null,
+              "originalLine": 7,
+              "originalStartLine": null,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 2401005,
+                    "author": null,
+                    "body": "From a deleted account.",
+                    "url": "https://github.com/jowi-dev/tskmstr/pull/140#discussion_r2401005",
+                    "createdAt": "2026-10-18T09:30:00Z",
+                    "originalCommit": null
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
