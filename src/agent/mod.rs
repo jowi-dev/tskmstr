@@ -467,6 +467,11 @@ pub struct RunOutcome {
     pub usage: Option<UsageSnapshot>,
 }
 
+/// The [`AgentRunner::name`] of the only agent that renders a statusline
+/// with usage windows: `tm usage statusline` (GitHub issue #130) records
+/// its snapshots under this name.
+pub const STATUSLINE_AGENT: &str = claude::NAME;
+
 /// One observation of a subscription's usage windows, as reported by the
 /// agent CLI itself. See `docs/plans/gh-113-proactive-usage-signal.md`.
 #[derive(Debug, Clone, PartialEq)]

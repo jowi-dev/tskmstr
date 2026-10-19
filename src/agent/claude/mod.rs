@@ -164,9 +164,12 @@ const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeRunner;
 
+/// [`ClaudeRunner`]'s [`AgentRunner::name`].
+pub const NAME: &str = "claude";
+
 impl AgentRunner for ClaudeRunner {
     fn name(&self) -> &'static str {
-        "claude"
+        NAME
     }
 
     fn display_name(&self) -> &'static str {

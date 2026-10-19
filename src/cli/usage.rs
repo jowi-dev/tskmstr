@@ -17,9 +17,9 @@ use std::process::{Command, Stdio};
 use crate::cli::runs::format_age;
 use crate::runs::{RunStore, RunStoreError, UsageSnapshotRow};
 
-/// The agent statusline snapshots are recorded under: only Claude Code
-/// renders a statusline.
-pub const STATUSLINE_AGENT: &str = "claude";
+/// The agent statusline snapshots are recorded under: the only one that
+/// renders a statusline with usage windows.
+pub use crate::agent::STATUSLINE_AGENT;
 
 /// The `source` column value for snapshots written by the shim.
 pub const STATUSLINE_SOURCE: &str = "statusline";
