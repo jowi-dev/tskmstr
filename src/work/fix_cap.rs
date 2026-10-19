@@ -5,10 +5,8 @@
 //! whatever started it, including a human's `F`; only the automatic
 //! triggers stop at the cap.
 
+pub use crate::runs::overview::REVIEW_FIX_KIND;
 use crate::runs::{RunStore, RunStoreError};
-
-/// Run `kind` of a `tm review fix` pass.
-pub const REVIEW_FIX_KIND: &str = "review-fix";
 
 /// How many `review-fix` runs `ticket` has in `scope`.
 ///

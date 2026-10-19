@@ -906,6 +906,12 @@ fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
                     auto_review_style(round),
                 ));
             }
+            if let Some(import) = &row.review_import {
+                spans.push(Span::styled(
+                    format!("  gh {import}"),
+                    auto_review_style(import),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1003,6 +1009,9 @@ fn draw_overview_columns(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 if let Some(round) = &row.auto_review_round {
                     detail.push_str(&format!("  review {round}"));
+                }
+                if let Some(import) = &row.review_import {
+                    detail.push_str(&format!("  gh {import}"));
                 }
                 ListItem::new(vec![
                     Line::from(vec![
@@ -4304,6 +4313,7 @@ mod tests {
             worktree: None,
             repo_root: crate::runs::overview::RepoRoot::Unresolved,
             auto_review_round: None,
+            review_import: None,
             fix_rounds: 0,
         }
     }
@@ -4386,6 +4396,25 @@ mod tests {
         };
         let text = buffer_text(&render_with_size(&app, 240, 24));
         assert!(text.contains("review 2/2"), "{text}");
+    }
+
+    #[test]
+    fn overview_rows_show_the_github_review_import_in_both_layouts() {
+        let row = OverviewRow {
+            review_import: Some("fix".to_string()),
+            ..overview_row("github:me/alpha", "GH-1", Stage::NeedsReview)
+        };
+        let app = overview_app(vec![row.clone()]);
+        let text = buffer_text(&render_with_size(&app, 120, 24));
+        let line = text.lines().nth(line_of(&text, "GH-1").unwrap()).unwrap();
+        assert!(line.contains("gh fix"), "{line}");
+
+        let app = App {
+            overview_layout: OverviewLayout::Columns,
+            ..overview_app(vec![row])
+        };
+        let text = buffer_text(&render_with_size(&app, 240, 24));
+        assert!(text.contains("gh fix"), "{text}");
     }
 
     #[test]

@@ -2694,7 +2694,11 @@ impl RunStore {
                     ORDER BY e.at DESC, e.id DESC LIMIT 1)
                     AS auto_review_round,
                 EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = r.id AND e.kind = 'pr_closed')
-                    AS pr_closed
+                    AS pr_closed,
+                (SELECT e.detail FROM run_events e
+                    WHERE e.run_id = r.id AND e.kind = 'review_import'
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1)
+                    AS review_import
              FROM runs r
              ORDER BY r.started_at DESC, r.id DESC";
 
@@ -2719,6 +2723,7 @@ impl RunStore {
                 heartbeat_age_secs: row.get(8)?,
                 auto_review_round: row.get(12)?,
                 pr_closed: row.get(13)?,
+                review_import: row.get(14)?,
                 awaiting_input,
                 state_age_secs: match last_event_age {
                     Some(age) if awaiting_input => age,
@@ -8622,6 +8627,25 @@ mod tests {
         assert_eq!(round.auto_review_round.as_deref(), Some("1/2 fix-failed"));
         let plain = runs.iter().find(|r| r.id == plain).unwrap();
         assert_eq!(plain.auto_review_round, None);
+    }
+
+    #[test]
+    fn overview_runs_carries_the_latest_review_import_detail() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "GH-1", None);
+        let plain = start_lane_with_pid(&store, "GH-2", None);
+        store
+            .add_event(id, "review_import", Some("2 imported"))
+            .unwrap();
+        store.add_event(id, "review_import", Some("fix")).unwrap();
+
+        let runs = store.overview_runs().unwrap();
+
+        let imported = runs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(imported.review_import.as_deref(), Some("fix"));
+        let plain = runs.iter().find(|r| r.id == plain).unwrap();
+        assert_eq!(plain.review_import, None);
     }
 
     #[test]

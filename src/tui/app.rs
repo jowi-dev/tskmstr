@@ -8689,6 +8689,7 @@ mod tests {
             worktree: None,
             repo_root: crate::runs::overview::RepoRoot::Unresolved,
             auto_review_round: None,
+            review_import: None,
             fix_rounds: 0,
         }
     }
