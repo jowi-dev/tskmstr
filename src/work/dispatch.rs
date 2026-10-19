@@ -71,6 +71,14 @@ pub trait CandidateSource {
     fn candidates(&self) -> Result<Vec<Candidate>, String>;
 }
 
+/// Production: `tm ready`'s own classification
+/// ([`crate::cli::ready::dispatch_candidates`]).
+impl CandidateSource for crate::cli::ready::ReadyContext<'_> {
+    fn candidates(&self) -> Result<Vec<Candidate>, String> {
+        crate::cli::ready::dispatch_candidates(self).map_err(|err| err.to_string())
+    }
+}
+
 /// Starts one lane run. Production runs `tm work run`; see
 /// [`CommandLauncher`].
 pub trait Launcher {
