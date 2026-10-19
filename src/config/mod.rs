@@ -325,8 +325,12 @@ pub struct RawDispatchConfig {
     pub allow_paid_fallback: Option<bool>,
     /// See [`DispatchConfig::max_fix_rounds`].
     pub max_fix_rounds: Option<u32>,
+    /// See [`DispatchConfig::max_launches_per_day`].
+    pub max_launches_per_day: Option<usize>,
     /// See [`DispatchConfig::max_lanes`].
     pub max_lanes: Option<usize>,
+    /// See [`DispatchConfig::stall_notify_mins`].
+    pub stall_notify_mins: Option<u64>,
     /// See [`DispatchConfig::tick_secs`].
     pub tick_secs: Option<u64>,
 }
@@ -991,11 +995,19 @@ pub const DEFAULT_DISPATCH_MAX_LANES: usize = 1;
 /// [`DispatchConfig::tick_secs`] when `[dispatch] tick_secs` is unset.
 pub const DEFAULT_DISPATCH_TICK_SECS: u64 = 60;
 
+/// [`DispatchConfig::max_launches_per_day`] when `[dispatch]
+/// max_launches_per_day` is unset.
+pub const DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY: usize = 20;
+
+/// [`DispatchConfig::stall_notify_mins`] when `[dispatch] stall_notify_mins`
+/// is unset.
+pub const DEFAULT_DISPATCH_STALL_NOTIFY_MINS: u64 = 30;
+
 /// The shortest [`DispatchConfig::tick_secs`]. Every tick asks the tracker
 /// for ready tickets, so a smaller configured value is raised to this one.
 pub const MIN_DISPATCH_TICK_SECS: u64 = 10;
 
-/// Validated `[dispatch]` settings (GitHub issues #114, #115 and #120).
+/// Validated `[dispatch]` settings (GitHub issues #114, #115, #120 and #121).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchConfig {
     /// Whether unattended dispatch may route to a [`Billing::Metered`]
@@ -1011,6 +1023,15 @@ pub struct DispatchConfig {
     /// (`crate::work::dispatch::tick`). Every running lane counts, however
     /// it was launched. Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
     pub max_lanes: usize,
+    /// The most lanes the autopilot dispatcher launches for one scope in
+    /// any rolling 24 hours, a backstop against a runaway dispatcher
+    /// (GitHub issue #121). A tick at the cap refuses with its own reason.
+    /// Defaults to [`DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY`].
+    pub max_launches_per_day: usize,
+    /// How many minutes the dispatcher may keep refusing for the same reason
+    /// before a tick sends a desktop notification about the stall (GitHub
+    /// issue #121). Defaults to [`DEFAULT_DISPATCH_STALL_NOTIFY_MINS`].
+    pub stall_notify_mins: u64,
     /// How often a TUI host runs a dispatch tick for each scope it shows
     /// (GitHub issue #116), in seconds. Defaults to
     /// [`DEFAULT_DISPATCH_TICK_SECS`]; never less than
@@ -1024,6 +1045,8 @@ impl Default for DispatchConfig {
             allow_paid_fallback: false,
             max_fix_rounds: DEFAULT_MAX_FIX_ROUNDS,
             max_lanes: DEFAULT_DISPATCH_MAX_LANES,
+            max_launches_per_day: DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY,
+            stall_notify_mins: DEFAULT_DISPATCH_STALL_NOTIFY_MINS,
             tick_secs: DEFAULT_DISPATCH_TICK_SECS,
         }
     }
@@ -1899,6 +1922,21 @@ fn merge_with_repo_dir(
             .and_then(|d| d.max_lanes)
             .or(global.dispatch.as_ref().and_then(|d| d.max_lanes))
             .unwrap_or(DEFAULT_DISPATCH_MAX_LANES),
+        max_launches_per_day: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.max_launches_per_day)
+            .or(global
+                .dispatch
+                .as_ref()
+                .and_then(|d| d.max_launches_per_day))
+            .unwrap_or(DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY),
+        stall_notify_mins: repo
+            .dispatch
+            .as_ref()
+            .and_then(|d| d.stall_notify_mins)
+            .or(global.dispatch.as_ref().and_then(|d| d.stall_notify_mins))
+            .unwrap_or(DEFAULT_DISPATCH_STALL_NOTIFY_MINS),
         tick_secs: repo
             .dispatch
             .as_ref()
@@ -6255,6 +6293,30 @@ mod tests {
     fn dispatch_tick_secs_below_the_floor_is_raised_to_it() {
         let cfg = load_with("[dispatch]\ntick_secs = 0\n", None).expect("should load");
         assert_eq!(cfg.dispatch.tick_secs, MIN_DISPATCH_TICK_SECS);
+    }
+
+    #[test]
+    fn dispatch_guardrails_have_defaults() {
+        let cfg = load_with("", None).expect("should load");
+        assert_eq!(
+            cfg.dispatch.max_launches_per_day,
+            DEFAULT_DISPATCH_MAX_LAUNCHES_PER_DAY
+        );
+        assert_eq!(
+            cfg.dispatch.stall_notify_mins,
+            DEFAULT_DISPATCH_STALL_NOTIFY_MINS
+        );
+    }
+
+    #[test]
+    fn dispatch_guardrails_are_merged_repo_over_global() {
+        let cfg = load_with(
+            "[dispatch]\nmax_launches_per_day = 9\nstall_notify_mins = 90\n",
+            Some("[dispatch]\nmax_launches_per_day = 4\n"),
+        )
+        .expect("should load");
+        assert_eq!(cfg.dispatch.max_launches_per_day, 4, "repo wins");
+        assert_eq!(cfg.dispatch.stall_notify_mins, 90, "global fills the gap");
     }
 
     #[test]

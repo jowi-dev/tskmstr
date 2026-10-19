@@ -1280,10 +1280,15 @@ fn execute_autopilot(
     match cmd {
         Cmd::LoadAutopilotStatus { scopes } => {
             let result = match store {
-                Some(store) => {
-                    crate::work::autopilot::load_status(store, &scopes, autopilot.max_lanes)
-                        .map_err(|err| err.to_string())
-                }
+                Some(store) => crate::work::autopilot::load_status(
+                    store,
+                    &scopes,
+                    autopilot.max_lanes,
+                    crate::work::review_watch::Clock::now_unix_secs(
+                        &crate::work::review_watch::SystemClock,
+                    ),
+                )
+                .map_err(|err| err.to_string()),
                 None => Err(NO_STORE.to_string()),
             };
             vec![Msg::AutopilotStatusLoaded(result)]

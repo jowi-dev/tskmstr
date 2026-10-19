@@ -361,7 +361,7 @@ fn run_dispatch(
             current.as_ref(),
             &mut stdout,
         )?,
-        DispatchCmd::Status => tskmstr::cli::dispatch::status(&store, &mut stdout)?,
+        DispatchCmd::Status => tskmstr::cli::dispatch::status(&store, unix_now(), &mut stdout)?,
     }
     Ok(())
 }
@@ -439,6 +439,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             program: self.current_exe.clone(),
             cwd: repo_dir.to_path_buf(),
         };
+        let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = tskmstr::work::dispatch::TickDeps {
             store: self.store,
             lock: self.lock,
@@ -447,10 +448,14 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             usage_prober: &usage_prober,
             now: unix_now(),
+            notifier: &notifier,
         };
         let cfg = tskmstr::work::dispatch::TickConfig {
             scope,
             max_lanes: config.dispatch.max_lanes,
+            max_launches_per_day: config.dispatch.max_launches_per_day,
+            max_fix_rounds: config.dispatch.max_fix_rounds,
+            stall_notify_mins: config.dispatch.stall_notify_mins,
             lanes: &lanes,
             agent,
             memory: &config.work.memory,
@@ -2695,6 +2700,7 @@ impl AutopilotTicker {
             ),
         };
 
+        let notifier = tskmstr::work::notify::DesktopNotifier::detect();
         let deps = dispatch::TickDeps {
             store: &store,
             lock: &lock,
@@ -2703,10 +2709,14 @@ impl AutopilotTicker {
             memory_pressure: &tskmstr::runs::footprint::memory_pressure,
             usage_prober: &usage_prober,
             now: unix_now(),
+            notifier: &notifier,
         };
         let cfg = dispatch::TickConfig {
             scope: &scope,
             max_lanes: config.dispatch.max_lanes,
+            max_launches_per_day: config.dispatch.max_launches_per_day,
+            max_fix_rounds: config.dispatch.max_fix_rounds,
+            stall_notify_mins: config.dispatch.stall_notify_mins,
             lanes: &lanes,
             agent: runner.map(|runner| runner.name()),
             memory: &config.work.memory,

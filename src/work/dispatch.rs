@@ -19,11 +19,18 @@
 //! 4. Orders them by how many other candidates each unblocks, most first,
 //!    keeping the tracker's rank order within a tie.
 //! 5. Launches them in that order through a [`Launcher`] while the running
-//!    lane count is under `max_lanes` and memory and usage admission pass.
+//!    lane count is under `max_lanes`, the scope launched fewer than
+//!    `max_launches_per_day` lanes in the last 24 hours, and memory and
+//!    usage admission pass.
 //!    The first refusal ends the tick; a failed launch is recorded and the
 //!    tick moves on to the next ticket.
 //! 6. Records a `launch` row in `dispatch_events` per launch, and a
-//!    `refused` row for the tick's first refusal.
+//!    `refused` row, with its [`Refusal::code`], for the tick's first
+//!    refusal.
+//! 7. Sends the desktop notifications the scope owes
+//!    ([`crate::work::notify`]): tickets that entered awaiting review or hit
+//!    the fix-round cap, and a refusal streak older than
+//!    `stall_notify_mins`. Each transition notifies once.
 //!
 //! Every dependency is injected, so tests drive [`tick`] with a real
 //! [`RunStore`] in a temp dir and fake candidates and launchers.
@@ -46,11 +53,15 @@ use crate::work::admission::{
     check_usage_admission,
 };
 use crate::work::auto_review::RoundVerdict;
+use crate::work::notify::{self, Notifier};
 
 /// `dispatch_events.kind` of a launched lane.
 pub const LAUNCH_EVENT: &str = "launch";
 /// `dispatch_events.kind` of a tick's first refusal.
 pub const REFUSED_EVENT: &str = "refused";
+
+/// The daily launch cap's rolling window, in seconds.
+const DAY_SECS: i64 = 24 * 60 * 60;
 
 /// One `tm ready` ticket as the dispatcher reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +217,14 @@ pub struct TickConfig<'a> {
     pub scope: &'a str,
     /// `[dispatch] max_lanes`.
     pub max_lanes: usize,
+    /// `[dispatch] max_launches_per_day`: the most launches in any rolling
+    /// 24 hours for this scope.
+    pub max_launches_per_day: usize,
+    /// `[dispatch] max_fix_rounds`, for fix-cap notifications.
+    pub max_fix_rounds: u32,
+    /// `[dispatch] stall_notify_mins`: how long refusals for one reason
+    /// last before a stall notification.
+    pub stall_notify_mins: u64,
     /// The lanes compatible with this scope, in board order. The board
     /// launches directly when there is one and asks when there are more; a
     /// tick can't ask, so it takes the first.
@@ -234,8 +253,11 @@ pub struct TickDeps<'a> {
     pub memory_pressure: &'a dyn Fn() -> MemoryPressure,
     /// Refreshes a stale usage snapshot for usage admission.
     pub usage_prober: &'a dyn UsageProber,
-    /// Unix seconds, for usage admission.
+    /// Unix seconds, for usage admission, the daily launch cap and stall
+    /// notifications.
     pub now: i64,
+    /// Shows the tick's notifications ([`crate::work::notify`]).
+    pub notifier: &'a dyn Notifier,
 }
 
 /// Why a tick did nothing at all.
@@ -256,6 +278,14 @@ pub enum Refusal {
         /// Lanes running now, across every scope.
         running: usize,
         /// `[dispatch] max_lanes`.
+        max: usize,
+    },
+    /// The scope launched `[dispatch] max_launches_per_day` lanes in the
+    /// last 24 hours.
+    DailyCap {
+        /// Launches recorded for the scope in the last 24 hours.
+        launched: usize,
+        /// `[dispatch] max_launches_per_day`.
         max: usize,
     },
     /// No configured lane is compatible with the scope.
@@ -282,6 +312,10 @@ impl fmt::Display for Refusal {
                 f,
                 "not launching: {running} lanes running, [dispatch] max_lanes is {max}"
             ),
+            Refusal::DailyCap { launched, max } => write!(
+                f,
+                "not launching: {launched} lanes launched in the last 24h, [dispatch] max_launches_per_day is {max}"
+            ),
             Refusal::NoLane => write!(f, "not launching: no configured lane matches this repo"),
             Refusal::NoUnattendedRunner => write!(
                 f,
@@ -292,6 +326,23 @@ impl fmt::Display for Refusal {
             Refusal::LaunchFailed { ticket, error } => {
                 write!(f, "launching {ticket} failed: {error}")
             }
+        }
+    }
+}
+
+impl Refusal {
+    /// A stable code for the refusal's kind, recorded in
+    /// `dispatch_events.reason`. Two refusals with one code are "the same
+    /// reason" for stall notifications, whatever their detail says.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refusal::MaxLanes { .. } => "max_lanes",
+            Refusal::DailyCap { .. } => "daily_cap",
+            Refusal::NoLane => "no_lane",
+            Refusal::NoUnattendedRunner => "no_unattended_runner",
+            Refusal::Memory(_) => "memory",
+            Refusal::Usage(_) => "usage",
+            Refusal::LaunchFailed { .. } => "launch_failed",
         }
     }
 }
@@ -317,6 +368,8 @@ pub struct TickReport {
     pub refused: Option<Refusal>,
     /// Set when the tick did nothing at all.
     pub skipped: Option<Skip>,
+    /// The titles of the notifications the tick sent, in order.
+    pub notified: Vec<String>,
 }
 
 /// Errors that stop a tick outright.
@@ -351,7 +404,8 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     }
     deps.store.stamp_autopilot_tick(cfg.scope)?;
 
-    let busy = in_hand(&deps.store.overview_runs()?, cfg.scope);
+    let runs = deps.store.overview_runs()?;
+    let busy = in_hand(&runs, cfg.scope);
     let mut queue: Vec<Candidate> = deps
         .candidates
         .candidates()
@@ -416,13 +470,22 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     }
 
     if let Some(refusal) = &report.refused {
-        deps.store.record_dispatch_event(
+        deps.store.record_dispatch_refusal(
             cfg.scope,
             refused_ticket.as_deref(),
-            REFUSED_EVENT,
+            refusal.code(),
             &refusal.to_string(),
         )?;
     }
+
+    let mut notices = notify::ticket_notices(&runs, cfg.scope, cfg.max_fix_rounds);
+    notices.extend(notify::stall_notice(
+        cfg.scope,
+        deps.store.refusal_streak(cfg.scope)?.as_ref(),
+        deps.now,
+        i64::try_from(cfg.stall_notify_mins.saturating_mul(60)).unwrap_or(i64::MAX),
+    ));
+    report.notified = notify::send(deps.store, deps.notifier, cfg.scope, &notices)?;
     Ok(report)
 }
 
@@ -447,6 +510,15 @@ fn admit<'c>(
             max: cfg.max_lanes,
         }));
     }
+    let launched = deps
+        .store
+        .dispatch_launches_since(cfg.scope, deps.now - DAY_SECS)?;
+    if launched >= cfg.max_launches_per_day {
+        return Ok(Err(Refusal::DailyCap {
+            launched,
+            max: cfg.max_launches_per_day,
+        }));
+    }
     let Some(lane) = cfg.lanes.first() else {
         return Ok(Err(Refusal::NoLane));
     };
@@ -469,6 +541,55 @@ fn admit<'c>(
         return Ok(Err(Refusal::Usage(refusal)));
     }
     Ok(Ok(lane))
+}
+
+/// What a scope's dispatcher is doing, for `tm dispatch status` and the
+/// TUI autopilot header (GitHub issue #121).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchState {
+    /// When the scope last launched a lane, in unix seconds.
+    pub last_launch_unix: Option<i64>,
+    /// What is stopping launches now: set while the scope's newest dispatch
+    /// event is a refusal.
+    pub blocked: Option<Blocked>,
+}
+
+/// The refusal a scope's dispatcher is stuck on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// When refusals for this reason began, in unix seconds: the start of
+    /// the [`RunStore::refusal_streak`], or the refusal itself when it has
+    /// no reason code.
+    pub since_unix: i64,
+    /// The newest refusal's detail.
+    pub detail: String,
+}
+
+/// Reads `scope`'s [`DispatchState`] from `dispatch_events`.
+///
+/// # Errors
+///
+/// Returns the store's error when a read fails.
+pub fn dispatch_state(store: &RunStore, scope: &str) -> Result<DispatchState, RunStoreError> {
+    let last_launch_unix = store
+        .last_dispatch_event(scope, LAUNCH_EVENT)?
+        .map(|event| event.created_unix);
+    let blocked = match store.dispatch_events(scope, 1)?.into_iter().next() {
+        Some(newest) if newest.kind == REFUSED_EVENT => {
+            let since_unix = store
+                .refusal_streak(scope)?
+                .map_or(newest.created_unix, |streak| streak.since_unix);
+            Some(Blocked {
+                since_unix,
+                detail: newest.detail,
+            })
+        }
+        _ => None,
+    };
+    Ok(DispatchState {
+        last_launch_unix,
+        blocked,
+    })
 }
 
 /// Why the run store says a ticket is already in hand, so a tick leaves it
@@ -541,6 +662,16 @@ mod tests {
     use crate::runs::{FinishRun, StartRun, UsageSnapshotRow};
     use crate::work::auto_review::ROUND_EVENT;
     use tempfile::{TempDir, tempdir};
+
+    /// Records every notification a tick sends.
+    #[derive(Default)]
+    struct Recorder(RefCell<Vec<String>>);
+
+    impl Notifier for Recorder {
+        fn notify(&self, title: &str, _body: &str) {
+            self.0.borrow_mut().push(title.to_string());
+        }
+    }
 
     const SCOPE: &str = "github:o/r";
     const NOW: i64 = 1_000_000;
@@ -615,6 +746,11 @@ mod tests {
         max_lanes: usize,
         agent: Option<&'static str>,
         pressure: MemoryPressure,
+        max_launches_per_day: usize,
+        now: i64,
+        max_fix_rounds: u32,
+        stall_notify_mins: u64,
+        notifier: Recorder,
     }
 
     impl Fixture {
@@ -634,6 +770,11 @@ mod tests {
                 max_lanes: 5,
                 agent: Some("claude"),
                 pressure: MemoryPressure::Normal,
+                max_launches_per_day: 20,
+                now: NOW,
+                max_fix_rounds: 3,
+                stall_notify_mins: 30,
+                notifier: Recorder::default(),
             }
         }
 
@@ -655,11 +796,15 @@ mod tests {
                 launcher,
                 memory_pressure: &pressure_fn,
                 usage_prober: &NoProbe,
-                now: NOW,
+                now: self.now,
+                notifier: &self.notifier,
             };
             let cfg = TickConfig {
                 scope: SCOPE,
                 max_lanes: self.max_lanes,
+                max_launches_per_day: self.max_launches_per_day,
+                max_fix_rounds: self.max_fix_rounds,
+                stall_notify_mins: self.stall_notify_mins,
                 lanes: &self.lanes,
                 agent: self.agent,
                 memory: &self.memory,
@@ -774,18 +919,26 @@ mod tests {
 
         fx.tick(&[], &launcher);
 
-        // Another test thread that forks a child while the tick's lock file
-        // is open hands the child a copy of the descriptor, and with it the
-        // `flock`, until the child execs and close-on-exec drops it. So
-        // retry briefly instead of failing on that window.
-        let released = (0..100).any(|_| {
-            let taken = fx.lock().try_lock(SCOPE).unwrap().is_some();
-            if !taken {
+        assert!(
+            take_lock(&fx).is_some(),
+            "the scope lock is still held after the tick"
+        );
+    }
+
+    /// Takes the fixture's scope lock, retrying for up to a second.
+    ///
+    /// Another test thread that forks a child while a tick's lock file is
+    /// open hands the child a copy of the descriptor, and with it the
+    /// `flock`, until the child execs and close-on-exec drops it. So retry
+    /// briefly instead of failing on that window.
+    fn take_lock(fx: &Fixture) -> Option<ScopeGuard> {
+        (0..100).find_map(|_| {
+            let guard = fx.lock().try_lock(SCOPE).unwrap();
+            if guard.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            taken
-        });
-        assert!(released, "the scope lock is still held after the tick");
+            guard
+        })
     }
 
     #[test]
@@ -807,6 +960,62 @@ mod tests {
         assert_eq!(report.skipped, Some(Skip::Disabled));
         assert!(launcher.tickets().is_empty());
         assert!(fx.events().is_empty());
+    }
+
+    /// GH-9 opened a PR and its watch finished clean: awaiting review.
+    fn awaiting_review(store: &RunStore) {
+        let lane = start(store, "GH-9", "lane");
+        finish(store, lane, RunStatus::Done, Some("https://gh/pr/9"));
+        let watch = start(store, "GH-9", "review-watch");
+        finish(store, watch, RunStatus::Done, None);
+    }
+
+    #[test]
+    fn awaiting_review_notifies_once_across_ticks() {
+        let fx = Fixture::new();
+        awaiting_review(&fx.store);
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let first = fx.tick(&[], &launcher);
+        let second = fx.tick(&[], &launcher);
+
+        assert_eq!(first.notified, vec!["tm: GH-9 is awaiting your review"]);
+        assert!(second.notified.is_empty());
+        assert_eq!(*fx.notifier.0.borrow(), first.notified);
+    }
+
+    #[test]
+    fn a_disabled_scope_sends_no_notifications() {
+        let fx = Fixture::new();
+        fx.store.set_autopilot(SCOPE, false).unwrap();
+        awaiting_review(&fx.store);
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[], &launcher);
+
+        assert!(fx.notifier.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_stall_notifies_once_after_stall_notify_mins() {
+        let mut fx = Fixture::new();
+        fx.max_lanes = 0;
+        fx.now = unix_now();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let first = fx.tick(&[ready("GH-1", 0)], &launcher);
+        fx.now += 31 * 60;
+        let late = fx.tick(&[ready("GH-1", 0)], &launcher);
+        let later = fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        assert!(first.notified.is_empty(), "not stalled long enough yet");
+        assert_eq!(late.notified.len(), 1);
+        assert!(
+            late.notified[0].starts_with("tm autopilot stalled for 31 min"),
+            "{:?}",
+            late.notified
+        );
+        assert!(later.notified.is_empty(), "one stall notifies once");
     }
 
     fn last_tick_at(store: &RunStore) -> Option<String> {
@@ -834,7 +1043,7 @@ mod tests {
         let launcher = FakeLauncher::new(&fx.store);
         fx.store.set_autopilot(SCOPE, false).unwrap();
         fx.tick(&[], &launcher);
-        let _held = fx.lock().try_lock(SCOPE).unwrap().unwrap();
+        let _held = take_lock(&fx).unwrap();
         fx.store.set_autopilot(SCOPE, true).unwrap();
         fx.tick(&[], &launcher);
 
@@ -933,6 +1142,68 @@ mod tests {
                 "not launching: 2 lanes running, [dispatch] max_lanes is 2".to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_refusal_event_carries_its_reason_code() {
+        let mut fx = Fixture::new();
+        fx.max_lanes = 0;
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        let event = fx.store.dispatch_events(SCOPE, 1).unwrap().remove(0);
+        assert_eq!(event.reason.as_deref(), Some("max_lanes"));
+    }
+
+    #[test]
+    fn the_daily_launch_cap_refuses_with_its_own_reason() {
+        let mut fx = Fixture::new();
+        fx.max_launches_per_day = 2;
+        fx.now = unix_now();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(
+            &[ready("GH-1", 0), ready("GH-2", 0), ready("GH-3", 0)],
+            &launcher,
+        );
+
+        assert_eq!(launcher.tickets(), vec!["GH-1", "GH-2"]);
+        assert_eq!(
+            report.refused,
+            Some(Refusal::DailyCap {
+                launched: 2,
+                max: 2
+            })
+        );
+        let event = fx.store.dispatch_events(SCOPE, 1).unwrap().remove(0);
+        assert_eq!(event.reason.as_deref(), Some("daily_cap"));
+        assert_eq!(
+            event.detail,
+            "not launching: 2 lanes launched in the last 24h, [dispatch] max_launches_per_day is 2"
+        );
+    }
+
+    #[test]
+    fn launches_older_than_a_day_leave_the_daily_cap() {
+        let mut fx = Fixture::new();
+        fx.max_launches_per_day = 1;
+        fx.now = unix_now();
+        let launcher = FakeLauncher::new(&fx.store);
+        fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        fx.now += 24 * 60 * 60 + 60;
+        let report = fx.tick(&[ready("GH-2", 0)], &launcher);
+
+        assert_eq!(launcher.tickets(), vec!["GH-1", "GH-2"]);
+        assert_eq!(report.refused, None);
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     #[test]
@@ -1094,6 +1365,47 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn dispatch_state_reads_the_last_launch_and_the_current_block() {
+        let fx = Fixture::new();
+        assert_eq!(
+            dispatch_state(&fx.store, SCOPE).unwrap(),
+            DispatchState::default()
+        );
+
+        fx.store
+            .record_dispatch_event(SCOPE, Some("GH-1"), LAUNCH_EVENT, "lane backend")
+            .unwrap();
+        let state = dispatch_state(&fx.store, SCOPE).unwrap();
+        let launched_at = state.last_launch_unix.expect("a launch");
+        assert!(launched_at > NOW, "real wall-clock time");
+        assert_eq!(state.blocked, None, "the newest event is a launch");
+
+        fx.store
+            .record_dispatch_refusal(SCOPE, None, "max_lanes", "max lanes 1")
+            .unwrap();
+        fx.store
+            .record_dispatch_refusal(SCOPE, None, "max_lanes", "max lanes 2")
+            .unwrap();
+        let state = dispatch_state(&fx.store, SCOPE).unwrap();
+        assert_eq!(state.last_launch_unix, Some(launched_at));
+        let blocked = state.blocked.expect("blocked");
+        assert_eq!(blocked.detail, "max lanes 2");
+        assert!(blocked.since_unix >= launched_at);
+    }
+
+    #[test]
+    fn a_refusal_without_a_reason_code_still_blocks() {
+        let fx = Fixture::new();
+        fx.store
+            .record_dispatch_event(SCOPE, None, REFUSED_EVENT, "old refusal")
+            .unwrap();
+
+        let blocked = dispatch_state(&fx.store, SCOPE).unwrap().blocked.unwrap();
+
+        assert_eq!(blocked.detail, "old refusal");
     }
 
     #[test]

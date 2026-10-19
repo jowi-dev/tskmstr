@@ -255,6 +255,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE autopilot ADD COLUMN repo_dir TEXT;
     ALTER TABLE autopilot ADD COLUMN last_tick_at TEXT;
     "#,
+    // GitHub issue #121: autopilot guardrails and notifications. `reason`
+    // is a refusal's stable code (`max_lanes`, `memory`, ...), so a stall
+    // can tell "refused for the same reason" apart from a refusal whose
+    // detail text changed; NULL on launches and older rows.
+    // `notifications` holds, per scope, ticket ('' for scope-wide) and
+    // reason, the key of the last transition a desktop notification went
+    // out for, so each transition notifies once however many ticks see it.
+    r#"
+    ALTER TABLE dispatch_events ADD COLUMN reason TEXT;
+    CREATE TABLE notifications (
+      scope   TEXT NOT NULL,
+      ticket  TEXT NOT NULL,
+      reason  TEXT NOT NULL,
+      key     TEXT NOT NULL,
+      sent_at TEXT NOT NULL,
+      PRIMARY KEY (scope, ticket, reason)
+    );
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -456,8 +474,47 @@ pub struct DispatchEvent {
     pub kind: String,
     /// Human-readable detail, e.g. the lane launched or the refusal reason.
     pub detail: String,
+    /// A refusal's stable reason code (GitHub issue #121), from
+    /// [`RunStore::record_dispatch_refusal`]. `None` on launches and on
+    /// rows written before the code was recorded.
+    pub reason: Option<String>,
     /// When the row was written, as [`NOW_SQL`] renders it.
     pub created_at: String,
+    /// `created_at` in unix seconds.
+    pub created_unix: i64,
+}
+
+/// The `dispatch_events` columns [`dispatch_event_from_row`] reads, in order.
+const DISPATCH_EVENT_COLUMNS: &str = "id, scope, ticket, kind, detail, reason, created_at, \
+     CAST(strftime('%s', created_at) AS INTEGER)";
+
+fn dispatch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchEvent> {
+    Ok(DispatchEvent {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        ticket: row.get(2)?,
+        kind: row.get(3)?,
+        detail: row.get(4)?,
+        reason: row.get(5)?,
+        created_at: row.get(6)?,
+        created_unix: row.get(7)?,
+    })
+}
+
+/// The run of consecutive refusals with one reason that a scope's newest
+/// dispatch event belongs to (GitHub issue #121). See
+/// [`RunStore::refusal_streak`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalStreak {
+    /// The refusals' shared reason code.
+    pub reason: String,
+    /// The id of the streak's first refusal. A new streak has a new id, so
+    /// it doubles as a notification key.
+    pub first_id: i64,
+    /// When the first refusal was written, in unix seconds.
+    pub since_unix: i64,
+    /// The newest refusal's detail.
+    pub detail: String,
 }
 
 /// One `autopilot` row (GitHub issues #115, #117): a scope's dispatcher
@@ -3410,20 +3467,11 @@ impl RunStore {
         scope: &str,
         limit: usize,
     ) -> Result<Vec<DispatchEvent>, RunStoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, scope, ticket, kind, detail, created_at FROM dispatch_events
-              WHERE scope = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![scope, limit as i64], |row| {
-            Ok(DispatchEvent {
-                id: row.get(0)?,
-                scope: row.get(1)?,
-                ticket: row.get(2)?,
-                kind: row.get(3)?,
-                detail: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DISPATCH_EVENT_COLUMNS} FROM dispatch_events
+                  WHERE scope = ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![scope, limit as i64], dispatch_event_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(RunStoreError::from)
     }
@@ -3438,21 +3486,102 @@ impl RunStore {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, scope, ticket, kind, detail, created_at FROM dispatch_events
-                  WHERE scope = ?1 AND kind = ?2 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT {DISPATCH_EVENT_COLUMNS} FROM dispatch_events
+                      WHERE scope = ?1 AND kind = ?2 ORDER BY id DESC LIMIT 1"
+                ),
                 params![scope, kind],
-                |row| {
-                    Ok(DispatchEvent {
-                        id: row.get(0)?,
-                        scope: row.get(1)?,
-                        ticket: row.get(2)?,
-                        kind: row.get(3)?,
-                        detail: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                },
+                dispatch_event_from_row,
             )
             .optional()?)
+    }
+
+    /// Appends one `refused` `dispatch_events` row for `scope` with its
+    /// stable `reason` code (GitHub issue #121), which
+    /// [`RunStore::refusal_streak`] groups by.
+    pub fn record_dispatch_refusal(
+        &self,
+        scope: &str,
+        ticket: Option<&str>,
+        reason: &str,
+        detail: &str,
+    ) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO dispatch_events (scope, ticket, kind, detail, reason, created_at)
+                 VALUES (?1, ?2, 'refused', ?3, ?4, {NOW_SQL})"
+            ),
+            params![scope, ticket, detail, reason],
+        )?;
+        Ok(())
+    }
+
+    /// How many `launch` events `scope` recorded at or after `since` (unix
+    /// seconds), for the daily launch cap (GitHub issue #121).
+    pub fn dispatch_launches_since(&self, scope: &str, since: i64) -> Result<usize, RunStoreError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dispatch_events
+              WHERE scope = ?1 AND kind = 'launch'
+                AND CAST(strftime('%s', created_at) AS INTEGER) >= ?2",
+            params![scope, since],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// The streak of refusals `scope`'s newest dispatch event belongs to
+    /// (GitHub issue #121): the refusals since the newest launch, or since
+    /// the newest refusal with a different (or no) reason code. `None` when
+    /// the newest event is not a coded refusal. A tick with nothing to
+    /// launch writes no event, so it neither extends nor ends a streak.
+    pub fn refusal_streak(&self, scope: &str) -> Result<Option<RefusalStreak>, RunStoreError> {
+        let Some(newest) = self.dispatch_events(scope, 1)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(reason) = newest.reason.filter(|_| newest.kind == "refused") else {
+            return Ok(None);
+        };
+        let (first_id, since_unix) = self.conn.query_row(
+            "SELECT id, CAST(strftime('%s', created_at) AS INTEGER) FROM dispatch_events
+              WHERE scope = ?1
+                AND id > COALESCE((SELECT MAX(id) FROM dispatch_events
+                                    WHERE scope = ?1
+                                      AND (kind != 'refused' OR reason IS NOT ?2)), 0)
+              ORDER BY id LIMIT 1",
+            params![scope, reason],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(Some(RefusalStreak {
+            reason,
+            first_id,
+            since_unix,
+            detail: newest.detail,
+        }))
+    }
+
+    /// Records that a notification for `scope`, `ticket` ('' for a
+    /// scope-wide one) and `reason` went out for the transition `key`
+    /// (GitHub issue #121). Returns `true` when `key` differs from the last
+    /// one recorded, so the caller should send it, and `false` when this
+    /// transition was already notified.
+    pub fn claim_notification(
+        &self,
+        scope: &str,
+        ticket: &str,
+        reason: &str,
+        key: &str,
+    ) -> Result<bool, RunStoreError> {
+        let changed = self.conn.execute(
+            &format!(
+                "INSERT INTO notifications (scope, ticket, reason, key, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, {NOW_SQL})
+                 ON CONFLICT(scope, ticket, reason) DO UPDATE
+                   SET key = excluded.key, sent_at = excluded.sent_at
+                   WHERE notifications.key != excluded.key"
+            ),
+            params![scope, ticket, reason, key],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Sums the input and output tokens recorded in `model_usage` across
@@ -3724,7 +3853,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_18() {
+    fn open_migrates_a_fresh_db_to_user_version_19() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -3732,7 +3861,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -7087,6 +7216,162 @@ mod tests {
             ]
         );
         assert_eq!(store.dispatch_events("s", 1).unwrap().len(), 1);
+    }
+
+    // --- autopilot guardrails and notifications (GitHub issue #121) ---
+
+    /// Moves `scope`'s dispatch event `id` to unix second `at`.
+    fn backdate_dispatch_event(store: &RunStore, id: i64, at: i64) {
+        store
+            .conn
+            .execute(
+                "UPDATE dispatch_events
+                    SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?2, 'unixepoch')
+                  WHERE id = ?1",
+                params![id, at],
+            )
+            .unwrap();
+    }
+
+    fn newest_event_id(store: &RunStore, scope: &str) -> i64 {
+        store.dispatch_events(scope, 1).unwrap()[0].id
+    }
+
+    #[test]
+    fn a_dispatch_refusal_records_its_reason_code() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .record_dispatch_refusal("s", Some("GH-1"), "max_lanes", "max lanes")
+            .unwrap();
+        store
+            .record_dispatch_event("s", Some("GH-2"), "launch", "lane backend")
+            .unwrap();
+
+        let events = store.dispatch_events("s", 10).unwrap();
+        assert_eq!(events[0].reason, None);
+        assert_eq!(events[1].kind, "refused");
+        assert_eq!(events[1].reason.as_deref(), Some("max_lanes"));
+        assert_eq!(events[1].detail, "max lanes");
+    }
+
+    #[test]
+    fn a_dispatch_event_carries_its_unix_time() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .record_dispatch_event("s", None, "launch", "lane backend")
+            .unwrap();
+        backdate_dispatch_event(&store, newest_event_id(&store, "s"), 1_000_000);
+
+        assert_eq!(
+            store.dispatch_events("s", 1).unwrap()[0].created_unix,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn launches_since_counts_only_this_scopes_launches_in_the_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        for _ in 0..3 {
+            store
+                .record_dispatch_event("s", Some("GH-1"), "launch", "lane backend")
+                .unwrap();
+        }
+        backdate_dispatch_event(&store, newest_event_id(&store, "s") - 2, 1_000);
+        store
+            .record_dispatch_refusal("s", None, "max_lanes", "max lanes")
+            .unwrap();
+        store
+            .record_dispatch_event("other", Some("GH-9"), "launch", "lane x")
+            .unwrap();
+
+        assert_eq!(store.dispatch_launches_since("s", 2_000).unwrap(), 2);
+        assert_eq!(store.dispatch_launches_since("s", 0).unwrap(), 3);
+    }
+
+    #[test]
+    fn the_refusal_streak_runs_back_to_a_launch_or_another_reason() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        assert_eq!(store.refusal_streak("s").unwrap(), None);
+
+        store
+            .record_dispatch_refusal("s", None, "memory", "memory")
+            .unwrap();
+        store
+            .record_dispatch_event("s", Some("GH-1"), "launch", "lane backend")
+            .unwrap();
+        assert_eq!(store.refusal_streak("s").unwrap(), None, "a launch ends it");
+
+        store
+            .record_dispatch_refusal("s", None, "usage", "usage 1")
+            .unwrap();
+        store
+            .record_dispatch_refusal("s", None, "max_lanes", "max lanes 1")
+            .unwrap();
+        let first = newest_event_id(&store, "s");
+        backdate_dispatch_event(&store, first, 5_000);
+        store
+            .record_dispatch_refusal("s", None, "max_lanes", "max lanes 2")
+            .unwrap();
+        store
+            .record_dispatch_refusal("other", None, "usage", "usage")
+            .unwrap();
+
+        let streak = store.refusal_streak("s").unwrap().unwrap();
+        assert_eq!(streak.reason, "max_lanes");
+        assert_eq!(streak.first_id, first);
+        assert_eq!(streak.since_unix, 5_000);
+        assert_eq!(streak.detail, "max lanes 2", "the newest refusal's detail");
+    }
+
+    #[test]
+    fn a_notification_is_claimed_once_per_key() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert!(
+            store
+                .claim_notification("s", "GH-1", "awaiting_review", "7")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_notification("s", "GH-1", "awaiting_review", "7")
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_notification("s", "GH-1", "fix_cap", "7")
+                .unwrap(),
+            "another reason"
+        );
+        assert!(
+            store
+                .claim_notification("s", "GH-2", "awaiting_review", "7")
+                .unwrap(),
+            "another ticket"
+        );
+        assert!(
+            store
+                .claim_notification("t", "GH-1", "awaiting_review", "7")
+                .unwrap(),
+            "another scope"
+        );
+        assert!(
+            store
+                .claim_notification("s", "GH-1", "awaiting_review", "9")
+                .unwrap(),
+            "a new transition"
+        );
+        assert!(
+            !store
+                .claim_notification("s", "GH-1", "awaiting_review", "9")
+                .unwrap()
+        );
     }
 
     // --- autopilot registry for `tm dispatch` (GitHub issue #117) ---
