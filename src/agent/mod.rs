@@ -110,6 +110,14 @@ pub(crate) const SUBAGENT_MODEL_PLACEHOLDER: &str = "TODO-set-the-subagent-model
 /// which agent it drives.
 pub const TSKMSTR_RUN_ID: &str = "TSKMSTR_RUN_ID";
 
+/// Environment variable naming the lane's delegation subagent (the lane
+/// config's `subagent` key), exported on lane runs whose lane sets it. The
+/// lane guard hook (`hooks/guard-delegate.sh`) reads it to tell the main
+/// loop which scaffolded agent to delegate edits to, so no model name is
+/// baked into the hook (GitHub issue #144). Unset when the lane names no
+/// subagent.
+pub const TSKMSTR_SUBAGENT: &str = "TSKMSTR_SUBAGENT";
+
 /// Environment variable naming the pre-registered run row an *interactive*
 /// session should adopt, read by
 /// [`crate::runs::session::register_session`]. The same variable

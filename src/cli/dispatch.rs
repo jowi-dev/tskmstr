@@ -988,6 +988,7 @@ mod tests {
             model: None,
             max_turns: None,
             permission_mode: None,
+            subagent: None,
         }
     }
 

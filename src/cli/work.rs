@@ -1215,6 +1215,7 @@ mod tests {
                 model: None,
                 max_turns: None,
                 permission_mode: None,
+                subagent: None,
             },
         );
         let config = config_with_lanes(lanes);
@@ -2536,6 +2537,7 @@ mod tests {
             model: None,
             max_turns: None,
             permission_mode: None,
+            subagent: None,
         }
     }
 
