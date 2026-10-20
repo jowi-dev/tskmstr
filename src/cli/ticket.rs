@@ -939,6 +939,7 @@ mod tests {
             agent_fallbacks: Vec::new(),
             require_audit: true,
             usage: Default::default(),
+            models: Default::default(),
             dispatch: Default::default(),
             review: Default::default(),
         }

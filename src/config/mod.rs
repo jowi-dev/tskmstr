@@ -288,20 +288,25 @@ pub struct RawAgentConfig {
     /// `strategy = "priority"` is [`ConfigError::OrderRequiresPriorityStrategy`]
     /// — the key must not be silently inert.
     pub order: Option<Vec<String>>,
-    /// `[agent.claude]`: usage-admission settings for the claude runner.
-    /// See [`RawRunnerUsageConfig`] and GitHub issue #114. Independent of
-    /// the routing mode above: setting only these keys selects no mode.
-    pub claude: Option<RawRunnerUsageConfig>,
-    /// `[agent.opencode]`: usage-admission settings for the opencode
-    /// runner. See [`RawRunnerUsageConfig`].
-    pub opencode: Option<RawRunnerUsageConfig>,
+    /// `[agent.claude]`: per-runner settings for the claude runner. See
+    /// [`RawRunnerConfig`]. Independent of the routing mode above: setting
+    /// only these keys selects no mode.
+    pub claude: Option<RawRunnerConfig>,
+    /// `[agent.opencode]`: per-runner settings for the opencode runner. See
+    /// [`RawRunnerConfig`].
+    pub opencode: Option<RawRunnerConfig>,
 }
 
-/// Raw `[agent.<runner>]` usage-admission settings (GitHub issue #114).
-/// Each key merges repo-over-global on its own. See [`RunnerUsageConfig`]
-/// for what each one means once validated.
+/// Raw `[agent.<runner>]` settings: usage admission (GitHub issue #114) and
+/// the runner's models (GitHub issue #143). Each key merges repo-over-global
+/// on its own. See [`RunnerUsageConfig`] and [`RunnerModels`] for what each
+/// one means once validated.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct RawRunnerUsageConfig {
+pub struct RawRunnerConfig {
+    /// See [`RunnerModels::default_model`].
+    pub default_model: Option<String>,
+    /// See [`RunnerModels::usage_probe_model`].
+    pub usage_probe_model: Option<String>,
     /// See [`RunnerUsageConfig::five_hour_ceiling`].
     pub five_hour_ceiling: Option<f64>,
     /// See [`RunnerUsageConfig::seven_day_ceiling`].
@@ -389,6 +394,24 @@ impl AgentKind {
         &["claude", "opencode"]
     }
 
+    /// The models tm launches on this runner when nothing in config names
+    /// one. This is the only place a launch model is written into the
+    /// source: every launch resolves through
+    /// `crate::work::model::resolve_model`, which ends here (GitHub issue
+    /// #143).
+    pub fn builtin_models(self) -> BuiltinModels {
+        match self {
+            AgentKind::Claude => BuiltinModels {
+                default_model: "opus",
+                usage_probe_model: Some("haiku"),
+            },
+            AgentKind::Opencode => BuiltinModels {
+                default_model: "venice/z-ai-glm-5-3-flash",
+                usage_probe_model: None,
+            },
+        }
+    }
+
     /// How this runner is paid for unless `[agent.<runner>] billing` says
     /// otherwise: claude rides a subscription, and opencode is
     /// pay-per-token (ADR-0008's Venice fallback).
@@ -398,6 +421,16 @@ impl AgentKind {
             AgentKind::Opencode => Billing::Metered,
         }
     }
+}
+
+/// One runner's built-in models. See [`AgentKind::builtin_models`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinModels {
+    /// The model every launch on this runner falls back to last.
+    pub default_model: &'static str,
+    /// The model the usage probe runs, or `None` for a runner with no
+    /// probe (`crate::agent::AgentRunner::usage_probe_invocation`).
+    pub usage_probe_model: Option<&'static str>,
 }
 
 /// Default for [`RawWorkConfig::idle_hibernate_mins`]: two hours. Generous
@@ -843,6 +876,9 @@ pub struct Config {
     /// Validated `[agent.<runner>]` usage-admission settings. See
     /// [`UsageConfig`] and GitHub issue #114.
     pub usage: UsageConfig,
+    /// Validated `[agent.<runner>]` model settings. See [`ModelsConfig`]
+    /// and GitHub issue #143.
+    pub models: ModelsConfig,
     /// Validated `[dispatch]` settings. See [`DispatchConfig`].
     pub dispatch: DispatchConfig,
     /// Validated `[review]` settings. See [`ReviewConfig`].
@@ -908,7 +944,7 @@ pub const DEFAULT_FIVE_HOUR_CEILING: f64 = 0.80;
 pub const DEFAULT_SEVEN_DAY_CEILING: f64 = 0.90;
 /// Default for [`RunnerUsageConfig::snapshot_max_age_secs`]: ten minutes.
 pub const DEFAULT_SNAPSHOT_MAX_AGE_SECS: u64 = 600;
-/// Default for [`RawRunnerUsageConfig::token_budget_window_hours`].
+/// Default for [`RawRunnerConfig::token_budget_window_hours`].
 pub const DEFAULT_TOKEN_BUDGET_WINDOW_HOURS: u64 = 5;
 
 /// One runner's validated usage-admission settings (GitHub issue #114).
@@ -983,6 +1019,41 @@ impl UsageConfig {
     /// `None` for a name no [`AgentKind`] parses.
     pub fn for_agent(&self, name: &str) -> Option<&RunnerUsageConfig> {
         AgentKind::parse(name).map(|kind| self.for_kind(kind))
+    }
+}
+
+/// One runner's configured models (GitHub issue #143), from
+/// `[agent.<runner>]`. Either may be unset; the built-in defaults
+/// ([`AgentKind::builtin_models`]) are applied when a launch resolves its
+/// model, not here, so `tm check` can tell configured from built-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunnerModels {
+    /// `[agent.<runner>] default_model`: the model a launch on this runner
+    /// uses when nothing more specific (`--model`, the surface's own
+    /// `model` key, `[work] default_model`) names one the runner accepts.
+    pub default_model: Option<String>,
+    /// `[agent.<runner>] usage_probe_model`: the model of the one-turn
+    /// usage probe (GitHub issue #114). Only legal on a runner with a
+    /// probe; see [`ConfigError::UsageProbeModelUnsupported`].
+    pub usage_probe_model: Option<String>,
+}
+
+/// Configured models for every runner. See [`RunnerModels`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelsConfig {
+    /// `[agent.claude]`.
+    pub claude: RunnerModels,
+    /// `[agent.opencode]`.
+    pub opencode: RunnerModels,
+}
+
+impl ModelsConfig {
+    /// The models configured for `kind`.
+    pub fn for_kind(&self, kind: AgentKind) -> &RunnerModels {
+        match kind {
+            AgentKind::Claude => &self.claude,
+            AgentKind::Opencode => &self.opencode,
+        }
     }
 }
 
@@ -1531,6 +1602,15 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// `[agent.<runner>] usage_probe_model` was set for a runner that has
+    /// no usage probe, so the key would never take effect (GitHub issue
+    /// #143).
+    #[error("[agent.{runner}] usage_probe_model is set, but {runner} has no usage probe")]
+    UsageProbeModelUnsupported {
+        /// The runner whose table set the key.
+        runner: &'static str,
+    },
+
     /// An `[agent.<runner>] billing` value was not recognized (GitHub issue
     /// #114).
     #[error("invalid [agent] billing `{value}`; expected \"subscription\" or \"metered\"")]
@@ -1903,6 +1983,7 @@ fn merge_with_repo_dir(
         .unwrap_or(true);
     let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
     let usage = merge_usage(global.agent.as_ref(), repo.agent.as_ref())?;
+    let models = merge_models(global.agent.as_ref(), repo.agent.as_ref())?;
     let dispatch = DispatchConfig {
         allow_paid_fallback: repo
             .dispatch
@@ -1984,6 +2065,7 @@ fn merge_with_repo_dir(
             agent_fallbacks,
             require_audit,
             usage,
+            models,
             dispatch,
             review,
         }),
@@ -2025,6 +2107,7 @@ fn merge_with_repo_dir(
                 agent_fallbacks,
                 require_audit,
                 usage,
+                models,
                 dispatch,
                 review,
             })
@@ -2091,6 +2174,39 @@ fn merge_usage(
         })
     };
     Ok(UsageConfig {
+        claude: merge_one(AgentKind::Claude)?,
+        opencode: merge_one(AgentKind::Opencode)?,
+    })
+}
+
+/// Merges `[agent.<runner>]` model keys key by key, repo over global
+/// (GitHub issue #143).
+fn merge_models(
+    global: Option<&RawAgentConfig>,
+    repo: Option<&RawAgentConfig>,
+) -> Result<ModelsConfig, ConfigError> {
+    let pick = |kind: AgentKind, raw: Option<&RawAgentConfig>| {
+        raw.and_then(|agent| match kind {
+            AgentKind::Claude => agent.claude.clone(),
+            AgentKind::Opencode => agent.opencode.clone(),
+        })
+        .unwrap_or_default()
+    };
+    let merge_one = |kind: AgentKind| -> Result<RunnerModels, ConfigError> {
+        let global = pick(kind, global);
+        let repo = pick(kind, repo);
+        let usage_probe_model = repo.usage_probe_model.or(global.usage_probe_model);
+        if usage_probe_model.is_some() && kind.builtin_models().usage_probe_model.is_none() {
+            return Err(ConfigError::UsageProbeModelUnsupported {
+                runner: kind.as_str(),
+            });
+        }
+        Ok(RunnerModels {
+            default_model: repo.default_model.or(global.default_model),
+            usage_probe_model,
+        })
+    };
+    Ok(ModelsConfig {
         claude: merge_one(AgentKind::Claude)?,
         opencode: merge_one(AgentKind::Opencode)?,
     })
@@ -6348,6 +6464,62 @@ mod tests {
                     ..
                 }
             ),
+            "{err:?}"
+        );
+    }
+
+    // --- per-runner models (GitHub issue #143) ---
+
+    #[test]
+    fn builtin_models_are_one_default_per_runner_plus_the_claude_probe() {
+        let claude = AgentKind::Claude.builtin_models();
+        assert_eq!(claude.default_model, "opus");
+        assert_eq!(claude.usage_probe_model, Some("haiku"));
+
+        let opencode = AgentKind::Opencode.builtin_models();
+        assert_eq!(opencode.default_model, "venice/z-ai-glm-5-3-flash");
+        assert_eq!(opencode.usage_probe_model, None);
+    }
+
+    #[test]
+    fn runner_models_are_unset_when_no_agent_table_sets_them() {
+        let cfg = load_with("", None).expect("should load");
+
+        assert_eq!(cfg.models.for_kind(AgentKind::Claude), &RunnerModels::default());
+        assert_eq!(cfg.models.for_kind(AgentKind::Opencode), &RunnerModels::default());
+    }
+
+    #[test]
+    fn runner_models_merge_key_by_key_repo_over_global() {
+        let cfg = load_with(
+            "[agent.claude]\n\
+             default_model = \"sonnet\"\n\
+             usage_probe_model = \"haiku-global\"\n\
+             [agent.opencode]\n\
+             default_model = \"venice/global\"\n",
+            Some("[agent.claude]\ndefault_model = \"opus\"\n"),
+        )
+        .expect("should load");
+
+        let claude = cfg.models.for_kind(AgentKind::Claude);
+        assert_eq!(claude.default_model.as_deref(), Some("opus"), "repo wins");
+        assert_eq!(
+            claude.usage_probe_model.as_deref(),
+            Some("haiku-global"),
+            "global kept"
+        );
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Opencode).default_model.as_deref(),
+            Some("venice/global")
+        );
+    }
+
+    #[test]
+    fn a_usage_probe_model_on_a_runner_without_a_probe_is_a_config_error() {
+        let err = load_with("[agent.opencode]\nusage_probe_model = \"venice/x\"\n", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UsageProbeModelUnsupported { runner: "opencode" }),
             "{err:?}"
         );
     }
