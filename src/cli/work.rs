@@ -716,6 +716,7 @@ pub fn supervise(
     state: &crate::work::detach::SupervisorState,
     runner: &dyn AgentRunner,
     watch_armer: Option<&dyn crate::work::run::WatchArmer>,
+    review_starter: Option<&dyn crate::work::run::AutoReviewStarter>,
     out: &mut dyn Write,
 ) -> Result<bool, WorkCliError> {
     let outcome = crate::work::run::supervise_run(
@@ -727,6 +728,7 @@ pub fn supervise(
         std::process::id(),
         runner,
         watch_armer,
+        review_starter,
         out,
     )?;
     Ok(!outcome.is_error)
@@ -3657,6 +3659,7 @@ mod tests {
             None,
             &state,
             &ClaudeRunner,
+            None,
             None,
             &mut out,
         )

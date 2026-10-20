@@ -18,7 +18,7 @@ use crate::work::git::{GitError, GitOps};
 use crate::work::review_watch::{
     self, AutoReviewLauncher, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper,
 };
-use crate::work::run::WatchArmer;
+use crate::work::run::{AutoReviewStarter, WatchArmer};
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
 #[derive(Debug, Error)]
@@ -394,25 +394,66 @@ pub struct DetachedAutoReviewLauncher<'a> {
 
 impl AutoReviewLauncher for DetachedAutoReviewLauncher<'_> {
     fn launch_auto_review(&self, key: &str) {
-        let log_path = crate::cli::review::auto_review_log_path(self.home, key);
-        let spawned = log_path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .map_err(|e| e.to_string())
-            .and_then(|()| {
-                self.detach
-                    .spawn_detached(
-                        self.current_exe,
-                        &["review".to_string(), "auto".to_string(), key.to_string()],
-                        self.working_dir,
-                        &log_path,
-                    )
-                    .map_err(|e| e.to_string())
-            });
+        let spawned = spawn_auto_review(
+            self.detach,
+            self.current_exe,
+            self.home,
+            key,
+            self.working_dir,
+        );
         if let Err(err) = spawned {
             eprintln!("tm pr watch: could not launch tm review auto {key}: {err}");
         }
     }
+}
+
+/// [`AutoReviewStarter`] the lane supervisor uses under autopilot (GitHub
+/// issue #145): the same detached `tm review auto <KEY>` as
+/// [`DetachedAutoReviewLauncher`], run from the lane's worktree.
+pub struct DetachedAutoReviewStarter<'a> {
+    /// Detached-child process spawning (real or fake).
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path, i.e. `tm`.
+    pub current_exe: &'a Path,
+    /// The invoking user's home directory, for the log file location.
+    pub home: &'a Path,
+}
+
+impl AutoReviewStarter for DetachedAutoReviewStarter<'_> {
+    fn start(&self, ticket: &str, working_dir: &Path) -> Result<(), String> {
+        spawn_auto_review(
+            self.detach,
+            self.current_exe,
+            self.home,
+            ticket,
+            working_dir,
+        )
+    }
+}
+
+/// Spawns a detached `tm review auto <key>` in `working_dir`, logging to
+/// the ticket's auto-review log.
+fn spawn_auto_review(
+    detach: &dyn DetachSpawner,
+    current_exe: &Path,
+    home: &Path,
+    key: &str,
+    working_dir: &Path,
+) -> Result<(), String> {
+    let log_path = crate::cli::review::auto_review_log_path(home, key);
+    log_path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .map_err(|e| e.to_string())?;
+    detach
+        .spawn_detached(
+            current_exe,
+            &["review".to_string(), "auto".to_string(), key.to_string()],
+            working_dir,
+            &log_path,
+        )
+        .map(|_pid| ())
+        .map_err(|e| e.to_string())
 }
 
 /// `tm pr watch <KEY> [--foreground]`: resolve `KEY`'s open pull request,
@@ -1570,6 +1611,34 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
         assert_eq!(recorded[0].working_dir, PathBuf::from("/repo"));
+        assert_eq!(
+            recorded[0].log_path,
+            crate::cli::review::auto_review_log_path(tmp.path(), "PROJ-372")
+        );
+    }
+
+    #[test]
+    fn detached_auto_review_starter_spawns_tm_review_auto_in_the_worktree() {
+        let tmp = tempdir().unwrap();
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let starter = DetachedAutoReviewStarter {
+            detach: &detach,
+            current_exe: &current_exe,
+            home: tmp.path(),
+        };
+
+        starter
+            .start("PROJ-372", Path::new("/worktrees/proj-372"))
+            .unwrap();
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
+        assert_eq!(
+            recorded[0].working_dir,
+            PathBuf::from("/worktrees/proj-372")
+        );
         assert_eq!(
             recorded[0].log_path,
             crate::cli::review::auto_review_log_path(tmp.path(), "PROJ-372")

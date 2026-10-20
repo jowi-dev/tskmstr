@@ -890,6 +890,13 @@ fn run_work(
             let auto_arm = full_config
                 .as_ref()
                 .is_some_and(|cfg| cfg.work.review_watch.auto_arm);
+            // GitHub issue #145: under autopilot, start `tm review auto`
+            // straight away. The supervisor checks the scope's flag itself.
+            let review_starter = tskmstr::cli::pr::DetachedAutoReviewStarter {
+                detach: &detach,
+                current_exe: &current_exe,
+                home: &home,
+            };
             let succeeded = tskmstr::cli::work::supervise(
                 &spawner,
                 &gh,
@@ -898,6 +905,7 @@ fn run_work(
                 &state,
                 agent_runner_or_default(full_config.as_ref()),
                 auto_arm.then_some(&watch_armer as &dyn tskmstr::work::run::WatchArmer),
+                Some(&review_starter),
                 &mut stdout,
             )?;
             // The state file has served its one-shot handoff purpose; a
