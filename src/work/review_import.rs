@@ -8,7 +8,8 @@
 //! 1. [`plan_imports`] picks the threads to import: unresolved, with at
 //!    least one comment that is not from a review bot, not an echo of a
 //!    comment tm or vdiff published, and not already recorded in the dedup
-//!    sidecar.
+//!    sidecar. [`import_bots`] picks the review bots' comments instead,
+//!    for `tm review auto` under autopilot (GitHub issue #145).
 //! 2. Each picked thread becomes one comment-store entry, written through
 //!    [`comment_store::append`]. Its text starts with `[github · @author]`,
 //!    folds in the replies, and ends with the thread URL. An outdated thread

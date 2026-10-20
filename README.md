@@ -1755,6 +1755,14 @@ which is not hooked, the same gap `status_on_pr` has. Combined with
 `on_bots_done = "launch"`, a run can go from PR to cleanup session
 unattended, so it is off by default.
 
+**Under autopilot the watch only records what the bots said.** While the
+ticket's scope has autopilot on (`tm dispatch on` or the TUI toggle), the
+watch never launches the cleanup session and never chains `tm review
+auto`, whatever `on_bots_done` and `[work.auto_review].auto` say. The lane
+supervisor starts the review itself (see [Auto-review](#auto-review)), and a
+cleanup session on the same branch would race its fixer. The flag is read
+when the watch finishes, so turning autopilot on during a long watch counts.
+
 When there are findings, the watcher writes them to
 `${XDG_DATA_HOME:-~/.local/share}/tskmstr/findings/<key>.json` before
 finishing, and the cleanup session (the `bugbot` window of the ticket's
@@ -1853,6 +1861,21 @@ finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
 
+**Under autopilot, review bots never gate the review.** While the ticket's
+scope has autopilot on, a detached lane run that finishes with a PR starts
+`tm review auto` straight from its supervisor, without waiting for any
+review bot, and records an `autopilot_review` event on the run
+(`started tm review auto` or `failed: ...`). This keys on the flag, not on
+how the lane was launched, so a lane you start by hand takes this path too.
+Before each fix round, the loop imports the PR's unresolved `review_bots`
+threads into the comment store the same way `tm review import` imports
+human ones, so one fix pass handles thatch's findings and bugbot's comments
+together. Each bot thread is imported once, and a thread bugbot posts
+late is picked up by the next fix round. Bot comments only ride along: a round
+whose own findings are all below `fix_threshold` does not fix, even when
+bugbot left comments. Those stay out of the store, on the PR, for you.
+With autopilot off, none of this applies.
+
 Every automatic fix pass, from `tm review auto` or `tm review import --fix`,
 stops at `[dispatch] max_fix_rounds` (default 3). The cap counts every
 `review-fix` run the ticket has had, including ones you started with `F`.
@@ -1867,8 +1890,9 @@ folded in and the thread URL at the end. A thread whose code moved since
 the review is anchored at its original line and marked
 `(outdated: was L<n> @ <sha>)`.
 
-Review-bot threads (`review_bots`) are skipped, and so are comments tm or
-vdiff posted, such as a published auto-review finding. Each GitHub comment
+Review-bot threads (`review_bots`) are skipped (under autopilot,
+`tm review auto` imports those itself before each fix round), and so are
+comments tm or vdiff posted, such as a published auto-review finding. Each GitHub comment
 is imported once: `<git-dir>/vdiff/imported-threads.json` records what was
 imported. An import that added anything records a `review_import` event,
 and the overview row shows it as `gh 2 imported`.
