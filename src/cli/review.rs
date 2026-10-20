@@ -491,7 +491,9 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 /// the ticket's lane worktree and branch, and each fix round is [`fix`]
 /// with [`Dispatch::HeadlessForeground`]. A round that needs a fix after the
 /// ticket already has `max_fix_rounds` `review-fix` runs (`[dispatch]`,
-/// see [`crate::work::fix_cap`]) ends the loop as capped instead.
+/// see [`crate::work::fix_cap`]) ends the loop as capped instead. Under
+/// autopilot, each fix round first imports the PR's unresolved
+/// `review_bots` threads ([`import_bot_threads`], GitHub issue #145).
 ///
 /// # Errors
 ///
@@ -504,6 +506,7 @@ pub fn auto(
     paths: &RunLanePaths,
     cfg: &AutoReviewConfig,
     max_fix_rounds: u32,
+    review_bots: &[String],
     key: &str,
     foreground: bool,
     out: &mut dyn Write,
@@ -561,6 +564,8 @@ pub fn auto(
         lane: &run.lane,
         worktree: &worktree,
         branch: &branch,
+        git_dir: &git_dir,
+        review_bots,
         max_fix_rounds,
         out: RefCell::new(out),
     };
@@ -576,6 +581,60 @@ pub fn auto(
     Ok(AutoOutcome::Finished(outcome))
 }
 
+/// Imports the unresolved `review_bots` threads on `branch`'s PR into the
+/// comment store under `git_dir`, for an auto-review fix round to address
+/// alongside its own findings (GitHub issue #145). Only while `scope`'s
+/// autopilot flag is on; otherwise the bots' threads stay `tm pr watch`'s.
+/// Returns how many threads were imported.
+///
+/// A review bot must never stop a review, so a missing PR or a failed `gh`
+/// call imports nothing (the latter with a warning on `out`) rather than
+/// failing the round.
+///
+/// # Errors
+///
+/// [`ReviewCliError::Runs`] if the autopilot flag can't be read;
+/// [`ReviewCliError::CommentStore`] for a store or sidecar failure.
+pub fn import_bot_threads(
+    deps: &ReviewFixDeps<'_>,
+    scope: &str,
+    branch: &str,
+    worktree: &Path,
+    git_dir: &Path,
+    review_bots: &[String],
+    out: &mut dyn Write,
+) -> Result<usize, ReviewCliError> {
+    use crate::work::{comment_store, review_import};
+
+    if review_bots.is_empty() || !deps.run_store.autopilot_enabled(scope)? {
+        return Ok(0);
+    }
+    let threads = deps.gh.pr_url_for_branch(branch).and_then(|url| {
+        match url.as_deref().and_then(pr_number_from_url) {
+            Some(pr) => deps.gh.pr_review_threads_full(worktree, pr).map(Some),
+            None => Ok(None),
+        }
+    });
+    let threads = match threads {
+        Ok(Some(threads)) => threads,
+        Ok(None) => return Ok(0),
+        Err(err) => {
+            writeln!(
+                out,
+                "warning: could not read review-bot threads for {branch}: {err}"
+            )?;
+            return Ok(0);
+        }
+    };
+    let created_at = comment_store::iso8601_utc(deps.clock.now_unix_secs());
+    let report = review_import::import_bots(git_dir, &threads.threads, review_bots, &created_at)?;
+    let imported = report.imported.len();
+    if imported > 0 {
+        writeln!(out, "imported  {imported} review-bot thread(s) for the fix")?;
+    }
+    Ok(imported)
+}
+
 /// [`AutoReviewOps`] over the real run store, agent runner and `vdiff`.
 struct CliAutoReviewOps<'a, 'o> {
     deps: &'a ReviewFixDeps<'a>,
@@ -585,6 +644,8 @@ struct CliAutoReviewOps<'a, 'o> {
     lane: &'a str,
     worktree: &'a Path,
     branch: &'a str,
+    git_dir: &'a Path,
+    review_bots: &'a [String],
     max_fix_rounds: u32,
     out: RefCell<&'o mut dyn Write>,
 }
@@ -693,6 +754,20 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
 
     fn now_unix_secs(&self) -> i64 {
         self.deps.clock.now_unix_secs()
+    }
+
+    fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {
+        let mut out = self.out.borrow_mut();
+        import_bot_threads(
+            self.deps,
+            self.scope,
+            self.branch,
+            self.worktree,
+            self.git_dir,
+            self.review_bots,
+            &mut **out,
+        )
+        .map_err(|e| AutoReviewError::step("import", e))
     }
 }
 
@@ -1675,6 +1750,7 @@ mod tests {
             &paths,
             &AutoReviewConfig::default(),
             crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
             "proj-1",
             false,
             &mut out,
@@ -1725,6 +1801,7 @@ mod tests {
             &paths(&tmp),
             &AutoReviewConfig::default(),
             crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
             "PROJ-1",
             false,
             &mut out,
@@ -1756,6 +1833,7 @@ mod tests {
             &paths(&tmp),
             &AutoReviewConfig::default(),
             crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
             "PROJ-1",
             true,
             &mut out,
@@ -1808,6 +1886,7 @@ mod tests {
             &paths(&tmp),
             &AutoReviewConfig::default(),
             crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
             "PROJ-1",
             true,
             &mut out,
@@ -1827,6 +1906,136 @@ mod tests {
             Some(131)
         );
         assert_eq!(pr_number_from_url("https://github.com/o/r/pull/"), None);
+    }
+
+    // --- bugbot threads feeding auto-review fixes (GitHub issue #145) ---
+
+    fn bot_thread_fakes(tmp: &TempDir, pr_url: Option<&str>) -> AutoFakes {
+        let comment = crate::github::review_threads::ThreadComment {
+            id: 77,
+            author_login: Some("cursor".to_string()),
+            body: "off by one".to_string(),
+            url: "https://github.com/o/r/pull/140#discussion_r77".to_string(),
+            created_at: "2026-10-20T10:00:00Z".to_string(),
+            original_commit: Some("abcdef0123".to_string()),
+        };
+        let thread = crate::github::review_threads::FullReviewThread {
+            id: "PRRT_bot".to_string(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "src/a.rs".to_string(),
+            line: Some(3),
+            start_line: None,
+            original_line: Some(3),
+            original_start_line: None,
+            comments: vec![comment],
+        };
+        AutoFakes {
+            gh: FakeGhCli::new()
+                .with_pr_url_for_branch(Ok(pr_url.map(str::to_string)))
+                .with_pr_review_threads_full(
+                    140,
+                    Ok(crate::github::review_threads::PrReviewThreads {
+                        pr_author: Some("jowi-dev".to_string()),
+                        threads: vec![thread],
+                    }),
+                ),
+            ..auto_fakes(tmp)
+        }
+    }
+
+    const BOT_PR: &str = "https://github.com/o/r/pull/140";
+
+    fn import_bot_threads_with(
+        fakes: &AutoFakes,
+        run_store: &RunStore,
+        git_dir: &Path,
+    ) -> (usize, String) {
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(fakes, run_store, &spawner);
+        let mut out = Vec::new();
+        let n = import_bot_threads(
+            &deps,
+            "",
+            "jowi-dev/proj-1-slug",
+            Path::new("/wt"),
+            git_dir,
+            &["cursor[bot]".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        (n, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn import_bot_threads_imports_bot_comments_once_under_autopilot() {
+        let (tmp, run_store, _) = setup();
+        run_store.set_autopilot("", true).unwrap();
+        let fakes = bot_thread_fakes(&tmp, Some(BOT_PR));
+        let git_dir = tmp.path().join("git");
+
+        let (first, printed) = import_bot_threads_with(&fakes, &run_store, &git_dir);
+        let (again, _) = import_bot_threads_with(&fakes, &run_store, &git_dir);
+
+        assert_eq!((first, again), (1, 0));
+        assert!(printed.contains("1 review-bot thread"), "{printed}");
+        let store = crate::work::comment_store::load(&git_dir).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(
+            store[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[github · @cursor] off by one")
+        );
+    }
+
+    #[test]
+    fn import_bot_threads_does_nothing_when_autopilot_is_off() {
+        let (tmp, run_store, _) = setup();
+        let fakes = bot_thread_fakes(&tmp, Some(BOT_PR));
+        let git_dir = tmp.path().join("git");
+
+        let (n, _) = import_bot_threads_with(&fakes, &run_store, &git_dir);
+
+        assert_eq!(n, 0);
+        assert!(fakes.gh.pr_review_threads_full_calls().is_empty());
+        assert!(
+            crate::work::comment_store::load(&git_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn import_bot_threads_skips_quietly_without_a_pr() {
+        let (tmp, run_store, _) = setup();
+        run_store.set_autopilot("", true).unwrap();
+        let fakes = bot_thread_fakes(&tmp, None);
+
+        let (n, _) = import_bot_threads_with(&fakes, &run_store, &tmp.path().join("git"));
+
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn import_bot_threads_warns_and_carries_on_when_gh_fails() {
+        let (tmp, run_store, _) = setup();
+        run_store.set_autopilot("", true).unwrap();
+        let fakes = AutoFakes {
+            gh: FakeGhCli::new().with_pr_url_for_branch(Err(
+                crate::github::gh_cli::GhError::Command {
+                    command: "gh pr view".to_string(),
+                    exit_code: Some(1),
+                    stderr: "rate limited".to_string(),
+                },
+            )),
+            ..auto_fakes(&tmp)
+        };
+
+        let (n, printed) = import_bot_threads_with(&fakes, &run_store, &tmp.path().join("git"));
+
+        assert_eq!(n, 0);
+        assert!(printed.contains("warning"), "{printed}");
     }
 
     // --- tm review import (GitHub issue #120) ---

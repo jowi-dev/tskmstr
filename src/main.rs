@@ -2247,11 +2247,13 @@ fn run_review_auto(key: String, foreground: bool) -> Result<(), Box<dyn std::err
             c.dispatch.max_fix_rounds
         });
         let mut stdout = std::io::stdout();
+        let review_bots = config.map_or(&[][..], |c| &c.review_bots[..]);
         tskmstr::cli::review::auto(
             deps,
             run_paths,
             cfg,
             max_fix_rounds,
+            review_bots,
             &key,
             foreground,
             &mut stdout,
