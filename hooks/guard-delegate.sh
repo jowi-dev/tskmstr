@@ -3,8 +3,10 @@
 #
 # Lane policy: during a tracked lane run (TSKMSTR_RUN_ID set), the main loop
 # may not edit files directly — it must delegate the change to a subagent
-# (Agent tool, model: sonnet) and review the diff instead. Subagents are the
-# delegates and remain allowed to edit.
+# (Agent tool) and review the diff instead. Subagents are the delegates and
+# remain allowed to edit. When the lane config names a `subagent`, tm exports
+# it as TSKMSTR_SUBAGENT and the deny reason names that scaffolded agent; the
+# agent definition carries its own model, so none is named here.
 #
 # Context: lane run AX-403 cost $15.81 because the main loop did 8 Edits and
 # 34 Bash calls itself with only 3 Agent delegations. This guard forces the
@@ -25,7 +27,13 @@ INPUT=$(cat)
 AGENT_ID=$(printf '%s' "$INPUT" | jq -r '.agent_id // empty' 2>/dev/null)
 [ -n "$AGENT_ID" ] && exit 0
 
-REASON="Lane policy: do not edit files from the main loop. Delegate this change to a subagent (Agent tool, model: sonnet) with a precise spec, then review its diff. The main loop only plans, reviews, and verifies."
+if [ -n "${TSKMSTR_SUBAGENT:-}" ]; then
+  DELEGATE="Delegate this change to the \`${TSKMSTR_SUBAGENT}\` subagent (Agent tool)"
+else
+  DELEGATE="Delegate this change to a subagent (Agent tool)"
+fi
+
+REASON="Lane policy: do not edit files from the main loop. ${DELEGATE} with a precise spec, then review its diff. The main loop only plans, reviews, and verifies."
 
 jq -nc --arg reason "$REASON" '{
   hookSpecificOutput: {

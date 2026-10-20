@@ -51,7 +51,7 @@ work hooks install --user` when the session hooks are absent — everything
 
 The model question adapts to the selected runner: `claude` takes a bare
 model name, `opencode` a `provider/model` spelling (e.g.
-`venice/z-ai-glm-5-3`). The offered default, and what `--yes` writes, is the
+`venice/z-ai-glm-5-3-flash`). The offered default, and what `--yes` writes, is the
 runner's built-in default model (`opus` for claude,
 `venice/z-ai-glm-5-3-flash` for opencode). An empty interactive answer
 leaves the key unset, and runs then resolve their model through the rest of
@@ -928,7 +928,11 @@ An optional `subagent` key names the lane's delegation subagent (see
 (`.claude/agents/<name>.md` or `.opencode/agent/<name>.md`, which carries
 the subagent's own `model`), not a runtime driver setting. It is consumed
 by `tm init`/`tm check`/`tm update` to detect and additively fix a missing
-definition; the lane's own model/turn/permission keys are unaffected.
+definition; the lane's own model/turn/permission keys are unaffected. Lane
+runs also export it as `TSKMSTR_SUBAGENT`, so the lane's
+`guard-delegate.sh` hook tells the main loop to delegate edits to that
+agent by name (with no `subagent` set, it says to delegate to a subagent
+without naming one).
 
 `tm work run <lane> [ticket]` and the board's `w` key (see "Board-launched
 lane runs" below) both refuse a lane whose `repo` resolves to a different
@@ -2518,8 +2522,9 @@ With `runner = "opencode"`, headless lane runs go through `opencode run
 <lane>.md` and the resume hint becomes `opencode --session <id>`. The
 runner-neutral `[work]` keys map as follows: `default_model` passes
 through as `--model` in opencode's `provider/model` spelling (e.g.
-`anthropic/claude-sonnet-4-5`), and when unset the flag is omitted so
-opencode's own configured default model applies; `default_permission_mode
+`venice/z-ai-glm-5-3-flash`), and when unset the model comes from the
+rest of the chain in "Which model a launch uses", ending at the built-in
+`venice/z-ai-glm-5-3-flash`; `default_permission_mode
 = "bypassPermissions"` (and the unset default) maps to
 `--dangerously-skip-permissions` on headless `opencode run` runs only —
 the TUI accepts no permission flag at all, so interactive sessions pass
@@ -2593,12 +2598,13 @@ window has actually reset. If every runner in `order` is still within its
 window, `tm` still runs — it probes whichever one recovers soonest rather
 than refusing to run at all.
 
-One thing priority mode does **not** carry across runners: `--model`
-(and `[work].default_model`/a lane's own `model`) only ever applies to
-`order[0]`'s own attempt. Model strings are runner-specific in practice
-(`"fable"` vs. opencode's `"provider/model"` spelling), so a fallback
-attempt always omits `--model` and gets that runner's own configured
-default instead of misapplying the preferred runner's model string.
+Model strings are runner-specific (`"opus"` vs. opencode's
+`"provider/model"` spelling), so each attempt resolves its own model
+through the chain in "Which model a launch uses" on its own runner. A
+`--model`, `[work].default_model` or lane `model` the fallback runner
+rejects is skipped, and the attempt falls through to that runner's
+`[agent.<runner>] default_model` or built-in default instead of
+misapplying the preferred runner's model string.
 
 ### Ranking
 

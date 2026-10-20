@@ -787,10 +787,11 @@ pub struct RawLaneConfig {
     /// (GitHub issue #52). A reference to a scaffolded agent *definition*
     /// (opencode's `.opencode/agent/<name>.md` or claude's
     /// `.claude/agents/<name>.md`, which carries the subagent's own `model`),
-    /// not a runtime driver setting — it is consumed by `tm init`/`tm
-    /// check`/`tm update` reading the raw config document to detect and
-    /// additively fix a missing definition, and intentionally not surfaced
-    /// on [`LaneConfig`].
+    /// not a driver model setting. `tm init`/`tm check`/`tm update` read it
+    /// from the raw config document to detect and additively fix a missing
+    /// definition, and a lane run exports it as
+    /// [`crate::agent::TSKMSTR_SUBAGENT`] so the delegation guard hook names
+    /// the agent to delegate to (GitHub issue #144).
     pub subagent: Option<String>,
 }
 
@@ -1508,6 +1509,10 @@ pub struct LaneConfig {
     pub max_turns: Option<u32>,
     /// See [`RawLaneConfig::permission_mode`].
     pub permission_mode: Option<String>,
+    /// See [`RawLaneConfig::subagent`]. A lane run exports it to the agent
+    /// as [`crate::agent::TSKMSTR_SUBAGENT`] so the delegation guard hook
+    /// can name it (GitHub issue #144).
+    pub subagent: Option<String>,
 }
 
 /// Locations to read configuration from.
@@ -2433,6 +2438,7 @@ fn merge_work(
                     model: raw.model,
                     max_turns: raw.max_turns,
                     permission_mode: raw.permission_mode,
+                    subagent: raw.subagent,
                 },
             ))
         })

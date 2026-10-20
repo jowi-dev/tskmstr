@@ -110,6 +110,14 @@ pub(crate) const SUBAGENT_MODEL_PLACEHOLDER: &str = "TODO-set-the-subagent-model
 /// which agent it drives.
 pub const TSKMSTR_RUN_ID: &str = "TSKMSTR_RUN_ID";
 
+/// Environment variable naming the lane's delegation subagent (the lane
+/// config's `subagent` key), exported on lane runs whose lane sets it. The
+/// lane guard hook (`hooks/guard-delegate.sh`) reads it to tell the main
+/// loop which scaffolded agent to delegate edits to, so no model name is
+/// baked into the hook (GitHub issue #144). Unset when the lane names no
+/// subagent.
+pub const TSKMSTR_SUBAGENT: &str = "TSKMSTR_SUBAGENT";
+
 /// Environment variable naming the pre-registered run row an *interactive*
 /// session should adopt, read by
 /// [`crate::runs::session::register_session`]. The same variable
@@ -556,11 +564,14 @@ pub struct SessionEnvVars {
 /// `--yes` writes is the runner's built-in default
 /// (`crate::config::AgentKind::builtin_models`), not an adapter value
 /// (GitHub issue #143).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LaneModelPrompt {
     /// Accepted-spelling help shown alongside the prompt, e.g.
-    /// `"provider/model, e.g. venice/z-ai-glm-5-3"`.
-    pub help: &'static str,
+    /// `"provider/model, e.g. <provider>/<model>"`. Its example names come
+    /// from the runner's built-in defaults
+    /// (`crate::config::AgentKind::builtin_models`), never a literal of the
+    /// adapter's own (GitHub issue #144).
+    pub help: String,
 }
 
 /// Backend-agnostic AI coding agent operations. See the module doc comment
@@ -1023,5 +1034,169 @@ mod tests {
             "found claude/anthropic/opencode literals outside src/agent/ (and outside the allowlist):\n{}",
             violations.join("\n")
         );
+    }
+    /// Items allowed to name a model, as `(file, opening line prefix)`. The
+    /// region runs from the line whose trimmed text starts with the prefix
+    /// through the next line at the same indentation that closes it (`}` or
+    /// `];`). See `no_model_names_outside_the_defaults_table`.
+    const MODEL_NAME_ALLOWLIST: &[(&str, &str)] = &[
+        // The built-in defaults table every launch resolves through
+        // (GitHub issue #143).
+        ("src/config/mod.rs", "pub fn builtin_models("),
+        // Per-model token prices, keyed by the model names each runner
+        // reports.
+        ("src/agent/claude/mod.rs", "const PRICE_TABLE"),
+        ("src/agent/opencode/mod.rs", "const PRICE_TABLE"),
+    ];
+
+    /// Whether `line` names a model or model provider: `opus`, `sonnet`,
+    /// `haiku`, `fable`, `glm`, `venice`, `deepseek`, `grok`, `qwen`, or
+    /// `claude-` followed by a version (`claude-3-...`, `claude-opus-5`).
+    fn names_a_model(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        let named = [
+            "opus", "sonnet", "haiku", "fable", "glm", "venice", "deepseek", "grok", "qwen",
+        ]
+        .iter()
+        .any(|name| lower.contains(name));
+        named
+            || lower.match_indices("claude-").any(|(at, prefix)| {
+                let rest = &lower[at + prefix.len()..];
+                let family_len = rest.find(|c: char| !c.is_ascii_lowercase()).unwrap_or(0);
+                let after_family = match &rest[family_len..] {
+                    s if family_len > 0 => s.strip_prefix('-').unwrap_or(""),
+                    s => s,
+                };
+                after_family.starts_with(|c: char| c.is_ascii_digit())
+            })
+    }
+
+    /// Drops `#`-to-end-of-line comments from a shell script line. Naive
+    /// like [`strip_comments_and_tests`]: a `#` inside a string ends the
+    /// line early, which can only hide a match, never invent one.
+    fn strip_shell_comment(line: &str) -> &str {
+        match line.find('#') {
+            Some(0) => "",
+            Some(pos) if line[..pos].ends_with(char::is_whitespace) => &line[..pos],
+            _ => line,
+        }
+    }
+
+    /// Recursively collects every file under `dir`.
+    fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read_dir({}): {err}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Guard for GitHub issue #144: model names live only in the built-in
+    /// defaults table and the two `PRICE_TABLE`s ([`MODEL_NAME_ALLOWLIST`]),
+    /// so a hard-coded model can't creep back into a launch, a prompt, a
+    /// hook or a help string. Scans the non-test, non-comment code of every
+    /// `src/**/*.rs` file and every file under `hooks/` (`#` comments
+    /// stripped from shell scripts, `//` comments from the rest).
+    #[test]
+    fn no_model_names_outside_the_defaults_table() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest_dir.join("src"), &mut files);
+        collect_files(&manifest_dir.join("hooks"), &mut files);
+
+        let mut violations = Vec::new();
+        let mut regions_found = Vec::new();
+        for path in &files {
+            let rel = path
+                .strip_prefix(manifest_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let contents = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let lines: Vec<(usize, String)> = if rel.ends_with(".rs") {
+                strip_comments_and_tests(&contents)
+            } else if rel.ends_with(".sh") {
+                contents
+                    .lines()
+                    .enumerate()
+                    .map(|(idx, line)| (idx + 1, strip_shell_comment(line).to_string()))
+                    .collect()
+            } else {
+                contents
+                    .lines()
+                    .enumerate()
+                    .map(|(idx, line)| {
+                        let code = line.find("//").map_or(line, |pos| &line[..pos]);
+                        (idx + 1, code.to_string())
+                    })
+                    .collect()
+            };
+
+            // Indentation of the allowlisted region currently open, if any.
+            let mut open_region: Option<usize> = None;
+            for (line_no, line) in lines {
+                let indent = line.len() - line.trim_start().len();
+                let trimmed = line.trim();
+                if let Some(region_indent) = open_region {
+                    if indent == region_indent && (trimmed == "}" || trimmed == "];") {
+                        open_region = None;
+                    }
+                    continue;
+                }
+                if let Some(entry) = MODEL_NAME_ALLOWLIST
+                    .iter()
+                    .find(|(file, prefix)| *file == rel && trimmed.starts_with(prefix))
+                {
+                    regions_found.push(*entry);
+                    open_region = Some(indent);
+                    continue;
+                }
+                if names_a_model(&line) {
+                    violations.push(format!("{rel}:{line_no}: {trimmed}"));
+                }
+            }
+        }
+
+        for entry in MODEL_NAME_ALLOWLIST {
+            assert!(
+                regions_found.contains(entry),
+                "allowlisted region {entry:?} not found; update MODEL_NAME_ALLOWLIST"
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "found model names outside the defaults table and PRICE_TABLEs; \
+             build examples from `AgentKind::builtin_models` instead:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn names_a_model_matches_model_names_and_versioned_claude_ids() {
+        for hit in [
+            "\"sonnet\"",
+            "Opus",
+            "venice/z-ai-glm-5-3",
+            "claude-3-5-sonnet",
+            "claude-opus-5",
+            "model: claude-2",
+        ] {
+            assert!(names_a_model(hit), "{hit}");
+        }
+        for miss in [
+            "claude-",
+            "strip_prefix(\"claude-\")",
+            ".claude-nudge-count",
+            "claude-code",
+            "opencode",
+        ] {
+            assert!(!names_a_model(miss), "{miss}");
+        }
     }
 }

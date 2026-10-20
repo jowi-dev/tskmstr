@@ -1427,6 +1427,21 @@ pub fn prepare_run_lane(
         });
     }
 
+    // GitHub issue #144: name the lane's delegation subagent to the guard
+    // hook, which tells the main loop to delegate edits to it instead of
+    // naming a model. Every attempt runs the same lane, so fallbacks get it
+    // too.
+    if let Some(subagent) = lane_config.subagent.as_deref().filter(|s| !s.is_empty()) {
+        let var = (
+            crate::agent::TSKMSTR_SUBAGENT.to_string(),
+            subagent.to_string(),
+        );
+        invocation.env_set.push(var.clone());
+        for fallback in &mut fallbacks {
+            fallback.invocation.env_set.push(var.clone());
+        }
+    }
+
     // GitHub issue #65: with `[work] build_slots` set, put tm's `cargo`
     // wrapper first on the lane's PATH so its builds share N machine-wide
     // slots. Best-effort like the status transition above: a shim that
@@ -2388,6 +2403,7 @@ mod tests {
             model: None,
             max_turns: None,
             permission_mode: None,
+            subagent: None,
         }
     }
 
@@ -5393,6 +5409,95 @@ mod tests {
         assert_eq!(get(crate::work::build_slots::SLOTS_ENV), "3");
         // The run id the agent adapter set is still there.
         assert_eq!(get("TSKMSTR_RUN_ID"), prepared.run_id.to_string());
+    }
+
+    /// `prepare_run_lane` for a headless `mylane` run whose lane names
+    /// `subagent`, returning the prepared run.
+    fn prepare_with_subagent(subagent: Option<&str>) -> (TempDir, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.subagent = subagent.map(str::to_string);
+        let config = config_with_lane("mylane", lane, &worktree_root);
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: vec![&crate::agent::opencode::OpencodeRunner],
+            models: &crate::config::ModelsConfig::default(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            mode: RunMode::Headless,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+        let prepared =
+            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        (tmp, prepared)
+    }
+
+    #[test]
+    fn prepare_run_lane_exports_the_lane_subagent_to_every_attempt() {
+        let (_tmp, prepared) = prepare_with_subagent(Some("impl"));
+
+        let subagent_of = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(k, _)| k == crate::agent::TSKMSTR_SUBAGENT)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            subagent_of(&prepared.invocation.env_set).as_deref(),
+            Some("impl")
+        );
+        assert!(!prepared.fallbacks.is_empty(), "fallback planned");
+        for fallback in &prepared.fallbacks {
+            assert_eq!(
+                subagent_of(&fallback.invocation.env_set).as_deref(),
+                Some("impl"),
+                "fallback {} must carry the subagent too",
+                fallback.agent
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_run_lane_exports_no_subagent_when_the_lane_names_none() {
+        for subagent in [None, Some("")] {
+            let (_tmp, prepared) = prepare_with_subagent(subagent);
+            let attempts = std::iter::once(&prepared.invocation)
+                .chain(prepared.fallbacks.iter().map(|f| &f.invocation));
+            for invocation in attempts {
+                assert!(
+                    invocation
+                        .env_set
+                        .iter()
+                        .all(|(k, _)| k != crate::agent::TSKMSTR_SUBAGENT),
+                    "{subagent:?}: {:?}",
+                    invocation.env_set
+                );
+            }
+        }
     }
 
     #[test]
