@@ -44,7 +44,8 @@ impl<'a> ModelDefaults<'a> {
         }
     }
 
-    /// No configured defaults; see [`NO_MODELS`].
+    /// No configured defaults: the chain ends straight in the built-in
+    /// default.
     pub fn none() -> ModelDefaults<'static> {
         ModelDefaults {
             work_default: None,

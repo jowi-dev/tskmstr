@@ -450,8 +450,11 @@ pub struct RawWorkConfig {
     /// with [`RawConfig::run_db_path`]); expansion, if any, is the
     /// responsibility of the `tm work` caller.
     pub worktree_root: Option<String>,
-    /// Default Claude model used for a lane's driver process when the lane
-    /// itself doesn't set [`RawLaneConfig::model`].
+    /// The model every launch falls back to when its own key is unset: lane
+    /// runs and review fix/auto (after [`RawLaneConfig::model`]), merge
+    /// conflict, audit, create and cleanup sessions (after their `model`),
+    /// and the setup session. Skipped on a runner that rejects its
+    /// spelling. See `crate::work::model` (GitHub issue #143).
     pub default_model: Option<String>,
     /// Default max-turns budget for a lane's driver process when the lane
     /// itself doesn't set [`RawLaneConfig::max_turns`].
@@ -548,16 +551,15 @@ pub struct RawAuditConfig {
     /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
     /// `/ticket-audit {key}` when unset.
     pub prompt: Option<String>,
-    /// Model alias passed to the launched session as `claude --model <model>`,
-    /// e.g. `fable`. Deliberately separate from [`RawWorkConfig::default_model`],
-    /// which only governs headless `tm work run` lanes: an audit is an
-    /// interactive digging session whose model choice is worth setting
-    /// independently of the lane default.
+    /// Model the launched session passes as `--model`, e.g. `opus`. Takes
+    /// precedence over [`RawWorkConfig::default_model`] for audits: an
+    /// audit is an interactive digging session whose model choice is worth
+    /// setting independently of the lane default.
     ///
-    /// When unset, `claude` picks its own default — which, under an
-    /// enterprise-managed model pin, is whatever the policy pins rather than
-    /// anything tskmstr configures. Set this to launch audits on a specific
-    /// model regardless of that pin.
+    /// When unset, the session falls back to [`RawWorkConfig::default_model`],
+    /// then `[agent.<runner>] default_model`, then the runner's built-in
+    /// default (GitHub issue #143, `crate::work::model`). `--model` is
+    /// always passed, so an enterprise-managed model pin never applies.
     pub model: Option<String>,
     /// Path to a prompt file whose contents become the session's opening
     /// prompt in place of [`RawAuditConfig::prompt`], with the same `{key}`
@@ -595,10 +597,8 @@ pub struct RawCreateConfig {
     /// unset. Unlike [`RawAuditConfig::prompt`], no `{key}` substitution
     /// applies — there is no ticket key yet.
     pub prompt: Option<String>,
-    /// Model alias passed to the launched session as `claude --model <model>`.
-    /// Same rationale as [`RawAuditConfig::model`]: an interactive session's
-    /// model choice is worth setting independently of the lane default, and
-    /// an explicit `--model` is what escapes an enterprise-managed pin.
+    /// Model the launched session passes as `--model`. Same precedence and
+    /// fallback as [`RawAuditConfig::model`].
     pub model: Option<String>,
     /// Path to a prompt file whose contents become the session's opening
     /// prompt in place of [`RawCreateConfig::prompt`]. Setting both `prompt`
@@ -635,9 +635,8 @@ pub struct RawMergeConfig {
     /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
     /// path passes through unchanged, matching [`RawCreateConfig::prompt_file`].
     pub prompt_file: Option<String>,
-    /// Model alias passed to the launched conflict-resolution session,
-    /// overriding the runner's default model. Same rationale as
-    /// [`RawCreateConfig::model`].
+    /// Model the launched conflict-resolution session passes as `--model`.
+    /// Same precedence and fallback as [`RawAuditConfig::model`].
     pub model: Option<String>,
     /// Prompt template for the single combined conflict-resolution session
     /// a batch `tm merge KEY1 KEY2 ...` opens when two or more of its
@@ -709,10 +708,10 @@ pub struct RawReviewWatchConfig {
     /// legal in a repo-local `.tskmstr.toml`); a `~`-prefixed or absolute
     /// path passes through unchanged, matching [`RawReviewWatchConfig::dir`].
     pub prompt_file: Option<String>,
-    /// Model alias passed to the launched cleanup session as
-    /// `claude --model <model>`. When unset, falls back to
-    /// [`RawAuditConfig::model`] (applied in [`merge_work`], not here — see
-    /// [`ReviewWatchConfig::model`]).
+    /// Model the launched cleanup session passes as `--model`. When unset,
+    /// falls back to [`RawAuditConfig::model`] (applied in [`merge_work`],
+    /// not here — see [`ReviewWatchConfig::model`]), then to the rest of
+    /// [`RawAuditConfig::model`]'s chain.
     pub model: Option<String>,
     /// Seconds between PR polls while watching. Defaults to 45 when unset.
     pub poll_secs: Option<u64>,
@@ -773,8 +772,10 @@ pub struct RawLaneConfig {
     /// Base branch new lane branches are created from, overriding whatever
     /// default (e.g. `origin/HEAD`) the caller would otherwise use.
     pub base_branch: Option<String>,
-    /// Claude model for this lane's driver process, overriding
-    /// [`RawWorkConfig::default_model`].
+    /// Model for this lane's driver process, its usage-limit fallbacks and
+    /// its review fix/auto runs, overriding [`RawWorkConfig::default_model`].
+    /// Spelled for one runner; an attempt on a runner that rejects the
+    /// spelling skips it (GitHub issue #143, `crate::work::model`).
     pub model: Option<String>,
     /// Max-turns budget for this lane's driver process, overriding
     /// [`RawWorkConfig::default_max_turns`].
@@ -1181,7 +1182,7 @@ pub struct WorkConfig {
     /// absent from both global and repo config.
     pub create: CreateConfig,
     /// Validated `[work.merge]` settings. See [`MergeConfig`]; falls back to
-    /// the built-in conflict prompt and the runner's default model when the
+    /// the built-in conflict prompt and the rest of the model chain when the
     /// `[work.merge]` section is absent from both global and repo config.
     pub merge: MergeConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
@@ -1300,12 +1301,12 @@ pub struct CreateConfig {
 /// when a rebase hits conflicts. `prompt`/`prompt_file` override the
 /// built-in conflict prompt — the prompt text supports `{key}` (the ticket
 /// key), `{branch}` (the branch being merged), and `{base}` (the branch it's
-/// being merged onto) placeholders. `model` overrides the runner's default
-/// model for that session. `batch_conflict_prompt` overrides the built-in
-/// template for the combined session a multi-key `tm merge` opens (its one
-/// placeholder is `{ticket_list}`). All fields are optional: an absent
-/// section falls back to the built-in prompts and the runner's default
-/// model.
+/// being merged onto) placeholders. `model` is that session's own model
+/// key, ahead of `[work] default_model` (see `crate::work::model`).
+/// `batch_conflict_prompt` overrides the built-in template for the combined
+/// session a multi-key `tm merge` opens (its one placeholder is
+/// `{ticket_list}`). All fields are optional: an absent section falls back
+/// to the built-in prompts and the rest of the model chain.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergeConfig {
     /// See [`RawMergeConfig::prompt`].

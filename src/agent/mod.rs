@@ -551,12 +551,11 @@ pub struct SessionEnvVars {
 }
 
 /// Runner-specific guidance for `tm init`'s lane-scaffold model question
-/// (GitHub issue #51). The lane scaffold asks for the lane's `model` so a
-/// run doesn't silently fall back to the agent CLI's own default model, and
-/// the spelling is runner-specific — this carries what the question shows
-/// See [`AgentRunner::lane_model_prompt`]. What `--yes` writes is the
-/// runner's built-in default (`crate::config::AgentKind::builtin_models`),
-/// not an adapter value (GitHub issue #143).
+/// (GitHub issue #51). The spelling is runner-specific, so this carries the
+/// help the question shows. See [`AgentRunner::lane_model_prompt`]. What
+/// `--yes` writes is the runner's built-in default
+/// (`crate::config::AgentKind::builtin_models`), not an adapter value
+/// (GitHub issue #143).
 #[derive(Debug, Clone, Copy)]
 pub struct LaneModelPrompt {
     /// Accepted-spelling help shown alongside the prompt, e.g.

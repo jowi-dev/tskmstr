@@ -34,8 +34,8 @@ remote is detected, with the slug pre-filled), writes the repo-local
 `base_branch`, an optional starter prompt file at
 `.tskmstr/prompts/<lane>-lane.md` — a committed, `.vscode/`-style home for
 tm's repo-local assets; see `docs/decisions/0006-repo-local-assets.md` — and
-the lane's `model`, runner-spelled, so a run doesn't silently fall back to
-the agent CLI's own default model; see `docs/plans/gh-51-lane-model.md`),
+the lane's `model`, runner-spelled; see `docs/plans/gh-51-lane-model.md`
+and "Which model a launch uses" below),
 creates the GitHub backend's `tm:status/*` labels, offers to wire
 `status_on_pr` (the status a ticket moves to when `tm pr create` opens its
 PR — defaulting to `"In Review"` under the GitHub backend, the label init
@@ -50,11 +50,12 @@ work hooks install --user` when the session hooks are absent — everything
 `tm board` and the board's `w`/`c`/`a` keys need.
 
 The model question adapts to the selected runner: `claude` takes a bare
-model name and `--yes` writes its always-passed default (`fable`), while
-`opencode` takes a `provider/model` spelling (e.g. `venice/z-ai-glm-5-3`)
-and, having no safe universal default across providers, leaves `model`
-unset under `--yes` and prints that the run will use opencode's own default
-model. An empty interactive answer likewise leaves the key unset.
+model name, `opencode` a `provider/model` spelling (e.g.
+`venice/z-ai-glm-5-3`). The offered default, and what `--yes` writes, is the
+runner's built-in default model (`opus` for claude,
+`venice/z-ai-glm-5-3-flash` for opencode). An empty interactive answer
+leaves the key unset, and runs then resolve their model through the rest of
+the chain described in "Which model a launch uses".
 
 The scaffolded lane prompt is a generic skeleton, so after everything is
 written the wizard offers to launch an agent-assisted setup session
@@ -879,6 +880,49 @@ top-level `prompts/` directory keeps working (any path is honored), but
 also be a relative path — see "Relative `repo`/`dir` paths in a repo-local
 config" below.
 
+### Which model a launch uses
+
+Every agent tm launches gets an explicit `--model`: lane runs and their
+usage-limit fallbacks, `tm review fix`/`auto`, `tm merge` conflict sessions
+(single and batch), the `tm init`/`tm update` setup session, the board's
+audit, create and review_watch cleanup sessions, and the usage probe. None
+of them falls through to the agent CLI's own default, so an
+enterprise-pinned claude model is overridden too. A launch on runner R
+takes the first of these that R accepts (GitHub issue #143):
+
+1. `tm work run --model` (lane runs only);
+2. the surface's own key: the lane's `model` (lane runs, review fix/auto),
+   `[work.merge] model`, `[work.audit] model`, `[work.create] model`, or
+   `[work.review_watch] model` (which falls back to `[work.audit] model`).
+   The setup session has no key of its own;
+3. `[work] default_model`;
+4. `[agent.<R>] default_model`;
+5. R's built-in default: `opus` for claude, `venice/z-ai-glm-5-3-flash`
+   for opencode.
+
+"Accepts" means the runner's spelling check: claude rejects a
+`provider/model` name, and opencode requires one. A rejected candidate is
+skipped, not passed, so a usage-limit fallback from claude to opencode
+skips a claude lane `model` and lands on `[agent.opencode] default_model`
+(ADR-0010 amends ADR-0008's decision to pass no model on fallback).
+
+```toml
+[agent.claude]
+# default_model = "opus"          # this runner's default; built-in is opus
+# usage_probe_model = "haiku"     # the usage probe's model; built-in is haiku
+
+[agent.opencode]
+# default_model = "venice/z-ai-glm-5-3-flash"   # built-in default
+```
+
+These keys merge key by key, repo over global, like the usage keys below.
+opencode has no usage probe, so `[agent.opencode] usage_probe_model` is a
+config error. `tm check` lists the model every surface resolves to on each
+runner, and flags a configured model the runner would reject: as drift on
+the preferred runner, and as an advisory note on a priority-routing
+fallback, where skipping a model spelled for the preferred runner is
+expected.
+
 An optional `subagent` key names the lane's delegation subagent (see
 "Setup"): it is a reference to a scaffolded agent *definition*
 (`.claude/agents/<name>.md` or `.opencode/agent/<name>.md`, which carries
@@ -978,8 +1022,8 @@ output. The check:
   `not launching: claude 5h usage at 83% >= 80% ceiling, resets in 1h 12m`.
 - **probes** when there is no snapshot, or a window's snapshot is older than
   `snapshot_max_age_secs` and the window hasn't reset. The probe is one
-  Haiku turn (`claude -p 'ok' --model haiku --max-turns 1 --output-format
-  stream-json --verbose`). It runs in an empty temp directory with the same
+  turn on `[agent.claude] usage_probe_model`, Haiku by default (`claude -p
+  'ok' --model haiku --max-turns 1 --output-format stream-json --verbose`). It runs in an empty temp directory with the same
   billing-safety env stripping as a lane run, and its result is stored with
   source `probe`. Concurrent `tm` processes share one probe per max-age
   window. If the probe fails, the launch isn't refused for staleness: the
@@ -1528,7 +1572,7 @@ terminal to that session (the board suspends, tmux takes over; detach with
 dir = "~/Projects/axiom"            # required: where the session runs
 # prompt = "/ticket-audit {key}"    # optional; this is the default
 # prompt_file = ".tskmstr/prompts/audit.md"  # optional; see below
-# model = "fable"                   # optional; passed as `claude --model`
+# model = "opus"                    # optional; see "Which model a launch uses"
 ```
 
 `dir` is the repo whose `.claude/` provides the audit skill and telemetry
@@ -1552,12 +1596,12 @@ resolves the ticket correctly. The status line notes the fallback:
 `launched audit for <KEY> in the current repo (configured audit dir is
 backend-incompatible) -- press a to attach`.
 
-`model` is separate from `[work].default_model`, which only applies to
-headless `tm work run` lanes. Leave it unset and the session takes whatever
-model `claude` defaults to — under an enterprise-managed model pin, that is
-the pinned model, not anything tskmstr configures. Setting it emits an
-explicit `claude --model`, which overrides that pin. Since an audit is
-where digging quality matters most, it is worth setting deliberately.
+`model` takes precedence over `[work] default_model` for audits only. Leave
+it unset and the session falls back to `[work] default_model`, then the
+runner's default (see "Which model a launch uses"). The session always
+passes `--model`, so an enterprise-managed claude model pin never applies.
+Since an audit is where digging quality matters most, it is worth setting
+deliberately.
 
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
@@ -1615,7 +1659,7 @@ board; the new ticket shows up on the next `r` refresh. Launching requires:
 dir = "~/Projects/axiom"     # required: where the session runs
 # prompt = "/ticket-create"  # optional; this is the default
 # prompt_file = ".tskmstr/prompts/create.md"  # optional; see [work.audit]'s prompt_file
-# model = "fable"            # optional; passed as `claude --model`
+# model = "opus"             # optional; see "Which model a launch uses"
 ```
 
 `prompt_file`'s contents become the opening prompt, mutually exclusive with
@@ -1682,7 +1726,7 @@ Watching requires:
 dir = "~/Projects/axiom"          # optional; falls back to [work.audit].dir
 # prompt = "/bugbot-triage {key} {findings_file}"  # optional; this is the default
 # prompt_file = ".tskmstr/prompts/cleanup.md"      # optional; see [work.audit]'s prompt_file
-# model = "fable"                 # optional; falls back to [work.audit].model
+# model = "opus"                  # optional; falls back to [work.audit].model, then [work] default_model
 # poll_secs = 45                  # optional, default 45
 # max_wait_mins = 1440            # optional, default 1440 (24h)
 # on_bots_done = "notify"         # optional, "notify" # auto_arm = false               # optional; arm the watch when a run ends with a PR
@@ -2057,7 +2101,7 @@ never gates whether merging is available at all, unlike `[work.audit]`'s
 [work.merge]
 # prompt = "..."                              # optional; ships a built-in default prompt
 # prompt_file = ".tskmstr/prompts/merge.md"    # optional; see [work.audit]'s prompt_file above
-# model = "fable"                              # optional; passed as `claude --model`
+# model = "opus"                               # optional; see "Which model a launch uses"
 # batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
 ```
 
@@ -2067,9 +2111,9 @@ Leave both unset and tm ships a sensible default prompt itself,
 `{key}`/`{branch}`/`{base}`-substituted the same way `prompt`/`prompt_file`
 are — no config is required to get a working conflict-resolution session.
 `{key}` is the ticket key, `{branch}` is the PR's branch, and `{base}` is
-the PR's base branch (e.g. `main`). `model` overrides whatever `claude`
-defaults to (or an enterprise model pin), same semantics as
-`[work.audit].model`.
+the PR's base branch (e.g. `main`). `model` takes precedence over `[work]
+default_model` for conflict sessions, the same way `[work.audit].model`
+does for audits.
 
 `batch_conflict_prompt` is the template for the single combined session a
 multi-key `tm merge` opens when its tickets stop on conflicts (see

@@ -522,7 +522,7 @@ impl AgentRunner for ClaudeRunner {
     fn validate_lane_model(&self, model: &str) -> Result<(), String> {
         if model.contains('/') {
             return Err(format!(
-                "`{model}` looks like a provider/model spelling; claude wants a bare model name like `fable` or `sonnet`"
+                "`{model}` looks like a provider/model spelling; claude wants a bare model name like `opus` or `sonnet`"
             ));
         }
         Ok(())
