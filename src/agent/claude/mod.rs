@@ -1595,10 +1595,7 @@ mod tests {
         let err = ClaudeRunner.validate_lane_model("a/b").unwrap_err();
         for text in [&help, &err] {
             assert!(text.contains(builtin.default_model), "{text}");
-            assert!(
-                text.contains(builtin.usage_probe_model.unwrap()),
-                "{text}"
-            );
+            assert!(text.contains(builtin.usage_probe_model.unwrap()), "{text}");
         }
     }
 }
