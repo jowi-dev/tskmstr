@@ -2099,6 +2099,12 @@ pub fn run_agent_and_finish(
 /// re-arms bot review on its new push. `--fg` runs and interactive runs
 /// never reach it: an interactive run ends through `tm runs finish`, which
 /// is not hooked, the same gap `status_on_pr` has (GitHub issue #92).
+///
+/// `review_starter` starts `tm review auto` for a lane run that finished
+/// with a PR while its scope's autopilot flag is on (GitHub issue #145), so
+/// the thatch review never waits on a review bot; see
+/// [`autopilot_start_review`]. The watch is still armed when `auto_arm` is
+/// on, but under autopilot it only records what the bots said.
 #[allow(clippy::too_many_arguments)]
 pub fn supervise_run(
     spawner: &dyn ProcessSpawner,
@@ -2109,6 +2115,7 @@ pub fn supervise_run(
     supervisor_pid: u32,
     runner: &dyn AgentRunner,
     watch_armer: Option<&dyn WatchArmer>,
+    review_starter: Option<&dyn AutoReviewStarter>,
     out: &mut dyn Write,
 ) -> Result<RunLaneOutcome, RunLaneError> {
     run_store.update_pid(prepared.run_id, supervisor_pid)?;
@@ -2124,7 +2131,68 @@ pub fn supervise_run(
     if let Some(armer) = watch_armer {
         auto_arm_watch(run_store, armer, prepared, out)?;
     }
+    if let Some(starter) = review_starter {
+        autopilot_start_review(run_store, starter, prepared, out)?;
+    }
     Ok(outcome)
+}
+
+/// Event kind [`autopilot_start_review`] records on the lane run. Its
+/// detail is `started tm review auto` or `failed: <message>`.
+pub const AUTOPILOT_REVIEW_EVENT: &str = "autopilot_review";
+
+/// Starts a detached `tm review auto` for a ticket (GitHub issue #145).
+/// Behind a trait so [`supervise_run`] can be tested without spawning
+/// anything; the production implementation is
+/// `crate::cli::pr::DetachedAutoReviewLauncher`.
+pub trait AutoReviewStarter {
+    /// Start the auto-review loop for `ticket` from `working_dir`, without
+    /// waiting for it. The error is only ever shown to a human.
+    fn start(&self, ticket: &str, working_dir: &Path) -> Result<(), String>;
+}
+
+/// Start `tm review auto` for a finished, ticketed lane run whose row has a
+/// PR, when its scope's autopilot flag is on, recording an
+/// [`AUTOPILOT_REVIEW_EVENT`] on the run either way it goes. Keyed on the
+/// flag rather than on how the lane was launched, so a hand-started lane
+/// takes this path too while autopilot is on. `tm review auto` refuses a
+/// second loop itself, so no dedup is needed here. A failed start only
+/// warns: the run itself is already recorded.
+fn autopilot_start_review(
+    run_store: &RunStore,
+    starter: &dyn AutoReviewStarter,
+    prepared: &PreparedRun,
+    out: &mut dyn Write,
+) -> Result<(), RunLaneError> {
+    let Some(ticket) = prepared.ticket.as_deref() else {
+        return Ok(());
+    };
+    let Some(run) = run_store.run_by_id(prepared.run_id)? else {
+        return Ok(());
+    };
+    if run.kind != "lane" || run.pr_url.is_none() || !run_store.autopilot_enabled(&run.scope)? {
+        return Ok(());
+    }
+
+    match starter.start(ticket, &prepared.worktree) {
+        Ok(()) => {
+            run_store.add_event(
+                prepared.run_id,
+                AUTOPILOT_REVIEW_EVENT,
+                Some("started tm review auto"),
+            )?;
+            writeln!(out, "started tm review auto for {ticket}")?;
+        }
+        Err(message) => {
+            let detail = format!("failed: {message}");
+            run_store.add_event(prepared.run_id, AUTOPILOT_REVIEW_EVENT, Some(&detail))?;
+            writeln!(
+                out,
+                "warning: could not start tm review auto for {ticket}: {message}"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Starts a detached `tm pr watch` for a ticket (GitHub issue #118). Behind
@@ -6211,6 +6279,7 @@ mod tests {
             9999,
             &ClaudeRunner,
             None,
+            None,
             &mut supervisor_out,
         )
         .unwrap();
@@ -6248,6 +6317,31 @@ mod tests {
         }
     }
 
+    /// Records every [`AutoReviewStarter::start`] call and answers with
+    /// `result`.
+    struct FakeReviewStarter {
+        calls: std::cell::RefCell<Vec<(String, PathBuf)>>,
+        result: Result<(), String>,
+    }
+
+    impl FakeReviewStarter {
+        fn new(result: Result<(), String>) -> Self {
+            FakeReviewStarter {
+                calls: std::cell::RefCell::new(Vec::new()),
+                result,
+            }
+        }
+    }
+
+    impl AutoReviewStarter for FakeReviewStarter {
+        fn start(&self, ticket: &str, working_dir: &Path) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push((ticket.to_string(), working_dir.to_path_buf()));
+            self.result.clone()
+        }
+    }
+
     /// Prepare a detached `ABC-123` lane run (or a ticketless one, when
     /// `ticket` is `None`), then supervise it with `gh` reporting `pr_url`
     /// for its branch and `armer` as the watch armer. Returns the store, the
@@ -6256,6 +6350,18 @@ mod tests {
         ticket: Option<&str>,
         pr_url: Option<&str>,
         armer: Option<&dyn WatchArmer>,
+        before_supervise: &dyn Fn(&RunStore),
+    ) -> (TempDir, RunStore, PreparedRun, String) {
+        supervise_ticketed_run_with(ticket, pr_url, armer, None, before_supervise)
+    }
+
+    /// [`supervise_ticketed_run`] with `starter` as the autopilot
+    /// auto-review starter.
+    fn supervise_ticketed_run_with(
+        ticket: Option<&str>,
+        pr_url: Option<&str>,
+        armer: Option<&dyn WatchArmer>,
+        starter: Option<&dyn AutoReviewStarter>,
         before_supervise: &dyn Fn(&RunStore),
     ) -> (TempDir, RunStore, PreparedRun, String) {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
@@ -6322,6 +6428,7 @@ mod tests {
             9999,
             &ClaudeRunner,
             armer,
+            starter,
             &mut out,
         )
         .unwrap();
@@ -6440,6 +6547,123 @@ mod tests {
         assert_eq!(run.status, RunStatus::Done);
     }
 
+    fn autopilot_review_events(run_store: &RunStore, run_id: i64) -> Vec<Option<String>> {
+        run_store
+            .events_for_run(run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == AUTOPILOT_REVIEW_EVENT)
+            .map(|e| e.detail)
+            .collect()
+    }
+
+    fn autopilot_on(store: &RunStore) {
+        store
+            .set_autopilot(&compatible_test_identity().scope(), true)
+            .unwrap();
+    }
+
+    #[test]
+    fn supervise_run_starts_auto_review_when_autopilot_is_on() {
+        let starter = FakeReviewStarter::new(Ok(()));
+
+        let (_tmp, run_store, prepared, printed) = supervise_ticketed_run_with(
+            Some("ABC-123"),
+            Some(PR_URL),
+            None,
+            Some(&starter),
+            &autopilot_on,
+        );
+
+        assert_eq!(
+            *starter.calls.borrow(),
+            vec![("ABC-123".to_string(), prepared.worktree.clone())]
+        );
+        assert_eq!(
+            autopilot_review_events(&run_store, prepared.run_id),
+            vec![Some("started tm review auto".to_string())]
+        );
+        assert!(
+            printed.contains("started tm review auto for ABC-123"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn supervise_run_starts_auto_review_alongside_the_watch() {
+        let armer = FakeWatchArmer::new(Ok(()));
+        let starter = FakeReviewStarter::new(Ok(()));
+
+        supervise_ticketed_run_with(
+            Some("ABC-123"),
+            Some(PR_URL),
+            Some(&armer),
+            Some(&starter),
+            &autopilot_on,
+        );
+
+        assert_eq!(armer.calls.borrow().len(), 1);
+        assert_eq!(starter.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn supervise_run_does_not_start_auto_review_when_autopilot_is_off() {
+        let starter = FakeReviewStarter::new(Ok(()));
+
+        let (_tmp, run_store, prepared, _) = supervise_ticketed_run_with(
+            Some("ABC-123"),
+            Some(PR_URL),
+            None,
+            Some(&starter),
+            &|_| {},
+        );
+
+        assert!(starter.calls.borrow().is_empty());
+        assert!(autopilot_review_events(&run_store, prepared.run_id).is_empty());
+    }
+
+    #[test]
+    fn supervise_run_does_not_start_auto_review_without_a_pr() {
+        let starter = FakeReviewStarter::new(Ok(()));
+
+        supervise_ticketed_run_with(Some("ABC-123"), None, None, Some(&starter), &autopilot_on);
+
+        assert!(starter.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn supervise_run_does_not_start_auto_review_for_a_ticketless_run() {
+        let starter = FakeReviewStarter::new(Ok(()));
+
+        supervise_ticketed_run_with(None, Some(PR_URL), None, Some(&starter), &autopilot_on);
+
+        assert!(starter.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn supervise_run_auto_review_start_failure_warns_and_still_finishes_the_run() {
+        let starter = FakeReviewStarter::new(Err("spawn failed".to_string()));
+
+        let (_tmp, run_store, prepared, printed) = supervise_ticketed_run_with(
+            Some("ABC-123"),
+            Some(PR_URL),
+            None,
+            Some(&starter),
+            &autopilot_on,
+        );
+
+        assert!(
+            printed.contains("warning: could not start tm review auto for ABC-123: spawn failed"),
+            "{printed}"
+        );
+        assert_eq!(
+            autopilot_review_events(&run_store, prepared.run_id),
+            vec![Some("failed: spawn failed".to_string())]
+        );
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Done);
+    }
+
     #[test]
     fn supervise_run_marks_failed_on_nonzero_claude_exit() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
@@ -6502,6 +6726,7 @@ mod tests {
             &prepared,
             4321,
             &ClaudeRunner,
+            None,
             None,
             &mut supervisor_out,
         )

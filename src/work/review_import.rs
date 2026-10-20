@@ -8,7 +8,8 @@
 //! 1. [`plan_imports`] picks the threads to import: unresolved, with at
 //!    least one comment that is not from a review bot, not an echo of a
 //!    comment tm or vdiff published, and not already recorded in the dedup
-//!    sidecar.
+//!    sidecar. [`import_bots`] picks the review bots' comments instead,
+//!    for `tm review auto` under autopilot (GitHub issue #145).
 //! 2. Each picked thread becomes one comment-store entry, written through
 //!    [`comment_store::append`]. Its text starts with `[github · @author]`,
 //!    folds in the replies, and ends with the thread URL. An outdated thread
@@ -229,22 +230,47 @@ pub fn plan_imports(
     sidecar: &ImportedThreads,
     local_texts: &HashSet<String>,
 ) -> Vec<PlannedImport> {
+    plan_where(threads, sidecar, local_texts, |c| !is_bot(c, bots))
+}
+
+/// [`plan_imports`] for the other half of each thread: only the comments
+/// from `bots`, for `tm review auto` to hand the fixer under autopilot
+/// (GitHub issue #145). Human comments are left to [`plan_imports`], and
+/// both share one sidecar, so neither import marks the other's comments
+/// done.
+pub fn plan_bot_imports(
+    threads: &[FullReviewThread],
+    bots: &[String],
+    sidecar: &ImportedThreads,
+    local_texts: &HashSet<String>,
+) -> Vec<PlannedImport> {
+    plan_where(threads, sidecar, local_texts, |c| is_bot(c, bots))
+}
+
+/// Plans an entry for every unresolved thread with a comment that `keep`
+/// picks, is not an echo, and is not yet in the sidecar.
+fn plan_where(
+    threads: &[FullReviewThread],
+    sidecar: &ImportedThreads,
+    local_texts: &HashSet<String>,
+    keep: impl Fn(&ThreadComment) -> bool,
+) -> Vec<PlannedImport> {
     threads
         .iter()
         .filter(|t| !t.is_resolved)
         .filter_map(|thread| {
-            let human: Vec<&ThreadComment> = thread
+            let kept: Vec<&ThreadComment> = thread
                 .comments
                 .iter()
-                .filter(|c| !is_bot(c, bots) && !is_echo(&c.body, local_texts))
+                .filter(|c| keep(c) && !is_echo(&c.body, local_texts))
                 .collect();
-            if human.iter().all(|c| sidecar.contains(c.id)) {
+            if kept.iter().all(|c| sidecar.contains(c.id)) {
                 return None;
             }
             Some(PlannedImport {
                 thread_id: thread.id.clone(),
-                comment_ids: human.iter().map(|c| c.id).collect(),
-                comment: to_comment(thread, &human),
+                comment_ids: kept.iter().map(|c| c.id).collect(),
+                comment: to_comment(thread, &kept),
             })
         })
         .collect()
@@ -254,7 +280,8 @@ fn author(comment: &ThreadComment) -> &str {
     comment.author_login.as_deref().unwrap_or("ghost")
 }
 
-/// Builds the entry for `thread` from its non-empty `human` comments.
+/// Builds the entry for `thread` from its non-empty picked `human`
+/// comments (the bot comments, for [`plan_bot_imports`]).
 fn to_comment(thread: &FullReviewThread, human: &[&ThreadComment]) -> NewComment {
     let first = human[0];
     let (start_line, end_line, outdated_note) = match thread.line {
@@ -312,9 +339,39 @@ pub fn import(
     bots: &[String],
     created_at: &str,
 ) -> Result<ImportReport, CommentStoreError> {
+    import_planned(git_dir, threads, bots, created_at, plan_imports)
+}
+
+/// [`import`] for the `bots`' own comments, through [`plan_bot_imports`]
+/// (GitHub issue #145).
+///
+/// # Errors
+///
+/// As for [`import`].
+pub fn import_bots(
+    git_dir: &Path,
+    threads: &[FullReviewThread],
+    bots: &[String],
+    created_at: &str,
+) -> Result<ImportReport, CommentStoreError> {
+    import_planned(git_dir, threads, bots, created_at, plan_bot_imports)
+}
+
+/// [`plan_imports`] or [`plan_bot_imports`].
+type Planner =
+    fn(&[FullReviewThread], &[String], &ImportedThreads, &HashSet<String>) -> Vec<PlannedImport>;
+
+/// One import pass with `plan` picking the threads.
+fn import_planned(
+    git_dir: &Path,
+    threads: &[FullReviewThread],
+    bots: &[String],
+    created_at: &str,
+    plan: Planner,
+) -> Result<ImportReport, CommentStoreError> {
     let mut sidecar = load_sidecar(git_dir)?;
     let texts = local_texts(git_dir)?;
-    let planned = plan_imports(threads, bots, &sidecar, &texts);
+    let planned = plan(threads, bots, &sidecar, &texts);
     if planned.is_empty() {
         return Ok(ImportReport::default());
     }
@@ -481,6 +538,65 @@ mod tests {
         assert_eq!(planned[0].thread_id, "T2");
         assert_eq!(planned[0].comment_ids, [3]);
         assert!(!planned[0].comment.text.contains("bot finding"));
+    }
+
+    #[test]
+    fn bot_imports_take_only_the_bot_comments_of_unresolved_threads() {
+        let mut resolved = thread("T3", vec![comment(4, "cursor", "fixed already")]);
+        resolved.is_resolved = true;
+        let threads = vec![
+            thread("T1", vec![comment(1, "cursor", "bot finding")]),
+            thread(
+                "T2",
+                vec![
+                    comment(2, "teammate", "human finding"),
+                    comment(3, "cursor", "bot reply"),
+                ],
+            ),
+            resolved,
+        ];
+
+        let planned = plan_bot_imports(
+            &threads,
+            &bots(),
+            &ImportedThreads::default(),
+            &HashSet::new(),
+        );
+
+        let ids: Vec<&[u64]> = planned.iter().map(|p| p.comment_ids.as_slice()).collect();
+        assert_eq!(ids, [&[1][..], &[3][..]]);
+        assert!(
+            planned[0]
+                .comment
+                .text
+                .starts_with("[github · @cursor] bot finding")
+        );
+        assert!(!planned[1].comment.text.contains("human finding"));
+    }
+
+    #[test]
+    fn import_bots_writes_once_and_leaves_human_threads_alone() {
+        let tmp = TempDir::new().unwrap();
+        let threads = vec![
+            thread("T1", vec![comment(1, "cursor", "bot finding")]),
+            thread("T2", vec![comment(2, "teammate", "human finding")]),
+        ];
+
+        let first = import_bots(tmp.path(), &threads, &bots(), "2026-10-20T12:00:00Z").unwrap();
+        let again = import_bots(tmp.path(), &threads, &bots(), "2026-10-20T12:01:00Z").unwrap();
+
+        assert_eq!(first.imported, [("T1".to_string(), "c1".to_string())]);
+        assert!(
+            again.imported.is_empty(),
+            "the sidecar dedups bot threads too"
+        );
+        assert_eq!(comment_store::load(tmp.path()).unwrap().len(), 1);
+        let human = import(tmp.path(), &threads, &bots(), "2026-10-20T12:02:00Z").unwrap();
+        assert_eq!(
+            human.imported.len(),
+            1,
+            "a bot import never marks a human thread imported"
+        );
     }
 
     #[test]

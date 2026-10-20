@@ -18,7 +18,7 @@ use crate::work::git::{GitError, GitOps};
 use crate::work::review_watch::{
     self, AutoReviewLauncher, CleanupLauncher, Clock, PollDeps, PollRequest, Sleeper,
 };
-use crate::work::run::WatchArmer;
+use crate::work::run::{AutoReviewStarter, WatchArmer};
 
 /// Errors surfaced by `tm pr create` and `tm pr status`.
 #[derive(Debug, Error)]
@@ -394,25 +394,110 @@ pub struct DetachedAutoReviewLauncher<'a> {
 
 impl AutoReviewLauncher for DetachedAutoReviewLauncher<'_> {
     fn launch_auto_review(&self, key: &str) {
-        let log_path = crate::cli::review::auto_review_log_path(self.home, key);
-        let spawned = log_path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .map_err(|e| e.to_string())
-            .and_then(|()| {
-                self.detach
-                    .spawn_detached(
-                        self.current_exe,
-                        &["review".to_string(), "auto".to_string(), key.to_string()],
-                        self.working_dir,
-                        &log_path,
-                    )
-                    .map_err(|e| e.to_string())
-            });
+        let spawned = spawn_auto_review(
+            self.detach,
+            self.current_exe,
+            self.home,
+            key,
+            self.working_dir,
+        );
         if let Err(err) = spawned {
             eprintln!("tm pr watch: could not launch tm review auto {key}: {err}");
         }
     }
+}
+
+/// Wraps a watch launcher so it does nothing while `scope`'s autopilot flag
+/// is on (GitHub issue #145). A flag that can't be read counts as on: a
+/// skipped launch is recoverable by hand, a cleanup session racing the
+/// auto-review fixer is not.
+struct AutopilotGate<'a, L: ?Sized> {
+    store: &'a RunStore,
+    scope: &'a str,
+    inner: &'a L,
+}
+
+impl<L: ?Sized> AutopilotGate<'_, L> {
+    /// Whether to skip `what` for `key`, saying so on stderr (the watch log)
+    /// when skipping.
+    fn skips(&self, what: &str, key: &str) -> bool {
+        let on = self
+            .store
+            .autopilot_enabled(self.scope)
+            .unwrap_or_else(|err| {
+                eprintln!("tm pr watch: could not read the autopilot flag: {err}");
+                true
+            });
+        if on {
+            eprintln!("tm pr watch: autopilot is on; not starting {what} for {key}");
+        }
+        on
+    }
+}
+
+impl<L: CleanupLauncher + ?Sized> CleanupLauncher for AutopilotGate<'_, L> {
+    fn launch_cleanup(&self, key: &str) {
+        if !self.skips("the bugbot cleanup session", key) {
+            self.inner.launch_cleanup(key);
+        }
+    }
+}
+
+impl<L: AutoReviewLauncher + ?Sized> AutoReviewLauncher for AutopilotGate<'_, L> {
+    fn launch_auto_review(&self, key: &str) {
+        if !self.skips("tm review auto", key) {
+            self.inner.launch_auto_review(key);
+        }
+    }
+}
+
+/// [`AutoReviewStarter`] the lane supervisor uses under autopilot (GitHub
+/// issue #145): the same detached `tm review auto <KEY>` as
+/// [`DetachedAutoReviewLauncher`], run from the lane's worktree.
+pub struct DetachedAutoReviewStarter<'a> {
+    /// Detached-child process spawning (real or fake).
+    pub detach: &'a dyn DetachSpawner,
+    /// This process's own executable path, i.e. `tm`.
+    pub current_exe: &'a Path,
+    /// The invoking user's home directory, for the log file location.
+    pub home: &'a Path,
+}
+
+impl AutoReviewStarter for DetachedAutoReviewStarter<'_> {
+    fn start(&self, ticket: &str, working_dir: &Path) -> Result<(), String> {
+        spawn_auto_review(
+            self.detach,
+            self.current_exe,
+            self.home,
+            ticket,
+            working_dir,
+        )
+    }
+}
+
+/// Spawns a detached `tm review auto <key>` in `working_dir`, logging to
+/// the ticket's auto-review log.
+fn spawn_auto_review(
+    detach: &dyn DetachSpawner,
+    current_exe: &Path,
+    home: &Path,
+    key: &str,
+    working_dir: &Path,
+) -> Result<(), String> {
+    let log_path = crate::cli::review::auto_review_log_path(home, key);
+    log_path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .map_err(|e| e.to_string())?;
+    detach
+        .spawn_detached(
+            current_exe,
+            &["review".to_string(), "auto".to_string(), key.to_string()],
+            working_dir,
+            &log_path,
+        )
+        .map(|_pid| ())
+        .map_err(|e| e.to_string())
 }
 
 /// `tm pr watch <KEY> [--foreground]`: resolve `KEY`'s open pull request,
@@ -511,7 +596,7 @@ pub fn watch(
 
     let run_id = deps.run_store.start_run(&StartRun {
         ticket: key.to_string(),
-        scope,
+        scope: scope.clone(),
         lane: "review-watch".to_string(),
         worktree: repo_root.to_string_lossy().into_owned(),
         branch: None,
@@ -533,14 +618,28 @@ pub fn watch(
                 home: deps.home,
                 working_dir: &repo_root,
             });
+    // GitHub issue #145: under autopilot the lane supervisor owns the
+    // auto-review trigger, and a cleanup session would race its fixer, so
+    // the watch only records what the bots said. Checked when a launcher
+    // fires, not now, since the flag can change during a long watch.
+    let gated_auto_review = auto_review_launcher.as_ref().map(|l| AutopilotGate {
+        store: deps.run_store,
+        scope: &scope,
+        inner: l,
+    });
+    let gated_cleanup = AutopilotGate {
+        store: deps.run_store,
+        scope: &scope,
+        inner: deps.cleanup_launcher,
+    };
     let started_at_unix = deps.clock.now_unix_secs();
     let poll_deps = PollDeps {
         gh: ctx.gh,
         store: deps.run_store,
         clock: deps.clock,
         sleeper: deps.sleeper,
-        cleanup_launcher: deps.cleanup_launcher,
-        auto_review_launcher: auto_review_launcher
+        cleanup_launcher: &gated_cleanup,
+        auto_review_launcher: gated_auto_review
             .as_ref()
             .map(|l| l as &dyn AutoReviewLauncher),
     };
@@ -1577,6 +1676,34 @@ mod tests {
     }
 
     #[test]
+    fn detached_auto_review_starter_spawns_tm_review_auto_in_the_worktree() {
+        let tmp = tempdir().unwrap();
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let starter = DetachedAutoReviewStarter {
+            detach: &detach,
+            current_exe: &current_exe,
+            home: tmp.path(),
+        };
+
+        starter
+            .start("PROJ-372", Path::new("/worktrees/proj-372"))
+            .unwrap();
+
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
+        assert_eq!(
+            recorded[0].working_dir,
+            PathBuf::from("/worktrees/proj-372")
+        );
+        assert_eq!(
+            recorded[0].log_path,
+            crate::cli::review::auto_review_log_path(tmp.path(), "PROJ-372")
+        );
+    }
+
+    #[test]
     fn watch_foreground_clean_bots_chain_auto_review_when_auto_is_on() {
         let tmp = tempdir().unwrap();
         let db_dir = tempdir().unwrap();
@@ -1625,6 +1752,93 @@ mod tests {
         let recorded = detach.recorded.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].argv, vec!["review", "auto", "PROJ-372"]);
+    }
+
+    /// Watches PROJ-372's PR #42 in the foreground under `cfg` with the
+    /// scope's autopilot flag on, bots having reviewed and left `threads`.
+    /// Returns what was spawned detached and what the cleanup launcher saw.
+    fn watch_under_autopilot(
+        mut cfg: Config,
+        threads: Vec<crate::github::bot_findings::ReviewThread>,
+    ) -> (Vec<Vec<String>>, Vec<String>) {
+        let tmp = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let run_store = open_run_store(db_dir.path());
+        cfg.work.auto_review.auto = true;
+        cfg.work.review_watch.on_bots_done = crate::config::OnBotsDone::Launch;
+        let scope = crate::config::BackendIdentity::from_config(&cfg).scope();
+        run_store.set_autopilot(&scope, true).unwrap();
+        let jira = FakeJiraClient::new();
+        let gh = FakeGhCli::new()
+            .with_pr_list(Ok(vec![pr_with_title("[PROJ-372] Fix the thing")]))
+            .with_pr_state(42, Ok(PrLifecycle::Open))
+            .with_pr_reviews(
+                42,
+                Ok(vec![crate::github::bot_findings::PrReview {
+                    author_login: Some("cursor[bot]".to_string()),
+                }]),
+            )
+            .with_review_threads(42, Ok(threads))
+            .with_pr_bot_finding_details(42, Ok(vec![]));
+        let ctx = TicketingContext {
+            jira: &jira,
+            gh: &gh,
+            config: &cfg,
+        };
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let clock = FakeClock::at(0);
+        let sleeper = FakeSleeper::default();
+        let cleanup = FakeCleanupLauncher::default();
+        let home = tmp.path().to_path_buf();
+        let git = FakeGitOps::new();
+        let cwd = PathBuf::from("/repo");
+        let deps = watch_deps(
+            &run_store,
+            &detach,
+            &current_exe,
+            &clock,
+            &sleeper,
+            &cleanup,
+            &home,
+            &git,
+            &cwd,
+        );
+
+        let outcome = watch(&ctx, &deps, "PROJ-372", true, &mut Vec::new()).unwrap();
+
+        assert_eq!(outcome, WatchOutcome::Handled);
+        let spawned = detach
+            .recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.argv.clone())
+            .collect();
+        (spawned, cleanup.calls())
+    }
+
+    #[test]
+    fn watch_under_autopilot_does_not_chain_auto_review_on_clean_bots() {
+        let (spawned, _) = watch_under_autopilot(config(), vec![]);
+
+        assert!(
+            spawned.is_empty(),
+            "the lane supervisor starts auto-review under autopilot: {spawned:?}"
+        );
+    }
+
+    #[test]
+    fn watch_under_autopilot_never_launches_the_cleanup_session() {
+        let (_, cleanup_calls) = watch_under_autopilot(
+            config(),
+            vec![crate::github::bot_findings::ReviewThread {
+                is_resolved: false,
+                author_login: Some("cursor".to_string()),
+            }],
+        );
+
+        assert!(cleanup_calls.is_empty(), "{cleanup_calls:?}");
     }
 
     #[test]

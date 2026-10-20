@@ -67,7 +67,7 @@ pub enum AutoReviewError {
     /// One of [`AutoReviewOps`]' steps failed.
     #[error("auto-review {step} failed: {message}")]
     Step {
-        /// Which step: `review`, `fix`, `publish` or `record`.
+        /// Which step: `review`, `import`, `fix`, `publish` or `record`.
         step: &'static str,
         /// The underlying error, rendered.
         message: String,
@@ -218,6 +218,10 @@ pub trait AutoReviewOps {
     fn fix_cap_reached(&self) -> Result<bool, AutoReviewError>;
     /// Seconds since the Unix epoch, for comments' `created_at`.
     fn now_unix_secs(&self) -> i64;
+    /// Imports the PR's not-yet-imported, unresolved review-bot threads into
+    /// the comment store, so the fix about to run addresses them too
+    /// (GitHub issue #145). Returns how many were imported.
+    fn import_bot_comments(&self) -> Result<usize, AutoReviewError>;
 }
 
 /// How one round ended, recorded as the tail of its [`ROUND_EVENT`]
@@ -310,6 +314,9 @@ pub fn run_loop(
             });
         }
 
+        // Review bots' comments ride along with a fix but never start one:
+        // only this round's own findings decided `verdict` above.
+        ops.import_bot_comments()?;
         let fixed = ops.fix()?;
         let verdict = if fixed {
             RoundVerdict::Fix
@@ -348,6 +355,12 @@ mod tests {
         prompts: RefCell<Vec<String>>,
         store_at_fix: RefCell<Vec<usize>>,
         fix_cap_reached: bool,
+        /// Bot comments the first `import_bot_comments` call appends; later
+        /// calls append nothing, as the dedup sidecar would.
+        bot_comments: RefCell<Vec<NewComment>>,
+        /// `log`'s length at each `import_bot_comments` call, so a test can
+        /// place the import among the logged steps without changing them.
+        import_at: RefCell<Vec<usize>>,
     }
 
     impl FakeOps {
@@ -360,6 +373,8 @@ mod tests {
                 prompts: RefCell::new(Vec::new()),
                 store_at_fix: RefCell::new(Vec::new()),
                 fix_cap_reached: false,
+                bot_comments: RefCell::new(Vec::new()),
+                import_at: RefCell::new(Vec::new()),
             }
         }
 
@@ -409,6 +424,15 @@ mod tests {
 
         fn fix_cap_reached(&self) -> Result<bool, AutoReviewError> {
             Ok(self.fix_cap_reached)
+        }
+
+        fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {
+            self.import_at.borrow_mut().push(self.log.borrow().len());
+            let comments = std::mem::take(&mut *self.bot_comments.borrow_mut());
+            if !comments.is_empty() {
+                comment_store::append(&self.git_dir, &comments, "2026-10-20T00:00:00Z")?;
+            }
+            Ok(comments.len())
         }
 
         fn now_unix_secs(&self) -> i64 {
@@ -552,6 +576,53 @@ mod tests {
         assert!(
             prompts[1].contains(&*comment_store::archive_path(tmp.path(), 1).to_string_lossy())
         );
+    }
+
+    fn bot_comment(text: &str) -> NewComment {
+        NewComment {
+            path: "src/b.rs".to_string(),
+            start_line: 2,
+            end_line: 2,
+            text: format!("[github · @cursor[bot]] {text}"),
+        }
+    }
+
+    #[test]
+    fn bot_comments_are_imported_right_before_each_fix_and_ride_along() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM, "[]"]);
+        *ops.bot_comments.borrow_mut() = vec![bot_comment("off by one")];
+        let cfg = AutoReviewConfig {
+            max_review_rounds: 3,
+            ..cfg()
+        };
+
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(
+            *ops.import_at.borrow(),
+            vec![1, 4],
+            "once after each fixing round's review, before its fix"
+        );
+        assert_eq!(
+            *ops.store_at_fix.borrow(),
+            vec![2, 1],
+            "round 1's fix sees its finding plus the bot comment; round 2's \
+             sees only its own, the bot thread having been imported once"
+        );
+    }
+
+    #[test]
+    fn bot_comments_never_trigger_a_fix() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec!["[]"]);
+        *ops.bot_comments.borrow_mut() = vec![bot_comment("off by one")];
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert!(ops.import_at.borrow().is_empty());
+        assert!(!ops.log().contains(&"fix".to_string()));
     }
 
     #[test]
@@ -708,6 +779,9 @@ mod tests {
             }
             fn now_unix_secs(&self) -> i64 {
                 0
+            }
+            fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {
+                unreachable!()
             }
         }
         let tmp = TempDir::new().unwrap();
