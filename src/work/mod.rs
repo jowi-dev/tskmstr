@@ -21,6 +21,7 @@ pub mod interactive;
 pub mod kill_safety;
 pub mod manual;
 pub mod merge;
+pub mod model;
 pub mod naming;
 pub mod notify;
 pub mod prompt;

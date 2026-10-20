@@ -6485,8 +6485,14 @@ mod tests {
     fn runner_models_are_unset_when_no_agent_table_sets_them() {
         let cfg = load_with("", None).expect("should load");
 
-        assert_eq!(cfg.models.for_kind(AgentKind::Claude), &RunnerModels::default());
-        assert_eq!(cfg.models.for_kind(AgentKind::Opencode), &RunnerModels::default());
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Claude),
+            &RunnerModels::default()
+        );
+        assert_eq!(
+            cfg.models.for_kind(AgentKind::Opencode),
+            &RunnerModels::default()
+        );
     }
 
     #[test]
@@ -6509,17 +6515,23 @@ mod tests {
             "global kept"
         );
         assert_eq!(
-            cfg.models.for_kind(AgentKind::Opencode).default_model.as_deref(),
+            cfg.models
+                .for_kind(AgentKind::Opencode)
+                .default_model
+                .as_deref(),
             Some("venice/global")
         );
     }
 
     #[test]
     fn a_usage_probe_model_on_a_runner_without_a_probe_is_a_config_error() {
-        let err = load_with("[agent.opencode]\nusage_probe_model = \"venice/x\"\n", None)
-            .unwrap_err();
+        let err =
+            load_with("[agent.opencode]\nusage_probe_model = \"venice/x\"\n", None).unwrap_err();
         assert!(
-            matches!(err, ConfigError::UsageProbeModelUnsupported { runner: "opencode" }),
+            matches!(
+                err,
+                ConfigError::UsageProbeModelUnsupported { runner: "opencode" }
+            ),
             "{err:?}"
         );
     }
