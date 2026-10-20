@@ -928,7 +928,11 @@ An optional `subagent` key names the lane's delegation subagent (see
 (`.claude/agents/<name>.md` or `.opencode/agent/<name>.md`, which carries
 the subagent's own `model`), not a runtime driver setting. It is consumed
 by `tm init`/`tm check`/`tm update` to detect and additively fix a missing
-definition; the lane's own model/turn/permission keys are unaffected.
+definition; the lane's own model/turn/permission keys are unaffected. Lane
+runs also export it as `TSKMSTR_SUBAGENT`, so the lane's
+`guard-delegate.sh` hook tells the main loop to delegate edits to that
+agent by name (with no `subagent` set, it says to delegate to a subagent
+without naming one).
 
 `tm work run <lane> [ticket]` and the board's `w` key (see "Board-launched
 lane runs" below) both refuse a lane whose `repo` resolves to a different
