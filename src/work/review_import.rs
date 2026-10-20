@@ -357,18 +357,17 @@ pub fn import_bots(
     import_planned(git_dir, threads, bots, created_at, plan_bot_imports)
 }
 
+/// [`plan_imports`] or [`plan_bot_imports`].
+type Planner =
+    fn(&[FullReviewThread], &[String], &ImportedThreads, &HashSet<String>) -> Vec<PlannedImport>;
+
 /// One import pass with `plan` picking the threads.
 fn import_planned(
     git_dir: &Path,
     threads: &[FullReviewThread],
     bots: &[String],
     created_at: &str,
-    plan: fn(
-        &[FullReviewThread],
-        &[String],
-        &ImportedThreads,
-        &HashSet<String>,
-    ) -> Vec<PlannedImport>,
+    plan: Planner,
 ) -> Result<ImportReport, CommentStoreError> {
     let mut sidecar = load_sidecar(git_dir)?;
     let texts = local_texts(git_dir)?;

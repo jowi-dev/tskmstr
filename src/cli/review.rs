@@ -501,6 +501,7 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 /// [`fix`]; [`ReviewCliError::AutoReviewRunning`] for a second loop;
 /// [`ReviewCliError::PromptFile`] for an unreadable `prompt_file`;
 /// [`ReviewCliError::AutoReview`] if any round step fails.
+#[allow(clippy::too_many_arguments)]
 pub fn auto(
     deps: &ReviewFixDeps<'_>,
     paths: &RunLanePaths,
