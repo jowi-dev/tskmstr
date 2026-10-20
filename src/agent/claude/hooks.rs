@@ -540,6 +540,82 @@ mod tests {
         );
     }
 
+    /// Runs the embedded `guard-delegate.sh` as a lane main loop would hit
+    /// it (an `Edit` with no `agent_id`), with `TSKMSTR_RUN_ID` set and
+    /// `TSKMSTR_SUBAGENT` set to `subagent` or removed. Returns the deny
+    /// reason, or `None` when `jq` is missing (the script fails open
+    /// without it, so there is nothing to assert).
+    fn guard_delegate_deny_reason(subagent: Option<&str>) -> Option<String> {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let jq_found = Command::new("jq")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !jq_found {
+            eprintln!("skipping: jq not on PATH");
+            return None;
+        }
+        let (_, script) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "guard-delegate.sh")
+            .unwrap();
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("TSKMSTR_RUN_ID", "run-1")
+            .env_remove(crate::agent::TSKMSTR_SUBAGENT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(subagent) = subagent {
+            command.env(crate::agent::TSKMSTR_SUBAGENT, subagent);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"tool_name":"Edit","tool_input":{}}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)));
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+        Some(
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    #[test]
+    fn guard_delegate_names_the_lane_subagent_when_set() {
+        let Some(reason) = guard_delegate_deny_reason(Some("impl")) else {
+            return;
+        };
+        assert!(reason.contains("`impl`"), "{reason}");
+        assert!(reason.contains("Agent tool"), "{reason}");
+    }
+
+    #[test]
+    fn guard_delegate_still_says_to_delegate_without_a_subagent() {
+        for subagent in [None, Some("")] {
+            let Some(reason) = guard_delegate_deny_reason(subagent) else {
+                return;
+            };
+            assert!(
+                reason.contains("Delegate this change to a subagent"),
+                "{reason}"
+            );
+            assert!(!reason.contains("``"), "{subagent:?}: {reason}");
+        }
+    }
+
     // --- Session-usage gating parity (docs/plans/session-usage.md "Hook
     // gating: marker fallback") — the four telemetry scripts must keep the
     // marker-fallback path so registered interactive sessions (audit/create)
