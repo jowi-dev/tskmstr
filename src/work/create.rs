@@ -106,12 +106,16 @@ pub struct CreateLaunchOutcome {
 /// and `identity`'s [`session_slug`](BackendIdentity::session_slug)
 /// qualifies the session name, both exactly as
 /// [`crate::work::audit::launch_audit`] does.
+///
+/// The session's model is `create_cfg.model`, else the rest of the chain
+/// `model_defaults` ends (GitHub issue #143, [`crate::work::model`]).
 pub fn launch_create(
     tmux: &dyn TmuxOps,
     create_cfg: &CreateConfig,
     home: &Path,
     identity: &BackendIdentity,
     runner: &dyn AgentRunner,
+    model_defaults: crate::work::model::ModelDefaults<'_>,
 ) -> Result<CreateLaunchOutcome, CreateLaunchError> {
     let raw_dir = create_cfg
         .dir
@@ -142,7 +146,14 @@ pub fn launch_create(
         .as_deref()
         .or(create_cfg.prompt.as_deref())
         .unwrap_or_else(|| runner.default_create_prompt());
-    let command = runner.interactive_shell_command(create_cfg.model.as_deref(), prompt);
+    let model = model_defaults.resolve(
+        runner,
+        &[crate::work::model::ModelCandidate {
+            source: "[work.create] model",
+            model: create_cfg.model.as_deref(),
+        }],
+    );
+    let command = runner.interactive_shell_command(&model.model, prompt);
 
     if existing_windows.is_empty() {
         tmux.new_session_with_command(&session_name, &dir_str, &window_name, &[], &command)?;
@@ -204,8 +215,15 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("~/Projects/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect("launch should succeed");
+        let outcome = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
         assert_eq!(outcome.window_name, "create");
@@ -218,7 +236,7 @@ mod tests {
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                     window_name: "create".to_string(),
                     env: vec![],
-                    command: "claude '/ticket-create'".to_string(),
+                    command: "claude --model 'opus' '/ticket-create'".to_string(),
                 },
             ]
         );
@@ -230,8 +248,15 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = CreateConfig::default();
 
-        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect_err("should refuse to launch");
+        let err = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect_err("should refuse to launch");
 
         assert!(matches!(err, CreateLaunchError::NotConfigured));
         assert!(tmux.calls().is_empty());
@@ -243,8 +268,15 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect_err("should refuse to double-launch");
+        let err = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect_err("should refuse to double-launch");
 
         match err {
             CreateLaunchError::AlreadyRunning {
@@ -267,8 +299,15 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect("launch should succeed");
+        let outcome = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.window_name, "create-2");
         assert_eq!(
@@ -280,7 +319,7 @@ mod tests {
                     window_name: "create-2".to_string(),
                     dir: "/repo/axiom".to_string(),
                     env: vec![],
-                    command: "claude '/ticket-create'".to_string(),
+                    command: "claude --model 'opus' '/ticket-create'".to_string(),
                 },
                 TmuxCall::SelectWindow {
                     name: "tm-proj-create".to_string(),
@@ -298,10 +337,54 @@ mod tests {
         let home = PathBuf::from("/Users/jowi");
         let cfg = configured("/repo/axiom");
 
-        let outcome = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect("launch should succeed");
+        let outcome = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect("launch should succeed");
 
         assert_eq!(outcome.session_name, "tm-proj-create");
+    }
+
+    /// GitHub issue #143: with no `[work.create] model`, the session uses
+    /// `[work] default_model`.
+    #[test]
+    fn launch_create_falls_back_to_the_work_default_model() {
+        let tmux = FakeTmuxOps::new();
+        let cfg = CreateConfig {
+            dir: Some("/repo/axiom".to_string()),
+            prompt: None,
+            prompt_file: None,
+            model: None,
+        };
+        let models = crate::config::ModelsConfig::default();
+        let defaults = crate::work::model::ModelDefaults {
+            work_default: Some("sonnet"),
+            models: &models,
+        };
+
+        launch_create(
+            &tmux,
+            &cfg,
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            defaults,
+        )
+        .unwrap();
+
+        let command = tmux.calls().iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            command,
+            Some("claude --model 'sonnet' '/ticket-create'".to_string())
+        );
     }
 
     #[test]
@@ -315,7 +398,15 @@ mod tests {
             model: Some("opus".to_string()),
         };
 
-        launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER).unwrap();
+        launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap();
 
         let command = tmux.calls().iter().find_map(|call| match call {
             TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
@@ -341,13 +432,24 @@ mod tests {
             model: None,
         };
 
-        launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER).unwrap();
+        launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap();
 
         let command = tmux.calls().iter().find_map(|call| match call {
             TmuxCall::NewSessionWithCommand { command, .. } => Some(command.clone()),
             _ => None,
         });
-        assert_eq!(command, Some("claude '/my-file-prompt'".to_string()));
+        assert_eq!(
+            command,
+            Some("claude --model 'opus' '/my-file-prompt'".to_string())
+        );
     }
 
     #[test]
@@ -363,8 +465,15 @@ mod tests {
             model: None,
         };
 
-        let err = launch_create(&tmux, &cfg, &home, &test_identity(), RUNNER)
-            .expect_err("missing prompt file should error");
+        let err = launch_create(
+            &tmux,
+            &cfg,
+            &home,
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .expect_err("missing prompt file should error");
 
         match &err {
             CreateLaunchError::PromptFile(inner) => {

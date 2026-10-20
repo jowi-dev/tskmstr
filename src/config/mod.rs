@@ -1048,6 +1048,18 @@ pub struct ModelsConfig {
 }
 
 impl ModelsConfig {
+    /// No models configured for any runner.
+    pub const UNSET: ModelsConfig = ModelsConfig {
+        claude: RunnerModels {
+            default_model: None,
+            usage_probe_model: None,
+        },
+        opencode: RunnerModels {
+            default_model: None,
+            usage_probe_model: None,
+        },
+    };
+
     /// The models configured for `kind`.
     pub fn for_kind(&self, kind: AgentKind) -> &RunnerModels {
         match kind {

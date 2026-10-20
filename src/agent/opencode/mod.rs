@@ -11,14 +11,14 @@
 //! Headless (`RunMode::Headless`):
 //!
 //! ```text
-//! opencode run --format json [--model <provider/model>]
+//! opencode run --format json --model <provider/model>
 //!     [--dangerously-skip-permissions] -- <prompt>
 //! ```
 //!
 //! Interactive (`RunMode::Interactive`, the default `opencode` TUI command):
 //!
 //! ```text
-//! opencode [--model <provider/model>] --prompt <prompt>
+//! opencode --model <provider/model> --prompt <prompt>
 //! ```
 //!
 //! The TUI takes no permission flag at all: opencode 1.15.13 rejects
@@ -26,13 +26,8 @@
 //! instantly. Headless bypass uses `--dangerously-skip-permissions`,
 //! 1.15.13's only CLI-level bypass.
 //!
-//! # Three deliberate divergences from `claude`
+//! # Two deliberate divergences from `claude`
 //!
-//! - **No default model.** `--model` is omitted entirely when
-//!   [`crate::agent::InvocationInputs::model`] is `None`, letting opencode's
-//!   own multi-provider default-model resolution apply — unlike
-//!   [`crate::agent::claude::ClaudeRunner`]'s always-pass-`fable` convention,
-//!   which makes sense only for a single-provider CLI.
 //! - **Empty `env_remove`.** `claude`'s `env_remove` strips
 //!   `ANTHROPIC_*`/`CLAUDECODE` for subscription-billing safety; opencode's
 //!   provider credentials are explicit config or env keys the user intends
@@ -311,10 +306,8 @@ impl AgentRunner for OpencodeRunner {
                 args.push("run".to_string());
                 args.push("--format".to_string());
                 args.push("json".to_string());
-                if let Some(model) = inputs.model {
-                    args.push("--model".to_string());
-                    args.push(model);
-                }
+                args.push("--model".to_string());
+                args.push(inputs.model);
                 if bypass {
                     args.push("--dangerously-skip-permissions".to_string());
                 }
@@ -330,10 +323,8 @@ impl AgentRunner for OpencodeRunner {
                 // impls' `args[0]` convention.
                 args.push("--prompt".to_string());
                 args.push(inputs.prompt);
-                if let Some(model) = inputs.model {
-                    args.push("--model".to_string());
-                    args.push(model);
-                }
+                args.push("--model".to_string());
+                args.push(inputs.model);
             }
         }
 
@@ -499,21 +490,15 @@ impl AgentRunner for OpencodeRunner {
         }
     }
 
-    /// Builds `opencode --model <model> --prompt <prompt>` (or `opencode
-    /// --prompt <prompt>` when `model` is `None`), every value
+    /// Builds `opencode --model <model> --prompt <prompt>`, every value
     /// [`shell_quote`]d. Mirrors [`crate::agent::claude::ClaudeRunner`]'s
-    /// same-named method; `--model` is omitted (not defaulted) when absent,
-    /// same rationale as `build_invocation`'s headless/interactive `--model`
-    /// handling.
-    fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String {
-        match model {
-            Some(model) => format!(
-                "opencode --model {} --prompt {}",
-                shell_quote(model),
-                shell_quote(prompt)
-            ),
-            None => format!("opencode --prompt {}", shell_quote(prompt)),
-        }
+    /// same-named method.
+    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String {
+        format!(
+            "opencode --model {} --prompt {}",
+            shell_quote(model),
+            shell_quote(prompt)
+        )
     }
 
     /// Overrides the default: opencode's interactive prompt is the value
@@ -693,15 +678,11 @@ impl AgentRunner for OpencodeRunner {
         model.split_once('/').map(|(_, m)| m).unwrap_or(model)
     }
 
-    /// opencode wants the full `provider/model` spelling. There is no safe
-    /// universal default across providers, so `--yes` leaves `model` unset
-    /// (`yes_default: None`) and `tm init` prints that the run will fall
-    /// back to opencode's own default model. See
+    /// opencode wants the full `provider/model` spelling. See
     /// [`crate::agent::LaneModelPrompt`].
     fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
         crate::agent::LaneModelPrompt {
             help: "provider/model, e.g. venice/z-ai-glm-5-3",
-            yes_default: None,
         }
     }
 
@@ -812,13 +793,17 @@ mod tests {
 
     #[test]
     fn opencode_has_no_usage_probe() {
-        assert!(OpencodeRunner.usage_probe_invocation().is_none());
+        assert!(
+            OpencodeRunner
+                .usage_probe_invocation("venice/glm")
+                .is_none()
+        );
     }
 
     fn base_inputs() -> InvocationInputs {
         InvocationInputs {
             prompt: "do the thing".to_string(),
-            model: Some("anthropic/claude-sonnet-4-5".to_string()),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
             max_turns: Some("300".to_string()),
             permission_mode: Some("bypassPermissions".to_string()),
             settings_path: None,
@@ -883,7 +868,7 @@ mod tests {
     fn resume_spec_drops_the_prompt_flag_and_its_value() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             prompt: "do the thing".to_string(),
-            model: Some("anthropic/claude-sonnet-4-5".to_string()),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
             max_turns: None,
             permission_mode: None,
             settings_path: None,
@@ -1157,22 +1142,6 @@ mod tests {
                 "anthropic/claude-sonnet-4-5",
             ]
         );
-    }
-
-    #[test]
-    fn model_omitted_when_none_in_both_modes() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            model: None,
-            ..base_inputs()
-        });
-        assert!(!headless.args.iter().any(|a| a == "--model"));
-
-        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
-            model: None,
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
-        assert!(!interactive.args.iter().any(|a| a == "--model"));
     }
 
     #[test]
@@ -1461,13 +1430,8 @@ mod tests {
     #[test]
     fn interactive_shell_command_quotes_model_and_prompt() {
         assert_eq!(
-            OpencodeRunner
-                .interactive_shell_command(Some("anthropic/opus"), "/ticket-audit PROJ-9"),
+            OpencodeRunner.interactive_shell_command("anthropic/opus", "/ticket-audit PROJ-9"),
             "opencode --model 'anthropic/opus' --prompt '/ticket-audit PROJ-9'"
-        );
-        assert_eq!(
-            OpencodeRunner.interactive_shell_command(None, "/ticket-audit PROJ-9"),
-            "opencode --prompt '/ticket-audit PROJ-9'"
         );
     }
 
@@ -1477,7 +1441,7 @@ mod tests {
     fn tmux_command_line_reads_the_prompt_from_the_file_with_no_env_prefix() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             prompt: "do the thing".to_string(),
-            model: Some("anthropic/claude-sonnet-4-5".to_string()),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
             max_turns: None,
             permission_mode: Some("bypassPermissions".to_string()),
             settings_path: None,
@@ -1507,7 +1471,7 @@ mod tests {
     fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
         let invocation = OpencodeRunner.build_invocation(InvocationInputs {
             prompt: "prompt".to_string(),
-            model: None,
+            model: "venice/glm".to_string(),
             max_turns: None,
             permission_mode: Some("bypassPermissions".to_string()),
             settings_path: None,
@@ -1522,13 +1486,6 @@ mod tests {
     }
 
     // --- lane_model_prompt / validate_lane_model (GitHub issue #51) ---
-
-    #[test]
-    fn lane_model_prompt_has_no_yes_default() {
-        // No safe universal default across providers: `--yes` leaves the key
-        // unset and `tm init` prints the consequence.
-        assert_eq!(OpencodeRunner.lane_model_prompt().yes_default, None);
-    }
 
     #[test]
     fn validate_lane_model_requires_a_provider_model_spelling() {

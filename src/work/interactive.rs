@@ -281,7 +281,7 @@ mod tests {
     fn interactive_invocation(prompt: &str) -> AgentInvocation {
         ClaudeRunner.build_invocation(InvocationInputs {
             prompt: prompt.to_string(),
-            model: Some("fable".to_string()),
+            model: "fable".to_string(),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
             settings_path: Some(PathBuf::from("/hooks/settings.json")),
@@ -314,7 +314,7 @@ mod tests {
         let invocation = crate::agent::opencode::OpencodeRunner.build_invocation(
             crate::agent::InvocationInputs {
                 prompt: prompt.to_string(),
-                model: None,
+                model: "venice/glm".to_string(),
                 max_turns: None,
                 permission_mode: None,
                 settings_path: None,

@@ -41,9 +41,11 @@
 //! code path that omits any of them. Where a lane/run option is absent,
 //! `run_lane` substitutes a hardcoded default and still passes the flag —
 //! it never falls back to omitting a flag and trusting `claude`'s own
-//! default. This module ports that: absent `model`/`max_turns`/
-//! `permission_mode` resolve to hardcoded defaults (`"fable"`, `"200"`,
-//! `"bypassPermissions"`) rather than being left out of argv. The
+//! default. This module ports that: absent `max_turns`/`permission_mode`
+//! resolve to hardcoded defaults (`"200"`, `"bypassPermissions"`) rather
+//! than being left out of argv. `model` is never absent: the caller always
+//! resolves one through `crate::work::model::resolve_model` (GitHub issue
+//! #143), so this adapter holds no default model. The
 //! permission-mode default deliberately diverges from `work.ml`'s
 //! `"acceptEdits"` — see [`DEFAULT_PERMISSION_MODE`] (issue #29). `--settings`
 //! is the one exception, since phase 5 of GitHub issue #17
@@ -134,11 +136,6 @@ const PRICE_TABLE: &[(&str, ModelPrice)] = &[
     ),
 ];
 
-/// Driver model default when a lane/run doesn't specify one, mirroring
-/// `run_lane`'s `let model = match opts.model with Some m -> m | None ->
-/// "fable"`.
-const DEFAULT_MODEL: &str = "fable";
-
 /// `--max-turns` default, mirroring `run_lane`'s `let max_turns = match
 /// opts.max_turns with Some t -> t | None -> "200"`.
 const DEFAULT_MAX_TURNS: &str = "200";
@@ -176,16 +173,17 @@ impl AgentRunner for ClaudeRunner {
         "Claude Code"
     }
 
-    /// `claude -p 'ok' --model haiku --max-turns 1 --output-format
-    /// stream-json --verbose`: one Haiku turn (about $0.003 list price when
-    /// measured), whose `rate_limit_event` is the snapshot. Built through
+    /// `claude -p 'ok' --model <model> --max-turns 1 --output-format
+    /// stream-json --verbose`: one turn (about $0.003 list price on haiku,
+    /// the built-in probe model, when measured), whose `rate_limit_event`
+    /// is the snapshot. Built through
     /// [`ClaudeRunner::build_invocation`] so it keeps the billing-safety env
     /// stripping. No settings, so no telemetry hooks fire, and no run id, so
     /// it is untracked. See `docs/plans/gh-113-proactive-usage-signal.md`.
-    fn usage_probe_invocation(&self) -> Option<AgentInvocation> {
+    fn usage_probe_invocation(&self, model: &str) -> Option<AgentInvocation> {
         Some(self.build_invocation(InvocationInputs {
             prompt: "ok".to_string(),
-            model: Some("haiku".to_string()),
+            model: model.to_string(),
             max_turns: Some("1".to_string()),
             permission_mode: None,
             settings_path: None,
@@ -221,8 +219,8 @@ impl AgentRunner for ClaudeRunner {
     }
 
     /// Build the [`AgentInvocation`] for one run from already-resolved
-    /// [`InvocationInputs`], applying the same model/max-turns/
-    /// permission-mode defaults `work.ml`'s `run_lane` applies when a
+    /// [`InvocationInputs`], applying the same max-turns/permission-mode
+    /// defaults `work.ml`'s `run_lane` applies when a
     /// lane/run option is absent.
     ///
     /// [`InvocationInputs::mode`] forks both halves of the result:
@@ -241,7 +239,6 @@ impl AgentRunner for ClaudeRunner {
     ///
     /// Read [`RunMode`] before touching the env-set fork.
     fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
-        let model = inputs.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let permission_mode = inputs
             .permission_mode
             .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string());
@@ -260,7 +257,7 @@ impl AgentRunner for ClaudeRunner {
             RunMode::Interactive => args.push(inputs.prompt),
         }
         args.push("--model".to_string());
-        args.push(model);
+        args.push(inputs.model);
         if let Some(settings_path) = inputs.settings_path {
             args.push("--settings".to_string());
             args.push(settings_path.to_string_lossy().into_owned());
@@ -398,23 +395,20 @@ impl AgentRunner for ClaudeRunner {
         }
     }
 
-    /// Builds `claude --model <model> <prompt>` (or `claude <prompt>` when
-    /// `model` is `None`), every value [`shell_quote`]d. `--model` is
-    /// emitted only when `model` is `Some`, so an unconfigured launch keeps
-    /// the exact command shape it had before the option existed. Moved
+    /// Builds `claude --model <model> <prompt>`, every value
+    /// [`shell_quote`]d. `--model` is always passed (GitHub issue #143), so
+    /// a session never runs on claude's own or an enterprise-pinned
+    /// default unless config resolves to that model. Moved
     /// verbatim from `work::audit::claude_command` (deleted); shared by
     /// [`crate::work::audit::launch_audit`] and
     /// [`crate::work::bugbot::launch_cleanup`], which host their sessions
     /// the same way.
-    fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String {
-        match model {
-            Some(model) => format!(
-                "claude --model {} {}",
-                shell_quote(model),
-                shell_quote(prompt)
-            ),
-            None => format!("claude {}", shell_quote(prompt)),
-        }
+    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String {
+        format!(
+            "claude --model {} {}",
+            shell_quote(model),
+            shell_quote(prompt)
+        )
     }
 
     fn default_audit_prompt_template(&self) -> &'static str {
@@ -514,13 +508,11 @@ impl AgentRunner for ClaudeRunner {
         model.strip_prefix("claude-").unwrap_or(model)
     }
 
-    /// Claude wants a bare model name (`fable`, `sonnet`); `--yes` writes
-    /// [`DEFAULT_MODEL`], matching this adapter's always-pass-`fable`
-    /// convention. See [`crate::agent::LaneModelPrompt`].
+    /// Claude wants a bare model name (`opus`, `sonnet`). See
+    /// [`crate::agent::LaneModelPrompt`].
     fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
         crate::agent::LaneModelPrompt {
-            help: "bare model name, e.g. fable or sonnet",
-            yes_default: Some(DEFAULT_MODEL),
+            help: "bare model name, e.g. opus or sonnet",
         }
     }
 
@@ -739,7 +731,7 @@ mod tests {
     fn base_inputs() -> InvocationInputs {
         InvocationInputs {
             prompt: "do the thing".to_string(),
-            model: Some("sonnet".to_string()),
+            model: "sonnet".to_string(),
             max_turns: Some("300".to_string()),
             permission_mode: Some("plan".to_string()),
             settings_path: Some(PathBuf::from(
@@ -826,12 +818,8 @@ mod tests {
     #[test]
     fn interactive_shell_command_quotes_model_and_prompt() {
         assert_eq!(
-            ClaudeRunner.interactive_shell_command(Some("opus"), "/ticket-audit PROJ-9"),
+            ClaudeRunner.interactive_shell_command("opus", "/ticket-audit PROJ-9"),
             "claude --model 'opus' '/ticket-audit PROJ-9'"
-        );
-        assert_eq!(
-            ClaudeRunner.interactive_shell_command(None, "/ticket-audit PROJ-9"),
-            "claude '/ticket-audit PROJ-9'"
         );
     }
 
@@ -868,7 +856,7 @@ mod tests {
     fn tmux_command_line_strips_billing_env_and_reads_the_prompt_from_the_file() {
         let invocation = ClaudeRunner.build_invocation(InvocationInputs {
             prompt: "do the thing".to_string(),
-            model: Some("fable".to_string()),
+            model: "fable".to_string(),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
             settings_path: Some(PathBuf::from("/hooks/settings.json")),
@@ -895,7 +883,7 @@ mod tests {
     fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
         let invocation = ClaudeRunner.build_invocation(InvocationInputs {
             prompt: "prompt".to_string(),
-            model: Some("fable".to_string()),
+            model: "fable".to_string(),
             max_turns: Some("200".to_string()),
             permission_mode: Some("acceptEdits".to_string()),
             settings_path: Some(PathBuf::from("/hooks/settings.json")),
@@ -935,9 +923,8 @@ mod tests {
     }
 
     #[test]
-    fn absent_model_and_max_turns_and_permission_mode_fall_back_to_built_in_defaults() {
+    fn absent_max_turns_and_permission_mode_fall_back_to_built_in_defaults() {
         let inputs = InvocationInputs {
-            model: None,
             max_turns: None,
             permission_mode: None,
             ..base_inputs()
@@ -946,14 +933,13 @@ mod tests {
         let invocation = ClaudeRunner.build_invocation(inputs);
 
         // work.ml never omits these flags when the option is absent — it
-        // substitutes a hardcoded default and still passes the flag. That
-        // never-omit convention still holds for all three; the
+        // substitutes a hardcoded default and still passes the flag. The
         // permission-mode *value* deliberately diverges from work.ml per
-        // issue #29 (see `DEFAULT_PERMISSION_MODE`).
-        assert!(invocation.args.contains(&"--model".to_string()));
+        // issue #29 (see `DEFAULT_PERMISSION_MODE`). The model has no
+        // adapter default at all: the caller always passes one (#143).
         assert_eq!(
             invocation.args[invocation.args.iter().position(|a| a == "--model").unwrap() + 1],
-            "fable"
+            "sonnet"
         );
         assert!(invocation.args.contains(&"--max-turns".to_string()));
         assert_eq!(
@@ -1129,7 +1115,7 @@ mod tests {
     #[test]
     fn usage_probe_is_one_haiku_turn_in_stream_json_with_billing_env_stripped() {
         let probe = ClaudeRunner
-            .usage_probe_invocation()
+            .usage_probe_invocation("haiku")
             .expect("claude has a usage probe");
 
         assert_eq!(probe.program, "claude");
@@ -1575,12 +1561,6 @@ mod tests {
     }
 
     // --- lane_model_prompt / validate_lane_model (GitHub issue #51) ---
-
-    #[test]
-    fn lane_model_prompt_defaults_to_the_always_passed_model() {
-        let prompt = ClaudeRunner.lane_model_prompt();
-        assert_eq!(prompt.yes_default, Some(DEFAULT_MODEL));
-    }
 
     #[test]
     fn validate_lane_model_accepts_bare_names_and_rejects_provider_spelling() {

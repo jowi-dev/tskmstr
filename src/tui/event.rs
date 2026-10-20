@@ -219,6 +219,12 @@ pub struct TuiDeps {
     /// cleanup session is disabled (a status-line error) when `dir` is unset;
     /// see [`crate::work::bugbot::launch_cleanup`].
     pub review_watch: crate::config::ReviewWatchConfig,
+    /// `[work] default_model`, which the audit, create and cleanup sessions'
+    /// models fall back to after their own `model` keys (GitHub issue
+    /// #143).
+    pub work_default_model: Option<String>,
+    /// The `[agent.<runner>]` models those sessions' model chain ends in.
+    pub models: crate::config::ModelsConfig,
     /// `$XDG_DATA_HOME`, if set, used (with `home`) to locate the findings
     /// file a launched cleanup session's prompt points at.
     pub xdg_data_home: Option<std::path::PathBuf>,
@@ -2301,6 +2307,14 @@ fn ticket_session_prefix(session_slug: &str) -> String {
     format!("tm-{session_slug}-")
 }
 
+/// The model defaults the board's interactive sessions resolve against.
+fn model_defaults(deps: &TuiDeps) -> crate::work::model::ModelDefaults<'_> {
+    crate::work::model::ModelDefaults {
+        work_default: deps.work_default_model.as_deref(),
+        models: &deps.models,
+    }
+}
+
 /// Run `Cmd::LaunchAudit`: launch a ticket-audit session for `key` via
 /// [`crate::work::audit::launch_audit`], mapping the outcome to a
 /// status-line message. `deps.store` being `None` surfaces as `runs db
@@ -2318,6 +2332,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         &deps.home,
         &deps.backend_identity,
         deps.runner,
+        model_defaults(deps),
         key,
     ) {
         Ok(_) if deps.audit_dir_fallback => format!(
@@ -2355,6 +2370,7 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
         &deps.home,
         &deps.backend_identity,
         deps.runner,
+        model_defaults(deps),
     ) {
         Ok(outcome) => outcome.session_name,
         Err(crate::work::create::CreateLaunchError::AlreadyRunning { session_name, .. }) => {
@@ -2387,6 +2403,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         store,
         tmux: deps.tmux.as_ref(),
         runner: deps.runner,
+        model_defaults: model_defaults(deps),
     };
     let request = crate::work::bugbot::CleanupLaunchRequest {
         cfg: &deps.review_watch,
@@ -2957,6 +2974,8 @@ mod tests {
             manual: crate::config::ManualConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
             review_watch: crate::config::ReviewWatchConfig::default(),
+            work_default_model: None,
+            models: crate::config::ModelsConfig::default(),
             xdg_data_home: None,
             idle_hibernate_mins: 0,
             kill_pid: |_| {},

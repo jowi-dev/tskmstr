@@ -175,6 +175,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         xdg_data_home: xdg_data_home.as_deref(),
         identity: &backend_identity,
         runner: agent_runner_for(&config),
+        model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -433,6 +434,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             .map(|kind| tskmstr::agent::routing::runner_for(*kind))
             .into_iter()
             .collect(),
+            models: &config.models,
             spawner: &spawner,
         };
         let launcher = tskmstr::work::dispatch::CommandLauncher {
@@ -806,8 +808,13 @@ fn run_work(
             } else {
                 tskmstr::work::admission::UsageGateMode::Warn
             };
+            let models = full_config
+                .as_ref()
+                .map(|cfg| cfg.models.clone())
+                .unwrap_or_default();
             let usage_prober = tskmstr::work::admission::SpawnUsageProber {
                 runners: vec![runner],
+                models: &models,
                 spawner: &spawner,
             };
             let run_deps = tskmstr::cli::work::RunDeps {
@@ -831,6 +838,7 @@ fn run_work(
                     .and_then(|cfg| cfg.status_on_pr.as_deref()),
                 ticket_provider_error: ticket_provider_error.as_deref(),
                 fallback_runners,
+                models: &models,
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
                 usage: &usage,
                 usage_prober: &usage_prober,
@@ -1036,6 +1044,8 @@ fn run_board(
             create,
             manual: config.work.manual,
             review_watch: config.work.review_watch,
+            work_default_model: config.work.default_model.clone(),
+            models: config.models.clone(),
             xdg_data_home,
             idle_hibernate_mins: config.work.idle_hibernate_mins,
             kill_pid: tskmstr::runs::pid::kill_pid,
@@ -2138,6 +2148,7 @@ fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
         identity: &identity,
         lanes: &config.work.lanes,
         merge_cfg: &config.work.merge,
+        model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
         status_on_merge: config.status_on_merge.as_deref(),
         state_dir: &state_dir,
         kill_pid: &tskmstr::runs::pid::kill_pid,
@@ -2315,6 +2326,7 @@ fn with_review_deps<T>(
         tmux: &tmux,
         backend_identity: &backend_identity,
         runner: agent_runner_or_default(full_config.as_ref()),
+        config: full_config.as_ref(),
     };
     Ok(f(&deps, &run_paths, full_config.as_ref()))
 }
@@ -2686,6 +2698,7 @@ impl AutopilotTicker {
         let spawner = tskmstr::work::runner::StdProcessSpawner;
         let usage_prober = tskmstr::work::admission::SpawnUsageProber {
             runners: runner.into_iter().collect(),
+            models: &config.models,
             spawner: &spawner,
         };
         let launcher = dispatch::CommandLauncher {

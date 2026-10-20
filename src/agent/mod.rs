@@ -181,8 +181,11 @@ pub struct InvocationInputs {
     /// `"\n\nWork ticket: <ticket>."` suffix if a ticket was given —
     /// ticket-suffixing is the caller's job, not this module's.
     pub prompt: String,
-    /// Driver model override. `None` resolves to the adapter's own default.
-    pub model: Option<String>,
+    /// The driver model, passed as `--model`. Always set: every caller
+    /// resolves it through `crate::work::model::resolve_model` (GitHub
+    /// issue #143), so no launch falls through to the agent CLI's own
+    /// default and no adapter holds a default model.
+    pub model: String,
     /// Turn-budget override. `None` resolves to the adapter's own default.
     /// Ignored entirely under [`RunMode::Interactive`], which passes no
     /// turn budget at all.
@@ -551,17 +554,14 @@ pub struct SessionEnvVars {
 /// (GitHub issue #51). The lane scaffold asks for the lane's `model` so a
 /// run doesn't silently fall back to the agent CLI's own default model, and
 /// the spelling is runner-specific — this carries what the question shows
-/// and what `--yes` writes. See [`AgentRunner::lane_model_prompt`].
+/// See [`AgentRunner::lane_model_prompt`]. What `--yes` writes is the
+/// runner's built-in default (`crate::config::AgentKind::builtin_models`),
+/// not an adapter value (GitHub issue #143).
 #[derive(Debug, Clone, Copy)]
 pub struct LaneModelPrompt {
     /// Accepted-spelling help shown alongside the prompt, e.g.
     /// `"provider/model, e.g. venice/z-ai-glm-5-3"`.
     pub help: &'static str,
-    /// The value `--yes` writes for the lane's `model`, or `None` to leave
-    /// `model` unset (and print that the run will use the agent CLI's own
-    /// default). opencode has no safe universal default across providers, so
-    /// it returns `None`; claude returns its always-passed default.
-    pub yes_default: Option<&'static str>,
 }
 
 /// Backend-agnostic AI coding agent operations. See the module doc comment
@@ -640,16 +640,17 @@ pub trait AgentRunner: Sync {
     fn resume_spec(&self, invocation: &AgentInvocation) -> ResumeSpec;
 
     /// Shell command string for a tmux-hosted audit/bugbot session: the
-    /// adapter's CLI with an optional `--model` and `prompt` as its
-    /// positional argument. Replaces `work::audit::claude_command`.
-    fn interactive_shell_command(&self, model: Option<&str>, prompt: &str) -> String;
+    /// adapter's CLI with `--model <model>` and `prompt` as its positional
+    /// argument. Replaces `work::audit::claude_command`.
+    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String;
 
     /// The cheapest headless invocation whose output carries a usage
     /// snapshot ([`RunOutcome::usage`]), for usage admission to refresh a
-    /// stale one (GitHub issue #114). `None` for a runner that reports no
-    /// usage signal, which is never probed. The invocation must strip the
-    /// same billing-safety env vars as a lane run.
-    fn usage_probe_invocation(&self) -> Option<AgentInvocation> {
+    /// stale one (GitHub issue #114), run on `model`
+    /// (`crate::work::model::resolve_usage_probe_model`). `None` for a
+    /// runner that reports no usage signal, which is never probed. The
+    /// invocation must strip the same billing-safety env vars as a lane run.
+    fn usage_probe_invocation(&self, _model: &str) -> Option<AgentInvocation> {
         None
     }
 

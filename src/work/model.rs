@@ -18,7 +18,58 @@
 //! default.
 
 use crate::agent::AgentRunner;
-use crate::config::{AgentKind, ModelsConfig};
+use crate::config::{AgentKind, Config, ModelsConfig};
+
+/// The config-wide end of the chain: `[work] default_model` and the
+/// `[agent.<runner>]` models. Every launch surface carries one of these and
+/// adds its own candidates in front.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelDefaults<'a> {
+    /// `[work] default_model`.
+    pub work_default: Option<&'a str>,
+    /// The `[agent.<runner>]` models.
+    pub models: &'a ModelsConfig,
+}
+
+/// No configured models, for a launch with no config loaded: the chain
+/// ends straight in the built-in default.
+static NO_MODELS: ModelsConfig = ModelsConfig::UNSET;
+
+impl<'a> ModelDefaults<'a> {
+    /// The defaults `config` sets.
+    pub fn from_config(config: &'a Config) -> Self {
+        ModelDefaults {
+            work_default: config.work.default_model.as_deref(),
+            models: &config.models,
+        }
+    }
+
+    /// No configured defaults; see [`NO_MODELS`].
+    pub fn none() -> ModelDefaults<'static> {
+        ModelDefaults {
+            work_default: None,
+            models: &NO_MODELS,
+        }
+    }
+
+    /// [`ModelDefaults::from_config`], or [`ModelDefaults::none`] with no
+    /// config loaded.
+    pub fn from_optional(config: Option<&'a Config>) -> Self {
+        match config {
+            Some(config) => ModelDefaults::from_config(config),
+            None => ModelDefaults::none(),
+        }
+    }
+
+    /// [`resolve_model`] with these defaults.
+    pub fn resolve(
+        &self,
+        runner: &dyn AgentRunner,
+        specific: &[ModelCandidate<'_>],
+    ) -> ResolvedModel {
+        resolve_model(runner, *self, specific)
+    }
+}
 
 /// One configured model a launch may use, and where it came from.
 #[derive(Debug, Clone, Copy)]
@@ -70,16 +121,23 @@ fn kind_of(runner: &dyn AgentRunner) -> AgentKind {
     AgentKind::parse(runner.name()).expect("every agent runner's name is an AgentKind name")
 }
 
+/// `runner`'s built-in default model ([`AgentKind::builtin_models`]).
+pub fn builtin_default_model(runner: &dyn AgentRunner) -> &'static str {
+    kind_of(runner).builtin_models().default_model
+}
+
 /// Resolves the model a launch on `runner` passes. See the module docs for
 /// the order. `specific` holds the launch's own candidates (the `--model`
-/// flag, then the surface's key), most specific first; `work_default` is
-/// `[work] default_model`.
+/// flag, then the surface's key), most specific first.
 pub fn resolve_model(
     runner: &dyn AgentRunner,
-    models: &ModelsConfig,
-    work_default: Option<&str>,
+    defaults: ModelDefaults<'_>,
     specific: &[ModelCandidate<'_>],
 ) -> ResolvedModel {
+    let ModelDefaults {
+        work_default,
+        models,
+    } = defaults;
     let kind = kind_of(runner);
     let runner_source = runner_default_source(kind);
     let configured = specific.iter().copied().chain([
@@ -144,6 +202,13 @@ mod tests {
     use crate::agent::opencode::OpencodeRunner;
     use crate::config::RunnerModels;
 
+    fn md<'a>(models: &'a ModelsConfig, work_default: Option<&'static str>) -> ModelDefaults<'a> {
+        ModelDefaults {
+            work_default,
+            models,
+        }
+    }
+
     fn lane(model: Option<&str>) -> Vec<ModelCandidate<'_>> {
         vec![ModelCandidate {
             source: "lane model",
@@ -165,11 +230,11 @@ mod tests {
     fn nothing_configured_resolves_to_each_runners_builtin_default() {
         let models = ModelsConfig::default();
 
-        let claude = resolve_model(&ClaudeRunner, &models, None, &[]);
+        let claude = resolve_model(&ClaudeRunner, md(&models, None), &[]);
         assert_eq!(claude.model, "opus");
         assert_eq!(claude.source, BUILTIN_SOURCE);
 
-        let opencode = resolve_model(&OpencodeRunner, &models, None, &[]);
+        let opencode = resolve_model(&OpencodeRunner, md(&models, None), &[]);
         assert_eq!(opencode.model, "venice/z-ai-glm-5-3-flash");
     }
 
@@ -193,20 +258,20 @@ mod tests {
             },
         ];
 
-        let resolved = resolve_model(&ClaudeRunner, &models, Some("opus"), &specific);
+        let resolved = resolve_model(&ClaudeRunner, md(&models, Some("opus")), &specific);
         assert_eq!(resolved.model, "fable");
         assert_eq!(resolved.source, "--model");
 
-        let resolved = resolve_model(&ClaudeRunner, &models, Some("opus"), &specific[1..]);
+        let resolved = resolve_model(&ClaudeRunner, md(&models, Some("opus")), &specific[1..]);
         assert_eq!(resolved.model, "sonnet");
 
-        let resolved = resolve_model(&ClaudeRunner, &models, Some("opus"), &[]);
+        let resolved = resolve_model(&ClaudeRunner, md(&models, Some("opus")), &[]);
         assert_eq!(
             (resolved.model.as_str(), resolved.source.as_str()),
             ("opus", "[work] default_model")
         );
 
-        let resolved = resolve_model(&ClaudeRunner, &models, None, &[]);
+        let resolved = resolve_model(&ClaudeRunner, md(&models, None), &[]);
         assert_eq!(
             (resolved.model.as_str(), resolved.source.as_str()),
             ("haiku", "[agent.claude] default_model")
@@ -219,8 +284,7 @@ mod tests {
 
         let resolved = resolve_model(
             &OpencodeRunner,
-            &models,
-            Some("opus"),
+            md(&models, Some("opus")),
             &lane(Some("sonnet")),
         );
 
@@ -241,8 +305,7 @@ mod tests {
     fn a_model_valid_on_the_runner_is_kept() {
         let resolved = resolve_model(
             &OpencodeRunner,
-            &opencode_default("venice/glm"),
-            None,
+            md(&opencode_default("venice/glm"), None),
             &lane(Some("anthropic/claude-opus")),
         );
         assert_eq!(resolved.model, "anthropic/claude-opus");
@@ -253,8 +316,7 @@ mod tests {
     fn a_blank_candidate_counts_as_unset() {
         let resolved = resolve_model(
             &ClaudeRunner,
-            &ModelsConfig::default(),
-            Some("  "),
+            md(&ModelsConfig::default(), Some("  ")),
             &lane(Some("")),
         );
         assert_eq!(resolved.model, "opus");

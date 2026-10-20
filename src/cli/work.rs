@@ -405,6 +405,9 @@ pub struct RunDeps<'a> {
     /// [`crate::work::run::RunLaneDeps::fallback_runners`]. Empty in
     /// single-runner mode. See GitHub issue #54.
     pub fallback_runners: Vec<&'a dyn AgentRunner>,
+    /// The configured per-runner models, passed through to
+    /// [`crate::work::run::RunLaneDeps::models`]. See GitHub issue #143.
+    pub models: &'a crate::config::ModelsConfig,
     /// Reads the kernel's memory-pressure level for memory-budget admission
     /// (GitHub issue #66); production passes
     /// [`crate::runs::footprint::memory_pressure`]. Only called when
@@ -476,6 +479,7 @@ pub fn run(
         status_on_pr: deps.status_on_pr,
         ticket_provider_error: deps.ticket_provider_error,
         fallback_runners: deps.fallback_runners.clone(),
+        models: deps.models,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -2667,6 +2671,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -2836,6 +2841,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -2972,6 +2978,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3048,6 +3055,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3212,6 +3220,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3294,6 +3303,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3362,6 +3372,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3480,6 +3491,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3549,6 +3561,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
             memory_pressure: &normal_pressure,
             usage: &crate::config::UsageConfig::default(),
             usage_prober: &NoUsageProbe,
@@ -3610,6 +3623,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = crate::work::run::RunLanePaths {
             home: home.clone(),

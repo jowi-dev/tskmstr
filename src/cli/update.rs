@@ -169,6 +169,7 @@ pub fn run_update(
     super::init::offer_agent_setup(
         ctx.runner,
         ctx.setup_launcher,
+        ctx.paths,
         "tm update",
         yes,
         &tasks,

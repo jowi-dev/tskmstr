@@ -208,6 +208,10 @@ pub struct MergeDeps<'a> {
     pub lanes: &'a BTreeMap<String, LaneConfig>,
     /// Validated `[work.merge]` settings.
     pub merge_cfg: &'a MergeConfig,
+    /// `[work] default_model` and the `[agent.<runner>]` models, which the
+    /// conflict session's model resolution falls back to after `[work.merge]
+    /// model` (GitHub issue #143).
+    pub model_defaults: crate::work::model::ModelDefaults<'a>,
     /// Configured `status_on_merge` target status, if any.
     pub status_on_merge: Option<&'a str>,
     /// Directory the conflict session's prompt file is written under
@@ -400,9 +404,19 @@ fn open_agent_window(
     session_key: &str,
     dir: &Path,
 ) -> Result<AgentWindow, MergeError> {
+    let model = deps
+        .model_defaults
+        .resolve(
+            deps.runner,
+            &[crate::work::model::ModelCandidate {
+                source: "[work.merge] model",
+                model: deps.merge_cfg.model.as_deref(),
+            }],
+        )
+        .model;
     let invocation = deps.runner.build_invocation(InvocationInputs {
         prompt,
-        model: deps.merge_cfg.model.clone(),
+        model,
         max_turns: None,
         permission_mode: None,
         settings_path: None,
@@ -1638,6 +1652,8 @@ mod tests {
         identity: BackendIdentity,
         lanes: BTreeMap<String, LaneConfig>,
         merge_cfg: MergeConfig,
+        work_default_model: Option<String>,
+        models: crate::config::ModelsConfig,
         status_on_merge: Option<String>,
         _worktree_dirs: Vec<tempfile::TempDir>,
         _state_dir: tempfile::TempDir,
@@ -1678,6 +1694,8 @@ mod tests {
                 identity: identity(),
                 lanes: BTreeMap::new(),
                 merge_cfg: MergeConfig::default(),
+                work_default_model: None,
+                models: crate::config::ModelsConfig::default(),
                 status_on_merge: None,
                 _worktree_dirs: Vec::new(),
                 _state_dir: state_tmp,
@@ -1733,6 +1751,10 @@ mod tests {
                 identity: &self.identity,
                 lanes: &self.lanes,
                 merge_cfg: &self.merge_cfg,
+                model_defaults: crate::work::model::ModelDefaults {
+                    work_default: self.work_default_model.as_deref(),
+                    models: &self.models,
+                },
                 status_on_merge: self.status_on_merge.as_deref(),
                 state_dir: &self.state_dir,
                 kill_pid: &*self.kill_pid,
@@ -2940,6 +2962,30 @@ mod tests {
         );
     }
 
+    /// GitHub issue #143: with `[work.merge] model` unset, the conflict
+    /// session falls back to `[work] default_model`, and with neither set,
+    /// to the runner's built-in default.
+    #[test]
+    fn conflict_session_falls_back_to_the_work_default_then_the_builtin_model() {
+        let fx = conflicted_fixture();
+        let _ = run(&fx.deps(), "PROJ-1");
+        let command = launched_command(&fx);
+        assert!(command.contains("'--model' 'opus'"), "{command}");
+
+        let mut fx = conflicted_fixture();
+        fx.work_default_model = Some("sonnet".to_string());
+        let _ = run(&fx.deps(), "PROJ-1");
+        let command = launched_command(&fx);
+        assert!(command.contains("'--model' 'sonnet'"), "{command}");
+
+        let mut fx = conflicted_fixture();
+        fx.work_default_model = Some("sonnet".to_string());
+        fx.merge_cfg.model = Some("fable".to_string());
+        let _ = run(&fx.deps(), "PROJ-1");
+        let command = launched_command(&fx);
+        assert!(command.contains("'--model' 'fable'"), "{command}");
+    }
+
     #[test]
     fn conflict_session_prompt_write_failure_creates_no_window() {
         let fx = conflicted_fixture();
@@ -3164,6 +3210,19 @@ mod tests {
         }
         assert!(prompt.contains("main"), "{prompt}");
         assert!(!prompt.contains("{ticket_list}"), "{prompt}");
+    }
+
+    /// GitHub issue #143: the batch's shared conflict session resolves its
+    /// model through the same chain as a single merge's.
+    #[test]
+    fn batch_conflict_session_passes_the_work_default_model() {
+        let mut fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+        fx.work_default_model = Some("sonnet".to_string());
+
+        let _ = run_batch(&fx.deps(), &keys(2));
+
+        let command = launched_command(&fx);
+        assert!(command.contains("'--model' 'sonnet'"), "{command}");
     }
 
     #[test]

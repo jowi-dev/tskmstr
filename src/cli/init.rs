@@ -414,6 +414,7 @@ pub fn run_init(
     offer_agent_setup(
         ctx.runner,
         ctx.setup_launcher,
+        ctx.paths,
         "tm init",
         yes,
         &tasks,
@@ -436,9 +437,11 @@ pub fn run_init(
 /// Takes `runner`/`setup_launcher` rather than a whole [`InitContext`]:
 /// `tm update` (`src/cli/update.rs`) makes the same offer for the assets
 /// *it* scaffolds, so the two commands share one setup-session flow.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn offer_agent_setup(
     runner: &dyn AgentRunner,
     setup_launcher: &dyn Fn(&AgentInvocation) -> Result<(), String>,
+    paths: &ConfigPaths,
     rerun_hint: &str,
     yes: bool,
     tasks: &SetupTasks,
@@ -468,7 +471,7 @@ pub(crate) fn offer_agent_setup(
 
     let invocation = runner.build_invocation(InvocationInputs {
         prompt: setup_session_prompt(tasks),
-        model: None,
+        model: setup_session_model(runner, paths),
         max_turns: None,
         permission_mode: None,
         settings_path: None,
@@ -482,6 +485,18 @@ pub(crate) fn offer_agent_setup(
         )?;
     }
     Ok(())
+}
+
+/// The setup session's model (GitHub issue #143). The session has no
+/// `model` key of its own, so it resolves `[work] default_model`, then
+/// `[agent.<runner>] default_model`, then the built-in default, from the
+/// config as just written. A config that doesn't load yet (no backend
+/// credentials, say) leaves only the built-in default.
+fn setup_session_model(runner: &dyn AgentRunner, paths: &ConfigPaths) -> String {
+    let config = crate::config::load(paths).ok();
+    crate::work::model::ModelDefaults::from_optional(config.as_ref())
+        .resolve(runner, &[])
+        .model
 }
 
 /// The tm-shipped "create work lane" setup prompt (GitHub issue #30):
@@ -1171,12 +1186,11 @@ fn ask_required(
 
 /// Ask for the lane's `model`, runner-aware (GitHub issue #51). Returns the
 /// value to write into the lane, or `None` to leave `model` unset. The
-/// spelling and defaults come from the runner's
-/// [`AgentRunner::lane_model_prompt`]: claude offers its always-passed
-/// default (`fable`), opencode has none and leaves the key unset with a
-/// printed consequence. With `yes`, takes the existing value, else the
-/// runner's `--yes` default (which may itself be `None`). An empty
-/// interactive answer also leaves the key unset.
+/// spelling help comes from the runner's [`AgentRunner::lane_model_prompt`];
+/// the offered default is the existing value, else the runner's built-in
+/// default (`crate::config::AgentKind::builtin_models`, GitHub issue #143).
+/// With `yes`, takes that default. An empty interactive answer leaves the
+/// key unset, with a printed note on what runs will use instead.
 fn ask_lane_model(
     runner: &dyn AgentRunner,
     yes: bool,
@@ -1186,18 +1200,15 @@ fn ask_lane_model(
 ) -> Result<Option<String>, InitCliError> {
     let guidance = runner.lane_model_prompt();
     let default = existing
-        .map(str::to_string)
-        .or_else(|| guidance.yes_default.map(str::to_string));
+        .unwrap_or_else(|| crate::work::model::builtin_default_model(runner))
+        .to_string();
     if yes {
-        if default.is_none() {
-            print_model_unset_consequence(runner, out)?;
-        }
-        return Ok(default);
+        return Ok(Some(default));
     }
     loop {
         let answer = prompter.prompt_line(
             &format!("Lane model ({}); blank to leave unset", guidance.help),
-            default.as_deref().unwrap_or(""),
+            &default,
         )?;
         let trimmed = answer.trim();
         if trimmed.is_empty() {
@@ -1212,13 +1223,15 @@ fn ask_lane_model(
 }
 
 /// Print the consequence of leaving a lane's `model` unset (GitHub issue
-/// #51's silent-fallback hazard): the run uses the agent CLI's own default
-/// model.
+/// #51): the run resolves its model through the rest of the chain (GitHub
+/// issue #143, [`crate::work::model`]).
 fn print_model_unset_consequence(runner: &dyn AgentRunner, out: &mut dyn Write) -> io::Result<()> {
     writeln!(
         out,
-        "Leaving [work.lanes] `model` unset; runs will use {}'s own default model.",
-        runner.display_name()
+        "Leaving [work.lanes] `model` unset; runs will use [work] default_model, \
+         else [agent.{}] default_model, else `{}`.",
+        runner.name(),
+        crate::work::model::builtin_default_model(runner)
     )
 }
 
@@ -3581,6 +3594,62 @@ mod tests {
     // --- lane model question (GitHub issue #51) ---
 
     #[test]
+    fn setup_session_passes_the_work_default_model() {
+        let env = test_env();
+        std::fs::create_dir_all(env.paths.global.parent().unwrap()).unwrap();
+        std::fs::write(&env.paths.global, "[work]\ndefault_model = \"sonnet\"\n").unwrap();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
+            std::cell::RefCell::new(Vec::new());
+        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+            recorded.borrow_mut().push(invocation.clone());
+            Ok(())
+        };
+        ctx.setup_launcher = &launcher;
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let invocations = recorded.borrow();
+        let args = &invocations[0].args;
+        let at = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model passed");
+        assert_eq!(args[at + 1], "sonnet", "{args:?}");
+    }
+
+    #[test]
+    fn setup_session_without_config_models_passes_the_builtin_default() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let mut ctx = github_ctx(&env, &gh, &keychain);
+        let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
+            std::cell::RefCell::new(Vec::new());
+        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+            recorded.borrow_mut().push(invocation.clone());
+            Ok(())
+        };
+        ctx.setup_launcher = &launcher;
+
+        let mut prompter = FakePrompter::new();
+        let mut out = Vec::new();
+        run_init(&ctx, false, &mut prompter, &mut out).expect("init should succeed");
+
+        let invocations = recorded.borrow();
+        let args = &invocations[0].args;
+        let at = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model passed");
+        assert_eq!(args[at + 1], "opus", "{args:?}");
+    }
+
+    #[test]
     fn lane_model_question_writes_the_claude_default_under_yes() {
         let env = test_env();
         let gh = FakeGhCli::new();
@@ -3592,13 +3661,13 @@ mod tests {
 
         let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
         assert!(
-            repo_text.contains("model = \"fable\""),
-            "claude --yes writes the always-passed default: {repo_text}"
+            repo_text.contains("model = \"opus\""),
+            "claude --yes writes the built-in default: {repo_text}"
         );
     }
 
     #[test]
-    fn lane_model_question_opencode_yes_leaves_model_unset_and_prints_consequence() {
+    fn lane_model_question_opencode_yes_writes_the_builtin_default() {
         let env = test_env();
         let gh = FakeGhCli::new();
         let keychain = InMemoryKeychain::empty();
@@ -3610,13 +3679,8 @@ mod tests {
 
         let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
         assert!(
-            !repo_text.contains("model ="),
-            "opencode --yes leaves the lane model unset: {repo_text}"
-        );
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert!(
-            rendered.contains("own default model"),
-            "the unset consequence is printed: {rendered}"
+            repo_text.contains("model = \"venice/z-ai-glm-5-3-flash\""),
+            "opencode --yes writes the built-in default: {repo_text}"
         );
     }
 
