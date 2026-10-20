@@ -144,6 +144,9 @@ pub fn run_update(
             DriftFinding::LegacyPromptDir { .. } => {}
             // Collected below and written in one confirmed batch.
             DriftFinding::MissingConfigKey { .. } => {}
+            // Which model to configure is the operator's call; reported
+            // only (GitHub issue #143).
+            DriftFinding::RejectedModel { .. } => {}
         }
     }
 
