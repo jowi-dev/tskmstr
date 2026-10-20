@@ -564,11 +564,14 @@ pub struct SessionEnvVars {
 /// `--yes` writes is the runner's built-in default
 /// (`crate::config::AgentKind::builtin_models`), not an adapter value
 /// (GitHub issue #143).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LaneModelPrompt {
     /// Accepted-spelling help shown alongside the prompt, e.g.
-    /// `"provider/model, e.g. venice/z-ai-glm-5-3"`.
-    pub help: &'static str,
+    /// `"provider/model, e.g. <provider>/<model>"`. Its example names come
+    /// from the runner's built-in defaults
+    /// (`crate::config::AgentKind::builtin_models`), never a literal of the
+    /// adapter's own (GitHub issue #144).
+    pub help: String,
 }
 
 /// Backend-agnostic AI coding agent operations. See the module doc comment

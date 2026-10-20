@@ -678,11 +678,16 @@ impl AgentRunner for OpencodeRunner {
         model.split_once('/').map(|(_, m)| m).unwrap_or(model)
     }
 
-    /// opencode wants the full `provider/model` spelling. See
-    /// [`crate::agent::LaneModelPrompt`].
+    /// opencode wants the full `provider/model` spelling; the example is the
+    /// built-in default. See [`crate::agent::LaneModelPrompt`].
     fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
         crate::agent::LaneModelPrompt {
-            help: "provider/model, e.g. venice/z-ai-glm-5-3",
+            help: format!(
+                "provider/model, e.g. {}",
+                crate::config::AgentKind::Opencode
+                    .builtin_models()
+                    .default_model
+            ),
         }
     }
 
@@ -695,7 +700,10 @@ impl AgentRunner for OpencodeRunner {
         match model.split_once('/') {
             Some((provider, rest)) if !provider.is_empty() && !rest.is_empty() => Ok(()),
             _ => Err(format!(
-                "`{model}` isn't a provider/model spelling; opencode wants e.g. `venice/z-ai-glm-5-3`"
+                "`{model}` isn't a provider/model spelling; opencode wants e.g. `{}`",
+                crate::config::AgentKind::Opencode
+                    .builtin_models()
+                    .default_model
             )),
         }
     }
@@ -1506,5 +1514,17 @@ mod tests {
         assert!(err.contains("provider/model"), "reason: {err}");
         assert!(OpencodeRunner.validate_lane_model("venice/").is_err());
         assert!(OpencodeRunner.validate_lane_model("/model").is_err());
+    }
+
+    /// The help and error text name the built-in default rather than
+    /// hard-coding a model name of their own (GitHub issue #144).
+    #[test]
+    fn lane_model_guidance_examples_come_from_the_defaults_table() {
+        let builtin = crate::config::AgentKind::Opencode.builtin_models();
+        let help = OpencodeRunner.lane_model_prompt().help;
+        let err = OpencodeRunner.validate_lane_model("bare").unwrap_err();
+        for text in [&help, &err] {
+            assert!(text.contains(builtin.default_model), "{text}");
+        }
     }
 }

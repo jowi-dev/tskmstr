@@ -508,11 +508,14 @@ impl AgentRunner for ClaudeRunner {
         model.strip_prefix("claude-").unwrap_or(model)
     }
 
-    /// Claude wants a bare model name (`opus`, `sonnet`). See
-    /// [`crate::agent::LaneModelPrompt`].
+    /// Claude wants a bare model name; the examples are the built-in
+    /// defaults. See [`crate::agent::LaneModelPrompt`].
     fn lane_model_prompt(&self) -> crate::agent::LaneModelPrompt {
         crate::agent::LaneModelPrompt {
-            help: "bare model name, e.g. opus or sonnet",
+            help: format!(
+                "bare model name, e.g. {}",
+                bare_model_examples().join(" or ")
+            ),
         }
     }
 
@@ -522,11 +525,22 @@ impl AgentRunner for ClaudeRunner {
     fn validate_lane_model(&self, model: &str) -> Result<(), String> {
         if model.contains('/') {
             return Err(format!(
-                "`{model}` looks like a provider/model spelling; claude wants a bare model name like `opus` or `sonnet`"
+                "`{model}` looks like a provider/model spelling; claude wants a bare model name like `{}`",
+                bare_model_examples().join("` or `")
             ));
         }
         Ok(())
     }
+}
+
+/// Example bare model names for claude's lane-model help and error text:
+/// the built-in default and usage-probe models, so no model name is written
+/// here (GitHub issue #144).
+fn bare_model_examples() -> Vec<&'static str> {
+    let builtin = crate::config::AgentKind::Claude.builtin_models();
+    std::iter::once(builtin.default_model)
+        .chain(builtin.usage_probe_model)
+        .collect()
 }
 
 /// Case-insensitive usage-limit/rate-limit phrases, verified against the
@@ -1570,5 +1584,21 @@ mod tests {
             .validate_lane_model("venice/z-ai-glm-5-3")
             .expect_err("a provider/model spelling is not claude's");
         assert!(err.contains("bare model name"), "reason: {err}");
+    }
+
+    /// The help and error text name the built-in defaults rather than
+    /// hard-coding model names of their own (GitHub issue #144).
+    #[test]
+    fn lane_model_guidance_examples_come_from_the_defaults_table() {
+        let builtin = crate::config::AgentKind::Claude.builtin_models();
+        let help = ClaudeRunner.lane_model_prompt().help;
+        let err = ClaudeRunner.validate_lane_model("a/b").unwrap_err();
+        for text in [&help, &err] {
+            assert!(text.contains(builtin.default_model), "{text}");
+            assert!(
+                text.contains(builtin.usage_probe_model.unwrap()),
+                "{text}"
+            );
+        }
     }
 }
