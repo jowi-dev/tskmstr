@@ -517,7 +517,7 @@ pub enum WorkCmd {
         /// lane's `base_branch` and the repo's default branch.
         #[arg(long)]
         from: Option<String>,
-        /// Driver model override, e.g. `sonnet`.
+        /// Driver model override, spelled for the configured runner.
         #[arg(long)]
         model: Option<String>,
         /// Max-turns budget override for the driver process.
