@@ -156,6 +156,11 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 /// [`AgentRunner`] and GitHub issue #17) — it supplies both the default
 /// prompt template (when `audit_cfg.prompt` is unset) and the rendered
 /// shell command.
+///
+/// The session's model is `audit_cfg.model`, else the rest of the chain
+/// `model_defaults` ends (GitHub issue #143, [`crate::work::model`]), so
+/// `--model` is always passed.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_audit(
     store: &RunStore,
     tmux: &dyn TmuxOps,
@@ -163,6 +168,7 @@ pub fn launch_audit(
     home: &Path,
     identity: &BackendIdentity,
     runner: &dyn AgentRunner,
+    model_defaults: crate::work::model::ModelDefaults<'_>,
     key: &str,
 ) -> Result<LaunchOutcome, AuditLaunchError> {
     let raw_dir = audit_cfg
@@ -209,7 +215,14 @@ pub fn launch_audit(
         .or(audit_cfg.prompt.as_deref())
         .unwrap_or_else(|| runner.default_audit_prompt_template());
     let prompt = audit_prompt(template, key);
-    let command = runner.interactive_shell_command(audit_cfg.model.as_deref(), &prompt);
+    let model = model_defaults.resolve(
+        runner,
+        &[crate::work::model::ModelCandidate {
+            source: "[work.audit] model",
+            model: audit_cfg.model.as_deref(),
+        }],
+    );
+    let command = runner.interactive_shell_command(&model.model, &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
     if existing_windows.is_empty() {
@@ -302,6 +315,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect("launch should succeed");
@@ -329,7 +343,7 @@ mod tests {
                     dir: "/Users/jowi/Projects/axiom".to_string(),
                     window_name: "audit".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
-                    command: "claude '/ticket-audit PROJ-1'".to_string(),
+                    command: "claude --model 'opus' '/ticket-audit PROJ-1'".to_string(),
                 },
                 TmuxCall::NewWindow {
                     name: "tm-proj-proj-1".to_string(),
@@ -359,6 +373,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect_err("should refuse to launch");
@@ -396,6 +411,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect_err("should refuse to double-launch");
@@ -434,6 +450,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect("launch should succeed");
@@ -448,7 +465,7 @@ mod tests {
                     window_name: "audit".to_string(),
                     dir: "/repo/axiom".to_string(),
                     env: vec![(SESSION_RUN_ID_ENV.to_string(), outcome.run_id.to_string())],
-                    command: "claude '/ticket-audit PROJ-1'".to_string(),
+                    command: "claude --model 'opus' '/ticket-audit PROJ-1'".to_string(),
                 },
             ]
         );
@@ -471,6 +488,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect("launch should succeed");
@@ -494,6 +512,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-1",
         )
         .expect("launch should succeed");
@@ -527,13 +546,14 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-9",
         )
         .unwrap();
 
         assert_eq!(
             launched_command(&tmux),
-            Some("claude '/custom-audit PROJ-9'".to_string())
+            Some("claude --model 'opus' '/custom-audit PROJ-9'".to_string())
         );
     }
 
@@ -557,6 +577,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-9",
         )
         .unwrap();
@@ -565,6 +586,48 @@ mod tests {
             launched_command(&tmux),
             Some("claude --model 'opus' '/ticket-audit PROJ-9'".to_string())
         );
+    }
+
+    /// GitHub issue #143: with no `[work.audit] model`, the session falls
+    /// back to `[work] default_model` instead of leaving `--model` out; a
+    /// set `[work.audit] model` still wins.
+    #[test]
+    fn launch_audit_falls_back_to_the_work_default_model() {
+        let models = crate::config::ModelsConfig::default();
+        let defaults = crate::work::model::ModelDefaults {
+            work_default: Some("sonnet"),
+            models: &models,
+        };
+        for (audit_model, expected) in [(None, "sonnet"), (Some("fable"), "fable")] {
+            let db_dir = tempdir().unwrap();
+            let store = open_store(db_dir.path());
+            let tmux = FakeTmuxOps::new();
+            let audit_cfg = AuditConfig {
+                dir: Some("/repo/axiom".to_string()),
+                prompt: None,
+                prompt_file: None,
+                model: audit_model.map(str::to_string),
+            };
+
+            launch_audit(
+                &store,
+                &tmux,
+                &audit_cfg,
+                Path::new("/Users/jowi"),
+                &test_identity(),
+                &ClaudeRunner,
+                defaults,
+                "PROJ-9",
+            )
+            .unwrap();
+
+            assert_eq!(
+                launched_command(&tmux),
+                Some(format!(
+                    "claude --model '{expected}' '/ticket-audit PROJ-9'"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -590,13 +653,14 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-9",
         )
         .unwrap();
 
         assert_eq!(
             launched_command(&tmux),
-            Some("claude '/custom-audit-file PROJ-9'".to_string())
+            Some("claude --model 'opus' '/custom-audit-file PROJ-9'".to_string())
         );
     }
 
@@ -622,6 +686,7 @@ mod tests {
             &home,
             &test_identity(),
             &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
             "PROJ-9",
         )
         .expect_err("missing prompt file should error");

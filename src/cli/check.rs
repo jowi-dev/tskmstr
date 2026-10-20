@@ -15,7 +15,12 @@
 //!   global config? A missing key is named with its suggested value; a
 //!   missing *recommended* key is advisory and doesn't affect the exit code.
 //!
-//! All three are presence-only. `tm check` never opens a scaffolded
+//! It also reports **the model every launch surface resolves** per runner
+//! (GitHub issue #143, [`crate::work::model`]), flagging a configured model
+//! the runner it would be used with rejects. That check needs the merged
+//! config, so it is skipped with a note when the config doesn't load.
+//!
+//! The first three are presence-only. `tm check` never opens a scaffolded
 //! asset's *contents* — lane prompts and skills are meant to be edited after
 //! `tm init` writes them (GitHub issue #30's agent-assisted setup edits them
 //! on purpose), so a content diff would flag normal customization as drift.
@@ -153,6 +158,20 @@ pub enum DriftFinding {
         severity: KeySeverity,
         suggested_default: Option<DefaultValue>,
     },
+    /// A configured model whose spelling `runner` rejects
+    /// ([`AgentRunner::validate_lane_model`]), so every launch on that
+    /// runner skips it down the model chain (GitHub issue #143). `source`
+    /// is the key it came from. Advisory when `runner` is only a
+    /// priority-routing fallback, where skipping a model spelled for the
+    /// preferred runner is expected; drift when it is the preferred runner.
+    /// `tm update` has no fix for it.
+    RejectedModel {
+        runner: String,
+        source: String,
+        model: String,
+        reason: String,
+        fallback_only: bool,
+    },
 }
 
 impl DriftFinding {
@@ -165,6 +184,9 @@ impl DriftFinding {
             self,
             DriftFinding::MissingConfigKey {
                 severity: KeySeverity::Recommended,
+                ..
+            } | DriftFinding::RejectedModel {
+                fallback_only: true,
                 ..
             }
         )
@@ -247,6 +269,25 @@ impl std::fmt::Display for DriftFinding {
                     None => write!(f, "set it in .tskmstr.toml"),
                 }
             }
+            DriftFinding::RejectedModel {
+                runner,
+                source,
+                model,
+                reason,
+                fallback_only,
+            } => {
+                write!(
+                    f,
+                    "`{source}` = \"{model}\" is skipped on {runner}: {reason}"
+                )?;
+                if *fallback_only {
+                    write!(
+                        f,
+                        " ({runner} is a fallback runner; expected when the model is spelled for the preferred one)"
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -268,9 +309,157 @@ pub fn run_check(
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
 
-    let findings = collect_findings(ctx, &doc, &repo_dir);
+    let mut findings = collect_findings(ctx, &doc, &repo_dir);
+    let config = crate::config::load(ctx.paths).ok();
+    let report = config.as_ref().map(model_report);
+    if let Some((_, model_findings)) = &report {
+        findings.extend(model_findings.iter().cloned());
+    }
     render(&findings, out)?;
+    render_models(report.as_ref().map(|(lines, _)| lines.as_slice()), out)?;
     Ok(findings)
+}
+
+/// One line of `tm check`'s models report: the model `surface` resolves
+/// to on `runner`, and the key it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelLine {
+    runner: &'static str,
+    surface: String,
+    model: String,
+    source: String,
+}
+
+/// Resolves every launch surface's model on every runner it can launch on
+/// (GitHub issue #143), and the [`DriftFinding::RejectedModel`]s the
+/// resolution skipped. Lanes run on the preferred runner and every
+/// priority-routing fallback; every other surface launches on the
+/// preferred runner only.
+fn model_report(config: &crate::config::Config) -> (Vec<ModelLine>, Vec<DriftFinding>) {
+    use crate::work::model::{ModelCandidate, ModelDefaults, resolve_usage_probe_model};
+
+    let defaults = ModelDefaults::from_config(config);
+    let work = &config.work;
+    let mut lines = Vec::new();
+    let mut findings: Vec<DriftFinding> = Vec::new();
+    let runners = std::iter::once((config.agent, false))
+        .chain(config.agent_fallbacks.iter().map(|kind| (*kind, true)));
+    for (kind, fallback_only) in runners {
+        let runner = crate::agent::routing::runner_for(kind);
+        let lane_sources: Vec<(String, String, Option<&str>)> = work
+            .lanes
+            .iter()
+            .map(|(name, lane)| {
+                (
+                    format!("lane {name}"),
+                    format!("[work.lanes.{name}] model"),
+                    lane.model.as_deref(),
+                )
+            })
+            .collect();
+        let session_sources: Vec<(String, String, Option<&str>)> = if fallback_only {
+            Vec::new()
+        } else {
+            vec![
+                (
+                    "merge session".to_string(),
+                    "[work.merge] model".to_string(),
+                    work.merge.model.as_deref(),
+                ),
+                (
+                    "audit session".to_string(),
+                    "[work.audit] model".to_string(),
+                    work.audit.model.as_deref(),
+                ),
+                (
+                    "create session".to_string(),
+                    "[work.create] model".to_string(),
+                    work.create.model.as_deref(),
+                ),
+                (
+                    "review_watch session".to_string(),
+                    "[work.review_watch] model".to_string(),
+                    work.review_watch.model.as_deref(),
+                ),
+                ("init setup session".to_string(), String::new(), None),
+            ]
+        };
+        for (surface, source, model) in lane_sources.iter().chain(&session_sources) {
+            let resolved = defaults.resolve(
+                runner,
+                &[ModelCandidate {
+                    source,
+                    model: *model,
+                }],
+            );
+            for rejected in resolved.rejected {
+                let finding = DriftFinding::RejectedModel {
+                    runner: runner.name().to_string(),
+                    source: rejected.source,
+                    model: rejected.model,
+                    reason: rejected.reason,
+                    fallback_only,
+                };
+                if !findings.contains(&finding) {
+                    findings.push(finding);
+                }
+            }
+            lines.push(ModelLine {
+                runner: runner.name(),
+                surface: surface.clone(),
+                model: resolved.model,
+                source: resolved.source,
+            });
+        }
+        if !fallback_only && let Some(probe) = resolve_usage_probe_model(runner, &config.models) {
+            let configured = config.models.for_kind(kind).usage_probe_model.as_deref();
+            let source = if configured == Some(probe.as_str()) {
+                format!("[agent.{}] usage_probe_model", kind.as_str())
+            } else {
+                crate::work::model::BUILTIN_SOURCE.to_string()
+            };
+            if let Some(model) = configured.filter(|m| *m != probe)
+                && let Err(reason) = runner.validate_lane_model(model)
+            {
+                findings.push(DriftFinding::RejectedModel {
+                    runner: runner.name().to_string(),
+                    source: format!("[agent.{}] usage_probe_model", kind.as_str()),
+                    model: model.to_string(),
+                    reason,
+                    fallback_only,
+                });
+            }
+            lines.push(ModelLine {
+                runner: runner.name(),
+                surface: "usage probe".to_string(),
+                model: probe,
+                source,
+            });
+        }
+    }
+    (lines, findings)
+}
+
+/// Renders the models report, or a note that it was skipped when the
+/// config didn't load (`lines` is `None`).
+fn render_models(lines: Option<&[ModelLine]>, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(out)?;
+    let Some(lines) = lines else {
+        writeln!(
+            out,
+            "models: skipped (the config doesn't load; any tm command that loads it shows why)"
+        )?;
+        return Ok(());
+    };
+    writeln!(out, "models:")?;
+    for line in lines {
+        writeln!(
+            out,
+            "  {} {}: {} ({})",
+            line.runner, line.surface, line.model, line.source
+        )?;
+    }
+    Ok(())
 }
 
 /// `tm check --quiet`: the fast path (GitHub issue #39), meant to run on
@@ -682,8 +871,13 @@ fn render(findings: &[DriftFinding], out: &mut dyn Write) -> io::Result<()> {
     for finding in findings {
         writeln!(out, "{finding}")?;
     }
-    writeln!(out)?;
-    writeln!(out, "Run `tm update` to apply the additive fixes.")?;
+    if findings
+        .iter()
+        .any(|finding| !matches!(finding, DriftFinding::RejectedModel { .. }))
+    {
+        writeln!(out)?;
+        writeln!(out, "Run `tm update` to apply the additive fixes.")?;
+    }
     Ok(())
 }
 
@@ -1605,5 +1799,114 @@ mod tests {
 
         let after = snapshot(env.repo_dir.parent().unwrap());
         assert_eq!(before, after, "run_check must write no files");
+    }
+
+    // --- resolved models (GitHub issue #143) ---
+
+    /// A global config `config::load` accepts, plus `extra`.
+    fn write_global_config(env: &TestEnv, extra: &str) {
+        std::fs::create_dir_all(env.paths.global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &env.paths.global,
+            format!(
+                "jira_base_url = \"https://x.atlassian.net\"\n\
+                 jira_email = \"x@example.com\"\n\
+                 default_project_key = \"PROJ\"\n{extra}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn rendered_check(env: &TestEnv) -> (Vec<DriftFinding>, String) {
+        let runner = ClaudeRunner;
+        let mut out = Vec::new();
+        let findings = run_check(&ctx(env, &runner), &mut out).expect("check should succeed");
+        (findings, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn check_reports_the_resolved_model_per_runner_and_surface() {
+        let env = test_env();
+        write_global_config(&env, "[work]\ndefault_model = \"sonnet\"\n");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             repo = \".\"\n\
+             model = \"fable\"\n\
+             [work.merge]\n",
+        );
+
+        let (_, rendered) = rendered_check(&env);
+
+        assert!(rendered.contains("models:"), "{rendered}");
+        assert!(
+            rendered.contains("claude lane widget: fable ([work.lanes.widget] model)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("claude merge session: sonnet ([work] default_model)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("claude usage probe: haiku (built-in default)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn check_flags_a_model_the_preferred_runner_rejects_as_drift() {
+        let env = test_env();
+        write_global_config(&env, "");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             repo = \".\"\n\
+             model = \"venice/glm\"\n",
+        );
+
+        let (findings, rendered) = rendered_check(&env);
+
+        let rejected: Vec<_> = findings
+            .iter()
+            .filter(|f| matches!(f, DriftFinding::RejectedModel { .. }))
+            .collect();
+        assert_eq!(rejected.len(), 1, "{findings:?}");
+        assert!(!rejected[0].is_advisory());
+        assert!(has_drift(&findings));
+        assert!(
+            rendered.contains("`[work.lanes.widget] model` = \"venice/glm\" is skipped on claude"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn check_flags_a_model_only_a_fallback_runner_rejects_as_advisory() {
+        let env = test_env();
+        write_global_config(
+            &env,
+            "[agent]\nstrategy = \"priority\"\norder = [\"claude\", \"opencode\"]\n",
+        );
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             repo = \".\"\n\
+             model = \"opus\"\n",
+        );
+
+        let (findings, rendered) = rendered_check(&env);
+
+        let rejected: Vec<_> = findings
+            .iter()
+            .filter(|f| matches!(f, DriftFinding::RejectedModel { .. }))
+            .collect();
+        assert_eq!(rejected.len(), 1, "{findings:?}");
+        assert!(rejected[0].is_advisory(), "{findings:?}");
+        assert!(
+            rendered.contains("opencode lane widget: venice/z-ai-glm-5-3-flash (built-in default)"),
+            "{rendered}"
+        );
     }
 }

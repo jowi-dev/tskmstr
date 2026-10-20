@@ -227,6 +227,31 @@ pub struct ReviewFixDeps<'a> {
     /// through to [`prepare_review_fix`]. See [`crate::agent::AgentRunner`]
     /// and GitHub issue #17.
     pub runner: &'a dyn AgentRunner,
+    /// The loaded config, or `None` when it could not load. A fix or
+    /// auto-review run resolves its model from the lane's `model` through
+    /// the shared chain ([`review_run_model`], GitHub issue #143).
+    pub config: Option<&'a crate::config::Config>,
+}
+
+/// The model a fix pass or auto-review round on `lane` passes: the lane's
+/// own `model`, then `[work] default_model`, `[agent.<runner>]
+/// default_model` and the built-in default, per
+/// [`crate::work::model::resolve_model`]. With no config loaded, the
+/// built-in default.
+fn review_run_model(deps: &ReviewFixDeps<'_>, lane: &str) -> String {
+    let lane_model = deps
+        .config
+        .and_then(|cfg| cfg.work.lanes.get(lane))
+        .and_then(|l| l.model.as_deref());
+    crate::work::model::ModelDefaults::from_optional(deps.config)
+        .resolve(
+            deps.runner,
+            &[crate::work::model::ModelCandidate {
+                source: "lane model",
+                model: lane_model,
+            }],
+        )
+        .model
 }
 
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
@@ -320,6 +345,7 @@ pub fn fix(
         &worktree,
         &branch,
         prompt,
+        review_run_model(deps, &run.lane),
         pid,
         dispatch.run_mode(),
         deps.runner,
@@ -579,6 +605,7 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
                 worktree: self.worktree,
                 branch: self.branch,
                 prompt,
+                model: review_run_model(deps, self.lane),
                 pid: Some(std::process::id()),
                 mode: RunMode::Headless,
             },
@@ -948,6 +975,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -995,6 +1023,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1031,6 +1060,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1069,6 +1099,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1108,6 +1139,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1172,6 +1204,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1252,6 +1285,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1332,6 +1366,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1373,6 +1408,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1406,6 +1442,74 @@ mod tests {
         assert_eq!(review_fix_run.status, crate::runs::RunStatus::Done);
     }
 
+    /// Runs a foreground `fix` under `config` and returns the agent's
+    /// `--model` value.
+    fn foreground_fix_model(config: Option<&crate::config::Config>) -> String {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let vdiff = FakeVdiffOps::with_export(Ok("## a.rs\n\na.rs:1-2 nit".to_string()));
+        let detach = FakeDetachSpawner::new(4242);
+        let tmux = FakeTmuxOps::new();
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+            backend_identity: test_identity(),
+            runner: &ClaudeRunner,
+            config,
+        };
+        fix(
+            &deps,
+            &paths(&tmp),
+            "PROJ-1",
+            Dispatch::HeadlessForeground,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let recorded = spawner.recorded.lock().unwrap();
+        let args = &recorded[0].args;
+        let at = args.iter().position(|a| a == "--model").expect("--model");
+        args[at + 1].clone()
+    }
+
+    fn config_with(extra: &str) -> crate::config::Config {
+        let raw = format!(
+            "jira_base_url = \"https://x.atlassian.net\"\n\
+             jira_email = \"x@example.com\"\n\
+             default_project_key = \"PROJ\"\n{extra}"
+        );
+        crate::config::merge(toml::from_str(&raw).unwrap(), None).unwrap()
+    }
+
+    /// GitHub issue #143: a fix pass resolves its model through the shared
+    /// chain instead of running the adapter's old hard-coded default.
+    #[test]
+    fn fix_passes_the_lane_model_then_the_work_default_model() {
+        assert_eq!(foreground_fix_model(None), "opus");
+
+        let work_default = config_with("[work]\ndefault_model = \"sonnet\"\n");
+        assert_eq!(foreground_fix_model(Some(&work_default)), "sonnet");
+
+        let lane_model = config_with(
+            "[work]\ndefault_model = \"sonnet\"\n\
+             [work.lanes.mylane]\nrepo = \"/r\"\nmodel = \"fable\"\n",
+        );
+        assert_eq!(foreground_fix_model(Some(&lane_model)), "fable");
+    }
+
     #[test]
     fn fix_foreground_reports_failure_without_erroring() {
         let (tmp, run_store, worktree) = setup();
@@ -1433,6 +1537,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1476,6 +1581,7 @@ mod tests {
             tmux: &tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1550,6 +1656,7 @@ mod tests {
             tmux: &fakes.tmux,
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
+            config: None,
         }
     }
 

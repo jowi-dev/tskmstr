@@ -220,6 +220,10 @@ pub trait UsageProber {
 pub struct SpawnUsageProber<'a> {
     /// The runners that may be probed, looked up by [`AgentRunner::name`].
     pub runners: Vec<&'a dyn AgentRunner>,
+    /// The configured models; the probe runs
+    /// [`crate::work::model::resolve_usage_probe_model`] (GitHub issue
+    /// #143).
+    pub models: &'a crate::config::ModelsConfig,
     /// Spawns the probe and waits for it.
     pub spawner: &'a dyn ProcessSpawner,
 }
@@ -227,7 +231,10 @@ pub struct SpawnUsageProber<'a> {
 impl SpawnUsageProber<'_> {
     fn invocation(&self, agent: &str) -> Option<(&dyn AgentRunner, AgentInvocation)> {
         let runner = *self.runners.iter().find(|r| r.name() == agent)?;
-        runner.usage_probe_invocation().map(|inv| (runner, inv))
+        let model = crate::work::model::resolve_usage_probe_model(runner, self.models)?;
+        runner
+            .usage_probe_invocation(&model)
+            .map(|inv| (runner, inv))
     }
 }
 

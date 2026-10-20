@@ -82,7 +82,12 @@ usage availability, building on ADR-0004's seam and the opencode adapter
    order — a repo with no `[agent]` table at all still inherits the global
    one untouched, since there's nothing to conflict with.
 
-5. **`model` is passed through only for the preferred agent's own
+5. **Amended by ADR-0010:** a fallback attempt now resolves its model on
+   its own runner through the shared model chain, skipping a model the
+   fallback runner rejects, instead of passing none. The original
+   decision follows.
+
+   **`model` is passed through only for the preferred agent's own
    attempt.** A fallback invocation always omits `--model`/its equivalent
    and gets that runner's own configured default instead. Model strings
    are runner-specific in practice — `"fable"` for `claude`, opencode's

@@ -31,8 +31,7 @@ dir = "."
 prompt_file = ".tskmstr/prompts/create.md"
 
 [work.merge]
-# Explicit because the conflict session passes only this key to the claude
-# adapter, which substitutes its own `fable` default when it is unset (it
-# does not consult [work] default_model the way lane runs do). Conflict
-# resolution is bounded mechanical work, so it runs on sonnet.
+# Conflict sessions resolve this key, then [work] default_model, then the
+# runner's default (README "Which model a launch uses"). Kept explicit so a
+# change to the work default doesn't move conflict resolution with it.
 model = "opus"

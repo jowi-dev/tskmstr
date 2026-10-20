@@ -454,6 +454,10 @@ pub struct RunLaneDeps<'a> {
     /// carried on [`PreparedRun::fallbacks`] for
     /// [`run_agent_and_finish`] to retry through on a rate-limit outcome.
     pub fallback_runners: Vec<&'a dyn AgentRunner>,
+    /// The configured `[agent.<runner>]` models (see
+    /// [`crate::config::Config::models`]), which every attempt's model
+    /// resolution ends in (GitHub issue #143, [`crate::work::model`]).
+    pub models: &'a crate::config::ModelsConfig,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -1337,24 +1341,35 @@ pub fn prepare_run_lane(
         }
     }
 
-    // Build the claude invocation (still part of step 9's "safe to do in the
-    // foreground" work: pure argv construction, no spawning yet). `model`
-    // is only ever resolved for the *preferred* agent's own attempt —
-    // model strings are runner-specific ("fable" vs "provider/model"), so a
-    // fallback attempt always gets `None` and falls back to that runner's
-    // own default (see the plan doc's "model only for the configured
-    // preferred agent" rule). Since `preferred_kind` can only ever appear
-    // as `attempts[0]` (relative order is preserved, and it's always the
-    // first element of `full_order` above), this is equivalent to "only the
-    // primary attempt, and only when it wasn't a fallback substitution".
-    let model = if primary_kind == preferred_kind {
-        request
-            .model
-            .clone()
-            .or_else(|| lane_config.model.clone())
-            .or_else(|| config.default_model.clone())
-    } else {
-        None
+    // Build the agent invocation (still part of step 9's "safe to do in the
+    // foreground" work: pure argv construction, no spawning yet). Every
+    // attempt, primary or fallback, resolves its model through the same
+    // chain on its own runner (GitHub issue #143, `crate::work::model`):
+    // `--model`, lane `model`, `[work] default_model`, `[agent.<runner>]
+    // default_model`, the built-in default. Model spellings are
+    // runner-specific (`opus` vs `provider/model`), so a candidate the
+    // attempt's runner rejects is skipped down the chain rather than
+    // passed. This amends ADR-0008 decision 5, which passed no model on
+    // fallback.
+    let lane_model = |runner: &dyn AgentRunner| {
+        crate::work::model::resolve_model(
+            runner,
+            crate::work::model::ModelDefaults {
+                work_default: config.default_model.as_deref(),
+                models: deps.models,
+            },
+            &[
+                crate::work::model::ModelCandidate {
+                    source: "--model",
+                    model: request.model.as_deref(),
+                },
+                crate::work::model::ModelCandidate {
+                    source: "lane model",
+                    model: lane_config.model.as_deref(),
+                },
+            ],
+        )
+        .model
     };
     let max_turns = request
         .max_turns
@@ -1379,7 +1394,7 @@ pub fn prepare_run_lane(
 
     let mut invocation = primary_runner.build_invocation(InvocationInputs {
         prompt: prompt.clone(),
-        model,
+        model: lane_model(primary_runner),
         max_turns: max_turns.clone(),
         permission_mode: permission_mode.clone(),
         settings_path,
@@ -1391,16 +1406,15 @@ pub fn prepare_run_lane(
     // invocation per agent `plan_attempts` says to try next if the primary
     // attempt's outcome classifies as a usage-limit hit. Same resolved
     // prompt text, `permission_mode`/`max_turns` passed through, each
-    // attempt's own `deploy_telemetry` result as `settings_path`, and
-    // `model: None` always — see the model comment above; a fallback
-    // attempt is by definition never `preferred_kind`.
+    // attempt's own `deploy_telemetry` result as `settings_path`, and the
+    // model the chain above resolves on the fallback runner.
     let mut fallbacks = Vec::with_capacity(attempts.len().saturating_sub(1));
     for kind in attempts.iter().skip(1) {
         let fallback_runner = crate::agent::routing::runner_for(*kind);
         let fallback_settings_path = fallback_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
         let fallback_invocation = fallback_runner.build_invocation(InvocationInputs {
             prompt: prompt.clone(),
-            model: None,
+            model: lane_model(fallback_runner),
             max_turns: max_turns.clone(),
             permission_mode: permission_mode.clone(),
             settings_path: fallback_settings_path,
@@ -1559,6 +1573,7 @@ pub fn prepare_review_fix(
     worktree: &Path,
     branch: &str,
     prompt: String,
+    model: String,
     pid: Option<u32>,
     mode: RunMode,
     runner: &dyn AgentRunner,
@@ -1576,6 +1591,7 @@ pub fn prepare_review_fix(
             worktree,
             branch,
             prompt,
+            model,
             pid,
             mode,
         },
@@ -1600,6 +1616,9 @@ pub struct ExistingBranchRun<'a> {
     pub branch: &'a str,
     /// The agent's prompt.
     pub prompt: String,
+    /// The model to pass, already resolved by the caller through
+    /// [`crate::work::model::resolve_model`] (GitHub issue #143).
+    pub model: String,
     /// See [`prepare_review_fix`]'s `pid`.
     pub pid: Option<u32>,
     /// Headless or interactive.
@@ -1630,6 +1649,7 @@ pub fn prepare_existing_branch_run(
         worktree,
         branch,
         prompt,
+        model,
         pid,
         mode,
     } = run;
@@ -1659,7 +1679,7 @@ pub fn prepare_existing_branch_run(
 
     let invocation = runner.build_invocation(InvocationInputs {
         prompt,
-        model: None,
+        model,
         max_turns: None,
         permission_mode: None,
         settings_path,
@@ -2492,6 +2512,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -2565,6 +2586,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2623,6 +2645,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2680,6 +2703,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2736,6 +2760,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2794,6 +2819,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2855,6 +2881,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -2946,6 +2973,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3030,6 +3058,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3137,6 +3166,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3480,6 +3510,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3534,6 +3565,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3601,6 +3633,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3666,6 +3699,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3719,6 +3753,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3778,6 +3813,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3834,6 +3870,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3890,6 +3927,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -3944,6 +3982,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4019,6 +4058,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4080,6 +4120,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4130,6 +4171,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4183,6 +4225,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4267,6 +4310,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4328,6 +4372,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4384,6 +4429,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4442,6 +4488,7 @@ mod tests {
             ticket_provider_error: Some("no Jira API token found"),
             status_on_pr: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -4504,6 +4551,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4559,6 +4607,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4608,6 +4657,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4660,6 +4710,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4717,6 +4768,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4772,6 +4824,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4859,6 +4912,7 @@ mod tests {
             status_on_pr,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -4991,6 +5045,7 @@ mod tests {
             status_on_pr: Some("In Review"),
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5052,6 +5107,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5109,6 +5165,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5168,6 +5225,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5228,6 +5286,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home: home.clone(),
@@ -5316,6 +5375,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5387,6 +5447,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5445,6 +5506,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5503,6 +5565,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5555,6 +5618,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5613,6 +5677,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5684,6 +5749,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5741,6 +5807,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5828,6 +5895,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5851,8 +5919,107 @@ mod tests {
         assert_eq!(prepared.invocation.program, "claude");
     }
 
+    /// The `--model` value an invocation passes.
+    fn model_arg(invocation: &crate::agent::AgentInvocation) -> &str {
+        let at = invocation
+            .args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("every invocation passes --model");
+        &invocation.args[at + 1]
+    }
+
+    /// Prepares a `mylane` run with `lane_model`, claude preferred and
+    /// opencode as its fallback, under `models`.
+    fn prepare_with_opencode_fallback(
+        lane_model: &str,
+        models: &crate::config::ModelsConfig,
+    ) -> PreparedRun {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let mut lane = lane_config(&repo_root.to_string_lossy());
+        lane.model = Some(lane_model.to_string());
+        let config = config_with_lane("mylane", lane, &worktree_root);
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: vec![&OpencodeRunner],
+            models,
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        prepare_run_lane(
+            &deps,
+            &config,
+            &paths,
+            "mylane",
+            RunLaneRequest::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// GitHub issue #143: a fallback attempt resolves its model on its own
+    /// runner. The claude lane model is skipped (opencode rejects its
+    /// spelling) and `[agent.opencode] default_model` is passed.
     #[test]
-    fn prepare_run_lane_with_fallback_runners_builds_one_planned_fallback_with_no_model() {
+    fn a_fallback_attempt_passes_the_fallback_runners_configured_model() {
+        let models = crate::config::ModelsConfig {
+            opencode: crate::config::RunnerModels {
+                default_model: Some("venice/glm-fallback".to_string()),
+                usage_probe_model: None,
+            },
+            ..crate::config::ModelsConfig::default()
+        };
+
+        let prepared = prepare_with_opencode_fallback("fable", &models);
+
+        assert_eq!(model_arg(&prepared.invocation), "fable");
+        assert_eq!(prepared.fallbacks.len(), 1);
+        assert_eq!(
+            model_arg(&prepared.fallbacks[0].invocation),
+            "venice/glm-fallback"
+        );
+    }
+
+    /// GitHub issue #143: a lane model is kept on whichever attempt's runner
+    /// accepts its spelling and skipped on the one that doesn't.
+    #[test]
+    fn a_lane_model_is_kept_only_on_the_runner_that_accepts_it() {
+        let prepared = prepare_with_opencode_fallback(
+            "venice/glm-lane",
+            &crate::config::ModelsConfig::default(),
+        );
+
+        assert_eq!(model_arg(&prepared.invocation), "opus", "claude skips it");
+        assert_eq!(
+            model_arg(&prepared.fallbacks[0].invocation),
+            "venice/glm-lane",
+            "opencode keeps it"
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_with_fallback_runners_builds_one_planned_fallback() {
         let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
         let mut lane = lane_config(&repo_root.to_string_lossy());
         lane.model = Some("fable".to_string());
@@ -5879,6 +6046,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5907,10 +6075,9 @@ mod tests {
         let fallback = &prepared.fallbacks[0];
         assert_eq!(fallback.agent, "opencode");
         assert_eq!(fallback.invocation.program, "opencode");
-        // model is runner-specific and only ever set for the preferred
-        // agent's own attempt — the opencode fallback must never see
-        // "fable".
-        assert!(!fallback.invocation.args.iter().any(|a| a == "fable"));
+        // Model spellings are runner-specific: opencode rejects the claude
+        // lane model, so the fallback resolves to opencode's own default.
+        assert_eq!(model_arg(&fallback.invocation), "venice/z-ai-glm-5-3-flash");
     }
 
     #[test]
@@ -5946,6 +6113,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: vec![&OpencodeRunner],
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -5968,7 +6136,7 @@ mod tests {
         // opencode drives the primary attempt since claude is exhausted,
         // and there's no further fallback to plan beyond it.
         assert_eq!(prepared.invocation.program, "opencode");
-        assert!(!prepared.invocation.args.iter().any(|a| a == "fable"));
+        assert_eq!(model_arg(&prepared.invocation), "venice/z-ai-glm-5-3-flash");
         assert!(prepared.fallbacks.is_empty());
     }
 
@@ -6003,6 +6171,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6115,6 +6284,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6301,6 +6471,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6676,6 +6847,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6749,6 +6921,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -6819,6 +6992,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let state_dir = tmp.path().join("state");
         let paths = RunLanePaths {
@@ -6888,6 +7062,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6945,6 +7120,7 @@ mod tests {
             status_on_pr: None,
             ticket_provider_error: None,
             fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
         };
         let paths = RunLanePaths {
             home,
@@ -6994,6 +7170,7 @@ mod tests {
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
+            "opus".to_string(),
             None,
             RunMode::Headless,
             &ClaudeRunner,
@@ -7046,6 +7223,7 @@ mod tests {
                 worktree: &worktree,
                 branch: "jowi-dev/proj-1-slug",
                 prompt: "review it".to_string(),
+                model: "opus".to_string(),
                 pid: Some(77),
                 mode: RunMode::Headless,
             },
@@ -7080,6 +7258,7 @@ mod tests {
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
+            "opus".to_string(),
             None,
             RunMode::Headless,
             &ClaudeRunner,
@@ -7110,6 +7289,7 @@ mod tests {
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
+            "opus".to_string(),
             None,
             RunMode::Interactive,
             &ClaudeRunner,
@@ -7148,6 +7328,7 @@ mod tests {
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
+            "opus".to_string(),
             Some(4242),
             RunMode::Headless,
             &ClaudeRunner,

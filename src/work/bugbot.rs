@@ -125,6 +125,9 @@ pub struct CleanupLaunchDeps<'a> {
     /// template (when `req.cfg.prompt` is unset) and the rendered shell
     /// command.
     pub runner: &'a dyn AgentRunner,
+    /// The end of the session's model chain after `req.cfg.model` (GitHub
+    /// issue #143, [`crate::work::model`]).
+    pub model_defaults: crate::work::model::ModelDefaults<'a>,
 }
 
 /// Everything [`launch_cleanup`] needs to know about *this* launch, mirroring
@@ -232,9 +235,14 @@ pub fn launch_cleanup(
         .or(req.cfg.prompt.as_deref())
         .unwrap_or_else(|| deps.runner.default_cleanup_prompt_template());
     let prompt = cleanup_prompt(template, req.key, &findings_file);
-    let command = deps
-        .runner
-        .interactive_shell_command(req.cfg.model.as_deref(), &prompt);
+    let model = deps.model_defaults.resolve(
+        deps.runner,
+        &[crate::work::model::ModelCandidate {
+            source: "[work.review_watch] model",
+            model: req.cfg.model.as_deref(),
+        }],
+    );
+    let command = deps.runner.interactive_shell_command(&model.model, &prompt);
     let env = [(
         crate::work::audit::SESSION_RUN_ID_ENV.to_string(),
         run_id.to_string(),
@@ -293,6 +301,8 @@ pub struct RealCleanupLauncher<'a> {
     /// The AI coding agent cleanup sessions launch (Claude today; see
     /// [`AgentRunner`] and GitHub issue #17).
     pub runner: &'a dyn AgentRunner,
+    /// See [`CleanupLaunchDeps::model_defaults`].
+    pub model_defaults: crate::work::model::ModelDefaults<'a>,
 }
 
 impl CleanupLauncher for RealCleanupLauncher<'_> {
@@ -301,6 +311,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
             store: self.store,
             tmux: self.tmux,
             runner: self.runner,
+            model_defaults: self.model_defaults,
         };
         let req = CleanupLaunchRequest {
             cfg: self.cfg,
@@ -384,6 +395,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -423,7 +435,7 @@ mod tests {
                         outcome.run_id.to_string()
                     )],
                     command: format!(
-                        "claude '/bugbot-triage PROJ-1 {}'",
+                        "claude --model 'opus' '/bugbot-triage PROJ-1 {}'",
                         findings_file.to_string_lossy()
                     ),
                 },
@@ -451,6 +463,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -482,6 +495,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -524,6 +538,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -549,7 +564,7 @@ mod tests {
                         outcome.run_id.to_string()
                     )],
                     command: format!(
-                        "claude '/bugbot-triage PROJ-1 {}'",
+                        "claude --model 'opus' '/bugbot-triage PROJ-1 {}'",
                         findings_file.to_string_lossy()
                     ),
                 },
@@ -572,6 +587,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -593,9 +609,55 @@ mod tests {
         assert_eq!(
             command,
             Some(format!(
-                "claude '/custom-triage PROJ-9 reading {}'",
+                "claude --model 'opus' '/custom-triage PROJ-9 reading {}'",
                 findings_file.to_string_lossy()
             ))
+        );
+    }
+
+    /// GitHub issue #143: with no `[work.review_watch] model` (and no audit
+    /// model for it to fall back to), the session uses `[work]
+    /// default_model`.
+    #[test]
+    fn launch_cleanup_falls_back_to_the_work_default_model() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            ..ReviewWatchConfig::default()
+        };
+        let models = crate::config::ModelsConfig::default();
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+            runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults {
+                work_default: Some("sonnet"),
+                models: &models,
+            },
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            identity: test_identity(),
+            key: "PROJ-9",
+        };
+
+        launch_cleanup(&deps, &req).unwrap();
+
+        let command = tmux.calls().iter().find_map(|call| match call {
+            TmuxCall::NewSessionWithCommand { command, .. }
+            | TmuxCall::NewWindowWithCommand { command, .. } => Some(command.clone()),
+            _ => None,
+        });
+        assert!(
+            command
+                .as_deref()
+                .is_some_and(|c| c.starts_with("claude --model 'sonnet' ")),
+            "{command:?}"
         );
     }
 
@@ -614,6 +676,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -656,6 +719,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
 
         launcher.launch_cleanup("PROJ-1");
@@ -689,6 +753,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
 
         // Must not propagate/panic per the `CleanupLauncher` contract.
@@ -716,6 +781,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -737,7 +803,7 @@ mod tests {
         assert_eq!(
             command,
             Some(format!(
-                "claude '/custom-file PROJ-9 at {}'",
+                "claude --model 'opus' '/custom-file PROJ-9 at {}'",
                 findings_file.to_string_lossy()
             ))
         );
@@ -760,6 +826,7 @@ mod tests {
             store: &store,
             tmux: &tmux,
             runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
