@@ -1300,7 +1300,8 @@ to" windows.
 A ticket that sits under an epic shows it on its card as an `epic <KEY>`
 line, and in the detail window as `Epic: <KEY>  <summary>` under its
 status. Tickets without a parent epic render without either line, and
-their cards keep their usual height.
+their cards keep their usual height. If the epics can't be loaded, the
+board still loads, without epic lines, and the status line says why.
 
 | Key | Action |
 |---|---|

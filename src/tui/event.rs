@@ -2497,14 +2497,18 @@ impl TicketPage {
     }
 }
 
-/// Run `Cmd::FetchTickets`: search for tickets matching `query`, classify
-/// each one's worker-lane readiness ([`board_readiness`], GitHub issue #62),
-/// and map them to [`crate::tui::app::TicketSummary`]s.
+/// Run `Cmd::FetchTickets`: search for tickets matching `query`, fill in
+/// each one's epic ([`TicketProvider::hydrate_parents`], one batched call on
+/// GitHub), classify each one's worker-lane readiness ([`board_readiness`],
+/// GitHub issue #62), and map them to
+/// [`crate::tui::app::TicketSummary`]s.
 ///
 /// Emits [`Msg::TicketsLoaded`], then [`Msg::SearchTruncated`] if the search
-/// hit its page budget, then [`Msg::ReadinessDegraded`] if a readiness input
-/// couldn't be fetched -- last, so the status line keeps the note the
-/// affected `?` glyphs need explaining by.
+/// hit its page budget, then [`Msg::BoardDegraded`] if the epics or a
+/// readiness input couldn't be fetched -- last, so the status line keeps
+/// the note the missing epic lines or affected `?` glyphs need explaining
+/// by. A failed epic lookup leaves every card without an epic line but
+/// never fails the fetch.
 fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     let result = match deps.jira.search(query) {
         Ok(result) => result,
@@ -2512,7 +2516,16 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     };
     let truncated = result.next_page_token.is_some();
     let mut issues = result.issues;
-    let (readiness, degraded) = board_readiness(deps, &mut issues);
+    let epics_degraded = deps
+        .jira
+        .hydrate_parents(&mut issues)
+        .err()
+        .map(|err| format!("epics unknown: could not load parents ({err})"));
+    let (readiness, readiness_degraded) = board_readiness(deps, &mut issues);
+    let degraded = [readiness_degraded, epics_degraded]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| format!("{a}; {b}"));
     let page = TicketPage {
         truncated,
         tickets: issues
@@ -2527,7 +2540,7 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
     let truncation = page.truncation_msg();
     let mut msgs = vec![Msg::TicketsLoaded(page.tickets)];
     msgs.extend(truncation);
-    msgs.extend(degraded.map(Msg::ReadinessDegraded));
+    msgs.extend(degraded.map(Msg::BoardDegraded));
     msgs
 }
 
@@ -3277,11 +3290,11 @@ mod tests {
             ]
         );
         match msgs.last() {
-            Some(Msg::ReadinessDegraded(note)) => {
+            Some(Msg::BoardDegraded(note)) => {
                 assert!(note.contains("boom"), "{note}");
                 assert!(note.contains("readiness"), "{note}");
             }
-            other => panic!("expected a trailing ReadinessDegraded, got {other:?}"),
+            other => panic!("expected a trailing BoardDegraded, got {other:?}"),
         }
     }
 
@@ -3383,8 +3396,105 @@ mod tests {
             "no blocker data must never read as ready"
         );
         match msgs.last() {
-            Some(Msg::ReadinessDegraded(note)) => assert!(note.contains("rate limited"), "{note}"),
-            other => panic!("expected a trailing ReadinessDegraded, got {other:?}"),
+            Some(Msg::BoardDegraded(note)) => assert!(note.contains("rate limited"), "{note}"),
+            other => panic!("expected a trailing BoardDegraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_tickets_on_github_carries_each_parent_onto_its_card_epic_in_one_call() {
+        use crate::github::gh_cli::{FakeGhCli, IssueInfo, IssueParent, IssueState};
+        use crate::ticketing::github_provider::GithubProvider;
+
+        let info = |number: u64| IssueInfo {
+            number,
+            url: String::new(),
+            title: format!("Issue {number}"),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+        let provider_gh: &'static FakeGhCli = Box::leak(Box::new(
+            FakeGhCli::new()
+                .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+                .with_issue_list(Ok(vec![info(2), info(3)]))
+                .with_issue_parent(
+                    2,
+                    IssueParent {
+                        node_id: "I_1".to_string(),
+                        repo: "jowi-dev/tskmstr".to_string(),
+                        number: 1,
+                        title: "The epic".to_string(),
+                    },
+                ),
+        ));
+        let mut deps = net_deps(FakeJiraClient::new());
+        deps.jira = Box::new(GithubProvider::new(
+            provider_gh,
+            "jowi-dev/tskmstr".to_string(),
+        ));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        match msgs.as_slice() {
+            [Msg::TicketsLoaded(tickets)] => {
+                let epics: Vec<Option<(String, String)>> = tickets
+                    .iter()
+                    .map(|t| t.epic.as_ref().map(|e| (e.key.clone(), e.summary.clone())))
+                    .collect();
+                assert_eq!(
+                    epics,
+                    vec![Some(("GH-1".to_string(), "The epic".to_string())), None]
+                );
+            }
+            other => panic!("expected only TicketsLoaded, got {other:?}"),
+        }
+        assert_eq!(provider_gh.issues_parents_calls().len(), 1);
+    }
+
+    #[test]
+    fn fetch_tickets_parent_fetch_failure_still_loads_cards_and_notes_it() {
+        use crate::github::gh_cli::{FakeGhCli, GhError, IssueInfo, IssueState};
+        use crate::ticketing::github_provider::GithubProvider;
+
+        let provider_gh: &'static FakeGhCli = Box::leak(Box::new(
+            FakeGhCli::new()
+                .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+                .with_issue_list(Ok(vec![IssueInfo {
+                    number: 2,
+                    url: String::new(),
+                    title: "Issue 2".to_string(),
+                    body: String::new(),
+                    state: IssueState::Open,
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                }]))
+                .with_issues_parents_error(GhError::Command {
+                    command: "gh api graphql".to_string(),
+                    exit_code: Some(1),
+                    stderr: "rate limited".to_string(),
+                }),
+        ));
+        let mut deps = net_deps(FakeJiraClient::new());
+        deps.jira = Box::new(GithubProvider::new(
+            provider_gh,
+            "jowi-dev/tskmstr".to_string(),
+        ));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![("GH-2".to_string(), Readiness::Ready)],
+            "a failed epic lookup must not affect readiness"
+        );
+        match msgs.last() {
+            Some(Msg::BoardDegraded(note)) => {
+                assert!(note.contains("epics unknown"), "{note}");
+                assert!(note.contains("rate limited"), "{note}");
+            }
+            other => panic!("expected a trailing BoardDegraded, got {other:?}"),
         }
     }
 

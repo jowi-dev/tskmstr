@@ -1392,9 +1392,10 @@ pub enum Msg {
     },
     /// A board fetch loaded its tickets, but a readiness input (blockers or
     /// the PR list) couldn't be fetched, so some cards show
-    /// [`Readiness::Unknown`]. Emitted after the load message, like
+    /// [`Readiness::Unknown`], or the epics couldn't be fetched, so no card
+    /// shows an epic line. Emitted after the load message, like
     /// [`Msg::SearchTruncated`], and carries the status-line note.
-    ReadinessDegraded(String),
+    BoardDegraded(String),
     /// Transitions for the selected ticket finished loading.
     TransitionsLoaded(Vec<Transition>),
     /// Transitions for the selected ticket failed to load.
@@ -2334,7 +2335,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 format!("showing first {shown} tickets -- more matched; narrow the filter");
             (app, Vec::new())
         }
-        Msg::ReadinessDegraded(note) => {
+        Msg::BoardDegraded(note) => {
             app.status_line = note;
             (app, Vec::new())
         }
@@ -4574,7 +4575,7 @@ mod tests {
     fn readiness_degraded_puts_its_note_on_the_status_line() {
         let (app, cmds) = update(
             App::new(),
-            Msg::ReadinessDegraded("readiness unknown: boom".to_string()),
+            Msg::BoardDegraded("readiness unknown: boom".to_string()),
         );
         assert_eq!(app.status_line, "readiness unknown: boom");
         assert!(cmds.is_empty());
