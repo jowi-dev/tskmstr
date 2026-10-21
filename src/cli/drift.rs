@@ -310,6 +310,7 @@ mod tests {
             jira_base_url: "https://example.atlassian.net".to_string(),
             jira_email: "ada@example.com".to_string(),
             default_project_key: "PROJ".to_string(),
+            epic_issue_type: "Epic".into(),
             github_repo: None,
             default_assignee_account_id: None,
             status_on_pr: None,

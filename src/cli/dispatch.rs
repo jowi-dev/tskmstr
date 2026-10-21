@@ -960,6 +960,7 @@ mod tests {
             jira_base_url: String::new(),
             jira_email: String::new(),
             default_project_key: String::new(),
+            epic_issue_type: String::new(),
             github_repo: Some(repo.to_string()),
             default_assignee_account_id: None,
             status_on_pr: None,
