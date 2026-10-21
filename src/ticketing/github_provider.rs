@@ -786,7 +786,7 @@ impl TicketProvider for GithubProvider<'_> {
         for (issue, number) in issues.iter_mut().zip(numbers) {
             let deps = IssueDependencies {
                 blocked_by: blocked_by.remove(&number).unwrap_or_default(),
-                blocking: Vec::new(),
+                ..Default::default()
             };
             let links = &mut issue.fields.issue_links;
             links.retain(|link| link.inward_issue.is_none());
@@ -1233,6 +1233,7 @@ mod tests {
                         state: IssueState::Closed,
                         url: String::new(),
                     }],
+                    parent: None,
                 }),
             );
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
@@ -2079,6 +2080,7 @@ mod tests {
                         url: String::new(),
                     }],
                     blocking: Vec::new(),
+                    parent: None,
                 }),
             );
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
