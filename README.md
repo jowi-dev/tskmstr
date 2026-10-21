@@ -179,6 +179,8 @@ tm auth status
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
 | `tm ticket <KEY>` | Associate Jira issue `<KEY>` (e.g. `PROJ-123`) with the PR open for the current branch |
 | `tm ticket create [--title] [--body] [--status <STATUS>\|--no-transition] [--audited [--audit-notes]]` | Create a new ticket in the configured default project. No PR required or touched. `--audited` also records a passing audit so `tm ready` can pick it up |
+| `tm ticket create --epic [--title] [--body]` | Create an epic instead of a task. Conflicts with `--parent` (epics are not nested). Backend-dependent (see the note below the table) |
+| `tm ticket create --parent <EPIC> [--title] [--body]` | Create the ticket under epic `<EPIC>`, which must be an epic. Backend-dependent |
 | `tm ticket transition <KEY> <STATUS>` | Move ticket `<KEY>` to `<STATUS>`. Fails (non-zero exit) if no transition matches or the Jira API call fails |
 | `tm ticket transition <KEY>` | List ticket `<KEY>`'s current status and available transitions |
 | `tm ticket assign <KEY> <NAME>` | Assign ticket `<KEY>` to the assignable user matching `<NAME>` (exact displayName match, else an unambiguous substring match). Fails if no user or more than one matches |
@@ -190,6 +192,10 @@ tm auth status
 | `tm ticket link <KEY> --blocked-by <OTHER>` | Create a `Blocks` link: `<KEY>` is blocked by `<OTHER>` |
 | `tm ticket link <KEY>` | List `<KEY>`'s existing links, of any link type |
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
+| `tm ticket parent <KEY> <EPIC>` | Put `<KEY>` under epic `<EPIC>`. Fails if `<EPIC>` is not an epic or `<KEY>` is one. Backend-dependent |
+| `tm ticket parent <KEY> --clear` | Take `<KEY>` out from under its epic. Backend-dependent |
+| `tm ticket parent <KEY>` | Print the epic `<KEY>` sits under, or that it has none |
+| `tm ticket children <EPIC>` | List the tickets under `<EPIC>`, one `KEY  STATUS  SUMMARY` line each. Backend-dependent |
 | `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
 | `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` | Post a comment to ticket `<KEY>` (inferred from the current branch's PR if omitted); `--pr` also posts it to the current branch's PR |
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
@@ -238,6 +244,8 @@ tm auth status
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
+
+**Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and neither the Jira nor the GitHub backend implements them yet (GitHub issues #157 and #158). Until then they fail with a "not supported by this ticket backend" error, or with "is not an epic" when the parent check runs first, rather than creating a plain task. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
 
 ## Ticket/run status drift (`tm drift`)
 
