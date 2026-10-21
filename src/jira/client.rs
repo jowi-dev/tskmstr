@@ -795,6 +795,7 @@ mod tests {
             summary: "Fix the thing".to_string(),
             description: json!({ "type": "doc", "version": 1, "content": [] }),
             issue_type_name: "Task".to_string(),
+            parent_key: None,
             assignee_account_id: None,
         };
 

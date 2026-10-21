@@ -444,6 +444,7 @@ impl TicketProvider for JiraProvider {
             summary: req.summary.clone(),
             description: text_to_adf(&req.description),
             issue_type_name: req.kind.jira_issue_type_name().to_string(),
+            parent_key: req.parent_key.clone(),
             assignee_account_id: req.assignee_account_id.clone(),
         })?)
     }
@@ -549,6 +550,7 @@ impl TicketProvider for FakeJiraClient {
                 summary: req.summary.clone(),
                 description: text_to_adf(&req.description),
                 issue_type_name: req.kind.jira_issue_type_name().to_string(),
+                parent_key: req.parent_key.clone(),
                 assignee_account_id: req.assignee_account_id.clone(),
             },
         )?;
