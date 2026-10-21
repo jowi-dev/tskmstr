@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::jira::client::RankAnchor;
 use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
-use crate::ticketing::provider::TicketProvider;
+use crate::ticketing::provider::{TicketKind, TicketProvider};
 use crate::ticketing::types::CreateLinkRequest;
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
@@ -170,7 +170,14 @@ pub fn create(
             .or(ctx.config.status_on_create.as_deref())
     };
 
-    let outcome = create_ticket(ctx, &title, opts.body.as_deref(), status_target)?;
+    let outcome = create_ticket(
+        ctx,
+        &title,
+        opts.body.as_deref(),
+        TicketKind::Task,
+        None,
+        status_target,
+    )?;
 
     if let Some(store) = session_store {
         let scope = crate::config::BackendIdentity::from_config(ctx.config).scope();

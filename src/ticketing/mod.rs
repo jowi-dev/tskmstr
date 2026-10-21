@@ -110,7 +110,7 @@ use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{NewTicket, TicketKind, TicketProvider, TicketQuery};
 use crate::ticketing::types::{
-    CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue, RemoteLinkRequest,
+    CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue, ParentRef, RemoteLinkRequest,
 };
 
 /// Dependencies shared by the ticketing orchestration functions that deal
@@ -302,6 +302,28 @@ pub enum TicketingError {
         /// The branch a ticket key could not be resolved for.
         branch: String,
     },
+
+    /// A ticket was to be put under `parent`, but the backend doesn't
+    /// report `parent` as an epic ([`TicketProvider::is_epic`]). Only epics
+    /// have children. Until a backend implements epics, every parent is
+    /// refused this way.
+    #[error("cannot put {child} under {parent}: {parent} is not an epic")]
+    ParentNotEpic {
+        /// The ticket that was to get the parent: its key, or `a new
+        /// ticket` when creating one.
+        child: String,
+        /// The would-be parent.
+        parent: String,
+    },
+
+    /// An epic was to be put under another ticket. Epics are not nested:
+    /// a parent means "this epic is made of these tickets", and
+    /// epic-to-epic ordering is a `Blocks` link instead.
+    #[error("cannot put {key} under an epic: epics cannot have a parent")]
+    EpicCannotHaveParent {
+        /// The epic: its key, or `a new epic` when creating one.
+        key: String,
+    },
 }
 
 /// Describe `others` for display in [`TicketingError::NoBlocksLinkBetween`]:
@@ -454,18 +476,33 @@ pub struct CreateTicketOutcome {
 /// [`Config::status_on_create`] is the caller's job (see
 /// [`crate::cli::ticket::create`]); this function only ever applies whatever
 /// it's given.
+///
+/// `kind` picks a Task or an Epic. `parent`, if given, is the epic to create
+/// the ticket under; it's checked before anything is created: an epic can't
+/// have a parent ([`TicketingError::EpicCannotHaveParent`]), and the parent
+/// must be an epic ([`TicketingError::ParentNotEpic`]).
 pub fn create_ticket(
     ctx: &CreateTicketContext,
     title: &str,
     body: Option<&str>,
+    kind: TicketKind,
+    parent: Option<&str>,
     status_target: Option<&str>,
 ) -> Result<CreateTicketOutcome, TicketingError> {
+    if let Some(parent) = parent {
+        if kind == TicketKind::Epic {
+            return Err(TicketingError::EpicCannotHaveParent {
+                key: "a new epic".to_string(),
+            });
+        }
+        require_epic(ctx.jira, "a new ticket", parent)?;
+    }
     let req = NewTicket {
         project_key: ctx.config.default_project_key.clone(),
         summary: title.to_string(),
         description: body.unwrap_or_default().to_string(),
-        kind: TicketKind::Task,
-        parent_key: None,
+        kind,
+        parent_key: parent.map(str::to_string),
         assignee_account_id: default_new_ticket_assignee(ctx.jira, ctx.config),
     };
     let issue = ctx.jira.create_issue(&req)?;
@@ -841,6 +878,69 @@ pub fn link_ticket(
     jira.get_issue(key)?;
     jira.create_link(req)?;
     Ok(())
+}
+
+/// Fail with [`TicketingError::ParentNotEpic`] unless `parent` exists and
+/// the backend reports it as an epic. `child` names the ticket being placed,
+/// for the error message only.
+fn require_epic(
+    jira: &dyn TicketProvider,
+    child: &str,
+    parent: &str,
+) -> Result<(), TicketingError> {
+    let parent_issue = jira.get_issue(parent)?;
+    if jira.is_epic(&parent_issue) {
+        Ok(())
+    } else {
+        Err(TicketingError::ParentNotEpic {
+            child: child.to_string(),
+            parent: parent.to_string(),
+        })
+    }
+}
+
+/// `tm ticket parent <KEY> (<EPIC>|--clear)`: put `key` under the epic
+/// `parent`, or with `None`, take it out from under its epic.
+///
+/// Verifies `key` exists first. Setting a parent also requires that `key`
+/// is not itself an epic ([`TicketingError::EpicCannotHaveParent`]) and
+/// that `parent` is one ([`TicketingError::ParentNotEpic`]); neither rule
+/// applies to clearing. A backend without parent support fails with
+/// [`ProviderError::NotSupported`], or with `ParentNotEpic` first, since
+/// such a backend reports no epics.
+pub fn set_ticket_parent(
+    jira: &dyn TicketProvider,
+    key: &str,
+    parent: Option<&str>,
+) -> Result<(), TicketingError> {
+    let child = jira.get_issue(key)?;
+    if let Some(parent) = parent {
+        if jira.is_epic(&child) {
+            return Err(TicketingError::EpicCannotHaveParent {
+                key: key.to_string(),
+            });
+        }
+        require_epic(jira, key, parent)?;
+    }
+    jira.set_parent(key, parent)?;
+    Ok(())
+}
+
+/// `tm ticket parent <KEY>`: the epic `key` sits under, if any, read from
+/// [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent).
+pub fn ticket_parent(
+    jira: &dyn TicketProvider,
+    key: &str,
+) -> Result<Option<ParentRef>, TicketingError> {
+    Ok(jira.get_issue(key)?.fields.parent)
+}
+
+/// `tm ticket children <EPIC>`: the tickets under `epic`. Verifies `epic`
+/// exists first, so a mistyped key is a not-found error rather than an
+/// empty list.
+pub fn epic_children(jira: &dyn TicketProvider, epic: &str) -> Result<Vec<Issue>, TicketingError> {
+    jira.get_issue(epic)?;
+    Ok(jira.children(epic)?)
 }
 
 /// Result of successfully [`unlink_ticket`]ing two tickets.
@@ -1437,8 +1537,15 @@ mod tests {
         let jira = FakeJiraClient::new().with_create_issue_result(issue("GH-9"));
         let cfg = github_config();
 
-        let outcome = create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
-            .expect("should succeed");
+        let outcome = create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            None,
+        )
+        .expect("should succeed");
 
         assert_eq!(
             outcome.issue_url,
@@ -2042,7 +2149,15 @@ mod tests {
             config: &cfg,
         };
 
-        let outcome = create_ticket(&ctx, "Add the widget", None, Some("To Do")).expect("ok");
+        let outcome = create_ticket(
+            &ctx,
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            Some("To Do"),
+        )
+        .expect("ok");
 
         assert_eq!(
             outcome.status_transition,
@@ -2334,8 +2449,15 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", Some("Some **body**"), None)
-            .expect("should succeed");
+        let outcome = create_ticket(
+            &ctx,
+            "Add the widget",
+            Some("Some **body**"),
+            TicketKind::Task,
+            None,
+            None,
+        )
+        .expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(calls.len(), 1);
@@ -2369,8 +2491,15 @@ mod tests {
             });
         let cfg = github_config();
 
-        create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
-            .expect("should succeed");
+        create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            None,
+        )
+        .expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(calls.len(), 1);
@@ -2384,8 +2513,15 @@ mod tests {
             .with_myself_unauthorized();
         let cfg = github_config();
 
-        create_ticket(&create_ctx(&jira, &cfg), "Add the widget", None, None)
-            .expect("should succeed");
+        create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            None,
+        )
+        .expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(calls.len(), 1);
@@ -2398,7 +2534,8 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        create_ticket(&ctx, "Add the widget", None, None).expect("should succeed");
+        create_ticket(&ctx, "Add the widget", None, TicketKind::Task, None, None)
+            .expect("should succeed");
 
         let calls = jira.create_issue_calls();
         assert_eq!(
@@ -2418,8 +2555,15 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None, Some("In Progress"))
-            .expect("should succeed");
+        let outcome = create_ticket(
+            &ctx,
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            Some("In Progress"),
+        )
+        .expect("should succeed");
 
         assert_eq!(
             outcome.status_transition,
@@ -2439,8 +2583,15 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None, Some("In Progress"))
-            .expect("should succeed even with no matching transition");
+        let outcome = create_ticket(
+            &ctx,
+            "Add the widget",
+            None,
+            TicketKind::Task,
+            None,
+            Some("In Progress"),
+        )
+        .expect("should succeed even with no matching transition");
 
         match outcome.status_transition {
             Some(StatusTransition::Warning(msg)) => {
@@ -2459,7 +2610,8 @@ mod tests {
         let cfg = config();
         let ctx = create_ctx(&jira, &cfg);
 
-        let outcome = create_ticket(&ctx, "Add the widget", None, None).expect("should succeed");
+        let outcome = create_ticket(&ctx, "Add the widget", None, TicketKind::Task, None, None)
+            .expect("should succeed");
 
         assert_eq!(outcome.status_transition, None);
         assert!(jira.transition_calls().is_empty());
@@ -3232,6 +3384,194 @@ mod tests {
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_ticket_creates_an_epic() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+
+        let outcome = create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Big objective",
+            None,
+            TicketKind::Epic,
+            None,
+            None,
+        )
+        .expect("should succeed");
+
+        assert_eq!(outcome.issue_key, "PROJ-9");
+        assert_eq!(jira.create_issue_calls()[0].issue_type_name, "Epic");
+    }
+
+    #[test]
+    fn create_ticket_under_an_epic_passes_the_parent_to_the_provider() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-9", issue("PROJ-9"))
+            .with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+
+        create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Part of it",
+            None,
+            TicketKind::Task,
+            Some("PROJ-1"),
+            None,
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            ticket_parent(&jira, "PROJ-9").unwrap().map(|p| p.key),
+            Some("PROJ-1".to_string())
+        );
+    }
+
+    #[test]
+    fn create_ticket_under_a_non_epic_is_rejected_before_creating() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+
+        let err = create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Part of it",
+            None,
+            TicketKind::Task,
+            Some("PROJ-1"),
+            None,
+        )
+        .expect_err("PROJ-1 is not an epic");
+
+        assert!(
+            matches!(&err, TicketingError::ParentNotEpic { parent, .. } if parent == "PROJ-1"),
+            "{err:?}"
+        );
+        assert!(jira.create_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn create_ticket_rejects_an_epic_with_a_parent() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_create_issue_result(issue("PROJ-9"));
+        let cfg = config();
+
+        let err = create_ticket(
+            &create_ctx(&jira, &cfg),
+            "Nested",
+            None,
+            TicketKind::Epic,
+            Some("PROJ-1"),
+            None,
+        )
+        .expect_err("epics are not nested");
+
+        assert!(
+            matches!(err, TicketingError::EpicCannotHaveParent { .. }),
+            "{err:?}"
+        );
+        assert!(jira.create_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn set_ticket_parent_puts_a_ticket_under_an_epic() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"));
+
+        set_ticket_parent(&jira, "PROJ-2", Some("PROJ-1")).expect("should succeed");
+
+        assert_eq!(
+            jira.set_parent_calls(),
+            vec![("PROJ-2".to_string(), Some("PROJ-1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn set_ticket_parent_none_clears_without_checking_epics() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-2", issue("PROJ-2"));
+
+        set_ticket_parent(&jira, "PROJ-2", None).expect("should succeed");
+
+        assert_eq!(jira.set_parent_calls(), vec![("PROJ-2".to_string(), None)]);
+    }
+
+    #[test]
+    fn set_ticket_parent_rejects_a_parent_that_is_not_an_epic() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"));
+
+        let err = set_ticket_parent(&jira, "PROJ-2", Some("PROJ-1")).expect_err("not an epic");
+
+        assert!(
+            matches!(&err, TicketingError::ParentNotEpic { child, parent }
+                if child == "PROJ-2" && parent == "PROJ-1"),
+            "{err:?}"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn set_ticket_parent_rejects_putting_an_epic_under_an_epic() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_epic("PROJ-2", issue("PROJ-2"));
+
+        let err = set_ticket_parent(&jira, "PROJ-2", Some("PROJ-1")).expect_err("epics nest");
+
+        assert!(
+            matches!(&err, TicketingError::EpicCannotHaveParent { key } if key == "PROJ-2"),
+            "{err:?}"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn set_ticket_parent_missing_child_is_not_found() {
+        let jira = FakeJiraClient::new().with_epic("PROJ-1", issue("PROJ-1"));
+
+        let err = set_ticket_parent(&jira, "PROJ-2", Some("PROJ-1")).expect_err("missing");
+
+        assert!(
+            matches!(
+                err,
+                TicketingError::Provider(ProviderError::NotFound { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn epic_children_lists_the_epics_children() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_parent("PROJ-2", "PROJ-1");
+
+        let children = epic_children(&jira, "PROJ-1").expect("should succeed");
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].key, "PROJ-2");
+    }
+
+    #[test]
+    fn epic_children_missing_epic_is_not_found() {
+        let jira = FakeJiraClient::new();
+
+        let err = epic_children(&jira, "PROJ-1").expect_err("missing");
+
+        assert!(
+            matches!(
+                err,
+                TicketingError::Provider(ProviderError::NotFound { .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
