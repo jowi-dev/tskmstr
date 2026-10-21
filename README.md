@@ -1297,6 +1297,11 @@ its transitions opens a centered floating window on top of the board rather
 than replacing it, so the board stays visible behind the detail and "Move
 to" windows.
 
+A ticket that sits under an epic shows it on its card as an `epic <KEY>`
+line, and in the detail window as `Epic: <KEY>  <summary>` under its
+status. Tickets without a parent epic render without either line, and
+their cards keep their usual height.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
