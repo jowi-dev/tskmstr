@@ -6,7 +6,7 @@
 //! by [`crate::github::gh_cli::FakeGhCli`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::jira::client::{JiraClient, JiraError, RankAnchor};
 use crate::jira::types::CreateIssueRequest;
@@ -83,6 +83,9 @@ pub struct FakeJiraClient {
     add_comment_calls: RefCell<Vec<(String, serde_json::Value)>>,
     cleared_status_labels: RefCell<HashMap<String, ClearedLabelsOutcome>>,
     clear_closed_status_labels_calls: RefCell<Vec<String>>,
+    epic_keys: RefCell<HashSet<String>>,
+    parents: RefCell<BTreeMap<String, String>>,
+    set_parent_calls: RefCell<Vec<(String, Option<String>)>>,
 }
 
 impl Default for FakeJiraClient {
@@ -113,6 +116,9 @@ impl Default for FakeJiraClient {
             add_comment_calls: RefCell::new(Vec::new()),
             cleared_status_labels: RefCell::new(HashMap::new()),
             clear_closed_status_labels_calls: RefCell::new(Vec::new()),
+            epic_keys: RefCell::new(HashSet::new()),
+            parents: RefCell::new(BTreeMap::new()),
+            set_parent_calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -383,6 +389,69 @@ impl FakeJiraClient {
     /// The `(key, body)` pairs passed to `add_comment`, in call order.
     pub fn add_comment_calls(&self) -> Vec<(String, serde_json::Value)> {
         self.add_comment_calls.borrow().clone()
+    }
+
+    /// Seed `get_issue(key)` to return `issue`, and report it as an epic
+    /// from `TicketProvider::is_epic`.
+    pub fn with_epic(self, key: &str, issue: Issue) -> Self {
+        self.mark_epic(key);
+        self.with_issue(key, issue)
+    }
+
+    /// Seed `child` as sitting under the epic `parent`, without recording a
+    /// `set_parent` call.
+    pub fn with_parent(self, child: &str, parent: &str) -> Self {
+        self.store_parent(child, Some(parent));
+        self
+    }
+
+    /// The `(child, parent)` pairs passed to `TicketProvider::set_parent`,
+    /// in call order. A `None` parent is a clear.
+    pub fn set_parent_calls(&self) -> Vec<(String, Option<String>)> {
+        self.set_parent_calls.borrow().clone()
+    }
+
+    /// Remember `key` as an epic.
+    pub(crate) fn mark_epic(&self, key: &str) {
+        self.epic_keys.borrow_mut().insert(key.to_string());
+    }
+
+    /// Whether `key` was seeded or created as an epic.
+    pub(crate) fn is_epic_key(&self, key: &str) -> bool {
+        self.epic_keys.borrow().contains(key)
+    }
+
+    /// Put `child` under `parent`, or take it out from under its parent
+    /// with `None`.
+    pub(crate) fn store_parent(&self, child: &str, parent: Option<&str>) {
+        let mut parents = self.parents.borrow_mut();
+        match parent {
+            Some(parent) => parents.insert(child.to_string(), parent.to_string()),
+            None => parents.remove(child),
+        };
+    }
+
+    /// Record a `TicketProvider::set_parent` call, then apply it.
+    pub(crate) fn record_set_parent(&self, child: &str, parent: Option<&str>) {
+        self.set_parent_calls
+            .borrow_mut()
+            .push((child.to_string(), parent.map(str::to_string)));
+        self.store_parent(child, parent);
+    }
+
+    /// The epic `child` sits under, if any.
+    pub(crate) fn parent_of(&self, child: &str) -> Option<String> {
+        self.parents.borrow().get(child).cloned()
+    }
+
+    /// The keys of every ticket under `epic`, in key order.
+    pub(crate) fn child_keys(&self, epic: &str) -> Vec<String> {
+        self.parents
+            .borrow()
+            .iter()
+            .filter(|(_, parent)| parent.as_str() == epic)
+            .map(|(child, _)| child.clone())
+            .collect()
     }
 }
 
