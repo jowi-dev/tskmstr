@@ -2338,8 +2338,8 @@ login`/`gh auth status`, not a stored Jira token); ticket keys are
 `GH-<issue number>` instead of a Jira project key; status lives in
 `tm:status/{todo,in-progress,in-review,blocked}` labels (no label, or a
 closed issue, both map to their obvious default) rather than a Jira
-workflow; and `tm backend init-labels` creates those four labels in the
-configured repo (idempotently — safe to re-run) so a fresh repo's board has
+workflow; and `tm backend init-labels` creates those four labels, plus the
+`tm:epic` label that marks an epic, in the configured repo (idempotently — safe to re-run) so a fresh repo's board has
 somewhere to put issues. `tm backend clean-status-labels` (`--dry-run` to
 preview) removes `tm:status/*` labels left on closed issues — GitHub's
 closing keywords close an issue without touching its labels; `tm merge`

@@ -62,6 +62,11 @@ use serde_json::Value;
 /// used when more than one is present.
 pub(crate) const STATUS_LABEL_PREFIX: &str = "tm:status/";
 
+/// The label that makes an issue an epic (see
+/// [`TicketProvider::is_epic`]). GitHub's own issue types exist only for
+/// organization repos, so a label is the one marker every repo can carry.
+pub(crate) const EPIC_LABEL: &str = "tm:epic";
+
 /// [`TicketProvider`] backed by GitHub Issues via a borrowed [`GhCli`].
 ///
 /// Holds a `&dyn GhCli` rather than owning a boxed one (contrast
