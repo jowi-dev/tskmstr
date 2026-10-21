@@ -1713,7 +1713,9 @@ fn draw_events_panel(
 }
 
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
-/// ticket's full detail, drawn over the board.
+/// ticket's full detail, drawn over the board: its status, its parent epic
+/// (`Epic: <KEY>  <summary>`, omitted when it has none), its URL, then its
+/// description.
 fn draw_detail_window(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
@@ -1725,17 +1727,21 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
 
     let text = match app.selected_ticket() {
         Some(ticket) => {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("Status: ", theme::SECTION_HEADER),
-                    Span::styled(
-                        ticket.status.clone(),
-                        theme::ticket_status_style(&ticket.status_category),
-                    ),
-                ]),
-                Line::from(Span::styled(ticket.url.clone(), theme::DIM)),
-                Line::from(""),
-            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled("Status: ", theme::SECTION_HEADER),
+                Span::styled(
+                    ticket.status.clone(),
+                    theme::ticket_status_style(&ticket.status_category),
+                ),
+            ])];
+            if let Some(epic) = &ticket.epic {
+                lines.push(Line::from(vec![
+                    Span::styled("Epic: ", theme::SECTION_HEADER),
+                    Span::raw(format!("{}  {}", epic.key, epic.summary)),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(ticket.url.clone(), theme::DIM)));
+            lines.push(Line::from(""));
             // `split('\n')`, not `.lines()`: a trailing blank line in the
             // description (e.g. a trailing hardBreak) should still render as
             // an empty row rather than being silently dropped.
@@ -2519,6 +2525,26 @@ mod tests {
             Some(value_cell.fg),
             theme::ticket_status_style("indeterminate").fg
         );
+    }
+
+    #[test]
+    fn detail_overlay_shows_the_epic_key_and_summary() {
+        let app = App {
+            columns: group_into_columns(vec![with_epic("PROJ-1", "PROJ-9", "Ship epics")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        assert!(buffer_text(&render(&app)).contains("Epic: PROJ-9  Ship epics"));
+    }
+
+    #[test]
+    fn detail_overlay_without_an_epic_has_no_epic_line() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        assert!(!buffer_text(&render(&app)).contains("Epic:"));
     }
 
     #[test]
