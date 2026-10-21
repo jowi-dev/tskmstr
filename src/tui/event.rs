@@ -2957,6 +2957,7 @@ fn to_ticket_summary(jira: &dyn TicketProvider, issue: Issue) -> crate::tui::app
         description,
         assignee,
         readiness: Readiness::Unknown,
+        epic: issue.fields.parent,
     }
 }
 
@@ -3810,6 +3811,26 @@ mod tests {
         });
         let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
         assert_eq!(summary.assignee, Some("Jane Doe".to_string()));
+    }
+
+    #[test]
+    fn to_ticket_summary_with_no_parent_has_no_epic() {
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue("PROJ-1", "To Do"));
+        assert_eq!(summary.epic, None);
+    }
+
+    #[test]
+    fn to_ticket_summary_carries_the_parent_as_its_epic() {
+        use crate::ticketing::types::ParentRef;
+
+        let epic = ParentRef {
+            key: "PROJ-9".to_string(),
+            summary: "Ship epics".to_string(),
+        };
+        let mut issue = issue("PROJ-1", "To Do");
+        issue.fields.parent = Some(epic.clone());
+        let summary = to_ticket_summary(&FakeJiraClient::new(), issue);
+        assert_eq!(summary.epic, Some(epic));
     }
 
     #[test]
