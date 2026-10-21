@@ -630,6 +630,14 @@ pub enum TicketCmd {
         /// creation".
         #[arg(long, requires = "audited")]
         audit_notes: Option<String>,
+        /// Create an epic instead of a task. Conflicts with `--parent`:
+        /// epics are not nested. Support depends on the ticket backend.
+        #[arg(long, conflicts_with = "parent")]
+        epic: bool,
+        /// Create the ticket under this epic key (case-insensitive), which
+        /// must be an epic. Support depends on the ticket backend.
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Move a ticket to a workflow status, or list its available
     /// transitions.
@@ -736,6 +744,27 @@ pub enum TicketCmd {
         key: String,
         /// The other issue key to remove the `Blocks` link with.
         other: String,
+    },
+    /// Put a ticket under an epic, take it out with `--clear`, or, with
+    /// neither, print the epic it sits under.
+    ///
+    /// The parent must be an epic, and an epic cannot have a parent.
+    /// Support depends on the ticket backend.
+    Parent {
+        /// Ticket key, e.g. `PROJ-372` (case-insensitive).
+        key: String,
+        /// Epic key to put `KEY` under. Conflicts with `--clear`.
+        #[arg(conflicts_with = "clear")]
+        epic: Option<String>,
+        /// Take `KEY` out from under its epic.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// List the tickets under an epic, one `KEY  STATUS  SUMMARY` line
+    /// each. Support depends on the ticket backend.
+    Children {
+        /// Epic key, e.g. `PROJ-1` (case-insensitive).
+        epic: String,
     },
     /// Replace a ticket's description.
     ///
@@ -1587,6 +1616,99 @@ mod tests {
             }
             other => panic!("expected Ticket, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ticket_create_epic_and_parent() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "create", "--epic"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Create {
+                    epic: true,
+                    parent: None,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tm", "ticket", "create", "--parent", "PROJ-1"])
+            .expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Create { epic: false, parent: Some(p), .. }),
+                ..
+            }) if p == "PROJ-1"
+        ));
+    }
+
+    #[test]
+    fn ticket_create_epic_conflicts_with_parent() {
+        let err = Cli::try_parse_from(["tm", "ticket", "create", "--epic", "--parent", "PROJ-1"])
+            .expect_err("epics are not nested");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_ticket_parent_forms() {
+        let cli = Cli::try_parse_from(["tm", "ticket", "parent", "PROJ-2", "PROJ-1"])
+            .expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Parent { key, epic: Some(epic), clear: false }),
+                ..
+            }) if key == "PROJ-2" && epic == "PROJ-1"
+        ));
+
+        let cli = Cli::try_parse_from(["tm", "ticket", "parent", "PROJ-2", "--clear"])
+            .expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Parent {
+                    epic: None,
+                    clear: true,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tm", "ticket", "parent", "PROJ-2"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Parent {
+                    epic: None,
+                    clear: false,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ticket_parent_epic_conflicts_with_clear() {
+        let err = Cli::try_parse_from(["tm", "ticket", "parent", "PROJ-2", "PROJ-1", "--clear"])
+            .expect_err("set and clear at once");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_ticket_children() {
+        let cli =
+            Cli::try_parse_from(["tm", "ticket", "children", "PROJ-1"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ticket {
+                cmd: Some(TicketCmd::Children { epic }),
+                ..
+            }) if epic == "PROJ-1"
+        ));
     }
 
     #[test]

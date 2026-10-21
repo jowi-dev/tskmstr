@@ -1,6 +1,7 @@
 //! `tm ticket <KEY>`, `tm ticket create`, `tm ticket transition`, `tm
 //! ticket assign`, `tm ticket rank`, `tm ticket link`, `tm ticket unlink`,
-//! `tm ticket update`, `tm ticket audit`, and `tm ticket search`.
+//! `tm ticket parent`, `tm ticket children`, `tm ticket update`, `tm ticket
+//! audit`, and `tm ticket search`.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -16,8 +17,9 @@ use crate::ticketing::provider::{TicketKind, TicketProvider};
 use crate::ticketing::types::CreateLinkRequest;
 use crate::ticketing::{
     AssignOutcome, AssignTarget, CreateTicketContext, TicketingContext, TicketingError,
-    TransitionOutcome, assign_ticket, associate_ticket, comment_ticket, create_ticket, link_ticket,
-    list_links, list_transitions, rank_ticket, search_tickets, transition_ticket, unlink_ticket,
+    TransitionOutcome, assign_ticket, associate_ticket, comment_ticket, create_ticket,
+    epic_children, link_ticket, list_links, list_transitions, rank_ticket, search_tickets,
+    set_ticket_parent, ticket_parent, transition_ticket, unlink_ticket,
 };
 
 /// Errors surfaced by `tm ticket`.
@@ -83,6 +85,15 @@ pub enum TicketCliError {
         key: String,
     },
 
+    /// `tm ticket parent <KEY> <EPIC>` was given the same key (after
+    /// normalization) for both. Rejected before any backend call, mirroring
+    /// [`TicketCliError::LinkRelativeToSelf`].
+    #[error("cannot put {key} under itself")]
+    ParentIsSelf {
+        /// The key given for both the ticket and its would-be parent.
+        key: String,
+    },
+
     /// Association with the current branch's pull request failed.
     #[error(transparent)]
     Ticketing(#[from] TicketingError),
@@ -119,6 +130,12 @@ pub struct CreateOptions {
     /// `--audit-notes`: notes for the `audited` row; `"audited at
     /// creation"` when `None`.
     pub audit_notes: Option<String>,
+    /// `--epic`: create an epic instead of a task. Mutually exclusive with
+    /// `parent` at the clap level.
+    pub epic: bool,
+    /// `--parent`: key of the epic to create the ticket under, normalized
+    /// like any other key before use.
+    pub parent: Option<String>,
 }
 
 /// `tm ticket create`: create a new ticket in the configured default
@@ -145,6 +162,10 @@ pub struct CreateOptions {
 /// gate at once. If that can't be recorded (no store, or a write error),
 /// prints a `warning:` line naming the `tm ticket audit` command that
 /// finishes the job; the create itself still succeeds.
+///
+/// `opts.epic` creates an epic; `opts.parent` creates the ticket under that
+/// epic and prints a `KEY is under EPIC` line. See [`create_ticket`] for
+/// the parent checks, which run before anything is created.
 pub fn create(
     ctx: &CreateTicketContext,
     opts: &CreateOptions,
@@ -170,12 +191,19 @@ pub fn create(
             .or(ctx.config.status_on_create.as_deref())
     };
 
+    let kind = if opts.epic {
+        TicketKind::Epic
+    } else {
+        TicketKind::Task
+    };
+    let parent = opts.parent.as_deref().map(normalize_key).transpose()?;
+
     let outcome = create_ticket(
         ctx,
         &title,
         opts.body.as_deref(),
-        TicketKind::Task,
-        None,
+        kind,
+        parent.as_deref(),
         status_target,
     )?;
 
@@ -191,11 +219,18 @@ pub fn create(
         );
     }
 
+    let noun = match kind {
+        TicketKind::Task => "ticket",
+        TicketKind::Epic => "epic",
+    };
     writeln!(
         out,
-        "Created ticket {}: {}",
+        "Created {noun} {}: {}",
         outcome.issue_key, outcome.issue_url
     )?;
+    if let Some(parent) = &parent {
+        writeln!(out, "{} is under {parent}", outcome.issue_key)?;
+    }
     super::print_status_transition(&outcome.issue_key, &outcome.status_transition, out)?;
 
     if opts.audited {
@@ -525,6 +560,68 @@ pub fn unlink(
     let outcome = unlink_ticket(jira, &normalized, &other)?;
     for phrase in &outcome.removed {
         writeln!(out, "Unlinked: {normalized} {phrase} {other}")?;
+    }
+    Ok(())
+}
+
+/// `tm ticket parent <KEY> [<EPIC>|--clear]`: put `key` under the epic
+/// `epic`, take it out from under its epic with `clear`, or, with neither,
+/// print the epic it sits under (`KEY is under EPIC  <summary>` or `KEY has
+/// no parent`).
+///
+/// Keys are normalized via [`normalize_key`]; a ticket as its own parent is
+/// rejected as [`TicketCliError::ParentIsSelf`] before any backend call.
+/// The epic checks and backend errors come from [`set_ticket_parent`].
+pub fn parent(
+    jira: &dyn TicketProvider,
+    key: &str,
+    epic: Option<&str>,
+    clear: bool,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let key = normalize_key(key)?;
+    match (epic, clear) {
+        (Some(epic), false) => {
+            let epic = normalize_key(epic)?;
+            if key == epic {
+                return Err(TicketCliError::ParentIsSelf { key });
+            }
+            set_ticket_parent(jira, &key, Some(&epic))?;
+            writeln!(out, "{key} is now under {epic}")?;
+        }
+        (None, true) => {
+            set_ticket_parent(jira, &key, None)?;
+            writeln!(out, "{key} no longer has a parent")?;
+        }
+        (None, false) => match ticket_parent(jira, &key)? {
+            Some(parent) => writeln!(out, "{key} is under {}  {}", parent.key, parent.summary)?,
+            None => writeln!(out, "{key} has no parent")?,
+        },
+        (Some(_), true) => unreachable!("clap rejects an epic together with --clear"),
+    }
+    Ok(())
+}
+
+/// `tm ticket children <EPIC>`: print the tickets under `epic` in the same
+/// `KEY  STATUS  SUMMARY` shape as [`search`], or a friendly line when it
+/// has none. Errors (an unknown epic, a backend without epic support) come
+/// from [`epic_children`].
+pub fn children(
+    jira: &dyn TicketProvider,
+    epic: &str,
+    out: &mut dyn Write,
+) -> Result<(), TicketCliError> {
+    let epic = normalize_key(epic)?;
+    let children = epic_children(jira, &epic)?;
+    if children.is_empty() {
+        writeln!(out, "{epic} has no child tickets.")?;
+    }
+    for child in &children {
+        writeln!(
+            out,
+            "{}  {}  {}",
+            child.key, child.fields.status.name, child.fields.summary
+        )?;
     }
     Ok(())
 }
@@ -2123,6 +2220,316 @@ mod tests {
             }
             other => panic!("expected Jira Api error, got {other:?}"),
         }
+    }
+
+    fn titled(key: &str, summary: &str) -> Issue {
+        let mut issue = issue(key);
+        issue.fields.summary = summary.to_string();
+        issue
+    }
+
+    fn run_create(jira: &FakeJiraClient, opts: &CreateOptions) -> Result<String, TicketCliError> {
+        let cfg = config();
+        let ctx = create_ctx(jira, &cfg);
+        let mut prompter = crate::cli::FakePrompter::new();
+        let mut out = Vec::new();
+        create(
+            &ctx,
+            opts,
+            &mut prompter,
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn create_epic_creates_an_epic() {
+        let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let opts = CreateOptions {
+            title: Some("Big objective".to_string()),
+            epic: true,
+            ..Default::default()
+        };
+
+        let output = run_create(&jira, &opts).expect("should succeed");
+
+        assert!(
+            output.contains("Created epic PROJ-9: https://example.atlassian.net/browse/PROJ-9"),
+            "{output}"
+        );
+        assert_eq!(jira.create_issue_calls()[0].issue_type_name, "Epic");
+    }
+
+    #[test]
+    fn create_with_parent_creates_the_ticket_under_the_epic() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-9", issue("PROJ-9"))
+            .with_create_issue_result(issue("PROJ-9"));
+        let opts = CreateOptions {
+            title: Some("Part of it".to_string()),
+            parent: Some("proj-1".to_string()),
+            ..Default::default()
+        };
+
+        let output = run_create(&jira, &opts).expect("should succeed");
+
+        assert!(output.contains("Created ticket PROJ-9"), "{output}");
+        assert!(output.contains("PROJ-9 is under PROJ-1"), "{output}");
+        assert_eq!(jira.create_issue_calls()[0].issue_type_name, "Task");
+        let child = TicketProvider::get_issue(&jira, "PROJ-9").unwrap();
+        assert_eq!(
+            child.fields.parent.map(|p| p.key),
+            Some("PROJ-1".to_string())
+        );
+    }
+
+    #[test]
+    fn create_with_a_non_epic_parent_is_rejected() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_create_issue_result(issue("PROJ-9"));
+        let opts = CreateOptions {
+            title: Some("Part of it".to_string()),
+            parent: Some("PROJ-1".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_create(&jira, &opts).expect_err("PROJ-1 is not an epic");
+
+        assert_eq!(
+            err.to_string(),
+            "cannot put a new ticket under PROJ-1: PROJ-1 is not an epic"
+        );
+        assert!(jira.create_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn create_epic_on_a_real_backend_refuses_instead_of_creating_a_task() {
+        let provider = crate::ticketing::provider::JiraProvider::new(
+            FakeJiraClient::new().with_create_issue_result(issue("PROJ-9")),
+            "https://example.atlassian.net",
+        );
+        let cfg = config();
+        let ctx = CreateTicketContext {
+            jira: &provider,
+            config: &cfg,
+        };
+        let opts = CreateOptions {
+            title: Some("Big objective".to_string()),
+            epic: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let err = create(
+            &ctx,
+            &opts,
+            &mut crate::cli::FakePrompter::new(),
+            None,
+            &no_session_env(),
+            &no_sessions_dir(),
+            &mut out,
+        )
+        .expect_err("not supported");
+
+        assert!(
+            matches!(
+                err,
+                TicketCliError::Ticketing(TicketingError::Provider(
+                    ProviderError::NotSupported { .. }
+                ))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parent_sets_the_parent_and_prints_it() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"));
+        let mut out = Vec::new();
+
+        parent(&jira, "proj-2", Some("proj-1"), false, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-2 is now under PROJ-1\n"
+        );
+        assert_eq!(
+            jira.set_parent_calls(),
+            vec![("PROJ-2".to_string(), Some("PROJ-1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn parent_clear_removes_the_parent() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_parent("PROJ-2", "PROJ-1");
+        let mut out = Vec::new();
+
+        parent(&jira, "PROJ-2", None, true, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-2 no longer has a parent\n"
+        );
+        assert_eq!(jira.set_parent_calls(), vec![("PROJ-2".to_string(), None)]);
+    }
+
+    #[test]
+    fn parent_query_prints_the_current_parent() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", titled("PROJ-1", "Big objective"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_parent("PROJ-2", "PROJ-1");
+        let mut out = Vec::new();
+
+        parent(&jira, "PROJ-2", None, false, &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-2 is under PROJ-1  Big objective\n"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn parent_query_without_a_parent_says_so() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-2", issue("PROJ-2"));
+        let mut out = Vec::new();
+
+        parent(&jira, "PROJ-2", None, false, &mut out).expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "PROJ-2 has no parent\n");
+    }
+
+    #[test]
+    fn parent_rejects_a_parent_that_is_not_an_epic() {
+        let jira = FakeJiraClient::new()
+            .with_issue("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"));
+        let mut out = Vec::new();
+
+        let err = parent(&jira, "PROJ-2", Some("PROJ-1"), false, &mut out).expect_err("not epic");
+
+        assert_eq!(
+            err.to_string(),
+            "cannot put PROJ-2 under PROJ-1: PROJ-1 is not an epic"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn parent_rejects_putting_an_epic_under_an_epic() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_epic("PROJ-2", issue("PROJ-2"));
+        let mut out = Vec::new();
+
+        let err = parent(&jira, "PROJ-2", Some("PROJ-1"), false, &mut out).expect_err("nested");
+
+        assert_eq!(
+            err.to_string(),
+            "cannot put PROJ-2 under an epic: epics cannot have a parent"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn parent_rejects_a_ticket_as_its_own_parent() {
+        let jira = FakeJiraClient::new().with_epic("PROJ-1", issue("PROJ-1"));
+        let mut out = Vec::new();
+
+        let err = parent(&jira, "PROJ-1", Some("proj-1"), false, &mut out).expect_err("self");
+
+        assert!(
+            matches!(&err, TicketCliError::ParentIsSelf { key } if key == "PROJ-1"),
+            "{err:?}"
+        );
+        assert!(jira.set_parent_calls().is_empty());
+    }
+
+    #[test]
+    fn parent_invalid_key_is_an_actionable_error() {
+        let jira = FakeJiraClient::new();
+        let mut out = Vec::new();
+
+        let err = parent(&jira, "nope", None, false, &mut out).expect_err("invalid");
+
+        assert!(matches!(err, TicketCliError::InvalidKey { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn parent_on_a_real_backend_fails_instead_of_succeeding_silently() {
+        let provider = crate::ticketing::provider::JiraProvider::new(
+            FakeJiraClient::new()
+                .with_issue("PROJ-1", issue("PROJ-1"))
+                .with_issue("PROJ-2", issue("PROJ-2")),
+            "https://example.atlassian.net",
+        );
+        let mut out = Vec::new();
+
+        assert!(parent(&provider, "PROJ-2", Some("PROJ-1"), false, &mut out).is_err());
+        assert!(parent(&provider, "PROJ-2", None, true, &mut out).is_err());
+    }
+
+    #[test]
+    fn children_prints_one_line_per_child() {
+        let jira = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", titled("PROJ-2", "First part"))
+            .with_issue("PROJ-3", titled("PROJ-3", "Second part"))
+            .with_parent("PROJ-2", "PROJ-1")
+            .with_parent("PROJ-3", "PROJ-1");
+        let mut out = Vec::new();
+
+        children(&jira, "proj-1", &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-2  To Do  First part\nPROJ-3  To Do  Second part\n"
+        );
+    }
+
+    #[test]
+    fn children_of_an_empty_epic_prints_a_friendly_line() {
+        let jira = FakeJiraClient::new().with_epic("PROJ-1", issue("PROJ-1"));
+        let mut out = Vec::new();
+
+        children(&jira, "PROJ-1", &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-1 has no child tickets.\n"
+        );
+    }
+
+    #[test]
+    fn children_on_a_real_backend_is_not_supported() {
+        let provider = crate::ticketing::provider::JiraProvider::new(
+            FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")),
+            "https://example.atlassian.net",
+        );
+        let mut out = Vec::new();
+
+        let err = children(&provider, "PROJ-1", &mut out).expect_err("not supported");
+
+        assert!(
+            matches!(
+                err,
+                TicketCliError::Ticketing(TicketingError::Provider(
+                    ProviderError::NotSupported { .. }
+                ))
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
