@@ -377,6 +377,17 @@ pub trait TicketProvider {
         false
     }
 
+    /// Whether [`TicketProvider::get_issue`] fills in
+    /// [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent).
+    /// When `false`, a `None` parent means "unknown", not "no parent", so
+    /// [`crate::ticketing::ticket_parent`] refuses instead of answering.
+    ///
+    /// The default is `false`. Jira reports its `parent` field; the github
+    /// backend learns sub-issue parents in GitHub issue #158.
+    fn reports_parents(&self) -> bool {
+        false
+    }
+
     /// Whether `token` is plausibly a ticket key in this backend's key
     /// scheme. Used by PR title/body/branch key scraping
     /// ([`crate::ticketing::resolve_existing_key`] and every
@@ -447,6 +458,10 @@ impl TicketProvider for JiraProvider {
 
     fn get_issue(&self, key: &str) -> Result<Issue, ProviderError> {
         Ok(self.client.get_issue(key)?)
+    }
+
+    fn reports_parents(&self) -> bool {
+        true
     }
 
     /// An epic is created as [`JiraProvider::with_epic_issue_type`]'s type
@@ -617,6 +632,10 @@ impl TicketProvider for FakeJiraClient {
 
     fn is_epic(&self, issue: &Issue) -> bool {
         self.is_epic_key(&issue.key)
+    }
+
+    fn reports_parents(&self) -> bool {
+        true
     }
 
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError> {

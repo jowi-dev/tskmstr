@@ -194,7 +194,7 @@ tm auth status
 | `tm ticket unlink <KEY> <OTHER>` | Remove the `Blocks` link(s) between `<KEY>` and `<OTHER>`, either direction |
 | `tm ticket parent <KEY> <EPIC>` | Put `<KEY>` under epic `<EPIC>`. Fails if `<EPIC>` is not an epic or `<KEY>` is one. Backend-dependent |
 | `tm ticket parent <KEY> --clear` | Take `<KEY>` out from under its epic. Backend-dependent |
-| `tm ticket parent <KEY>` | Print the epic `<KEY>` sits under, or that it has none |
+| `tm ticket parent <KEY>` | Print the epic `<KEY>` sits under, or that it has none. Backend-dependent |
 | `tm ticket children <EPIC>` | List the tickets under `<EPIC>`, one `KEY  STATUS  SUMMARY` line each. Backend-dependent |
 | `tm ticket update <KEY> --body <BODY>` | Replace ticket `<KEY>`'s description with `<BODY>` (GitHub-flavored Markdown, converted to Jira's ADF format) |
 | `tm ticket comment [<KEY>] [--body <TEXT>] [--pr]` | Post a comment to ticket `<KEY>` (inferred from the current branch's PR if omitted); `--pr` also posts it to the current branch's PR |

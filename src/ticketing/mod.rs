@@ -928,10 +928,20 @@ pub fn set_ticket_parent(
 
 /// `tm ticket parent <KEY>`: the epic `key` sits under, if any, read from
 /// [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent).
+///
+/// Fails with [`ProviderError::NotSupported`] on a backend that does not
+/// [report parents](TicketProvider::reports_parents), rather than claim
+/// the ticket has none.
 pub fn ticket_parent(
     jira: &dyn TicketProvider,
     key: &str,
 ) -> Result<Option<ParentRef>, TicketingError> {
+    if !jira.reports_parents() {
+        return Err(ProviderError::NotSupported {
+            operation: "reading a ticket's parent epic".to_string(),
+        }
+        .into());
+    }
     Ok(jira.get_issue(key)?.fields.parent)
 }
 
@@ -3429,6 +3439,34 @@ mod tests {
         assert_eq!(
             ticket_parent(&jira, "PROJ-9").unwrap().map(|p| p.key),
             Some("PROJ-1".to_string())
+        );
+    }
+
+    #[test]
+    fn ticket_parent_refuses_on_a_backend_that_cannot_report_parents() {
+        let gh = FakeGhCli::new().with_issue_view(
+            10,
+            Ok(crate::github::gh_cli::IssueInfo {
+                number: 10,
+                url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                title: "Fix the thing".to_string(),
+                body: String::new(),
+                state: crate::github::gh_cli::IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            }),
+        );
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
+
+        let err = ticket_parent(&provider, "GH-10").expect_err("cannot report parents");
+
+        assert!(
+            matches!(
+                err,
+                TicketingError::Provider(ProviderError::NotSupported { .. })
+            ),
+            "{err:?}"
         );
     }
 
