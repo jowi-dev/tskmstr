@@ -1625,6 +1625,8 @@ fn run_ticket(
                 no_transition,
                 audited,
                 audit_notes,
+                epic,
+                parent,
             }),
         ) => {
             let config = config::load(paths)?;
@@ -1640,6 +1642,8 @@ fn run_ticket(
                 no_transition,
                 audited,
                 audit_notes,
+                epic,
+                parent,
             };
             let mut prompter = RealPrompter;
             let mut stdout = std::io::stdout();
@@ -1754,6 +1758,20 @@ fn run_ticket(
             let jira = ticket_provider_for(&config, keychain, env_token)?;
             let mut stdout = std::io::stdout();
             tskmstr::cli::ticket::unlink(jira.as_ref(), &key, &other, &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Parent { key, epic, clear })) => {
+            let config = config::load(paths)?;
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::parent(jira.as_ref(), &key, epic.as_deref(), clear, &mut stdout)?;
+            Ok(())
+        }
+        (None, Some(TicketCmd::Children { epic })) => {
+            let config = config::load(paths)?;
+            let jira = ticket_provider_for(&config, keychain, env_token)?;
+            let mut stdout = std::io::stdout();
+            tskmstr::cli::ticket::children(jira.as_ref(), &epic, &mut stdout)?;
             Ok(())
         }
         (None, Some(TicketCmd::Audit { key, record, notes })) => {
