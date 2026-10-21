@@ -23,8 +23,9 @@ use thiserror::Error;
 /// method, regardless of which backend is configured.
 ///
 /// See the module doc comment for how this relates to [`JiraError`]: every
-/// variant here has a one-to-one [`JiraError`] counterpart, converted by
-/// [`From<JiraError>`] at the [`super::provider::JiraProvider`] boundary.
+/// variant here except [`ProviderError::NotSupported`] has a one-to-one
+/// [`JiraError`] counterpart, converted by [`From<JiraError>`] at the
+/// [`super::provider::JiraProvider`] boundary.
 #[derive(Debug, Error)]
 pub enum ProviderError {
     /// The requested ticket does not exist.
@@ -111,6 +112,20 @@ pub enum ProviderError {
     LinkIdNotFound {
         /// The issue-link id that was not found.
         link_id: String,
+    },
+
+    /// The configured backend does not implement `operation` (yet): the
+    /// default body of an optional [`super::provider::TicketProvider`]
+    /// method such as [`super::provider::TicketProvider::set_parent`], or a
+    /// backend refusing a [`super::provider::NewTicket`] it can't honor
+    /// rather than silently creating something else. Has no [`JiraError`]
+    /// counterpart: it's raised by the provider layer itself, never by a
+    /// backend's API.
+    #[error("{operation} is not supported by this ticket backend")]
+    NotSupported {
+        /// What was attempted, phrased to complete "... is not supported",
+        /// e.g. `creating an epic`.
+        operation: String,
     },
 }
 
@@ -238,6 +253,17 @@ mod tests {
             link_id: "10001".to_string(),
         });
         assert!(matches!(err, ProviderError::LinkIdNotFound { link_id } if link_id == "10001"));
+    }
+
+    #[test]
+    fn not_supported_names_the_operation() {
+        let err = ProviderError::NotSupported {
+            operation: "creating an epic".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "creating an epic is not supported by this ticket backend"
+        );
     }
 
     #[test]
