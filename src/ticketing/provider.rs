@@ -564,8 +564,7 @@ impl TicketProvider for FakeJiraClient {
     }
 
     fn set_parent(&self, child_key: &str, parent_key: Option<&str>) -> Result<(), ProviderError> {
-        self.record_set_parent(child_key, parent_key);
-        Ok(())
+        Ok(JiraClient::set_parent(self, child_key, parent_key)?)
     }
 
     fn children(&self, epic_key: &str) -> Result<Vec<Issue>, ProviderError> {
@@ -951,7 +950,7 @@ mod tests {
             .with_epic("PROJ-1", epic)
             .with_issue("PROJ-2", issue("PROJ-2"));
 
-        fake.set_parent("PROJ-2", Some("PROJ-1")).unwrap();
+        TicketProvider::set_parent(&fake, "PROJ-2", Some("PROJ-1")).unwrap();
 
         assert_eq!(
             fake.set_parent_calls(),
@@ -974,7 +973,7 @@ mod tests {
             .with_issue("PROJ-2", issue("PROJ-2"))
             .with_parent("PROJ-2", "PROJ-1");
 
-        fake.set_parent("PROJ-2", None).unwrap();
+        TicketProvider::set_parent(&fake, "PROJ-2", None).unwrap();
 
         let child = TicketProvider::get_issue(&fake, "PROJ-2").unwrap();
         assert_eq!(child.fields.parent, None);

@@ -641,6 +641,13 @@ impl JiraClient for FakeJiraClient {
             }),
         }
     }
+
+    /// Recorded in [`FakeJiraClient::set_parent_calls`] and applied to the
+    /// fake's parent map, the same as `TicketProvider::set_parent`.
+    fn set_parent(&self, key: &str, parent_key: Option<&str>) -> Result<(), JiraError> {
+        self.record_set_parent(key, parent_key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
