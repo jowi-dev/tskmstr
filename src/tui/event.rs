@@ -47,7 +47,7 @@ use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::Issue;
 use crate::tui::app::{
     App, AssignChoice, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator,
-    bot_watch_indicator, lane_run_indicator,
+    auto_review_indicator, bot_watch_indicator, lane_run_indicator,
 };
 use crate::tui::app::{query_for_filter, update};
 use crate::tui::keymap::{RetroOverlay, map_key};
@@ -361,7 +361,8 @@ impl Drop for TerminalGuard {
 /// timed-out poll feeds [`Msg::Tick`] through the same path (mirroring
 /// [`run_watch`]), which is what drives [`Screen::Board`]'s periodic badge
 /// polling ([`Cmd::LoadAuditStatus`], [`Cmd::LoadLaneRunStatus`],
-/// [`Cmd::LoadBotWatchStatus`] and [`Cmd::LoadCleanupStatus`]). Every
+/// [`Cmd::LoadBotWatchStatus`], [`Cmd::LoadCleanupStatus`] and
+/// [`Cmd::LoadAutoReviewStatus`]). Every
 /// iteration also drains the worker's completed results (so a finished
 /// provider call lands within one poll interval) and polls `launches` (the
 /// board-launched lane runs still in flight, per [`run_cmds`]'s
@@ -408,6 +409,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
             Cmd::LoadLaneRunStatus,
             Cmd::LoadBotWatchStatus,
             Cmd::LoadCleanupStatus,
+            Cmd::LoadAutoReviewStatus,
             Cmd::LoadAutopilotStatus {
                 scopes: vec![deps.backend_identity.scope()],
             },
@@ -1940,6 +1942,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
         Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
+        Cmd::LoadAutoReviewStatus => load_auto_review_status(deps),
         cmd @ (Cmd::LoadAutopilotStatus { .. }
         | Cmd::ToggleAutopilot { .. }
         | Cmd::SetAutopilotTargets(_)) => {
@@ -2211,6 +2214,38 @@ fn load_bot_watch_status(deps: &TuiDeps) -> Vec<Msg> {
     }
 
     vec![Msg::BotWatchStatusLoaded(status)]
+}
+
+/// Run `Cmd::LoadAutoReviewStatus`: build the board's per-ticket `review:`
+/// badge map (GitHub issue #153) from the newest `kind = "auto-review"` run
+/// per ticket ([`crate::runs::RunStore::latest_round_runs`]), via
+/// [`auto_review_indicator`]'s pure mapping.
+///
+/// The loop-liveness input is a local [`crate::runs::pid::pid_alive`] check
+/// on the run's recorded pid (every round row carries the loop's pid), so a
+/// fix pass between rounds still reads as reviewing; nothing here calls
+/// GitHub. Same leniency as [`load_bot_watch_status`]: a store error yields
+/// an empty map rather than an error.
+fn load_auto_review_status(deps: &TuiDeps) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::AutoReviewStatusLoaded(HashMap::new())];
+    };
+
+    let status = store
+        .latest_round_runs(
+            Some(&deps.backend_identity.scope()),
+            crate::work::auto_review::AUTO_REVIEW_KIND,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run| {
+            let loop_alive = run.pid.is_some_and(crate::runs::pid::pid_alive);
+            let badge = auto_review_indicator(run.status, run.round.as_deref(), loop_alive);
+            (run.ticket, badge)
+        })
+        .collect();
+
+    vec![Msg::AutoReviewStatusLoaded(status)]
 }
 
 /// Run `Cmd::LoadCleanupStatus`: build the board's per-ticket bugbot-cleanup
@@ -6954,6 +6989,115 @@ mod tests {
 
         let msgs = load_bot_watch_status(&deps);
         assert_eq!(msgs, vec![Msg::BotWatchStatusLoaded(HashMap::new())]);
+    }
+
+    // --- Cmd::LoadAutoReviewStatus / load_auto_review_status ---
+
+    /// Record a finished `tm review auto` round for `ticket` whose loop ran
+    /// as `pid`, with `round` as its `auto_review_round` event detail.
+    fn finished_round(store: &crate::runs::RunStore, ticket: &str, pid: u32, round: &str) {
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                kind: crate::work::auto_review::AUTO_REVIEW_KIND.to_string(),
+                pid: Some(pid),
+                ..start_params(ticket)
+            })
+            .unwrap();
+        finish(store, run_id, crate::runs::RunStatus::Done);
+        store
+            .add_event(run_id, crate::work::auto_review::ROUND_EVENT, Some(round))
+            .unwrap();
+    }
+
+    /// A pid that's certainly dead: a spawned and already-reaped child.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// The single [`Msg::AutoReviewStatusLoaded`] map `msgs` must hold.
+    fn auto_review_map(msgs: Vec<Msg>) -> HashMap<String, crate::tui::app::AutoReviewBadge> {
+        match msgs.as_slice() {
+            [Msg::AutoReviewStatusLoaded(status)] => status.clone(),
+            other => panic!("expected AutoReviewStatusLoaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_auto_review_status_with_no_store_yields_empty_map() {
+        let mut deps = deps();
+        deps.store = None;
+        let msgs = load_auto_review_status(&deps);
+        assert_eq!(msgs, vec![Msg::AutoReviewStatusLoaded(HashMap::new())]);
+    }
+
+    #[test]
+    fn load_auto_review_status_capped_round_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        finished_round(&store, "PROJ-1", dead_pid(), "2/3 capped");
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let status = auto_review_map(load_auto_review_status(&deps));
+        assert_eq!(
+            status.get("PROJ-1"),
+            Some(&crate::tui::app::AutoReviewBadge {
+                indicator: crate::tui::app::AutoReviewIndicator::NeedsYou,
+                rounds: Some("2/3".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn load_auto_review_status_fix_round_with_a_live_loop_is_reviewing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        finished_round(&store, "PROJ-1", std::process::id(), "1/3 fix");
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let status = auto_review_map(load_auto_review_status(&deps));
+        assert_eq!(
+            status.get("PROJ-1").map(|badge| badge.indicator),
+            Some(crate::tui::app::AutoReviewIndicator::Reviewing)
+        );
+    }
+
+    #[test]
+    fn load_auto_review_status_fix_round_with_a_dead_loop_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        finished_round(&store, "PROJ-1", dead_pid(), "1/3 fix");
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let status = auto_review_map(load_auto_review_status(&deps));
+        assert_eq!(
+            status.get("PROJ-1").map(|badge| badge.indicator),
+            Some(crate::tui::app::AutoReviewIndicator::NeedsYou)
+        );
+    }
+
+    #[test]
+    fn load_auto_review_status_excludes_other_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        store.start_run(&lane_start_params("PROJ-1")).unwrap();
+        store
+            .start_run(&review_watch_start_params("PROJ-2"))
+            .unwrap();
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let msgs = load_auto_review_status(&deps);
+        assert_eq!(msgs, vec![Msg::AutoReviewStatusLoaded(HashMap::new())]);
     }
 
     // --- Cmd::LoadCleanupStatus / load_cleanup_status ---

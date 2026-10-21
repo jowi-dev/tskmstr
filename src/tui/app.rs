@@ -963,6 +963,13 @@ pub struct App {
     /// `audit_status`/`lane_run_status`. Empty when the runs DB is unavailable
     /// or no ticket has ever had a `tm pr watch` run.
     pub bot_watch_status: HashMap<String, BotWatchIndicator>,
+    /// Per-ticket `tm review auto` badge state for [`Screen::Board`], keyed by
+    /// ticket key. Populated by [`Cmd::LoadAutoReviewStatus`] on the same
+    /// cadence as `bot_watch_status`, from the newest `kind = "auto-review"`
+    /// run per ticket plus a local pid check (see [`auto_review_indicator`]).
+    /// Empty when the runs DB is unavailable or no ticket has ever had an
+    /// auto-review round.
+    pub auto_review_status: HashMap<String, AutoReviewBadge>,
     /// Per-ticket bugbot-cleanup session badge state for [`Screen::Board`],
     /// keyed by ticket key. Populated by [`Cmd::LoadCleanupStatus`] on the same
     /// cadence, and derived by the *same* [`audit_indicator`] rule as
@@ -1592,6 +1599,9 @@ pub enum Msg {
     /// [`Cmd::LoadBotWatchStatus`] finished loading, replacing
     /// `app.bot_watch_status` wholesale.
     BotWatchStatusLoaded(HashMap<String, BotWatchIndicator>),
+    /// [`Cmd::LoadAutoReviewStatus`] finished loading, replacing
+    /// `app.auto_review_status` wholesale.
+    AutoReviewStatusLoaded(HashMap<String, AutoReviewBadge>),
     /// [`Cmd::LoadCleanupStatus`] finished loading, replacing
     /// `app.cleanup_status` wholesale.
     CleanupStatusLoaded(HashMap<String, AuditStatusEntry>),
@@ -1819,6 +1829,10 @@ pub enum Cmd {
     /// `kind = "bugbot-cleanup"` run per ticket, mapped through the same
     /// [`audit_indicator`] rule audit sessions use).
     LoadCleanupStatus,
+    /// Reload [`Screen::Board`]'s per-ticket `tm review auto` status (the
+    /// newest `kind = "auto-review"` run per ticket and its latest round
+    /// event, mapped through [`auto_review_indicator`]).
+    LoadAutoReviewStatus,
     /// Launch a bugbot-cleanup session for `key` (see
     /// [`crate::work::bugbot::launch_cleanup`]). Executed in-process, exactly
     /// like [`Cmd::LaunchAudit`]: the launch only pre-registers a run row and
@@ -2621,6 +2635,10 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         }
         Msg::CleanupStatusLoaded(status) => {
             app.cleanup_status = status;
+            (app, Vec::new())
+        }
+        Msg::AutoReviewStatusLoaded(status) => {
+            app.auto_review_status = status;
             (app, Vec::new())
         }
         Msg::BotsAction => bots_action(app),
@@ -3483,11 +3501,12 @@ fn review_fix_action(mut app: App) -> (App, Vec<Cmd>) {
 ///
 /// On [`Screen::Board`], increments the same counter and emits
 /// [`Cmd::LoadAuditStatus`], [`Cmd::LoadLaneRunStatus`],
-/// [`Cmd::LoadBotWatchStatus`] and [`Cmd::LoadCleanupStatus`] every 8th tick
-/// (~2s) -- the board polls every badge source on its own clock while leaving
-/// the Jira ticket list itself on manual refresh (`r`). The four polls stay
-/// separate `Cmd`s (not merged into one query) since a ticket can legitimately
-/// carry all four badges at once, each keyed off a different run `kind`.
+/// [`Cmd::LoadBotWatchStatus`], [`Cmd::LoadCleanupStatus`] and
+/// [`Cmd::LoadAutoReviewStatus`] every 8th tick (~2s) -- the board polls every
+/// badge source on its own clock while leaving the Jira ticket list itself on
+/// manual refresh (`r`). The five polls stay separate `Cmd`s (not merged into
+/// one query) since a ticket can legitimately carry all five badges at once,
+/// each keyed off a different run `kind`.
 /// Additionally, while the run detail overlay is open (`show_run_detail`),
 /// emits [`Cmd::LoadTicketRunDetail`] for the selected ticket every 2nd tick
 /// (~500ms), matching the watch screen's detail refresh cadence.
@@ -3547,6 +3566,7 @@ fn tick(mut app: App) -> (App, Vec<Cmd>) {
                 cmds.push(Cmd::LoadLaneRunStatus);
                 cmds.push(Cmd::LoadBotWatchStatus);
                 cmds.push(Cmd::LoadCleanupStatus);
+                cmds.push(Cmd::LoadAutoReviewStatus);
                 cmds.extend(crate::tui::autopilot::status_cmd(&app));
             }
             if app.watch_tick.is_multiple_of(2)
@@ -7573,7 +7593,7 @@ mod tests {
         assert!(cmds.is_empty());
     }
 
-    // --- Msg::BotWatchStatusLoaded / Msg::CleanupStatusLoaded ---
+    // --- Msg::BotWatchStatusLoaded / Msg::AutoReviewStatusLoaded / Msg::CleanupStatusLoaded ---
 
     #[test]
     fn bot_watch_status_loaded_replaces_bot_watch_status() {
@@ -7582,6 +7602,29 @@ mod tests {
         status.insert("PROJ-1".to_string(), BotWatchIndicator::Ready);
         let (app, cmds) = update(app, Msg::BotWatchStatusLoaded(status.clone()));
         assert_eq!(app.bot_watch_status, status);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn auto_review_status_loaded_replaces_auto_review_status() {
+        let mut app = App::new();
+        app.auto_review_status.insert(
+            "PROJ-9".to_string(),
+            AutoReviewBadge {
+                indicator: AutoReviewIndicator::Clean,
+                rounds: None,
+            },
+        );
+        let mut status = HashMap::new();
+        status.insert(
+            "PROJ-1".to_string(),
+            AutoReviewBadge {
+                indicator: AutoReviewIndicator::NeedsYou,
+                rounds: Some("3/3".to_string()),
+            },
+        );
+        let (app, cmds) = update(app, Msg::AutoReviewStatusLoaded(status.clone()));
+        assert_eq!(app.auto_review_status, status);
         assert!(cmds.is_empty());
     }
 
@@ -7977,6 +8020,7 @@ mod tests {
                 Cmd::LoadLaneRunStatus,
                 Cmd::LoadBotWatchStatus,
                 Cmd::LoadCleanupStatus,
+                Cmd::LoadAutoReviewStatus,
             ]
         );
     }
