@@ -156,10 +156,53 @@ pub struct NewTicket {
     pub summary: String,
     /// Issue description, as Markdown text.
     pub description: String,
-    /// Issue type name, e.g. `Task`.
-    pub issue_type_name: String,
+    /// What kind of ticket to create. Each provider maps this onto its own
+    /// model (a Jira issue type, a GitHub label).
+    pub kind: TicketKind,
+    /// Key of the epic to create the ticket under, if any. Never set
+    /// alongside [`TicketKind::Epic`]: epics are not nested.
+    pub parent_key: Option<String>,
     /// Account ID to assign the new issue to, if any.
     pub assignee_account_id: Option<String>,
+}
+
+/// The kind of ticket a [`NewTicket`] creates, independent of how any one
+/// backend spells it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TicketKind {
+    /// An ordinary unit of work. Every create path made one of these before
+    /// epics existed, and still does unless asked otherwise.
+    #[default]
+    Task,
+    /// A larger objective that groups other tickets under it as children
+    /// (see [`TicketProvider::set_parent`]).
+    Epic,
+}
+
+impl TicketKind {
+    /// The Jira issue type name for this kind.
+    fn jira_issue_type_name(self) -> &'static str {
+        match self {
+            TicketKind::Task => "Task",
+            TicketKind::Epic => "Epic",
+        }
+    }
+}
+
+/// Refuse a [`NewTicket`] that asks for an epic or a parent, for a backend
+/// that can't create either yet. Without this the backend would silently
+/// create a plain, unparented Task, which looks like success but isn't.
+pub(crate) fn refuse_epic_or_parent(req: &NewTicket) -> Result<(), ProviderError> {
+    let operation = if req.kind == TicketKind::Epic {
+        "creating an epic"
+    } else if req.parent_key.is_some() {
+        "creating a ticket under an epic"
+    } else {
+        return Ok(());
+    };
+    Err(ProviderError::NotSupported {
+        operation: operation.to_string(),
+    })
 }
 
 /// Document-label prefixes that look like ticket keys but never are:
@@ -344,11 +387,12 @@ impl TicketProvider for JiraProvider {
     }
 
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
+        refuse_epic_or_parent(req)?;
         Ok(self.client.create_issue(&CreateIssueRequest {
             project_key: req.project_key.clone(),
             summary: req.summary.clone(),
             description: text_to_adf(&req.description),
-            issue_type_name: req.issue_type_name.clone(),
+            issue_type_name: req.kind.jira_issue_type_name().to_string(),
             assignee_account_id: req.assignee_account_id.clone(),
         })?)
     }
@@ -439,7 +483,7 @@ impl TicketProvider for FakeJiraClient {
                 project_key: req.project_key.clone(),
                 summary: req.summary.clone(),
                 description: text_to_adf(&req.description),
-                issue_type_name: req.issue_type_name.clone(),
+                issue_type_name: req.kind.jira_issue_type_name().to_string(),
                 assignee_account_id: req.assignee_account_id.clone(),
             },
         )?)
@@ -682,7 +726,8 @@ mod tests {
                 project_key: "PROJ".to_string(),
                 summary: "Fix the thing".to_string(),
                 description: "**bold** text".to_string(),
-                issue_type_name: "Task".to_string(),
+                kind: TicketKind::Task,
+                parent_key: None,
                 assignee_account_id: None,
             })
             .expect("should succeed");
@@ -698,7 +743,8 @@ mod tests {
                 project_key: "PROJ".to_string(),
                 summary: "Fix the thing".to_string(),
                 description: "**bold** text".to_string(),
-                issue_type_name: "Task".to_string(),
+                kind: TicketKind::Task,
+                parent_key: None,
                 assignee_account_id: None,
             },
         )
@@ -707,6 +753,51 @@ mod tests {
         let calls = fake.create_issue_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].description.to_string().contains("\"strong\""));
+    }
+
+    fn new_ticket(kind: TicketKind, parent_key: Option<&str>) -> NewTicket {
+        NewTicket {
+            project_key: "PROJ".to_string(),
+            summary: "Fix the thing".to_string(),
+            description: String::new(),
+            kind,
+            parent_key: parent_key.map(str::to_string),
+            assignee_account_id: None,
+        }
+    }
+
+    #[test]
+    fn fake_ticket_provider_maps_task_kind_to_the_jira_task_type() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+
+        TicketProvider::create_issue(&fake, &new_ticket(TicketKind::Task, None))
+            .expect("should succeed");
+
+        assert_eq!(fake.create_issue_calls()[0].issue_type_name, "Task");
+    }
+
+    #[test]
+    fn jira_provider_refuses_to_create_an_epic() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let provider = JiraProvider::new(fake, "https://example.atlassian.net");
+
+        let err = provider
+            .create_issue(&new_ticket(TicketKind::Epic, None))
+            .expect_err("epics are not supported yet");
+
+        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn jira_provider_refuses_to_create_under_a_parent() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+        let provider = JiraProvider::new(fake, "https://example.atlassian.net");
+
+        let err = provider
+            .create_issue(&new_ticket(TicketKind::Task, Some("PROJ-1")))
+            .expect_err("parents are not supported yet");
+
+        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
     }
 
     #[test]

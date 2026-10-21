@@ -48,7 +48,7 @@ use crate::github::gh_cli::{
 use crate::jira::client::RankAnchor;
 use crate::runs::RunStore;
 use crate::ticketing::error::ProviderError;
-use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
+use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery, refuse_epic_or_parent};
 use crate::ticketing::types::{
     CreateLinkRequest, Issue, IssueFields, IssueLink, IssueLinkType, JiraUser, LinkedIssue,
     LinkedIssueFields, Myself, RemoteLinkRequest, SearchResult, Status, StatusCategory, Transition,
@@ -552,12 +552,10 @@ impl TicketProvider for GithubProvider<'_> {
     }
 
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        // `req.issue_type_name` is Jira-only (Jira's issue-type field has no
-        // GitHub equivalent -- an issue is just an issue) and is deliberately
-        // ignored here rather than encoded as a label or rejected: GitHub
-        // callers pass whatever `NewTicket` requires today, and this is where
-        // that Jira-specific field's journey ends, per the carry-forward
-        // decision this phase settles (see the plan doc's phase 6 section).
+        // Epics and parents arrive with the github backend's sub-issue
+        // support (GitHub issue #158); until then refuse them rather than
+        // create a plain issue the caller didn't ask for.
+        refuse_epic_or_parent(req)?;
         let info = self
             .gh
             .issue_create(
@@ -990,6 +988,7 @@ impl TicketProvider for GithubProvider<'_> {
 mod tests {
     use super::*;
     use crate::github::gh_cli::{FakeGhCli, GhError};
+    use crate::ticketing::provider::TicketKind;
     use crate::ticketing::types::IssueLink;
 
     // --- pure helpers ---
@@ -1735,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_calls_issue_create_with_todo_label_and_ignores_issue_type_name() {
+    fn create_issue_calls_issue_create_with_todo_label() {
         let created = issue_info(9, "New", IssueState::Open, &[]);
         let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
@@ -1745,7 +1744,8 @@ mod tests {
                 project_key: "GH".to_string(),
                 summary: "New".to_string(),
                 description: "details".to_string(),
-                issue_type_name: "Task".to_string(),
+                kind: TicketKind::Task,
+                parent_key: None,
                 assignee_account_id: Some("jowi-dev".to_string()),
             })
             .unwrap();
@@ -1772,12 +1772,53 @@ mod tests {
                 project_key: "GH".to_string(),
                 summary: "New".to_string(),
                 description: String::new(),
-                issue_type_name: "Task".to_string(),
+                kind: TicketKind::Task,
+                parent_key: None,
                 assignee_account_id: None,
             })
             .unwrap();
 
         assert!(fake.issue_create_calls()[0].1.assignees.is_empty());
+    }
+
+    #[test]
+    fn create_issue_refuses_an_epic_without_calling_gh() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let err = provider
+            .create_issue(&NewTicket {
+                project_key: "GH".to_string(),
+                summary: "New".to_string(),
+                description: String::new(),
+                kind: TicketKind::Epic,
+                parent_key: None,
+                assignee_account_id: None,
+            })
+            .expect_err("epics are not supported yet");
+
+        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
+        assert!(fake.issue_create_calls().is_empty());
+    }
+
+    #[test]
+    fn create_issue_refuses_a_parent_without_calling_gh() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let err = provider
+            .create_issue(&NewTicket {
+                project_key: "GH".to_string(),
+                summary: "New".to_string(),
+                description: String::new(),
+                kind: TicketKind::Task,
+                parent_key: Some("GH-1".to_string()),
+                assignee_account_id: None,
+            })
+            .expect_err("parents are not supported yet");
+
+        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
+        assert!(fake.issue_create_calls().is_empty());
     }
 
     #[test]
