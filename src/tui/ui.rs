@@ -1815,10 +1815,15 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("O           open Jira directly"),
         Line::from("Enter/Space grab/drop (rank view)"),
         Line::from("?           toggle this help"),
-        Line::from(""),
         Line::from("card key markers:"),
         Line::from("  ✓ ready    ◐ stackable"),
         Line::from("  ✗ blocked  ? unknown"),
+        // The `review:` badge (GitHub issue #153) is the one badge whose
+        // states aren't self-explanatory. On a 24-row terminal this column
+        // fills all 17 of the overlay's inner rows, so adding a line here
+        // means removing one.
+        Line::from("review: auto-review loop"),
+        Line::from("  reviewing/clean/needs you"),
         Line::from("press any key to close"),
     ];
     let actions = vec![
@@ -2587,6 +2592,25 @@ mod tests {
             assert!(
                 text.contains(phrase),
                 "help overlay should document `{phrase}`:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_explains_the_review_badge_within_24_rows() {
+        let app = App {
+            show_help: true,
+            ..App::new()
+        };
+        let text = buffer_text(&render_with_size(&app, 80, 24));
+        for phrase in [
+            "review:",
+            "reviewing/clean/needs you",
+            "press any key to close",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "help overlay should show `{phrase}` on a 24-row terminal:\n{text}"
             );
         }
     }
