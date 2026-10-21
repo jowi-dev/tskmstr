@@ -445,6 +445,7 @@ mod tests {
                     .collect(),
                 parent: None,
                 labels: Vec::new(),
+                issue_type: None,
             },
         }
     }

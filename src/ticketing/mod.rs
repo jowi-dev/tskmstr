@@ -1431,6 +1431,7 @@ mod tests {
                 issue_links: vec![],
                 parent: None,
                 labels: Vec::new(),
+                issue_type: None,
             },
         }
     }

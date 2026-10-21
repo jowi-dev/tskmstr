@@ -173,6 +173,7 @@ impl<'a> GithubProvider<'a> {
                 parent: deps.parent.clone().map(|p| self.to_parent_ref(p)),
                 issue_links: self.to_issue_links(number, deps),
                 labels: info.labels,
+                issue_type: None,
             },
         }
     }

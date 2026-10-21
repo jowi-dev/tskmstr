@@ -82,6 +82,22 @@ pub struct IssueFields {
     /// list of strings, so a search that does request it deserializes as is.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// The ticket's type, if the backend reports one. The Jira backend
+    /// reads it to tell epics from ordinary tickets
+    /// ([`super::provider::TicketProvider::is_epic`]).
+    ///
+    /// `#[serde(default)]` for the same reasons as
+    /// [`IssueFields::issue_links`]. Jira's field name is `issuetype`.
+    #[serde(default, rename = "issuetype")]
+    pub issue_type: Option<IssueType>,
+}
+
+/// A ticket's type, as embedded in [`IssueFields::issue_type`]. Only the
+/// name is kept, e.g. `Task` or `Epic`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueType {
+    /// The type's display name.
+    pub name: String,
 }
 
 /// The epic a ticket sits under, as embedded in [`IssueFields::parent`].
@@ -357,6 +373,46 @@ mod tests {
         "#;
         let issue: Issue = serde_json::from_str(raw).unwrap();
         assert_eq!(issue.fields.parent, None);
+    }
+
+    #[test]
+    fn deserializes_issue_type_name_from_jira_wire_shape() {
+        let raw = r#"
+        {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "The epic",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "description": null,
+                "assignee": null,
+                "issuetype": { "id": "10000", "name": "Epic", "subtask": false }
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            issue.fields.issue_type,
+            Some(IssueType {
+                name: "Epic".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_issue_without_issue_type_as_none() {
+        let raw = r#"
+        {
+            "key": "PROJ-2",
+            "fields": {
+                "summary": "Child",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "description": null,
+                "assignee": null
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert_eq!(issue.fields.issue_type, None);
     }
 
     #[test]
