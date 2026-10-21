@@ -444,6 +444,7 @@ mod tests {
                     })
                     .collect(),
                 parent: None,
+                labels: Vec::new(),
             },
         }
     }

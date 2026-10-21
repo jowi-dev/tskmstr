@@ -48,7 +48,7 @@ use crate::github::gh_cli::{
 use crate::jira::client::RankAnchor;
 use crate::runs::RunStore;
 use crate::ticketing::error::ProviderError;
-use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery, refuse_epic_or_parent};
+use crate::ticketing::provider::{NewTicket, TicketKind, TicketProvider, TicketQuery};
 use crate::ticketing::types::{
     CreateLinkRequest, Issue, IssueFields, IssueLink, IssueLinkType, JiraUser, LinkedIssue,
     LinkedIssueFields, Myself, RemoteLinkRequest, SearchResult, Status, StatusCategory, Transition,
@@ -146,6 +146,7 @@ impl<'a> GithubProvider<'a> {
                 assignee,
                 issue_links: self.to_issue_links(number, deps),
                 parent: None,
+                labels: info.labels,
             },
         }
     }
@@ -558,10 +559,15 @@ impl TicketProvider for GithubProvider<'_> {
     }
 
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        // Epics and parents arrive with the github backend's sub-issue
-        // support (GitHub issue #158); until then refuse them rather than
-        // create a plain issue the caller didn't ask for.
-        refuse_epic_or_parent(req)?;
+        if req.parent_key.is_some() {
+            return Err(ProviderError::NotSupported {
+                operation: "creating a ticket under an epic".to_string(),
+            });
+        }
+        let mut labels = vec!["tm:status/todo".to_string()];
+        if req.kind == TicketKind::Epic {
+            labels.push(EPIC_LABEL.to_string());
+        }
         let info = self
             .gh
             .issue_create(
@@ -569,7 +575,7 @@ impl TicketProvider for GithubProvider<'_> {
                 &IssueCreateRequest {
                     title: req.summary.clone(),
                     body: req.description.clone(),
-                    labels: vec!["tm:status/todo".to_string()],
+                    labels,
                     assignees: req.assignee_account_id.clone().into_iter().collect(),
                 },
             )
@@ -577,6 +583,11 @@ impl TicketProvider for GithubProvider<'_> {
         let number = info.number;
         let key = self.issue_key(number);
         Ok(self.to_issue(&key, number, info, IssueDependencies::default()))
+    }
+
+    /// An issue is an epic when it carries the [`EPIC_LABEL`].
+    fn is_epic(&self, issue: &Issue) -> bool {
+        issue.fields.labels.iter().any(|label| label == EPIC_LABEL)
     }
 
     /// A deliberate no-op: under the github backend, associating a ticket
@@ -1788,11 +1799,12 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_refuses_an_epic_without_calling_gh() {
-        let fake = FakeGhCli::new();
+    fn create_issue_labels_an_epic_with_the_epic_and_todo_labels() {
+        let created = issue_info(9, "New", IssueState::Open, &["tm:status/todo", "tm:epic"]);
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
-        let err = provider
+        let issue = provider
             .create_issue(&NewTicket {
                 project_key: "GH".to_string(),
                 summary: "New".to_string(),
@@ -1801,10 +1813,27 @@ mod tests {
                 parent_key: None,
                 assignee_account_id: None,
             })
-            .expect_err("epics are not supported yet");
+            .unwrap();
 
-        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
-        assert!(fake.issue_create_calls().is_empty());
+        assert_eq!(
+            fake.issue_create_calls()[0].1.labels,
+            vec!["tm:status/todo".to_string(), "tm:epic".to_string()]
+        );
+        assert!(provider.is_epic(&issue));
+    }
+
+    #[test]
+    fn is_epic_is_true_only_for_an_issue_labeled_tm_epic() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(1, Ok(issue_info(1, "Epic", IssueState::Open, &["tm:epic"])))
+            .with_issue_view(
+                2,
+                Ok(issue_info(2, "Task", IssueState::Open, &["tm:status/todo"])),
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert!(provider.is_epic(&provider.get_issue("GH-1").unwrap()));
+        assert!(!provider.is_epic(&provider.get_issue("GH-2").unwrap()));
     }
 
     #[test]

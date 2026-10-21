@@ -1009,6 +1009,7 @@ mod tests {
                 assignee: None,
                 issue_links: vec![],
                 parent: None,
+                labels: Vec::new(),
             },
         }
     }
