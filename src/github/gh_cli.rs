@@ -654,6 +654,51 @@ pub trait GhCli {
         blocked_number: u64,
     ) -> Result<(), GhError>;
 
+    // --- Sub-issues (GitHub issue #158) ---
+
+    /// Fetch the parent of every issue in `numbers` in **one** `gh api
+    /// graphql` call (one aliased `issue(number:)` field per number, see
+    /// [`issues_parents_query`]), keyed by issue number; `None` for an
+    /// issue with no parent. The batched counterpart of
+    /// [`IssueDependencies::parent`], for a whole board at once. An empty
+    /// `numbers` makes no call at all.
+    fn issues_parents(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Option<IssueParent>>, GhError>;
+
+    /// Fetch issue `number`'s sub-issues in `repo`, in GitHub's order. A
+    /// sub-issue may live in another repository; [`SubIssue::repo`] says
+    /// which. Only the first 100 are fetched, the same single-page limit
+    /// as [`GhCli::issue_dependencies`].
+    fn sub_issues(&self, repo: &str, number: u64) -> Result<Vec<SubIssue>, GhError>;
+
+    /// Make `child_number` a sub-issue of `parent_number`, both in `repo`,
+    /// via the `addSubIssue` mutation with `replaceParent: true`: a child
+    /// that already has a parent moves to the new one in the same call.
+    ///
+    /// Two `gh api graphql` round trips, the same as
+    /// [`GhCli::create_issue_dependency`]: resolve both node ids, then run
+    /// the mutation.
+    fn add_sub_issue(
+        &self,
+        repo: &str,
+        parent_number: u64,
+        child_number: u64,
+    ) -> Result<(), GhError>;
+
+    /// Take `child_number` (in `repo`) out from under `parent`, via the
+    /// `removeSubIssue` mutation. `parent` comes from
+    /// [`IssueDependencies::parent`] and already carries its node id, so
+    /// only the child's needs resolving: two round trips.
+    fn remove_sub_issue(
+        &self,
+        repo: &str,
+        child_number: u64,
+        parent: &IssueParent,
+    ) -> Result<(), GhError>;
+
     // --- Phase 5 additions (GithubProvider read path,
     // docs/plans/github-issues-backend.md) ---
 
@@ -904,13 +949,44 @@ pub struct IssueRef {
 
 /// The result of [`GhCli::issue_dependencies`]: the issues an issue is
 /// blocked by, and the issues it blocks, via GitHub's native issue
-/// dependencies feature.
+/// dependencies feature, plus its sub-issue parent.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IssueDependencies {
     /// Issues blocking this one.
     pub blocked_by: Vec<IssueRef>,
     /// Issues this one blocks.
     pub blocking: Vec<IssueRef>,
+    /// The issue this one is a sub-issue of, if any. Fetched by the same
+    /// query as the dependencies so reading an issue's parent costs no
+    /// extra call.
+    pub parent: Option<IssueParent>,
+}
+
+/// The parent of a sub-issue, as returned by [`GhCli::issue_dependencies`]
+/// and [`GhCli::issues_parents`]. The parent may live in another
+/// repository, so it carries its own `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueParent {
+    /// The parent's GraphQL node id, which [`GhCli::remove_sub_issue`]
+    /// needs and would otherwise have to look up again.
+    pub node_id: String,
+    /// The parent's `"owner/name"` repo slug.
+    pub repo: String,
+    /// The parent's issue number within `repo`.
+    pub number: u64,
+    /// The parent's title.
+    pub title: String,
+}
+
+/// One child returned by [`GhCli::sub_issues`]: the issue itself plus the
+/// `"owner/name"` repo it lives in, since a sub-issue may live in a
+/// different repository from its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubIssue {
+    /// The child's `"owner/name"` repo slug.
+    pub repo: String,
+    /// The child issue.
+    pub info: IssueInfo,
 }
 
 /// Fields requested from `gh pr view --json`; shared so the flag and the
@@ -1017,6 +1093,7 @@ const ISSUE_DEPENDENCIES_QUERY: &str = "query($owner: String!, $name: String!, $
       blocking(first: 100) {
         nodes { number title state url }
       }
+      parent { id number title repository { nameWithOwner } }
     }
   }
 }";
@@ -1040,6 +1117,68 @@ fn issues_blocked_by_query(numbers: &[u64]) -> String {
         "query($owner: String!, $name: String!) {{\n  repository(owner: $owner, name: $name) {{\n{fields}  }}\n}}"
     )
 }
+
+/// Build [`GhCli::issues_parents`]'s batched query, aliased the same way as
+/// [`issues_blocked_by_query`] (see it for why the numbers are
+/// interpolated), each alias selecting the same `parent` fields
+/// [`ISSUE_DEPENDENCIES_QUERY`] does.
+fn issues_parents_query(numbers: &[u64]) -> String {
+    let fields: String = numbers
+        .iter()
+        .map(|n| {
+            format!(
+                "    i{n}: issue(number: {n}) {{ parent {{ id number title repository {{ nameWithOwner }} }} }}\n"
+            )
+        })
+        .collect();
+    format!(
+        "query($owner: String!, $name: String!) {{\n  repository(owner: $owner, name: $name) {{\n{fields}  }}\n}}"
+    )
+}
+
+/// GraphQL query fetching an issue's sub-issues (see
+/// [`GhCli::sub_issues`]), with the same fields [`ISSUE_JSON_FIELDS`]
+/// requests from `gh issue view` plus each child's repository.
+const SUB_ISSUES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 100) {
+        nodes {
+          number url title body state
+          labels(first: 100) { nodes { name } }
+          assignees(first: 100) { nodes { login } }
+          repository { nameWithOwner }
+        }
+      }
+    }
+  }
+}";
+
+/// GraphQL query resolving one issue's node id by number, for
+/// [`GhCli::remove_sub_issue`]'s child.
+const ISSUE_NODE_ID_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) { id }
+  }
+}";
+
+/// GraphQL mutation making `subIssueId` a sub-issue of `issueId`.
+/// `replaceParent: true` moves a child that already has a parent instead
+/// of failing. Input shape confirmed live via `gh api graphql`
+/// introspection (`AddSubIssueInput`).
+const ADD_SUB_ISSUE_MUTATION: &str = "mutation($issueId: ID!, $subIssueId: ID!) {
+  addSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId, replaceParent: true}) {
+    issue { id }
+  }
+}";
+
+/// GraphQL mutation taking `subIssueId` out from under `issueId`. Input
+/// shape confirmed live the same way (`RemoveSubIssueInput`).
+const REMOVE_SUB_ISSUE_MUTATION: &str = "mutation($issueId: ID!, $subIssueId: ID!) {
+  removeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId}) {
+    issue { id }
+  }
+}";
 
 /// GraphQL query resolving two issues' GraphQL node ids by number, for
 /// [`GhCli::create_issue_dependency`]/[`GhCli::delete_issue_dependency`]:
@@ -1196,6 +1335,45 @@ impl ShellGhCli {
         )
     }
 
+    /// Resolve issue `number`'s GraphQL node id in `repo` (`gh api graphql`
+    /// running [`ISSUE_NODE_ID_QUERY`]).
+    fn resolve_issue_node_id(&self, repo: &str, number: u64) -> Result<String, GhError> {
+        let (owner, name) = split_repo_slug(repo)?;
+        let output = graphql_command(
+            ISSUE_NODE_ID_QUERY,
+            &[
+                ("owner", owner),
+                ("name", name),
+                ("number", &number.to_string()),
+            ],
+        )?;
+        interpret_issue_node_id_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            number,
+        )
+    }
+
+    /// Run `mutation` (either [`ADD_SUB_ISSUE_MUTATION`] or
+    /// [`REMOVE_SUB_ISSUE_MUTATION`]) with the given node ids.
+    fn run_sub_issue_mutation(
+        &self,
+        mutation: &str,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<(), GhError> {
+        let output = graphql_command(
+            mutation,
+            &[("issueId", parent_id), ("subIssueId", child_id)],
+        )?;
+        interpret_success_or_command_error(
+            "gh api graphql",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
     /// Run `mutation` (either [`ADD_BLOCKED_BY_MUTATION`] or
     /// [`REMOVE_BLOCKED_BY_MUTATION`]) with the given node ids.
     fn run_blocked_by_mutation(
@@ -1230,6 +1408,30 @@ impl ShellGhCli {
             &String::from_utf8_lossy(&output.stderr),
         )
     }
+}
+
+/// Run `gh api graphql` with `query` and each of `vars` as a typed `-F
+/// name=value` variable, from the ambient cwd (the repo is named by the
+/// variables, never by a checkout), returning the raw output for an
+/// `interpret_*` function to classify.
+fn graphql_command(query: &str, vars: &[(&str, &str)]) -> Result<std::process::Output, GhError> {
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+    ];
+    for (name, value) in vars {
+        args.push("-F".to_string());
+        args.push(format!("{name}={value}"));
+    }
+    Command::new("gh")
+        .args(&args)
+        .output()
+        .map_err(|err| GhError::Spawn {
+            command: "gh api graphql".to_string(),
+            message: err.to_string(),
+        })
 }
 
 /// Split an `"owner/name"` repo slug (e.g. `[backend].repo` from config)
@@ -1888,6 +2090,65 @@ impl GhCli for ShellGhCli {
         let (blocker_id, blocked_id) =
             self.resolve_issue_node_ids(repo, blocker_number, blocked_number)?;
         self.run_blocked_by_mutation(REMOVE_BLOCKED_BY_MUTATION, &blocked_id, &blocker_id)
+    }
+
+    fn issues_parents(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Option<IssueParent>>, GhError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (owner, name) = split_repo_slug(repo)?;
+        let output = graphql_command(
+            &issues_parents_query(numbers),
+            &[("owner", owner), ("name", name)],
+        )?;
+        interpret_issues_parents_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn sub_issues(&self, repo: &str, number: u64) -> Result<Vec<SubIssue>, GhError> {
+        let (owner, name) = split_repo_slug(repo)?;
+        let output = graphql_command(
+            SUB_ISSUES_QUERY,
+            &[
+                ("owner", owner),
+                ("name", name),
+                ("number", &number.to_string()),
+            ],
+        )?;
+        interpret_sub_issues_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+            number,
+        )
+    }
+
+    fn add_sub_issue(
+        &self,
+        repo: &str,
+        parent_number: u64,
+        child_number: u64,
+    ) -> Result<(), GhError> {
+        let (parent_id, child_id) =
+            self.resolve_issue_node_ids(repo, parent_number, child_number)?;
+        self.run_sub_issue_mutation(ADD_SUB_ISSUE_MUTATION, &parent_id, &child_id)
+    }
+
+    fn remove_sub_issue(
+        &self,
+        repo: &str,
+        child_number: u64,
+        parent: &IssueParent,
+    ) -> Result<(), GhError> {
+        let child_id = self.resolve_issue_node_id(repo, child_number)?;
+        self.run_sub_issue_mutation(REMOVE_SUB_ISSUE_MUTATION, &parent.node_id, &child_id)
     }
 
     fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
@@ -3047,6 +3308,36 @@ struct RawIssueDependenciesIssue {
     #[serde(rename = "blockedBy")]
     blocked_by: RawDependencyConnection,
     blocking: RawDependencyConnection,
+    #[serde(default)]
+    parent: Option<RawIssueParent>,
+}
+
+/// Raw shape of an issue's `parent { id number title repository {
+/// nameWithOwner } }` selection, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueParent {
+    id: String,
+    number: u64,
+    title: String,
+    repository: RawRepositoryName,
+}
+
+/// Raw shape of a `repository { nameWithOwner }` selection.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRepositoryName {
+    name_with_owner: String,
+}
+
+impl From<RawIssueParent> for IssueParent {
+    fn from(raw: RawIssueParent) -> Self {
+        IssueParent {
+            node_id: raw.id,
+            repo: raw.repository.name_with_owner,
+            number: raw.number,
+            title: raw.title,
+        }
+    }
 }
 
 /// Interpret the result of a `gh api graphql ...` invocation running
@@ -3094,6 +3385,7 @@ fn interpret_issue_dependencies_output(
                     .into_iter()
                     .map(IssueRef::from)
                     .collect(),
+                parent: issue.parent.map(IssueParent::from),
             })
         }
         Some(code) => Err(GhError::Command {
@@ -3200,6 +3492,207 @@ struct RawIssueNodeIdsData {
 #[derive(Debug, Deserialize)]
 struct RawIssueNodeIdsResponse {
     data: Option<RawIssueNodeIdsData>,
+}
+
+/// Raw shape of one aliased `i<number>` field in [`issues_parents_query`]'s
+/// response, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawParentOnlyIssue {
+    parent: Option<RawIssueParent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesParentsData {
+    repository: Option<HashMap<String, Option<RawParentOnlyIssue>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesParentsResponse {
+    data: Option<RawIssuesParentsData>,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`issues_parents_query`], keyed by the issue number parsed back out of
+/// each `i<number>` alias. A null aliased issue is a [`GhError::Parse`]
+/// naming it, as in [`interpret_issues_blocked_by_output`].
+fn interpret_issues_parents_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<HashMap<u64, Option<IssueParent>>, GhError> {
+    let parse_err = |message: String| GhError::Parse {
+        command: "gh api graphql".to_string(),
+        message,
+    };
+    match exit_code {
+        Some(0) => {
+            let response = serde_json::from_str::<RawIssuesParentsResponse>(stdout)
+                .map_err(|err| parse_err(err.to_string()))?;
+            let repository = response
+                .data
+                .and_then(|data| data.repository)
+                .ok_or_else(|| parse_err("repository not found".to_string()))?;
+            repository
+                .into_iter()
+                .map(|(alias, issue)| {
+                    let number = alias
+                        .strip_prefix('i')
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| parse_err(format!("unexpected alias `{alias}`")))?;
+                    let issue =
+                        issue.ok_or_else(|| parse_err(format!("issue #{number} not found")))?;
+                    Ok((number, issue.parent.map(IssueParent::from)))
+                })
+                .collect()
+        }
+        code => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+/// Raw shape of one `subIssues` node in [`SUB_ISSUES_QUERY`]'s response,
+/// for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawSubIssueNode {
+    number: u64,
+    url: String,
+    title: String,
+    body: String,
+    state: String,
+    labels: RawNodes<RawIssueLabel>,
+    assignees: RawNodes<RawIssueAssignee>,
+    repository: RawRepositoryName,
+}
+
+/// A GraphQL connection's `{ nodes: [...] }` wrapper.
+#[derive(Debug, Deserialize)]
+struct RawNodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSubIssuesIssue {
+    sub_issues: RawNodes<RawSubIssueNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubIssuesRepository {
+    issue: Option<RawSubIssuesIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubIssuesData {
+    repository: Option<RawSubIssuesRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubIssuesResponse {
+    data: Option<RawSubIssuesData>,
+}
+
+impl From<RawSubIssueNode> for SubIssue {
+    fn from(raw: RawSubIssueNode) -> Self {
+        SubIssue {
+            repo: raw.repository.name_with_owner,
+            info: IssueInfo::from(RawIssueView {
+                number: raw.number,
+                url: raw.url,
+                title: raw.title,
+                body: raw.body,
+                state: raw.state,
+                labels: raw.labels.nodes,
+                assignees: raw.assignees.nodes,
+            }),
+        }
+    }
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`SUB_ISSUES_QUERY`] for issue `number`. A null issue is a
+/// [`GhError::Parse`] naming `number`, the same convention as
+/// [`interpret_issue_dependencies_output`].
+fn interpret_sub_issues_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    number: u64,
+) -> Result<Vec<SubIssue>, GhError> {
+    let parse_err = |message: String| GhError::Parse {
+        command: "gh api graphql".to_string(),
+        message,
+    };
+    match exit_code {
+        Some(0) => {
+            let response = serde_json::from_str::<RawSubIssuesResponse>(stdout)
+                .map_err(|err| parse_err(err.to_string()))?;
+            let issue = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.issue)
+                .ok_or_else(|| parse_err(format!("issue #{number} not found")))?;
+            Ok(issue
+                .sub_issues
+                .nodes
+                .into_iter()
+                .map(SubIssue::from)
+                .collect())
+        }
+        code => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdRepository {
+    issue: Option<RawIssueNodeId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdData {
+    repository: Option<RawIssueNodeIdRepository>,
+}
+
+/// Raw shape of the `gh api graphql` response body for
+/// [`ISSUE_NODE_ID_QUERY`], for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawIssueNodeIdResponse {
+    data: Option<RawIssueNodeIdData>,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`ISSUE_NODE_ID_QUERY`] for issue `number`, returning its node id. A
+/// missing issue is a [`GhError::Parse`] naming `number`.
+fn interpret_issue_node_id_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    number: u64,
+) -> Result<String, GhError> {
+    let parse_err = |message: String| GhError::Parse {
+        command: "gh api graphql".to_string(),
+        message,
+    };
+    match exit_code {
+        Some(0) => serde_json::from_str::<RawIssueNodeIdResponse>(stdout)
+            .map_err(|err| parse_err(err.to_string()))?
+            .data
+            .and_then(|data| data.repository)
+            .and_then(|repo| repo.issue)
+            .map(|issue| issue.id)
+            .ok_or_else(|| parse_err(format!("issue #{number} not found"))),
+        code => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
 }
 
 /// Interpret the result of a `gh api graphql ...` invocation running
@@ -3363,6 +3856,18 @@ pub struct FakeGhCli {
     create_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
     delete_issue_dependency_result: RefCell<Result<(), GhError>>,
     delete_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
+    /// Per-issue parents for `issues_parents`; unconfigured numbers have
+    /// none.
+    issues_parents_results: RefCell<HashMap<u64, IssueParent>>,
+    /// When set, `issues_parents` fails with this instead.
+    issues_parents_error: RefCell<Option<GhError>>,
+    issues_parents_calls: RefCell<Vec<(String, Vec<u64>)>>,
+    sub_issues_results: RefCell<HashMap<u64, Vec<SubIssue>>>,
+    sub_issues_calls: RefCell<Vec<(String, u64)>>,
+    add_sub_issue_result: RefCell<Result<(), GhError>>,
+    add_sub_issue_calls: RefCell<Vec<(String, u64, u64)>>,
+    remove_sub_issue_result: RefCell<Result<(), GhError>>,
+    remove_sub_issue_calls: RefCell<Vec<(String, u64, IssueParent)>>,
     repo_assignees_result: RefCell<Result<Vec<String>, GhError>>,
     repo_assignees_calls: RefCell<Vec<String>>,
     label_create_result: RefCell<Result<(), GhError>>,
@@ -3445,6 +3950,15 @@ impl Default for FakeGhCli {
             create_issue_dependency_calls: RefCell::new(Vec::new()),
             delete_issue_dependency_result: RefCell::new(Ok(())),
             delete_issue_dependency_calls: RefCell::new(Vec::new()),
+            issues_parents_results: RefCell::new(HashMap::new()),
+            issues_parents_error: RefCell::new(None),
+            issues_parents_calls: RefCell::new(Vec::new()),
+            sub_issues_results: RefCell::new(HashMap::new()),
+            sub_issues_calls: RefCell::new(Vec::new()),
+            add_sub_issue_result: RefCell::new(Ok(())),
+            add_sub_issue_calls: RefCell::new(Vec::new()),
+            remove_sub_issue_result: RefCell::new(Ok(())),
+            remove_sub_issue_calls: RefCell::new(Vec::new()),
             repo_assignees_result: RefCell::new(Ok(Vec::new())),
             repo_assignees_calls: RefCell::new(Vec::new()),
             label_create_result: RefCell::new(Ok(())),
@@ -3862,6 +4376,66 @@ impl FakeGhCli {
         self.delete_issue_dependency_calls.borrow().clone()
     }
 
+    /// Set the parent `issues_parents` reports for issue `number`.
+    /// Independent of [`FakeGhCli::with_issue_dependencies`], whose
+    /// [`IssueDependencies::parent`] is configured separately.
+    pub fn with_issue_parent(self, number: u64, parent: IssueParent) -> Self {
+        self.issues_parents_results
+            .borrow_mut()
+            .insert(number, parent);
+        self
+    }
+
+    /// Make every `issues_parents` call fail with `err`.
+    pub fn with_issues_parents_error(self, err: GhError) -> Self {
+        *self.issues_parents_error.borrow_mut() = Some(err);
+        self
+    }
+
+    /// The `(repo, numbers)` pairs passed to `issues_parents`, in call
+    /// order.
+    pub fn issues_parents_calls(&self) -> Vec<(String, Vec<u64>)> {
+        self.issues_parents_calls.borrow().clone()
+    }
+
+    /// Set the children `sub_issues` returns for issue `number`;
+    /// unconfigured numbers have none.
+    pub fn with_sub_issues(self, number: u64, children: Vec<SubIssue>) -> Self {
+        self.sub_issues_results
+            .borrow_mut()
+            .insert(number, children);
+        self
+    }
+
+    /// The `(repo, number)` pairs passed to `sub_issues`, in call order.
+    pub fn sub_issues_calls(&self) -> Vec<(String, u64)> {
+        self.sub_issues_calls.borrow().clone()
+    }
+
+    /// Set the result `add_sub_issue` will return.
+    pub fn with_add_sub_issue_result(self, result: Result<(), GhError>) -> Self {
+        *self.add_sub_issue_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, parent_number, child_number)` triples passed to
+    /// `add_sub_issue`, in call order.
+    pub fn add_sub_issue_calls(&self) -> Vec<(String, u64, u64)> {
+        self.add_sub_issue_calls.borrow().clone()
+    }
+
+    /// Set the result `remove_sub_issue` will return.
+    pub fn with_remove_sub_issue_result(self, result: Result<(), GhError>) -> Self {
+        *self.remove_sub_issue_result.borrow_mut() = result;
+        self
+    }
+
+    /// The `(repo, child_number, parent)` triples passed to
+    /// `remove_sub_issue`, in call order.
+    pub fn remove_sub_issue_calls(&self) -> Vec<(String, u64, IssueParent)> {
+        self.remove_sub_issue_calls.borrow().clone()
+    }
+
     /// Set the result `repo_assignees` will return.
     pub fn with_repo_assignees(self, result: Result<Vec<String>, GhError>) -> Self {
         *self.repo_assignees_result.borrow_mut() = result;
@@ -4131,6 +4705,62 @@ impl GhCli for FakeGhCli {
             blocked_number,
         ));
         self.delete_issue_dependency_result.borrow().clone()
+    }
+
+    fn issues_parents(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, Option<IssueParent>>, GhError> {
+        self.issues_parents_calls
+            .borrow_mut()
+            .push((repo.to_string(), numbers.to_vec()));
+        if let Some(err) = self.issues_parents_error.borrow().clone() {
+            return Err(err);
+        }
+        let results = self.issues_parents_results.borrow();
+        Ok(numbers
+            .iter()
+            .map(|n| (*n, results.get(n).cloned()))
+            .collect())
+    }
+
+    fn sub_issues(&self, repo: &str, number: u64) -> Result<Vec<SubIssue>, GhError> {
+        self.sub_issues_calls
+            .borrow_mut()
+            .push((repo.to_string(), number));
+        Ok(self
+            .sub_issues_results
+            .borrow()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn add_sub_issue(
+        &self,
+        repo: &str,
+        parent_number: u64,
+        child_number: u64,
+    ) -> Result<(), GhError> {
+        self.add_sub_issue_calls
+            .borrow_mut()
+            .push((repo.to_string(), parent_number, child_number));
+        self.add_sub_issue_result.borrow().clone()
+    }
+
+    fn remove_sub_issue(
+        &self,
+        repo: &str,
+        child_number: u64,
+        parent: &IssueParent,
+    ) -> Result<(), GhError> {
+        self.remove_sub_issue_calls.borrow_mut().push((
+            repo.to_string(),
+            child_number,
+            parent.clone(),
+        ));
+        self.remove_sub_issue_result.borrow().clone()
     }
 
     fn repo_assignees(&self, repo: &str) -> Result<Vec<String>, GhError> {
@@ -5872,6 +6502,7 @@ mod tests {
                 url: "u1".to_string(),
             }],
             blocking: Vec::new(),
+            parent: None,
         };
         let fake = FakeGhCli::new().with_issue_dependencies(3, Ok(deps.clone()));
 
@@ -6042,6 +6673,253 @@ mod tests {
         let err = fake.create_issue_dependency("jowi-dev/tskmstr", 1, 2);
 
         assert!(err.is_err());
+    }
+
+    // --- sub-issues (GitHub issue #158) ---
+
+    fn parent_ref(number: u64, repo: &str) -> IssueParent {
+        IssueParent {
+            node_id: format!("I_{number}"),
+            repo: repo.to_string(),
+            number,
+            title: "Epic".to_string(),
+        }
+    }
+
+    #[test]
+    fn issue_dependencies_parses_the_parent_issue() {
+        let stdout = r#"{"data": {"repository": {"issue": {
+            "blockedBy": {"nodes": []},
+            "blocking": {"nodes": []},
+            "parent": {"id": "I_1", "number": 1, "title": "Epic",
+                       "repository": {"nameWithOwner": "jowi-dev/tskmstr"}}
+        }}}}"#;
+        let deps = interpret_issue_dependencies_output(Some(0), stdout, "", 3).unwrap();
+        assert_eq!(deps.parent, Some(parent_ref(1, "jowi-dev/tskmstr")));
+    }
+
+    #[test]
+    fn issue_dependencies_null_parent_is_none() {
+        let stdout = r#"{"data": {"repository": {"issue": {
+            "blockedBy": {"nodes": []},
+            "blocking": {"nodes": []},
+            "parent": null
+        }}}}"#;
+        let deps = interpret_issue_dependencies_output(Some(0), stdout, "", 3).unwrap();
+        assert_eq!(deps.parent, None);
+    }
+
+    #[test]
+    fn issue_dependencies_query_selects_the_parent() {
+        assert!(ISSUE_DEPENDENCIES_QUERY.contains("parent {"));
+    }
+
+    #[test]
+    fn issues_parents_query_aliases_one_issue_field_per_number() {
+        let query = issues_parents_query(&[3, 17]);
+        assert!(query.contains("i3: issue(number: 3)"), "{query}");
+        assert!(query.contains("i17: issue(number: 17)"), "{query}");
+        assert_eq!(query.matches("parent {").count(), 2);
+    }
+
+    #[test]
+    fn issues_parents_parses_each_aliased_issue() {
+        let stdout = r#"{"data": {"repository": {
+            "i3": {"parent": {"id": "I_1", "number": 1, "title": "Epic",
+                              "repository": {"nameWithOwner": "jowi-dev/tskmstr"}}},
+            "i17": {"parent": null}
+        }}}"#;
+        let map = interpret_issues_parents_output(Some(0), stdout, "").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&3], Some(parent_ref(1, "jowi-dev/tskmstr")));
+        assert_eq!(map[&17], None);
+    }
+
+    #[test]
+    fn issues_parents_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"i3": null}}}"#;
+        let err = interpret_issues_parents_output(Some(0), stdout, "").unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("#3"), "{message}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issues_parents_failure_is_a_command_error() {
+        let err =
+            interpret_issues_parents_output(Some(1), "", "gh: rate limit exceeded").unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_issues_parents_with_no_numbers_makes_no_call() {
+        let map = ShellGhCli.issues_parents("jowi-dev/tskmstr", &[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn sub_issues_parses_each_child_with_its_repo() {
+        let stdout = r#"{"data": {"repository": {"issue": {"subIssues": {"nodes": [
+            {"number": 2, "url": "u2", "title": "Child", "body": "b", "state": "OPEN",
+             "labels": {"nodes": [{"name": "tm:status/in-progress"}]},
+             "assignees": {"nodes": [{"login": "jowi-dev"}]},
+             "repository": {"nameWithOwner": "jowi-dev/tskmstr"}},
+            {"number": 7, "url": "u7", "title": "Elsewhere", "body": "", "state": "CLOSED",
+             "labels": {"nodes": []},
+             "assignees": {"nodes": []},
+             "repository": {"nameWithOwner": "jowi-dev/devtools"}}
+        ]}}}}}"#;
+        let children = interpret_sub_issues_output(Some(0), stdout, "", 1).unwrap();
+        assert_eq!(
+            children,
+            vec![
+                SubIssue {
+                    repo: "jowi-dev/tskmstr".to_string(),
+                    info: IssueInfo {
+                        number: 2,
+                        url: "u2".to_string(),
+                        title: "Child".to_string(),
+                        body: "b".to_string(),
+                        state: IssueState::Open,
+                        labels: vec!["tm:status/in-progress".to_string()],
+                        assignees: vec!["jowi-dev".to_string()],
+                    },
+                },
+                SubIssue {
+                    repo: "jowi-dev/devtools".to_string(),
+                    info: IssueInfo {
+                        number: 7,
+                        url: "u7".to_string(),
+                        title: "Elsewhere".to_string(),
+                        body: String::new(),
+                        state: IssueState::Closed,
+                        labels: Vec::new(),
+                        assignees: Vec::new(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sub_issues_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"issue": null}}}"#;
+        let err = interpret_sub_issues_output(Some(0), stdout, "", 1).unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("#1"), "{message}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_issues_failure_is_a_command_error() {
+        let err = interpret_sub_issues_output(Some(1), "", "boom", 1).unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn issue_node_id_parses_the_id() {
+        let stdout = r#"{"data": {"repository": {"issue": {"id": "I_2"}}}}"#;
+        assert_eq!(
+            interpret_issue_node_id_output(Some(0), stdout, "", 2).unwrap(),
+            "I_2"
+        );
+    }
+
+    #[test]
+    fn issue_node_id_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"issue": null}}}"#;
+        let err = interpret_issue_node_id_output(Some(0), stdout, "", 2).unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("#2"), "{message}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_sub_issue_mutation_replaces_an_existing_parent() {
+        assert!(ADD_SUB_ISSUE_MUTATION.contains("replaceParent: true"));
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_parents_defaults_to_none_and_logs_one_call() {
+        let fake = FakeGhCli::new().with_issue_parent(3, parent_ref(1, "jowi-dev/tskmstr"));
+
+        let map = fake.issues_parents("jowi-dev/tskmstr", &[3, 4]).unwrap();
+
+        assert_eq!(map[&3], Some(parent_ref(1, "jowi-dev/tskmstr")));
+        assert_eq!(map[&4], None);
+        assert_eq!(
+            fake.issues_parents_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![3, 4])]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_parents_returns_configured_error() {
+        let fake = FakeGhCli::new().with_issues_parents_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        });
+        assert!(fake.issues_parents("jowi-dev/tskmstr", &[3]).is_err());
+    }
+
+    #[test]
+    fn fake_gh_cli_sub_issues_defaults_to_empty_and_returns_configured_children() {
+        let child = SubIssue {
+            repo: "jowi-dev/tskmstr".to_string(),
+            info: IssueInfo {
+                number: 2,
+                url: "u2".to_string(),
+                title: "Child".to_string(),
+                body: String::new(),
+                state: IssueState::Open,
+                labels: Vec::new(),
+                assignees: Vec::new(),
+            },
+        };
+        let fake = FakeGhCli::new().with_sub_issues(1, vec![child.clone()]);
+
+        assert_eq!(fake.sub_issues("jowi-dev/tskmstr", 1).unwrap(), vec![child]);
+        assert!(fake.sub_issues("jowi-dev/tskmstr", 5).unwrap().is_empty());
+        assert_eq!(
+            fake.sub_issues_calls(),
+            vec![
+                ("jowi-dev/tskmstr".to_string(), 1),
+                ("jowi-dev/tskmstr".to_string(), 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_add_and_remove_sub_issue_record_calls() {
+        let fake = FakeGhCli::new();
+        let parent = parent_ref(1, "jowi-dev/tskmstr");
+
+        fake.add_sub_issue("jowi-dev/tskmstr", 1, 2).unwrap();
+        fake.remove_sub_issue("jowi-dev/tskmstr", 2, &parent)
+            .unwrap();
+
+        assert_eq!(
+            fake.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+        assert_eq!(
+            fake.remove_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 2, parent)]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_add_sub_issue_seeded_error_is_returned() {
+        let fake = FakeGhCli::new().with_add_sub_issue_result(Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        }));
+        assert!(fake.add_sub_issue("jowi-dev/tskmstr", 1, 2).is_err());
     }
 
     // --- repo_assignees / label_create (phase 5) ---
