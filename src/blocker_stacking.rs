@@ -443,6 +443,7 @@ mod tests {
                         outward_issue: None,
                     })
                     .collect(),
+                parent: None,
             },
         }
     }

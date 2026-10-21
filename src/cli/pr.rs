@@ -689,6 +689,7 @@ mod tests {
                 description: None,
                 assignee: None,
                 issue_links: vec![],
+                parent: None,
             },
         }
     }

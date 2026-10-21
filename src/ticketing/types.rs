@@ -67,6 +67,54 @@ pub struct IssueFields {
     /// camelCase used elsewhere in this struct.
     #[serde(default, rename = "issuelinks")]
     pub issue_links: Vec<IssueLink>,
+    /// The epic this ticket sits under, if any.
+    ///
+    /// `#[serde(default)]` for the same reasons as
+    /// [`IssueFields::issue_links`]: a search that didn't request `parent`
+    /// omits it, and older fixtures predate it.
+    #[serde(default)]
+    pub parent: Option<ParentRef>,
+}
+
+/// The epic a ticket sits under, as embedded in [`IssueFields::parent`].
+///
+/// Deliberately a separate type from [`IssueLink`]/[`LinkedIssue`]: a
+/// parent means "this epic is made of this ticket" (decomposition), while
+/// an issue link such as `Blocks` is a dependency between peers. Mixing the
+/// two would let a parent leak into blocker readiness or the reverse.
+///
+/// Deserializes from Jira's wire shape (`{"key": ..., "fields":
+/// {"summary": ...}}`, which `GET /issue/{key}` already returns for a
+/// child ticket) and flattens it to just the key and summary.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "WireParent")]
+pub struct ParentRef {
+    /// The epic's key, e.g. `PROJ-1`.
+    pub key: String,
+    /// The epic's one-line summary.
+    pub summary: String,
+}
+
+/// Jira's nested `parent` shape, flattened into [`ParentRef`].
+#[derive(Deserialize)]
+struct WireParent {
+    key: String,
+    fields: WireParentFields,
+}
+
+/// The subset of [`WireParent`]'s embedded fields [`ParentRef`] keeps.
+#[derive(Deserialize)]
+struct WireParentFields {
+    summary: String,
+}
+
+impl From<WireParent> for ParentRef {
+    fn from(wire: WireParent) -> Self {
+        ParentRef {
+            key: wire.key,
+            summary: wire.fields.summary,
+        }
+    }
 }
 
 /// A single issue-link entry, as embedded in [`IssueFields::issue_links`].
@@ -253,6 +301,54 @@ mod tests {
         "#;
         let myself: Myself = serde_json::from_str(raw).unwrap();
         assert_eq!(myself.email_address, None);
+    }
+
+    #[test]
+    fn deserializes_issue_parent_from_jira_wire_shape() {
+        let raw = r#"
+        {
+            "key": "PROJ-2",
+            "fields": {
+                "summary": "Child",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "description": null,
+                "assignee": null,
+                "parent": {
+                    "id": "10001",
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "The epic",
+                        "status": { "name": "To Do", "statusCategory": { "key": "new" } }
+                    }
+                }
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            issue.fields.parent,
+            Some(ParentRef {
+                key: "PROJ-1".to_string(),
+                summary: "The epic".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_issue_without_parent_as_none() {
+        let raw = r#"
+        {
+            "key": "PROJ-2",
+            "fields": {
+                "summary": "Child",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "description": null,
+                "assignee": null
+            }
+        }
+        "#;
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        assert_eq!(issue.fields.parent, None);
     }
 
     #[test]

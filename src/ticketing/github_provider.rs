@@ -140,6 +140,7 @@ impl<'a> GithubProvider<'a> {
                 description,
                 assignee,
                 issue_links: self.to_issue_links(number, deps),
+                parent: None,
             },
         }
     }
