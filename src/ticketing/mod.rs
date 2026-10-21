@@ -108,7 +108,7 @@ use crate::github::gh_cli::{GhCli, GhError, PrEditRequest};
 use crate::github::pr::{KeySource, PrInfo, issue_key_candidates, with_issue_key_prefix};
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
-use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery};
+use crate::ticketing::provider::{NewTicket, TicketKind, TicketProvider, TicketQuery};
 use crate::ticketing::types::{
     CreateLinkRequest, Issue, IssueLink, JiraUser, LinkedIssue, RemoteLinkRequest,
 };
@@ -379,7 +379,8 @@ pub fn auto_create_and_associate(
         project_key: ctx.config.default_project_key.clone(),
         summary: pr.title.clone(),
         description: format!("{}\n\n{}", pr.body, pr.url),
-        issue_type_name: "Task".to_string(),
+        kind: TicketKind::Task,
+        parent_key: None,
         assignee_account_id: default_new_ticket_assignee(ctx.jira, ctx.config),
     };
     let issue = ctx.jira.create_issue(&req)?;
@@ -463,7 +464,8 @@ pub fn create_ticket(
         project_key: ctx.config.default_project_key.clone(),
         summary: title.to_string(),
         description: body.unwrap_or_default().to_string(),
-        issue_type_name: "Task".to_string(),
+        kind: TicketKind::Task,
+        parent_key: None,
         assignee_account_id: default_new_ticket_assignee(ctx.jira, ctx.config),
     };
     let issue = ctx.jira.create_issue(&req)?;
