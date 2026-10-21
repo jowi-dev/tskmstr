@@ -316,6 +316,9 @@ mod tests {
         fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError> {
             JiraClient::add_comment(&*self.0, key, body)
         }
+        fn set_parent(&self, key: &str, parent_key: Option<&str>) -> Result<(), JiraError> {
+            JiraClient::set_parent(&*self.0, key, parent_key)
+        }
     }
 
     fn write_test_config(path: &Path) {

@@ -259,6 +259,15 @@ pub trait JiraClient {
     /// [`JiraClient::update_description`] does. This only ever posts a new
     /// comment; there is no edit/replace form.
     fn add_comment(&self, key: &str, body: &serde_json::Value) -> Result<(), JiraError>;
+
+    /// Put `key` under the epic `parent_key` (`PUT /issue/{key}` with
+    /// `{"fields": {"parent": {"key": parent_key}}}`), or, with `None`,
+    /// clear its parent by sending `"parent": null`. 204 on success.
+    ///
+    /// The `parent` field replaced the deprecated "Epic Link" custom field
+    /// in Jira Cloud. The clear shape is covered by an httpmock test only;
+    /// it has not been checked against a live instance.
+    fn set_parent(&self, key: &str, parent_key: Option<&str>) -> Result<(), JiraError>;
 }
 
 /// Thin response body from `POST /rest/api/3/issue`, which returns only the
@@ -673,6 +682,19 @@ impl JiraClient for HttpJiraClient {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "body": body }))
+            .send()?;
+        Self::parse_empty(response, key)
+    }
+
+    fn set_parent(&self, key: &str, parent_key: Option<&str>) -> Result<(), JiraError> {
+        let parent = parent_key.map(|parent_key| serde_json::json!({ "key": parent_key }));
+        let response = self
+            .http
+            .put(self.url(&format!("/issue/{key}")))
+            .basic_auth(&self.ctx.email, Some(&self.ctx.token))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "fields": { "parent": parent } }))
             .send()?;
         Self::parse_empty(response, key)
     }
@@ -1650,6 +1672,68 @@ mod tests {
         let client = HttpJiraClient::new(test_ctx(&server));
         let err = client
             .update_description("PROJ-404", &description)
+            .expect_err("should fail");
+
+        match err {
+            JiraError::NotFound { key } => assert_eq!(key, "PROJ-404"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_parent_puts_parent_key() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-2")
+                .header(
+                    "Authorization",
+                    "Basic YWRhQGV4YW1wbGUuY29tOnRlc3QtdG9rZW4=",
+                )
+                .json_body(serde_json::json!({ "fields": { "parent": { "key": "PROJ-1" } } }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .set_parent("PROJ-2", Some("PROJ-1"))
+            .expect("set_parent should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn set_parent_none_puts_null_parent() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-2")
+                .json_body(serde_json::json!({ "fields": { "parent": null } }));
+            then.status(204);
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        client
+            .set_parent("PROJ-2", None)
+            .expect("clearing the parent should succeed");
+
+        mock.assert();
+    }
+
+    #[test]
+    fn set_parent_maps_404_to_not_found_with_key() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-404");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "errorMessages": ["Issue does not exist"] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let err = client
+            .set_parent("PROJ-404", Some("PROJ-1"))
             .expect_err("should fail");
 
         match err {
