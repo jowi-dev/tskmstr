@@ -39,6 +39,9 @@ pub use backend_identity::{
     session_slug_from_scope,
 };
 
+/// Default for [`Config::epic_issue_type`]: Jira Cloud's stock epic type.
+pub const DEFAULT_EPIC_ISSUE_TYPE: &str = "Epic";
+
 /// Raw, partially-specified configuration as parsed directly from TOML.
 ///
 /// Every field is optional because either the global or the repo file alone
@@ -51,6 +54,10 @@ pub struct RawConfig {
     pub jira_email: Option<String>,
     /// Default Jira project key used when none is specified explicitly.
     pub default_project_key: Option<String>,
+    /// Jira issue type name `tm` creates epics as and recognizes epics by.
+    /// Defaults to `"Epic"`; set it for a project whose epic type is named
+    /// something else.
+    pub epic_issue_type: Option<String>,
     /// Default Jira account ID to assign new tickets to.
     pub default_assignee_account_id: Option<String>,
     /// Workflow status name to transition an auto-created ticket to, e.g.
@@ -205,6 +212,8 @@ pub struct RawJiraBackendConfig {
     pub jira_email: Option<String>,
     /// Default Jira project key used when none is specified explicitly.
     pub default_project_key: Option<String>,
+    /// See [`RawConfig::epic_issue_type`].
+    pub epic_issue_type: Option<String>,
 }
 
 /// Raw, partially-specified `[backend.github]` section as parsed directly
@@ -818,6 +827,10 @@ pub struct Config {
     /// Default Jira project key used when none is specified explicitly.
     /// Empty under the GitHub backend — see [`Config::jira_base_url`].
     pub default_project_key: String,
+    /// Jira issue type name epics are created as and recognized by,
+    /// [`DEFAULT_EPIC_ISSUE_TYPE`] unless configured. Empty under the GitHub
+    /// backend — see [`Config::jira_base_url`].
+    pub epic_issue_type: String,
     /// The `"owner/name"` GitHub repo slug the GitHub provider targets.
     /// `None` when `backend` is [`BackendKind::Jira`]; always `Some` when
     /// `backend` is [`BackendKind::Github`], since [`merge`]'s
@@ -1833,6 +1846,7 @@ fn to_raw(seed: &GlobalConfigSeed) -> RawConfig {
         jira_base_url: Some(seed.jira_base_url.clone()),
         jira_email: Some(seed.jira_email.clone()),
         default_project_key: Some(seed.default_project_key.clone()),
+        epic_issue_type: None,
         default_assignee_account_id: None,
         status_on_pr: None,
         status_on_create: None,
@@ -1965,6 +1979,18 @@ fn merge_with_repo_dir(
             &global.default_project_key,
         )
     });
+    let epic_issue_type = resolved_jira_field(
+        &repo,
+        |jira| jira.epic_issue_type.clone(),
+        &repo.epic_issue_type,
+    )
+    .or_else(|| {
+        resolved_jira_field(
+            &global,
+            |jira| jira.epic_issue_type.clone(),
+            &global.epic_issue_type,
+        )
+    });
     let default_assignee_account_id = repo
         .default_assignee_account_id
         .clone()
@@ -2069,6 +2095,7 @@ fn merge_with_repo_dir(
                 "default_project_key",
                 &expected_path,
             )?,
+            epic_issue_type: epic_issue_type.unwrap_or_else(|| DEFAULT_EPIC_ISSUE_TYPE.to_string()),
             github_repo: None,
             default_assignee_account_id,
             status_on_pr,
@@ -2107,6 +2134,7 @@ fn merge_with_repo_dir(
                 jira_base_url: String::new(),
                 jira_email: String::new(),
                 default_project_key: String::new(),
+                epic_issue_type: String::new(),
                 github_repo: Some(require_field(
                     configured_repo,
                     "backend.github.repo",
@@ -2919,6 +2947,7 @@ mod tests {
             jira_base_url: Some("https://global.atlassian.net".into()),
             jira_email: Some("global@example.com".into()),
             default_project_key: Some("GLOBAL".into()),
+            epic_issue_type: None,
             default_assignee_account_id: Some("acct-global".into()),
             status_on_pr: Some("In Review".into()),
             status_on_create: Some("In Progress".into()),
@@ -2952,6 +2981,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: Some("REPO".into()),
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
@@ -3052,6 +3082,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: Some("Ready for Review".into()),
             status_on_create: None,
@@ -3088,6 +3119,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: Some("In Progress".into()),
@@ -3124,6 +3156,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
@@ -3160,6 +3193,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
@@ -3196,6 +3230,7 @@ mod tests {
             jira_base_url: None,
             jira_email: None,
             default_project_key: None,
+            epic_issue_type: None,
             default_assignee_account_id: None,
             status_on_pr: None,
             status_on_create: None,
@@ -3337,6 +3372,60 @@ mod tests {
         let cfg = load(&paths).expect("should load");
         assert_eq!(cfg.default_project_key, "REPO");
         assert_eq!(cfg.jira_base_url, "https://global.atlassian.net");
+    }
+
+    #[test]
+    fn epic_issue_type_defaults_to_epic() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert_eq!(cfg.epic_issue_type, "Epic");
+    }
+
+    #[test]
+    fn epic_issue_type_resolves_global_then_repo() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+            epic_issue_type = "Initiative"
+            "#,
+        )
+        .unwrap();
+        let global_only = load(&ConfigPaths {
+            global: global_path.clone(),
+            repo: None,
+        })
+        .expect("should load");
+        assert_eq!(global_only.epic_issue_type, "Initiative");
+
+        let repo_path = dir.path().join(".tskmstr.toml");
+        fs::write(&repo_path, r#"epic_issue_type = "Feature""#).unwrap();
+        let with_repo = load(&ConfigPaths {
+            global: global_path,
+            repo: Some(repo_path),
+        })
+        .expect("should load");
+        assert_eq!(with_repo.epic_issue_type, "Feature");
+    }
+
+    #[test]
+    fn epic_issue_type_reads_backend_jira_section() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            jira_base_url = "https://example.atlassian.net"
+            jira_email = "person@example.com"
+            default_project_key = "KEY"
+
+            [backend.jira]
+            epic_issue_type = "Saga"
+            "#,
+        )
+        .expect("should parse");
+        let cfg = merge(raw, None).expect("should merge");
+        assert_eq!(cfg.epic_issue_type, "Saga");
     }
 
     #[test]
