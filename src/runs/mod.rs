@@ -709,6 +709,22 @@ pub struct RunSummary {
     pub mem_peak_bytes: Option<u64>,
 }
 
+/// A ticket's newest run of one kind with its latest round verdict, from
+/// [`RunStore::latest_round_runs`]; backs the board's `review:` badge
+/// (GitHub issue #153).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundRun {
+    /// Ticket key.
+    pub ticket: String,
+    /// Current status of the newest run.
+    pub status: RunStatus,
+    /// PID recorded for the run (the round loop's), if any.
+    pub pid: Option<u32>,
+    /// Detail of the run's latest `auto_review_round` event
+    /// (`"<round>/<max> <verdict>"`), or `None` before its first round ends.
+    pub round: Option<String>,
+}
+
 /// One ticket scope's recent runs, from [`RunStore::recent_scope_activity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeActivity {
@@ -2328,6 +2344,54 @@ impl RunStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// The newest run of `kind` per ticket, with the detail of its latest
+    /// `auto_review_round` event, for the board's `review:` badge (GitHub
+    /// issue #153). `scope` filters like [`RunStore::list_runs_filtered`].
+    ///
+    /// "Newest" is strictly `started_at DESC, id DESC`: unlike
+    /// [`RunStore::list_runs_filtered`], status never affects the order, so
+    /// an older capped (`review`) run can't outrank a newer clean one.
+    pub fn latest_round_runs(
+        &self,
+        scope: Option<&str>,
+        kind: &str,
+    ) -> Result<Vec<RoundRun>, RunStoreError> {
+        let sql = "SELECT
+                r.ticket,
+                r.status,
+                r.pid,
+                (SELECT e.detail FROM run_events e
+                    WHERE e.run_id = r.id AND e.kind = 'auto_review_round'
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS round
+             FROM runs r
+             WHERE r.kind = ?1
+                AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
+                AND NOT EXISTS (
+                    SELECT 1 FROM runs n
+                    WHERE n.ticket = r.ticket
+                        AND n.kind = ?1
+                        AND (?2 IS NULL OR n.scope = ?2 OR n.scope = '')
+                        AND (n.started_at > r.started_at
+                            OR (n.started_at = r.started_at AND n.id > r.id))
+                )
+             ORDER BY r.started_at DESC, r.id DESC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![kind, scope], |row| {
+            let status_str: String = row.get(1)?;
+            // Same forward-compat fallback as list_runs_filtered.
+            let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
+            Ok(RoundRun {
+                ticket: row.get(0)?,
+                status,
+                pid: row.get(2)?,
+                round: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(RunStoreError::from)
     }
 
     /// Returns cost aggregates grouped by bot-findings outcome, restricted
@@ -9247,6 +9311,62 @@ mod tests {
         assert_eq!(round.auto_review_round.as_deref(), Some("1/2 fix-failed"));
         let plain = runs.iter().find(|r| r.id == plain).unwrap();
         assert_eq!(plain.auto_review_round, None);
+    }
+
+    #[test]
+    fn latest_round_runs_returns_the_newest_run_per_ticket_with_its_round() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let auto_review = |ticket: &str, scope: &str| StartRun {
+            kind: "auto-review".to_string(),
+            scope: scope.to_string(),
+            pid: Some(42),
+            ..start_params(ticket)
+        };
+        let capped = store.start_run(&auto_review("GH-1", "me/proj")).unwrap();
+        store
+            .add_event(capped, "auto_review_round", Some("3/3 capped"))
+            .unwrap();
+        store.flag_for_review(capped).unwrap();
+        let newer = store.start_run(&auto_review("GH-1", "me/proj")).unwrap();
+        store
+            .add_event(newer, "auto_review_round", Some("1/3 fix"))
+            .unwrap();
+        store
+            .add_event(newer, "auto_review_round", Some("1/3 clean"))
+            .unwrap();
+        store.start_run(&auto_review("GH-2", "me/proj")).unwrap();
+        store.start_run(&auto_review("GH-3", "other/repo")).unwrap();
+        store
+            .start_run(&StartRun {
+                scope: "me/proj".to_string(),
+                ..start_params("GH-4")
+            })
+            .unwrap();
+
+        let mut runs = store
+            .latest_round_runs(Some("me/proj"), "auto-review")
+            .unwrap();
+        runs.sort_by(|a, b| a.ticket.cmp(&b.ticket));
+
+        assert_eq!(
+            runs,
+            vec![
+                RoundRun {
+                    ticket: "GH-1".to_string(),
+                    status: RunStatus::Running,
+                    pid: Some(42),
+                    round: Some("1/3 clean".to_string()),
+                },
+                RoundRun {
+                    ticket: "GH-2".to_string(),
+                    status: RunStatus::Running,
+                    pid: Some(42),
+                    round: None,
+                },
+            ],
+            "the older capped GH-1 run must not beat the newer clean one"
+        );
     }
 
     #[test]
