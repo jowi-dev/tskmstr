@@ -623,22 +623,21 @@ impl TicketProvider for GithubProvider<'_> {
         Ok(self.to_issue(&key, number, info, IssueDependencies::default()))
     }
 
-    /// Via sub-issues. Setting uses `addSubIssue` with `replaceParent`, so
-    /// moving a ticket between epics is one mutation. Clearing reads the
-    /// child's current parent first and makes no mutation when it has none.
+    /// Via sub-issues. Reads the child's current parent first. Setting uses
+    /// `addSubIssue` with `replaceParent`, so moving a ticket between epics
+    /// is one mutation, and makes none when the child is already under that
+    /// epic: GitHub rejects re-adding an existing sub-issue. Clearing makes
+    /// no mutation when the child has no parent.
     fn set_parent(&self, child_key: &str, parent_key: Option<&str>) -> Result<(), ProviderError> {
         let child = parse_issue_number(child_key)?;
-        match parent_key {
-            Some(parent_key) => {
-                let parent = parse_issue_number(parent_key)?;
-                self.gh.add_sub_issue(&self.repo, parent, child)?;
-            }
-            None => {
-                let deps = self.gh.issue_dependencies(&self.repo, child)?;
-                if let Some(parent) = deps.parent {
-                    self.gh.remove_sub_issue(&self.repo, child, &parent)?;
-                }
-            }
+        let parent_number = parent_key.map(parse_issue_number).transpose()?;
+        let current = self.gh.issue_dependencies(&self.repo, child)?.parent;
+        match (parent_number, current) {
+            (Some(new), Some(current))
+                if current.number == new && current.repo.eq_ignore_ascii_case(&self.repo) => {}
+            (Some(new), _) => self.gh.add_sub_issue(&self.repo, new, child)?,
+            (None, Some(current)) => self.gh.remove_sub_issue(&self.repo, child, &current)?,
+            (None, None) => {}
         }
         Ok(())
     }
@@ -2035,6 +2034,43 @@ mod tests {
     #[test]
     fn set_parent_adds_the_child_as_a_sub_issue_of_the_epic() {
         let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", Some("GH-1")).unwrap();
+
+        assert_eq!(
+            fake.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn set_parent_to_the_current_parent_succeeds_without_a_mutation() {
+        // GitHub rejects re-adding an existing sub-issue ("may not contain
+        // duplicate sub-issues"); replaceParent only covers a new parent.
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Ok(IssueDependencies {
+                parent: Some(parent(1, "jowi-dev/tskmstr")),
+                ..Default::default()
+            }),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", Some("GH-1")).unwrap();
+
+        assert!(fake.add_sub_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn set_parent_moves_a_child_whose_parent_is_a_different_epic() {
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Ok(IssueDependencies {
+                parent: Some(parent(5, "jowi-dev/tskmstr")),
+                ..Default::default()
+            }),
+        );
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
         provider.set_parent("GH-2", Some("GH-1")).unwrap();
