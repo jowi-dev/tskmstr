@@ -12,7 +12,7 @@ use crate::blocker_stacking::Readiness;
 use crate::jira::client::RankAnchor;
 use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
 use crate::ticketing::provider::TicketQuery;
-use crate::ticketing::types::{JiraUser, Transition};
+use crate::ticketing::types::{JiraUser, ParentRef, Transition};
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::ticketing::types::Issue`] plus the configured Jira base URL.
@@ -40,6 +40,10 @@ pub struct TicketSummary {
     /// fetch. [`Readiness::Unknown`] wherever it wasn't (or couldn't be)
     /// computed, e.g. on [`Screen::Rank`], which never renders it.
     pub readiness: Readiness,
+    /// The epic this ticket sits under (GitHub issue #159), copied from
+    /// [`crate::ticketing::types::IssueFields::parent`]. `None` when the
+    /// ticket has no parent or the backend didn't report one.
+    pub epic: Option<ParentRef>,
 }
 
 /// The board's assignee filter: which subset of tickets to show.
@@ -4285,6 +4289,7 @@ mod tests {
             status_category: "new".to_string(),
             assignee: None,
             readiness: Readiness::Unknown,
+            epic: None,
         }
     }
 
