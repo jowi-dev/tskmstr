@@ -421,8 +421,8 @@ fn draw_column(
 /// One ticket's card: a rounded-border block titled with the issue key,
 /// containing its word-wrapped summary (capped at [`MAX_SUMMARY_LINES`]
 /// lines), then an `epic <KEY>` line when the ticket has a parent epic,
-/// then any assignee and badge lines. The selected card is rendered reversed so it's clearly
-/// distinguished from its neighbors.
+/// then any assignee and badge lines. The selected card is rendered
+/// reversed so it's clearly distinguished from its neighbors.
 fn draw_card(
     frame: &mut Frame,
     area: Rect,
