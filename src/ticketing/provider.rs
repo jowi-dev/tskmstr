@@ -171,11 +171,10 @@ pub struct NewTicket {
 
 /// The kind of ticket a [`NewTicket`] creates, independent of how any one
 /// backend spells it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketKind {
     /// An ordinary unit of work. Every create path made one of these before
     /// epics existed, and still does unless asked otherwise.
-    #[default]
     Task,
     /// A larger objective that groups other tickets under it as children
     /// (see [`TicketProvider::set_parent`]).
