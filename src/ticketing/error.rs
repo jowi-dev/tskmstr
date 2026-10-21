@@ -23,8 +23,9 @@ use thiserror::Error;
 /// method, regardless of which backend is configured.
 ///
 /// See the module doc comment for how this relates to [`JiraError`]: every
-/// variant here except [`ProviderError::NotSupported`] has a one-to-one
-/// [`JiraError`] counterpart, converted by [`From<JiraError>`] at the
+/// variant here except [`ProviderError::NotSupported`] and
+/// [`ProviderError::CreatedWithoutParent`] has a one-to-one [`JiraError`]
+/// counterpart, converted by [`From<JiraError>`] at the
 /// [`super::provider::JiraProvider`] boundary.
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -126,6 +127,23 @@ pub enum ProviderError {
         /// What was attempted, phrased to complete "... is not supported",
         /// e.g. `creating an epic`.
         operation: String,
+    },
+
+    /// [`super::provider::TicketProvider::create_issue`] created `key` but
+    /// could not then put it under the requested epic `parent`, on a
+    /// backend where creating and parenting are two separate calls. The
+    /// ticket is kept rather than deleted, so the caller can retry with
+    /// `tm ticket parent`. Raised by the provider layer, like
+    /// [`ProviderError::NotSupported`], so it has no [`JiraError`]
+    /// counterpart.
+    #[error("created {key} but could not put it under {parent}: {message}")]
+    CreatedWithoutParent {
+        /// The key of the ticket that was created.
+        key: String,
+        /// The epic it should have gone under.
+        parent: String,
+        /// Why the parenting call failed.
+        message: String,
     },
 }
 
