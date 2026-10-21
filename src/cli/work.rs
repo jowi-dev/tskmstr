@@ -3162,6 +3162,7 @@ mod tests {
                 }],
                 parent: None,
                 labels: Vec::new(),
+                issue_type: None,
             },
         }
     }
