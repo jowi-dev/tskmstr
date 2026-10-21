@@ -28,6 +28,9 @@ pub struct CreateIssueRequest {
     pub description: Value,
     /// Issue type name, e.g. `Task`.
     pub issue_type_name: String,
+    /// Key of the epic to create the issue under, sent as Jira's `parent`
+    /// field, if any.
+    pub parent_key: Option<String>,
     /// Account ID to assign the new issue to, if any.
     pub assignee_account_id: Option<String>,
 }
@@ -43,6 +46,9 @@ impl CreateIssueRequest {
             "issuetype": { "name": self.issue_type_name },
         });
 
+        if let Some(parent_key) = &self.parent_key {
+            fields["parent"] = serde_json::json!({ "key": parent_key });
+        }
         if let Some(account_id) = &self.assignee_account_id {
             fields["assignee"] = serde_json::json!({ "id": account_id });
         }
@@ -112,6 +118,7 @@ mod tests {
             summary: "Fix the thing".to_string(),
             description: json!({ "type": "doc", "version": 1, "content": [] }),
             issue_type_name: "Task".to_string(),
+            parent_key: None,
             assignee_account_id: Some("acct-1".to_string()),
         };
         let payload = req.to_payload();
@@ -136,6 +143,7 @@ mod tests {
             summary: "Fix the thing".to_string(),
             description: json!({ "type": "doc", "version": 1, "content": [] }),
             issue_type_name: "Task".to_string(),
+            parent_key: None,
             assignee_account_id: None,
         };
         let payload = req.to_payload();
@@ -147,6 +155,47 @@ mod tests {
                     "summary": "Fix the thing",
                     "description": { "type": "doc", "version": 1, "content": [] },
                     "issuetype": { "name": "Task" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_create_issue_request_as_epic() {
+        let req = CreateIssueRequest {
+            project_key: "PROJ".to_string(),
+            summary: "Ship epics".to_string(),
+            description: json!({ "type": "doc", "version": 1, "content": [] }),
+            issue_type_name: "Epic".to_string(),
+            parent_key: None,
+            assignee_account_id: None,
+        };
+        assert_eq!(
+            req.to_payload()["fields"]["issuetype"],
+            json!({ "name": "Epic" })
+        );
+        assert!(req.to_payload()["fields"].get("parent").is_none());
+    }
+
+    #[test]
+    fn serializes_create_issue_request_under_a_parent_epic() {
+        let req = CreateIssueRequest {
+            project_key: "PROJ".to_string(),
+            summary: "One slice".to_string(),
+            description: json!({ "type": "doc", "version": 1, "content": [] }),
+            issue_type_name: "Task".to_string(),
+            parent_key: Some("PROJ-1".to_string()),
+            assignee_account_id: None,
+        };
+        assert_eq!(
+            req.to_payload(),
+            json!({
+                "fields": {
+                    "project": { "key": "PROJ" },
+                    "summary": "One slice",
+                    "description": { "type": "doc", "version": 1, "content": [] },
+                    "issuetype": { "name": "Task" },
+                    "parent": { "key": "PROJ-1" }
                 }
             })
         );
