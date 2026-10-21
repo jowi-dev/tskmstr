@@ -105,13 +105,39 @@ pub fn ticket_search_jql(project_key: &str, text: &str) -> String {
     )
 }
 
+/// The JQL query used by `tm ticket children <EPIC>` to list the tickets
+/// directly under `epic_key`, whatever their status: an epic's done children
+/// are still part of it. `epic_key` is quoted and escaped via
+/// [`escape_jql_string`], since it comes from the command line. Ordered by
+/// `Rank ASC`, backlog order, like [`ranked_tickets_jql`].
+pub fn children_jql(epic_key: &str) -> String {
+    let escaped = escape_jql_string(epic_key);
+    format!("parent = \"{escaped}\" ORDER BY Rank ASC")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        assignee_tickets_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql,
+        assignee_tickets_jql, children_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql,
         ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
         unassigned_tickets_jql,
     };
+
+    #[test]
+    fn children_jql_selects_the_epics_children_in_rank_order() {
+        assert_eq!(
+            children_jql("PROJ-1"),
+            "parent = \"PROJ-1\" ORDER BY Rank ASC"
+        );
+    }
+
+    #[test]
+    fn children_jql_escapes_the_epic_key() {
+        assert_eq!(
+            children_jql(r#"PROJ-1" OR project = X"#),
+            r#"parent = "PROJ-1\" OR project = X" ORDER BY Rank ASC"#
+        );
+    }
 
     #[test]
     fn keys_jql_lists_every_key_in_one_clause() {
