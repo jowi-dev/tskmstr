@@ -46,7 +46,8 @@ use crate::jira::jql::{
 use crate::jira::types::CreateIssueRequest;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::types::{
-    CreateLinkRequest, Issue, JiraUser, Myself, RemoteLinkRequest, SearchResult, Transition,
+    CreateLinkRequest, Issue, JiraUser, Myself, ParentRef, RemoteLinkRequest, SearchResult,
+    Transition,
 };
 
 /// A backend-agnostic ticket search, rendered by each [`TicketProvider`] into
@@ -324,6 +325,42 @@ pub trait TicketProvider {
         Ok(Vec::new())
     }
 
+    /// Put `child_key` under the epic `parent_key`, or, with `None`, take
+    /// it out from under whatever epic it sits under. Moving a ticket that
+    /// already has a parent replaces that parent.
+    ///
+    /// Only the backend call: the "parent must be an epic" and "epics have
+    /// no parent" rules live in [`crate::ticketing::set_ticket_parent`], so
+    /// every backend enforces them the same way.
+    ///
+    /// The default is [`ProviderError::NotSupported`]. Jira and GitHub
+    /// implementations arrive in GitHub issues #157 and #158.
+    fn set_parent(&self, _child_key: &str, _parent_key: Option<&str>) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported {
+            operation: "setting a ticket's parent epic".to_string(),
+        })
+    }
+
+    /// The tickets directly under the epic `epic_key`, in whatever order
+    /// the backend returns them. Empty when the epic has no children.
+    ///
+    /// The default is [`ProviderError::NotSupported`].
+    fn children(&self, _epic_key: &str) -> Result<Vec<Issue>, ProviderError> {
+        Err(ProviderError::NotSupported {
+            operation: "listing an epic's child tickets".to_string(),
+        })
+    }
+
+    /// Whether `issue` is an epic in this backend's model (a Jira issue of
+    /// type Epic, a GitHub issue labeled `tm:epic`).
+    ///
+    /// The default is `false`: a backend with no epic support has no
+    /// epics, so [`crate::ticketing::set_ticket_parent`] refuses every
+    /// parent on it.
+    fn is_epic(&self, _issue: &Issue) -> bool {
+        false
+    }
+
     /// Whether `token` is plausibly a ticket key in this backend's key
     /// scheme. Used by PR title/body/branch key scraping
     /// ([`crate::ticketing::resolve_existing_key`] and every
@@ -472,12 +509,26 @@ impl TicketProvider for FakeJiraClient {
         Ok(JiraClient::myself(self)?)
     }
 
+    /// Fills in [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent)
+    /// from the fake's in-memory parent map, so a parent set through
+    /// [`TicketProvider::set_parent`] reads back the way a real backend's
+    /// would.
     fn get_issue(&self, key: &str) -> Result<Issue, ProviderError> {
-        Ok(JiraClient::get_issue(self, key)?)
+        let mut issue = JiraClient::get_issue(self, key)?;
+        issue.fields.parent = self.parent_of(key).map(|parent_key| ParentRef {
+            summary: JiraClient::get_issue(self, &parent_key)
+                .map(|parent| parent.fields.summary)
+                .unwrap_or_default(),
+            key: parent_key,
+        });
+        Ok(issue)
     }
 
+    /// Records the request like any other create, then remembers a created
+    /// epic as an epic and a created child under its parent, so the rest of
+    /// the parent surface sees the new ticket.
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        Ok(JiraClient::create_issue(
+        let issue = JiraClient::create_issue(
             self,
             &CreateIssueRequest {
                 project_key: req.project_key.clone(),
@@ -486,7 +537,30 @@ impl TicketProvider for FakeJiraClient {
                 issue_type_name: req.kind.jira_issue_type_name().to_string(),
                 assignee_account_id: req.assignee_account_id.clone(),
             },
-        )?)
+        )?;
+        if req.kind == TicketKind::Epic {
+            self.mark_epic(&issue.key);
+        }
+        if let Some(parent_key) = &req.parent_key {
+            self.store_parent(&issue.key, Some(parent_key));
+        }
+        Ok(issue)
+    }
+
+    fn set_parent(&self, child_key: &str, parent_key: Option<&str>) -> Result<(), ProviderError> {
+        self.record_set_parent(child_key, parent_key);
+        Ok(())
+    }
+
+    fn children(&self, epic_key: &str) -> Result<Vec<Issue>, ProviderError> {
+        self.child_keys(epic_key)
+            .iter()
+            .map(|key| TicketProvider::get_issue(self, key))
+            .collect()
+    }
+
+    fn is_epic(&self, issue: &Issue) -> bool {
+        self.is_epic_key(&issue.key)
     }
 
     fn add_remote_link(&self, key: &str, link: &RemoteLinkRequest) -> Result<(), ProviderError> {
@@ -799,6 +873,124 @@ mod tests {
             .expect_err("parents are not supported yet");
 
         assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn default_parent_methods_refuse_honestly() {
+        let provider = JiraProvider::new(
+            FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")),
+            "https://example.atlassian.net",
+        );
+
+        assert!(matches!(
+            provider.set_parent("PROJ-2", Some("PROJ-1")),
+            Err(ProviderError::NotSupported { .. })
+        ));
+        assert!(matches!(
+            provider.set_parent("PROJ-2", None),
+            Err(ProviderError::NotSupported { .. })
+        ));
+        assert!(matches!(
+            provider.children("PROJ-1"),
+            Err(ProviderError::NotSupported { .. })
+        ));
+        assert!(!provider.is_epic(&issue("PROJ-1")));
+    }
+
+    #[test]
+    fn fake_ticket_provider_marks_a_created_epic_as_an_epic() {
+        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
+
+        let created = TicketProvider::create_issue(&fake, &new_ticket(TicketKind::Epic, None))
+            .expect("should succeed");
+
+        assert!(fake.is_epic(&created));
+        assert_eq!(fake.create_issue_calls()[0].issue_type_name, "Epic");
+    }
+
+    #[test]
+    fn fake_ticket_provider_records_the_parent_of_a_ticket_created_under_an_epic() {
+        let fake = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-9", issue("PROJ-9"))
+            .with_create_issue_result(issue("PROJ-9"));
+
+        TicketProvider::create_issue(&fake, &new_ticket(TicketKind::Task, Some("PROJ-1")))
+            .expect("should succeed");
+
+        let child = TicketProvider::get_issue(&fake, "PROJ-9").unwrap();
+        assert_eq!(
+            child.fields.parent.map(|p| p.key),
+            Some("PROJ-1".to_string())
+        );
+    }
+
+    #[test]
+    fn fake_ticket_provider_set_parent_records_the_call_and_shows_on_get_issue() {
+        let mut epic = issue("PROJ-1");
+        epic.fields.summary = "The epic".to_string();
+        let fake = FakeJiraClient::new()
+            .with_epic("PROJ-1", epic)
+            .with_issue("PROJ-2", issue("PROJ-2"));
+
+        fake.set_parent("PROJ-2", Some("PROJ-1")).unwrap();
+
+        assert_eq!(
+            fake.set_parent_calls(),
+            vec![("PROJ-2".to_string(), Some("PROJ-1".to_string()))]
+        );
+        let child = TicketProvider::get_issue(&fake, "PROJ-2").unwrap();
+        assert_eq!(
+            child.fields.parent,
+            Some(crate::ticketing::types::ParentRef {
+                key: "PROJ-1".to_string(),
+                summary: "The epic".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn fake_ticket_provider_set_parent_none_clears_the_parent() {
+        let fake = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_parent("PROJ-2", "PROJ-1");
+
+        fake.set_parent("PROJ-2", None).unwrap();
+
+        let child = TicketProvider::get_issue(&fake, "PROJ-2").unwrap();
+        assert_eq!(child.fields.parent, None);
+        assert!(fake.children("PROJ-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_ticket_provider_children_returns_only_that_epics_children_in_key_order() {
+        let fake = FakeJiraClient::new()
+            .with_epic("PROJ-1", issue("PROJ-1"))
+            .with_epic("PROJ-5", issue("PROJ-5"))
+            .with_issue("PROJ-3", issue("PROJ-3"))
+            .with_issue("PROJ-2", issue("PROJ-2"))
+            .with_issue("PROJ-4", issue("PROJ-4"))
+            .with_parent("PROJ-3", "PROJ-1")
+            .with_parent("PROJ-2", "PROJ-1")
+            .with_parent("PROJ-4", "PROJ-5");
+
+        let keys: Vec<String> = fake
+            .children("PROJ-1")
+            .unwrap()
+            .into_iter()
+            .map(|child| child.key)
+            .collect();
+
+        assert_eq!(keys, vec!["PROJ-2".to_string(), "PROJ-3".to_string()]);
+    }
+
+    #[test]
+    fn fake_ticket_provider_only_seeded_or_created_epics_are_epics() {
+        let fake = FakeJiraClient::new().with_epic("PROJ-1", issue("PROJ-1"));
+
+        assert!(fake.is_epic(&issue("PROJ-1")));
+        assert!(!fake.is_epic(&issue("PROJ-2")));
     }
 
     #[test]

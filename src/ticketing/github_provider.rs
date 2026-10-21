@@ -1823,6 +1823,21 @@ mod tests {
     }
 
     #[test]
+    fn parent_operations_are_not_supported_yet() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert!(matches!(
+            provider.set_parent("GH-2", Some("GH-1")),
+            Err(ProviderError::NotSupported { .. })
+        ));
+        assert!(matches!(
+            provider.children("GH-1"),
+            Err(ProviderError::NotSupported { .. })
+        ));
+    }
+
+    #[test]
     fn normalize_status_target_maps_common_jira_review_names_onto_in_review() {
         let fake = FakeGhCli::new();
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
