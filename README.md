@@ -245,7 +245,7 @@ tm auth status
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
-**Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend. The GitHub backend supports them: an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. The Jira backend doesn't implement them yet (GitHub issue #157), so there they fail with a "not supported by this ticket backend" error, or with "is not an epic" when the parent check runs first, rather than creating a plain task. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
+**Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and both backends support them. In Jira, an epic is an issue of type `Epic` (or whatever `epic_issue_type` names, see "Configuration"), a child points at its epic through Jira's `parent` field, and `tm ticket children` lists every ticket under the epic, done ones included, in backlog rank order. In GitHub, an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
 
 ## Ticket/run status drift (`tm drift`)
 
@@ -2235,6 +2235,7 @@ jira_base_url = "https://example.atlassian.net"
 jira_email = "dev@example.com"
 default_project_key = "PROJ"
 default_assignee_account_id = "..."   # filled in by `tm auth login`
+# epic_issue_type = "Epic"            # optional, see below; this is the default
 # status_on_pr = "In Review"          # optional, see below
 # status_on_create = "In Progress"    # optional, see below
 # status_on_merge = "Done"            # optional, see below
@@ -2256,9 +2257,16 @@ A repo can override any subset of these fields with a `.tskmstr.toml` in
 its root; fields it doesn't set fall back to the global config.
 `jira_base_url`, `jira_email`, and `default_project_key` must resolve
 between the two files whenever the Jira backend is selected, or `tm`
-refuses to run; `default_assignee_account_id`, `status_on_pr`,
+refuses to run; `default_assignee_account_id`, `epic_issue_type`, `status_on_pr`,
 `status_on_create`, `status_on_merge`, `status_on_run_start`, `review_bots`,
 `board_column_order`, `[ready]`, and `[backend]` are optional.
+
+`epic_issue_type` is the Jira issue type name `tm ticket create --epic`
+creates and `tm ticket parent` checks a parent against (case-insensitively).
+It defaults to `"Epic"`; set it when your project's epic type is named
+something else. `tm` doesn't look the type up first: if the project has no
+issue type by that name, Jira's create error is shown as is. Like the other
+Jira fields it can also live under `[backend.jira]`.
 
 ### Relative `repo`/`dir` paths in a repo-local config
 
