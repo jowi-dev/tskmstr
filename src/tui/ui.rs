@@ -522,13 +522,13 @@ fn assignee_line(ticket: &TicketSummary) -> String {
 
 /// The rendered height of `ticket`'s card at `content_width`: its wrapped,
 /// capped summary plus top/bottom border rows, plus one more row each for
-/// the epic line (when `ticket.epic` is set), the assignee line (when `show_assignee` is set), the audit badge line
-/// (when `ticket.key` has an entry in `badges.audit_status`), the lane-run
-/// badge line (when it has an entry in `badges.lane_run_status`), the
-/// bot-watch badge line (when [`bot_watch_badge`] yields one), and the
-/// bugbot-cleanup badge line (when it has an entry in
-/// `badges.cleanup_status`) -- every badge line can render on the same card at
-/// once.
+/// the epic line (when `ticket.epic` is set), the assignee line (when
+/// `show_assignee` is set), the audit badge line (when `ticket.key` has an
+/// entry in `badges.audit_status`), the lane-run badge line (when it has
+/// an entry in `badges.lane_run_status`), the bot-watch badge line (when
+/// [`bot_watch_badge`] yields one), and the bugbot-cleanup badge line
+/// (when it has an entry in `badges.cleanup_status`) -- every badge line
+/// can render on the same card at once.
 fn card_height(
     ticket: &TicketSummary,
     content_width: usize,
