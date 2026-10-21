@@ -459,7 +459,7 @@ impl JiraClient for HttpJiraClient {
         for _ in 0..MAX_SEARCH_PAGES {
             let mut body = serde_json::json!({
                 "jql": jql,
-                "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                "fields": ["summary", "status", "assignee", "description", "issuelinks", "parent", "issuetype"],
                 "maxResults": SEARCH_PAGE_SIZE,
             });
             if let Some(token) = &token {
@@ -989,7 +989,7 @@ mod tests {
                 )
                 .json_body(serde_json::json!({
                     "jql": "assignee = currentUser()",
-                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks", "parent", "issuetype"],
                     "maxResults": SEARCH_PAGE_SIZE
                 }));
             then.status(200)
@@ -1008,6 +1008,40 @@ mod tests {
     }
 
     #[test]
+    fn search_parses_parent_and_issue_type_when_present() {
+        let server = MockServer::start();
+        let mut child = issue_json("PROJ-2");
+        child["fields"]["parent"] = serde_json::json!({
+            "id": "10001",
+            "key": "PROJ-1",
+            "fields": { "summary": "The epic" }
+        });
+        child["fields"]["issuetype"] = serde_json::json!({ "name": "Task" });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "issues": [child, issue_json("PROJ-3")] }));
+        });
+
+        let client = HttpJiraClient::new(test_ctx(&server));
+        let result = client
+            .search("parent = PROJ-1")
+            .expect("search should succeed");
+
+        let with = &result.issues[0].fields;
+        assert_eq!(with.parent.as_ref().map(|p| p.key.as_str()), Some("PROJ-1"));
+        assert_eq!(
+            with.issue_type.as_ref().map(|t| t.name.as_str()),
+            Some("Task")
+        );
+        let without = &result.issues[1].fields;
+        assert_eq!(without.parent, None);
+        assert_eq!(without.issue_type, None);
+    }
+
+    #[test]
     fn search_follows_next_page_token_until_exhausted() {
         let server = MockServer::start();
         let first = server.mock(|when, then| {
@@ -1015,7 +1049,7 @@ mod tests {
                 .path("/rest/api/3/search/jql")
                 .json_body(serde_json::json!({
                     "jql": "project = PROJ",
-                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks", "parent", "issuetype"],
                     "maxResults": SEARCH_PAGE_SIZE
                 }));
             then.status(200)
@@ -1030,7 +1064,7 @@ mod tests {
                 .path("/rest/api/3/search/jql")
                 .json_body(serde_json::json!({
                     "jql": "project = PROJ",
-                    "fields": ["summary", "status", "assignee", "description", "issuelinks"],
+                    "fields": ["summary", "status", "assignee", "description", "issuelinks", "parent", "issuetype"],
                     "maxResults": SEARCH_PAGE_SIZE,
                     "nextPageToken": "page-2"
                 }));
