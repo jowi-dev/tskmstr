@@ -1115,8 +1115,12 @@ fn net_deps_builder(
                 token,
             };
             let base_url = config.jira_base_url.clone();
+            let epic_issue_type = config.epic_issue_type.clone();
             Ok(Box::new(move || NetDeps {
-                jira: Box::new(JiraProvider::new(HttpJiraClient::new(client_ctx), base_url)),
+                jira: Box::new(
+                    JiraProvider::new(HttpJiraClient::new(client_ctx), base_url)
+                        .with_epic_issue_type(epic_issue_type),
+                ),
                 gh: Box::new(ShellGhCli::new()),
                 git: Box::new(ShellGitOps::new()),
                 store: tskmstr::runs::RunStore::open(&db_path).ok(),
@@ -1311,14 +1315,17 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
 }
 
 fn jira_client_for(config: &Config, token: &str) -> Box<dyn TicketProvider> {
-    Box::new(JiraProvider::new(
-        HttpJiraClient::new(JiraClientContext {
-            base_url: config.jira_base_url.clone(),
-            email: config.jira_email.clone(),
-            token: token.to_string(),
-        }),
-        config.jira_base_url.clone(),
-    ))
+    Box::new(
+        JiraProvider::new(
+            HttpJiraClient::new(JiraClientContext {
+                base_url: config.jira_base_url.clone(),
+                email: config.jira_email.clone(),
+                token: token.to_string(),
+            }),
+            config.jira_base_url.clone(),
+        )
+        .with_epic_issue_type(config.epic_issue_type.clone()),
+    )
 }
 
 fn run_auth(

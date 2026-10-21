@@ -2312,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn create_epic_on_a_real_backend_refuses_instead_of_creating_a_task() {
+    fn create_epic_on_the_jira_backend_creates_it() {
         let provider = crate::ticketing::provider::JiraProvider::new(
             FakeJiraClient::new().with_create_issue_result(issue("PROJ-9")),
             "https://example.atlassian.net",
@@ -2329,7 +2329,7 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let err = create(
+        create(
             &ctx,
             &opts,
             &mut crate::cli::FakePrompter::new(),
@@ -2338,17 +2338,9 @@ mod tests {
             &no_sessions_dir(),
             &mut out,
         )
-        .expect_err("not supported");
+        .expect("the Jira backend creates epics");
 
-        assert!(
-            matches!(
-                err,
-                TicketCliError::Ticketing(TicketingError::Provider(
-                    ProviderError::NotSupported { .. }
-                ))
-            ),
-            "{err:?}"
-        );
+        assert!(String::from_utf8(out).unwrap().contains("PROJ-9"));
     }
 
     #[test]
@@ -2471,7 +2463,26 @@ mod tests {
     }
 
     #[test]
-    fn parent_on_a_real_backend_fails_instead_of_succeeding_silently() {
+    fn parent_on_the_jira_backend_sets_and_clears_under_a_jira_epic() {
+        let mut epic = issue("PROJ-1");
+        epic.fields.issue_type = Some(crate::ticketing::types::IssueType {
+            name: "Epic".to_string(),
+        });
+        let provider = crate::ticketing::provider::JiraProvider::new(
+            FakeJiraClient::new()
+                .with_issue("PROJ-1", epic)
+                .with_issue("PROJ-2", issue("PROJ-2")),
+            "https://example.atlassian.net",
+        );
+        let mut out = Vec::new();
+
+        parent(&provider, "PROJ-2", Some("PROJ-1"), false, &mut out)
+            .expect("PROJ-1 is a Jira epic");
+        parent(&provider, "PROJ-2", None, true, &mut out).expect("clearing should succeed");
+    }
+
+    #[test]
+    fn parent_on_the_jira_backend_refuses_a_non_epic_parent() {
         let provider = crate::ticketing::provider::JiraProvider::new(
             FakeJiraClient::new()
                 .with_issue("PROJ-1", issue("PROJ-1"))
@@ -2481,7 +2492,6 @@ mod tests {
         let mut out = Vec::new();
 
         assert!(parent(&provider, "PROJ-2", Some("PROJ-1"), false, &mut out).is_err());
-        assert!(parent(&provider, "PROJ-2", None, true, &mut out).is_err());
     }
 
     #[test]
@@ -2516,23 +2526,23 @@ mod tests {
     }
 
     #[test]
-    fn children_on_a_real_backend_is_not_supported() {
+    fn children_on_the_jira_backend_prints_the_search_results() {
         let provider = crate::ticketing::provider::JiraProvider::new(
-            FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")),
+            FakeJiraClient::new()
+                .with_issue("PROJ-1", issue("PROJ-1"))
+                .with_search_result(crate::ticketing::types::SearchResult {
+                    issues: vec![titled("PROJ-2", "First part")],
+                    next_page_token: None,
+                }),
             "https://example.atlassian.net",
         );
         let mut out = Vec::new();
 
-        let err = children(&provider, "PROJ-1", &mut out).expect_err("not supported");
+        children(&provider, "PROJ-1", &mut out).expect("the Jira backend lists children");
 
-        assert!(
-            matches!(
-                err,
-                TicketCliError::Ticketing(TicketingError::Provider(
-                    ProviderError::NotSupported { .. }
-                ))
-            ),
-            "{err:?}"
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PROJ-2  To Do  First part\n"
         );
     }
 

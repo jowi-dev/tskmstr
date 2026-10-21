@@ -36,12 +36,14 @@
 //! so by reference, with no ownership transfer and no test rewritten to
 //! route through a wrapper value it can no longer see into.
 
+use crate::config::DEFAULT_EPIC_ISSUE_TYPE;
 use crate::jira::adf::{adf_to_text, text_to_adf};
 use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::fake::FakeJiraClient;
 use crate::jira::jql::{
-    assignee_tickets_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql, ranked_tickets_jql,
-    ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
+    assignee_tickets_jql, children_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql,
+    ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
+    unassigned_tickets_jql,
 };
 use crate::jira::types::CreateIssueRequest;
 use crate::ticketing::error::ProviderError;
@@ -181,11 +183,12 @@ pub enum TicketKind {
 }
 
 impl TicketKind {
-    /// The Jira issue type name for this kind.
-    fn jira_issue_type_name(self) -> &'static str {
+    /// The Jira issue type name for this kind, given the type name the
+    /// project uses for epics ([`crate::config::Config::epic_issue_type`]).
+    fn jira_issue_type_name(self, epic_issue_type: &str) -> &str {
         match self {
             TicketKind::Task => "Task",
-            TicketKind::Epic => "Epic",
+            TicketKind::Epic => epic_issue_type,
         }
     }
 }
@@ -346,9 +349,9 @@ pub trait TicketProvider {
     /// no parent" rules live in [`crate::ticketing::set_ticket_parent`], so
     /// every backend enforces them the same way.
     ///
-    /// The default is [`ProviderError::NotSupported`]. The github backend
-    /// implements it with sub-issues; Jira's implementation arrives in
-    /// GitHub issue #157.
+    /// The default is [`ProviderError::NotSupported`]. [`JiraProvider`]
+    /// edits Jira's `parent` field; the github backend implements it with
+    /// sub-issues.
     fn set_parent(&self, _child_key: &str, _parent_key: Option<&str>) -> Result<(), ProviderError> {
         Err(ProviderError::NotSupported {
             operation: "setting a ticket's parent epic".to_string(),
@@ -405,14 +408,15 @@ pub trait TicketProvider {
 
 /// [`TicketProvider`] backed by a boxed [`JiraClient`].
 ///
-/// Every method forwards unchanged to the wrapped client — this phase is a
-/// pure retyping of every ticketing call site from `&dyn JiraClient` to
-/// `&dyn TicketProvider`, with no behavior change. `base_url` exists only
-/// for [`TicketProvider::issue_url`]: the [`JiraClient`] trait has no way to
-/// report the instance it talks to, so the provider carries it alongside.
+/// Most methods forward unchanged to the wrapped client. `base_url` exists
+/// only for [`TicketProvider::issue_url`]: the [`JiraClient`] trait has no
+/// way to report the instance it talks to, so the provider carries it
+/// alongside. `epic_issue_type` is the Jira issue type name epics are
+/// created as and recognized by (see [`JiraProvider::with_epic_issue_type`]).
 pub struct JiraProvider {
     client: Box<dyn JiraClient>,
     base_url: String,
+    epic_issue_type: String,
 }
 
 impl JiraProvider {
@@ -424,7 +428,16 @@ impl JiraProvider {
         Self {
             client: Box::new(client),
             base_url: base_url.into(),
+            epic_issue_type: DEFAULT_EPIC_ISSUE_TYPE.to_string(),
         }
+    }
+
+    /// Use `name` as the Jira issue type for epics instead of
+    /// [`DEFAULT_EPIC_ISSUE_TYPE`], for a project whose epic type is named
+    /// differently ([`crate::config::Config::epic_issue_type`]).
+    pub fn with_epic_issue_type(mut self, name: impl Into<String>) -> Self {
+        self.epic_issue_type = name.into();
+        self
     }
 }
 
@@ -437,13 +450,19 @@ impl TicketProvider for JiraProvider {
         Ok(self.client.get_issue(key)?)
     }
 
+    /// An epic is created as [`JiraProvider::with_epic_issue_type`]'s type
+    /// (default `Epic`); if the project has no such type, Jira's create
+    /// error is returned as is. A `parent_key` becomes Jira's `parent`
+    /// field.
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        refuse_epic_or_parent(req)?;
         Ok(self.client.create_issue(&CreateIssueRequest {
             project_key: req.project_key.clone(),
             summary: req.summary.clone(),
             description: text_to_adf(&req.description),
-            issue_type_name: req.kind.jira_issue_type_name().to_string(),
+            issue_type_name: req
+                .kind
+                .jira_issue_type_name(&self.epic_issue_type)
+                .to_string(),
             parent_key: req.parent_key.clone(),
             assignee_account_id: req.assignee_account_id.clone(),
         })?)
@@ -511,6 +530,26 @@ impl TicketProvider for JiraProvider {
     fn issue_url(&self, key: &str) -> String {
         format!("{}/browse/{key}", self.base_url)
     }
+
+    fn set_parent(&self, child_key: &str, parent_key: Option<&str>) -> Result<(), ProviderError> {
+        Ok(self.client.set_parent(child_key, parent_key)?)
+    }
+
+    /// Searches `parent = <EPIC>` ([`children_jql`]), so a child of any
+    /// status is included.
+    fn children(&self, epic_key: &str) -> Result<Vec<Issue>, ProviderError> {
+        Ok(self.client.search(&children_jql(epic_key))?.issues)
+    }
+
+    /// True when the issue's type name equals the epic type name, ignoring
+    /// case. An issue fetched without `issuetype` is never an epic.
+    fn is_epic(&self, issue: &Issue) -> bool {
+        issue
+            .fields
+            .issue_type
+            .as_ref()
+            .is_some_and(|issue_type| issue_type.name.eq_ignore_ascii_case(&self.epic_issue_type))
+    }
 }
 
 /// [`FakeJiraClient`] satisfies [`TicketProvider`] directly, delegating to
@@ -549,7 +588,10 @@ impl TicketProvider for FakeJiraClient {
                 project_key: req.project_key.clone(),
                 summary: req.summary.clone(),
                 description: text_to_adf(&req.description),
-                issue_type_name: req.kind.jira_issue_type_name().to_string(),
+                issue_type_name: req
+                    .kind
+                    .jira_issue_type_name(DEFAULT_EPIC_ISSUE_TYPE)
+                    .to_string(),
                 parent_key: req.parent_key.clone(),
                 assignee_account_id: req.assignee_account_id.clone(),
             },
@@ -868,50 +910,188 @@ mod tests {
         assert_eq!(fake.create_issue_calls()[0].issue_type_name, "Task");
     }
 
-    #[test]
-    fn jira_provider_refuses_to_create_an_epic() {
-        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
-        let provider = JiraProvider::new(fake, "https://example.atlassian.net");
+    /// A [`JiraProvider`] over a real [`HttpJiraClient`] pointed at
+    /// `server`, so a test can assert the exact request a provider method
+    /// sends. The fake can't show that: the provider boxes its client, so
+    /// the fake's recorded calls are out of reach.
+    fn http_provider(server: &httpmock::MockServer) -> JiraProvider {
+        JiraProvider::new(
+            crate::jira::client::HttpJiraClient::new(crate::jira::client::JiraClientContext {
+                base_url: server.url(""),
+                email: "ada@example.com".to_string(),
+                token: "test-token".to_string(),
+            }),
+            server.url(""),
+        )
+    }
 
-        let err = provider
-            .create_issue(&new_ticket(TicketKind::Epic, None))
-            .expect_err("epics are not supported yet");
-
-        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
+    /// Mock `POST /issue` expecting `fields` to contain `expected_fields`,
+    /// plus the `GET /issue/PROJ-9` the client makes for the created issue.
+    fn mock_create<'a>(
+        server: &'a httpmock::MockServer,
+        expected_fields: serde_json::Value,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/rest/api/3/issue/PROJ-9");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "key": "PROJ-9",
+                    "fields": {
+                        "summary": "Fix the thing",
+                        "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                        "description": null,
+                        "assignee": null
+                    }
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/issue")
+                .json_body_partial(serde_json::json!({ "fields": expected_fields }).to_string());
+            then.status(201)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "id": "10009", "key": "PROJ-9" }));
+        })
     }
 
     #[test]
-    fn jira_provider_refuses_to_create_under_a_parent() {
-        let fake = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));
-        let provider = JiraProvider::new(fake, "https://example.atlassian.net");
-
-        let err = provider
-            .create_issue(&new_ticket(TicketKind::Task, Some("PROJ-1")))
-            .expect_err("parents are not supported yet");
-
-        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn default_parent_methods_refuse_honestly() {
-        let provider = JiraProvider::new(
-            FakeJiraClient::new().with_issue("PROJ-1", issue("PROJ-1")),
-            "https://example.atlassian.net",
+    fn jira_provider_creates_an_epic_as_the_default_epic_type() {
+        let server = httpmock::MockServer::start();
+        let create = mock_create(
+            &server,
+            serde_json::json!({ "issuetype": { "name": "Epic" } }),
         );
 
-        assert!(matches!(
-            provider.set_parent("PROJ-2", Some("PROJ-1")),
-            Err(ProviderError::NotSupported { .. })
-        ));
-        assert!(matches!(
-            provider.set_parent("PROJ-2", None),
-            Err(ProviderError::NotSupported { .. })
-        ));
-        assert!(matches!(
-            provider.children("PROJ-1"),
-            Err(ProviderError::NotSupported { .. })
-        ));
-        assert!(!provider.is_epic(&issue("PROJ-1")));
+        http_provider(&server)
+            .create_issue(&new_ticket(TicketKind::Epic, None))
+            .expect("epic create should succeed");
+
+        create.assert();
+    }
+
+    #[test]
+    fn jira_provider_creates_an_epic_as_the_configured_epic_type() {
+        let server = httpmock::MockServer::start();
+        let create = mock_create(
+            &server,
+            serde_json::json!({ "issuetype": { "name": "Initiative" } }),
+        );
+
+        http_provider(&server)
+            .with_epic_issue_type("Initiative")
+            .create_issue(&new_ticket(TicketKind::Epic, None))
+            .expect("epic create should succeed");
+
+        create.assert();
+    }
+
+    #[test]
+    fn jira_provider_creates_a_task_under_a_parent_epic() {
+        let server = httpmock::MockServer::start();
+        let create = mock_create(
+            &server,
+            serde_json::json!({
+                "issuetype": { "name": "Task" },
+                "parent": { "key": "PROJ-1" }
+            }),
+        );
+
+        http_provider(&server)
+            .create_issue(&new_ticket(TicketKind::Task, Some("PROJ-1")))
+            .expect("child create should succeed");
+
+        create.assert();
+    }
+
+    #[test]
+    fn jira_provider_set_parent_edits_the_parent_field() {
+        let server = httpmock::MockServer::start();
+        let set = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-2")
+                .json_body(serde_json::json!({ "fields": { "parent": { "key": "PROJ-1" } } }));
+            then.status(204);
+        });
+        let clear = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path("/rest/api/3/issue/PROJ-3")
+                .json_body(serde_json::json!({ "fields": { "parent": null } }));
+            then.status(204);
+        });
+        let provider = http_provider(&server);
+
+        provider
+            .set_parent("PROJ-2", Some("PROJ-1"))
+            .expect("set should succeed");
+        provider
+            .set_parent("PROJ-3", None)
+            .expect("clear should succeed");
+
+        set.assert();
+        clear.assert();
+    }
+
+    #[test]
+    fn jira_provider_children_searches_by_parent() {
+        let server = httpmock::MockServer::start();
+        let search = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/rest/api/3/search/jql")
+                .json_body_partial(
+                    serde_json::json!({ "jql": crate::jira::jql::children_jql("PROJ-1") })
+                        .to_string(),
+                );
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "issues": [{
+                        "key": "PROJ-2",
+                        "fields": {
+                            "summary": "Child",
+                            "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                            "description": null,
+                            "assignee": null
+                        }
+                    }]
+                }));
+        });
+
+        let children = http_provider(&server)
+            .children("PROJ-1")
+            .expect("children should succeed");
+
+        search.assert();
+        let keys: Vec<&str> = children.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["PROJ-2"]);
+    }
+
+    fn issue_of_type(type_name: Option<&str>) -> Issue {
+        let mut issue = issue("PROJ-1");
+        issue.fields.issue_type = type_name.map(|name| crate::ticketing::types::IssueType {
+            name: name.to_string(),
+        });
+        issue
+    }
+
+    #[test]
+    fn jira_provider_is_epic_matches_the_epic_type_case_insensitively() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net");
+
+        assert!(provider.is_epic(&issue_of_type(Some("Epic"))));
+        assert!(provider.is_epic(&issue_of_type(Some("epic"))));
+        assert!(!provider.is_epic(&issue_of_type(Some("Task"))));
+        assert!(!provider.is_epic(&issue_of_type(None)));
+    }
+
+    #[test]
+    fn jira_provider_is_epic_uses_the_configured_epic_type() {
+        let provider = JiraProvider::new(FakeJiraClient::new(), "https://example.atlassian.net")
+            .with_epic_issue_type("Initiative");
+
+        assert!(provider.is_epic(&issue_of_type(Some("Initiative"))));
+        assert!(!provider.is_epic(&issue_of_type(Some("Epic"))));
     }
 
     #[test]
