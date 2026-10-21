@@ -69,10 +69,14 @@ pub struct IssueFields {
     pub issue_links: Vec<IssueLink>,
     /// The epic this ticket sits under, if any.
     ///
+    /// Jira also sets `parent` on a sub-task, pointing at an ordinary task.
+    /// That is not an epic, so deserialization drops it (see
+    /// [`deserialize_epic_parent`]) and a sub-task reads as having none.
+    ///
     /// `#[serde(default)]` for the same reasons as
     /// [`IssueFields::issue_links`]: a search that didn't request `parent`
     /// omits it, and older fixtures predate it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_epic_parent")]
     pub parent: Option<ParentRef>,
     /// Label names on this issue. The github backend reads its `tm:epic`
     /// label from here ([`super::provider::TicketProvider::is_epic`]).
@@ -107,11 +111,11 @@ pub struct IssueType {
 /// an issue link such as `Blocks` is a dependency between peers. Mixing the
 /// two would let a parent leak into blocker readiness or the reverse.
 ///
-/// Deserializes from Jira's wire shape (`{"key": ..., "fields":
-/// {"summary": ...}}`, which `GET /issue/{key}` already returns for a
-/// child ticket) and flattens it to just the key and summary.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(from = "WireParent")]
+/// Built from Jira's wire shape (`{"key": ..., "fields": {"summary": ...,
+/// "issuetype": ...}}`, which `GET /issue/{key}` already returns for a
+/// child ticket) by [`deserialize_epic_parent`], which flattens it to just
+/// the key and summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentRef {
     /// The epic's key, e.g. `PROJ-1`.
     pub key: String,
@@ -126,10 +130,53 @@ struct WireParent {
     fields: WireParentFields,
 }
 
-/// The subset of [`WireParent`]'s embedded fields [`ParentRef`] keeps.
+/// The subset of [`WireParent`]'s embedded fields [`ParentRef`] keeps,
+/// plus the issue type [`deserialize_epic_parent`] checks.
 #[derive(Deserialize)]
 struct WireParentFields {
     summary: String,
+    #[serde(default)]
+    issuetype: Option<WireParentType>,
+}
+
+/// The parent's issue type, as Jira embeds it in `parent.fields`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireParentType {
+    name: String,
+    /// Jira's level for the type: 1 for epics (whatever the site renamed
+    /// them to), 0 for standard types, -1 for sub-tasks.
+    hierarchy_level: Option<i64>,
+}
+
+impl WireParentType {
+    /// Whether this is the epic level. Uses `hierarchyLevel` when present,
+    /// else falls back to the stock `Epic` type name.
+    fn is_epic(&self) -> bool {
+        match self.hierarchy_level {
+            Some(level) => level == 1,
+            None => self.name == "Epic",
+        }
+    }
+}
+
+/// Deserialize [`IssueFields::parent`], keeping it only when it is an
+/// epic. A parent with no `issuetype` is dropped too, since nothing says
+/// it is one.
+fn deserialize_epic_parent<'de, D>(deserializer: D) -> Result<Option<ParentRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wire = Option::<WireParent>::deserialize(deserializer)?;
+    Ok(wire
+        .filter(|parent| {
+            parent
+                .fields
+                .issuetype
+                .as_ref()
+                .is_some_and(WireParentType::is_epic)
+        })
+        .map(ParentRef::from))
 }
 
 impl From<WireParent> for ParentRef {
@@ -342,7 +389,8 @@ mod tests {
                     "key": "PROJ-1",
                     "fields": {
                         "summary": "The epic",
-                        "status": { "name": "To Do", "statusCategory": { "key": "new" } }
+                        "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                        "issuetype": { "name": "Epic", "subtask": false, "hierarchyLevel": 1 }
                     }
                 }
             }
@@ -356,6 +404,52 @@ mod tests {
                 summary: "The epic".to_string(),
             })
         );
+    }
+
+    /// Parse an issue whose `parent` has the given `issuetype` JSON.
+    fn issue_with_parent_type(issuetype: &str) -> Issue {
+        let raw = format!(
+            r#"{{
+                "key": "PROJ-5",
+                "fields": {{
+                    "summary": "Child",
+                    "status": {{ "name": "To Do", "statusCategory": {{ "key": "new" }} }},
+                    "description": null,
+                    "assignee": null,
+                    "parent": {{
+                        "key": "PROJ-4",
+                        "fields": {{ "summary": "Parent", "issuetype": {issuetype} }}
+                    }}
+                }}
+            }}"#
+        );
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn drops_a_sub_task_parent_that_is_not_an_epic() {
+        let issue = issue_with_parent_type(r#"{ "name": "Task", "hierarchyLevel": 0 }"#);
+        assert_eq!(issue.fields.parent, None);
+    }
+
+    #[test]
+    fn keeps_a_renamed_epic_parent_by_hierarchy_level() {
+        let issue = issue_with_parent_type(r#"{ "name": "Feature", "hierarchyLevel": 1 }"#);
+        assert_eq!(
+            issue.fields.parent.map(|p| p.key),
+            Some("PROJ-4".to_string())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_epic_type_name_without_a_hierarchy_level() {
+        let epic = issue_with_parent_type(r#"{ "name": "Epic" }"#);
+        assert_eq!(
+            epic.fields.parent.map(|p| p.key),
+            Some("PROJ-4".to_string())
+        );
+        let task = issue_with_parent_type(r#"{ "name": "Task" }"#);
+        assert_eq!(task.fields.parent, None);
     }
 
     #[test]
