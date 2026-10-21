@@ -3160,6 +3160,7 @@ mod tests {
                     }),
                     outward_issue: None,
                 }],
+                parent: None,
             },
         }
     }

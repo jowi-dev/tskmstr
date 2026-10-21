@@ -20,7 +20,7 @@ use crate::ticketing::types::{
 /// are stored in this smaller enum and turned into a fresh `JiraError` on
 /// each call instead.
 enum IssueOutcome {
-    Found(Issue),
+    Found(Box<Issue>),
     NotFound,
     Error { status: u16, message: String },
 }
@@ -127,7 +127,7 @@ impl FakeJiraClient {
     pub fn with_issue(self, key: &str, issue: Issue) -> Self {
         self.issues
             .borrow_mut()
-            .insert(key.to_string(), IssueOutcome::Found(issue));
+            .insert(key.to_string(), IssueOutcome::Found(Box::new(issue)));
         self
     }
 
@@ -404,7 +404,7 @@ impl JiraClient for FakeJiraClient {
 
     fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
         match self.issues.borrow().get(key) {
-            Some(IssueOutcome::Found(issue)) => Ok(issue.clone()),
+            Some(IssueOutcome::Found(issue)) => Ok(issue.as_ref().clone()),
             Some(IssueOutcome::Error { status, message }) => Err(JiraError::Api {
                 status: *status,
                 message: message.clone(),
@@ -594,6 +594,7 @@ mod tests {
                 description: None,
                 assignee: None,
                 issue_links: vec![],
+                parent: None,
             },
         }
     }
