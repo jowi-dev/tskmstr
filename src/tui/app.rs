@@ -553,6 +553,67 @@ pub fn bot_watch_indicator(run: Option<RunStatus>) -> Option<BotWatchIndicator> 
     }
 }
 
+/// A ticket's `tm review auto` state on the board's `review:` badge (GitHub
+/// issue #153). Derived, never stored: [`auto_review_indicator`] computes it
+/// fresh each poll from the ticket's newest `kind = "auto-review"` run
+/// ([`crate::runs::RunStore::latest_round_runs`]) plus a local pid check, with
+/// no GitHub calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoReviewIndicator {
+    /// A round is running, or the loop is alive between steps (including
+    /// the fix pass after a `fix` round).
+    Reviewing,
+    /// The newest round came back clean.
+    Clean,
+    /// The loop stopped without a clean verdict: capped, fix-failed, or died
+    /// mid-loop. The loud, act-on-me state.
+    NeedsYou,
+}
+
+/// The board's `review:` badge for one ticket: its [`AutoReviewIndicator`]
+/// plus the round count when an `auto_review_round` event supplies one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReviewBadge {
+    /// The ticket's auto-review state.
+    pub indicator: AutoReviewIndicator,
+    /// The `"<round>/<max>"` part of the latest round event (e.g. `"1/3"`),
+    /// or `None` before the first round ends.
+    pub rounds: Option<String>,
+}
+
+/// Pure mapping from a ticket's newest auto-review run to its
+/// [`AutoReviewBadge`]. `round` is the latest `auto_review_round` event
+/// detail (`"<round>/<max> <verdict>"`, see
+/// [`crate::work::auto_review::ROUND_EVENT`]); `loop_alive` is whether the
+/// run's recorded pid (the round loop's) is still alive. Rules, in order:
+///
+/// 1. [`RunStatus::Running`] -> [`AutoReviewIndicator::Reviewing`].
+/// 2. Verdict `clean` -> [`AutoReviewIndicator::Clean`].
+/// 3. No verdict yet, or `fix`, with a live loop ->
+///    [`AutoReviewIndicator::Reviewing`]: the fix pass runs after the round
+///    row is finished, and the round event lands only once it ends.
+/// 4. Everything else -> [`AutoReviewIndicator::NeedsYou`]: `capped`,
+///    `fix-failed`, a dead loop with `fix` or no event, or an unknown verdict.
+pub fn auto_review_indicator(
+    status: RunStatus,
+    round: Option<&str>,
+    loop_alive: bool,
+) -> AutoReviewBadge {
+    // A detail with no space has no round count; the whole detail is then an
+    // unknown verdict.
+    let (rounds, verdict) = match round.and_then(|detail| detail.split_once(' ')) {
+        Some((rounds, verdict)) => (Some(rounds.to_string()), Some(verdict)),
+        None => (None, round),
+    };
+    let indicator = match (status, verdict) {
+        (RunStatus::Running, _) => AutoReviewIndicator::Reviewing,
+        (_, Some("clean")) => AutoReviewIndicator::Clean,
+        (_, None | Some("fix")) if loop_alive => AutoReviewIndicator::Reviewing,
+        _ => AutoReviewIndicator::NeedsYou,
+    };
+    AutoReviewBadge { indicator, rounds }
+}
+
 /// The pending merge the confirmation overlay ([`Msg::MergePrAction`],
 /// GitHub issue #32) is asking about, captured whole at resolution time
 /// ([`merge_pr_resolved`]) rather than re-read off the selection at confirm
@@ -7181,6 +7242,94 @@ mod tests {
     #[test]
     fn bot_watch_indicator_with_no_run_is_none() {
         assert_eq!(bot_watch_indicator(None), None);
+    }
+
+    // --- auto_review_indicator ---
+
+    fn review_badge(indicator: AutoReviewIndicator, rounds: Option<&str>) -> AutoReviewBadge {
+        AutoReviewBadge {
+            indicator,
+            rounds: rounds.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn auto_review_indicator_running_is_reviewing() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Running, Some("1/3 fix"), false),
+            review_badge(AutoReviewIndicator::Reviewing, Some("1/3"))
+        );
+        assert_eq!(
+            auto_review_indicator(RunStatus::Running, None, false),
+            review_badge(AutoReviewIndicator::Reviewing, None)
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_clean_round_is_clean() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, Some("1/3 clean"), false),
+            review_badge(AutoReviewIndicator::Clean, Some("1/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_clean_wins_even_while_the_loop_is_alive() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, Some("2/3 clean"), true),
+            review_badge(AutoReviewIndicator::Clean, Some("2/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_capped_needs_you() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Review, Some("3/3 capped"), true),
+            review_badge(AutoReviewIndicator::NeedsYou, Some("3/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_fix_failed_needs_you() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, Some("1/3 fix-failed"), true),
+            review_badge(AutoReviewIndicator::NeedsYou, Some("1/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_fix_with_a_live_loop_is_reviewing() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, Some("1/3 fix"), true),
+            review_badge(AutoReviewIndicator::Reviewing, Some("1/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_fix_with_a_dead_loop_needs_you() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, Some("1/3 fix"), false),
+            review_badge(AutoReviewIndicator::NeedsYou, Some("1/3"))
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_no_event_with_a_live_loop_is_reviewing() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Done, None, true),
+            review_badge(AutoReviewIndicator::Reviewing, None)
+        );
+    }
+
+    #[test]
+    fn auto_review_indicator_no_event_with_a_dead_loop_needs_you() {
+        for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Interrupted] {
+            assert_eq!(
+                auto_review_indicator(status, None, false),
+                review_badge(AutoReviewIndicator::NeedsYou, None),
+                "unexpected badge for {status:?}"
+            );
+        }
     }
 
     // --- Msg::BotsAction precedence ---
