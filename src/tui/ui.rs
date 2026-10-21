@@ -24,8 +24,9 @@ use crate::runs::overview::{LIFECYCLE_COLUMNS, Stage};
 use crate::runs::system::SystemHeader;
 use crate::runs::{RetroSeverity, RunStatus};
 use crate::tui::app::{
-    App, AssignChoice, AssigneeFilter, AuditStatusEntry, BotWatchIndicator, Column, OverviewLayout,
-    RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator, Screen, TicketSummary,
+    App, AssignChoice, AssigneeFilter, AuditStatusEntry, AutoReviewBadge, BotWatchIndicator,
+    Column, OverviewLayout, RETRO_SEVERITIES, RUN_COLUMNS, RunCard, RunIndicator, Screen,
+    TicketSummary,
 };
 use crate::tui::theme;
 
@@ -41,10 +42,11 @@ const CARD_BORDER_ROWS: u16 = 2;
 
 /// A board ticket's badge-worthy status maps, bundled so [`draw_column`],
 /// [`draw_card`], and [`card_height`] can each take one reference instead of
-/// four -- keeping their arity down now that a ticket can carry an audit
+/// five -- keeping their arity down now that a ticket can carry an audit
 /// badge, a lane-run badge (see `docs/plans/board-lane-runs.md`'s "Badges"
-/// decision), a bot-watch badge and a cleanup badge (see
-/// `docs/plans/bugbot-watch.md`'s "Board integration") all at once.
+/// decision), a bot-watch badge, a cleanup badge (see
+/// `docs/plans/bugbot-watch.md`'s "Board integration") and an auto-review
+/// `review:` badge (GitHub issue #153) all at once.
 struct BoardBadges<'a> {
     /// Per-ticket audit badge state, from [`App::audit_status`].
     audit_status: &'a HashMap<String, AuditStatusEntry>,
@@ -61,6 +63,9 @@ struct BoardBadges<'a> {
     pending_bot_watch: &'a std::collections::HashSet<String>,
     /// Per-ticket bugbot-cleanup badge state, from [`App::cleanup_status`].
     cleanup_status: &'a HashMap<String, AuditStatusEntry>,
+    /// Per-ticket `tm review auto` badge state, from
+    /// [`App::auto_review_status`].
+    auto_review_status: &'a HashMap<String, AutoReviewBadge>,
     /// Ticket keys marked for a batch merge, from [`App::merge_queue`]
     /// (GitHub issue #68); a queued card gets [`theme::MERGE_QUEUED_GLYPH`]
     /// in its title.
@@ -314,6 +319,7 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         bot_watch_status: &app.bot_watch_status,
         pending_bot_watch: &app.pending_bot_watch_launches,
         cleanup_status: &app.cleanup_status,
+        auto_review_status: &app.auto_review_status,
         merge_queue: &app.merge_queue,
     };
 
@@ -496,6 +502,12 @@ fn draw_card(
             style.patch(theme::cleanup_indicator_style(entry.indicator)),
         )));
     }
+    if let Some(badge) = badges.auto_review_status.get(&ticket.key) {
+        lines.push(Line::from(Span::styled(
+            theme::auto_review_badge_label(badge),
+            style.patch(theme::auto_review_indicator_style(badge.indicator)),
+        )));
+    }
 
     let paragraph = Paragraph::new(lines).style(style).block(block);
     frame.render_widget(paragraph, area);
@@ -516,10 +528,11 @@ fn assignee_line(ticket: &TicketSummary) -> String {
 /// the assignee line (when `show_assignee` is set), the audit badge line
 /// (when `ticket.key` has an entry in `badges.audit_status`), the lane-run
 /// badge line (when it has an entry in `badges.lane_run_status`), the
-/// bot-watch badge line (when [`bot_watch_badge`] yields one), and the
+/// bot-watch badge line (when [`bot_watch_badge`] yields one), the
 /// bugbot-cleanup badge line (when it has an entry in
-/// `badges.cleanup_status`) -- every badge line can render on the same card at
-/// once.
+/// `badges.cleanup_status`), and the auto-review badge line (when it has an
+/// entry in `badges.auto_review_status`) -- every badge line can render on the
+/// same card at once.
 fn card_height(
     ticket: &TicketSummary,
     content_width: usize,
@@ -548,7 +561,19 @@ fn card_height(
     } else {
         0
     };
-    lines + assignee_row + audit_row + lane_run_row + bot_watch_row + cleanup_row + CARD_BORDER_ROWS
+    let auto_review_row = if badges.auto_review_status.contains_key(&ticket.key) {
+        1
+    } else {
+        0
+    };
+    lines
+        + assignee_row
+        + audit_row
+        + lane_run_row
+        + bot_watch_row
+        + cleanup_row
+        + auto_review_row
+        + CARD_BORDER_ROWS
 }
 
 /// Word-wrap `summary` to `width` columns, hard-breaking any single word
@@ -2819,6 +2844,37 @@ mod tests {
     }
 
     #[test]
+    fn card_with_needs_you_auto_review_status_renders_the_badge_styled() {
+        use crate::tui::app::{AutoReviewBadge, AutoReviewIndicator};
+
+        let mut app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        app.auto_review_status.insert(
+            "PROJ-1".to_string(),
+            AutoReviewBadge {
+                indicator: AutoReviewIndicator::NeedsYou,
+                rounds: Some("3/3".to_string()),
+            },
+        );
+        let buffer = render_with_size(&app, 80, 24);
+        let cell = cell_at(&buffer, "review: needs you 3/3").expect("review badge renders");
+        assert_eq!(Some(cell.fg), theme::STALE_MARKER.fg);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn card_with_no_auto_review_status_renders_no_review_badge() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        let text = buffer_text(&render(&app));
+        assert!(!text.contains("review:"));
+    }
+
+    #[test]
     fn card_with_ready_bot_watch_status_renders_the_loud_accent() {
         use crate::tui::app::BotWatchIndicator;
 
@@ -2908,7 +2964,9 @@ mod tests {
 
     #[test]
     fn card_can_render_every_badge_family_at_once() {
-        use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
+        use crate::tui::app::{
+            AuditIndicator, AutoReviewBadge, AutoReviewIndicator, BotWatchIndicator, RunIndicator,
+        };
 
         let mut app = App {
             columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
@@ -2932,11 +2990,20 @@ mod tests {
                 window_live: true,
             },
         );
+        app.auto_review_status.insert(
+            "PROJ-1".to_string(),
+            AutoReviewBadge {
+                indicator: AutoReviewIndicator::Clean,
+                rounds: Some("1/3".to_string()),
+            },
+        );
         let text = buffer_text(&render_with_size(&app, 80, 24));
         assert!(text.contains("audit: done"));
         assert!(text.contains("run: done"));
         assert!(text.contains("bots: ready"));
         assert!(text.contains("clean: waiting"));
+        // Last badge line: only visible if `card_height` counts its row.
+        assert!(text.contains("review: clean 1/3"));
     }
 
     #[test]
