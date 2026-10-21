@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::config::BackendKind;
 use crate::github::gh_cli::{GhCli, IssueEditRequest, IssueListFilter, IssueListState, IssueState};
-use crate::ticketing::github_provider::STATUS_LABEL_PREFIX;
+use crate::ticketing::github_provider::{EPIC_LABEL, STATUS_LABEL_PREFIX};
 
 /// `--limit` for each closed-issue listing in [`clean_status_labels`]:
 /// closed issues accumulate forever, so this is well above
@@ -23,6 +23,12 @@ const STATUS_LABELS: &[(&str, &str, &str)] = &[
     ("tm:status/in-review", "0e8a16", "tm board: In Review"),
     ("tm:status/blocked", "d73a4a", "tm board: Blocked"),
 ];
+
+/// Labels marking what kind of ticket an issue is, in the same
+/// `(name, color, description)` shape as [`STATUS_LABELS`]. Kept apart from
+/// the status labels because they are not workflow state:
+/// [`clean_status_labels`] must never strip them from a closed issue.
+const KIND_LABELS: &[(&str, &str, &str)] = &[(EPIC_LABEL, "5319e7", "tm: epic")];
 
 /// Errors surfaced by `tm backend` subcommands.
 #[derive(Debug, Error)]
@@ -59,8 +65,9 @@ pub enum BackendCliError {
     Io(#[from] std::io::Error),
 }
 
-/// Idempotently create every `tm:status/*` label (see [`STATUS_LABELS`]) in
-/// `repo`, printing one confirmation line per label. Returns
+/// Idempotently create every `tm:status/*` label (see [`STATUS_LABELS`]),
+/// then the `tm:epic` label (see [`KIND_LABELS`]), in `repo`, printing one
+/// confirmation line per label. Returns
 /// [`BackendCliError::NotGithubBackend`] without calling `gh` at all when
 /// `backend` isn't [`BackendKind::Github`] — there's no label taxonomy to
 /// create under any other provider.
@@ -77,7 +84,7 @@ pub fn init_labels(
         });
     }
 
-    for (name, color, description) in STATUS_LABELS {
+    for (name, color, description) in STATUS_LABELS.iter().chain(KIND_LABELS) {
         gh.label_create(repo, name, color, description)
             .map_err(|source| BackendCliError::LabelCreate {
                 label: name,
@@ -165,6 +172,20 @@ mod tests {
     use crate::github::gh_cli::{FakeGhCli, GhError, IssueInfo, IssueListState, IssueState};
 
     #[test]
+    fn init_labels_creates_the_epic_label_after_the_status_labels() {
+        let fake = FakeGhCli::new();
+        let mut out = Vec::new();
+
+        init_labels(BackendKind::Github, "jowi-dev/tskmstr", &fake, &mut out).unwrap();
+
+        let calls = fake.label_create_calls();
+        assert_eq!(calls.len(), 5);
+        let (_, name, _, description) = calls.last().unwrap();
+        assert_eq!(name, "tm:epic");
+        assert_eq!(description, "tm: epic");
+    }
+
+    #[test]
     fn init_labels_creates_every_status_label() {
         let fake = FakeGhCli::new();
         let mut out = Vec::new();
@@ -172,10 +193,9 @@ mod tests {
         init_labels(BackendKind::Github, "jowi-dev/tskmstr", &fake, &mut out).unwrap();
 
         let calls = fake.label_create_calls();
-        assert_eq!(calls.len(), 4);
         let names: Vec<&str> = calls.iter().map(|(_, name, ..)| name.as_str()).collect();
         assert_eq!(
-            names,
+            names[..4],
             vec![
                 "tm:status/todo",
                 "tm:status/in-progress",
@@ -196,7 +216,7 @@ mod tests {
         init_labels(BackendKind::Github, "jowi-dev/tskmstr", &fake, &mut out).unwrap();
 
         let printed = String::from_utf8(out).unwrap();
-        assert_eq!(printed.lines().count(), 4);
+        assert_eq!(printed.lines().count(), 5);
         assert!(printed.contains("Created label tm:status/todo in jowi-dev/tskmstr"));
     }
 

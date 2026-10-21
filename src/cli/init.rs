@@ -1927,7 +1927,7 @@ mod tests {
         assert_eq!(config.github_repo.as_deref(), Some("jowi-dev/widget"));
 
         let labels = gh.label_create_calls();
-        assert_eq!(labels.len(), 4, "all four tm:status/* labels");
+        assert_eq!(labels.len(), 5, "the four tm:status/* labels and tm:epic");
         assert!(labels.iter().all(|(repo, ..)| repo == "jowi-dev/widget"));
 
         assert!(env.paths.global.exists(), "placeholder global config");
@@ -2045,7 +2045,7 @@ mod tests {
         assert!(prompter.messages.is_empty(), "no prompts under --yes");
         let config = config::load(&env.paths).expect("written config should load");
         assert_eq!(config.github_repo.as_deref(), Some("jowi-dev/widget"));
-        assert_eq!(gh.label_create_calls().len(), 4);
+        assert_eq!(gh.label_create_calls().len(), 5);
     }
 
     #[test]
