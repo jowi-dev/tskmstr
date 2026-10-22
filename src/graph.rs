@@ -151,7 +151,6 @@ pub fn build_graph(
     project_key: &str,
     focus: Option<&str>,
 ) -> Result<Graph, GraphError> {
-    let _ = focus;
     let mut epics: Vec<Issue> = provider
         .search(&TicketQuery::Epics {
             project_key: project_key.to_string(),
@@ -203,7 +202,77 @@ pub fn build_graph(
             builder.add_link(&epic.key, &child.key, LinkKind::Parent);
         }
     }
-    Ok(builder.finish())
+    let graph = builder.finish();
+    match focus {
+        Some(key) => focus_on(graph, provider, key),
+        None => Ok(graph),
+    }
+}
+
+/// Keep only the part of `graph` connected to the epic `key` (matched
+/// case-insensitively) through unlocks links in either direction, plus
+/// the kept epics' children. The walk passes through epics only: a plain
+/// ticket next to a kept epic is kept, but its other links are not
+/// followed.
+fn focus_on(graph: Graph, provider: &dyn TicketProvider, key: &str) -> Result<Graph, GraphError> {
+    let Some(start) = graph
+        .nodes
+        .iter()
+        .find(|n| n.children.is_some() && n.key.eq_ignore_ascii_case(key))
+    else {
+        return Err(missing_focus_error(provider, key));
+    };
+    let epic_set: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.children.is_some())
+        .map(|n| n.key.as_str())
+        .collect();
+    let mut neighbors: HashMap<&str, Vec<&str>> = HashMap::new();
+    for link in graph.links.iter().filter(|l| l.kind == LinkKind::Unlocks) {
+        neighbors.entry(&link.from).or_default().push(&link.to);
+        neighbors.entry(&link.to).or_default().push(&link.from);
+    }
+    let mut kept: HashSet<&str> = HashSet::from([start.key.as_str()]);
+    let mut queue = vec![start.key.as_str()];
+    while let Some(current) = queue.pop() {
+        for &next in neighbors.get(current).into_iter().flatten() {
+            if kept.insert(next) && epic_set.contains(next) {
+                queue.push(next);
+            }
+        }
+    }
+    for link in graph.links.iter().filter(|l| l.kind == LinkKind::Parent) {
+        if kept.contains(link.from.as_str()) && epic_set.contains(link.from.as_str()) {
+            kept.insert(&link.to);
+        }
+    }
+    let kept: HashSet<String> = kept.into_iter().map(str::to_string).collect();
+    Ok(Graph {
+        nodes: graph
+            .nodes
+            .into_iter()
+            .filter(|n| kept.contains(&n.key))
+            .collect(),
+        links: graph
+            .links
+            .into_iter()
+            .filter(|l| kept.contains(&l.from) && kept.contains(&l.to))
+            .collect(),
+        warnings: graph.warnings,
+    })
+}
+
+/// Why the focus `key` is not an epic in the graph: a Done epic the graph
+/// leaves out, or not an epic at all. A key no ticket has is not an epic.
+fn missing_focus_error(provider: &dyn TicketProvider, key: &str) -> GraphError {
+    match provider.get_issue(key) {
+        Ok(issue) if provider.is_epic(&issue) => GraphError::DoneEpicNotInGraph { key: issue.key },
+        Ok(_) | Err(ProviderError::NotFound { .. }) => GraphError::NotAnEpic {
+            key: key.to_string(),
+        },
+        Err(err) => GraphError::Provider(err),
+    }
 }
 
 /// Whether a status counts as finished.
@@ -318,7 +387,7 @@ impl<'a> GraphBuilder<'a> {
     /// with the same key in place; an existing epic node is kept as is.
     fn add_child_node(&mut self, node: GraphNode) {
         match self.node_index.get(&node.key) {
-            Some(&index) if self.nodes[index].children.is_none() => self.nodes[index] = node,
+            Some(&index) if !self.nodes[index].is_epic => self.nodes[index] = node,
             Some(_) => {}
             None => self.add_node(node),
         }
@@ -616,6 +685,82 @@ mod tests {
         assert_eq!(
             graph.links,
             vec![unlocks("PROJ-10", "PROJ-2"), parent("PROJ-1", "PROJ-10")]
+        );
+    }
+
+    /// PROJ-1 unlocks PROJ-2, PROJ-3 unlocks PROJ-2, PROJ-1 and PROJ-5
+    /// both unlock the plain ticket PROJ-9, and PROJ-4 stands alone with a
+    /// child. PROJ-6 is a Done epic with no links.
+    fn focus_fixture() -> FakeJiraClient {
+        let fake = fake_with_epics(vec![
+            issue(
+                "PROJ-1",
+                "new",
+                vec![blocks("PROJ-2", "new"), blocks("PROJ-9", "new")],
+            ),
+            issue(
+                "PROJ-2",
+                "new",
+                vec![blocked_by("PROJ-1", "new"), blocked_by("PROJ-3", "new")],
+            ),
+            issue("PROJ-3", "new", vec![blocks("PROJ-2", "new")]),
+            issue("PROJ-4", "new", vec![]),
+            issue("PROJ-5", "new", vec![blocks("PROJ-9", "new")]),
+            issue("PROJ-6", "done", vec![]),
+        ]);
+        let fake = with_child(fake, "PROJ-2", issue("PROJ-20", "new", vec![]));
+        with_child(fake, "PROJ-4", issue("PROJ-40", "new", vec![]))
+    }
+
+    #[test]
+    fn focus_keeps_epics_reachable_either_way_and_their_children() {
+        let fake = focus_fixture();
+
+        let graph = build(&fake, Some("proj-1")).unwrap();
+
+        assert_eq!(
+            keys(&graph),
+            ["PROJ-1", "PROJ-2", "PROJ-3", "PROJ-9", "PROJ-20"]
+        );
+        assert_eq!(
+            graph.links,
+            vec![
+                unlocks("PROJ-1", "PROJ-2"),
+                unlocks("PROJ-1", "PROJ-9"),
+                unlocks("PROJ-3", "PROJ-2"),
+                parent("PROJ-2", "PROJ-20"),
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_on_a_plain_ticket_is_not_an_epic() {
+        let fake = focus_fixture();
+
+        let err = build(&fake, Some("PROJ-9")).unwrap_err();
+
+        assert!(matches!(err, GraphError::NotAnEpic { .. }));
+        assert_eq!(err.to_string(), "PROJ-9 is not an epic");
+    }
+
+    #[test]
+    fn focus_on_an_unknown_key_is_not_an_epic() {
+        let fake = focus_fixture();
+
+        let err = build(&fake, Some("PROJ-404")).unwrap_err();
+
+        assert_eq!(err.to_string(), "PROJ-404 is not an epic");
+    }
+
+    #[test]
+    fn focus_on_an_excluded_done_epic_says_why_it_is_missing() {
+        let fake = focus_fixture();
+
+        let err = build(&fake, Some("PROJ-6")).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "PROJ-6 is a Done epic with no unlocks link to an open epic, so it is not in the graph"
         );
     }
 }
