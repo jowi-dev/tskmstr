@@ -827,7 +827,7 @@ pub fn resolve_blocker_stacking(
         }
     };
 
-    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
+    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, &|_| false);
     match blocker_stacking::decide(unmerged, in_flight) {
         StackDecision::Ready => Ok(BlockerResolution::default()),
         StackDecision::Stackable {

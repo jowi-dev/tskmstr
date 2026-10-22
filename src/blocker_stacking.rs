@@ -35,13 +35,18 @@
 //!   genuinely finished — a config change, a spike, docs, manual ops —
 //!   often has no PR to find in the first place), OR
 //! - it has a **merged** PR (its code is already in the base, whatever
-//!   Jira's status says).
+//!   Jira's status says), OR
+//! - it has a **closed** PR whose head commit is already in the lane's base
+//!   branch (GitHub issue #168). A PR merged locally and pushed, then
+//!   closed, never shows as merged on GitHub; a stacked PR whose own base is
+//!   the blocker's branch never does either. The caller supplies the
+//!   containment check, so this stays pure. Squash and rebase merges rewrite commits and are not detected.
 //!
 //! Otherwise it remains unmerged, split by PR state:
 //! - PR **open** → an unmerged blocker with something to stack on.
-//! - **no PR** (including a closed-but-unmerged one, or a PR whose branch
-//!   name doesn't match [`find_blocker_pr`]'s naming convention) → an
-//!   unmerged blocker with nothing to stack on yet.
+//! - **no PR** (including a closed one whose head is not in the base, or a
+//!   PR whose branch name doesn't match [`find_blocker_pr`]'s naming
+//!   convention) → an unmerged blocker with nothing to stack on yet.
 //!
 //! Then, across the ticket's unmerged blockers ([`decide`]):
 //! - **zero** → [`StackDecision::Ready`].
@@ -142,13 +147,28 @@ pub fn format_unmerged_blocker(blocker: &UnmergedBlocker) -> String {
 /// Resolve `issue`'s direct blockers (via [`direct_blockers`]) against
 /// already-fetched `prs`, keeping only those not satisfied — see this
 /// module's doc comment for the full rule.
-pub fn unmerged_direct_blockers(issue: &Issue, prs: &[PrSummary]) -> Vec<UnmergedBlocker> {
+///
+/// `in_base` answers whether a commit SHA is already in the lane's base
+/// branch. It is asked only about a closed PR's non-empty head SHA; pass
+/// `&|_| false` to treat every closed PR as abandoned (the pre-#168 rule).
+pub fn unmerged_direct_blockers(
+    issue: &Issue,
+    prs: &[PrSummary],
+    in_base: &dyn Fn(&str) -> bool,
+) -> Vec<UnmergedBlocker> {
     direct_blockers(issue)
         .into_iter()
         .filter_map(|blocker| {
             let pr = find_blocker_pr(prs, &blocker.key);
             let is_done = blocker.fields.status.status_category.key == "done";
-            let is_merged = matches!(&pr, Some(pr) if pr.lifecycle == PrLifecycle::Merged);
+            let is_merged = match &pr {
+                Some(pr) => match pr.lifecycle {
+                    PrLifecycle::Merged => true,
+                    PrLifecycle::Closed => !pr.head_ref_oid.is_empty() && in_base(&pr.head_ref_oid),
+                    PrLifecycle::Open => false,
+                },
+                None => false,
+            };
             // A blocker is cleared if EITHER condition holds, and the two
             // are independent: a blocker Done in Jira needs no stacking
             // regardless of whether it ever had a PR (config changes,
@@ -370,7 +390,12 @@ pub fn readiness(issue: &Issue, prs: Option<&[PrSummary]>) -> Readiness {
         return Readiness::Unknown;
     };
     // The board shows waiting and blocked alike, so live runs are moot here.
-    match decide(unmerged_direct_blockers(issue, prs), &InFlight::new()) {
+    // It has no lane base to check against, so a closed PR reads as
+    // abandoned (see GitHub issue #168).
+    match decide(
+        unmerged_direct_blockers(issue, prs, &|_| false),
+        &InFlight::new(),
+    ) {
         StackDecision::Ready => Readiness::Ready,
         StackDecision::Stackable { blocker_key, .. } => Readiness::Stackable { blocker_key },
         StackDecision::BlockedNoPr { blocker }
@@ -463,7 +488,7 @@ mod tests {
     #[test]
     fn decide_ready_with_no_blockers() {
         let issue = issue_blocked_by(vec![]);
-        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let unmerged = unmerged_direct_blockers(&issue, &[], &never_landed);
         assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
@@ -471,7 +496,7 @@ mod tests {
     fn decide_ready_when_the_only_blocker_pr_is_merged() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "Done")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
@@ -485,7 +510,7 @@ mod tests {
     #[test]
     fn decide_ready_when_the_only_blocker_is_done_in_jira_with_no_pr_at_all() {
         let issue = issue_blocked_by(vec![linked_issue_with_category("AX-408", "Done", "done")]);
-        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let unmerged = unmerged_direct_blockers(&issue, &[], &never_landed);
         assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
     }
 
@@ -503,7 +528,7 @@ mod tests {
             "indeterminate",
         )]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         assert_eq!(
             decide(unmerged, &no_runs()),
             StackDecision::Stackable {
@@ -518,7 +543,7 @@ mod tests {
     fn decide_stackable_with_one_unmerged_blocker_and_open_pr() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "Code Review")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         assert_eq!(
             decide(unmerged, &no_runs()),
             StackDecision::Stackable {
@@ -532,7 +557,7 @@ mod tests {
     #[test]
     fn decide_blocked_no_pr_with_one_unmerged_blocker_and_no_pr() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
-        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let unmerged = unmerged_direct_blockers(&issue, &[], &never_landed);
         match decide(unmerged, &no_runs()) {
             StackDecision::BlockedNoPr { blocker } => assert_eq!(blocker.key, "AX-408"),
             other => panic!("expected BlockedNoPr, got {other:?}"),
@@ -546,7 +571,7 @@ mod tests {
             linked_issue("AX-409", "In Progress"),
         ]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         match decide(unmerged, &no_runs()) {
             StackDecision::BlockedMultiple { blockers } => {
                 assert_eq!(blockers.len(), 2);
@@ -561,11 +586,121 @@ mod tests {
     fn a_closed_unmerged_pr_counts_as_no_pr_to_stack_on() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Closed)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         match decide(unmerged, &no_runs()) {
             StackDecision::BlockedNoPr { blocker } => assert!(blocker.open_pr.is_none()),
             other => panic!("expected BlockedNoPr, got {other:?}"),
         }
+    }
+
+    fn pr_with_head(
+        number: u64,
+        head_ref_name: &str,
+        head_ref_oid: &str,
+        lifecycle: PrLifecycle,
+    ) -> PrSummary {
+        PrSummary {
+            head_ref_oid: head_ref_oid.to_string(),
+            ..pr(number, head_ref_name, lifecycle)
+        }
+    }
+
+    /// A containment check that reports exactly `shas` as in the base branch.
+    fn landed<'a>(shas: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |sha| shas.contains(&sha)
+    }
+
+    fn never_landed(_sha: &str) -> bool {
+        false
+    }
+
+    /// GitHub issue #168: a PR closed without merging, whose commits reached
+    /// the base branch anyway (merged locally, then pushed), is merged.
+    #[test]
+    fn a_closed_pr_whose_head_is_in_the_base_branch_clears_the_blocker() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-711", "In Review")]);
+        let prs = vec![pr_with_head(
+            673,
+            "jowi-dev/ax-711-thing",
+            "aaa111",
+            PrLifecycle::Closed,
+        )];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &landed(&["aaa111"]));
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
+    }
+
+    /// The stacked shape: AX-712's PR targeted AX-711's branch, not the lane
+    /// base, so GitHub never saw it merge. Only its head reaching the lane
+    /// base matters, which the containment check answers.
+    #[test]
+    fn a_closed_stacked_pr_whose_head_is_in_the_lane_base_clears_the_blocker() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-712", "In Review")]);
+        let prs = vec![
+            pr_with_head(673, "jowi-dev/ax-711-thing", "aaa111", PrLifecycle::Closed),
+            pr_with_head(696, "jowi-dev/ax-712-thing", "bbb222", PrLifecycle::Closed),
+        ];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &landed(&["aaa111", "bbb222"]));
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
+    }
+
+    #[test]
+    fn an_abandoned_closed_pr_whose_head_is_not_in_the_base_stays_blocked() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-711", "In Progress")]);
+        let prs = vec![pr_with_head(
+            673,
+            "jowi-dev/ax-711-thing",
+            "aaa111",
+            PrLifecycle::Closed,
+        )];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &landed(&["other"]));
+        match decide(unmerged, &no_runs()) {
+            StackDecision::BlockedNoPr { blocker } => assert!(blocker.open_pr.is_none()),
+            other => panic!("expected BlockedNoPr, got {other:?}"),
+        }
+    }
+
+    /// The AX-713 incident from GitHub issue #168: both blockers' PRs were
+    /// closed unmerged after their commits were pushed to staging.
+    #[test]
+    fn two_closed_blockers_both_in_the_base_are_ready_not_blocked_multiple() {
+        let issue = issue_blocked_by(vec![
+            linked_issue("AX-711", "In Review"),
+            linked_issue("AX-712", "In Review"),
+        ]);
+        let prs = vec![
+            pr_with_head(673, "jowi-dev/ax-711-thing", "aaa111", PrLifecycle::Closed),
+            pr_with_head(696, "jowi-dev/ax-712-thing", "bbb222", PrLifecycle::Closed),
+        ];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &landed(&["aaa111", "bbb222"]));
+        assert_eq!(decide(unmerged, &no_runs()), StackDecision::Ready);
+    }
+
+    /// Only a closed PR is checked: an open PR stays stackable, not merged,
+    /// even when its head already sits in the base.
+    #[test]
+    fn an_open_pr_whose_head_is_in_the_base_stays_stackable() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-711", "Code Review")]);
+        let prs = vec![pr_with_head(
+            673,
+            "jowi-dev/ax-711-thing",
+            "aaa111",
+            PrLifecycle::Open,
+        )];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &landed(&["aaa111"]));
+        assert!(matches!(
+            decide(unmerged, &no_runs()),
+            StackDecision::Stackable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_closed_pr_with_no_head_sha_never_asks_the_containment_check() {
+        let issue = issue_blocked_by(vec![linked_issue("AX-711", "In Progress")]);
+        let prs = vec![pr(673, "jowi-dev/ax-711-thing", PrLifecycle::Closed)];
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &|_: &str| -> bool {
+            panic!("an empty SHA must not be checked")
+        });
+        assert_eq!(unmerged.len(), 1);
     }
 
     #[test]
@@ -626,7 +761,7 @@ mod tests {
     #[test]
     fn decide_waits_on_a_no_pr_blocker_with_a_live_lane_run() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
-        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let unmerged = unmerged_direct_blockers(&issue, &[], &never_landed);
         let runs = in_flight("AX-408", 7, RunStatus::Running);
         match decide(unmerged, &runs) {
             StackDecision::WaitingOnInFlight { blocker, run } => {
@@ -646,7 +781,7 @@ mod tests {
     #[test]
     fn decide_stays_blocked_no_pr_when_another_ticket_is_in_flight() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
-        let unmerged = unmerged_direct_blockers(&issue, &[]);
+        let unmerged = unmerged_direct_blockers(&issue, &[], &never_landed);
         let runs = in_flight("AX-999", 7, RunStatus::Running);
         assert!(matches!(
             decide(unmerged, &runs),
@@ -658,7 +793,7 @@ mod tests {
     fn decide_prefers_stacking_over_waiting_once_the_blocker_has_an_open_pr() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "Code Review")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
-        let unmerged = unmerged_direct_blockers(&issue, &prs);
+        let unmerged = unmerged_direct_blockers(&issue, &prs, &never_landed);
         let runs = in_flight("AX-408", 7, RunStatus::Running);
         assert!(matches!(
             decide(unmerged, &runs),

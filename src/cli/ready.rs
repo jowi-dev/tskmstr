@@ -512,7 +512,7 @@ fn list_decision(
     };
 
     match blocker_stacking::decide(
-        blocker_stacking::unmerged_direct_blockers(issue, prs),
+        blocker_stacking::unmerged_direct_blockers(issue, prs, &|_| false),
         in_flight,
     ) {
         StackDecision::Ready => ListDecision::Ready,
@@ -636,7 +636,7 @@ pub fn check(
         }
     };
 
-    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
+    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, &|_| false);
     match blocker_stacking::decide(unmerged, &ctx.in_flight) {
         StackDecision::Ready => {
             ctx.audit.require(&normalized)?;
