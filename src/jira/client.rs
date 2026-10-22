@@ -1036,7 +1036,10 @@ mod tests {
         child["fields"]["parent"] = serde_json::json!({
             "id": "10001",
             "key": "PROJ-1",
-            "fields": { "summary": "The epic" }
+            "fields": {
+                "summary": "The epic",
+                "issuetype": { "name": "Epic", "hierarchyLevel": 1 }
+            }
         });
         child["fields"]["issuetype"] = serde_json::json!({ "name": "Task" });
         server.mock(|when, then| {
