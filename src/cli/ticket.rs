@@ -992,6 +992,7 @@ mod tests {
     use crate::jira::fake::FakeJiraClient;
     use crate::runs::{FinishRun, RunStatus, StartRun};
     use crate::ticketing::error::ProviderError;
+    use crate::ticketing::github_provider::GithubProvider;
     use crate::ticketing::types::{Issue, IssueFields, Status, StatusCategory, Transition};
 
     fn issue(key: &str) -> Issue {
@@ -1009,6 +1010,7 @@ mod tests {
                 assignee: None,
                 issue_links: vec![],
                 parent: None,
+                labels: Vec::new(),
             },
         }
     }
@@ -2529,6 +2531,81 @@ mod tests {
                 ))
             ),
             "{err:?}"
+        );
+    }
+
+    fn gh_issue(number: u64, title: &str, labels: &[&str]) -> crate::github::gh_cli::IssueInfo {
+        crate::github::gh_cli::IssueInfo {
+            number,
+            url: String::new(),
+            title: title.to_string(),
+            body: String::new(),
+            state: crate::github::gh_cli::IssueState::Open,
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            assignees: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parent_on_the_github_backend_adds_a_sub_issue_under_a_tm_epic_issue() {
+        let gh = FakeGhCli::new()
+            .with_issue_view(1, Ok(gh_issue(1, "Epic", &["tm:epic"])))
+            .with_issue_view(2, Ok(gh_issue(2, "Child", &[])));
+        let provider = GithubProvider::new(&gh, "jowi-dev/tskmstr".to_string());
+        let mut out = Vec::new();
+
+        parent(&provider, "GH-2", Some("GH-1"), false, &mut out).expect("should succeed");
+
+        assert_eq!(
+            gh.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn parent_rejects_a_foreign_repo_key_as_invalid() {
+        let gh = FakeGhCli::new();
+        let provider = GithubProvider::new(&gh, "jowi-dev/tskmstr".to_string());
+        let mut out = Vec::new();
+
+        let err = parent(
+            &provider,
+            "jowi-dev/devtools#7",
+            Some("GH-1"),
+            false,
+            &mut out,
+        )
+        .expect_err("foreign keys are display-only");
+
+        assert!(matches!(err, TicketCliError::InvalidKey { .. }), "{err:?}");
+        assert!(gh.add_sub_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn children_on_the_github_backend_shows_foreign_children_as_owner_repo_number() {
+        let gh = FakeGhCli::new()
+            .with_issue_view(1, Ok(gh_issue(1, "Epic", &["tm:epic"])))
+            .with_sub_issues(
+                1,
+                vec![
+                    crate::github::gh_cli::SubIssue {
+                        repo: "jowi-dev/tskmstr".to_string(),
+                        info: gh_issue(2, "Here", &[]),
+                    },
+                    crate::github::gh_cli::SubIssue {
+                        repo: "jowi-dev/devtools".to_string(),
+                        info: gh_issue(7, "Elsewhere", &[]),
+                    },
+                ],
+            );
+        let provider = GithubProvider::new(&gh, "jowi-dev/tskmstr".to_string());
+        let mut out = Vec::new();
+
+        children(&provider, "GH-1", &mut out).expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "GH-2  To Do  Here\njowi-dev/devtools#7  To Do  Elsewhere\n"
         );
     }
 

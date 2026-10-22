@@ -12,7 +12,7 @@ use crate::blocker_stacking::Readiness;
 use crate::jira::client::RankAnchor;
 use crate::runs::{RetroSeverity, RetroVerdict, RunStatus};
 use crate::ticketing::provider::TicketQuery;
-use crate::ticketing::types::{JiraUser, Transition};
+use crate::ticketing::types::{JiraUser, ParentRef, Transition};
 
 /// A ticket as displayed on the board, derived from a
 /// [`crate::ticketing::types::Issue`] plus the configured Jira base URL.
@@ -40,6 +40,10 @@ pub struct TicketSummary {
     /// fetch. [`Readiness::Unknown`] wherever it wasn't (or couldn't be)
     /// computed, e.g. on [`Screen::Rank`], which never renders it.
     pub readiness: Readiness,
+    /// The epic this ticket sits under (GitHub issue #159), copied from
+    /// [`crate::ticketing::types::IssueFields::parent`]. `None` when the
+    /// ticket has no parent or the backend didn't report one.
+    pub epic: Option<ParentRef>,
 }
 
 /// The board's assignee filter: which subset of tickets to show.
@@ -1320,9 +1324,10 @@ pub enum Msg {
     },
     /// A board fetch loaded its tickets, but a readiness input (blockers or
     /// the PR list) couldn't be fetched, so some cards show
-    /// [`Readiness::Unknown`]. Emitted after the load message, like
+    /// [`Readiness::Unknown`], or the epics couldn't be fetched, so no card
+    /// shows an epic line. Emitted after the load message, like
     /// [`Msg::SearchTruncated`], and carries the status-line note.
-    ReadinessDegraded(String),
+    BoardDegraded(String),
     /// Transitions for the selected ticket finished loading.
     TransitionsLoaded(Vec<Transition>),
     /// Transitions for the selected ticket failed to load.
@@ -2255,7 +2260,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 format!("showing first {shown} tickets -- more matched; narrow the filter");
             (app, Vec::new())
         }
-        Msg::ReadinessDegraded(note) => {
+        Msg::BoardDegraded(note) => {
             app.status_line = note;
             (app, Vec::new())
         }
@@ -4285,6 +4290,7 @@ mod tests {
             status_category: "new".to_string(),
             assignee: None,
             readiness: Readiness::Unknown,
+            epic: None,
         }
     }
 
@@ -4488,7 +4494,7 @@ mod tests {
     fn readiness_degraded_puts_its_note_on_the_status_line() {
         let (app, cmds) = update(
             App::new(),
-            Msg::ReadinessDegraded("readiness unknown: boom".to_string()),
+            Msg::BoardDegraded("readiness unknown: boom".to_string()),
         );
         assert_eq!(app.status_line, "readiness unknown: boom");
         assert!(cmds.is_empty());

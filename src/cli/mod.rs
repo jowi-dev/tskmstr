@@ -343,7 +343,7 @@ pub enum UsageCmd {
 #[derive(Subcommand, Debug)]
 pub enum BackendCmd {
     /// Idempotently create the `tm:status/*` labels this repo's board needs,
-    /// in the configured `[backend.github].repo`.
+    /// plus the `tm:epic` label, in the configured `[backend.github].repo`.
     ///
     /// Only meaningful under the GitHub backend; running it under the Jira
     /// backend (Jira has no label taxonomy to create) is an error naming the

@@ -307,6 +307,19 @@ pub trait TicketProvider {
         Ok(())
     }
 
+    /// Ensure every issue in `issues` (fresh from [`Self::search`]) carries
+    /// its epic in [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent),
+    /// so a board can show which epic each card belongs to.
+    ///
+    /// The default is a no-op, for a backend whose search already returns
+    /// the parent or that has no parents. The github backend overrides this
+    /// with one batched fetch for all of `issues`, the same bounded cost as
+    /// [`Self::hydrate_blockers`]. An `Err` means the parents are unknown;
+    /// the issues are left as they were.
+    fn hydrate_parents(&self, _issues: &mut [Issue]) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Strip leftover workflow-status markers from `key` if (and only if)
     /// the ticket is already closed, returning the markers removed (empty
     /// when there was nothing to strip or the ticket is still open).
@@ -333,8 +346,9 @@ pub trait TicketProvider {
     /// no parent" rules live in [`crate::ticketing::set_ticket_parent`], so
     /// every backend enforces them the same way.
     ///
-    /// The default is [`ProviderError::NotSupported`]. Jira and GitHub
-    /// implementations arrive in GitHub issues #157 and #158.
+    /// The default is [`ProviderError::NotSupported`]. The github backend
+    /// implements it with sub-issues; Jira's implementation arrives in
+    /// GitHub issue #157.
     fn set_parent(&self, _child_key: &str, _parent_key: Option<&str>) -> Result<(), ProviderError> {
         Err(ProviderError::NotSupported {
             operation: "setting a ticket's parent epic".to_string(),
@@ -658,6 +672,7 @@ mod tests {
                 assignee: None,
                 issue_links: vec![],
                 parent: None,
+                labels: Vec::new(),
             },
         }
     }

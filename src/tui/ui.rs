@@ -420,8 +420,9 @@ fn draw_column(
 
 /// One ticket's card: a rounded-border block titled with the issue key,
 /// containing its word-wrapped summary (capped at [`MAX_SUMMARY_LINES`]
-/// lines). The selected card is rendered reversed so it's clearly
-/// distinguished from its neighbors.
+/// lines), then an `epic <KEY>` line when the ticket has a parent epic,
+/// then any assignee and badge lines. The selected card is rendered
+/// reversed so it's clearly distinguished from its neighbors.
 fn draw_card(
     frame: &mut Frame,
     area: Rect,
@@ -467,6 +468,14 @@ fn draw_card(
         .into_iter()
         .map(Line::from)
         .collect();
+    if let Some(epic) = &ticket.epic {
+        // Key only: the epic's summary would compete with the ticket's own
+        // for card width. The detail overlay shows the summary.
+        lines.push(Line::from(Span::styled(
+            format!("epic {}", epic.key),
+            style.patch(theme::DIM),
+        )));
+    }
     if show_assignee {
         lines.push(Line::from(Span::styled(assignee_line(ticket), theme::DIM)));
     }
@@ -513,13 +522,13 @@ fn assignee_line(ticket: &TicketSummary) -> String {
 
 /// The rendered height of `ticket`'s card at `content_width`: its wrapped,
 /// capped summary plus top/bottom border rows, plus one more row each for
-/// the assignee line (when `show_assignee` is set), the audit badge line
-/// (when `ticket.key` has an entry in `badges.audit_status`), the lane-run
-/// badge line (when it has an entry in `badges.lane_run_status`), the
-/// bot-watch badge line (when [`bot_watch_badge`] yields one), and the
-/// bugbot-cleanup badge line (when it has an entry in
-/// `badges.cleanup_status`) -- every badge line can render on the same card at
-/// once.
+/// the epic line (when `ticket.epic` is set), the assignee line (when
+/// `show_assignee` is set), the audit badge line (when `ticket.key` has an
+/// entry in `badges.audit_status`), the lane-run badge line (when it has
+/// an entry in `badges.lane_run_status`), the bot-watch badge line (when
+/// [`bot_watch_badge`] yields one), and the bugbot-cleanup badge line
+/// (when it has an entry in `badges.cleanup_status`) -- every badge line
+/// can render on the same card at once.
 fn card_height(
     ticket: &TicketSummary,
     content_width: usize,
@@ -527,6 +536,7 @@ fn card_height(
     badges: &BoardBadges,
 ) -> u16 {
     let lines = wrapped_summary(&ticket.summary, content_width).len() as u16;
+    let epic_row = if ticket.epic.is_some() { 1 } else { 0 };
     let assignee_row = if show_assignee { 1 } else { 0 };
     let audit_row = if badges.audit_status.contains_key(&ticket.key) {
         1
@@ -548,7 +558,14 @@ fn card_height(
     } else {
         0
     };
-    lines + assignee_row + audit_row + lane_run_row + bot_watch_row + cleanup_row + CARD_BORDER_ROWS
+    lines
+        + epic_row
+        + assignee_row
+        + audit_row
+        + lane_run_row
+        + bot_watch_row
+        + cleanup_row
+        + CARD_BORDER_ROWS
 }
 
 /// Word-wrap `summary` to `width` columns, hard-breaking any single word
@@ -1677,7 +1694,9 @@ fn draw_events_panel(
 }
 
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
-/// ticket's full detail, drawn over the board.
+/// ticket's full detail, drawn over the board: its status, its parent epic
+/// (`Epic: <KEY>  <summary>`, omitted when it has none), its URL, then its
+/// description.
 fn draw_detail_window(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
@@ -1689,17 +1708,21 @@ fn draw_detail_window(frame: &mut Frame, app: &App) {
 
     let text = match app.selected_ticket() {
         Some(ticket) => {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("Status: ", theme::SECTION_HEADER),
-                    Span::styled(
-                        ticket.status.clone(),
-                        theme::ticket_status_style(&ticket.status_category),
-                    ),
-                ]),
-                Line::from(Span::styled(ticket.url.clone(), theme::DIM)),
-                Line::from(""),
-            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled("Status: ", theme::SECTION_HEADER),
+                Span::styled(
+                    ticket.status.clone(),
+                    theme::ticket_status_style(&ticket.status_category),
+                ),
+            ])];
+            if let Some(epic) = &ticket.epic {
+                lines.push(Line::from(vec![
+                    Span::styled("Epic: ", theme::SECTION_HEADER),
+                    Span::raw(format!("{}  {}", epic.key, epic.summary)),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(ticket.url.clone(), theme::DIM)));
+            lines.push(Line::from(""));
             // `split('\n')`, not `.lines()`: a trailing blank line in the
             // description (e.g. a trailing hardBreak) should still render as
             // an empty row rather than being silently dropped.
@@ -2192,6 +2215,7 @@ mod tests {
             status_category: "indeterminate".to_string(),
             assignee: None,
             readiness: crate::blocker_stacking::Readiness::Unknown,
+            epic: None,
         }
     }
 
@@ -2412,6 +2436,53 @@ mod tests {
         assert_eq!(Some(cell.fg), theme::DIM.fg);
     }
 
+    fn with_epic(key: &str, epic_key: &str, epic_summary: &str) -> TicketSummary {
+        TicketSummary {
+            epic: Some(crate::ticketing::types::ParentRef {
+                key: epic_key.to_string(),
+                summary: epic_summary.to_string(),
+            }),
+            ..ticket(key)
+        }
+    }
+
+    #[test]
+    fn card_height_grows_by_one_row_only_when_the_ticket_has_an_epic() {
+        let app = App::new();
+        let badges = BoardBadges {
+            audit_status: &app.audit_status,
+            lane_run_status: &app.lane_run_status,
+            bot_watch_status: &app.bot_watch_status,
+            pending_bot_watch: &app.pending_bot_watch_launches,
+            cleanup_status: &app.cleanup_status,
+            merge_queue: &app.merge_queue,
+        };
+        let plain = card_height(&ticket("PROJ-1"), 30, false, &badges);
+        let epic = card_height(&with_epic("PROJ-1", "PROJ-9", "Epic"), 30, false, &badges);
+        assert_eq!(plain, 1 + CARD_BORDER_ROWS);
+        assert_eq!(epic, plain + 1);
+    }
+
+    #[test]
+    fn card_with_an_epic_renders_a_dim_epic_line() {
+        let app = App {
+            columns: group_into_columns(vec![with_epic("PROJ-1", "PROJ-9", "Ship epics")], &[]),
+            ..App::new()
+        };
+        let buffer = render(&app);
+        let cell = cell_at(&buffer, "epic PROJ-9").expect("epic line renders");
+        assert_eq!(Some(cell.fg), theme::DIM.fg);
+    }
+
+    #[test]
+    fn card_without_an_epic_renders_no_epic_line() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            ..App::new()
+        };
+        assert!(!buffer_text(&render(&app)).contains("epic "));
+    }
+
     #[test]
     fn detail_overlay_status_value_carries_its_status_category_color() {
         let app = App {
@@ -2430,6 +2501,26 @@ mod tests {
             Some(value_cell.fg),
             theme::ticket_status_style("indeterminate").fg
         );
+    }
+
+    #[test]
+    fn detail_overlay_shows_the_epic_key_and_summary() {
+        let app = App {
+            columns: group_into_columns(vec![with_epic("PROJ-1", "PROJ-9", "Ship epics")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        assert!(buffer_text(&render(&app)).contains("Epic: PROJ-9  Ship epics"));
+    }
+
+    #[test]
+    fn detail_overlay_without_an_epic_has_no_epic_line() {
+        let app = App {
+            columns: group_into_columns(vec![ticket("PROJ-1")], &[]),
+            screen: Screen::Detail,
+            ..App::new()
+        };
+        assert!(!buffer_text(&render(&app)).contains("Epic:"));
     }
 
     #[test]

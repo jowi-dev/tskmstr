@@ -18,6 +18,12 @@
 //! matching the hardcoded string [`crate::blocker_stacking`] and
 //! [`super::open_blockers`] already key off of.
 //!
+//! Epics are issues labeled [`EPIC_LABEL`] (GitHub's own issue types exist
+//! only for organization repos), and a ticket's epic is its GitHub
+//! sub-issue parent (GitHub issue #158). Sub-issues may cross repos: an
+//! issue from another repo is keyed `owner/repo#<number>`, which `tm`
+//! shows but does not accept as a ticket key.
+//!
 //! A ticket key is `GH-<number>` ([`parse_issue_number`] strips the prefix);
 //! this provider is driven entirely by the configured `repo` slug, never a
 //! git checkout.
@@ -43,16 +49,16 @@ use std::collections::HashMap;
 
 use crate::github::gh_cli::{
     GhCli, IssueCreateRequest, IssueDependencies, IssueEditRequest, IssueInfo, IssueListFilter,
-    IssueListState, IssueRef, IssueState, IssueStateChange,
+    IssueListState, IssueParent, IssueRef, IssueState, IssueStateChange, SubIssue,
 };
 use crate::jira::client::RankAnchor;
 use crate::runs::RunStore;
 use crate::ticketing::error::ProviderError;
-use crate::ticketing::provider::{NewTicket, TicketProvider, TicketQuery, refuse_epic_or_parent};
+use crate::ticketing::provider::{NewTicket, TicketKind, TicketProvider, TicketQuery};
 use crate::ticketing::types::{
     CreateLinkRequest, Issue, IssueFields, IssueLink, IssueLinkType, JiraUser, LinkedIssue,
-    LinkedIssueFields, Myself, RemoteLinkRequest, SearchResult, Status, StatusCategory, Transition,
-    UserRef,
+    LinkedIssueFields, Myself, ParentRef, RemoteLinkRequest, SearchResult, Status, StatusCategory,
+    Transition, UserRef,
 };
 use serde_json::Value;
 
@@ -61,6 +67,11 @@ use serde_json::Value;
 /// open issue at a time; [`synthesize_status_slug`] documents the tie-break
 /// used when more than one is present.
 pub(crate) const STATUS_LABEL_PREFIX: &str = "tm:status/";
+
+/// The label that makes an issue an epic (see
+/// [`TicketProvider::is_epic`]). GitHub's own issue types exist only for
+/// organization repos, so a label is the one marker every repo can carry.
+pub(crate) const EPIC_LABEL: &str = "tm:epic";
 
 /// [`TicketProvider`] backed by GitHub Issues via a borrowed [`GhCli`].
 ///
@@ -113,6 +124,26 @@ impl<'a> GithubProvider<'a> {
         format!("{}-{}", self.key_prefix, number)
     }
 
+    /// The key for issue `number` in `repo`: the usual `GH-<number>` when
+    /// `repo` is this provider's own repo, or `owner/repo#<number>` for an
+    /// issue elsewhere (a sub-issue or parent in another repo). The second
+    /// form is display-only: it is not a ticket key `tm` accepts as input,
+    /// so a foreign issue can be shown but not acted on.
+    fn issue_key_in(&self, repo: &str, number: u64) -> String {
+        if repo.eq_ignore_ascii_case(&self.repo) {
+            self.issue_key(number)
+        } else {
+            format!("{repo}#{number}")
+        }
+    }
+
+    fn to_parent_ref(&self, parent: IssueParent) -> ParentRef {
+        ParentRef {
+            key: self.issue_key_in(&parent.repo, parent.number),
+            summary: parent.title,
+        }
+    }
+
     fn current_login(&self) -> Result<String, ProviderError> {
         self.gh
             .current_user_login()
@@ -139,8 +170,9 @@ impl<'a> GithubProvider<'a> {
                 status,
                 description,
                 assignee,
+                parent: deps.parent.clone().map(|p| self.to_parent_ref(p)),
                 issue_links: self.to_issue_links(number, deps),
-                parent: None,
+                labels: info.labels,
             },
         }
     }
@@ -553,10 +585,15 @@ impl TicketProvider for GithubProvider<'_> {
     }
 
     fn create_issue(&self, req: &NewTicket) -> Result<Issue, ProviderError> {
-        // Epics and parents arrive with the github backend's sub-issue
-        // support (GitHub issue #158); until then refuse them rather than
-        // create a plain issue the caller didn't ask for.
-        refuse_epic_or_parent(req)?;
+        let parent_number = req
+            .parent_key
+            .as_deref()
+            .map(parse_issue_number)
+            .transpose()?;
+        let mut labels = vec!["tm:status/todo".to_string()];
+        if req.kind == TicketKind::Epic {
+            labels.push(EPIC_LABEL.to_string());
+        }
         let info = self
             .gh
             .issue_create(
@@ -564,14 +601,67 @@ impl TicketProvider for GithubProvider<'_> {
                 &IssueCreateRequest {
                     title: req.summary.clone(),
                     body: req.description.clone(),
-                    labels: vec!["tm:status/todo".to_string()],
+                    labels,
                     assignees: req.assignee_account_id.clone().into_iter().collect(),
                 },
             )
             .map_err(ProviderError::from)?;
         let number = info.number;
         let key = self.issue_key(number);
+        if let (Some(parent_key), Some(parent_number)) = (&req.parent_key, parent_number) {
+            // A second call: GitHub can't create an issue as a sub-issue.
+            // If it fails the issue already exists, so report its key
+            // rather than delete it.
+            self.gh
+                .add_sub_issue(&self.repo, parent_number, number)
+                .map_err(|err| ProviderError::CreatedWithoutParent {
+                    key: key.clone(),
+                    parent: parent_key.clone(),
+                    message: err.to_string(),
+                })?;
+        }
         Ok(self.to_issue(&key, number, info, IssueDependencies::default()))
+    }
+
+    /// Via sub-issues. Reads the child's current parent first. Setting uses
+    /// `addSubIssue` with `replaceParent`, so moving a ticket between epics
+    /// is one mutation, and makes none when the child is already under that
+    /// epic: GitHub rejects re-adding an existing sub-issue. Clearing makes
+    /// no mutation when the child has no parent.
+    fn set_parent(&self, child_key: &str, parent_key: Option<&str>) -> Result<(), ProviderError> {
+        let child = parse_issue_number(child_key)?;
+        let parent_number = parent_key.map(parse_issue_number).transpose()?;
+        let current = self.gh.issue_dependencies(&self.repo, child)?.parent;
+        match (parent_number, current) {
+            (Some(new), Some(current))
+                if current.number == new && current.repo.eq_ignore_ascii_case(&self.repo) => {}
+            (Some(new), _) => self.gh.add_sub_issue(&self.repo, new, child)?,
+            (None, Some(current)) => self.gh.remove_sub_issue(&self.repo, child, &current)?,
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// The epic's sub-issues, from any repo. A child in another repo is
+    /// keyed `owner/repo#<number>` (see [`GithubProvider::issue_key_in`]).
+    /// Children carry no dependencies or parent: listing them is one call.
+    fn children(&self, epic_key: &str) -> Result<Vec<Issue>, ProviderError> {
+        let number = parse_issue_number(epic_key)?;
+        Ok(self
+            .gh
+            .sub_issues(&self.repo, number)?
+            .into_iter()
+            .map(|SubIssue { repo, info }| {
+                let number = info.number;
+                let key = self.issue_key_in(&repo, number);
+                self.to_issue(&key, number, info, IssueDependencies::default())
+            })
+            .collect())
+    }
+
+    /// An issue is an epic when it carries the [`EPIC_LABEL`].
+    fn is_epic(&self, issue: &Issue) -> bool {
+        issue.fields.labels.iter().any(|label| label == EPIC_LABEL)
     }
 
     /// A deliberate no-op: under the github backend, associating a ticket
@@ -770,11 +860,31 @@ impl TicketProvider for GithubProvider<'_> {
         for (issue, number) in issues.iter_mut().zip(numbers) {
             let deps = IssueDependencies {
                 blocked_by: blocked_by.remove(&number).unwrap_or_default(),
-                blocking: Vec::new(),
+                ..Default::default()
             };
             let links = &mut issue.fields.issue_links;
             links.retain(|link| link.inward_issue.is_none());
             links.extend(self.to_issue_links(number, deps));
+        }
+        Ok(())
+    }
+
+    /// Fetch every issue's parent in one batched [`GhCli::issues_parents`]
+    /// call, as [`TicketProvider::hydrate_blockers`] does for blockers.
+    fn hydrate_parents(&self, issues: &mut [Issue]) -> Result<(), ProviderError> {
+        let numbers = issues
+            .iter()
+            .map(|issue| parse_issue_number(&issue.key))
+            .collect::<Result<Vec<u64>, _>>()?;
+        let mut parents = self
+            .gh
+            .issues_parents(&self.repo, &numbers)
+            .map_err(ProviderError::from)?;
+        for (issue, number) in issues.iter_mut().zip(numbers) {
+            issue.fields.parent = parents
+                .remove(&number)
+                .flatten()
+                .map(|p| self.to_parent_ref(p));
         }
         Ok(())
     }
@@ -1217,6 +1327,7 @@ mod tests {
                         state: IssueState::Closed,
                         url: String::new(),
                     }],
+                    parent: None,
                 }),
             );
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
@@ -1783,11 +1894,12 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_refuses_an_epic_without_calling_gh() {
-        let fake = FakeGhCli::new();
+    fn create_issue_labels_an_epic_with_the_epic_and_todo_labels() {
+        let created = issue_info(9, "New", IssueState::Open, &["tm:status/todo", "tm:epic"]);
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
-        let err = provider
+        let issue = provider
             .create_issue(&NewTicket {
                 project_key: "GH".to_string(),
                 summary: "New".to_string(),
@@ -1796,45 +1908,324 @@ mod tests {
                 parent_key: None,
                 assignee_account_id: None,
             })
-            .expect_err("epics are not supported yet");
+            .unwrap();
 
-        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
-        assert!(fake.issue_create_calls().is_empty());
+        assert_eq!(
+            fake.issue_create_calls()[0].1.labels,
+            vec!["tm:status/todo".to_string(), "tm:epic".to_string()]
+        );
+        assert!(provider.is_epic(&issue));
     }
 
     #[test]
-    fn create_issue_refuses_a_parent_without_calling_gh() {
-        let fake = FakeGhCli::new();
+    fn is_epic_is_true_only_for_an_issue_labeled_tm_epic() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(1, Ok(issue_info(1, "Epic", IssueState::Open, &["tm:epic"])))
+            .with_issue_view(
+                2,
+                Ok(issue_info(2, "Task", IssueState::Open, &["tm:status/todo"])),
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert!(provider.is_epic(&provider.get_issue("GH-1").unwrap()));
+        assert!(!provider.is_epic(&provider.get_issue("GH-2").unwrap()));
+    }
+
+    fn parent(number: u64, repo: &str) -> IssueParent {
+        IssueParent {
+            node_id: format!("I_{number}"),
+            repo: repo.to_string(),
+            number,
+            title: "The epic".to_string(),
+        }
+    }
+
+    fn new_ticket_under(parent_key: &str) -> NewTicket {
+        NewTicket {
+            project_key: "GH".to_string(),
+            summary: "Child".to_string(),
+            description: String::new(),
+            kind: TicketKind::Task,
+            parent_key: Some(parent_key.to_string()),
+            assignee_account_id: None,
+        }
+    }
+
+    #[test]
+    fn create_issue_under_a_parent_adds_the_new_issue_as_a_sub_issue() {
+        let created = issue_info(9, "Child", IssueState::Open, &["tm:status/todo"]);
+        let fake = FakeGhCli::new().with_issue_create_result(Ok(created));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let issue = provider.create_issue(&new_ticket_under("GH-1")).unwrap();
+
+        assert_eq!(issue.key, "GH-9");
+        assert_eq!(
+            fake.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 9)]
+        );
+    }
+
+    #[test]
+    fn create_issue_under_a_parent_reports_the_created_key_when_linking_fails() {
+        let created = issue_info(9, "Child", IssueState::Open, &["tm:status/todo"]);
+        let fake = FakeGhCli::new()
+            .with_issue_create_result(Ok(created))
+            .with_add_sub_issue_result(Err(GhError::Command {
+                command: "gh api graphql".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            }));
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
         let err = provider
-            .create_issue(&NewTicket {
-                project_key: "GH".to_string(),
-                summary: "New".to_string(),
-                description: String::new(),
-                kind: TicketKind::Task,
-                parent_key: Some("GH-1".to_string()),
-                assignee_account_id: None,
-            })
-            .expect_err("parents are not supported yet");
+            .create_issue(&new_ticket_under("GH-1"))
+            .expect_err("linking failed");
 
-        assert!(matches!(err, ProviderError::NotSupported { .. }), "{err:?}");
-        assert!(fake.issue_create_calls().is_empty());
+        let message = err.to_string();
+        assert!(message.contains("GH-9"), "{message}");
+        assert!(message.contains("GH-1"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert_eq!(fake.issue_create_calls().len(), 1, "the issue is kept");
     }
 
     #[test]
-    fn parent_operations_are_not_supported_yet() {
+    fn get_issue_fills_a_same_repo_parent_with_its_gh_key() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(2, Ok(issue_info(2, "Child", IssueState::Open, &[])))
+            .with_issue_dependencies(
+                2,
+                Ok(IssueDependencies {
+                    parent: Some(parent(1, "jowi-dev/tskmstr")),
+                    ..Default::default()
+                }),
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let issue = provider.get_issue("GH-2").unwrap();
+
+        assert_eq!(
+            issue.fields.parent,
+            Some(ParentRef {
+                key: "GH-1".to_string(),
+                summary: "The epic".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn get_issue_shows_a_foreign_repo_parent_as_owner_repo_number() {
+        let fake = FakeGhCli::new()
+            .with_issue_view(2, Ok(issue_info(2, "Child", IssueState::Open, &[])))
+            .with_issue_dependencies(
+                2,
+                Ok(IssueDependencies {
+                    parent: Some(parent(7, "jowi-dev/devtools")),
+                    ..Default::default()
+                }),
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let issue = provider.get_issue("GH-2").unwrap();
+
+        assert_eq!(issue.fields.parent.unwrap().key, "jowi-dev/devtools#7");
+    }
+
+    #[test]
+    fn set_parent_adds_the_child_as_a_sub_issue_of_the_epic() {
         let fake = FakeGhCli::new();
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
 
-        assert!(matches!(
-            provider.set_parent("GH-2", Some("GH-1")),
-            Err(ProviderError::NotSupported { .. })
-        ));
-        assert!(matches!(
-            provider.children("GH-1"),
-            Err(ProviderError::NotSupported { .. })
-        ));
+        provider.set_parent("GH-2", Some("GH-1")).unwrap();
+
+        assert_eq!(
+            fake.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn set_parent_to_the_current_parent_succeeds_without_a_mutation() {
+        // GitHub rejects re-adding an existing sub-issue ("may not contain
+        // duplicate sub-issues"); replaceParent only covers a new parent.
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Ok(IssueDependencies {
+                parent: Some(parent(1, "jowi-dev/tskmstr")),
+                ..Default::default()
+            }),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", Some("GH-1")).unwrap();
+
+        assert!(fake.add_sub_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn set_parent_moves_a_child_whose_parent_is_a_different_epic() {
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Ok(IssueDependencies {
+                parent: Some(parent(5, "jowi-dev/tskmstr")),
+                ..Default::default()
+            }),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", Some("GH-1")).unwrap();
+
+        assert_eq!(
+            fake.add_sub_issue_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1, 2)]
+        );
+    }
+
+    #[test]
+    fn set_parent_none_removes_the_child_from_its_current_parent() {
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Ok(IssueDependencies {
+                parent: Some(parent(1, "jowi-dev/tskmstr")),
+                ..Default::default()
+            }),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", None).unwrap();
+
+        assert_eq!(
+            fake.remove_sub_issue_calls(),
+            vec![(
+                "jowi-dev/tskmstr".to_string(),
+                2,
+                parent(1, "jowi-dev/tskmstr")
+            )]
+        );
+    }
+
+    #[test]
+    fn set_parent_none_on_a_parentless_issue_succeeds_without_a_mutation() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        provider.set_parent("GH-2", None).unwrap();
+
+        assert!(fake.remove_sub_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn set_parent_none_fails_when_the_current_parent_cannot_be_read() {
+        let fake = FakeGhCli::new().with_issue_dependencies(
+            2,
+            Err(GhError::Command {
+                command: "gh api graphql".to_string(),
+                exit_code: Some(1),
+                stderr: "boom".to_string(),
+            }),
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert!(provider.set_parent("GH-2", None).is_err());
+        assert!(fake.remove_sub_issue_calls().is_empty());
+    }
+
+    #[test]
+    fn children_maps_sub_issues_keying_foreign_ones_by_owner_repo_number() {
+        let fake = FakeGhCli::new().with_sub_issues(
+            1,
+            vec![
+                SubIssue {
+                    repo: "jowi-dev/tskmstr".to_string(),
+                    info: issue_info(2, "Here", IssueState::Open, &["tm:status/in-progress"]),
+                },
+                SubIssue {
+                    repo: "jowi-dev/devtools".to_string(),
+                    info: issue_info(7, "Elsewhere", IssueState::Closed, &[]),
+                },
+            ],
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let children = provider.children("GH-1").unwrap();
+
+        let rows: Vec<(&str, &str, &str)> = children
+            .iter()
+            .map(|c| {
+                (
+                    c.key.as_str(),
+                    c.fields.status.name.as_str(),
+                    c.fields.summary.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("GH-2", "In Progress", "Here"),
+                ("jowi-dev/devtools#7", "Done", "Elsewhere"),
+            ]
+        );
+        assert_eq!(
+            fake.sub_issues_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn hydrate_parents_fills_every_issue_parent_in_one_call() {
+        let fake = FakeGhCli::new()
+            .with_issue_parent(2, parent(1, "jowi-dev/tskmstr"))
+            .with_issue_parent(4, parent(7, "jowi-dev/devtools"));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues: Vec<Issue> = [2, 3, 4]
+            .into_iter()
+            .map(|n| {
+                provider.to_issue(
+                    &format!("GH-{n}"),
+                    n,
+                    issue_info(n, "T", IssueState::Open, &[]),
+                    IssueDependencies::default(),
+                )
+            })
+            .collect();
+
+        provider.hydrate_parents(&mut issues).unwrap();
+
+        let parents: Vec<Option<String>> = issues
+            .iter()
+            .map(|i| i.fields.parent.as_ref().map(|p| p.key.clone()))
+            .collect();
+        assert_eq!(
+            parents,
+            vec![
+                Some("GH-1".to_string()),
+                None,
+                Some("jowi-dev/devtools#7".to_string()),
+            ]
+        );
+        assert_eq!(
+            fake.issues_parents_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![2, 3, 4])]
+        );
+    }
+
+    #[test]
+    fn hydrate_parents_failure_is_an_error() {
+        let fake = FakeGhCli::new().with_issues_parents_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        });
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-2",
+            2,
+            issue_info(2, "T", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+
+        assert!(provider.hydrate_parents(&mut issues).is_err());
     }
 
     #[test]
@@ -2045,6 +2436,7 @@ mod tests {
                         url: String::new(),
                     }],
                     blocking: Vec::new(),
+                    parent: None,
                 }),
             );
         let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());

@@ -245,7 +245,7 @@ tm auth status
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
-**Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and neither the Jira nor the GitHub backend implements them yet (GitHub issues #157 and #158). Until then they fail with a "not supported by this ticket backend" error, or with "is not an epic" when the parent check runs first, rather than creating a plain task. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
+**Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend. The GitHub backend supports them: an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. The Jira backend doesn't implement them yet (GitHub issue #157), so there they fail with a "not supported by this ticket backend" error, or with "is not an epic" when the parent check runs first, rather than creating a plain task. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
 
 ## Ticket/run status drift (`tm drift`)
 
@@ -1297,6 +1297,12 @@ its transitions opens a centered floating window on top of the board rather
 than replacing it, so the board stays visible behind the detail and "Move
 to" windows.
 
+A ticket that sits under an epic shows it on its card as an `epic <KEY>`
+line, and in the detail window as `Epic: <KEY>  <summary>` under its
+status. Tickets without a parent epic render without either line, and
+their cards keep their usual height. If the epics can't be loaded, the
+board still loads, without epic lines, and the status line says why.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
@@ -2326,8 +2332,8 @@ login`/`gh auth status`, not a stored Jira token); ticket keys are
 `GH-<issue number>` instead of a Jira project key; status lives in
 `tm:status/{todo,in-progress,in-review,blocked}` labels (no label, or a
 closed issue, both map to their obvious default) rather than a Jira
-workflow; and `tm backend init-labels` creates those four labels in the
-configured repo (idempotently — safe to re-run) so a fresh repo's board has
+workflow; and `tm backend init-labels` creates those four labels, plus the
+`tm:epic` label that marks an epic, in the configured repo (idempotently — safe to re-run) so a fresh repo's board has
 somewhere to put issues. `tm backend clean-status-labels` (`--dry-run` to
 preview) removes `tm:status/*` labels left on closed issues — GitHub's
 closing keywords close an issue without touching its labels; `tm merge`

@@ -74,6 +74,14 @@ pub struct IssueFields {
     /// omits it, and older fixtures predate it.
     #[serde(default)]
     pub parent: Option<ParentRef>,
+    /// Label names on this issue. The github backend reads its `tm:epic`
+    /// label from here ([`super::provider::TicketProvider::is_epic`]).
+    ///
+    /// `#[serde(default)]` for the same reasons as
+    /// [`IssueFields::issue_links`]; Jira's field of the same name is also a
+    /// list of strings, so a search that does request it deserializes as is.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// The epic a ticket sits under, as embedded in [`IssueFields::parent`].
