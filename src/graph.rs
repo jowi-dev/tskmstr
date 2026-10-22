@@ -1068,4 +1068,50 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn github_outgoing_only_link_is_found_with_one_dependency_fetch() {
+        use crate::github::gh_cli::{
+            FakeGhCli, IssueDependencies, IssueInfo, IssueRef, IssueState,
+        };
+        use crate::ticketing::github_provider::GithubProvider;
+
+        let epic = |number: u64| IssueInfo {
+            number,
+            url: format!("https://github.com/owner/repo/issues/{number}"),
+            title: format!("Epic {number}"),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: vec!["tm:epic".to_string()],
+            assignees: Vec::new(),
+        };
+        let fake = FakeGhCli::new()
+            .with_issue_list(Ok(vec![epic(1), epic(2), epic(3)]))
+            .with_issues_dependencies(
+                1,
+                IssueDependencies {
+                    blocking: vec![IssueRef {
+                        number: 2,
+                        title: "Epic 2".to_string(),
+                        state: IssueState::Open,
+                        url: String::new(),
+                    }],
+                    ..Default::default()
+                },
+            );
+        let provider = GithubProvider::new(&fake, "owner/repo".to_string());
+        let identity = BackendIdentity::Github {
+            repo: "owner/repo".to_string(),
+        };
+
+        let graph = build_graph(&provider, &identity, "owner/repo", None).unwrap();
+
+        assert_eq!(keys(&graph), ["GH-1", "GH-2", "GH-3"]);
+        assert_eq!(graph.links, vec![unlocks("GH-1", "GH-2")]);
+        assert_eq!(node(&graph, "GH-2").backend, "github:owner/repo");
+        assert_eq!(
+            fake.issues_dependencies_calls(),
+            vec![("owner/repo".to_string(), vec![1, 2, 3])]
+        );
+    }
 }
