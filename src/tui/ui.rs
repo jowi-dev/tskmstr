@@ -129,7 +129,11 @@ pub fn draw(frame: &mut Frame, app: &App, runner: &dyn AgentRunner) {
         frame,
         status_area,
         &status_line_text(app),
-        hint_for(app.screen, app.show_run_detail),
+        if app.screen == Screen::Board && app.board_searching {
+            SEARCH_HINT
+        } else {
+            hint_for(app.screen, app.show_run_detail)
+        },
     );
 
     if app.show_help {
@@ -215,7 +219,8 @@ fn with_autopilot(app: &App, base: String) -> String {
 }
 
 /// [`status_line_text`] without the pending indicator: the active view
-/// filter prefixed onto `app.status_line`.
+/// filter (and, on the board, the search query) prefixed onto
+/// `app.status_line`.
 fn status_line_with_filter(app: &App) -> String {
     let filter_text = if app.screen == Screen::Runs {
         let mut parts = Vec::new();
@@ -230,15 +235,39 @@ fn status_line_with_filter(app: &App) -> String {
         }
         format!("Filter: {}", parts.join(", "))
     } else {
-        if app.screen == Screen::Rank || app.filter == AssigneeFilter::Me {
+        let mut parts = Vec::new();
+        if app.screen != Screen::Rank && app.filter != AssigneeFilter::Me {
+            parts.push(format!("Filter: {}", app.filter.label()));
+        }
+        if let Some(search) = board_search_text(app) {
+            parts.push(search);
+        }
+        if parts.is_empty() {
             return app.status_line.clone();
         }
-        format!("Filter: {}", app.filter.label())
+        parts.join("  |  ")
     };
     if app.status_line.is_empty() {
         filter_text
     } else {
         format!("{filter_text}  |  {}", app.status_line)
+    }
+}
+
+/// The board's search segment of the status bar (GitHub issue #152):
+/// `Search: <query>`, with a trailing `_` cursor while search mode is on.
+/// `None` off the board, or with no query applied and search mode off.
+fn board_search_text(app: &App) -> Option<String> {
+    if app.screen != Screen::Board {
+        return None;
+    }
+    let query = &app.board_search_query;
+    if app.board_searching {
+        Some(format!("Search: {query}_"))
+    } else if query.is_empty() {
+        None
+    } else {
+        Some(format!("Search: {query}"))
     }
 }
 
@@ -263,6 +292,10 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, status_line: &str, hints: &str
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// The status-bar key hint while board search mode is on, replacing
+/// [`hint_for`]'s board hint (every printable key types into the query).
+const SEARCH_HINT: &str = "type to search  Backspace delete  Enter keep  Esc clear";
+
 /// The key-hint text shown in the status bar for `screen`. `show_run_detail`
 /// picks the detail-window variant on [`Screen::Board`], [`Screen::Runs`]
 /// and [`Screen::Overview`] -- the run-detail overlay's keymap
@@ -272,7 +305,7 @@ fn hint_for(screen: Screen, show_run_detail: bool) -> &'static str {
     match screen {
         Screen::Board if show_run_detail => "j/k scroll  Esc/q close  r refresh",
         Screen::Board => {
-            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  ? help  q quit"
+            "h/l column  j/k move  Enter open  r refresh  o browser  O jira  f filter  A assign  p priority  a audit  s session  m manual  w work  b bots  c create  v view run  L logs  V vdiff  F fix  M merge  Space queue  R retro  P autopilot  i or / search  ? help  q quit"
         }
         Screen::Detail => "j/k scroll  Enter transitions  Esc back  ? help  q quit",
         Screen::TransitionMenu => "j/k move  Enter apply  Esc back  ? help  q quit",
@@ -323,14 +356,25 @@ fn draw_board_columns(frame: &mut Frame, app: &App, area: Rect) {
         merge_queue: &app.merge_queue,
     };
 
+    let searching = !app.board_search_query.is_empty();
     for (index, column) in app.columns.iter().enumerate() {
-        let is_selected_column = index == app.selected_col;
-        let selected_row = is_selected_column.then_some(app.selected_row);
+        let selected_row = (index == app.selected_col).then_some(app.selected_row);
+        let tickets = app.tickets_in_col(index);
+        // While a search query is applied, the count reads `shown/total`.
+        let count = if searching {
+            format!("{}/{}", tickets.len(), column.tickets.len())
+        } else {
+            column.tickets.len().to_string()
+        };
+        let title = Line::from(Span::styled(
+            format!("{} ({count})", column.title),
+            column_title_style(column),
+        ));
         draw_column(
             frame,
             areas[index],
-            column,
-            is_selected_column,
+            title,
+            &tickets,
             selected_row,
             show_assignee,
             &badges,
@@ -352,7 +396,9 @@ fn column_title_style(column: &Column) -> Style {
     }
 }
 
-/// One column of the board: a bordered, titled stack of ticket cards.
+/// One column of the board: a bordered, titled stack of the search-visible
+/// `tickets` cards (see [`App::tickets_in_col`]). `selected_row` is `Some`
+/// exactly when this is the selected column.
 ///
 /// Each ticket renders as its own rounded-border card (see [`card_height`]
 /// and [`wrapped_summary`]) rather than a single `List` row, since summaries
@@ -363,17 +409,13 @@ fn column_title_style(column: &Column) -> Style {
 fn draw_column(
     frame: &mut Frame,
     area: Rect,
-    column: &Column,
-    is_selected: bool,
+    title: Line,
+    tickets: &[&TicketSummary],
     selected_row: Option<usize>,
     show_assignee: bool,
     badges: &BoardBadges,
 ) {
-    let title = Line::from(Span::styled(
-        format!("{} ({})", column.title, column.tickets.len()),
-        column_title_style(column),
-    ));
-    let border_style = if is_selected {
+    let border_style = if selected_row.is_some() {
         theme::SELECTED_COLUMN_BORDER
     } else {
         Style::default()
@@ -386,18 +428,17 @@ fn draw_column(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if column.tickets.is_empty() || inner.width == 0 || inner.height == 0 {
+    if tickets.is_empty() || inner.width == 0 || inner.height == 0 {
         return;
     }
 
     let content_width = inner.width.saturating_sub(2).max(1) as usize;
-    let heights: Vec<u16> = column
-        .tickets
+    let heights: Vec<u16> = tickets
         .iter()
         .map(|t| card_height(t, content_width, show_assignee, badges))
         .collect();
 
-    let selected = selected_row.unwrap_or(0).min(column.tickets.len() - 1);
+    let selected = selected_row.unwrap_or(0).min(tickets.len() - 1);
     let range = visible_card_range(&heights, selected, inner.height);
 
     let constraints: Vec<Constraint> = heights[range.clone()]
@@ -410,7 +451,7 @@ fn draw_column(
         .split(inner);
 
     for (offset, ticket_index) in range.enumerate() {
-        let ticket = &column.tickets[ticket_index];
+        let ticket = tickets[ticket_index];
         let is_selected_card = selected_row == Some(ticket_index);
         draw_card(
             frame,
@@ -1821,12 +1862,12 @@ fn draw_help_overlay(frame: &mut Frame) {
         .split(inner);
 
     let navigation = vec![
-        Line::from("j / Down    move down"),
-        Line::from("k / Up      move up"),
-        Line::from("h / Left    previous column"),
-        Line::from("l / Right   next column"),
+        Line::from("j/k ↓/↑     move down / up"),
+        Line::from("h/l ←/→     prev / next column"),
         Line::from("Enter       open / apply"),
         Line::from("Esc / q     back / quit"),
+        Line::from("i or /      search cards"),
+        Line::from("  Enter keep, Esc clear"),
         Line::from("r           refresh tickets"),
         Line::from("o           open in browser"),
         Line::from("O           open Jira directly"),
@@ -2402,6 +2443,7 @@ mod tests {
             "M merge",
             "Space queue",
             "R retro",
+            "i or / search",
             "?",
             "q",
         ] {
@@ -2410,6 +2452,79 @@ mod tests {
                 "board hint should mention `{key}`: {hint}"
             );
         }
+    }
+
+    /// A two-column board (In Progress: PROJ-1 "Fix login", PROJ-2 "Add
+    /// search", PROJ-3 "Login copy"; Done: PROJ-4 "Docs") for the board
+    /// search render tests (GitHub issue #152).
+    fn search_board(query: &str, searching: bool) -> App {
+        let titled = |key: &str, status: &str, category: &str, summary: &str| TicketSummary {
+            summary: summary.to_string(),
+            ..ticket_with(key, status, category)
+        };
+        App {
+            columns: group_into_columns(
+                vec![
+                    titled("PROJ-1", "In Progress", "indeterminate", "Fix login"),
+                    titled("PROJ-2", "In Progress", "indeterminate", "Add search"),
+                    titled("PROJ-3", "In Progress", "indeterminate", "Login copy"),
+                    titled("PROJ-4", "Done", "done", "Docs"),
+                ],
+                &[],
+            ),
+            board_search_query: query.to_string(),
+            board_searching: searching,
+            ..App::new()
+        }
+    }
+
+    #[test]
+    fn board_search_hides_non_matching_cards_and_keeps_empty_columns() {
+        let text = buffer_text(&render_with_size(&search_board("login", false), 120, 30));
+        assert!(text.contains("PROJ-1"), "{text}");
+        assert!(text.contains("PROJ-3"), "{text}");
+        assert!(!text.contains("PROJ-2"), "{text}");
+        assert!(!text.contains("PROJ-4"), "{text}");
+        assert!(text.contains("In Progress (2/3)"), "{text}");
+        assert!(text.contains("Done (0/1)"), "{text}");
+    }
+
+    #[test]
+    fn column_titles_show_the_plain_count_without_a_query() {
+        let text = buffer_text(&render_with_size(&search_board("", false), 120, 30));
+        assert!(text.contains("In Progress (3)"), "{text}");
+        assert!(text.contains("Done (1)"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_shows_the_applied_search_query() {
+        let text = buffer_text(&render_with_size(&search_board("login", false), 120, 30));
+        assert!(text.contains("Search: login"), "{text}");
+        let text = buffer_text(&render_with_size(&search_board("", false), 120, 30));
+        assert!(!text.contains("Search:"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_combines_the_assignee_filter_and_search_query() {
+        let app = App {
+            filter: AssigneeFilter::Everyone,
+            ..search_board("login", false)
+        };
+        let text = buffer_text(&render_with_size(&app, 160, 30));
+        assert!(
+            text.contains("Filter: Everyone  |  Search: login"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn search_mode_shows_a_cursor_and_the_search_hint() {
+        let text = buffer_text(&render_with_size(&search_board("log", true), 120, 30));
+        assert!(text.contains("Search: log_"), "{text}");
+        assert!(text.contains("Enter keep"), "{text}");
+        assert!(text.contains("Esc clear"), "{text}");
+        let text = buffer_text(&render_with_size(&search_board("", true), 120, 30));
+        assert!(text.contains("Search: _"), "{text}");
     }
 
     #[test]
@@ -2674,6 +2789,7 @@ mod tests {
             "merge",
             "merge queue",
             "retro",
+            "search cards",
         ] {
             assert!(
                 text.contains(phrase),
