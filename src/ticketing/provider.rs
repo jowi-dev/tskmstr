@@ -382,8 +382,8 @@ pub trait TicketProvider {
     /// When `false`, a `None` parent means "unknown", not "no parent", so
     /// [`crate::ticketing::ticket_parent`] refuses instead of answering.
     ///
-    /// The default is `false`. Jira reports its `parent` field; the github
-    /// backend learns sub-issue parents in GitHub issue #158.
+    /// The default is `false`. Jira reports its `parent` field and the
+    /// github backend its sub-issue parent.
     fn reports_parents(&self) -> bool {
         false
     }

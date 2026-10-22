@@ -3443,31 +3443,38 @@ mod tests {
     }
 
     #[test]
-    fn ticket_parent_refuses_on_a_backend_that_cannot_report_parents() {
-        let gh = FakeGhCli::new().with_issue_view(
-            10,
-            Ok(crate::github::gh_cli::IssueInfo {
-                number: 10,
-                url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
-                title: "Fix the thing".to_string(),
-                body: String::new(),
-                state: crate::github::gh_cli::IssueState::Open,
-                labels: Vec::new(),
-                assignees: Vec::new(),
-            }),
-        );
+    fn ticket_parent_reads_a_github_sub_issue_parent() {
+        let gh = FakeGhCli::new()
+            .with_issue_view(
+                10,
+                Ok(crate::github::gh_cli::IssueInfo {
+                    number: 10,
+                    url: "https://github.com/jowi-dev/tskmstr/issues/10".to_string(),
+                    title: "Fix the thing".to_string(),
+                    body: String::new(),
+                    state: crate::github::gh_cli::IssueState::Open,
+                    labels: Vec::new(),
+                    assignees: Vec::new(),
+                }),
+            )
+            .with_issue_dependencies(
+                10,
+                Ok(crate::github::gh_cli::IssueDependencies {
+                    parent: Some(crate::github::gh_cli::IssueParent {
+                        node_id: "I_epic".to_string(),
+                        repo: "jowi-dev/tskmstr".to_string(),
+                        number: 7,
+                        title: "The epic".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
         let provider =
             crate::ticketing::github_provider::GithubProvider::new(&gh, "jowi-dev/tskmstr".into());
 
-        let err = ticket_parent(&provider, "GH-10").expect_err("cannot report parents");
+        let parent = ticket_parent(&provider, "GH-10").expect("github reports parents");
 
-        assert!(
-            matches!(
-                err,
-                TicketingError::Provider(ProviderError::NotSupported { .. })
-            ),
-            "{err:?}"
-        );
+        assert_eq!(parent.map(|p| p.key), Some("GH-7".to_string()));
     }
 
     #[test]

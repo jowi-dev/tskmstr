@@ -665,6 +665,12 @@ impl TicketProvider for GithubProvider<'_> {
         issue.fields.labels.iter().any(|label| label == EPIC_LABEL)
     }
 
+    /// [`TicketProvider::get_issue`] reads the sub-issue parent alongside
+    /// the dependencies, so a `None` parent means the issue has none.
+    fn reports_parents(&self) -> bool {
+        true
+    }
+
     /// A deliberate no-op: under the github backend, associating a ticket
     /// with a PR needs no remote link at all. `GH-123` in the PR title (see
     /// `crate::github::pr::with_issue_key_prefix`, already applied by
