@@ -203,10 +203,114 @@ pub fn build_graph(
         }
     }
     let graph = builder.finish();
-    match focus {
-        Some(key) => focus_on(graph, provider, key),
-        None => Ok(graph),
+    let mut graph = match focus {
+        Some(key) => focus_on(graph, provider, key)?,
+        None => graph,
+    };
+    graph.warnings = cycle_warnings(&graph);
+    Ok(graph)
+}
+
+/// One `cycle` warning per loop of unlocks links: each strongly connected
+/// component with more than one member, and each ticket that unlocks
+/// itself. Sorted by first key.
+fn cycle_warnings(graph: &Graph) -> Vec<GraphWarning> {
+    let mut warnings: Vec<GraphWarning> = unlocks_components(graph)
+        .into_iter()
+        .filter(|component| {
+            component.len() > 1
+                || graph.links.iter().any(|l| {
+                    l.kind == LinkKind::Unlocks && l.from == component[0] && l.to == component[0]
+                })
+        })
+        .map(|mut keys| {
+            keys.sort();
+            GraphWarning {
+                kind: "cycle".to_string(),
+                message: format!("unlocks cycle among {}", keys.join(", ")),
+                keys,
+            }
+        })
+        .collect();
+    warnings.sort_by(|a, b| a.keys.cmp(&b.keys));
+    warnings
+}
+
+/// The strongly connected components of the graph's unlocks links, by
+/// Tarjan's algorithm with an explicit stack so deep chains cannot
+/// overflow the call stack.
+fn unlocks_components(graph: &Graph) -> Vec<Vec<String>> {
+    let index_of: HashMap<&str, usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.key.as_str(), i))
+        .collect();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+    for link in graph.links.iter().filter(|l| l.kind == LinkKind::Unlocks) {
+        if let (Some(&from), Some(&to)) = (
+            index_of.get(link.from.as_str()),
+            index_of.get(link.to.as_str()),
+        ) {
+            edges[from].push(to);
+        }
     }
+
+    let count = graph.nodes.len();
+    let mut order: Vec<Option<usize>> = vec![None; count];
+    let mut low = vec![0; count];
+    let mut on_stack = vec![false; count];
+    let mut stack = Vec::new();
+    let mut next_order = 0;
+    let mut components = Vec::new();
+    for root in 0..count {
+        if order[root].is_some() {
+            continue;
+        }
+        // Each frame is a node and how many of its edges are explored.
+        let mut frames = vec![(root, 0)];
+        order[root] = Some(next_order);
+        low[root] = next_order;
+        next_order += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (node, ref mut explored)) = frames.last_mut() {
+            if let Some(&next) = edges[node].get(*explored) {
+                *explored += 1;
+                match order[next] {
+                    None => {
+                        order[next] = Some(next_order);
+                        low[next] = next_order;
+                        next_order += 1;
+                        stack.push(next);
+                        on_stack[next] = true;
+                        frames.push((next, 0));
+                    }
+                    Some(next_order_seen) if on_stack[next] => {
+                        low[node] = low[node].min(next_order_seen);
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some(&(caller, _)) = frames.last() {
+                low[caller] = low[caller].min(low[node]);
+            }
+            if Some(low[node]) == order[node] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component.push(graph.nodes[member].key.clone());
+                    if member == node {
+                        break;
+                    }
+                }
+                components.push(component);
+            }
+        }
+    }
+    components
 }
 
 /// Keep only the part of `graph` connected to the epic `key` (matched
@@ -762,5 +866,72 @@ mod tests {
             err.to_string(),
             "PROJ-6 is a Done epic with no unlocks link to an open epic, so it is not in the graph"
         );
+    }
+
+    #[test]
+    fn unlocks_cycle_finishes_with_one_warning() {
+        let fake = fake_with_epics(vec![
+            issue(
+                "PROJ-2",
+                "new",
+                vec![blocks("PROJ-1", "new"), blocked_by("PROJ-1", "new")],
+            ),
+            issue(
+                "PROJ-1",
+                "new",
+                vec![blocks("PROJ-2", "new"), blocked_by("PROJ-2", "new")],
+            ),
+            issue("PROJ-3", "new", vec![blocked_by("PROJ-1", "new")]),
+        ]);
+
+        let graph = build(&fake, None).unwrap();
+
+        assert_eq!(
+            graph.warnings,
+            vec![GraphWarning {
+                kind: "cycle".to_string(),
+                keys: vec!["PROJ-1".to_string(), "PROJ-2".to_string()],
+                message: "unlocks cycle among PROJ-1, PROJ-2".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn longer_cycles_and_self_loops_each_warn_once() {
+        let fake = fake_with_epics(vec![
+            issue("PROJ-1", "new", vec![blocks("PROJ-2", "new")]),
+            issue("PROJ-2", "new", vec![blocks("PROJ-3", "new")]),
+            issue("PROJ-3", "new", vec![blocks("PROJ-1", "new")]),
+            issue("PROJ-4", "new", vec![blocks("PROJ-4", "new")]),
+            issue("PROJ-5", "new", vec![blocks("PROJ-1", "new")]),
+        ]);
+
+        let graph = build(&fake, None).unwrap();
+
+        let cycles: Vec<Vec<String>> = graph.warnings.iter().map(|w| w.keys.clone()).collect();
+        assert_eq!(
+            cycles,
+            vec![
+                vec![
+                    "PROJ-1".to_string(),
+                    "PROJ-2".to_string(),
+                    "PROJ-3".to_string()
+                ],
+                vec!["PROJ-4".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_drops_cycles_outside_the_kept_part() {
+        let fake = fake_with_epics(vec![
+            issue("PROJ-1", "new", vec![]),
+            issue("PROJ-2", "new", vec![blocks("PROJ-3", "new")]),
+            issue("PROJ-3", "new", vec![blocks("PROJ-2", "new")]),
+        ]);
+
+        let graph = build(&fake, Some("PROJ-1")).unwrap();
+
+        assert!(graph.warnings.is_empty());
     }
 }
