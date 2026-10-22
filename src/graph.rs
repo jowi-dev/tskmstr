@@ -185,6 +185,24 @@ pub fn build_graph(
             builder.add_link(from, to, LinkKind::Unlocks);
         }
     }
+    for epic in epics.iter().filter(|e| included.contains(e.key.as_str())) {
+        let children = provider.children(&epic.key)?;
+        let done = children
+            .iter()
+            .filter(|c| is_done(&c.fields.status))
+            .count();
+        builder.set_progress(
+            &epic.key,
+            ChildProgress {
+                done,
+                total: children.len(),
+            },
+        );
+        for child in &children {
+            builder.add_child_node(builder.node_from_issue(child, provider.is_epic(child)));
+            builder.add_link(&epic.key, &child.key, LinkKind::Parent);
+        }
+    }
     Ok(builder.finish())
 }
 
@@ -292,6 +310,23 @@ impl<'a> GraphBuilder<'a> {
         if !self.node_index.contains_key(&node.key) {
             self.node_index.insert(node.key.clone(), self.nodes.len());
             self.nodes.push(node);
+        }
+    }
+
+    /// Add a child's `node`. A child fetched in full carries more than a
+    /// link's embedded data, so it replaces an existing plain-ticket node
+    /// with the same key in place; an existing epic node is kept as is.
+    fn add_child_node(&mut self, node: GraphNode) {
+        match self.node_index.get(&node.key) {
+            Some(&index) if self.nodes[index].children.is_none() => self.nodes[index] = node,
+            Some(_) => {}
+            None => self.add_node(node),
+        }
+    }
+
+    fn set_progress(&mut self, key: &str, progress: ChildProgress) {
+        if let Some(&index) = self.node_index.get(key) {
+            self.nodes[index].children = Some(progress);
         }
     }
 
@@ -425,6 +460,20 @@ mod tests {
         }
     }
 
+    fn parent(from: &str, to: &str) -> GraphLink {
+        GraphLink {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: LinkKind::Parent,
+        }
+    }
+
+    /// Seed `child` as a plain ticket under `epic`.
+    fn with_child(fake: FakeJiraClient, epic: &str, child: Issue) -> FakeJiraClient {
+        let key = child.key.clone();
+        fake.with_issue(&key, child).with_parent(&key, epic)
+    }
+
     fn node<'a>(graph: &'a Graph, key: &str) -> &'a GraphNode {
         graph
             .nodes
@@ -514,5 +563,59 @@ mod tests {
         assert_eq!(plain.status, "In Progress");
         assert_eq!(plain.status_category, "indeterminate");
         assert_eq!(plain.url, "https://example.atlassian.net/browse/PROJ-9");
+    }
+
+    #[test]
+    fn children_get_parent_links_and_set_epic_progress() {
+        let fake = fake_with_epics(vec![
+            issue("PROJ-1", "new", vec![]),
+            issue("PROJ-2", "indeterminate", vec![]),
+        ]);
+        let fake = with_child(fake, "PROJ-1", issue("PROJ-10", "done", vec![]));
+        let fake = with_child(fake, "PROJ-1", issue("PROJ-11", "new", vec![]));
+
+        let graph = build(&fake, None).unwrap();
+
+        assert_eq!(keys(&graph), ["PROJ-1", "PROJ-2", "PROJ-10", "PROJ-11"]);
+        assert_eq!(
+            graph.links,
+            vec![parent("PROJ-1", "PROJ-10"), parent("PROJ-1", "PROJ-11")]
+        );
+        assert_eq!(
+            node(&graph, "PROJ-1").children,
+            Some(ChildProgress { done: 1, total: 2 })
+        );
+        assert_eq!(
+            node(&graph, "PROJ-2").children,
+            Some(ChildProgress { done: 0, total: 0 })
+        );
+        let child = node(&graph, "PROJ-10");
+        assert!(!child.is_epic);
+        assert_eq!(child.children, None);
+        assert_eq!(child.status_category, "done");
+    }
+
+    #[test]
+    fn child_that_is_also_an_unlocks_endpoint_is_one_node_with_both_links() {
+        let fake = fake_with_epics(vec![
+            issue("PROJ-1", "new", vec![]),
+            issue(
+                "PROJ-2",
+                "new",
+                vec![blocked_by("PROJ-10", "indeterminate")],
+            ),
+        ]);
+        let mut child = issue("PROJ-10", "indeterminate", vec![]);
+        child.fields.summary = "Full child title".to_string();
+        let fake = with_child(fake, "PROJ-1", child);
+
+        let graph = build(&fake, None).unwrap();
+
+        assert_eq!(keys(&graph), ["PROJ-1", "PROJ-2", "PROJ-10"]);
+        assert_eq!(node(&graph, "PROJ-10").title, "Full child title");
+        assert_eq!(
+            graph.links,
+            vec![unlocks("PROJ-10", "PROJ-2"), parent("PROJ-1", "PROJ-10")]
+        );
     }
 }
