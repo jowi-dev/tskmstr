@@ -11,6 +11,8 @@
 //! fetch, then one [`TicketProvider::children`] call per epic in the graph.
 //! It never follows links one fetch at a time.
 
+mod render;
+
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
@@ -21,6 +23,8 @@ use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::{Issue, LinkedIssue, Status};
 use crate::work::comment_store::iso8601_utc;
+
+pub use render::render_text;
 
 /// The status category key for finished work.
 const DONE_CATEGORY: &str = "done";
@@ -124,7 +128,7 @@ pub struct GraphNode {
 }
 
 /// How many of an epic's children are done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct ChildProgress {
     /// Children whose status category is `done`.
     pub done: usize,
