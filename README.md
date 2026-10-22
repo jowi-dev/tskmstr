@@ -1615,8 +1615,9 @@ the window is still up. Waiting-state telemetry comes from the `Stop` /
 `Notification` / `UserPromptSubmit` hooks emitting `await`/`resume`
 events; `tm runs watch` renders the same state as a `waiting` marker on
 running audit/create cards. The board polls the run store and tmux for
-badge updates every ~2s; the ticket list itself still refreshes only on
-`r`.
+badge updates every ~2s (this `audit:` badge, and the `run:`, `bots:`,
+`clean:` and `review:` badges described below); the ticket list itself
+still refreshes only on `r`.
 
 ### Board-opened manual sessions
 
@@ -1847,6 +1848,17 @@ round records an `auto_review_round` event (`1/2 fix`, `2/2 clean`,
 `2/2 capped`, `1/2 fix-failed`), and the overview row shows the newest one as
 `review 2/2 capped`, drawn as a warning when the loop stopped short of
 clean.
+
+On the board, a ticket with an auto-review run shows a `review:` badge.
+`review: reviewing` means the loop is alive, including during a fix pass
+between rounds. `review: clean` means the newest round came back clean.
+`review: needs you` (bold red) means the loop stopped without a clean
+verdict: it hit the round cap, the fix pass failed, or the loop process
+died. The round count follows once a round has finished, as in
+`review: needs you 2/2`. The badge is computed from the run store and a
+local pid check, never from GitHub, and only the ticket's newest
+auto-review run counts. A fix you make by hand after a cap isn't detected,
+so the badge stays at `needs you` until another round runs.
 
 ```toml
 [work.auto_review]

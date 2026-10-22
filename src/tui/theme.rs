@@ -13,7 +13,9 @@ use ratatui::text::Span;
 use crate::blocker_stacking::Readiness;
 use crate::runs::RunStatus;
 use crate::runs::overview::Stage;
-use crate::tui::app::{AuditIndicator, BotWatchIndicator, RunIndicator};
+use crate::tui::app::{
+    AuditIndicator, AutoReviewBadge, AutoReviewIndicator, BotWatchIndicator, RunIndicator,
+};
 
 /// Bold, default color. Used for board/runs column titles and every other
 /// floating window's border title.
@@ -261,6 +263,34 @@ pub fn bot_watch_indicator_label(indicator: BotWatchIndicator) -> &'static str {
         BotWatchIndicator::Ready => "bots: ready",
         BotWatchIndicator::Clean => "bots: clean",
         BotWatchIndicator::Failed => "bots: failed",
+    }
+}
+
+/// The style for a board ticket's `review:` badge (GitHub issue #153):
+/// `NeedsYou` is the loud one ([`STALE_MARKER`]'s bold red -- the loop has
+/// stopped without a clean verdict), `Reviewing` cyan (active, like
+/// [`audit_indicator_style`]'s running state), `Clean` [`DIM`] (nothing to
+/// do).
+pub fn auto_review_indicator_style(indicator: AutoReviewIndicator) -> Style {
+    match indicator {
+        AutoReviewIndicator::NeedsYou => STALE_MARKER,
+        AutoReviewIndicator::Reviewing => Style::new().fg(Color::Cyan),
+        AutoReviewIndicator::Clean => DIM,
+    }
+}
+
+/// Label text for a board ticket card's `review:` badge line (see
+/// [`auto_review_indicator_style`] for its color): the state, then the round
+/// count when one is known, e.g. `review: needs you 3/3`.
+pub fn auto_review_badge_label(badge: &AutoReviewBadge) -> String {
+    let state = match badge.indicator {
+        AutoReviewIndicator::Reviewing => "review: reviewing",
+        AutoReviewIndicator::Clean => "review: clean",
+        AutoReviewIndicator::NeedsYou => "review: needs you",
+    };
+    match &badge.rounds {
+        Some(rounds) => format!("{state} {rounds}"),
+        None => state.to_string(),
     }
 }
 
@@ -588,6 +618,50 @@ mod tests {
             assert!(label.starts_with("bots: "));
         }
         assert!(BOT_WATCH_STARTING_LABEL.starts_with("bots: "));
+    }
+
+    #[test]
+    fn auto_review_indicator_style_maps_every_indicator_to_a_distinct_style() {
+        assert_eq!(
+            auto_review_indicator_style(AutoReviewIndicator::NeedsYou),
+            STALE_MARKER
+        );
+        assert_eq!(
+            auto_review_indicator_style(AutoReviewIndicator::Reviewing).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(auto_review_indicator_style(AutoReviewIndicator::Clean), DIM);
+    }
+
+    #[test]
+    fn auto_review_indicator_style_never_sets_a_background() {
+        for indicator in [
+            AutoReviewIndicator::Reviewing,
+            AutoReviewIndicator::Clean,
+            AutoReviewIndicator::NeedsYou,
+        ] {
+            assert_eq!(auto_review_indicator_style(indicator).bg, None);
+        }
+    }
+
+    #[test]
+    fn auto_review_badge_label_names_the_state_and_appends_known_rounds() {
+        let badge = |indicator, rounds: Option<&str>| AutoReviewBadge {
+            indicator,
+            rounds: rounds.map(str::to_string),
+        };
+        assert_eq!(
+            auto_review_badge_label(&badge(AutoReviewIndicator::Reviewing, None)),
+            "review: reviewing"
+        );
+        assert_eq!(
+            auto_review_badge_label(&badge(AutoReviewIndicator::Clean, Some("1/3"))),
+            "review: clean 1/3"
+        );
+        assert_eq!(
+            auto_review_badge_label(&badge(AutoReviewIndicator::NeedsYou, Some("3/3"))),
+            "review: needs you 3/3"
+        );
     }
 
     #[test]
