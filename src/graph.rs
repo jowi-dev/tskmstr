@@ -24,7 +24,7 @@ use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::{Issue, LinkedIssue, Status};
 use crate::work::comment_store::iso8601_utc;
 
-pub use render::render_text;
+pub use render::{render_mermaid, render_text};
 
 /// The status category key for finished work.
 const DONE_CATEGORY: &str = "done";
