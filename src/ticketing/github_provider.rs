@@ -381,6 +381,22 @@ fn compute_new_ranks(
     assignments
 }
 
+/// Split a foreign `owner/name#<number>` key (the display-only form
+/// `GithubProvider::issue_key_in` gives an issue in another repo) into its
+/// repo slug and number. `None` for any other shape: a `GH-<n>` key, a slug
+/// without exactly one `/` or with an empty half, or a non-numeric number.
+fn parse_foreign_issue_key(key: &str) -> Option<(&str, u64)> {
+    let (repo, number) = key.split_once('#')?;
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((repo, number.parse().ok()?))
+}
+
 /// Extract the issue number out of a `GH-<number>`-shaped key (or any
 /// `<prefix>-<number>` key -- the prefix itself isn't validated, since
 /// `normalize_key`/`project_key_from_issue_key` upstream already establish
@@ -1098,11 +1114,16 @@ impl TicketProvider for GithubProvider<'_> {
     /// The issue's own page, built from the configured repo slug rather
     /// than fetched — `gh issue view` reports the same
     /// `https://github.com/{owner}/{name}/issues/{number}` shape, and
-    /// building it locally keeps this method infallible and free. A key
-    /// whose number can't be parsed (which `normalize_key` upstream should
-    /// never let through) degrades to the repo's issues list rather than a
-    /// broken link.
+    /// building it locally keeps this method infallible and free. A foreign
+    /// `owner/name#<number>` key (see `issue_key_in`: a sub-issue or parent
+    /// in another repo) links to that repo's issue page instead. Any other
+    /// key whose number can't be parsed (which `normalize_key` upstream
+    /// should never let through) degrades to the repo's issues list rather
+    /// than a broken link.
     fn issue_url(&self, key: &str) -> String {
+        if let Some((repo, number)) = parse_foreign_issue_key(key) {
+            return format!("https://github.com/{repo}/issues/{number}");
+        }
         match parse_issue_number(key) {
             Ok(number) => format!("https://github.com/{}/issues/{number}", self.repo),
             Err(_) => format!("https://github.com/{}/issues", self.repo),
@@ -2427,6 +2448,37 @@ mod tests {
             provider.issue_url("GH-13"),
             "https://github.com/jowi-dev/tskmstr/issues/13"
         );
+    }
+
+    #[test]
+    fn issue_url_foreign_repo_key_is_that_repos_issue_page() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(
+            provider.issue_url("octo-org/other-repo#42"),
+            "https://github.com/octo-org/other-repo/issues/42"
+        );
+    }
+
+    #[test]
+    fn issue_url_malformed_foreign_key_degrades_to_the_issues_list() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        for key in [
+            "octo-org/other-repo#",
+            "other-repo#42",
+            "a/b/c#42",
+            "/repo#42",
+            "octo/r#4x",
+        ] {
+            assert_eq!(
+                provider.issue_url(key),
+                "https://github.com/jowi-dev/tskmstr/issues",
+                "{key}"
+            );
+        }
     }
 
     #[test]
