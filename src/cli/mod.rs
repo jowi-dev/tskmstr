@@ -17,6 +17,7 @@ pub mod backend;
 pub mod check;
 pub mod dispatch;
 pub mod drift;
+pub mod graph;
 pub mod init;
 pub mod pr;
 pub mod ready;
