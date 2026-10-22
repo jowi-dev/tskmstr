@@ -409,12 +409,19 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
         let provider = ticket_provider_for(&config, self.keychain, self.env_token.clone())
             .map_err(|err| err.to_string())?;
         let gh = ShellGhCli::new();
+        let git = ShellGitOps::new();
+        let containment = tskmstr::blocker_stacking::BaseContainment::new(
+            &git,
+            repo_dir,
+            ready_lane_bases(&config, &git, repo_dir),
+        );
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: provider.as_ref(),
             gh: &gh,
             review_bots: &config.review_bots,
             in_flight: ready_in_flight(&config),
+            in_base: &|sha| containment.contains(sha),
             audit: ready_audit_gate(&config, &audit_store),
         };
         let resolver = tskmstr::config::FsBackendIdentityResolver {
@@ -1971,6 +1978,27 @@ fn ready_in_flight(config: &Config) -> tskmstr::blocker_stacking::InFlight {
         .unwrap_or_default()
 }
 
+/// The base branches `tm ready` checks a closed blocker PR's head against
+/// (GitHub issue #168): every configured lane's `base_branch`, or `dir`'s
+/// `origin/HEAD` when no lane sets one. Pass to
+/// [`tskmstr::blocker_stacking::BaseContainment::new`].
+fn ready_lane_bases(
+    config: &Config,
+    git: &dyn tskmstr::work::git::GitOps,
+    dir: &Path,
+) -> Vec<String> {
+    let bases: Vec<String> = config
+        .work
+        .lanes
+        .values()
+        .filter_map(|lane| lane.base_branch.clone())
+        .collect();
+    if !bases.is_empty() {
+        return bases;
+    }
+    git.default_base(dir).into_iter().collect()
+}
+
 /// The runs DB `tm ready`'s audit gate reads, opened only when `[ready]
 /// require_audit` is on (`None` when it's off). Pass to [`ready_audit_gate`],
 /// which borrows it.
@@ -2020,12 +2048,20 @@ fn run_ready(
     let config = config::load(paths)?;
     let jira = ticket_provider_for(&config, keychain, env_token)?;
     let gh = ShellGhCli::new();
+    let git = ShellGitOps::new();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let containment = tskmstr::blocker_stacking::BaseContainment::new(
+        &git,
+        &cwd,
+        ready_lane_bases(&config, &git, &cwd),
+    );
     let audit_store = open_ready_audit_store(&config);
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
         in_flight: ready_in_flight(&config),
+        in_base: &|sha| containment.contains(sha),
         audit: ready_audit_gate(&config, &audit_store),
     };
     let mut stdout = std::io::stdout();
@@ -2082,12 +2118,20 @@ fn run_ready_check(key: String) -> ExitCode {
         }
     };
     let gh = ShellGhCli::new();
+    let git = ShellGitOps::new();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let containment = tskmstr::blocker_stacking::BaseContainment::new(
+        &git,
+        &cwd,
+        ready_lane_bases(&config, &git, &cwd),
+    );
     let audit_store = open_ready_audit_store(&config);
     let ctx = tskmstr::cli::ready::ReadyContext {
         jira: jira.as_ref(),
         gh: &gh,
         review_bots: &config.review_bots,
         in_flight: ready_in_flight(&config),
+        in_base: &|sha| containment.contains(sha),
         audit: ready_audit_gate(&config, &audit_store),
     };
     let mut stdout = std::io::stdout();
@@ -2699,12 +2743,19 @@ impl AutopilotTicker {
                 ),
             };
         let gh = ShellGhCli::new();
+        let git = ShellGitOps::new();
+        let containment = tskmstr::blocker_stacking::BaseContainment::new(
+            &git,
+            &target.repo_root,
+            ready_lane_bases(&config, &git, &target.repo_root),
+        );
         let audit_store = open_ready_audit_store(&config);
         let candidates = tskmstr::cli::ready::ReadyContext {
             jira: jira.as_ref(),
             gh: &gh,
             review_bots: &config.review_bots,
             in_flight: ready_in_flight(&config),
+            in_base: &|sha| containment.contains(sha),
             audit: ready_audit_gate(&config, &audit_store),
         };
 

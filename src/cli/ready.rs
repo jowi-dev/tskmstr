@@ -53,6 +53,10 @@ pub struct ReadyContext<'a> {
     /// Each ticket's live lane run (see [`blocker_stacking::in_flight_lanes`]):
     /// a no-PR blocker with one reads as waiting rather than blocked.
     pub in_flight: blocker_stacking::InFlight,
+    /// Whether a commit is already in a lane base branch (normally a
+    /// [`blocker_stacking::BaseContainment`]): a blocker whose PR was closed
+    /// after its commits landed there counts as merged (GitHub issue #168).
+    pub in_base: &'a dyn Fn(&str) -> bool,
     /// The audit gate (GitHub issue #112): what a ticket with no blockers
     /// still needs before it counts as ready or stackable.
     pub audit: AuditGate<'a>,
@@ -444,7 +448,7 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
     let decisions: Vec<ListDecision> = candidates
         .iter()
         .map(|issue| {
-            let decision = list_decision(issue, prs.as_deref(), &ctx.in_flight);
+            let decision = list_decision(issue, prs.as_deref(), &ctx.in_flight, ctx.in_base);
             match decision {
                 ListDecision::Ready | ListDecision::Stackable { .. } => {
                     match ctx.audit.needs_audit(&issue.key) {
@@ -487,11 +491,13 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
 /// Classify `issue` via [`blocker_stacking::decide`]. `prs` is the blockers'
 /// repo PR list, or `None` when that lookup failed (or was skipped because no
 /// candidate had a blocker); a ticket with no direct blockers is ready
-/// without consulting it, matching [`check`].
+/// without consulting it, matching [`check`]. `in_base` is
+/// [`ReadyContext::in_base`].
 fn list_decision(
     issue: &Issue,
     prs: Option<&[PrSummary]>,
     in_flight: &blocker_stacking::InFlight,
+    in_base: &dyn Fn(&str) -> bool,
 ) -> ListDecision {
     if blocker_stacking::direct_blockers(issue).is_empty() {
         return ListDecision::Ready;
@@ -512,7 +518,7 @@ fn list_decision(
     };
 
     match blocker_stacking::decide(
-        blocker_stacking::unmerged_direct_blockers(issue, prs),
+        blocker_stacking::unmerged_direct_blockers(issue, prs, in_base),
         in_flight,
     ) {
         StackDecision::Ready => ListDecision::Ready,
@@ -636,7 +642,7 @@ pub fn check(
         }
     };
 
-    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
+    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, ctx.in_base);
     match blocker_stacking::decide(unmerged, &ctx.in_flight) {
         StackDecision::Ready => {
             ctx.audit.require(&normalized)?;
@@ -890,6 +896,7 @@ mod tests {
             gh,
             review_bots,
             in_flight: blocker_stacking::InFlight::new(),
+            in_base: &|_| false,
             audit: AuditGate::Off,
         }
     }
@@ -902,6 +909,7 @@ mod tests {
         crate::github::gh_cli::PrSummary {
             number,
             head_ref_name: head_ref_name.to_string(),
+            head_ref_oid: String::new(),
             lifecycle,
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -1243,6 +1251,78 @@ mod tests {
             "No ready tickets.\n\
              PROJ-1  Summary for PROJ-1  [blocked by PROJ-9 (In Progress), no PR yet]\n"
         );
+    }
+
+    fn closed_pr_with_head(
+        number: u64,
+        head_ref_name: &str,
+        head_ref_oid: &str,
+    ) -> crate::github::gh_cli::PrSummary {
+        crate::github::gh_cli::PrSummary {
+            head_ref_oid: head_ref_oid.to_string(),
+            ..pr_all_summary(
+                number,
+                head_ref_name,
+                crate::github::gh_cli::PrLifecycle::Closed,
+            )
+        }
+    }
+
+    /// GitHub issue #168's AX-713 incident: both blockers' PRs were closed
+    /// unmerged after their commits were pushed to staging, and both
+    /// tickets sit In Review. `tm ready <KEY>` must say ready, not blocked.
+    #[test]
+    fn check_is_ready_when_both_blockers_closed_prs_landed_in_the_base() {
+        let mut ticket = issue("AX-713");
+        ticket.fields.issue_links = ["AX-711", "AX-712"]
+            .iter()
+            .map(|key| IssueLink {
+                id: (*key).to_string(),
+                link_type: blocks_link_type(),
+                inward_issue: Some(linked_issue(key, "In Review", "indeterminate")),
+                outward_issue: None,
+            })
+            .collect();
+        let jira = FakeJiraClient::new().with_issue("AX-713", ticket);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![
+            closed_pr_with_head(673, "jowi-dev/ax-711-thing", "aaa111"),
+            closed_pr_with_head(696, "jowi-dev/ax-712-thing", "bbb222"),
+        ]));
+        let bots = cursor_bot();
+        let in_base = |sha: &str| sha == "aaa111" || sha == "bbb222";
+        let ctx = ReadyContext {
+            in_base: &in_base,
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        let outcome = check(&ctx, "AX-713", &mut out).expect("should be ready");
+
+        assert_eq!(outcome, ReadyOutcome::Ready);
+    }
+
+    #[test]
+    fn list_is_ready_when_a_blockers_closed_pr_landed_in_the_base() {
+        let blocked = blocked_issue("PROJ-1", &[("PROJ-8", "In Review", "indeterminate")]);
+        let jira = FakeJiraClient::new().with_search_result(search_result(vec![blocked]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![closed_pr_with_head(
+            3,
+            "jowi-dev/proj-8-thing",
+            "aaa111",
+        )]));
+        let bots = cursor_bot();
+        let in_base = |sha: &str| sha == "aaa111";
+        let ctx = ReadyContext {
+            in_base: &in_base,
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+        let mut out = Vec::new();
+
+        list(&ctx, &mut out).expect("should succeed");
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("blocked"), "{output}");
+        assert!(output.contains("PROJ-1"), "{output}");
     }
 
     #[test]
@@ -1923,6 +2003,7 @@ mod tests {
             std::path::Path::new("/repo"),
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
+            &|_| false,
         )
         .expect("resolve_blocker_stacking should also treat this as stackable, not refuse");
         assert_eq!(
@@ -1960,6 +2041,7 @@ mod tests {
             std::path::Path::new("/repo"),
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
+            &|_| false,
         )
         .expect("resolve_blocker_stacking should also treat this as ready, not refuse");
         assert_eq!(

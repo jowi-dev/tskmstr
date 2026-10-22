@@ -2815,19 +2815,27 @@ was stackable by `tm work run`'s own logic, but `tm ready` still reported it
 `BLOCKED`, and an autonomous lane prompt that treats `tm ready`'s word as
 final refused to touch it.
 
-For each of a ticket's *direct* `Blocks` blockers, satisfied means EITHER of
-these — a Jira status check and a PR merge-state check, either one clearing
-it independently:
+For each of a ticket's *direct* `Blocks` blockers, satisfied means ANY of
+these — a Jira status check and two PR checks, each one clearing it
+independently:
 
 - Jira status category **done** → satisfied, doesn't count, regardless of
   whether it ever had a PR at all (a config change, a spike, docs, or manual
   ops work often has none to find).
 - PR **merged** → satisfied, doesn't count, regardless of whether Jira's
   status has caught up yet.
+- PR **closed, with its head commit already in the lane base branch** →
+  satisfied. This covers a PR merged locally and pushed, then closed, and a
+  stacked PR whose own base was the blocker's branch: GitHub reports neither
+  as merged. `tm work run` checks the lane's `base_branch` (or
+  `origin/HEAD`); `tm ready` checks every configured lane's `base_branch`.
+  Both compare against the `origin/` ref after one `git fetch origin`, and
+  any git failure counts as "not in base". Squash and rebase merges rewrite
+  commits, so they are not detected. The board does not run this check.
 - otherwise, PR **open** → unmerged, a candidate to stack on.
-- otherwise, **no PR** (including a closed-but-unmerged one, or a PR whose
-  branch name doesn't match the lane-branch naming convention) → unmerged,
-  with nothing to stack on yet.
+- otherwise, **no PR** (including a closed one whose head is not in the
+  base, or a PR whose branch name doesn't match the lane-branch naming
+  convention) → unmerged, with nothing to stack on yet.
 
 Then, across the ticket's unmerged blockers:
 

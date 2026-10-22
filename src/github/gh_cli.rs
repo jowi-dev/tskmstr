@@ -489,7 +489,7 @@ pub trait GhCli {
     fn pr_url_for_branch(&self, branch: &str) -> Result<Option<String>, GhError>;
 
     /// List every pull request in the current repository, open *or* merged
-    /// (`gh pr list --state all --json number,headRefName,state,updatedAt`).
+    /// (`gh pr list --state all --json number,headRefName,headRefOid,state,updatedAt`).
     ///
     /// Used by `tm work run`'s blocked-ticket branch-off logic (see
     /// [`crate::work::run::resolve_blocker_stacking`]) to find and classify
@@ -727,7 +727,7 @@ pub trait GhCli {
     ) -> Result<(), GhError>;
 }
 
-/// A summary of one pull request — its number, head branch, lifecycle state,
+/// A summary of one pull request — its number, head branch and commit, lifecycle state,
 /// and last-updated timestamp — as returned by [`GhCli::pr_list_all`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSummary {
@@ -735,6 +735,11 @@ pub struct PrSummary {
     pub number: u64,
     /// The pull request's head branch name.
     pub head_ref_name: String,
+    /// The SHA of the pull request's head commit (`gh`'s `headRefOid`).
+    /// [`crate::blocker_stacking`] checks it against the lane's base branch
+    /// to tell a closed PR whose commits landed anyway (merged locally and
+    /// pushed) from an abandoned one.
+    pub head_ref_oid: String,
     /// The pull request's lifecycle state.
     pub lifecycle: PrLifecycle,
     /// `gh`'s reported `updatedAt`, an ISO-8601 timestamp. Only used to break
@@ -1004,7 +1009,7 @@ const PR_STATE_JSON_FIELDS: &str = "state";
 /// [`GhCli::pr_list_all`]; shared so the flag and [`RawPrListAllEntry`]
 /// deserialization stay in lockstep. Same `merged`-field pitfall as
 /// [`PR_STATE_JSON_FIELDS`] applies here.
-const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,state,updatedAt";
+const PR_LIST_ALL_JSON_FIELDS: &str = "number,headRefName,headRefOid,state,updatedAt";
 
 /// Fields requested from `gh pr list --json` in
 /// [`GhCli::pr_list_review_state`]: [`PR_VIEW_JSON_FIELDS`] plus review,
@@ -2798,20 +2803,22 @@ fn interpret_pr_review_state_output(
 }
 
 /// Raw shape of one entry in `gh pr list --state all --json
-/// number,headRefName,state,updatedAt` output, for deserialization only;
+/// number,headRefName,headRefOid,state,updatedAt` output, for deserialization only;
 /// [`PrSummary`] is the flattened shape callers use.
 #[derive(Debug, Deserialize)]
 struct RawPrListAllEntry {
     number: u64,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: String,
     state: String,
     #[serde(rename = "updatedAt")]
     updated_at: String,
 }
 
 /// Interpret the result of a `gh pr list --state all --json
-/// number,headRefName,state,updatedAt` invocation.
+/// number,headRefName,headRefOid,state,updatedAt` invocation.
 ///
 /// Pure over the exit code and captured stdout/stderr, for the same
 /// testability reasons as [`interpret_pr_view_output`]. `gh` reports `state`
@@ -2831,6 +2838,7 @@ fn interpret_pr_list_all_output(
                     .map(|entry| PrSummary {
                         number: entry.number,
                         head_ref_name: entry.head_ref_name,
+                        head_ref_oid: entry.head_ref_oid,
                         lifecycle: if entry.state.eq_ignore_ascii_case("merged") {
                             PrLifecycle::Merged
                         } else if entry.state.eq_ignore_ascii_case("closed") {
@@ -5339,6 +5347,20 @@ mod tests {
     }
 
     #[test]
+    fn pr_list_all_carries_each_head_commit_sha() {
+        let stdout = r#"[
+            {"number":1,"headRefName":"jowi-dev/ax-410-closed","headRefOid":"abc123","state":"CLOSED","updatedAt":"2026-08-03T00:00:00Z"}
+        ]"#;
+        let prs = interpret_pr_list_all_output(Some(0), stdout, "").unwrap();
+        assert_eq!(prs[0].head_ref_oid, "abc123");
+        assert!(
+            PR_LIST_ALL_JSON_FIELDS
+                .split(',')
+                .any(|f| f == "headRefOid")
+        );
+    }
+
+    #[test]
     fn pr_list_all_failure_is_a_command_error() {
         let err =
             interpret_pr_list_all_output(Some(1), "", "gh: authentication required").unwrap_err();
@@ -5776,7 +5798,7 @@ mod tests {
     fn pr_list_all_does_not_request_the_merged_field() {
         assert_eq!(
             PR_LIST_ALL_JSON_FIELDS,
-            "number,headRefName,state,updatedAt"
+            "number,headRefName,headRefOid,state,updatedAt"
         );
     }
 

@@ -86,7 +86,7 @@ use thiserror::Error;
 
 use crate::agent::routing::DEFAULT_EXHAUSTED_HOLD_SECS;
 use crate::agent::{AgentError, AgentInvocation, AgentRunner, InvocationInputs, RunMode};
-use crate::blocker_stacking::{self, InFlight, StackDecision};
+use crate::blocker_stacking::{self, BaseContainment, InFlight, StackDecision};
 use crate::config::{BackendIdentity, BackendIdentityResolver, ConfigError, WorkConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
@@ -772,6 +772,12 @@ impl BlockerResolution {
 /// visible). See [`GhError::is_permanent`]'s doc comment for the full
 /// incident and the narrow stderr-based detection this relies on.
 ///
+/// `in_base` is [`blocker_stacking::unmerged_direct_blockers`]'s
+/// containment check: whether a closed blocker PR's head commit is already
+/// in the lane's base branch, which clears that blocker (GitHub issue #168).
+/// [`prepare_run_lane`] passes a [`BaseContainment`] over the lane's
+/// `base_branch` (or `origin/HEAD`).
+///
 /// `repo_root` is passed through to [`GhCli::pr_list_all`] unchanged: a lane
 /// run targets `lane_config.repo`, not necessarily the invoking process's
 /// cwd, so `gh` must be told explicitly which repository's PRs to list (see
@@ -785,6 +791,7 @@ pub fn resolve_blocker_stacking(
     repo_root: &Path,
     ticket: Option<&str>,
     in_flight: &InFlight,
+    in_base: &dyn Fn(&str) -> bool,
 ) -> Result<BlockerResolution, RunLaneError> {
     let Some(ticket_provider) = ticket_provider else {
         return Ok(BlockerResolution::default());
@@ -827,7 +834,7 @@ pub fn resolve_blocker_stacking(
         }
     };
 
-    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs);
+    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, in_base);
     match blocker_stacking::decide(unmerged, in_flight) {
         StackDecision::Ready => Ok(BlockerResolution::default()),
         StackDecision::Stackable {
@@ -1137,12 +1144,21 @@ pub fn prepare_run_lane(
             .list_runs_filtered(Some(&deps.current_backend_identity.scope()), Some("lane"))
             .map(|runs| blocker_stacking::in_flight_lanes(&runs))
             .unwrap_or_default();
+        // A blocker PR closed after its commits reached this lane's base
+        // counts as merged (GitHub issue #168). Checked against the lane's
+        // base, not the PR's own, which for a stacked PR is another branch.
+        let lane_base = lane_config
+            .base_branch
+            .clone()
+            .or_else(|| deps.git.default_base(&repo_root).ok());
+        let containment = BaseContainment::new(deps.git, &repo_root, lane_base);
         match resolve_blocker_stacking(
             deps.ticket_provider,
             deps.gh,
             &repo_root,
             request.ticket.as_deref(),
             &in_flight,
+            &|sha| containment.contains(sha),
         ) {
             Ok(resolution) => resolution,
             Err(err) => {
@@ -2393,6 +2409,7 @@ mod tests {
         PrSummary {
             number,
             head_ref_name: head_ref_name.to_string(),
+            head_ref_oid: String::new(),
             lifecycle,
             updated_at: "2026-08-06T00:00:00Z".to_string(),
         }
@@ -6854,9 +6871,15 @@ mod tests {
         let jira = FakeJiraClient::new().with_issue("AX-1", issue("AX-1", "Something"));
         let gh = FakeGhCli::new();
 
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, Path::new("/repo"), None, &InFlight::new())
-                .unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            None,
+            &InFlight::new(),
+            &|_| false,
+        )
+        .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
         assert!(gh.pr_list_all_calls().is_empty());
@@ -6872,6 +6895,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-1"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -6890,6 +6914,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-1"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -6913,6 +6938,30 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(resolution, BlockerResolution::default());
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_closed_pr_landed_in_base_uses_normal_base() {
+        let mut blocked = issue("AX-2", "Depends on AX-410");
+        blocked.fields.issue_links = vec![blocks_link("AX-410", "indeterminate")];
+        let jira = FakeJiraClient::new().with_issue("AX-2", blocked);
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![PrSummary {
+            head_ref_oid: "aaa111".to_string(),
+            ..pr_summary(10, "jowi-dev/ax-410-add-connector", PrLifecycle::Closed)
+        }]));
+
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            Path::new("/repo"),
+            Some("AX-2"),
+            &InFlight::new(),
+            &|sha| sha == "aaa111",
         )
         .unwrap();
 
@@ -6936,6 +6985,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -6954,9 +7004,15 @@ mod tests {
         )]));
 
         let repo_root = Path::new("/repo");
-        let resolution =
-            resolve_blocker_stacking(Some(&jira), &gh, repo_root, Some("AX-2"), &InFlight::new())
-                .unwrap();
+        let resolution = resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            repo_root,
+            Some("AX-2"),
+            &InFlight::new(),
+            &|_| false,
+        )
+        .unwrap();
         assert_eq!(gh.pr_list_all_calls(), vec![repo_root.to_path_buf()]);
 
         assert_eq!(
@@ -6986,6 +7042,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -7015,6 +7072,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &in_flight,
+            &|_| false,
         )
         .unwrap_err();
 
@@ -7048,6 +7106,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap_err();
 
@@ -7073,6 +7132,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -7099,6 +7159,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap();
 
@@ -7130,6 +7191,7 @@ mod tests {
             Path::new("/repo"),
             Some("AX-2"),
             &InFlight::new(),
+            &|_| false,
         )
         .unwrap_err();
 
@@ -7207,6 +7269,73 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("blocked by AX-410"));
+    }
+
+    /// GitHub issue #168: the blocker's PR was closed after its commits were
+    /// pushed to the lane's base, so the run cuts from that base with no
+    /// "no PR found" warning.
+    #[test]
+    fn prepare_run_lane_treats_a_closed_blocker_pr_landed_in_the_lane_base_as_merged() {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            LaneConfig {
+                base_branch: Some("staging".to_string()),
+                ..lane_config(&repo_root.to_string_lossy())
+            },
+            &worktree_root,
+        );
+
+        let mut blocked = issue("AX-713", "Depends on AX-711");
+        blocked.fields.issue_links = vec![blocks_link("AX-711", "indeterminate")];
+        let jira = FakeJiraClient::new().with_issue("AX-713", blocked);
+        let git = FakeGitOps::new()
+            .with_is_ancestor_result(Ok(false))
+            .with_is_ancestor_for("aaa111", "origin/staging", Ok(true));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![PrSummary {
+            head_ref_oid: "aaa111".to_string(),
+            ..pr_summary(673, "jowi-dev/ax-711-thing", PrLifecycle::Closed)
+        }]));
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 10, 22, 9, 5, 3));
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &FakeProcessSpawner::success(canned_json()),
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: Some(&jira),
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+        };
+        let paths = RunLanePaths {
+            home,
+            state_dir: tmp.path().join("state"),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let mut out = Vec::new();
+
+        let request = RunLaneRequest {
+            ticket: Some("AX-713".to_string()),
+            ..Default::default()
+        };
+
+        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+
+        let calls = git.switch_new_branch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].base, "staging");
+        let printed = String::from_utf8(out).unwrap();
+        assert!(!printed.contains("AX-711"), "printed: {printed}");
     }
 
     #[test]
