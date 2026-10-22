@@ -1310,10 +1310,11 @@ board still loads, without epic lines, and the status line says why.
 | `h` / `Left` | Move to the previous column (board only) |
 | `l` / `Right` | Move to the next column (board only) |
 | `Enter` | Drill into the selected ticket, or apply the selected transition |
-| `Esc` / `q` | Go back a screen, or quit from the board |
+| `Esc` / `q` | Go back a screen, or quit from the board. On the board, `Esc` with a search query applied clears the query instead of quitting; `q` always quits |
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
@@ -1342,6 +1343,26 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### Searching the board
+
+Pressing `i` or `/` on the board enters search mode. Every key you type then
+goes into the search query rather than running its usual action, so `q`,
+`M`, `?` and the rest are typed as text. Each keystroke narrows the board to
+the cards whose key or summary contains the query, ignoring case. Columns
+keep their order; a column with no matching cards stays on screen, empty, and
+every column title reads `shown/total` while a query is applied. The status
+line shows `Search: <query>`.
+
+`Enter` leaves search mode and keeps the filter, so the normal board keys act
+on the filtered cards. `Esc` in search mode clears the query and leaves.
+Back in normal mode, `Esc` clears an applied query, and quits only once no
+query is left. `Backspace` deletes the last character.
+
+The search filters only the cards the board has already loaded, so it works
+the same on Jira and GitHub and composes with the `f` assignee filter: the
+query survives `r` refreshes and `f` refetches. A merge queue built with
+`Space` still merges every queued ticket, including ones the search hides.
 
 ### Assigning a ticket from the board
 
