@@ -40,7 +40,8 @@
 //!   branch (GitHub issue #168). A PR merged locally and pushed, then
 //!   closed, never shows as merged on GitHub; a stacked PR whose own base is
 //!   the blocker's branch never does either. The caller supplies the
-//!   containment check, so this stays pure. Squash and rebase merges rewrite commits and are not detected.
+//!   containment check ([`BaseContainment`] in production), so this stays
+//!   pure. Squash and rebase merges rewrite commits and are not detected.
 //!
 //! Otherwise it remains unmerged, split by PR state:
 //! - PR **open** → an unmerged blocker with something to stack on.
@@ -63,11 +64,14 @@
 //!   branch can only be stacked on one dependency at a time, so this refuses
 //!   rather than guessing which one.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::github::gh_cli::{PrLifecycle, PrSummary};
 use crate::runs::{RunStatus, RunSummary};
 use crate::ticketing::types::{Issue, LinkedIssue};
+use crate::work::git::GitOps;
 
 /// All direct `Blocks`-type blockers of `issue`, regardless of Jira status.
 ///
@@ -194,6 +198,59 @@ pub fn unmerged_direct_blockers(
             })
         })
         .collect()
+}
+
+/// The production containment check for [`unmerged_direct_blockers`]'s
+/// `in_base`: whether a commit is an ancestor of any of a set of base
+/// branches, compared on their `origin/` remote-tracking refs.
+///
+/// The first [`Self::contains`] call runs `git fetch origin` once, so a
+/// ticket with no closed blocker PR never pays for a fetch. Every git
+/// failure (offline fetch, a SHA or ref git doesn't have) reads as "not in
+/// base", which is the rule as it was before GitHub issue #168.
+pub struct BaseContainment<'a> {
+    git: &'a dyn GitOps,
+    dir: PathBuf,
+    bases: Vec<String>,
+    fetched: Cell<bool>,
+}
+
+impl<'a> BaseContainment<'a> {
+    /// Check against `bases` (e.g. a lane's `base_branch`, `staging` or
+    /// `origin/staging`) in the repository at `dir`.
+    pub fn new(git: &'a dyn GitOps, dir: &Path, bases: impl IntoIterator<Item = String>) -> Self {
+        let mut remote_bases: Vec<String> = Vec::new();
+        for base in bases {
+            let remote = if base.starts_with("origin/") {
+                base
+            } else {
+                format!("origin/{base}")
+            };
+            if !remote_bases.contains(&remote) {
+                remote_bases.push(remote);
+            }
+        }
+        Self {
+            git,
+            dir: dir.to_path_buf(),
+            bases: remote_bases,
+            fetched: Cell::new(false),
+        }
+    }
+
+    /// Whether `sha` is already in any of the base branches.
+    pub fn contains(&self, sha: &str) -> bool {
+        if self.bases.is_empty() {
+            return false;
+        }
+        if !self.fetched.replace(true) {
+            // A failed fetch still leaves the last-fetched refs to check.
+            let _ = self.git.fetch_origin(&self.dir);
+        }
+        self.bases
+            .iter()
+            .any(|base| self.git.is_ancestor(&self.dir, sha, base).unwrap_or(false))
+    }
 }
 
 /// The decision [`decide`] returns: what a ticket's unmerged direct blockers
@@ -414,6 +471,7 @@ mod tests {
     use crate::ticketing::types::{
         IssueFields, IssueLink, IssueLinkType, LinkedIssueFields, Status, StatusCategory,
     };
+    use crate::work::git::{FakeGitOps, GitError};
 
     fn blocks_link_type() -> IssueLinkType {
         IssueLinkType {
@@ -701,6 +759,62 @@ mod tests {
             panic!("an empty SHA must not be checked")
         });
         assert_eq!(unmerged.len(), 1);
+    }
+
+    fn git_error() -> GitError {
+        GitError::Command {
+            command: "git".to_string(),
+            exit_code: Some(128),
+            stderr: "fatal".to_string(),
+        }
+    }
+
+    #[test]
+    fn base_containment_checks_the_remote_tracking_ref_of_each_base() {
+        let git = FakeGitOps::new()
+            .with_is_ancestor_result(Ok(false))
+            .with_is_ancestor_for("aaa111", "origin/staging", Ok(true));
+        let check = BaseContainment::new(&git, Path::new("/repo"), ["staging".to_string()]);
+        assert!(check.contains("aaa111"));
+        assert!(!check.contains("bbb222"));
+    }
+
+    #[test]
+    fn base_containment_keeps_an_already_remote_base_as_is() {
+        let git = FakeGitOps::new()
+            .with_is_ancestor_result(Ok(false))
+            .with_is_ancestor_for("aaa111", "origin/main", Ok(true));
+        let check = BaseContainment::new(&git, Path::new("/repo"), ["origin/main".to_string()]);
+        assert!(check.contains("aaa111"));
+    }
+
+    #[test]
+    fn base_containment_fetches_once_and_only_when_asked() {
+        let git = FakeGitOps::new().with_is_ancestor_result(Ok(false));
+        let check = BaseContainment::new(&git, Path::new("/repo"), ["staging".to_string()]);
+        assert!(git.fetch_origin_calls().is_empty());
+        check.contains("aaa111");
+        check.contains("bbb222");
+        assert_eq!(git.fetch_origin_calls(), vec![PathBuf::from("/repo")]);
+    }
+
+    /// GitHub issue #168's safe-failure criterion: no network, or a SHA or
+    /// ref git doesn't have, reads as "not in base", today's behaviour.
+    #[test]
+    fn base_containment_treats_git_failures_as_not_in_base() {
+        let git = FakeGitOps::new()
+            .with_fetch_origin_result(Err(git_error()))
+            .with_is_ancestor_result(Err(git_error()));
+        let check = BaseContainment::new(&git, Path::new("/repo"), ["staging".to_string()]);
+        assert!(!check.contains("aaa111"));
+    }
+
+    #[test]
+    fn base_containment_with_no_bases_never_touches_git() {
+        let git = FakeGitOps::new();
+        let check = BaseContainment::new(&git, Path::new("/repo"), Vec::<String>::new());
+        assert!(!check.contains("aaa111"));
+        assert!(git.fetch_origin_calls().is_empty());
     }
 
     #[test]
