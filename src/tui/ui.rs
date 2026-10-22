@@ -2479,6 +2479,7 @@ mod tests {
             bot_watch_status: &app.bot_watch_status,
             pending_bot_watch: &app.pending_bot_watch_launches,
             cleanup_status: &app.cleanup_status,
+            auto_review_status: &app.auto_review_status,
             merge_queue: &app.merge_queue,
         };
         let plain = card_height(&ticket("PROJ-1"), 30, false, &badges);
