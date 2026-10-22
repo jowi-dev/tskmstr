@@ -1924,6 +1924,7 @@ mod tests {
             std::path::Path::new("/repo"),
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
+            &|_| false,
         )
         .expect("resolve_blocker_stacking should also treat this as stackable, not refuse");
         assert_eq!(
@@ -1961,6 +1962,7 @@ mod tests {
             std::path::Path::new("/repo"),
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
+            &|_| false,
         )
         .expect("resolve_blocker_stacking should also treat this as ready, not refuse");
         assert_eq!(
