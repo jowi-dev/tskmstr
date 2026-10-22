@@ -192,22 +192,6 @@ impl TicketKind {
     }
 }
 
-/// Refuse a [`NewTicket`] that asks for an epic or a parent, for a backend
-/// that can't create either yet. Without this the backend would silently
-/// create a plain, unparented Task, which looks like success but isn't.
-pub(crate) fn refuse_epic_or_parent(req: &NewTicket) -> Result<(), ProviderError> {
-    let operation = if req.kind == TicketKind::Epic {
-        "creating an epic"
-    } else if req.parent_key.is_some() {
-        "creating a ticket under an epic"
-    } else {
-        return Ok(());
-    };
-    Err(ProviderError::NotSupported {
-        operation: operation.to_string(),
-    })
-}
-
 /// Document-label prefixes that look like ticket keys but never are:
 /// `ADR-0006` in a PR body is an architecture-decision-record reference,
 /// not a ticket, and scraping it as one associated PR #34 with the wrong
