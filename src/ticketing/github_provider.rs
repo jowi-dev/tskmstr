@@ -841,6 +841,17 @@ impl TicketProvider for GithubProvider<'_> {
                 .filter(|issue| wanted.contains(&issue.key.to_uppercase()))
                 .collect()
             }
+            TicketQuery::Epics { .. } => {
+                // Closed epics included: a done epic still matters when it
+                // unlocked an open one. Bounded by `gh issue list`'s 200
+                // limit, like `Keys`: an epic older than the newest 200
+                // epic-labeled issues is missing from the result.
+                self.list_and_map(IssueListFilter {
+                    state: IssueListState::All,
+                    labels: vec![EPIC_LABEL.to_string()],
+                    ..Default::default()
+                })?
+            }
         };
         Ok(SearchResult {
             issues,
@@ -1786,6 +1797,28 @@ mod tests {
         let calls = fake.issue_list_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.state, IssueListState::All);
+    }
+
+    #[test]
+    fn search_epics_lists_open_and_closed_epic_labeled_issues() {
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![
+            issue_info(1, "Open epic", IssueState::Open, &[EPIC_LABEL]),
+            issue_info(2, "Done epic", IssueState::Closed, &[EPIC_LABEL]),
+        ]));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let result = provider
+            .search(&TicketQuery::Epics {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap();
+
+        let keys: Vec<_> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["GH-1", "GH-2"]);
+        let calls = fake.issue_list_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.state, IssueListState::All);
+        assert_eq!(calls[0].1.labels, vec![EPIC_LABEL.to_string()]);
     }
 
     #[test]
