@@ -381,6 +381,22 @@ fn compute_new_ranks(
     assignments
 }
 
+/// Split a foreign `owner/name#<number>` key (the display-only form
+/// `GithubProvider::issue_key_in` gives an issue in another repo) into its
+/// repo slug and number. `None` for any other shape: a `GH-<n>` key, a slug
+/// without exactly one `/` or with an empty half, or a non-numeric number.
+fn parse_foreign_issue_key(key: &str) -> Option<(&str, u64)> {
+    let (repo, number) = key.split_once('#')?;
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((repo, number.parse().ok()?))
+}
+
 /// Extract the issue number out of a `GH-<number>`-shaped key (or any
 /// `<prefix>-<number>` key -- the prefix itself isn't validated, since
 /// `normalize_key`/`project_key_from_issue_key` upstream already establish
@@ -841,6 +857,17 @@ impl TicketProvider for GithubProvider<'_> {
                 .filter(|issue| wanted.contains(&issue.key.to_uppercase()))
                 .collect()
             }
+            TicketQuery::Epics { .. } => {
+                // Closed epics included: a done epic still matters when it
+                // unlocked an open one. Bounded by `gh issue list`'s 200
+                // limit, like `Keys`: an epic older than the newest 200
+                // epic-labeled issues is missing from the result.
+                self.list_and_map(IssueListFilter {
+                    state: IssueListState::All,
+                    labels: vec![EPIC_LABEL.to_string()],
+                    ..Default::default()
+                })?
+            }
         };
         Ok(SearchResult {
             issues,
@@ -872,6 +899,28 @@ impl TicketProvider for GithubProvider<'_> {
             let links = &mut issue.fields.issue_links;
             links.retain(|link| link.inward_issue.is_none());
             links.extend(self.to_issue_links(number, deps));
+        }
+        Ok(())
+    }
+
+    /// Fetch both dependency sides of every issue in one batched
+    /// [`GhCli::issues_dependencies`] call and replace each issue's links
+    /// with them, inward and outward alike. Unlike
+    /// [`TicketProvider::hydrate_blockers`], nothing already in
+    /// `issue_links` survives: the fetch is the whole truth for both
+    /// directions.
+    fn hydrate_dependencies(&self, issues: &mut [Issue]) -> Result<(), ProviderError> {
+        let numbers = issues
+            .iter()
+            .map(|issue| parse_issue_number(&issue.key))
+            .collect::<Result<Vec<u64>, _>>()?;
+        let mut dependencies = self
+            .gh
+            .issues_dependencies(&self.repo, &numbers)
+            .map_err(ProviderError::from)?;
+        for (issue, number) in issues.iter_mut().zip(numbers) {
+            let deps = dependencies.remove(&number).unwrap_or_default();
+            issue.fields.issue_links = self.to_issue_links(number, deps);
         }
         Ok(())
     }
@@ -1065,11 +1114,16 @@ impl TicketProvider for GithubProvider<'_> {
     /// The issue's own page, built from the configured repo slug rather
     /// than fetched — `gh issue view` reports the same
     /// `https://github.com/{owner}/{name}/issues/{number}` shape, and
-    /// building it locally keeps this method infallible and free. A key
-    /// whose number can't be parsed (which `normalize_key` upstream should
-    /// never let through) degrades to the repo's issues list rather than a
-    /// broken link.
+    /// building it locally keeps this method infallible and free. A foreign
+    /// `owner/name#<number>` key (see `issue_key_in`: a sub-issue or parent
+    /// in another repo) links to that repo's issue page instead. Any other
+    /// key whose number can't be parsed (which `normalize_key` upstream
+    /// should never let through) degrades to the repo's issues list rather
+    /// than a broken link.
     fn issue_url(&self, key: &str) -> String {
+        if let Some((repo, number)) = parse_foreign_issue_key(key) {
+            return format!("https://github.com/{repo}/issues/{number}");
+        }
         match parse_issue_number(key) {
             Ok(number) => format!("https://github.com/{}/issues/{number}", self.repo),
             Err(_) => format!("https://github.com/{}/issues", self.repo),
@@ -1711,6 +1765,104 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_dependencies_fills_both_directions_for_every_issue_in_one_call() {
+        let dep = |number: u64, title: &str| IssueRef {
+            number,
+            title: title.to_string(),
+            state: IssueState::Open,
+            url: String::new(),
+        };
+        let fake = FakeGhCli::new()
+            .with_issue_list(Ok(vec![
+                issue_info(1, "Unlocker", IssueState::Closed, &[EPIC_LABEL]),
+                issue_info(2, "Unlocked", IssueState::Open, &[EPIC_LABEL]),
+            ]))
+            .with_issues_dependencies(
+                1,
+                IssueDependencies {
+                    blocking: vec![dep(5, "Blocked elsewhere")],
+                    ..Default::default()
+                },
+            )
+            .with_issues_dependencies(
+                2,
+                IssueDependencies {
+                    blocked_by: vec![dep(7, "Blocker")],
+                    ..Default::default()
+                },
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = provider
+            .search(&TicketQuery::Epics {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap()
+            .issues;
+
+        provider.hydrate_dependencies(&mut issues).unwrap();
+
+        let links = &issues[0].fields.issue_links;
+        assert_eq!(links.len(), 1);
+        assert!(links[0].inward_issue.is_none());
+        assert_eq!(links[0].outward_issue.as_ref().unwrap().key, "GH-5");
+        assert_eq!(links[0].id, link_id(1, 5));
+        let links = &issues[1].fields.issue_links;
+        assert_eq!(links.len(), 1);
+        assert!(links[0].outward_issue.is_none());
+        assert_eq!(links[0].inward_issue.as_ref().unwrap().key, "GH-7");
+        assert_eq!(links[0].id, link_id(7, 2));
+        assert_eq!(
+            fake.issues_dependencies_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![1, 2])],
+            "one batched call regardless of issue count"
+        );
+    }
+
+    #[test]
+    fn hydrate_dependencies_replaces_existing_links() {
+        let fake = FakeGhCli::new().with_issue_blocked_by(
+            1,
+            vec![IssueRef {
+                number: 9,
+                title: "Stale blocker".to_string(),
+                state: IssueState::Open,
+                url: String::new(),
+            }],
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-1",
+            1,
+            issue_info(1, "Epic", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+        provider.hydrate_blockers(&mut issues).unwrap();
+        assert_eq!(issues[0].fields.issue_links.len(), 1);
+
+        provider.hydrate_dependencies(&mut issues).unwrap();
+
+        assert!(issues[0].fields.issue_links.is_empty());
+    }
+
+    #[test]
+    fn hydrate_dependencies_failure_is_an_error() {
+        let fake = FakeGhCli::new().with_issues_dependencies_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "rate limited".to_string(),
+        });
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-1",
+            1,
+            issue_info(1, "Epic", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+
+        assert!(provider.hydrate_dependencies(&mut issues).is_err());
+    }
+
+    #[test]
     fn search_unassigned_filters_out_assigned_issues_client_side() {
         let mut assigned = issue_info(1, "Assigned", IssueState::Open, &[]);
         assigned.assignees = vec!["someone".to_string()];
@@ -1786,6 +1938,28 @@ mod tests {
         let calls = fake.issue_list_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.state, IssueListState::All);
+    }
+
+    #[test]
+    fn search_epics_lists_open_and_closed_epic_labeled_issues() {
+        let fake = FakeGhCli::new().with_issue_list(Ok(vec![
+            issue_info(1, "Open epic", IssueState::Open, &[EPIC_LABEL]),
+            issue_info(2, "Done epic", IssueState::Closed, &[EPIC_LABEL]),
+        ]));
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        let result = provider
+            .search(&TicketQuery::Epics {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap();
+
+        let keys: Vec<_> = result.issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["GH-1", "GH-2"]);
+        let calls = fake.issue_list_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.state, IssueListState::All);
+        assert_eq!(calls[0].1.labels, vec![EPIC_LABEL.to_string()]);
     }
 
     #[test]
@@ -2274,6 +2448,37 @@ mod tests {
             provider.issue_url("GH-13"),
             "https://github.com/jowi-dev/tskmstr/issues/13"
         );
+    }
+
+    #[test]
+    fn issue_url_foreign_repo_key_is_that_repos_issue_page() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        assert_eq!(
+            provider.issue_url("octo-org/other-repo#42"),
+            "https://github.com/octo-org/other-repo/issues/42"
+        );
+    }
+
+    #[test]
+    fn issue_url_malformed_foreign_key_degrades_to_the_issues_list() {
+        let fake = FakeGhCli::new();
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+
+        for key in [
+            "octo-org/other-repo#",
+            "other-repo#42",
+            "a/b/c#42",
+            "/repo#42",
+            "octo/r#4x",
+        ] {
+            assert_eq!(
+                provider.issue_url(key),
+                "https://github.com/jowi-dev/tskmstr/issues",
+                "{key}"
+            );
+        }
     }
 
     #[test]

@@ -205,6 +205,7 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
+| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |

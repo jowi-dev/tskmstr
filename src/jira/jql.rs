@@ -115,12 +115,23 @@ pub fn children_jql(epic_key: &str) -> String {
     format!("parent = \"{escaped}\" ORDER BY Rank ASC")
 }
 
+/// The JQL query used by `tm graph` to list every epic in `project_key`,
+/// Done ones included: a Done epic still matters when it unlocked an open
+/// one. `epic_issue_type` is the project's epic type name
+/// ([`crate::config::Config::epic_issue_type`]), quoted and escaped via
+/// [`escape_jql_string`] since it comes from config. Ordered by `Rank ASC`,
+/// backlog order, like [`ranked_tickets_jql`].
+pub fn epics_jql(project_key: &str, epic_issue_type: &str) -> String {
+    let escaped = escape_jql_string(epic_issue_type);
+    format!("project = {project_key} AND issuetype = \"{escaped}\" ORDER BY Rank ASC")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        assignee_tickets_jql, children_jql, everyone_tickets_jql, keys_jql, my_open_tickets_jql,
-        ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql, ticket_search_jql,
-        unassigned_tickets_jql,
+        assignee_tickets_jql, children_jql, epics_jql, everyone_tickets_jql, keys_jql,
+        my_open_tickets_jql, ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql,
+        ticket_search_jql, unassigned_tickets_jql,
     };
 
     #[test]
@@ -136,6 +147,22 @@ mod tests {
         assert_eq!(
             children_jql(r#"PROJ-1" OR project = X"#),
             r#"parent = "PROJ-1\" OR project = X" ORDER BY Rank ASC"#
+        );
+    }
+
+    #[test]
+    fn epics_jql_lists_every_epic_in_the_project_in_rank_order() {
+        assert_eq!(
+            epics_jql("PROJ", "Epic"),
+            "project = PROJ AND issuetype = \"Epic\" ORDER BY Rank ASC"
+        );
+    }
+
+    #[test]
+    fn epics_jql_escapes_the_epic_issue_type() {
+        assert_eq!(
+            epics_jql("PROJ", r#"Big "Epic""#),
+            r#"project = PROJ AND issuetype = "Big \"Epic\"" ORDER BY Rank ASC"#
         );
     }
 
