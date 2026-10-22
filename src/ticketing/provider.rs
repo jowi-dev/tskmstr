@@ -305,6 +305,18 @@ pub trait TicketProvider {
     }
 
     /// Ensure every issue in `issues` (fresh from [`Self::search`]) carries
+    /// all of its `Blocks` links in `issue_links`, in both directions: the
+    /// issues blocking it and the issues it blocks. `tm graph` uses this to
+    /// find which epics unlock which.
+    ///
+    /// The default is a no-op: Jira's search already returns `issuelinks` in
+    /// both directions. The github backend overrides this with one batched
+    /// fetch for all of `issues`. An `Err` means the links are unknown.
+    fn hydrate_dependencies(&self, _issues: &mut [Issue]) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Ensure every issue in `issues` (fresh from [`Self::search`]) carries
     /// its epic in [`IssueFields::parent`](crate::ticketing::types::IssueFields::parent),
     /// so a board can show which epic each card belongs to.
     ///

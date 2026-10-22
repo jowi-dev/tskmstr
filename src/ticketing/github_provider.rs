@@ -887,6 +887,28 @@ impl TicketProvider for GithubProvider<'_> {
         Ok(())
     }
 
+    /// Fetch both dependency sides of every issue in one batched
+    /// [`GhCli::issues_dependencies`] call and replace each issue's links
+    /// with them, inward and outward alike. Unlike
+    /// [`TicketProvider::hydrate_blockers`], nothing already in
+    /// `issue_links` survives: the fetch is the whole truth for both
+    /// directions.
+    fn hydrate_dependencies(&self, issues: &mut [Issue]) -> Result<(), ProviderError> {
+        let numbers = issues
+            .iter()
+            .map(|issue| parse_issue_number(&issue.key))
+            .collect::<Result<Vec<u64>, _>>()?;
+        let mut dependencies = self
+            .gh
+            .issues_dependencies(&self.repo, &numbers)
+            .map_err(ProviderError::from)?;
+        for (issue, number) in issues.iter_mut().zip(numbers) {
+            let deps = dependencies.remove(&number).unwrap_or_default();
+            issue.fields.issue_links = self.to_issue_links(number, deps);
+        }
+        Ok(())
+    }
+
     /// Fetch every issue's parent in one batched [`GhCli::issues_parents`]
     /// call, as [`TicketProvider::hydrate_blockers`] does for blockers.
     fn hydrate_parents(&self, issues: &mut [Issue]) -> Result<(), ProviderError> {
@@ -1719,6 +1741,104 @@ mod tests {
         )];
 
         assert!(provider.hydrate_blockers(&mut issues).is_err());
+    }
+
+    #[test]
+    fn hydrate_dependencies_fills_both_directions_for_every_issue_in_one_call() {
+        let dep = |number: u64, title: &str| IssueRef {
+            number,
+            title: title.to_string(),
+            state: IssueState::Open,
+            url: String::new(),
+        };
+        let fake = FakeGhCli::new()
+            .with_issue_list(Ok(vec![
+                issue_info(1, "Unlocker", IssueState::Closed, &[EPIC_LABEL]),
+                issue_info(2, "Unlocked", IssueState::Open, &[EPIC_LABEL]),
+            ]))
+            .with_issues_dependencies(
+                1,
+                IssueDependencies {
+                    blocking: vec![dep(5, "Blocked elsewhere")],
+                    ..Default::default()
+                },
+            )
+            .with_issues_dependencies(
+                2,
+                IssueDependencies {
+                    blocked_by: vec![dep(7, "Blocker")],
+                    ..Default::default()
+                },
+            );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = provider
+            .search(&TicketQuery::Epics {
+                project_key: "ignored".to_string(),
+            })
+            .unwrap()
+            .issues;
+
+        provider.hydrate_dependencies(&mut issues).unwrap();
+
+        let links = &issues[0].fields.issue_links;
+        assert_eq!(links.len(), 1);
+        assert!(links[0].inward_issue.is_none());
+        assert_eq!(links[0].outward_issue.as_ref().unwrap().key, "GH-5");
+        assert_eq!(links[0].id, link_id(1, 5));
+        let links = &issues[1].fields.issue_links;
+        assert_eq!(links.len(), 1);
+        assert!(links[0].outward_issue.is_none());
+        assert_eq!(links[0].inward_issue.as_ref().unwrap().key, "GH-7");
+        assert_eq!(links[0].id, link_id(7, 2));
+        assert_eq!(
+            fake.issues_dependencies_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![1, 2])],
+            "one batched call regardless of issue count"
+        );
+    }
+
+    #[test]
+    fn hydrate_dependencies_replaces_existing_links() {
+        let fake = FakeGhCli::new().with_issue_blocked_by(
+            1,
+            vec![IssueRef {
+                number: 9,
+                title: "Stale blocker".to_string(),
+                state: IssueState::Open,
+                url: String::new(),
+            }],
+        );
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-1",
+            1,
+            issue_info(1, "Epic", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+        provider.hydrate_blockers(&mut issues).unwrap();
+        assert_eq!(issues[0].fields.issue_links.len(), 1);
+
+        provider.hydrate_dependencies(&mut issues).unwrap();
+
+        assert!(issues[0].fields.issue_links.is_empty());
+    }
+
+    #[test]
+    fn hydrate_dependencies_failure_is_an_error() {
+        let fake = FakeGhCli::new().with_issues_dependencies_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "rate limited".to_string(),
+        });
+        let provider = GithubProvider::new(&fake, "jowi-dev/tskmstr".to_string());
+        let mut issues = vec![provider.to_issue(
+            "GH-1",
+            1,
+            issue_info(1, "Epic", IssueState::Open, &[]),
+            IssueDependencies::default(),
+        )];
+
+        assert!(provider.hydrate_dependencies(&mut issues).is_err());
     }
 
     #[test]
