@@ -20,12 +20,71 @@ use crate::config::BackendIdentity;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::{Issue, LinkedIssue, Status};
+use crate::work::comment_store::iso8601_utc;
 
 /// The status category key for finished work.
 const DONE_CATEGORY: &str = "done";
 
 /// The issue link type name that [`LinkKind::Unlocks`] links come from.
 const BLOCKS_LINK_TYPE: &str = "Blocks";
+
+/// The version of the JSON format [`GraphDocument`] serializes to. Its own
+/// number, separate from the repo config schema version. Adding an
+/// optional field keeps it; removing, renaming, or changing the meaning of
+/// a field bumps it.
+pub const GRAPH_SCHEMA_VERSION: u32 = 1;
+
+/// The `tm graph --json` document: a [`Graph`] plus the version, time, and
+/// backend it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphDocument {
+    /// Always [`GRAPH_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// When the graph was built, as `YYYY-MM-DDTHH:MM:SSZ`.
+    pub generated_at: String,
+    /// The backend and project the graph was read from.
+    pub source: GraphSource,
+    /// See [`Graph::nodes`].
+    pub nodes: Vec<GraphNode>,
+    /// See [`Graph::links`].
+    pub links: Vec<GraphLink>,
+    /// See [`Graph::warnings`].
+    pub warnings: Vec<GraphWarning>,
+}
+
+impl GraphDocument {
+    /// Wrap `graph`, read from the backend `identity`, as built at
+    /// `now_secs` seconds since the Unix epoch.
+    pub fn new(graph: Graph, identity: &BackendIdentity, now_secs: i64) -> Self {
+        let source = match identity {
+            BackendIdentity::Jira { project_key, .. } => GraphSource {
+                provider: "jira".to_string(),
+                project: project_key.clone(),
+            },
+            BackendIdentity::Github { repo } => GraphSource {
+                provider: "github".to_string(),
+                project: repo.clone(),
+            },
+        };
+        Self {
+            schema_version: GRAPH_SCHEMA_VERSION,
+            generated_at: iso8601_utc(now_secs),
+            source,
+            nodes: graph.nodes,
+            links: graph.links,
+            warnings: graph.warnings,
+        }
+    }
+}
+
+/// Where a [`GraphDocument`] was read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphSource {
+    /// The backend: `jira` or `github`.
+    pub provider: String,
+    /// The Jira project key, or the GitHub `owner/repo`.
+    pub project: String,
+}
 
 /// An epic graph held in memory: what [`build_graph`] returns and what
 /// the renderers read.
@@ -933,5 +992,80 @@ mod tests {
         let graph = build(&fake, Some("PROJ-1")).unwrap();
 
         assert!(graph.warnings.is_empty());
+    }
+
+    #[test]
+    fn document_serializes_the_versioned_json_shape() {
+        let fake = fake_with_epics(vec![issue(
+            "PROJ-1",
+            "new",
+            vec![blocks("PROJ-9", "indeterminate")],
+        )]);
+        let fake = with_child(fake, "PROJ-1", issue("PROJ-10", "done", vec![]));
+        let graph = build(&fake, None).unwrap();
+
+        let doc = GraphDocument::new(graph, &jira_identity(), 0);
+        let json = serde_json::to_value(&doc).unwrap();
+
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["generated_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(
+            json["source"],
+            serde_json::json!({"provider": "jira", "project": "PROJ"})
+        );
+        assert_eq!(
+            json["nodes"][0],
+            serde_json::json!({
+                "key": "PROJ-1",
+                "backend": "jira:https://example.atlassian.net:PROJ",
+                "title": "Summary for PROJ-1",
+                "status": "To Do",
+                "status_category": "new",
+                "url": "https://example.atlassian.net/browse/PROJ-1",
+                "is_epic": true,
+                "children": {"done": 1, "total": 1},
+            })
+        );
+        assert_eq!(json["nodes"][1]["key"], "PROJ-9");
+        assert_eq!(json["nodes"][1]["is_epic"], false);
+        assert!(json["nodes"][1]["children"].is_null());
+        assert_eq!(
+            json["links"],
+            serde_json::json!([
+                {"from": "PROJ-1", "to": "PROJ-9", "kind": "unlocks"},
+                {"from": "PROJ-1", "to": "PROJ-10", "kind": "parent"},
+            ])
+        );
+        assert_eq!(json["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn document_source_names_the_github_repo() {
+        let identity = BackendIdentity::Github {
+            repo: "owner/repo".to_string(),
+        };
+
+        let doc = GraphDocument::new(Graph::default(), &identity, 0);
+
+        assert_eq!(doc.source.provider, "github");
+        assert_eq!(doc.source.project, "owner/repo");
+    }
+
+    #[test]
+    fn cycle_warning_serializes_with_kind_keys_and_message() {
+        let warning = GraphWarning {
+            kind: "cycle".to_string(),
+            keys: vec!["PROJ-1".to_string(), "PROJ-2".to_string()],
+            message: "unlocks cycle among PROJ-1, PROJ-2".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&warning).unwrap(),
+            serde_json::json!({
+                "kind": "cycle",
+                "keys": ["PROJ-1", "PROJ-2"],
+                "message": "unlocks cycle among PROJ-1, PROJ-2",
+            })
+        );
     }
 }
