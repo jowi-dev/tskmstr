@@ -817,6 +817,15 @@ pub struct App {
     pub assignable_users: Option<Vec<JiraUser>>,
     /// Whether the assignee filter picker overlay is shown.
     pub show_filter_picker: bool,
+    /// Whether the board is in search mode (GitHub issue #152): every
+    /// printable key edits [`App::board_search_query`] instead of running its
+    /// usual board action.
+    pub board_searching: bool,
+    /// The board's client-side search query. Non-empty narrows every column
+    /// to the cards whose key or summary contains it, case-insensitive (see
+    /// [`App::tickets_in_col`]). Kept separate from [`App::filter`], so it
+    /// survives `r` refreshes and `f` refetches.
+    pub board_search_query: String,
     /// Index into the picker's option list of the currently highlighted
     /// option.
     pub filter_picker_selected: usize,
@@ -1350,6 +1359,20 @@ pub enum Msg {
     FilterPickerSelect,
     /// Close the filter picker without changing the active filter.
     FilterPickerClose,
+    /// Enter board search mode (GitHub issue #152): every printable key now
+    /// edits [`App::board_search_query`] until [`Msg::SearchSubmit`] or
+    /// [`Msg::SearchCancel`]. Only meaningful on [`Screen::Board`];
+    /// [`crate::tui::keymap::map_key`] only ever emits this from there.
+    StartSearch,
+    /// Append `char` to the board search query, narrowing the visible cards.
+    SearchChar(char),
+    /// Remove the last character of the board search query. A no-op (still
+    /// in search mode) when the query is already empty.
+    SearchBackspace,
+    /// Leave search mode, keeping the query applied.
+    SearchSubmit,
+    /// Leave search mode and clear the query, showing every card again.
+    SearchCancel,
     /// Assignable users for the picker finished loading.
     AssignableUsersLoaded(Vec<JiraUser>),
     /// Assignable users failed to load.
@@ -2387,6 +2410,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::FilterPickerSelect => filter_picker_select(app),
+        Msg::StartSearch
+        | Msg::SearchChar(_)
+        | Msg::SearchBackspace
+        | Msg::SearchSubmit
+        | Msg::SearchCancel => (app, Vec::new()),
         Msg::FilterPickerClose => {
             app.show_filter_picker = false;
             (app, Vec::new())
