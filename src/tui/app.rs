@@ -1112,12 +1112,34 @@ impl App {
             || self.overview_merge_confirm.is_some()
     }
 
-    /// The currently selected ticket, if any.
+    /// The currently selected ticket, if any. `selected_row` indexes the
+    /// search-filtered column (see [`App::tickets_in_col`]).
     pub fn selected_ticket(&self) -> Option<&TicketSummary> {
-        self.columns
-            .get(self.selected_col)?
-            .tickets
+        self.tickets_in_col(self.selected_col)
             .get(self.selected_row)
+            .copied()
+    }
+
+    /// The tickets of board column `col` that match
+    /// [`App::board_search_query`] (GitHub issue #152): every ticket when the
+    /// query is empty, otherwise those whose key or summary contains it,
+    /// case-insensitive, in column order. Empty (rather than panicking) if
+    /// `col` is out of bounds. `columns` stays the unfiltered source of
+    /// truth; selection, movement and rendering all go through this view.
+    pub fn tickets_in_col(&self, col: usize) -> Vec<&TicketSummary> {
+        let Some(column) = self.columns.get(col) else {
+            return Vec::new();
+        };
+        let query = self.board_search_query.to_lowercase();
+        column
+            .tickets
+            .iter()
+            .filter(|t| {
+                query.is_empty()
+                    || t.key.to_lowercase().contains(&query)
+                    || t.summary.to_lowercase().contains(&query)
+            })
+            .collect()
     }
 
     /// The currently highlighted ticket on [`Screen::Rank`], if any.
@@ -2410,11 +2432,29 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::FilterPickerSelect => filter_picker_select(app),
-        Msg::StartSearch
-        | Msg::SearchChar(_)
-        | Msg::SearchBackspace
-        | Msg::SearchSubmit
-        | Msg::SearchCancel => (app, Vec::new()),
+        Msg::StartSearch => {
+            app.board_searching = true;
+            (app, Vec::new())
+        }
+        Msg::SearchChar(c) => {
+            edit_search_query(&mut app, |query| query.push(c));
+            (app, Vec::new())
+        }
+        Msg::SearchBackspace => {
+            edit_search_query(&mut app, |query| {
+                query.pop();
+            });
+            (app, Vec::new())
+        }
+        Msg::SearchSubmit => {
+            app.board_searching = false;
+            (app, Vec::new())
+        }
+        Msg::SearchCancel => {
+            app.board_searching = false;
+            edit_search_query(&mut app, String::clear);
+            (app, Vec::new())
+        }
         Msg::FilterPickerClose => {
             app.show_filter_picker = false;
             (app, Vec::new())
@@ -4074,13 +4114,16 @@ fn enter(mut app: App) -> (App, Vec<Cmd>) {
 /// quitting (`tm runs watch` has no screen to fall back to, so `Back` quits
 /// only once the window is already closed). The board mirrors that: if the
 /// run detail overlay ([`Msg::ViewRunAction`]) is open, `Back` closes it
-/// instead of quitting.
+/// instead of quitting. Likewise, with a board search query applied
+/// (GitHub issue #152), `Back` clears it instead of quitting.
 fn back(app: &mut App) {
     match app.screen {
         Screen::Board => {
             if app.show_run_detail {
                 app.show_run_detail = false;
                 app.run_detail = None;
+            } else if !app.board_search_query.is_empty() {
+                edit_search_query(app, String::clear);
             } else {
                 app.quit = true;
             }
@@ -4326,14 +4369,25 @@ fn move_overview_column(app: &mut App, step: isize) {
     }
 }
 
-/// The number of tickets in the currently selected column, or `None` if
-/// there are no columns.
+/// The number of search-visible tickets in the currently selected column,
+/// or `None` if there are no columns.
 fn current_column_len(app: &App) -> Option<usize> {
-    app.columns.get(app.selected_col).map(|c| c.tickets.len())
+    app.columns
+        .get(app.selected_col)
+        .map(|_| app.tickets_in_col(app.selected_col).len())
 }
 
-/// Clamp `selected_row` into the bounds of the currently selected column,
-/// resetting to `0` when that column is empty.
+/// Apply `edit` to [`App::board_search_query`], then re-establish the
+/// selection on a visible card: the same one if it still matches, otherwise
+/// clamped within the filtered column.
+fn edit_search_query(app: &mut App, edit: impl FnOnce(&mut String)) {
+    let preferred_key = app.selected_ticket().map(|t| t.key.clone());
+    edit(&mut app.board_search_query);
+    reselect(app, preferred_key);
+}
+
+/// Clamp `selected_row` into the bounds of the currently selected column's
+/// visible tickets, resetting to `0` when none are visible.
 fn clamp_row(app: &mut App) {
     match current_column_len(app) {
         Some(0) | None => app.selected_row = 0,
@@ -4348,11 +4402,12 @@ fn flatten(columns: &[Column]) -> Vec<TicketSummary> {
     columns.iter().flat_map(|c| c.tickets.clone()).collect()
 }
 
-/// Select the ticket with key `key`, if it exists in `app.columns`. Returns
-/// whether it was found.
+/// Select the ticket with key `key`, if it is visible under the board
+/// search query. Returns whether it was found.
 fn select_by_key(app: &mut App, key: &str) -> bool {
-    for (col_index, column) in app.columns.iter().enumerate() {
-        if let Some(row_index) = column.tickets.iter().position(|t| t.key == key) {
+    for col_index in 0..app.columns.len() {
+        let tickets = app.tickets_in_col(col_index);
+        if let Some(row_index) = tickets.iter().position(|t| t.key == key) {
             app.selected_col = col_index;
             app.selected_row = row_index;
             return true;
@@ -4421,6 +4476,223 @@ mod tests {
             session_slug: "proj".to_string(),
             ..App::new()
         }
+    }
+
+    /// A ticket with `summary`, whose status category follows `status` (so
+    /// `group_into_columns` orders "To Do" before "Done").
+    fn titled(key: &str, status: &str, summary: &str) -> TicketSummary {
+        let category = if status == "Done" { "done" } else { "new" };
+        TicketSummary {
+            summary: summary.to_string(),
+            ..ticket_with(key, status, category)
+        }
+    }
+
+    /// A two-column board (To Do: PROJ-1 "Fix login", PROJ-2 "Add search",
+    /// PROJ-3 "Login copy"; Done: PROJ-4 "Search docs") for the search tests.
+    fn search_board() -> App {
+        board_with(
+            vec![
+                titled("PROJ-1", "To Do", "Fix login"),
+                titled("PROJ-2", "To Do", "Add search"),
+                titled("PROJ-3", "To Do", "Login copy"),
+                titled("PROJ-4", "Done", "Search docs"),
+            ],
+            0,
+        )
+    }
+
+    fn type_query(mut app: App, query: &str) -> App {
+        (app, _) = update(app, Msg::StartSearch);
+        for c in query.chars() {
+            (app, _) = update(app, Msg::SearchChar(c));
+        }
+        app
+    }
+
+    fn keys_in_col(app: &App, col: usize) -> Vec<String> {
+        app.tickets_in_col(col)
+            .iter()
+            .map(|t| t.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn tickets_in_col_matches_key_or_summary_case_insensitively() {
+        let mut app = search_board();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-2", "PROJ-3"]);
+        app.board_search_query = "LOGIN".to_string();
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-3"]);
+        assert!(keys_in_col(&app, 1).is_empty());
+        app.board_search_query = "proj-4".to_string();
+        assert!(keys_in_col(&app, 0).is_empty());
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+        assert!(keys_in_col(&app, 9).is_empty());
+    }
+
+    #[test]
+    fn start_search_enters_search_mode_with_the_query_kept() {
+        let mut app = search_board();
+        app.board_search_query = "login".to_string();
+        let (app, cmds) = update(app, Msg::StartSearch);
+        assert!(app.board_searching);
+        assert_eq!(app.board_search_query, "login");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn typing_narrows_the_cards_and_keeps_selection_visible() {
+        let mut app = search_board();
+        app.selected_row = 1; // PROJ-2 "Add search", filtered out by "login"
+        let app = type_query(app, "login");
+        assert!(app.board_searching);
+        assert_eq!(app.board_search_query, "login");
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+    }
+
+    #[test]
+    fn query_change_keeps_the_same_card_when_it_stays_visible() {
+        let mut app = search_board();
+        app.selected_row = 2; // PROJ-3 "Login copy"
+        let app = type_query(app, "login");
+        assert_eq!(app.selected_row, 1);
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+    }
+
+    #[test]
+    fn movement_stays_within_the_filtered_column() {
+        let app = type_query(search_board(), "login");
+        let (app, _) = update(app, Msg::SearchSubmit);
+        let (app, _) = update(app, Msg::Down);
+        let (app, _) = update(app, Msg::Down);
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+        let (app, _) = update(app, Msg::Right);
+        assert_eq!(app.selected_col, 1);
+        assert!(app.selected_ticket().is_none());
+    }
+
+    #[test]
+    fn no_matches_leaves_nothing_selected() {
+        let app = type_query(search_board(), "zzz");
+        assert!(app.selected_ticket().is_none());
+        let (app, _) = update(app, Msg::SearchSubmit);
+        let (app, cmds) = update(app, Msg::Enter);
+        assert_eq!(app.screen, Screen::Board);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn search_backspace_widens_and_is_a_noop_when_empty() {
+        let app = type_query(search_board(), "lx");
+        assert!(app.selected_ticket().is_none());
+        let (app, _) = update(app, Msg::SearchBackspace);
+        assert_eq!(app.board_search_query, "l");
+        assert!(app.selected_ticket().is_some());
+        let (app, _) = update(app, Msg::SearchBackspace);
+        let (app, _) = update(app, Msg::SearchBackspace);
+        assert_eq!(app.board_search_query, "");
+        assert!(app.board_searching);
+    }
+
+    #[test]
+    fn search_submit_keeps_the_query_and_leaves_search_mode() {
+        let app = type_query(search_board(), "login");
+        let (app, _) = update(app, Msg::SearchSubmit);
+        assert!(!app.board_searching);
+        assert_eq!(app.board_search_query, "login");
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-3"]);
+    }
+
+    #[test]
+    fn search_cancel_clears_the_query_and_leaves_search_mode() {
+        let mut app = type_query(search_board(), "login");
+        app.selected_row = 1; // PROJ-3 within the filtered column
+        let (app, _) = update(app, Msg::SearchCancel);
+        assert!(!app.board_searching);
+        assert!(app.board_search_query.is_empty());
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn back_clears_an_applied_query_instead_of_quitting() {
+        let app = type_query(search_board(), "login");
+        let (app, _) = update(app, Msg::SearchSubmit);
+        let (app, _) = update(app, Msg::Back);
+        assert!(!app.quit);
+        assert!(app.board_search_query.is_empty());
+        let (app, _) = update(app, Msg::Back);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn quit_still_quits_with_a_query_applied() {
+        let app = type_query(search_board(), "login");
+        let (app, _) = update(app, Msg::SearchSubmit);
+        let (app, _) = update(app, Msg::Quit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn tickets_loaded_keeps_the_query_and_reselects_a_visible_card() {
+        let app = type_query(search_board(), "login");
+        let (mut app, _) = update(app, Msg::SearchSubmit);
+        app.selected_row = 1; // PROJ-3
+        // The refetch drops PROJ-3 and adds a new matching card.
+        let (app, _) = update(
+            app,
+            Msg::TicketsLoaded(vec![
+                titled("PROJ-1", "To Do", "Fix login"),
+                titled("PROJ-2", "To Do", "Add search"),
+                titled("PROJ-5", "To Do", "Login audit"),
+            ]),
+        );
+        assert_eq!(app.board_search_query, "login");
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-5"]);
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-5")
+        );
+    }
+
+    #[test]
+    fn transition_applied_reselects_within_the_filter() {
+        let app = type_query(search_board(), "login");
+        let (app, _) = update(app, Msg::SearchSubmit);
+        let (app, _) = update(
+            app,
+            Msg::TransitionApplied {
+                key: "PROJ-3".to_string(),
+                status: "Done".to_string(),
+                status_category: "done".to_string(),
+            },
+        );
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1"]);
+    }
+
+    #[test]
+    fn merge_queue_ignores_the_search_filter() {
+        let mut app = search_board();
+        app.merge_queue.insert("PROJ-2".to_string());
+        app.merge_queue.insert("PROJ-1".to_string());
+        app.board_search_query = "login".to_string();
+        assert_eq!(merge_queue_in_board_order(&app), ["PROJ-1", "PROJ-2"]);
     }
 
     #[test]

@@ -3149,7 +3149,7 @@ mod tests {
                 Screen::Overview,
             ] {
                 assert_eq!(
-                    search_key(screen.clone(), false, key),
+                    search_key(screen, false, key),
                     None,
                     "{key:?} should be unbound on {screen:?}"
                 );
