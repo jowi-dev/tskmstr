@@ -97,7 +97,9 @@ marker/new-run paths: if `session_run_id` points at a `Running` run whose
 `kind` and `ticket` match, adopt it — write the marker file with that run
 id, `update_session_id`, `update_pid(CLAUDE_PID)`. Mismatch or missing
 run falls through to the existing behavior (the env var is advisory, the
-marker stays the source of truth). This closes the launch→registration
+marker stays the source of truth), except an `audit` row for a different
+ticket: the session is reading that ticket for context, so registration
+is a no-op (GH-169, see `session-usage.md`). This closes the launch→registration
 gap without a second registration path: the rest of the telemetry
 pipeline (marker-fallback hooks, `--record` finish, SessionEnd finisher)
 is untouched.

@@ -2719,6 +2719,32 @@ impl RunStore {
             .map_err(RunStoreError::from)
     }
 
+    /// Every run of `kind` stamped with `session_id` (see
+    /// [`RunStore::update_session_id`]), for any ticket and any status,
+    /// **oldest first** (by `started_at`, breaking ties by `id`).
+    ///
+    /// Unscoped on purpose: a session id names one conversation, so its rows
+    /// cannot collide across projects. Exists for
+    /// [`crate::runs::session`]'s one-audit-run-per-ticket rule: the first
+    /// row names the ticket the session audits, and a `done` row means that
+    /// ticket's verdict is already recorded.
+    pub fn session_runs(&self, session_id: &str, kind: &str) -> Result<Vec<Run>, RunStoreError> {
+        let sql = "SELECT
+                id, ticket, lane, kind, status, session_id, worktree, branch, pid, transcript,
+                started_at, heartbeat_at, ended_at, exit_code, num_turns, cost_usd,
+                blocker, pr_url, model_usage, log_path, findings_count, scope, tmux_session,
+                CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) AS age_secs,
+                mem_current_bytes, mem_peak_bytes, agent, repo, repo_root
+             FROM runs
+             WHERE session_id = ?1 AND kind = ?2
+             ORDER BY started_at ASC, id ASC";
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![session_id, kind], Self::row_to_run)?;
+        rows.collect::<rusqlite::Result<Vec<Run>>>()
+            .map_err(RunStoreError::from)
+    }
+
     /// Like [`RunStore::latest_run_for_ticket`], restricted to runs whose
     /// `kind` column equals `kind` when `Some`; `None` matches every kind
     /// (identical to [`RunStore::latest_run_for_ticket`]).
@@ -6575,6 +6601,40 @@ mod tests {
         let store = open_store(dir.path());
 
         assert!(store.runs_for_ticket(None, "PROJ-404").unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_runs_returns_one_sessions_runs_of_one_kind_oldest_first() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let start = |ticket: &str, kind: &str, session: &str| {
+            let id = store
+                .start_run(&StartRun {
+                    scope: String::new(),
+                    ticket: ticket.to_string(),
+                    lane: kind.to_string(),
+                    worktree: "/tmp/wt".to_string(),
+                    branch: None,
+                    pid: None,
+                    kind: kind.to_string(),
+                    log_path: None,
+                })
+                .unwrap();
+            store.update_session_id(id, session).unwrap();
+            id
+        };
+        let first = start("PROJ-1", "audit", "sess-1");
+        start("PROJ-1", "create", "sess-1");
+        start("PROJ-1", "audit", "sess-2");
+        let fourth = start("PROJ-2", "audit", "sess-1");
+
+        let runs = store.session_runs("sess-1", "audit").unwrap();
+
+        assert_eq!(
+            runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            vec![first, fourth]
+        );
     }
 
     #[test]
