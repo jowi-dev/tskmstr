@@ -1043,6 +1043,59 @@ mod tests {
         assert_eq!(json["warnings"], serde_json::json!([]));
     }
 
+    /// Every JSON object key `value` holds, at any depth.
+    fn json_keys(value: &serde_json::Value, keys: &mut HashSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    keys.insert(key.clone());
+                    json_keys(inner, keys);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    json_keys(item, keys);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn format_doc_names_every_serialized_field() {
+        let doc_text = include_str!("../docs/graph-format.md");
+        let graph = Graph {
+            nodes: vec![GraphNode {
+                key: "PROJ-1".to_string(),
+                backend: "jira:https://example.atlassian.net:PROJ".to_string(),
+                title: "Epic".to_string(),
+                status: "To Do".to_string(),
+                status_category: "new".to_string(),
+                url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
+                is_epic: true,
+                children: Some(ChildProgress { done: 0, total: 1 }),
+            }],
+            links: vec![parent("PROJ-1", "PROJ-2")],
+            warnings: vec![GraphWarning {
+                kind: "cycle".to_string(),
+                keys: vec!["PROJ-1".to_string()],
+                message: "unlocks cycle among PROJ-1".to_string(),
+            }],
+        };
+        let json = serde_json::to_value(GraphDocument::new(graph, &jira_identity(), 0)).unwrap();
+        let mut keys = HashSet::new();
+        json_keys(&json, &mut keys);
+
+        let missing: Vec<&String> = keys
+            .iter()
+            .filter(|key| !doc_text.contains(&format!("| `{key}` |")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/graph-format.md has no field table row for {missing:?}"
+        );
+    }
+
     #[test]
     fn document_source_names_the_github_repo() {
         let identity = BackendIdentity::Github {
