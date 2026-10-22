@@ -2393,6 +2393,7 @@ mod tests {
         PrSummary {
             number,
             head_ref_name: head_ref_name.to_string(),
+            head_ref_oid: String::new(),
             lifecycle,
             updated_at: "2026-08-06T00:00:00Z".to_string(),
         }

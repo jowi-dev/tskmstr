@@ -902,6 +902,7 @@ mod tests {
         crate::github::gh_cli::PrSummary {
             number,
             head_ref_name: head_ref_name.to_string(),
+            head_ref_oid: String::new(),
             lifecycle,
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }

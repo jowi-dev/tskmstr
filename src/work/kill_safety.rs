@@ -232,6 +232,7 @@ mod tests {
         PrSummary {
             number,
             head_ref_name: branch.to_string(),
+            head_ref_oid: String::new(),
             lifecycle,
             updated_at: "2026-09-08T00:00:00Z".to_string(),
         }
