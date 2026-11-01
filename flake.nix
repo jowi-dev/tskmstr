@@ -17,8 +17,10 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           # The work::git suite integration-tests ShellGitOps against real
-          # `git init` repos, so the check phase needs git on PATH.
-          nativeCheckInputs = [ pkgs.git ];
+          # `git init` repos, so the check phase needs git on PATH. The
+          # runs::footprint Linux test spawns perl to hold ~200 MB in a
+          # child process, so perl must be on PATH too.
+          nativeCheckInputs = [ pkgs.git pkgs.perl ];
         };
 
         devShells.default = pkgs.mkShell {
