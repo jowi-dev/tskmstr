@@ -23,7 +23,7 @@ use crate::ticketing::provider::TicketProvider;
 use crate::work::review_watch::Sleeper;
 use crate::work::run::{
     AutoReviewStarter, Clock, PreparedRun, RunLaneError, WatchArmer, apply_status_on_pr,
-    auto_arm_watch, autopilot_start_review, resolve_pr_url,
+    post_pr_tail, resolve_pr_url,
 };
 use crate::work::signal::{
     Signal, StepState, StepWatch, read_done_marker, temporary_name, wait_for_signal,
@@ -209,14 +209,16 @@ pub fn await_lane(
         .add_event(run_id, LANE_DONE_EVENT, Some(detail))?;
     writeln!(out, "lane done: {detail}")?;
 
-    // The post-PR tail `supervise_run` runs after a headless lane.
+    // What a headless lane gets from `run_agent_and_finish` and
+    // `supervise_run` once its row is finished.
     apply_status_on_pr(deps.ticket_provider, prepared, has_pr, out)?;
-    if let Some(armer) = deps.watch_armer {
-        auto_arm_watch(deps.run_store, armer, prepared, out)?;
-    }
-    if let Some(starter) = deps.review_starter {
-        autopilot_start_review(deps.run_store, starter, prepared, out)?;
-    }
+    post_pr_tail(
+        deps.run_store,
+        deps.watch_armer,
+        deps.review_starter,
+        prepared,
+        out,
+    )?;
     Ok(AwaitOutcome::Done { succeeded })
 }
 

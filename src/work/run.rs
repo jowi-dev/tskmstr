@@ -2257,13 +2257,30 @@ pub fn supervise_run(
         runner,
         out,
     )?;
+    post_pr_tail(run_store, watch_armer, review_starter, prepared, out)?;
+    Ok(outcome)
+}
+
+/// What runs after a lane's row is finished and its `status_on_pr` is
+/// applied: `tm pr watch` when `watch_armer` is given, then `tm review
+/// auto` when `review_starter` is. Shared by the headless supervisor
+/// ([`supervise_run`]) and the unattended interactive lane's awaiter
+/// (`crate::work::lane_await::await_lane`), so a new post-PR step lands in
+/// both.
+pub fn post_pr_tail(
+    run_store: &RunStore,
+    watch_armer: Option<&dyn WatchArmer>,
+    review_starter: Option<&dyn AutoReviewStarter>,
+    prepared: &PreparedRun,
+    out: &mut dyn Write,
+) -> Result<(), RunLaneError> {
     if let Some(armer) = watch_armer {
         auto_arm_watch(run_store, armer, prepared, out)?;
     }
     if let Some(starter) = review_starter {
         autopilot_start_review(run_store, starter, prepared, out)?;
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Event kind [`autopilot_start_review`] records on the lane run. Its
