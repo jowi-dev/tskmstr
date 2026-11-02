@@ -2610,11 +2610,13 @@ fn run_runs(
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("~"));
+            let transcripts = agent_runner_or_default(full_config.as_ref()).transcripts(&home);
             let sleeper = tskmstr::work::review_watch::RealSleeper;
             tskmstr::cli::runs::logs(
                 &store,
                 scope,
                 &home,
+                transcripts.as_deref(),
                 &ticket_or_id,
                 kind.as_deref(),
                 tail,

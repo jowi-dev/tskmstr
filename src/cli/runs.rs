@@ -143,10 +143,12 @@ pub enum RunsCliError {
     #[error("no run with id {0}")]
     NoRunWithId(i64),
 
-    /// `tm runs logs` resolved a run with no recorded `log_path` and no
-    /// by-convention fallback for its `kind` (see [`fallback_log_path`]).
+    /// `tm runs logs` resolved a run with no recorded `log_path`, no
+    /// by-convention fallback for its `kind` (see [`fallback_log_path`]),
+    /// no recorded transcript, and no Claude Code transcript findable by
+    /// its session id (see [`crate::agent::Transcripts::locate`]).
     #[error(
-        "run {id} ({ticket}) has no recorded log path, and its kind has no \
+        "run {id} ({ticket}) has no recorded log path or transcript, and its kind has no \
          by-convention fallback; see `tm runs show {ticket}` for its event timeline"
     )]
     NoLogPath {
@@ -156,8 +158,9 @@ pub enum RunsCliError {
         id: i64,
     },
 
-    /// `tm runs logs` resolved a log path, but nothing exists there (also
-    /// `tm runs scrollback` for an archive file that was deleted).
+    /// `tm runs logs` resolved a log path or a recorded transcript path,
+    /// but nothing exists there (also `tm runs scrollback` for an archive
+    /// file that was deleted).
     #[error("log file {path} does not exist")]
     LogFileMissing {
         /// The path that was resolved but not found.
@@ -1180,36 +1183,54 @@ fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
 }
 
 /// `tm runs logs <ticket-or-run-id> [--kind <kind>] [--tail <N>] [--follow]`:
-/// print (or follow) a run's detached-process log file.
+/// print (or follow) a run's detached-process log file, or, for an
+/// interactive run that has none, its Claude Code transcript rendered as
+/// readable text (GitHub issue #155).
 ///
 /// Resolves `ticket_or_id`/`kind` via [`resolve_run`] (same rules as `tm
-/// runs reopen`), then the log path via [`resolve_log_path`] — the recorded
-/// `log_path` column, or [`fallback_log_path`] for the many pre-migration
-/// rows (including the failed bugbot runs this whole feature exists for)
-/// that predate it.
+/// runs reopen`), then what to show, first match wins:
+/// 1. The log path via [`resolve_log_path`] — the recorded `log_path`
+///    column, or [`fallback_log_path`] for the many pre-migration rows
+///    (including the failed bugbot runs this whole feature exists for) that
+///    predate it.
+/// 2. The recorded `transcript` column (filled by the SessionEnd hook's
+///    `tm runs finish --transcript`).
+/// 3. The run's session id looked up via `transcripts` (the configured
+///    agent's [`crate::agent::AgentRunner::transcripts`]). This covers runs
+///    whose SessionEnd hook never fired, such as those hibernated by the
+///    idle sweep or cleaned up by `tm merge`: Claude Code's transcript file
+///    outlives the killed session.
+///
+/// Steps 2 and 3 apply only when `transcripts` is `Some`; an agent with no
+/// transcript reader skips straight to [`RunsCliError::NoLogPath`]. A
+/// transcript is printed through [`crate::agent::Transcripts::render`]
+/// (user/assistant messages, tool calls and results in brief), with `tail`
+/// applied to the rendered lines rather than the raw file.
 ///
 /// Three distinct "nothing to show" outcomes, each worded differently so the
 /// caller knows which one they hit:
-/// - [`RunsCliError::NoLogPath`]: no column value and no fallway for this
-///   run's `kind`.
-/// - [`RunsCliError::LogFileMissing`]: a path was resolved but nothing
-///   exists there on disk.
-/// - An empty (zero-byte) file is not an error: prints an explanatory line
-///   pointing at `tm runs show` (see this module's doc comment) and returns
-///   `Ok`, unless `--follow` is set, in which case it keeps watching for
-///   content to appear.
+/// - [`RunsCliError::NoLogPath`]: no log path, no fallback for this run's
+///   `kind`, and no transcript by column or session id.
+/// - [`RunsCliError::LogFileMissing`]: a log or recorded transcript path
+///   was resolved but nothing exists there on disk.
+/// - An empty (zero-byte) log file, or a transcript with no messages to
+///   render, is not an error: prints an explanatory line pointing at `tm
+///   runs show` (see this module's doc comment) and returns `Ok`, unless
+///   `--follow` is set, in which case it keeps watching for content to
+///   appear.
 ///
 /// `--follow`'s live loop is real (`sleeper.sleep`/re-reading the file
 /// forever) and, like [`crate::work::detach::RealDetachSpawner`]'s actual
 /// process spawn, is not itself unit-tested — only the pure pieces it's
-/// built from ([`read_appended`], [`tail_lines`]) are. It never returns on
-/// its own; the caller (a real terminal) is expected to Ctrl-C out, same as
-/// `tail -f`.
+/// built from ([`read_appended`], [`tail_lines`],
+/// [`render_appended_transcript`]) are. It never returns on its own; the
+/// caller (a real terminal) is expected to Ctrl-C out, same as `tail -f`.
 #[allow(clippy::too_many_arguments)]
 pub fn logs(
     store: &RunStore,
     scope: Option<&str>,
     home: &Path,
+    transcripts: Option<&dyn crate::agent::Transcripts>,
     ticket_or_id: &str,
     kind: Option<&str>,
     tail: usize,
@@ -1218,16 +1239,44 @@ pub fn logs(
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
     let run = resolve_run(store, scope, ticket_or_id, kind)?;
-    let path = resolve_log_path(&run, home).ok_or_else(|| RunsCliError::NoLogPath {
+    if let Some(path) = resolve_log_path(&run, home) {
+        return print_log(&run, &path, tail, follow, sleeper, out);
+    }
+    let no_log = || RunsCliError::NoLogPath {
         ticket: run.ticket.clone(),
         id: run.id,
-    })?;
+    };
+    let transcripts = transcripts.ok_or_else(no_log)?;
+    let path = run
+        .transcript
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            run.session_id
+                .as_deref()
+                .and_then(|sid| transcripts.locate(sid))
+        })
+        .ok_or_else(no_log)?;
+    print_transcript(&run, &path, transcripts, tail, follow, sleeper, out)
+}
 
+/// [`logs`] for a resolved detached-process log file at `path`: prints its
+/// last `tail` lines (or the empty-file note), then follows it if asked.
+fn print_log(
+    run: &Run,
+    path: &Path,
+    tail: usize,
+    follow: bool,
+    sleeper: &dyn crate::work::review_watch::Sleeper,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
     if !path.exists() {
-        return Err(RunsCliError::LogFileMissing { path });
+        return Err(RunsCliError::LogFileMissing {
+            path: path.to_path_buf(),
+        });
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     let mut offset = content.len() as u64;
 
     if content.is_empty() {
@@ -1251,7 +1300,7 @@ pub fn logs(
     if follow {
         loop {
             sleeper.sleep(2);
-            let (appended, new_offset) = read_appended(&path, offset)?;
+            let (appended, new_offset) = read_appended(path, offset)?;
             if !appended.is_empty() {
                 write!(out, "{appended}")?;
                 offset = new_offset;
@@ -1260,6 +1309,86 @@ pub fn logs(
     }
 
     Ok(())
+}
+
+/// [`logs`] for a Claude Code transcript at `path`: prints the last `tail`
+/// rendered lines (or a no-messages note), then follows it if asked,
+/// rendering only complete JSONL lines as they are appended.
+fn print_transcript(
+    run: &Run,
+    path: &Path,
+    transcripts: &dyn crate::agent::Transcripts,
+    tail: usize,
+    follow: bool,
+    sleeper: &dyn crate::work::review_watch::Sleeper,
+    out: &mut dyn Write,
+) -> Result<(), RunsCliError> {
+    if !path.exists() {
+        return Err(RunsCliError::LogFileMissing {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let mut offset = content.len() as u64;
+    // Only a followed transcript can still be mid-write: hold back its
+    // partial last line for the loop. A one-shot read renders everything.
+    let mut pending = String::new();
+    let rendered = if follow {
+        render_appended_transcript(transcripts, &mut pending, &content)
+    } else {
+        transcripts.render(&content)
+    };
+
+    if rendered.is_empty() {
+        writeln!(
+            out,
+            "transcript {} has no messages yet for run {}; \
+             see `tm runs show {}` for the recorded event timeline.",
+            path.display(),
+            run.id,
+            run.ticket
+        )?;
+        if !follow {
+            return Ok(());
+        }
+    } else {
+        let start = rendered.len().saturating_sub(tail);
+        for line in &rendered[start..] {
+            writeln!(out, "{line}")?;
+        }
+    }
+
+    if follow {
+        loop {
+            sleeper.sleep(2);
+            let (appended, new_offset) = read_appended(path, offset)?;
+            offset = new_offset;
+            for line in render_appended_transcript(transcripts, &mut pending, &appended) {
+                writeln!(out, "{line}")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Renders the complete lines of `pending` plus newly `appended` transcript
+/// text via [`crate::agent::Transcripts::render`], leaving any trailing
+/// partial line (one the agent has not finished writing) in `pending` for
+/// the next call. Used by [`logs`]'s transcript `--follow` loop so an entry
+/// split across two reads is rendered once, whole.
+fn render_appended_transcript(
+    transcripts: &dyn crate::agent::Transcripts,
+    pending: &mut String,
+    appended: &str,
+) -> Vec<String> {
+    pending.push_str(appended);
+    let Some(end) = pending.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete: String = pending.drain(..=end).collect();
+    transcripts.render(&complete)
 }
 
 /// `tm runs register --kind <KIND> <KEY>`: a thin wrapper around
@@ -1314,6 +1443,7 @@ pub fn format_age(secs: i64) -> String {
 mod tests {
     use super::*;
     use crate::agent::claude::ClaudeRunner;
+    use crate::agent::claude::transcript::ClaudeTranscripts;
     use tempfile::tempdir;
 
     fn open_store(dir: &std::path::Path) -> RunStore {
@@ -3656,6 +3786,7 @@ mod tests {
             &store,
             None,
             dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
             "proj-1",
             None,
             2,
@@ -3690,6 +3821,7 @@ mod tests {
             &store,
             None,
             dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
             "ax-408",
             None,
             200,
@@ -3721,6 +3853,7 @@ mod tests {
             &store,
             None,
             dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
             "ax-408",
             None,
             200,
@@ -3754,6 +3887,7 @@ mod tests {
             &store,
             None,
             dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
             "proj-1",
             None,
             200,
@@ -3782,6 +3916,7 @@ mod tests {
             &store,
             None,
             dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
             "proj-1",
             None,
             200,
@@ -3792,6 +3927,318 @@ mod tests {
         .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::LogFileMissing { .. }));
+    }
+
+    /// A two-message Claude Code transcript as JSONL, plus a non-message
+    /// entry the renderer must skip.
+    fn sample_transcript() -> String {
+        [
+            serde_json::json!({ "type": "summary", "summary": "s" }),
+            serde_json::json!({ "type": "user", "message": { "content": "fix it" } }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "text", "text": "on it" },
+                    { "type": "tool_use", "name": "Bash", "input": { "command": "cargo test" } }
+                ] }
+            }),
+        ]
+        .iter()
+        .map(|entry| format!("{entry}\n"))
+        .collect()
+    }
+
+    /// Starts an interactive-style run for `ticket` (no `log_path`) and
+    /// finishes it with `transcript` recorded, returning its id.
+    fn start_run_with_transcript(store: &RunStore, ticket: &str, transcript: &Path) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                kind: "audit".to_string(),
+                ..start_params(ticket)
+            })
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    transcript: Some(transcript.to_string_lossy().into_owned()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn logs_renders_the_recorded_transcript_when_there_is_no_log_path() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "user: fix it\nassistant: on it\n  -> Bash cargo test\n"
+        );
+    }
+
+    #[test]
+    fn logs_applies_tail_to_the_rendered_transcript_lines() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            "proj-1",
+            None,
+            2,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "assistant: on it\n  -> Bash cargo test\n"
+        );
+    }
+
+    #[test]
+    fn logs_finds_the_transcript_by_session_id_when_none_is_recorded() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let claude_dir = dir.path().join("claude");
+        let project = claude_dir.join("projects/-tmp-wt");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sess-9.jsonl"), sample_transcript()).unwrap();
+        let id = store
+            .start_run(&StartRun {
+                kind: "audit".to_string(),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(id, "sess-9").unwrap();
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(claude_dir.clone())),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "user: fix it\nassistant: on it\n  -> Bash cargo test\n"
+        );
+    }
+
+    #[test]
+    fn logs_prefers_the_log_path_over_a_recorded_transcript() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let log_file = dir.path().join("lane.log");
+        std::fs::write(&log_file, "from the log\n").unwrap();
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        let id = store
+            .start_run(&StartRun {
+                log_path: Some(log_file.to_string_lossy().into_owned()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    transcript: Some(transcript.to_string_lossy().into_owned()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "from the log\n");
+    }
+
+    #[test]
+    fn logs_reports_a_transcript_with_no_messages_and_points_at_show() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"summary\"}\n").unwrap();
+        let id = start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("no messages yet"), "got: {printed:?}");
+        assert!(printed.contains("tm runs show PROJ-1"), "got: {printed:?}");
+        assert!(printed.contains(&id.to_string()), "got: {printed:?}");
+    }
+
+    #[test]
+    fn logs_errors_when_the_recorded_transcript_is_missing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("gone.jsonl");
+        start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let mut out = Vec::new();
+
+        let err = logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(
+            matches!(&err, RunsCliError::LogFileMissing { path } if *path == transcript),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn logs_errors_with_no_log_path_when_the_session_has_no_transcript_file() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let claude_dir = dir.path().join("claude");
+        std::fs::create_dir_all(claude_dir.join("projects/-tmp-wt")).unwrap();
+        let id = store
+            .start_run(&StartRun {
+                kind: "audit".to_string(),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_session_id(id, "sess-9").unwrap();
+        let mut out = Vec::new();
+
+        let err = logs(
+            &store,
+            None,
+            dir.path(),
+            Some(&ClaudeTranscripts::new(claude_dir.clone())),
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::NoLogPath { .. }), "{err}");
+    }
+
+    #[test]
+    fn logs_errors_with_no_log_path_when_the_agent_has_no_transcript_reader() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let mut out = Vec::new();
+
+        let err = logs(
+            &store,
+            None,
+            dir.path(),
+            None,
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect_err("should fail");
+
+        assert!(matches!(err, RunsCliError::NoLogPath { .. }), "{err}");
+    }
+
+    #[test]
+    fn render_appended_transcript_holds_back_a_partial_trailing_line() {
+        let transcripts = ClaudeTranscripts::new(std::path::PathBuf::from("/unused"));
+        let mut pending = String::new();
+        let full = sample_transcript();
+        let (head, rest) = full.split_at(full.len() - 10);
+
+        assert_eq!(
+            render_appended_transcript(&transcripts, &mut pending, head),
+            ["user: fix it"]
+        );
+        assert_eq!(
+            render_appended_transcript(&transcripts, &mut pending, rest),
+            ["assistant: on it", "  -> Bash cargo test"]
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]
