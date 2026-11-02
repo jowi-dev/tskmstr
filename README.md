@@ -218,7 +218,7 @@ tm auth status
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
 | `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
-| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `setup`) |
+| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `merge-conflict`, `setup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
@@ -1724,10 +1724,12 @@ can't apply: the whole scope shares one keyless `tm-<scope>-create` session
 holding a `create` window. One draft at a time — pressing `c` while it is
 live re-attaches to it rather than starting a parallel session (a dead
 window from a finished draft is aftermath; relaunching appends a suffixed
-`create-2` window and lands on it). No run row is pre-registered either:
-`tm ticket create` registers its own `kind = "create"` run through the
-session marker once the ticket exists, so usage telemetry needs no
-launch-side plumbing.
+`create-2` window and lands on it). The launch pre-registers a running
+`kind = "create"` row straight away, with the placeholder ticket
+`new-ticket` since no ticket exists yet. The session's first `tm ticket
+create` adopts that row and re-stamps its ticket to the new key; creating
+more tickets in the same session keeps the one row. A session that never
+creates a ticket still has its row finished when it ends.
 
 ### Board-launched bot-findings watch
 
@@ -2111,9 +2113,12 @@ a `gh`/`git` failure).
 V1 boundaries, matched to the board's `M` key and worth knowing before you
 rely on this:
 
-- **The conflict session is untracked.** It opens a tmux window and runs
-  the agent, but records no `tm runs` row — `tm runs`/`tm runs watch` won't
-  show it. Track it via the tmux window itself.
+- **The conflict session is a `merge-conflict` run.** Each conflict
+  session (one per ticket, or one shared session for a batch, whose row
+  names the first conflicted key and records the full list in a
+  `merge-batch` event) shows up in `tm runs --kind merge-conflict` while it
+  is open. It ends `done` when the rebase resolves and `failed` when it is
+  handed back, unless the session's own exit finished it first.
 - **No merge-strategy override.** Always the repo's configured default,
   same as `M`.
 - **Cleanup is best-effort.** A failed worktree removal or branch deletion

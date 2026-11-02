@@ -136,6 +136,11 @@ affected.
   aggregates the *entire transcript* and fires at the end of the turn
   that ran the create. Documented limitation; a transcript back-scan for
   agent usage is a possible follow-up if the gap matters in practice.
+  (Since GitHub issue #156 a board-launched create session has its
+  `create` row from launch, under a placeholder ticket the first create
+  adopts and re-stamps, so the session is visible to runs.db throughout.
+  The event gap remains: the hooks find the row through the marker, which
+  is only written at adoption.)
 
 ### Hook gating: marker fallback
 
