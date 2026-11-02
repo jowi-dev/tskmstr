@@ -19,7 +19,7 @@ headless before).
 
 The loop waits for each step's **signal file**, not for claude to exit: the
 round's findings file, or the fix pass's
-`<git-dir>/vdiff/auto-review/fix-<round>.done` marker
+`<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done` marker (`<loop>` is the loop's pid and start time, so a leftover agent from an earlier loop never signals a later one)
 (`{"succeeded": true|false}`). tm appends a completion section to every
 round and fix prompt naming the file and the write-to-`.tmp`-then-rename
 step, so a custom prompt still signals. A file that exists but does not

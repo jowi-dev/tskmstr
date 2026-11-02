@@ -162,14 +162,18 @@ pub fn read_findings(path: &Path) -> Result<Vec<Finding>, AutoReviewError> {
     serde_json::from_str(&raw).map_err(|e| unusable(e.to_string()))
 }
 
-/// Where round `round` writes its findings:
-/// `<git_dir>/vdiff/auto-review/findings-<round>.json`. Under the git dir,
-/// like the comment store, so it never shows in `git status`.
-pub fn findings_path(git_dir: &Path, round: u32) -> PathBuf {
+/// Where round `round` of loop `loop_id` writes its findings:
+/// `<git_dir>/vdiff/auto-review/findings-<loop_id>-<round>.json`. Under the
+/// git dir, like the comment store, so it never shows in `git status`.
+///
+/// `loop_id` (see [`run_loop`]) keeps each loop's signal files apart, so an
+/// agent left behind by an earlier loop, still working after its step timed
+/// out, can never write a file a later loop reads as its own step's signal.
+pub fn findings_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
         .join("auto-review")
-        .join(format!("findings-{round}.json"))
+        .join(format!("findings-{loop_id}-{round}.json"))
 }
 
 /// Reads a round's findings file if it is ready: `None` while it is
@@ -179,15 +183,15 @@ pub fn try_read_findings(path: &Path) -> Option<Vec<Finding>> {
     read_findings(path).ok()
 }
 
-/// Where round `round`'s fix pass writes its completion marker:
-/// `<git_dir>/vdiff/auto-review/fix-<round>.done`, next to the findings
-/// files (GitHub issue #150). It holds `{"succeeded": true}` or
-/// `{"succeeded": false}`; see [`read_fix_marker`].
-pub fn fix_marker_path(git_dir: &Path, round: u32) -> PathBuf {
+/// Where round `round`'s fix pass in loop `loop_id` writes its completion
+/// marker: `<git_dir>/vdiff/auto-review/fix-<loop_id>-<round>.done`, next to
+/// the findings files and keyed the same way (GitHub issue #150). It holds
+/// `{"succeeded": true}` or `{"succeeded": false}`; see [`read_fix_marker`].
+pub fn fix_marker_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
         .join("auto-review")
-        .join(format!("fix-{round}.done"))
+        .join(format!("fix-{loop_id}-{round}.done"))
 }
 
 #[derive(Deserialize)]
@@ -432,7 +436,9 @@ pub struct LoopOutcome {
 
 /// Runs review rounds until one is clean, the fix round fails, or
 /// `cfg.max_review_rounds` is reached. See the plan doc for the round
-/// sequence; `git_dir` is the worktree's resolved git directory.
+/// sequence; `git_dir` is the worktree's resolved git directory, and
+/// `loop_id` names this loop's signal files ([`findings_path`]), unique
+/// per loop.
 ///
 /// Each round and each fix pass is launched and then waited on through its
 /// signal file, for at most `cfg.round_timeout_mins` each. A step that
@@ -451,20 +457,17 @@ pub fn run_loop(
     template: &str,
     key: &str,
     git_dir: &Path,
+    loop_id: &str,
 ) -> Result<LoopOutcome, AutoReviewError> {
     let max = cfg.max_review_rounds.max(1);
     let timeout_secs = i64::try_from(cfg.round_timeout_mins.saturating_mul(60)).unwrap_or(i64::MAX);
     let mut archive: Option<PathBuf> = None;
     for round in 1..=max {
-        let findings_file = findings_path(git_dir, round);
-        let marker = fix_marker_path(git_dir, round);
+        let findings_file = findings_path(git_dir, loop_id, round);
+        let marker = fix_marker_path(git_dir, loop_id, round);
         if let Some(dir) = findings_file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| AutoReviewError::step("review", e))?;
         }
-        // A stale file from an earlier loop must never stand in for this
-        // round's output.
-        let _ = std::fs::remove_file(&findings_file);
-        let _ = std::fs::remove_file(&marker);
 
         let prompt = render_prompt(template, key, round, &findings_file, archive.as_deref());
         let run_id = ops.review(round, prompt)?;
@@ -637,7 +640,10 @@ mod tests {
             self.log.borrow_mut().push(format!("review {round}"));
             self.prompts.borrow_mut().push(prompt);
             let body = self.findings[(round - 1) as usize];
-            self.signal(findings_path(&self.git_dir, round), body.to_string());
+            self.signal(
+                findings_path(&self.git_dir, LOOP_ID, round),
+                body.to_string(),
+            );
             Ok(100 + i64::from(round))
         }
 
@@ -658,7 +664,7 @@ mod tests {
             }
             if self.fix_signals {
                 self.signal(
-                    fix_marker_path(&self.git_dir, round),
+                    fix_marker_path(&self.git_dir, LOOP_ID, round),
                     format!(r#"{{"succeeded": {succeeded}}}"#),
                 );
             }
@@ -727,6 +733,8 @@ mod tests {
         }
     }
 
+    const LOOP_ID: &str = "42-1787054400";
+
     const MEDIUM: &str = r#"[{"path": "src/a.rs", "start_line": 4, "end_line": 6,
         "severity": "MEDIUM", "specialist": "state-flow", "body": "race"}]"#;
     const LOW: &str = r#"[{"path": "src/a.rs", "start_line": 9,
@@ -784,13 +792,13 @@ mod tests {
 
     #[test]
     fn the_fix_completion_section_names_the_marker_and_its_temporary_name() {
-        let marker = fix_marker_path(Path::new("/g"), 2);
-        assert_eq!(marker, Path::new("/g/vdiff/auto-review/fix-2.done"));
+        let marker = fix_marker_path(Path::new("/g"), "7-9", 2);
+        assert_eq!(marker, Path::new("/g/vdiff/auto-review/fix-7-9-2.done"));
 
         let section = fix_completion_section(&marker);
 
-        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done.tmp`"));
-        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done`"));
+        assert!(section.contains("`/g/vdiff/auto-review/fix-7-9-2.done.tmp`"));
+        assert!(section.contains("`/g/vdiff/auto-review/fix-7-9-2.done`"));
         assert!(section.contains(r#"{"succeeded": true}"#));
         assert!(section.contains(r#"{"succeeded": false}"#));
     }
@@ -861,7 +869,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![LOW]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -885,7 +893,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -937,7 +945,7 @@ mod tests {
             ..cfg()
         };
 
-        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             *ops.import_at.borrow(),
@@ -958,7 +966,7 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec!["[]"]);
         *ops.bot_comments.borrow_mut() = vec![bot_comment("off by one")];
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert!(ops.import_at.borrow().is_empty());
@@ -970,7 +978,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -996,7 +1004,7 @@ mod tests {
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM]);
         ops.fix_cap_reached = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -1032,7 +1040,7 @@ mod tests {
         .unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
 
-        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(*ops.store_at_fix.borrow(), vec![2]);
     }
@@ -1043,7 +1051,7 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.fix_results.borrow_mut().push(false);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::FixFailed);
         assert_eq!(
@@ -1071,7 +1079,7 @@ mod tests {
             ..cfg()
         };
 
-        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(ops.log()[..2], ["review 1", "publish"]);
         assert_eq!(
@@ -1090,7 +1098,7 @@ mod tests {
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert!(!ops.log().contains(&"fix".to_string()));
@@ -1102,7 +1110,7 @@ mod tests {
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.signal_after = Some(3);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -1115,7 +1123,7 @@ mod tests {
         assert_eq!(ops.sleeps.get(), 9, "three polls' sleeps per step");
         assert!(
             ops.completions.borrow()[0]
-                .contains(&*fix_marker_path(tmp.path(), 1).to_string_lossy())
+                .contains(&*fix_marker_path(tmp.path(), LOOP_ID, 1).to_string_lossy())
         );
     }
 
@@ -1126,7 +1134,7 @@ mod tests {
         ops.signal_after = Some(2);
         ops.half_written = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert_eq!(comment_store::load(tmp.path()).unwrap().len(), 1);
@@ -1143,7 +1151,7 @@ mod tests {
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -1171,7 +1179,7 @@ mod tests {
         ops.signal_after = Some(5);
         ops.states.borrow_mut().insert(101, StepState::Hibernated);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stuck);
         assert_eq!(ops.log()[1], "flag 101");
@@ -1184,7 +1192,7 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec![LOW]);
         ops.states.borrow_mut().insert(101, StepState::Hibernated);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert_eq!(*ops.signalled.borrow(), vec![101]);
@@ -1197,7 +1205,7 @@ mod tests {
         ops.signal_after = None;
         ops.states.borrow_mut().insert(101, StepState::Gone);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stopped);
         assert_eq!(
@@ -1211,15 +1219,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.fix_signals = false;
-        // A stale marker from an earlier loop must not count as this pass's.
-        std::fs::create_dir_all(fix_marker_path(tmp.path(), 1).parent().unwrap()).unwrap();
-        std::fs::write(fix_marker_path(tmp.path(), 1), r#"{"succeeded": true}"#).unwrap();
+        // A marker an earlier loop's agent writes must not count as this
+        // pass's.
+        let earlier = fix_marker_path(tmp.path(), "1-1", 1);
+        std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        std::fs::write(earlier, r#"{"succeeded": true}"#).unwrap();
         let cfg = AutoReviewConfig {
             round_timeout_mins: 1,
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stuck);
         assert_eq!(
@@ -1241,7 +1251,7 @@ mod tests {
         ops.fix_signals = false;
         ops.states.borrow_mut().insert(201, StepState::Gone);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stopped);
         assert!(!ops.log().iter().any(|line| line.starts_with("flag")));
@@ -1253,7 +1263,7 @@ mod tests {
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.nothing_to_fix = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert_eq!(*ops.signalled.borrow(), vec![101, 102]);

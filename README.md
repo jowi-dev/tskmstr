@@ -1919,8 +1919,10 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
    (`review-2` for round 2). Round 1 uses the `thatch-code-review` skill.
    Later rounds use `thatch-review-followup` and are pointed at the previous
    round's archived comments. The agent writes its confirmed findings to
-   `<git-dir>/vdiff/auto-review/findings-<round>.json`, and the round is
-   done once that file exists and parses.
+   `<git-dir>/vdiff/auto-review/findings-<loop>-<round>.json`, and the
+   round is done once that file exists and parses. `<loop>` is the loop's
+   pid and start time, so an agent left over from an earlier loop can never
+   signal a later loop's step.
 2. Appends the findings to the comment store with vdiff schema v1's rules
    (`c<n>` ids after the existing ones, `created_at`, sorted by
    `(path, start_line)`, pretty-printed). Your own comments are kept. Each
@@ -1930,7 +1932,7 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
    the store for you to read in `V`.
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
-   `<git-dir>/vdiff/auto-review/fix-<round>.done`, holding
+   `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
    `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
    round never re-reads comments with stale line anchors.

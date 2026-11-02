@@ -388,7 +388,7 @@ itself stays a detached process with no window.
   still working, including a step flagged stuck, still refuses.
 - **Done is a signal file, not claude exiting.** An interactive session sits
   at its prompt when finished, so the loop polls the round's findings file
-  or the fix pass's `fix-<round>.done` marker, then records an
+  or the fix pass's `fix-<loop>-<round>.done` marker, then records an
   `auto_review_signalled` event. It never ends the row: the row stays
   `running` while the agent lives, so hibernation and admission see it.
 - **SessionEnd keeps a status tm already set.** The hooks call `tm runs

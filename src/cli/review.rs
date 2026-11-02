@@ -706,7 +706,8 @@ pub fn auto(
         max_fix_rounds,
         out: RefCell::new(out),
     };
-    let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir)?;
+    let loop_id = format!("{}-{}", std::process::id(), deps.clock.now_unix_secs());
+    let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir, &loop_id)?;
     let out = ops.out.into_inner();
     writeln!(
         out,
@@ -2047,6 +2048,12 @@ mod tests {
 
     // --- tm review auto (GitHub issue #124) ---
 
+    /// The id a foreground loop gets in this process at
+    /// [`SignalSleeper`]'s starting time.
+    fn loop_id() -> String {
+        format!("{}-1787047200", std::process::id())
+    }
+
     /// A fake interactive agent's clock: each sleep of the loop's signal
     /// poll writes the next scripted `(path, body)` signal file, as an agent
     /// in its window would some time after launch (GitHub issue #150).
@@ -2372,7 +2379,7 @@ mod tests {
         fakes.tmux = FakeTmuxOps::new().with_has_session(Ok(true));
         let git_dir = worktree.join(".git");
         fakes.sleeper.script(vec![(
-            crate::work::auto_review::findings_path(&git_dir, 1),
+            crate::work::auto_review::findings_path(&git_dir, &loop_id(), 1),
             LOW_FINDING,
         )]);
         let spawner = FakeProcessSpawner::success(canned_json());
@@ -2459,14 +2466,17 @@ mod tests {
         let git_dir = worktree.join(".git");
         fakes.sleeper.script(vec![
             (
-                crate::work::auto_review::findings_path(&git_dir, 1),
+                crate::work::auto_review::findings_path(&git_dir, &loop_id(), 1),
                 MEDIUM_FINDING,
             ),
             (
-                crate::work::auto_review::fix_marker_path(&git_dir, 1),
+                crate::work::auto_review::fix_marker_path(&git_dir, &loop_id(), 1),
                 r#"{"succeeded": true}"#,
             ),
-            (crate::work::auto_review::findings_path(&git_dir, 2), "[]"),
+            (
+                crate::work::auto_review::findings_path(&git_dir, &loop_id(), 2),
+                "[]",
+            ),
         ]);
         let spawner = FakeProcessSpawner::success(canned_json());
         let deps = ReviewFixDeps {
@@ -2503,7 +2513,10 @@ mod tests {
             .find(|path| path.to_string_lossy().contains("review-fix"))
             .map(|path| std::fs::read_to_string(path).unwrap())
             .unwrap();
-        assert!(fix_prompt.contains("fix-1.done"), "{fix_prompt}");
+        assert!(
+            fix_prompt.contains(&format!("fix-{}-1.done", loop_id())),
+            "{fix_prompt}"
+        );
         for run in run_store.all_runs().unwrap() {
             if run.kind != "lane" {
                 assert_eq!(run.status, RunStatus::Running, "run {}", run.id);
