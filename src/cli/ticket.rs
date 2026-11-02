@@ -3554,6 +3554,55 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    /// GH-169: the audit skill re-reads the ticket after recording its
+    /// verdict. That read must not start a fresh `running` audit row, or the
+    /// dispatcher treats the ticket as in hand forever.
+    #[test]
+    fn audit_read_after_audit_record_leaves_no_running_audit_run() {
+        let jira = FakeJiraClient::new().with_issue("PROJ-372", issue("PROJ-372"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let status = AuditStoreStatus::Open(&store);
+        let markers_dir = tempfile::tempdir().unwrap();
+        let env = session_env_with_id("sess-1");
+        let mut out = Vec::new();
+        let read = |out: &mut Vec<u8>| {
+            audit_read(
+                &jira,
+                &status,
+                "",
+                "proj-372",
+                &env,
+                markers_dir.path(),
+                &ClaudeRunner,
+                out,
+            )
+            .expect("read should succeed");
+        };
+
+        read(&mut out);
+        audit_record(
+            &store,
+            "",
+            "proj-372",
+            "ready",
+            None,
+            &env,
+            markers_dir.path(),
+            &ClaudeRunner,
+            &mut out,
+        )
+        .expect("record should succeed");
+        read(&mut out);
+
+        let runs = store.list_runs().unwrap();
+        assert!(
+            runs.iter()
+                .all(|run| !(run.kind == "audit" && run.status == RunStatus::Running)),
+            "no audit run may be left running: {runs:?}"
+        );
+    }
+
     #[test]
     fn create_registers_a_session_run_with_kind_create_when_store_is_present() {
         let jira = FakeJiraClient::new().with_create_issue_result(issue("PROJ-9"));

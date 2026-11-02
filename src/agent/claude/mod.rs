@@ -78,6 +78,7 @@ use crate::work::naming::expand_tilde;
 
 pub mod hooks;
 pub mod hooks_install;
+pub mod transcript;
 
 /// The price table. Add an entry here for any new model name that shows up
 /// in `message.model` (transcript) or `modelUsage` (lane runs) and needs
@@ -495,6 +496,14 @@ impl AgentRunner for ClaudeRunner {
         hooks_install::install_user_hooks(&hooks_dir, &settings_path, "tm-init-probe", true)
             .map(|report| report.hooks_added.is_empty() && report.scripts_copied.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Reads `CLAUDE_CONFIG_DIR` itself (see [`hooks_install::config_dir`])
+    /// and returns a [`transcript::ClaudeTranscripts`] over that dir.
+    fn transcripts(&self, home: &Path) -> Option<Box<dyn crate::agent::Transcripts>> {
+        let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let config_dir = hooks_install::config_dir(claude_config_dir.as_deref(), home);
+        Some(Box::new(transcript::ClaudeTranscripts::new(config_dir)))
     }
 
     /// `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` are **observed but

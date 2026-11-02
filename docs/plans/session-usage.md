@@ -103,14 +103,22 @@ containing the bare run id (tm's usual bare-output style; trivially
   `pid = CLAUDE_PID`, `session_id`) and write the marker.
 - Opportunistic hygiene: sweep sibling markers whose run is no longer
   running (bounded: one small dir, local SQLite lookups).
+- Kind `audit` is the exception to the "different ticket" rule (GH-169):
+  a session owns at most one audit run per ticket, and only for the
+  ticket it audits (its first audit registration, or the board's
+  pre-registered row). Reading another ticket for context, or re-reading
+  its own ticket after the verdict is recorded (`done` run), registers
+  nothing and leaves the marker alone. A reaped (`failed`/`interrupted`)
+  run starts fresh. Without this, those reads stranded `running` audit
+  rows that kept the ticket in hand for the dispatcher.
 
-`finish_session(store, env, kind, ticket, status)` finishes the marker's
-run and unlinks the marker — but only when that run matches the given
-kind and ticket. The marker tracks the session's *latest* registration:
-a session that audits PROJ-1, then reads PROJ-2 for context, has its
-marker pointing at PROJ-2's run, and recording PROJ-1's verdict must not
-finish PROJ-2's run (or delete the marker and silence telemetry for the
-rest of the session).
+`finish_session(store, env, kind, ticket, status)` finishes the session's
+run for that kind and ticket and unlinks the marker if it points at that
+run. For `audit` it finds the session's latest running audit run for the
+ticket via `RunStore::session_runs`, independent of the marker. For other
+kinds it uses the marker's run, and only when that run matches the kind
+and ticket: the marker tracks the session's latest registration, so a
+marker pointing at another ticket's run must be left alone.
 
 Registration and finishing are telemetry — every failure path degrades
 silently; the ticket command's own output and exit code are never
