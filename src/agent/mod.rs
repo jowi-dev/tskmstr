@@ -1096,6 +1096,44 @@ mod tests {
         }
     }
 
+    /// Guard for GitHub issue #149: an
+    /// [`crate::work::admission::Admitted`] is the proof every agent
+    /// command line requires, so only the admission module may make one.
+    /// Outside test code, nothing else may call its constructor or its
+    /// test-only `for_test`; a launch path that wants an `Admitted` has to
+    /// go through `AdmissionGate` or `AdmissionDeps`.
+    #[test]
+    fn admitted_is_only_constructed_by_admission() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest_dir.join("src"), &mut files);
+
+        let mut violations = Vec::new();
+        for path in &files {
+            let rel = path
+                .strip_prefix(manifest_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "src/work/admission.rs" {
+                continue;
+            }
+            let contents = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            for (line_no, line) in strip_comments_and_tests(&contents) {
+                if line.contains("Admitted(") || line.contains("Admitted::for_test") {
+                    violations.push(format!("{rel}:{line_no}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Admitted constructed outside src/work/admission.rs; admit the \
+             launch through AdmissionGate or AdmissionDeps instead:\n{}",
+            violations.join("\n")
+        );
+    }
+
     /// Guard for GitHub issue #144: model names live only in the built-in
     /// defaults table and the two `PRICE_TABLE`s ([`MODEL_NAME_ALLOWLIST`]),
     /// so a hard-coded model can't creep back into a launch, a prompt, a
