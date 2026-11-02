@@ -732,8 +732,13 @@ pub struct RoundRun {
     pub ticket: String,
     /// Current status of the newest run.
     pub status: RunStatus,
-    /// PID recorded for the run (the round loop's), if any.
+    /// PID recorded for the run: the round loop's for a headless round, the
+    /// agent's for an interactive one.
     pub pid: Option<u32>,
+    /// The round loop's pid, from the run's latest `auto_review_loop_pid`
+    /// event, or `None` for a run from before that event (GitHub issue
+    /// #150).
+    pub loop_pid: Option<u32>,
     /// Detail of the run's latest `auto_review_round` event
     /// (`"<round>/<max> <verdict>"`), or `None` before its first round ends.
     pub round: Option<String>,
@@ -2412,8 +2417,9 @@ impl RunStore {
     }
 
     /// The newest run of `kind` per ticket, with the detail of its latest
-    /// `auto_review_round` event, for the board's `review:` badge (GitHub
-    /// issue #153). `scope` filters like [`RunStore::list_runs_filtered`].
+    /// `auto_review_round` event and the pid of its latest
+    /// `auto_review_loop_pid` event, for the board's `review:` badge (GitHub
+    /// issues #153, #150). `scope` filters like [`RunStore::list_runs_filtered`].
     ///
     /// "Newest" is strictly `started_at DESC, id DESC`: unlike
     /// [`RunStore::list_runs_filtered`], status never affects the order, so
@@ -2429,7 +2435,10 @@ impl RunStore {
                 r.pid,
                 (SELECT e.detail FROM run_events e
                     WHERE e.run_id = r.id AND e.kind = 'auto_review_round'
-                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS round
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS round,
+                (SELECT e.detail FROM run_events e
+                    WHERE e.run_id = r.id AND e.kind = 'auto_review_loop_pid'
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS loop_pid
              FROM runs r
              WHERE r.kind = ?1
                 AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
@@ -2448,10 +2457,12 @@ impl RunStore {
             let status_str: String = row.get(1)?;
             // Same forward-compat fallback as list_runs_filtered.
             let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
+            let loop_pid: Option<String> = row.get(4)?;
             Ok(RoundRun {
                 ticket: row.get(0)?,
                 status,
                 pid: row.get(2)?,
+                loop_pid: loop_pid.and_then(|pid| pid.trim().parse().ok()),
                 round: row.get(3)?,
             })
         })?;
@@ -9421,7 +9432,10 @@ mod tests {
         store
             .add_event(newer, "auto_review_round", Some("1/3 clean"))
             .unwrap();
-        store.start_run(&auto_review("GH-2", "me/proj")).unwrap();
+        let interactive = store.start_run(&auto_review("GH-2", "me/proj")).unwrap();
+        store
+            .add_event(interactive, "auto_review_loop_pid", Some("4242"))
+            .unwrap();
         store.start_run(&auto_review("GH-3", "other/repo")).unwrap();
         store
             .start_run(&StartRun {
@@ -9442,12 +9456,14 @@ mod tests {
                     ticket: "GH-1".to_string(),
                     status: RunStatus::Running,
                     pid: Some(42),
+                    loop_pid: None,
                     round: Some("1/3 clean".to_string()),
                 },
                 RoundRun {
                     ticket: "GH-2".to_string(),
                     status: RunStatus::Running,
                     pid: Some(42),
+                    loop_pid: Some(4242),
                     round: None,
                 },
             ],

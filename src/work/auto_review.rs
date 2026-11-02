@@ -22,6 +22,12 @@ pub const AUTO_REVIEW_KIND: &str = "auto-review";
 /// `<round>/<max> <verdict>`; see [`RoundVerdict`].
 pub const ROUND_EVENT: &str = "auto_review_round";
 
+/// Event kind the loop records on every review and fix row it creates,
+/// its detail the loop's own pid (GitHub issue #150). An interactive row's
+/// pid is its agent's, which outlives the loop in its open window, so the
+/// board's `review:` badge reads the loop's liveness from this event.
+pub const LOOP_PID_EVENT: &str = "auto_review_loop_pid";
+
 /// Skill a first round reviews with.
 pub const FIRST_ROUND_SKILL: &str = "thatch-code-review";
 
