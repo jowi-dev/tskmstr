@@ -2536,6 +2536,42 @@ mod tests {
     }
 
     #[test]
+    fn import_fix_over_the_memory_budget_is_refused_like_a_human_fix() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = import_fakes(&tmp, FakeGitOps::new());
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            admission: AdmissionDeps::with_budget(1),
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+        let mut out = Vec::new();
+
+        let err = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, false),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded"),
+            "{err}"
+        );
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn import_fix_at_the_cap_flags_the_lane_and_starts_nothing() {
         let (tmp, run_store, worktree) = setup();
         seed_lane_run(&run_store, &worktree);
