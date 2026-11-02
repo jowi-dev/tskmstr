@@ -1060,6 +1060,14 @@ pub enum RunsCmd {
         /// session-end hook it may still fire must not close the run.
         #[arg(long)]
         force: bool,
+        /// Only finish the run if it is still running; otherwise do nothing
+        /// and exit 0. A missing run counts as not running.
+        #[arg(long)]
+        if_running: bool,
+        /// Only finish the run if its kind is KIND; otherwise do nothing
+        /// and exit 0.
+        #[arg(long, value_name = "KIND")]
+        if_kind: Option<String>,
     },
     /// Appends a telemetry event to a run and bumps its heartbeat.
     Event {
@@ -2746,6 +2754,37 @@ mod tests {
             }) => {
                 assert_eq!(run_id, 3);
                 assert!(matches!(status, FinishStatusArg::Done));
+            }
+            other => panic!("expected Runs Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_runs_finish_guard_flags() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "runs",
+            "finish",
+            "3",
+            "--status",
+            "done",
+            "--if-running",
+            "--if-kind",
+            "create",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Runs {
+                cmd:
+                    Some(RunsCmd::Finish {
+                        if_running,
+                        if_kind,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert!(if_running);
+                assert_eq!(if_kind.as_deref(), Some("create"));
             }
             other => panic!("expected Runs Finish, got {other:?}"),
         }

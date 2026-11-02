@@ -52,6 +52,17 @@
 //! the other ticket, so the call is a context read (see "One audit run per
 //! ticket" above).
 //!
+//! **Board create sessions** (GitHub issue #156) are the one kind whose
+//! pre-registered row cannot match on ticket:
+//! [`crate::work::create::launch_create`] starts it before any ticket
+//! exists, under [`CREATE_PLACEHOLDER_TICKET`]. A `create` registration
+//! adopts a running placeholder `create` row named by
+//! `TSKMSTR_SESSION_RUN_ID` whatever its ticket, then re-stamps the ticket
+//! to the key just created. A `create` session's marker run is likewise
+//! reused across tickets, so a session that files two tickets keeps one row
+//! whose ticket is the first key. Every other kind still needs an exact
+//! kind/ticket match.
+//!
 //! [`SessionEnv::session_id`]/[`SessionEnv::agent_pid`] are read from
 //! whichever env vars the configured runner's
 //! [`crate::agent::AgentRunner::session_env_vars`] names (`claude` sets
@@ -81,6 +92,25 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
+
+/// The `ticket` a board create session's run row carries until the session
+/// creates its first ticket (GitHub issue #156).
+/// [`crate::work::create::launch_create`] pre-registers the row before any
+/// ticket exists; [`register_session`] swaps in the first key the session
+/// creates. Lowercase with a hyphen-joined word rather than a number, so it
+/// can never parse as a ticket key on any backend, and shell-safe, since it
+/// is printed and passed around like any other ticket value.
+pub const CREATE_PLACEHOLDER_TICKET: &str = "new-ticket";
+
+/// The run kind of a ticket-creation session, whether board-launched or a
+/// `tm ticket create` in a session tm did not launch.
+pub const CREATE_KIND: &str = "create";
+
+/// Whether `ticket` is [`CREATE_PLACEHOLDER_TICKET`], compared
+/// case-insensitively like every other ticket comparison here.
+fn is_create_placeholder(ticket: &str) -> bool {
+    ticket.eq_ignore_ascii_case(CREATE_PLACEHOLDER_TICKET)
+}
 
 /// Errors returned by this module's functions.
 #[derive(Debug, Error)]
@@ -150,9 +180,10 @@ pub struct SessionEnv {
     /// present, a lane run already owns telemetry for this process tree, so
     /// session registration is a no-op (see [`register_session`]).
     pub lane_run_id: Option<String>,
-    /// `TSKMSTR_SESSION_RUN_ID`: set by
-    /// [`crate::work::audit::launch_audit`] on a board-launched session,
-    /// naming the pre-registered run id for [`register_session`] to adopt
+    /// `TSKMSTR_SESSION_RUN_ID`: set by every launcher that pre-registers
+    /// an interactive session's row ([`crate::work::audit::launch_audit`],
+    /// [`crate::work::create::launch_create`], `tm merge`'s conflict
+    /// sessions, interactive lane and fix runs), naming the pre-registered run id for [`register_session`] to adopt
     /// (see the module docs' "Adoption of board-launched sessions"
     /// section). `None` when unset, empty, or unparseable as an `i64` —
     /// this is advisory input, never load-bearing on its own.
@@ -347,8 +378,16 @@ fn audit_claim(
 ///   (the latter case-insensitively). The
 ///   marker is written pointing at it, and its `session_id`/`pid` are
 ///   stamped (see the module docs' "Adoption of board-launched sessions").
+/// - `Ok(Some(id))` — `kind` is [`CREATE_KIND`] and `env.session_run_id`
+///   names a running `create` row still carrying
+///   [`CREATE_PLACEHOLDER_TICKET`] (a board create session's
+///   pre-registration): adopted as above, and its ticket re-stamped to
+///   `ticket`.
 /// - `Ok(Some(id))` — reused the existing run at the session's marker,
-///   because it is [`RunStatus::Running`] with the same `kind` and `ticket`.
+///   because it is [`RunStatus::Running`] with the same `kind` and `ticket`,
+///   or because both it and this call are `create` (one row per create
+///   session; a placeholder ticket is re-stamped to `ticket`, any real one
+///   kept).
 /// - `Ok(Some(id))` — started a fresh run and wrote the marker, either
 ///   because there was no marker, the marker's run wasn't running, or it was
 ///   running a *different* `kind`/`ticket` (in which case that old run is
@@ -405,6 +444,21 @@ pub fn register_session(
         }
     }
 
+    // A board create session's row was pre-registered before any ticket
+    // existed, so it carries the placeholder rather than `ticket`: the first
+    // `tm ticket create` adopts it and swaps in the key it just created.
+    if kind == CREATE_KIND
+        && let Some(candidate_id) = env.session_run_id
+        && let Some(run) = store.run_by_id(candidate_id)?
+        && run.status == RunStatus::Running
+        && run.kind == CREATE_KIND
+        && is_create_placeholder(&run.ticket)
+    {
+        adopt_run(store, dir, session_id, candidate_id, env.agent_pid)?;
+        store.update_ticket(candidate_id, ticket)?;
+        return Ok(Some(candidate_id));
+    }
+
     let path = marker_path(dir, session_id);
 
     if let Some(existing_id) = read_marker(&path)
@@ -412,6 +466,15 @@ pub fn register_session(
         && run.status == RunStatus::Running
     {
         if run.kind == kind && run.ticket == ticket {
+            return Ok(Some(existing_id));
+        }
+        // One create session is one agent, however many tickets it files:
+        // a second `tm ticket create` keeps the session's row (and its first
+        // key) rather than closing it and starting another.
+        if kind == CREATE_KIND && run.kind == CREATE_KIND {
+            if is_create_placeholder(&run.ticket) {
+                store.update_ticket(existing_id, ticket)?;
+            }
             return Ok(Some(existing_id));
         }
         store.finish_run(
@@ -584,6 +647,54 @@ pub fn finish_session(
     Ok(Some(run_id))
 }
 
+/// Removes every marker in `dir` that names `run_id`, returning how many
+/// were removed.
+///
+/// For a supervisor that finishes a session's run itself (`tm merge`'s
+/// conflict sessions, GitHub issue #156): with the marker gone, the
+/// session's later SessionEnd hook finds nothing to finish, so whichever of
+/// the two ends the run first wins and the other is a no-op. Without it the
+/// hook would still find the marker and overwrite the supervisor's
+/// `failed` with `done`.
+///
+/// A missing `dir` means no session ever registered, so it is `Ok(0)`, not
+/// an error. Markers whose contents don't parse are left alone, as are
+/// markers naming other runs.
+///
+/// # Errors
+///
+/// [`SessionError::ReadMarker`] if `dir` exists but cannot be listed;
+/// [`SessionError::RemoveMarker`] if a matching marker cannot be removed
+/// for any reason other than it already being gone.
+pub fn remove_markers_for_run(dir: &Path, run_id: i64) -> Result<usize, SessionError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(SessionError::ReadMarker {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if read_marker(&path) != Some(run_id) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            // The session's own hook got there first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(SessionError::RemoveMarker { path, source }),
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +855,111 @@ mod tests {
         assert_eq!(store.list_runs().unwrap().len(), 1, "no new run created");
     }
 
+    // --- board create sessions (GitHub issue #156) ---
+
+    /// The row `launch_create` pre-registers: no ticket exists yet, so it
+    /// carries the placeholder.
+    fn preregister_create(store: &RunStore) -> i64 {
+        store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: CREATE_PLACEHOLDER_TICKET.to_string(),
+                lane: "create".to_string(),
+                worktree: "/repo/axiom".to_string(),
+                branch: None,
+                pid: None,
+                kind: "create".to_string(),
+                log_path: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn register_session_adopts_a_placeholder_create_row_and_restamps_its_ticket() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let pre_id = preregister_create(&store);
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        let id = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
+            .unwrap()
+            .expect("expected the adopted run id");
+
+        assert_eq!(id, pre_id);
+        let run = store.run_by_id(pre_id).unwrap().unwrap();
+        assert_eq!(run.ticket, "GH-1");
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(run.pid, Some(4242));
+        assert_eq!(
+            std::fs::read_to_string(markers_dir.path().join("sess-1")).unwrap(),
+            pre_id.to_string()
+        );
+    }
+
+    #[test]
+    fn two_creates_in_a_board_create_session_leave_one_row_with_the_first_key() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let pre_id = preregister_create(&store);
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        let first = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
+            .unwrap()
+            .unwrap();
+        let second = register_session(&store, None, markers_dir.path(), &env, "create", "GH-2")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, pre_id);
+        assert_eq!(second, pre_id);
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1, "one row for the whole session: {runs:?}");
+        assert_eq!(runs[0].ticket, "GH-1");
+        assert_eq!(runs[0].status, RunStatus::Running);
+    }
+
+    #[test]
+    fn two_creates_in_an_unlaunched_session_also_share_one_row() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let first = register_session(&store, None, markers_dir.path(), &env, "create", "GH-1")
+            .unwrap()
+            .unwrap();
+        let second = register_session(&store, None, markers_dir.path(), &env, "create", "GH-2")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+        assert_eq!(store.run_by_id(first).unwrap().unwrap().ticket, "GH-1");
+    }
+
+    #[test]
+    fn a_placeholder_create_row_is_not_adopted_by_another_kind() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let pre_id = preregister_create(&store);
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "GH-1")
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(id, pre_id);
+        let pre = store.run_by_id(pre_id).unwrap().unwrap();
+        assert_eq!(pre.ticket, CREATE_PLACEHOLDER_TICKET);
+        assert_eq!(pre.session_id, None);
+    }
+
     #[test]
     fn register_session_adoption_falls_through_on_kind_mismatch() {
         let db_dir = tempdir().unwrap();
@@ -888,12 +1104,13 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        // `create` keeps the marker-follows-latest-registration behavior;
-        // `audit` does not (see the audit tests below).
-        let first = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
+        // `setup` keeps the marker-follows-latest-registration behavior;
+        // `audit` does not (one audit run per ticket, below) and `create`
+        // does not either (one create session is one agent, below).
+        let first = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-1")
             .unwrap()
             .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-2")
+        let second = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -1142,11 +1359,12 @@ mod tests {
 
         // A non-audit session registers PROJ-1, then PROJ-2: the marker now
         // points at PROJ-2's run, and finishing PROJ-1 must not finish
-        // PROJ-2's run or delete its marker.
-        register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
+        // PROJ-2's run or delete its marker. (`setup` still marker-follows;
+        // `create` keeps its session's row and `audit` reuses by ticket.)
+        register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-1")
             .unwrap()
             .unwrap();
-        let b_id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-2")
+        let b_id = register_session(&store, None, markers_dir.path(), &env, "setup", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -1154,7 +1372,7 @@ mod tests {
             &store,
             markers_dir.path(),
             &env,
-            "create",
+            "setup",
             "PROJ-1",
             RunStatus::Done,
             &ClaudeRunner,
@@ -1273,6 +1491,33 @@ mod tests {
 
         assert_eq!(result, None);
         assert!(markers_dir.path().join("sess-1").exists());
+    }
+
+    // --- remove_markers_for_run ---
+
+    #[test]
+    fn remove_markers_for_run_removes_only_markers_naming_the_run() {
+        let markers_dir = tempdir().unwrap();
+        let dir = markers_dir.path();
+        std::fs::write(dir.join("sess-a"), "7").unwrap();
+        std::fs::write(dir.join("sess-b"), "8").unwrap();
+        std::fs::write(dir.join("sess-c"), "garbage").unwrap();
+
+        let removed = remove_markers_for_run(dir, 7).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!dir.join("sess-a").exists());
+        assert!(dir.join("sess-b").exists());
+        assert!(dir.join("sess-c").exists());
+    }
+
+    #[test]
+    fn remove_markers_for_run_is_a_noop_without_a_sessions_dir() {
+        let parent = tempdir().unwrap();
+
+        let removed = remove_markers_for_run(&parent.path().join("missing"), 7).unwrap();
+
+        assert_eq!(removed, 0);
     }
 
     // --- one audit run per ticket per session ---

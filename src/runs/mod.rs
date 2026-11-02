@@ -879,7 +879,9 @@ pub struct Run {
     /// [`crate::agent::AgentRunner::name`] of the agent driving the run, if
     /// recorded; see [`RunStore::update_agent_repo`].
     pub agent: Option<String>,
-    /// Directory name of the lane's repo, if recorded; see
+    /// Directory name of the repo the run works in (the lane's repo for a
+    /// lane, review-fix or auto-review row; the configured directory for an
+    /// audit, bugbot-cleanup or setup row), if recorded; see
     /// [`RunStore::update_agent_repo`].
     pub repo: Option<String>,
     /// Absolute path of the lane repo's main checkout, if recorded; see
@@ -2167,9 +2169,12 @@ impl RunStore {
     }
 
     /// Records which agent drives `run_id` and which repo it runs against,
-    /// the key [`RunStore::lane_peak_estimate`] groups by. A separate update
-    /// rather than [`StartRun`] fields for the same reason as
-    /// [`RunStore::update_tmux_session`]: only the lane-run path knows both.
+    /// the key [`RunStore::lane_peak_estimate`] groups by. Every path that
+    /// starts an agent row stamps it right after [`RunStore::start_run`]
+    /// (GitHub issue #156); rows that are not agents, such as a review-watch
+    /// poller, leave both `NULL`. A separate update rather than [`StartRun`]
+    /// fields because most `start_run` callers (tests, pollers, adoption)
+    /// have no agent to name.
     ///
     /// # Errors
     ///
@@ -2183,6 +2188,28 @@ impl RunStore {
         let changes = self.conn.execute(
             "UPDATE runs SET agent = ?1, repo = ?2 WHERE id = ?3",
             params![agent, repo, run_id],
+        )?;
+
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
+    /// Re-stamps `run_id`'s `ticket`. Exists for board create sessions
+    /// (GitHub issue #156): their row is pre-registered under
+    /// [`crate::runs::session::CREATE_PLACEHOLDER_TICKET`] because no ticket
+    /// exists at launch, and the first in-session `tm ticket create` swaps
+    /// in the key it created (see
+    /// [`crate::runs::session::register_session`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_ticket(&self, run_id: i64, ticket: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET ticket = ?1 WHERE id = ?2",
+            params![ticket, run_id],
         )?;
 
         if changes == 0 {
@@ -9236,6 +9263,27 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.agent.as_deref(), Some("opencode"));
         assert_eq!(run.repo.as_deref(), Some("lemma"));
+    }
+
+    #[test]
+    fn update_ticket_restamps_the_rows_ticket() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "new-ticket", None);
+
+        store.update_ticket(id, "GH-7").unwrap();
+
+        assert_eq!(store.run_by_id(id).unwrap().unwrap().ticket, "GH-7");
+    }
+
+    #[test]
+    fn update_ticket_errors_for_a_missing_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let err = store.update_ticket(99, "GH-7").unwrap_err();
+
+        assert!(matches!(err, RunStoreError::RunNotFound(99)));
     }
 
     // --- repo root (GitHub issue #82, ADR-0009 decision 5) ---

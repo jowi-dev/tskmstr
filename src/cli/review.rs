@@ -254,6 +254,23 @@ fn review_run_model(deps: &ReviewFixDeps<'_>, lane: &str) -> String {
         .model
 }
 
+/// The `repo` a fix pass or auto-review round on `lane_run`'s ticket stamps
+/// as its memory-estimate key (GitHub issue #156): the repo the lane row
+/// recorded, so the follow-up keys on the same repo as the lane run it
+/// works on. A lane row predating the stamp falls back to the lane config's
+/// [`crate::work::run::lane_repo_key`], the rule the lane path itself
+/// stamps by, and with no config (or a lane since removed from it) to the
+/// lane name, that rule's own fallback.
+fn review_run_repo(config: Option<&crate::config::Config>, lane_run: &crate::runs::Run) -> String {
+    if let Some(repo) = &lane_run.repo {
+        return repo.clone();
+    }
+    config
+        .and_then(|cfg| cfg.work.lanes.get(&lane_run.lane))
+        .map(|lane_config| crate::work::run::lane_repo_key(&lane_run.lane, lane_config))
+        .unwrap_or_else(|| lane_run.lane.clone())
+}
+
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
 /// grouped by file with `path:start-end` anchors — in instructions for the
 /// fix-pass agent: address every comment, on the current branch, and commit
@@ -342,6 +359,7 @@ pub fn fix(
         &scope,
         &run.ticket,
         &run.lane,
+        &review_run_repo(deps.config, &run),
         &worktree,
         &branch,
         prompt,
@@ -557,12 +575,14 @@ pub fn auto(
         (None, None) => DEFAULT_PROMPT.to_string(),
     };
     let git_dir = deps.git.git_dir(&worktree)?;
+    let repo = review_run_repo(deps.config, &run);
     let ops = CliAutoReviewOps {
         deps,
         paths,
         scope: &scope,
         ticket: &run.ticket,
         lane: &run.lane,
+        repo: &repo,
         worktree: &worktree,
         branch: &branch,
         git_dir: &git_dir,
@@ -643,6 +663,8 @@ struct CliAutoReviewOps<'a, 'o> {
     scope: &'a str,
     ticket: &'a str,
     lane: &'a str,
+    /// See [`review_run_repo`].
+    repo: &'a str,
     worktree: &'a Path,
     branch: &'a str,
     git_dir: &'a Path,
@@ -664,6 +686,7 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
                 scope: self.scope,
                 ticket: self.ticket,
                 lane: self.lane,
+                repo: self.repo,
                 worktree: self.worktree,
                 branch: self.branch,
                 prompt,
@@ -1516,6 +1539,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(review_fix_run.status, crate::runs::RunStatus::Done);
+        // GitHub issue #156: the seeded lane row recorded no repo and no
+        // config is loaded, so the fix row keys on the lane name.
+        assert_eq!(review_fix_run.agent.as_deref(), Some("claude"));
+        assert_eq!(review_fix_run.repo.as_deref(), Some("mylane"));
+    }
+
+    /// The lane run `seed_lane_run` recorded, read back from `run_store`.
+    fn seeded_lane_run(run_store: &RunStore) -> crate::runs::Run {
+        run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn review_run_repo_prefers_the_repo_the_lane_run_recorded() {
+        let (_tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let lane_run = seeded_lane_run(&run_store);
+        run_store
+            .update_agent_repo(lane_run.id, "claude", "axiom")
+            .unwrap();
+        let config = config_with("[work.lanes.mylane]\nrepo = \"/r/other\"\n");
+
+        let repo = review_run_repo(Some(&config), &seeded_lane_run(&run_store));
+
+        assert_eq!(repo, "axiom");
+    }
+
+    #[test]
+    fn review_run_repo_falls_back_to_the_lane_config_repo_key() {
+        let (_tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let config = config_with("[work.lanes.mylane]\nrepo = \"/r/axiom\"\n");
+
+        let repo = review_run_repo(Some(&config), &seeded_lane_run(&run_store));
+
+        assert_eq!(repo, "axiom");
+    }
+
+    #[test]
+    fn review_run_repo_falls_back_to_the_lane_name_without_a_config() {
+        let (_tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+
+        let repo = review_run_repo(None, &seeded_lane_run(&run_store));
+
+        assert_eq!(repo, "mylane");
     }
 
     /// Runs a foreground `fix` under `config` and returns the agent's
@@ -1854,6 +1925,8 @@ mod tests {
             .unwrap();
         assert_eq!(round.worktree, worktree.to_string_lossy());
         assert_eq!(round.branch, Some("jowi-dev/proj-1-slug".to_string()));
+        assert_eq!(round.agent.as_deref(), Some("claude"));
+        assert_eq!(round.repo.as_deref(), Some("mylane"));
         let events = run_store.events_for_run(round.id).unwrap();
         assert!(
             events

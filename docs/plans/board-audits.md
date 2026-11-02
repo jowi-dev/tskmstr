@@ -221,7 +221,9 @@ Each step is TDD'd and lands as one commit; tests + clippy green via
 - Restoring audit tmux sessions after a reboot (`tm work restore`
   analog) — audits are short-lived; relaunching from the board is cheap.
 - Board-launched *create* sessions — same machinery would generalize;
-  do it when wanted.
+  do it when wanted. (Done in GitHub issue #156: `launch_create`
+  pre-registers a `create` row under a placeholder ticket that the first
+  `tm ticket create` adopts and re-stamps.)
 - A `Notification`-based OS-level alert (sound/badge) when a session
   starts waiting — the board indicator is the alert for now.
 - Emitting `await` telemetry for lane runs (headless; nothing to wait

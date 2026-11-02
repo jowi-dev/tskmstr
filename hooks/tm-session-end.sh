@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SessionEnd hook.
 #
-# Finishes a registered interactive session's run (audit/create) when the
-# Claude Code session that owns it terminates, so sessions the user never
+# Finishes a registered interactive session's run (audit, create, an
+# interactive lane or fix run, a tm merge conflict session) when the Claude
+# Code session that owns it terminates, so sessions the user never
 # `--record`ed or exited cleanly still get a final status and a model_usage
 # snapshot. Looked up via a marker file at
 # ${XDG_DATA_HOME:-~/.local/share}/tskmstr/sessions/<session_id> containing
@@ -15,18 +16,38 @@
 # Also records the transcript path (--transcript) whenever the hook input
 # carries one, so `tm runs logs` can render the session afterwards.
 # The marker is removed either way so a dead session never shadows a future
-# one with the same id.
+# one with the same id. No marker means nothing to finish here: either the
+# session never registered, or a supervisor (tm merge) already finished the
+# run and removed its marker.
+#
+# Create fallback (GitHub issue #156): a board create session's row is
+# pre-registered and named by TSKMSTR_SESSION_RUN_ID, but only gains a marker
+# once the session runs `tm ticket create`. On every exit past the lane gate
+# the hook also finishes that row, guarded by --if-running --if-kind create,
+# so a create session that never created a ticket is still closed while an
+# already-finished row, or a pre-registered row of any other kind (an audit
+# that never recorded a verdict is not "done"), is left alone.
 #
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
 
 [ -n "${TSKMSTR_RUN_ID:-}" ] && exit 0
 
+command -v tm >/dev/null 2>&1 || exit 0
+
+finish_create_fallback() {
+  [ -n "${TSKMSTR_SESSION_RUN_ID:-}" ] || return 0
+  tm runs finish "$TSKMSTR_SESSION_RUN_ID" --status done --if-running --if-kind create >/dev/null 2>&1
+  return 0
+}
+# An EXIT trap, so every early exit below (no sessions dir, no jq, no
+# marker) still runs the fallback, and runs it after any marker finish.
+trap finish_create_fallback EXIT
+
 SESSIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tskmstr/sessions"
 [ -n "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ] || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
-command -v tm >/dev/null 2>&1 || exit 0
 
 set -uo pipefail
 

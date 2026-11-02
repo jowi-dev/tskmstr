@@ -167,8 +167,9 @@ pub struct CleanupLaunchRequest<'a> {
 /// 3. Otherwise reads `req.cfg.prompt_file` (if set — see
 ///    [`crate::work::prompt::read_prompt_file`]) *before* pre-registering a
 ///    run, so a bad path leaves no orphaned run row, pre-registers a run
-///    (`kind = "bugbot-cleanup"`, `lane = "bugbot-cleanup"`, `pid = None`)
-///    and starts the tmux session running `claude <prompt>`, with
+///    (`kind = "bugbot-cleanup"`, `lane = "bugbot-cleanup"`, `pid = None`,
+///    `agent`/`repo` the runner's name and the cleanup directory's name via
+///    [`crate::work::run::dir_repo_key`]) and starts the tmux session running `claude <prompt>`, with
 ///    [`crate::work::audit::SESSION_RUN_ID_ENV`] set to the new run's id so
 ///    the in-session `/bugbot-triage` skill's `tm runs register --kind
 ///    bugbot-cleanup` step can adopt it.
@@ -229,6 +230,13 @@ pub fn launch_cleanup(
         kind: CLEANUP_KIND.to_string(),
         log_path: None,
     })?;
+    // Every agent row carries its estimate key (GitHub issue #156): the
+    // cleanup directory's name stands in for a lane's repo.
+    deps.store.update_agent_repo(
+        run_id,
+        deps.runner.name(),
+        &crate::work::run::dir_repo_key(&dir),
+    )?;
 
     let template = prompt_file_contents
         .as_deref()
@@ -419,6 +427,9 @@ mod tests {
         assert_eq!(run.status, RunStatus::Running);
         assert_eq!(run.pid, None);
         assert_eq!(run.worktree, "/Users/jowi/Projects/axiom");
+        // GitHub issue #156: the cleanup row carries its estimate key.
+        assert_eq!(run.agent.as_deref(), Some("claude"));
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
 
         assert_eq!(outcome.window_name, CLEANUP_WINDOW_NAME);
         let findings_file = findings_file_path(&home, None, "PROJ-1");

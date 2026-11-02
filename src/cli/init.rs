@@ -87,6 +87,8 @@ pub struct InitContext<'a> {
     /// Launches the agent-assisted setup session in the foreground (from the
     /// repo root) and waits for it to exit; `Err` is a display message.
     /// Injected so the wizard is testable without spawning a real agent.
+    /// The real launcher records the session as a `setup` run row (see
+    /// [`crate::work::setup_session`]).
     pub setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
 }
 
@@ -475,6 +477,8 @@ pub(crate) fn offer_agent_setup(
         max_turns: None,
         permission_mode: None,
         settings_path: None,
+        // No run id in the session's env: the launcher finishes the setup
+        // row from the child's exit status itself, so no hook must.
         run_id: None,
         mode: RunMode::Interactive,
     });

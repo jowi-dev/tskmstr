@@ -186,6 +186,26 @@ pub fn start(store: &RunStore, params: &StartRun, out: &mut dyn Write) -> Result
     Ok(())
 }
 
+/// Conditions on [`finish`], from `tm runs finish`'s `--if-running` and
+/// `--if-kind` flags. The default (no conditions) finishes unconditionally;
+/// with any condition set, a missing run is a no-op too rather than
+/// [`crate::runs::RunStoreError::RunNotFound`].
+///
+/// They exist for the SessionEnd hook's create fallback (GitHub issue
+/// #156): a board create session that never created a ticket has no marker,
+/// so the hook finishes the pre-registered row named by
+/// `TSKMSTR_SESSION_RUN_ID` instead, and must neither reopen a row something
+/// else already finished nor close a row of another kind (an audit session
+/// that never recorded a verdict is not `done`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinishGuard {
+    /// Only finish a run that is currently `running`; a missing run counts
+    /// as not running.
+    pub if_running: bool,
+    /// Only finish a run of this kind.
+    pub if_kind: Option<String>,
+}
+
 /// `tm runs finish`: record a run's terminal outcome.
 ///
 /// Prints `Finished run {id}: {status}` with `status` lowercased, matching
@@ -196,14 +216,40 @@ pub fn start(store: &RunStore, params: &StartRun, out: &mut dyn Write) -> Result
 /// automated callers are the agents' session-end hooks, and a hibernated
 /// run's agent ending is tm stopping it on purpose, not the run finishing
 /// (GitHub issue #64).
+///
+/// `guard` makes the finish conditional (`--if-running`, `--if-kind`): when
+/// a condition fails the run is left untouched, `Left run {id} alone: ...`
+/// is printed, and `Ok(())` returned, so a hook can fire it blind. The
+/// guard is checked before the hibernation refusal, so a guarded finish of a
+/// hibernated run is a quiet no-op rather than an error.
 pub fn finish(
     store: &RunStore,
     run_id: i64,
     outcome: &FinishRun,
     force: bool,
+    guard: &FinishGuard,
     runner: &dyn crate::agent::AgentRunner,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
+    if guard.if_running || guard.if_kind.is_some() {
+        let run = store.run_by_id(run_id)?;
+        let skip = match &run {
+            None => Some("no such run".to_string()),
+            Some(run) if guard.if_running && run.status != RunStatus::Running => {
+                Some(format!("not running ({})", run.status.as_str()))
+            }
+            Some(run) => guard
+                .if_kind
+                .as_deref()
+                .filter(|kind| *kind != run.kind)
+                .map(|kind| format!("kind {} is not {kind}", run.kind)),
+        };
+        if let Some(reason) = skip {
+            writeln!(out, "Left run {run_id} alone: {reason}")?;
+            return Ok(());
+        }
+    }
+
     if !force
         && store
             .run_by_id(run_id)?
@@ -1500,6 +1546,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut out,
         )
@@ -1568,6 +1615,123 @@ mod tests {
         assert!(out.is_empty(), "reap already prints the nothing-to-do line");
     }
 
+    fn done() -> FinishRun {
+        FinishRun {
+            status: RunStatus::Done,
+            ..FinishRun::default()
+        }
+    }
+
+    /// `--if-running`: the SessionEnd hook's create fallback must not
+    /// overwrite a row merge or an in-session `tm ticket create` already
+    /// finished (GitHub issue #156).
+    #[test]
+    fn finish_if_running_leaves_an_already_finished_run_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Failed,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let guard = FinishGuard {
+            if_running: true,
+            if_kind: None,
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out)
+            .expect("a guarded no-op is not an error");
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+        assert!(String::from_utf8(out).unwrap().contains("not running"));
+    }
+
+    #[test]
+    fn finish_if_running_treats_a_missing_run_as_not_running() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let guard = FinishGuard {
+            if_running: true,
+            if_kind: None,
+        };
+        let mut out = Vec::new();
+
+        finish(&store, 42, &done(), false, &guard, &ClaudeRunner, &mut out)
+            .expect("a guarded no-op is not an error");
+    }
+
+    #[test]
+    fn finish_if_running_finishes_a_running_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let guard = FinishGuard {
+            if_running: true,
+            if_kind: None,
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
+    /// `--if-kind`: an audit session that never recorded a verdict must not
+    /// be marked `done` by the create fallback (GitHub issue #156).
+    #[test]
+    fn finish_if_kind_leaves_a_run_of_another_kind_alone() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut params = start_params("PROJ-1");
+        params.kind = "audit".to_string();
+        let id = store.start_run(&params).unwrap();
+        let guard = FinishGuard {
+            if_running: false,
+            if_kind: Some("create".to_string()),
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn finish_if_kind_finishes_a_run_of_that_kind() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut params = start_params("new-ticket");
+        params.kind = "create".to_string();
+        let id = store.start_run(&params).unwrap();
+        let guard = FinishGuard {
+            if_running: true,
+            if_kind: Some("create".to_string()),
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
     /// The session-end hooks finish with `--status done` and swallow
     /// errors; refusing here is what keeps an agent stopped for
     /// hibernation from closing its own run (GitHub issue #64).
@@ -1583,8 +1747,16 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let err = finish(&store, id, &done, false, &ClaudeRunner, &mut out)
-            .expect_err("a hibernated run is not finished by default");
+        let err = finish(
+            &store,
+            id,
+            &done,
+            false,
+            &FinishGuard::default(),
+            &ClaudeRunner,
+            &mut out,
+        )
+        .expect_err("a hibernated run is not finished by default");
         assert!(matches!(err, RunsCliError::Hibernated(run) if run == id));
         assert!(out.is_empty());
         assert_eq!(
@@ -1592,7 +1764,16 @@ mod tests {
             RunStatus::Hibernated
         );
 
-        finish(&store, id, &done, true, &ClaudeRunner, &mut out).expect("forced finish");
+        finish(
+            &store,
+            id,
+            &done,
+            true,
+            &FinishGuard::default(),
+            &ClaudeRunner,
+            &mut out,
+        )
+        .expect("forced finish");
         assert_eq!(
             store.run_by_id(id).unwrap().unwrap().status,
             RunStatus::Done
@@ -1610,6 +1791,7 @@ mod tests {
             999,
             &FinishRun::default(),
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut out,
         )
@@ -1638,6 +1820,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut out,
         )
@@ -1673,7 +1856,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            false, &ClaudeRunner,
+            false, &FinishGuard::default(), &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -1710,7 +1893,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            false, &ClaudeRunner,
+            false, &FinishGuard::default(), &ClaudeRunner,
             &mut out,
         )
         .expect("should succeed");
@@ -1735,6 +1918,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut out,
         )
@@ -1764,6 +1948,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut out,
         )
@@ -2747,6 +2932,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2799,6 +2985,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -2829,6 +3016,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -3182,6 +3370,7 @@ mod tests {
                 ..FinishRun::default()
             },
             false,
+            &FinishGuard::default(),
             &ClaudeRunner,
             &mut Vec::new(),
         )
@@ -3252,7 +3441,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            false, &ClaudeRunner,
+            false, &FinishGuard::default(), &ClaudeRunner,
             &mut Vec::new(),
         )
         .unwrap();
@@ -3289,7 +3478,7 @@ mod tests {
                 ),
                 ..FinishRun::default()
             },
-            false, &ClaudeRunner,
+            false, &FinishGuard::default(), &ClaudeRunner,
             &mut Vec::new(),
         )
         .unwrap();

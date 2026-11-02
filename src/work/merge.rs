@@ -25,8 +25,13 @@
 //! [`crate::agent::AgentRunner::tmux_command_line`] rendering the command
 //! that reads it back — the same billing-safety `env -u` prefix and
 //! unattended default permissions (`bypassPermissions` for `ClaudeRunner`)
-//! every other agent session gets. The session itself stays deliberately
-//! untracked (no run row): see [`run_conflict_session`].
+//! every other agent session gets. When a run store is configured, each
+//! conflict session (one per single-ticket conflict, one shared row for a
+//! batch's session) is recorded as a [`MERGE_CONFLICT_KIND`] run row,
+//! pre-registered before the window opens and adopted by the session, then
+//! finished by merge itself once the rebase resolves (`done`) or is handed
+//! back (`failed`) — or by the session's SessionEnd hook if that comes
+//! first (GitHub issue #156): see [`run_conflict_session`].
 //!
 //! A conflict session that never resolves is not a hard failure: the
 //! rebase is deliberately left in progress on disk and
@@ -52,10 +57,11 @@ use crate::config::{BackendIdentity, LaneConfig, MergeConfig};
 use crate::github::gh_cli::{GhCli, GhError};
 use crate::github::pr::{find_issue_key, find_pr_for_ticket};
 use crate::runs::pid::pid_alive;
-use crate::runs::{RunStore, RunStoreError};
+use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::{StatusTransition, apply_status_on_merge, reconcile_status};
 use crate::work::git::{GitError, GitOps, RebaseOutcome};
+use crate::work::interactive::interactive_prompt;
 use crate::work::naming::ticket_session_name;
 use crate::work::prompt::{PromptFileError, read_prompt_file};
 use crate::work::review_watch::{Clock, Sleeper};
@@ -77,6 +83,15 @@ pub const CONFLICT_TIMEOUT_SECS: i64 = 900;
 /// Base name (before [`unique_window_name`] suffixing) of the tmux window a
 /// conflict-resolution session runs in.
 pub const MERGE_WINDOW_BASE: &str = "merge";
+
+/// The run kind, and lane, of a conflict-resolution session's run row
+/// (GitHub issue #156).
+pub const MERGE_CONFLICT_KIND: &str = "merge-conflict";
+
+/// The run event a batch conflict session's row records, its detail
+/// `{"tickets": [...]}` naming every ticket the shared session resolves
+/// (the row's own `ticket` holds only the first).
+pub const MERGE_BATCH_EVENT: &str = "merge-batch";
 
 /// Errors returned by [`run_merge`].
 #[derive(Debug, Error)]
@@ -189,7 +204,9 @@ pub struct MergeDeps<'a> {
     /// [`resolve_watch_repo_root`]'s lane-based repo-root resolution.
     /// `None` when no store is configured; the repo root then falls back
     /// directly to `git.repo_root(cwd)`, and no run-based checkout
-    /// candidate is considered.
+    /// candidate is considered. Also where a conflict session's
+    /// `merge-conflict` row is recorded; `None` leaves the session
+    /// untracked.
     pub run_store: Option<&'a RunStore>,
     /// "Now" source for the conflict poll loop's timeout.
     pub clock: &'a dyn Clock,
@@ -219,6 +236,12 @@ pub struct MergeDeps<'a> {
     /// `tm work run`/`tm review fix` use for their own interactive prompt
     /// files. Created (via `create_dir_all`) if it doesn't exist yet.
     pub state_dir: &'a Path,
+    /// The session marker directory
+    /// ([`crate::runs::session::sessions_dir_from_process_env`] in
+    /// production). When merge finishes a conflict session's row itself, it
+    /// removes any marker pointing at that row, so the session's later
+    /// SessionEnd hook is a no-op instead of overwriting the outcome.
+    pub sessions_dir: &'a Path,
     /// Stops a merged ticket's still-running agent by pid (see
     /// [`finish_ticket_runs`]); production passes
     /// [`crate::runs::pid::kill_pid`], the same `SIGKILL` sender idle
@@ -329,24 +352,35 @@ fn format_ts(unix_secs: i64) -> String {
 ///
 /// The session is launched the same way an interactive lane run is
 /// ([`crate::work::interactive::launch_interactive_run`]'s command
-/// construction, inlined here since this session is deliberately
-/// untracked — no run row, no [`crate::work::run::PreparedRun`] to hand
-/// that helper): [`AgentRunner::build_invocation`] under
-/// [`RunMode::Interactive`] with `permission_mode: None` (so it resolves to
-/// the runner's own default, `bypassPermissions` for `ClaudeRunner` since
-/// issue #29 — never hardcoded here), then
-/// [`AgentRunner::tmux_command_line`] renders the command that reads the
-/// prompt back from disk. This is what makes the session run unattended
-/// instead of stalling on the first permission prompt.
+/// construction, inlined here since there is no
+/// [`crate::work::run::PreparedRun`] to hand that helper):
+/// [`AgentRunner::build_invocation`] under [`RunMode::Interactive`] with
+/// `permission_mode: None` (so it resolves to the runner's own default,
+/// `bypassPermissions` for `ClaudeRunner` since issue #29 — never hardcoded
+/// here), then [`AgentRunner::tmux_command_line`] renders the command that
+/// reads the prompt back from disk. This is what makes the session run
+/// unattended instead of stalling on the first permission prompt.
+///
+/// **Tracked as a `merge-conflict` row** (GitHub issue #156) when
+/// [`MergeDeps::run_store`] is set, so the agent counts toward runs.db's
+/// view of what is running: see [`start_conflict_run`]. The row is
+/// pre-registered after the prompt is read (a bad `prompt_file` leaves no
+/// row), its id rides into the session as `TSKMSTR_SESSION_RUN_ID` (never
+/// `TSKMSTR_RUN_ID`, which would invert the SessionEnd hook), and the prompt
+/// gains [`crate::work::interactive::interactive_prompt`]'s registration
+/// preamble so the session adopts it. Merge finishes the row itself once
+/// polling ends ([`finish_conflict_run`]): `done` when the rebase resolved,
+/// `failed` when it was handed back or the session errored.
 fn run_conflict_session(
     deps: &MergeDeps<'_>,
-    key: &str,
-    branch: &str,
-    base: &str,
+    prepared: &PreparedMerge,
     dir: &Path,
     pre_rebase_rev: &str,
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
+    let PreparedMerge {
+        key, branch, base, ..
+    } = prepared;
     let template = match deps.merge_cfg.prompt_file.as_deref() {
         Some(raw) => read_prompt_file(raw, deps.home, "[work.merge].prompt_file")?,
         None => match deps.merge_cfg.prompt.as_deref() {
@@ -358,7 +392,38 @@ fn run_conflict_session(
         },
     };
     let prompt = conflict_prompt(&template, key, branch, base);
-    let session = open_agent_window(deps, prompt, key, key, dir)?;
+    let run_id = start_conflict_run(deps, key, Some(branch), dir, &prepared.repo_root);
+    let prompt = with_registration(run_id, key, prompt);
+
+    let result =
+        open_and_poll_conflict_session(deps, prompt, prepared, dir, pre_rebase_rev, run_id, out);
+    let ending = match &result {
+        Ok(ConflictOutcome::Resolved) => None,
+        Ok(ConflictOutcome::HandedBack) => Some(format!(
+            "{key}: rebase not completed (timed out, aborted, or the session ended); left in progress in {}",
+            dir.display()
+        )),
+        Err(err) => Some(format!("{key}: conflict session failed: {err}")),
+    };
+    finish_conflict_run(deps, run_id, ending);
+    result
+}
+
+/// The window-open and poll half of [`run_conflict_session`], split out so
+/// every way it can end (resolved, handed back, or an error) reaches that
+/// function's row finish.
+#[allow(clippy::too_many_arguments)]
+fn open_and_poll_conflict_session(
+    deps: &MergeDeps<'_>,
+    prompt: String,
+    prepared: &PreparedMerge,
+    dir: &Path,
+    pre_rebase_rev: &str,
+    run_id: Option<i64>,
+    out: &mut dyn Write,
+) -> Result<ConflictOutcome, MergeError> {
+    let key = &prepared.key;
+    let session = open_agent_window(deps, prompt, key, key, dir, run_id)?;
     let AgentWindow {
         target,
         window,
@@ -375,7 +440,94 @@ fn run_conflict_session(
         writeln!(out, "attach: tmux attach -t {target}")?;
     }
 
-    poll_conflict_session(deps, dir, target, window, branch, pre_rebase_rev, out)
+    poll_conflict_session(
+        deps,
+        dir,
+        target,
+        window,
+        &prepared.branch,
+        pre_rebase_rev,
+        out,
+    )
+}
+
+/// Pre-registers a conflict session's `merge-conflict` row (GitHub issue
+/// #156) and returns its id, or `None` when [`MergeDeps::run_store`] is
+/// unset or the store refused.
+///
+/// `lane` and `kind` are both [`MERGE_CONFLICT_KIND`], `ticket` the (first)
+/// conflicted key, `worktree` the checkout the rebase is in progress in,
+/// `pid` `None` until the window opens (see [`open_agent_window`]). `agent`
+/// is the runner's name and `repo` the main checkout's directory name
+/// ([`crate::work::run::dir_repo_key`] of `repo_root`), not the worktree's,
+/// so a conflict in any of a repo's worktrees estimates under the same key
+/// as that repo's lanes.
+///
+/// Store errors are swallowed here and in [`finish_conflict_run`]: the row
+/// is telemetry, and a broken runs DB must never fail a merge.
+fn start_conflict_run(
+    deps: &MergeDeps<'_>,
+    ticket: &str,
+    branch: Option<&str>,
+    dir: &Path,
+    repo_root: &Path,
+) -> Option<i64> {
+    let store = deps.run_store?;
+    let id = store
+        .start_run(&StartRun {
+            scope: deps.identity.scope(),
+            ticket: ticket.to_string(),
+            lane: MERGE_CONFLICT_KIND.to_string(),
+            worktree: dir.to_string_lossy().into_owned(),
+            branch: branch.map(str::to_string),
+            pid: None,
+            kind: MERGE_CONFLICT_KIND.to_string(),
+            log_path: None,
+        })
+        .ok()?;
+    let _ = store.update_agent_repo(
+        id,
+        deps.runner.name(),
+        &crate::work::run::dir_repo_key(repo_root),
+    );
+    Some(id)
+}
+
+/// `prompt` with the registration preamble prepended when the session has a
+/// row to adopt; unchanged for an untracked session.
+fn with_registration(run_id: Option<i64>, ticket: &str, prompt: String) -> String {
+    match run_id {
+        Some(_) => interactive_prompt(MERGE_CONFLICT_KIND, ticket, &prompt),
+        None => prompt,
+    }
+}
+
+/// Finishes a conflict session's row once merge stops polling: `done` when
+/// `failure` is `None`, otherwise `failed` with `failure` as its blocker.
+/// A no-op for an untracked session.
+///
+/// Uses [`RunStore::finish_run_from_supervisor`] without forcing, so a row
+/// the session's own SessionEnd hook already finished keeps that outcome,
+/// then removes every session marker naming the row
+/// ([`crate::runs::session::remove_markers_for_run`]) so a hook that fires
+/// later finds nothing to finish. Whichever of the two ends the row first
+/// wins; the other is a no-op. Errors are swallowed, as in
+/// [`start_conflict_run`].
+fn finish_conflict_run(deps: &MergeDeps<'_>, run_id: Option<i64>, failure: Option<String>) {
+    let (Some(store), Some(id)) = (deps.run_store, run_id) else {
+        return;
+    };
+    let outcome = FinishRun {
+        status: if failure.is_some() {
+            RunStatus::Failed
+        } else {
+            RunStatus::Done
+        },
+        blocker: failure,
+        ..FinishRun::default()
+    };
+    let _ = store.finish_run_from_supervisor(id, &outcome, false);
+    let _ = crate::runs::session::remove_markers_for_run(deps.sessions_dir, id);
 }
 
 /// Where [`open_agent_window`] opened a conflict-resolution session.
@@ -397,12 +549,24 @@ struct AgentWindow {
 /// The prompt file is written before any tmux call, so a `state_dir` write
 /// failure never leaves a half-opened session behind. See
 /// [`run_conflict_session`] for why the session is launched this way.
+///
+/// `run_id` is the session's pre-registered row, if any. It goes into the
+/// invocation as an interactive run id, so the window's environment carries
+/// `TSKMSTR_SESSION_RUN_ID` (the invocation's `env_set` is passed to tmux,
+/// the same as [`crate::work::interactive::launch_interactive_run`]). Once
+/// the window exists the row is stamped, best-effort, with the pane's pid,
+/// which keeps an agent that has not adopted the row yet from being reaped
+/// stale partway through [`CONFLICT_TIMEOUT_SECS`]. The row's tmux session
+/// is stamped only when tm created the ticket session for it: inside tmux
+/// the window joins the user's own session, which outlives the agent and so
+/// says nothing about whether the row is still live.
 fn open_agent_window(
     deps: &MergeDeps<'_>,
     prompt: String,
     prompt_stem: &str,
     session_key: &str,
     dir: &Path,
+    run_id: Option<i64>,
 ) -> Result<AgentWindow, MergeError> {
     let model = deps
         .model_defaults
@@ -420,7 +584,7 @@ fn open_agent_window(
         max_turns: None,
         permission_mode: None,
         settings_path: None,
-        run_id: None,
+        run_id: run_id.map(|id| id.to_string()),
         mode: RunMode::Interactive,
     });
     let prompt_text = deps
@@ -451,12 +615,23 @@ fn open_agent_window(
     let window = unique_window_name(MERGE_WINDOW_BASE, &existing);
     let dir_str = dir.to_string_lossy().into_owned();
 
+    let env = &invocation.env_set;
+
     if existing.is_empty() {
         deps.tmux
-            .new_session_with_command(&target, &dir_str, &window, &[], &command)?;
+            .new_session_with_command(&target, &dir_str, &window, env, &command)?;
     } else {
         deps.tmux
-            .new_window_with_command(&target, &window, &dir_str, &[], &command)?;
+            .new_window_with_command(&target, &window, &dir_str, env, &command)?;
+    }
+
+    if let (Some(store), Some(id)) = (deps.run_store, run_id) {
+        if !inside_tmux {
+            let _ = store.update_tmux_session(id, &target);
+        }
+        if let Ok(Some(pid)) = deps.tmux.pane_pid(&target, &window) {
+            let _ = store.update_pid(id, pid);
+        }
     }
 
     Ok(AgentWindow {
@@ -595,9 +770,7 @@ pub fn run_merge(
     if let Some(conflict) = prepared.conflict.take() {
         match run_conflict_session(
             deps,
-            key,
-            &prepared.branch,
-            &prepared.base,
+            &prepared,
             &conflict.dir,
             &conflict.pre_rebase_rev,
             out,
@@ -708,9 +881,7 @@ pub fn run_merge_batch(
             writeln!(out, "=== conflict session: {} ===", prepared.key)?;
             match run_conflict_session(
                 deps,
-                &prepared.key,
-                &prepared.branch,
-                &prepared.base,
+                &prepared,
                 &conflict.dir,
                 &conflict.pre_rebase_rev,
                 out,
@@ -834,6 +1005,15 @@ fn batch_ticket_list(tickets: &[(PreparedMerge, PendingConflict)]) -> String {
 /// Opens the one agent window shared by every set-aside ticket, then polls
 /// them all. Returns one flag per ticket, in order (`true` if its rebase
 /// resolved), plus the tmux session the shared window was opened in.
+///
+/// Tracked like [`run_conflict_session`], with one `merge-conflict` row for
+/// the whole shared session (GitHub issue #156): its `ticket` and the
+/// registration preamble's key are the first set-aside ticket's, its
+/// `worktree` that ticket's checkout (where the window opens), and its
+/// `branch` `None`, since the session works on several branches. Every
+/// set-aside key is recorded in a [`MERGE_BATCH_EVENT`] event. The row ends
+/// `done` only if every rebase resolved, `failed` (naming the handed-back
+/// keys) otherwise.
 fn run_batch_conflict_session(
     deps: &MergeDeps<'_>,
     tickets: &[(PreparedMerge, PendingConflict)],
@@ -851,7 +1031,60 @@ fn run_batch_conflict_session(
     // The window opens in the first ticket's checkout; the prompt names
     // every other ticket's directory explicitly.
     let (first, first_conflict) = &tickets[0];
-    let session = open_agent_window(deps, prompt, "batch", &first.key, &first_conflict.dir)?;
+    let keys: Vec<&str> = tickets.iter().map(|(p, _)| p.key.as_str()).collect();
+    let run_id = start_conflict_run(
+        deps,
+        &first.key,
+        None,
+        &first_conflict.dir,
+        &first.repo_root,
+    );
+    if let (Some(store), Some(id)) = (deps.run_store, run_id) {
+        let detail = serde_json::json!({ "tickets": keys }).to_string();
+        let _ = store.add_event(id, MERGE_BATCH_EVENT, Some(&detail));
+    }
+    let prompt = with_registration(run_id, &first.key, prompt);
+
+    let result = open_and_poll_batch_conflict_session(deps, prompt, tickets, run_id, out);
+    let ending = match &result {
+        Ok((flags, _)) => {
+            let handed_back: Vec<&str> = keys
+                .iter()
+                .zip(flags)
+                .filter(|(_, resolved)| !**resolved)
+                .map(|(key, _)| *key)
+                .collect();
+            (!handed_back.is_empty()).then(|| {
+                format!(
+                    "rebase not completed for {}; left in progress",
+                    handed_back.join(", ")
+                )
+            })
+        }
+        Err(err) => Some(format!("shared conflict session failed: {err}")),
+    };
+    finish_conflict_run(deps, run_id, ending);
+    result
+}
+
+/// The window-open and poll half of [`run_batch_conflict_session`], split
+/// out for the same reason as [`open_and_poll_conflict_session`].
+fn open_and_poll_batch_conflict_session(
+    deps: &MergeDeps<'_>,
+    prompt: String,
+    tickets: &[(PreparedMerge, PendingConflict)],
+    run_id: Option<i64>,
+    out: &mut dyn Write,
+) -> Result<(Vec<bool>, String), MergeError> {
+    let (first, first_conflict) = &tickets[0];
+    let session = open_agent_window(
+        deps,
+        prompt,
+        "batch",
+        &first.key,
+        &first_conflict.dir,
+        run_id,
+    )?;
     let AgentWindow {
         target,
         window,
@@ -1318,7 +1551,6 @@ fn merge_pr_with_retry(
     out: &mut dyn Write,
 ) -> Result<MergeFlowOutcome, MergeError> {
     let PreparedMerge {
-        key,
         repo_root,
         number,
         branch,
@@ -1355,7 +1587,7 @@ fn merge_pr_with_retry(
     match deps.git.rebase_onto(dir, &origin_base_ref)? {
         RebaseOutcome::Completed => writeln!(out, "rebase complete")?,
         RebaseOutcome::Conflicted => {
-            match run_conflict_session(deps, key, branch, base, dir, &pre_rebase_rev, out)? {
+            match run_conflict_session(deps, prepared, dir, &pre_rebase_rev, out)? {
                 ConflictOutcome::Resolved => {}
                 ConflictOutcome::HandedBack => return Ok(MergeFlowOutcome::ConflictsHandedBack),
             }
@@ -1661,6 +1893,8 @@ mod tests {
         _worktree_dirs: Vec<tempfile::TempDir>,
         _state_dir: tempfile::TempDir,
         state_dir: PathBuf,
+        _sessions_tmp: tempfile::TempDir,
+        sessions_dir: PathBuf,
         /// Every pid [`MergeDeps::kill_pid`] was asked to stop, in order.
         killed_pids: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
         kill_pid: Box<dyn Fn(u32)>,
@@ -1672,6 +1906,8 @@ mod tests {
             let store = open_store(db_dir.path());
             let state_tmp = tempdir().unwrap();
             let state_dir = state_tmp.path().join("state");
+            let sessions_tmp = tempdir().unwrap();
+            let sessions_dir = sessions_tmp.path().join("sessions");
             let killed_pids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorder = killed_pids.clone();
             Fixture {
@@ -1703,6 +1939,8 @@ mod tests {
                 _worktree_dirs: Vec::new(),
                 _state_dir: state_tmp,
                 state_dir,
+                _sessions_tmp: sessions_tmp,
+                sessions_dir,
             }
         }
 
@@ -1760,6 +1998,7 @@ mod tests {
                 },
                 status_on_merge: self.status_on_merge.as_deref(),
                 state_dir: &self.state_dir,
+                sessions_dir: &self.sessions_dir,
                 kill_pid: &*self.kill_pid,
             }
         }
@@ -2043,6 +2282,258 @@ mod tests {
         assert!(out.contains("timed out after 900s"));
         assert!(out.contains("attach: tmux attach -t dev"));
         assert!(out.contains("rebase --abort"));
+    }
+
+    // --- conflict session run rows (GitHub issue #156) ---
+
+    /// A single-ticket conflict inside tmux session `dev` that stays in
+    /// progress for two poll ticks (so the poll loop sleeps twice) and then
+    /// resolves.
+    fn resolving_conflict_fixture() -> Fixture {
+        let mut fx = Fixture::new();
+        fx.gh = fx
+            .gh
+            .with_pr_list(Ok(vec![pr_info(7, "proj-1-fix", "main", "PROJ-1")]));
+        fx.git = fx
+            .git
+            .with_current_branch(Ok("proj-1-fix".to_string()))
+            .with_current_branch_for(PathBuf::from("/repo"), Ok("proj-1-fix".to_string()))
+            .with_rev_parse_sequence(
+                "proj-1-fix",
+                vec![Ok("aaa".to_string()), Ok("bbb".to_string())],
+            )
+            .with_rev_parse_result("origin/proj-1-fix", Ok("aaa".to_string()))
+            .with_is_ancestor_result(Ok(false))
+            .with_rebase_onto_result(Ok(RebaseOutcome::Conflicted))
+            .with_rebase_in_progress_sequence(vec![Ok(true), Ok(true), Ok(false)])
+            .with_conflicted_files_sequence(vec![Ok(vec!["a.rs".to_string()])])
+            .with_branch_exists_local(Ok(false));
+        fx.tmux = fx
+            .tmux
+            .with_current_session_name(Ok(Some("dev".to_string())))
+            .with_list_windows_sequence(vec![
+                Ok(vec![shell_window()]),
+                Ok(vec![shell_window(), merge_window()]),
+            ]);
+        fx
+    }
+
+    /// A [`Sleeper`] that, on every poll tick, records the status of every
+    /// `merge-conflict` row (so a test can see the row while the session is
+    /// open) and, like an adopting session would, writes a session marker
+    /// pointing at the first one.
+    struct RowProbe<'a> {
+        store: &'a RunStore,
+        sessions_dir: &'a Path,
+        seen: std::cell::RefCell<Vec<Vec<crate::runs::RunStatus>>>,
+    }
+
+    impl Sleeper for RowProbe<'_> {
+        fn sleep(&self, _secs: u64) {
+            let rows: Vec<_> = self
+                .store
+                .list_runs()
+                .unwrap()
+                .into_iter()
+                .filter(|run| run.kind == MERGE_CONFLICT_KIND)
+                .collect();
+            if let Some(row) = rows.first() {
+                std::fs::create_dir_all(self.sessions_dir).unwrap();
+                std::fs::write(self.sessions_dir.join("sess-merge"), row.id.to_string()).unwrap();
+            }
+            self.seen
+                .borrow_mut()
+                .push(rows.into_iter().map(|run| run.status).collect());
+        }
+    }
+
+    fn conflict_rows(fx: &Fixture) -> Vec<crate::runs::Run> {
+        fx.store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.kind == MERGE_CONFLICT_KIND)
+            .map(|run| fx.store.run_by_id(run.id).unwrap().unwrap())
+            .collect()
+    }
+
+    fn window_env(fx: &Fixture) -> Vec<(String, String)> {
+        fx.tmux
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                TmuxCall::NewWindowWithCommand { env, .. } => Some(env),
+                TmuxCall::NewSessionWithCommand { env, .. } => Some(env),
+                _ => None,
+            })
+            .expect("a conflict window should have been opened")
+    }
+
+    /// The single `merge-<stem>-*.prompt.md` file the conflict session wrote.
+    fn conflict_prompt_file(fx: &Fixture, stem: &str) -> String {
+        let prefix = format!("merge-{stem}-");
+        let files: Vec<PathBuf> = std::fs::read_dir(&fx.state_dir)
+            .expect("state dir should exist")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        assert_eq!(files.len(), 1, "expected one prompt file, got {files:?}");
+        std::fs::read_to_string(&files[0]).unwrap()
+    }
+
+    #[test]
+    fn conflict_session_row_runs_while_open_and_ends_done_when_resolved() {
+        let fx = resolving_conflict_fixture();
+        std::fs::create_dir_all(&fx.sessions_dir).unwrap();
+        std::fs::write(fx.sessions_dir.join("sess-other"), "999").unwrap();
+        let probe = RowProbe {
+            store: &fx.store,
+            sessions_dir: &fx.sessions_dir,
+            seen: Default::default(),
+        };
+        let mut deps = fx.deps();
+        deps.sleeper = &probe;
+
+        let (result, _out) = run(&deps, "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        let seen = probe.seen.borrow().clone();
+        assert!(!seen.is_empty(), "the poll loop slept at least once");
+        for tick in &seen {
+            assert_eq!(tick, &vec![crate::runs::RunStatus::Running]);
+        }
+        let rows = conflict_rows(&fx);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.status, crate::runs::RunStatus::Done);
+        assert_eq!(row.ticket, "PROJ-1");
+        assert_eq!(row.lane, MERGE_CONFLICT_KIND);
+        assert_eq!(row.scope, fx.identity.scope());
+        assert_eq!(row.branch.as_deref(), Some("proj-1-fix"));
+        assert_eq!(row.worktree, "/repo");
+        assert_eq!(row.agent.as_deref(), Some("claude"));
+        assert_eq!(row.repo.as_deref(), Some("repo"));
+        assert!(
+            !fx.sessions_dir.join("sess-merge").exists(),
+            "merge removes the marker, so the SessionEnd hook finds nothing to overwrite"
+        );
+        assert!(fx.sessions_dir.join("sess-other").exists());
+    }
+
+    #[test]
+    fn conflict_session_gets_the_session_run_id_and_a_registration_preamble() {
+        let fx = resolving_conflict_fixture();
+
+        let _ = run(&fx.deps(), "PROJ-1");
+
+        let id = conflict_rows(&fx)[0].id;
+        let env = window_env(&fx);
+        assert!(
+            env.contains(&("TSKMSTR_SESSION_RUN_ID".to_string(), id.to_string())),
+            "{env:?}"
+        );
+        assert!(
+            env.iter().all(|(key, _)| key != "TSKMSTR_RUN_ID"),
+            "an interactive session must never get the headless run id: {env:?}"
+        );
+        let prompt = conflict_prompt_file(&fx, "PROJ-1");
+        assert!(
+            prompt.contains("tm runs register --kind merge-conflict PROJ-1"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn conflict_session_row_ends_failed_on_timeout() {
+        let mut fx = conflicted_fixture();
+        fx.git = fx
+            .git
+            .with_rebase_in_progress_sequence(vec![Ok(true)])
+            .with_conflicted_files_sequence(vec![Ok(vec!["a.rs".to_string()])]);
+        fx.tmux = fx.tmux.with_list_windows(Ok(vec![merge_window()]));
+        fx.clock = FakeClock::advancing(1_000, 901);
+
+        let (result, _out) = run(&fx.deps(), "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::ConflictsHandedBack)));
+        let rows = conflict_rows(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::runs::RunStatus::Failed);
+        assert!(rows[0].blocker.is_some());
+    }
+
+    #[test]
+    fn conflict_session_without_a_store_is_untracked() {
+        let fx = resolving_conflict_fixture();
+        let mut deps = fx.deps();
+        deps.run_store = None;
+
+        let (result, _out) = run(&deps, "PROJ-1");
+
+        assert!(matches!(result, Ok(MergeFlowOutcome::Merged)));
+        assert!(conflict_rows(&fx).is_empty());
+        assert!(window_env(&fx).is_empty());
+        assert!(!conflict_prompt_file(&fx, "PROJ-1").contains("tm runs register"));
+    }
+
+    #[test]
+    fn batch_conflict_session_records_one_row_for_every_conflicted_ticket() {
+        let fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+
+        let (result, _out) = run_batch(&fx.deps(), &keys(2));
+
+        assert_eq!(result.unwrap().merged, keys(2));
+        let rows = conflict_rows(&fx);
+        assert_eq!(rows.len(), 1, "one shared session, one row: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.ticket, "PROJ-1");
+        assert_eq!(row.branch, None);
+        assert_eq!(row.status, crate::runs::RunStatus::Done);
+        assert_eq!(row.agent.as_deref(), Some("claude"));
+        assert_eq!(row.repo.as_deref(), Some("repo"));
+        let events = fx.store.events_for_run(row.id).unwrap();
+        let batch = events
+            .iter()
+            .find(|event| event.kind == "merge-batch")
+            .expect("a merge-batch event");
+        let detail: serde_json::Value =
+            serde_json::from_str(batch.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["tickets"], serde_json::json!(["PROJ-1", "PROJ-2"]));
+        assert!(
+            window_env(&fx).contains(&("TSKMSTR_SESSION_RUN_ID".to_string(), row.id.to_string()))
+        );
+        assert!(
+            batch_prompt(&fx).contains("tm runs register --kind merge-conflict PROJ-1"),
+            "the shared session adopts under the first key"
+        );
+    }
+
+    #[test]
+    fn batch_conflict_row_ends_failed_when_a_ticket_is_handed_back() {
+        let mut fx = batch_fixture(&[
+            BatchTicket::Conflict { resolves: true },
+            BatchTicket::Conflict { resolves: false },
+        ]);
+        fx.clock = FakeClock::advancing(1_000, 300);
+
+        let _ = run_batch(&fx.deps(), &keys(2));
+
+        let rows = conflict_rows(&fx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::runs::RunStatus::Failed);
+        assert!(
+            rows[0]
+                .blocker
+                .as_deref()
+                .is_some_and(|b| b.contains("PROJ-2")),
+            "{:?}",
+            rows[0].blocker
+        );
     }
 
     // --- stale-base rejection: rebase and retry once (GitHub issue #109) ---
@@ -2849,9 +3340,11 @@ mod tests {
             prompt_path.display()
         );
         let written = std::fs::read_to_string(&prompt_path).expect("prompt file should exist");
-        assert_eq!(
-            written, "custom PROJ-1 proj-1-fix main prompt",
-            "expected the prompt_file contents (substituted) written to the prompt file"
+        // The tracked session's registration preamble comes first (GitHub
+        // issue #156), then the substituted prompt_file contents.
+        assert!(
+            written.ends_with("\n\ncustom PROJ-1 proj-1-fix main prompt"),
+            "expected the prompt_file contents (substituted) written to the prompt file: {written}"
         );
     }
 
@@ -3257,7 +3750,7 @@ mod tests {
 
         result.expect("batch should succeed");
         let prompt = batch_prompt(&fx);
-        assert!(prompt.starts_with("CUSTOM BATCH\n"), "{prompt}");
+        assert!(prompt.contains("\n\nCUSTOM BATCH\n"), "{prompt}");
         assert!(
             prompt.contains("PROJ-1") && prompt.contains("PROJ-2"),
             "{prompt}"

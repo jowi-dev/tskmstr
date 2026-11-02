@@ -8,12 +8,18 @@
 //!   [`crate::work::naming::create_session_name`] session, and a second
 //!   launch while it is live is an [`CreateLaunchError::AlreadyRunning`] the
 //!   board answers by attaching rather than duplicating.
-//! - **No run pre-registration.** An audit pre-registers a run row for the
-//!   in-session `tm ticket audit` to adopt; here there is no ticket to hang
-//!   a row on. `tm ticket create` already registers a `kind = "create"` run
-//!   through the session marker once the ticket exists (see
-//!   `crate::runs::session::register_session`), so launch-side telemetry
-//!   plumbing would be redundant.
+//! - **A placeholder ticket on its run row.** Like an audit, the launch
+//!   pre-registers a `kind = "create"` row (GitHub issue #156) so the agent
+//!   is visible to runs.db, and the memory budget, from the moment `c` is
+//!   pressed. No ticket exists yet, so the row carries
+//!   [`crate::runs::session::CREATE_PLACEHOLDER_TICKET`]; the session's
+//!   first `tm ticket create` adopts it and re-stamps the ticket to the key
+//!   it created, and later creates reuse it (see
+//!   [`crate::runs::session::register_session`]). A session that never
+//!   creates a ticket has its row finished by the SessionEnd hook's create
+//!   fallback instead. Unlike every other interactive launch, the prompt
+//!   gets no registration preamble: the default prompt is the
+//!   `/ticket-create` slash command, which only works as the whole prompt.
 //! - **Attached immediately.** The point of the flow is to start dictating a
 //!   ticket right away, so the board attaches the moment the launch returns
 //!   (that attach is the board's job, not this module's — same split as
@@ -25,6 +31,9 @@ use thiserror::Error;
 
 use crate::agent::AgentRunner;
 use crate::config::{BackendIdentity, CreateConfig};
+use crate::runs::session::{CREATE_KIND, CREATE_PLACEHOLDER_TICKET};
+use crate::runs::{FinishRun, RunStatus, RunStore, StartRun};
+use crate::work::audit::SESSION_RUN_ID_ENV;
 use crate::work::naming::{create_session_name, expand_tilde};
 use crate::work::tmux::{
     TmuxError, TmuxOps, has_live_window, session_window_names, unique_window_name,
@@ -72,6 +81,9 @@ pub struct CreateLaunchOutcome {
     /// [`unique_window_name`] suffixed variant when a previous create
     /// session's dead window still holds that name.
     pub window_name: String,
+    /// The pre-registered `create` row, or `None` when no store was given
+    /// or registering failed (telemetry never blocks the launch).
+    pub run_id: Option<i64>,
 }
 
 /// Launches (or refuses to double-launch) the scope's ticket-creation
@@ -99,8 +111,19 @@ pub struct CreateLaunchOutcome {
 ///    selected, so the immediate attach lands on the fresh agent rather
 ///    than the dead aftermath.
 ///
-/// No run row is created and no environment is injected — see the module
-/// docs' "No run pre-registration".
+/// With a `store`, a `create` row is pre-registered once the checks and
+/// the prompt-file read have passed, so a refused launch or a bad path
+/// leaves no row: `lane = kind = "create"`, `ticket =`
+/// [`CREATE_PLACEHOLDER_TICKET`], `worktree` the create directory, `pid =
+/// None`, and `agent`/`repo` the runner's name and the directory's name
+/// ([`crate::work::run::dir_repo_key`]). Its id rides into the window as
+/// [`SESSION_RUN_ID_ENV`] for the session to adopt. Once the window exists
+/// the row is stamped with the tmux session (so killing it reaps the row
+/// `interrupted`) and, best-effort, the pane's pid, so a draft left idle
+/// before its first `tm ticket create` is not reaped stale. A failed tmux
+/// spawn finishes the row `failed`. Store errors are swallowed: a broken
+/// runs DB never blocks creating tickets, and the launch then injects no
+/// environment, as it does without a store.
 ///
 /// `home` resolves a leading `~` in `create_cfg.dir` via [`expand_tilde`],
 /// and `identity`'s [`session_slug`](BackendIdentity::session_slug)
@@ -110,6 +133,7 @@ pub struct CreateLaunchOutcome {
 /// The session's model is `create_cfg.model`, else the rest of the chain
 /// `model_defaults` ends (GitHub issue #143, [`crate::work::model`]).
 pub fn launch_create(
+    store: Option<&RunStore>,
     tmux: &dyn TmuxOps,
     create_cfg: &CreateConfig,
     home: &Path,
@@ -155,22 +179,75 @@ pub fn launch_create(
     );
     let command = runner.interactive_shell_command(&model.model, prompt);
 
-    if existing_windows.is_empty() {
-        tmux.new_session_with_command(&session_name, &dir_str, &window_name, &[], &command)?;
+    let run_id = store.and_then(|store| preregister(store, identity, &dir, runner));
+    let env: Vec<(String, String)> = run_id
+        .map(|id| (SESSION_RUN_ID_ENV.to_string(), id.to_string()))
+        .into_iter()
+        .collect();
+
+    let spawned = if existing_windows.is_empty() {
+        tmux.new_session_with_command(&session_name, &dir_str, &window_name, &env, &command)
     } else {
-        tmux.new_window_with_command(&session_name, &window_name, &dir_str, &[], &command)?;
-        tmux.select_window(&session_name, &window_name)?;
+        tmux.new_window_with_command(&session_name, &window_name, &dir_str, &env, &command)
+            .and_then(|()| tmux.select_window(&session_name, &window_name))
+    };
+
+    if let (Some(store), Some(id)) = (store, run_id) {
+        if let Err(err) = &spawned {
+            let _ = store.finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Failed,
+                    blocker: Some(format!("create session failed to launch: {err}")),
+                    ..FinishRun::default()
+                },
+            );
+        } else {
+            let _ = store.update_tmux_session(id, &session_name);
+            if let Ok(Some(pid)) = tmux.pane_pid(&session_name, &window_name) {
+                let _ = store.update_pid(id, pid);
+            }
+        }
     }
+    spawned?;
 
     Ok(CreateLaunchOutcome {
         session_name,
         window_name,
+        run_id,
     })
+}
+
+/// Starts the create session's placeholder row and stamps its agent and
+/// repo, returning its id, or `None` if the store refused (see
+/// [`launch_create`] for why that is swallowed).
+fn preregister(
+    store: &RunStore,
+    identity: &BackendIdentity,
+    dir: &Path,
+    runner: &dyn AgentRunner,
+) -> Option<i64> {
+    let id = store
+        .start_run(&StartRun {
+            ticket: CREATE_PLACEHOLDER_TICKET.to_string(),
+            scope: identity.scope(),
+            lane: CREATE_KIND.to_string(),
+            worktree: dir.to_string_lossy().into_owned(),
+            branch: None,
+            pid: None,
+            kind: CREATE_KIND.to_string(),
+            log_path: None,
+        })
+        .ok()?;
+    let _ = store.update_agent_repo(id, runner.name(), &crate::work::run::dir_repo_key(dir));
+    Some(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runs::RunStatus;
+    use crate::runs::session::CREATE_PLACEHOLDER_TICKET;
     use crate::work::tmux::{FakeTmuxOps, TmuxCall, TmuxWindow};
     use std::path::PathBuf;
 
@@ -216,6 +293,7 @@ mod tests {
         let cfg = configured("~/Projects/axiom");
 
         let outcome = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -242,6 +320,171 @@ mod tests {
         );
     }
 
+    fn open_store(dir: &Path) -> RunStore {
+        RunStore::open(&dir.join("runs.db")).expect("open should succeed")
+    }
+
+    /// GitHub issue #156: pressing `c` leaves a running `create` row at
+    /// once, before any ticket exists, for the session's first `tm ticket
+    /// create` to adopt.
+    #[test]
+    fn launch_create_preregisters_a_running_create_row() {
+        let db = tempfile::tempdir().unwrap();
+        let store = open_store(db.path());
+        let tmux = FakeTmuxOps::new().with_pane_pid(Ok(Some(4321)));
+        let cfg = configured("/repo/axiom");
+
+        let outcome = launch_create(
+            Some(&store),
+            &tmux,
+            &cfg,
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap();
+
+        let run_id = outcome.run_id.expect("a row was pre-registered");
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+        let run = store.run_by_id(run_id).unwrap().unwrap();
+        assert_eq!(run.kind, "create");
+        assert_eq!(run.lane, "create");
+        assert_eq!(run.ticket, CREATE_PLACEHOLDER_TICKET);
+        assert_eq!(run.scope, test_identity().scope());
+        assert_eq!(run.worktree, "/repo/axiom");
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.agent.as_deref(), Some("claude"));
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
+        assert_eq!(run.tmux_session.as_deref(), Some("tm-proj-create"));
+        assert_eq!(
+            run.pid,
+            Some(4321),
+            "the pane's pid keeps an idle draft from being reaped stale"
+        );
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                TmuxCall::ListWindows,
+                TmuxCall::NewSessionWithCommand {
+                    name: "tm-proj-create".to_string(),
+                    dir: "/repo/axiom".to_string(),
+                    window_name: "create".to_string(),
+                    env: vec![("TSKMSTR_SESSION_RUN_ID".to_string(), run_id.to_string())],
+                    // No registration preamble: it would break the slash
+                    // command the prompt is.
+                    command: "claude --model 'opus' '/ticket-create'".to_string(),
+                },
+                TmuxCall::PanePid {
+                    name: "tm-proj-create".to_string(),
+                    window: "create".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_create_passes_the_session_run_id_to_an_appended_window() {
+        let db = tempfile::tempdir().unwrap();
+        let store = open_store(db.path());
+        let tmux = tmux_with_windows(&[("tm-proj-create", "create", true)]);
+
+        let outcome = launch_create(
+            Some(&store),
+            &tmux,
+            &configured("/repo/axiom"),
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap();
+
+        let run_id = outcome.run_id.unwrap();
+        let env = tmux.calls().into_iter().find_map(|call| match call {
+            TmuxCall::NewWindowWithCommand { env, .. } => Some(env),
+            _ => None,
+        });
+        assert_eq!(
+            env,
+            Some(vec![(
+                "TSKMSTR_SESSION_RUN_ID".to_string(),
+                run_id.to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn launch_create_without_a_store_registers_nothing_and_injects_no_env() {
+        let tmux = FakeTmuxOps::new();
+
+        let outcome = launch_create(
+            None,
+            &tmux,
+            &configured("/repo/axiom"),
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.run_id, None);
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|call| matches!(call, TmuxCall::PanePid { .. }))
+        );
+    }
+
+    #[test]
+    fn launch_create_refusing_a_double_launch_registers_no_row() {
+        let db = tempfile::tempdir().unwrap();
+        let store = open_store(db.path());
+        let tmux = tmux_with_windows(&[("tm-proj-create", "create", false)]);
+
+        let result = launch_create(
+            Some(&store),
+            &tmux,
+            &configured("/repo/axiom"),
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CreateLaunchError::AlreadyRunning { .. })
+        ));
+        assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_create_with_a_missing_prompt_file_registers_no_row() {
+        let db = tempfile::tempdir().unwrap();
+        let store = open_store(db.path());
+        let tmux = FakeTmuxOps::new();
+        let cfg = CreateConfig {
+            prompt_file: Some(db.path().join("missing.md").to_string_lossy().into_owned()),
+            ..configured("/repo/axiom")
+        };
+
+        let result = launch_create(
+            Some(&store),
+            &tmux,
+            &cfg,
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        );
+
+        assert!(matches!(result, Err(CreateLaunchError::PromptFile(_))));
+        assert!(store.list_runs().unwrap().is_empty());
+    }
+
     #[test]
     fn launch_create_errors_when_dir_is_unset() {
         let tmux = FakeTmuxOps::new();
@@ -249,6 +492,7 @@ mod tests {
         let cfg = CreateConfig::default();
 
         let err = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -269,6 +513,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let err = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -300,6 +545,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let outcome = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -338,6 +584,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let outcome = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -368,6 +615,7 @@ mod tests {
         };
 
         launch_create(
+            None,
             &tmux,
             &cfg,
             Path::new("/Users/jowi"),
@@ -399,6 +647,7 @@ mod tests {
         };
 
         launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -433,6 +682,7 @@ mod tests {
         };
 
         launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
@@ -466,6 +716,7 @@ mod tests {
         };
 
         let err = launch_create(
+            None,
             &tmux,
             &cfg,
             &home,
