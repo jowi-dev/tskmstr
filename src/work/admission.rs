@@ -804,6 +804,33 @@ impl AdmissionDeps<'_> {
         }
     }
 
+    /// [`AdmissionDeps::admit`] for a launch path whose run store is
+    /// optional. With no store there is nothing to count or read usage
+    /// from, so the launch is admitted with a warning on `out`.
+    ///
+    /// # Errors
+    ///
+    /// See [`AdmissionDeps::admit`].
+    pub fn admit_tracked(
+        &self,
+        store: Option<&RunStore>,
+        now: &dyn Fn() -> i64,
+        request: &LaunchRequest<'_>,
+        origin: LaunchOrigin,
+        out: &mut dyn Write,
+    ) -> Result<Admitted, AdmissionError> {
+        match store {
+            Some(store) => self.admit(store, now, request, origin, out),
+            None => {
+                let _ = writeln!(
+                    out,
+                    "warning: no run store; launching without memory or usage admission"
+                );
+                Ok(Admitted(()))
+            }
+        }
+    }
+
     /// Admits `request` the way `origin` calls for. See [`LaunchOrigin`].
     /// Wait events are best-effort: failing to record one never blocks or
     /// fails the launch.
@@ -1587,6 +1614,25 @@ mod gate_tests {
         assert_eq!(sleeper.slept.get(), 60);
         let kinds: Vec<String> = events(&store, lane).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, vec![ADMISSION_WAIT_EVENT, ADMISSION_TIMEOUT_EVENT]);
+    }
+
+    #[test]
+    fn with_no_run_store_a_launch_is_admitted_with_a_warning() {
+        let mut out = Vec::new();
+
+        let admitted = AdmissionDeps::with_budget(1).admit_tracked(
+            None,
+            &|| NOW,
+            &review_round(),
+            LaunchOrigin::Human,
+            &mut out,
+        );
+
+        assert!(admitted.is_ok());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: no run store; launching without memory or usage admission\n"
+        );
     }
 
     #[test]

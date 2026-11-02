@@ -2230,54 +2230,58 @@ fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
     let state_dir = home.join(".local/state/tskmstr/work");
     let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
 
-    let deps = tskmstr::work::merge::MergeDeps {
-        git: &git,
-        gh: &gh,
-        tmux: &tmux,
-        jira: jira.as_ref(),
-        runner: agent_runner_for(&config),
-        run_store: Some(&run_store),
-        clock: &clock,
-        sleeper: &sleeper,
-        cwd: &cwd,
-        home: &home,
-        identity: &identity,
-        lanes: &config.work.lanes,
-        merge_cfg: &config.work.merge,
-        model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
-        status_on_merge: config.status_on_merge.as_deref(),
-        state_dir: &state_dir,
-        sessions_dir: &sessions_dir,
-        kill_pid: &tskmstr::runs::pid::kill_pid,
-    };
-    let mut stdout = std::io::stdout();
+    let runner = agent_runner_for(&config);
+    with_admission(Some(&config), runner, |admission| {
+        let deps = tskmstr::work::merge::MergeDeps {
+            git: &git,
+            gh: &gh,
+            tmux: &tmux,
+            jira: jira.as_ref(),
+            runner,
+            run_store: Some(&run_store),
+            clock: &clock,
+            sleeper: &sleeper,
+            cwd: &cwd,
+            home: &home,
+            identity: &identity,
+            lanes: &config.work.lanes,
+            merge_cfg: &config.work.merge,
+            admission,
+            model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+            status_on_merge: config.status_on_merge.as_deref(),
+            state_dir: &state_dir,
+            sessions_dir: &sessions_dir,
+            kill_pid: &tskmstr::runs::pid::kill_pid,
+        };
+        let mut stdout = std::io::stdout();
 
-    let key = match keys.as_slice() {
-        [key] => key.clone(),
-        _ => {
-            return match tskmstr::work::merge::run_merge_batch(&deps, &keys, &mut stdout) {
-                Ok(report) => ExitCode::from(report.exit_code()),
-                Err(err) => {
-                    eprintln!("{err}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
-    };
+        let key = match keys.as_slice() {
+            [key] => key.clone(),
+            _ => {
+                return match tskmstr::work::merge::run_merge_batch(&deps, &keys, &mut stdout) {
+                    Ok(report) => ExitCode::from(report.exit_code()),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+        };
 
-    match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
-        Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
-        Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
-            eprintln!(
-                "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
-            );
-            ExitCode::from(MERGE_EXIT_CONFLICTS)
+        match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
+            Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
+            Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
+                eprintln!(
+                    "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
+                );
+                ExitCode::from(MERGE_EXIT_CONFLICTS)
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
         }
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
-    }
+    })
 }
 
 /// Exit code for `tm review fix <KEY>` reporting that `vdiff` captured no

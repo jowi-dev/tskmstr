@@ -96,6 +96,11 @@ pub const MERGE_BATCH_EVENT: &str = "merge-batch";
 /// Errors returned by [`run_merge`].
 #[derive(Debug, Error)]
 pub enum MergeError {
+    /// Memory or usage admission refused the conflict session (GitHub
+    /// issue #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
+
     /// A `git` shell-out failed.
     #[error(transparent)]
     Git(#[from] GitError),
@@ -225,6 +230,9 @@ pub struct MergeDeps<'a> {
     pub lanes: &'a BTreeMap<String, LaneConfig>,
     /// Validated `[work.merge]` settings.
     pub merge_cfg: &'a MergeConfig,
+    /// Memory and usage admission for the conflict session's agent (GitHub
+    /// issue #149).
+    pub admission: crate::work::admission::AdmissionDeps<'a>,
     /// `[work] default_model` and the `[agent.<runner>]` models, which the
     /// conflict session's model resolution falls back to after `[work.merge]
     /// model` (GitHub issue #143).
@@ -392,11 +400,20 @@ fn run_conflict_session(
         },
     };
     let prompt = conflict_prompt(&template, key, branch, base);
+    let admitted = admit_conflict_session(deps, &prepared.repo_root, out)?;
     let run_id = start_conflict_run(deps, key, Some(branch), dir, &prepared.repo_root);
     let prompt = with_registration(run_id, key, prompt);
 
-    let result =
-        open_and_poll_conflict_session(deps, prompt, prepared, dir, pre_rebase_rev, run_id, out);
+    let result = open_and_poll_conflict_session(
+        deps,
+        &admitted,
+        prompt,
+        prepared,
+        dir,
+        pre_rebase_rev,
+        run_id,
+        out,
+    );
     let ending = match &result {
         Ok(ConflictOutcome::Resolved) => None,
         Ok(ConflictOutcome::HandedBack) => Some(format!(
@@ -415,6 +432,7 @@ fn run_conflict_session(
 #[allow(clippy::too_many_arguments)]
 fn open_and_poll_conflict_session(
     deps: &MergeDeps<'_>,
+    admitted: &crate::work::admission::Admitted,
     prompt: String,
     prepared: &PreparedMerge,
     dir: &Path,
@@ -423,7 +441,7 @@ fn open_and_poll_conflict_session(
     out: &mut dyn Write,
 ) -> Result<ConflictOutcome, MergeError> {
     let key = &prepared.key;
-    let session = open_agent_window(deps, prompt, key, key, dir, run_id)?;
+    let session = open_agent_window(deps, admitted, prompt, key, key, dir, run_id)?;
     let AgentWindow {
         target,
         window,
@@ -449,6 +467,30 @@ fn open_and_poll_conflict_session(
         pre_rebase_rev,
         out,
     )
+}
+
+/// Admits a conflict session's agent (GitHub issue #149), before its row is
+/// pre-registered so a refusal leaves none. `tm merge` is human-started:
+/// over the memory budget it refuses, over a usage ceiling it warns and
+/// launches. With no [`MergeDeps::run_store`] there is nothing to count, so
+/// the session launches with a warning.
+fn admit_conflict_session(
+    deps: &MergeDeps<'_>,
+    repo_root: &Path,
+    out: &mut dyn Write,
+) -> Result<crate::work::admission::Admitted, MergeError> {
+    let repo = crate::work::run::dir_repo_key(repo_root);
+    Ok(deps.admission.admit_tracked(
+        deps.run_store,
+        &|| deps.clock.now_unix_secs(),
+        &crate::work::admission::LaunchRequest {
+            kind: MERGE_CONFLICT_KIND,
+            agent: deps.runner.name(),
+            repo: &repo,
+        },
+        crate::work::admission::LaunchOrigin::Human,
+        out,
+    )?)
 }
 
 /// Pre-registers a conflict session's `merge-conflict` row (GitHub issue
@@ -562,6 +604,7 @@ struct AgentWindow {
 /// says nothing about whether the row is still live.
 fn open_agent_window(
     deps: &MergeDeps<'_>,
+    _admitted: &crate::work::admission::Admitted,
     prompt: String,
     prompt_stem: &str,
     session_key: &str,
@@ -1032,6 +1075,7 @@ fn run_batch_conflict_session(
     // every other ticket's directory explicitly.
     let (first, first_conflict) = &tickets[0];
     let keys: Vec<&str> = tickets.iter().map(|(p, _)| p.key.as_str()).collect();
+    let admitted = admit_conflict_session(deps, &first.repo_root, out)?;
     let run_id = start_conflict_run(
         deps,
         &first.key,
@@ -1045,7 +1089,8 @@ fn run_batch_conflict_session(
     }
     let prompt = with_registration(run_id, &first.key, prompt);
 
-    let result = open_and_poll_batch_conflict_session(deps, prompt, tickets, run_id, out);
+    let result =
+        open_and_poll_batch_conflict_session(deps, &admitted, prompt, tickets, run_id, out);
     let ending = match &result {
         Ok((flags, _)) => {
             let handed_back: Vec<&str> = keys
@@ -1071,6 +1116,7 @@ fn run_batch_conflict_session(
 /// out for the same reason as [`open_and_poll_conflict_session`].
 fn open_and_poll_batch_conflict_session(
     deps: &MergeDeps<'_>,
+    admitted: &crate::work::admission::Admitted,
     prompt: String,
     tickets: &[(PreparedMerge, PendingConflict)],
     run_id: Option<i64>,
@@ -1079,6 +1125,7 @@ fn open_and_poll_batch_conflict_session(
     let (first, first_conflict) = &tickets[0];
     let session = open_agent_window(
         deps,
+        admitted,
         prompt,
         "batch",
         &first.key,
@@ -1992,6 +2039,7 @@ mod tests {
                 identity: &self.identity,
                 lanes: &self.lanes,
                 merge_cfg: &self.merge_cfg,
+                admission: crate::work::admission::AdmissionDeps::off(),
                 model_defaults: crate::work::model::ModelDefaults {
                     work_default: self.work_default_model.as_deref(),
                     models: &self.models,
@@ -2423,6 +2471,53 @@ mod tests {
             "merge removes the marker, so the SessionEnd hook finds nothing to overwrite"
         );
         assert!(fx.sessions_dir.join("sess-other").exists());
+    }
+
+    #[test]
+    fn conflict_session_over_the_memory_budget_is_refused_before_its_row_and_window() {
+        let fx = resolving_conflict_fixture();
+        let mut deps = fx.deps();
+        deps.admission = crate::work::admission::AdmissionDeps::with_budget(1);
+
+        let (result, _out) = run(&deps, "PROJ-1");
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded: repo/claude merge-conflict"),
+            "{err}"
+        );
+        assert!(conflict_rows(&fx).is_empty());
+        assert!(
+            !fx.tmux.calls().iter().any(|c| matches!(
+                c,
+                TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+            )),
+            "no agent window opened"
+        );
+    }
+
+    #[test]
+    fn batch_conflict_session_over_the_memory_budget_is_refused_before_its_row_and_window() {
+        let fx = batch_fixture(&[BatchTicket::Conflict { resolves: true }; 2]);
+        let mut deps = fx.deps();
+        deps.admission = crate::work::admission::AdmissionDeps::with_budget(1);
+
+        let (result, _out) = run_batch(&deps, &keys(2));
+
+        let rendered = match result {
+            Ok(report) => format!("{:?}", report.failed),
+            Err(err) => err.to_string(),
+        };
+        assert!(rendered.contains("memory budget exceeded"), "{rendered}");
+        assert!(conflict_rows(&fx).is_empty());
+        assert!(
+            !fx.tmux.calls().iter().any(|c| matches!(
+                c,
+                TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+            )),
+            "no agent window opened"
+        );
     }
 
     #[test]
