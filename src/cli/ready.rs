@@ -60,6 +60,11 @@ pub struct ReadyContext<'a> {
     /// The audit gate (GitHub issue #112): what a ticket with no blockers
     /// still needs before it counts as ready or stackable.
     pub audit: AuditGate<'a>,
+    /// Each ticket's parent epic, fetched once per invocation (GitHub issue
+    /// #178): a child of a locked epic is blocked. Built with
+    /// [`blocker_stacking::ParentEpics::from_provider`] from `[ready]
+    /// inherit_epic_blockers`.
+    pub epics: blocker_stacking::ParentEpics<'a>,
 }
 
 /// The verdict `tm ticket audit --record` stores for a ticket that passes
@@ -150,6 +155,17 @@ pub enum ReadyCliError {
         key: String,
         /// Why it fails the gate, e.g. `not audited`.
         reason: String,
+    },
+
+    /// `tm ready <KEY>` couldn't load `key`'s parent epic, so it can't tell
+    /// whether the epic is locked. Never read as ready.
+    #[error("cannot tell whether {key} is ready: {source}")]
+    EpicUnknown {
+        /// The issue key that was checked.
+        key: String,
+        /// The failed epic lookup.
+        #[source]
+        source: blocker_stacking::EpicLookupError,
     },
 
     /// A Jira API call failed.
@@ -416,13 +432,15 @@ struct ListReport {
 /// fallback does: a `gh` hiccup must never mislabel a blocked ticket as
 /// pickable, and failing the whole listing would be disproportionate.
 fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
-    let candidates = ready_candidates(ctx.jira)?;
+    let mut candidates = ready_candidates(ctx.jira)?;
+    if ctx.epics.enabled() {
+        ctx.jira
+            .hydrate_parents(&mut candidates)
+            .map_err(TicketingError::Provider)?;
+    }
     let mut warnings = Vec::new();
 
-    let prs = if candidates
-        .iter()
-        .any(|issue| !blocker_stacking::direct_blockers(issue).is_empty())
-    {
+    let prs = if candidates.iter().any(|issue| ctx.epics.needs_prs(issue)) {
         let cwd = std::env::current_dir()?;
         match ctx.gh.pr_list_all(&cwd) {
             Ok(prs) => Some(prs),
@@ -448,7 +466,7 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
     let decisions: Vec<ListDecision> = candidates
         .iter()
         .map(|issue| {
-            let decision = list_decision(issue, prs.as_deref(), &ctx.in_flight, ctx.in_base);
+            let decision = list_decision(ctx, issue, prs.as_deref());
             match decision {
                 ListDecision::Ready | ListDecision::Stackable { .. } => {
                     match ctx.audit.needs_audit(&issue.key) {
@@ -488,39 +506,43 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
     Ok(ListReport { tickets, warnings })
 }
 
-/// Classify `issue` via [`blocker_stacking::decide`]. `prs` is the blockers'
-/// repo PR list, or `None` when that lookup failed (or was skipped because no
-/// candidate had a blocker); a ticket with no direct blockers is ready
-/// without consulting it, matching [`check`]. `in_base` is
-/// [`ReadyContext::in_base`].
-fn list_decision(
-    issue: &Issue,
-    prs: Option<&[PrSummary]>,
-    in_flight: &blocker_stacking::InFlight,
-    in_base: &dyn Fn(&str) -> bool,
-) -> ListDecision {
-    if blocker_stacking::direct_blockers(issue).is_empty() {
-        return ListDecision::Ready;
-    }
-    let Some(prs) = prs else {
-        let open = open_blockers(issue);
-        if open.is_empty() {
-            return ListDecision::Ready;
+/// Classify `issue` via [`blocker_stacking::decide_with_epic`]. `prs` is
+/// the blockers' repo PR list, or `None` when that lookup failed (or was
+/// skipped because no candidate needed one); a ticket with no direct
+/// blockers is judged without it, matching [`check`]. A child of a locked
+/// epic ([`ReadyContext::epics`]) is blocked whatever its own links say.
+fn list_decision(ctx: &ReadyContext, issue: &Issue, prs: Option<&[PrSummary]>) -> ListDecision {
+    let epic_lock = match ctx.epics.lock(issue, prs, ctx.in_base) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return ListDecision::Blocked {
+                blocker_keys: Vec::new(),
+                reason: err.to_string(),
+            };
         }
-        let named: Vec<String> = open
-            .iter()
-            .map(|b| format!("{} ({})", b.key, b.fields.status.name))
-            .collect();
-        return ListDecision::Blocked {
-            blocker_keys: open.iter().map(|b| b.key.clone()).collect(),
-            reason: format!("blocked by {} — blocker PRs unresolved", named.join(", ")),
-        };
+    };
+    let has_direct = !blocker_stacking::direct_blockers(issue).is_empty();
+    let unmerged = match (&epic_lock, prs) {
+        (Some(_), _) => Vec::new(),
+        (None, _) if !has_direct => return ListDecision::Ready,
+        (None, Some(prs)) => blocker_stacking::unmerged_direct_blockers(issue, prs, ctx.in_base),
+        (None, None) => {
+            let open = open_blockers(issue);
+            if open.is_empty() {
+                return ListDecision::Ready;
+            }
+            let named: Vec<String> = open
+                .iter()
+                .map(|b| format!("{} ({})", b.key, b.fields.status.name))
+                .collect();
+            return ListDecision::Blocked {
+                blocker_keys: open.iter().map(|b| b.key.clone()).collect(),
+                reason: format!("blocked by {} — blocker PRs unresolved", named.join(", ")),
+            };
+        }
     };
 
-    match blocker_stacking::decide(
-        blocker_stacking::unmerged_direct_blockers(issue, prs, in_base),
-        in_flight,
-    ) {
+    match blocker_stacking::decide_with_epic(unmerged, epic_lock, &ctx.in_flight) {
         StackDecision::Ready => ListDecision::Ready,
         StackDecision::Stackable {
             blocker_key,
@@ -554,6 +576,10 @@ fn list_decision(
                     .join(", ")
             ),
             blocker_keys: blockers.into_iter().map(|b| b.key).collect(),
+        },
+        StackDecision::BlockedByEpic(lock) => ListDecision::Blocked {
+            reason: format!("blocked by {}", lock.describe()),
+            blocker_keys: lock.blocker_keys(),
         },
     }
 }
@@ -621,29 +647,36 @@ pub fn check(
         .map_err(TicketingError::Provider)?;
     let status_name = issue.fields.status.name.clone();
 
-    if blocker_stacking::direct_blockers(&issue).is_empty() {
-        ctx.audit.require(&normalized)?;
-        writeln!(out, "{normalized} is ready ({status_name})")?;
-        print_bot_finding_note(ctx, &normalized, out)?;
-        return Ok(ReadyOutcome::Ready);
-    }
-
-    let cwd = std::env::current_dir()?;
-    let prs = match ctx.gh.pr_list_all(&cwd) {
-        Ok(prs) => prs,
-        Err(err) if err.is_permanent() => {
-            return Err(ReadyCliError::GhBug {
-                key: normalized,
-                source: err,
-            });
+    let prs = if ctx.epics.needs_prs(&issue) {
+        let cwd = std::env::current_dir()?;
+        match ctx.gh.pr_list_all(&cwd) {
+            Ok(prs) => Some(prs),
+            Err(err) if err.is_permanent() => {
+                return Err(ReadyCliError::GhBug {
+                    key: normalized,
+                    source: err,
+                });
+            }
+            Err(err) => {
+                return jira_only_fallback(ctx, &normalized, &issue, &status_name, &err, out);
+            }
         }
-        Err(err) => {
-            return jira_only_fallback(ctx, &normalized, &issue, &status_name, &err, out);
-        }
+    } else {
+        None
     };
 
-    let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, ctx.in_base);
-    match blocker_stacking::decide(unmerged, &ctx.in_flight) {
+    let epic_lock = ctx
+        .epics
+        .lock(&issue, prs.as_deref(), ctx.in_base)
+        .map_err(|source| ReadyCliError::EpicUnknown {
+            key: normalized.clone(),
+            source,
+        })?;
+    let unmerged = match &prs {
+        Some(prs) => blocker_stacking::unmerged_direct_blockers(&issue, prs, ctx.in_base),
+        None => Vec::new(),
+    };
+    match blocker_stacking::decide_with_epic(unmerged, epic_lock, &ctx.in_flight) {
         StackDecision::Ready => {
             ctx.audit.require(&normalized)?;
             writeln!(out, "{normalized} is ready ({status_name})")?;
@@ -701,7 +734,31 @@ pub fn check(
                 blockers: lines.join("\n"),
             })
         }
+        StackDecision::BlockedByEpic(lock) => Err(ReadyCliError::NotReady {
+            key: normalized,
+            blockers: epic_lock_lines(&lock),
+        }),
     }
+}
+
+/// [`ReadyCliError::NotReady`]'s lines for a locked parent epic: one per
+/// inherited blocker, then why a lane can't stack on it.
+fn epic_lock_lines(lock: &blocker_stacking::EpicLock) -> String {
+    let mut lines: Vec<String> = lock
+        .blockers
+        .iter()
+        .map(|b| {
+            format!(
+                "  {} ({}): {} — via epic {}",
+                b.key, b.status_name, b.summary, lock.epic_key
+            )
+        })
+        .collect();
+    lines.push(format!(
+        "  (parent epic {} is still waiting on these — finish them first)",
+        lock.epic_key
+    ));
+    lines.join("\n")
 }
 
 /// Fallback for [`check`] when [`GhCli::pr_list_all`] fails **transiently**:
@@ -723,6 +780,21 @@ fn jira_only_fallback(
         out,
         "warning: could not resolve blocker PRs for {normalized} ({gh_err}) — falling back to Jira-only readiness check{note}"
     )?;
+
+    // Tracker status alone, for the parent epic too.
+    let epic_lock =
+        ctx.epics
+            .lock(issue, None, ctx.in_base)
+            .map_err(|source| ReadyCliError::EpicUnknown {
+                key: normalized.to_string(),
+                source,
+            })?;
+    if let Some(lock) = epic_lock {
+        return Err(ReadyCliError::NotReady {
+            key: normalized.to_string(),
+            blockers: epic_lock_lines(&lock),
+        });
+    }
 
     let blockers = open_blockers(issue);
     if blockers.is_empty() {
@@ -898,6 +970,7 @@ mod tests {
             in_flight: blocker_stacking::InFlight::new(),
             in_base: &|_| false,
             audit: AuditGate::Off,
+            epics: blocker_stacking::ParentEpics::from_provider(jira, true),
         }
     }
 
@@ -2004,6 +2077,7 @@ mod tests {
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
             &|_| false,
+            true,
         )
         .expect("resolve_blocker_stacking should also treat this as stackable, not refuse");
         assert_eq!(
@@ -2042,11 +2116,163 @@ mod tests {
             Some("AX-409"),
             &crate::blocker_stacking::InFlight::new(),
             &|_| false,
+            true,
         )
         .expect("resolve_blocker_stacking should also treat this as ready, not refuse");
         assert_eq!(
             resolution.stacked_base, None,
             "a Done blocker needs no stack base override"
+        );
+    }
+
+    // --- Inherited epic blockers (GitHub issue #178) ---
+
+    use crate::blocker_stacking::epic_fixture::{self, CHILD, EPIC, UNLOCKER};
+
+    fn check_child(jira: &FakeJiraClient, gh: &FakeGhCli) -> Result<ReadyOutcome, ReadyCliError> {
+        let bots = cursor_bot();
+        check(&ready_ctx(jira, gh, &bots), CHILD, &mut Vec::new())
+    }
+
+    #[test]
+    fn check_blocks_a_child_of_a_locked_epic_naming_the_epic() {
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        match check_child(&jira, &gh) {
+            Err(err @ ReadyCliError::NotReady { .. }) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains(&format!(
+                        "{UNLOCKER} (In Progress): Summary for {UNLOCKER} — via epic {EPIC}"
+                    )),
+                    "{text}"
+                );
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_is_ready_once_the_epics_unlocker_is_done() {
+        let jira = epic_fixture::provider("done");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        assert_eq!(check_child(&jira, &gh).unwrap(), ReadyOutcome::Ready);
+    }
+
+    #[test]
+    fn check_never_stacks_on_an_inherited_blocker_with_an_open_pr() {
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![pr_all_summary(
+            5,
+            "jowi-dev/proj-12-thing",
+            crate::github::gh_cli::PrLifecycle::Open,
+        )]));
+
+        assert!(matches!(
+            check_child(&jira, &gh),
+            Err(ReadyCliError::NotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn check_with_inheritance_off_judges_the_child_by_its_own_links() {
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new();
+        let bots = cursor_bot();
+        let ctx = ReadyContext {
+            epics: blocker_stacking::ParentEpics::from_provider(&jira, false),
+            ..ready_ctx(&jira, &gh, &bots)
+        };
+
+        assert_eq!(
+            check(&ctx, CHILD, &mut Vec::new()).unwrap(),
+            ReadyOutcome::Ready
+        );
+        assert!(gh.pr_list_all_calls().is_empty());
+    }
+
+    #[test]
+    fn check_cannot_call_a_child_ready_when_its_epic_fails_to_load() {
+        let jira = FakeJiraClient::new()
+            .with_issue(CHILD, epic_fixture::child())
+            .with_parent(CHILD, EPIC);
+        let gh = FakeGhCli::new();
+
+        match check_child(&jira, &gh) {
+            Err(err @ ReadyCliError::EpicUnknown { .. }) => {
+                assert!(err.to_string().contains(EPIC), "{err}");
+            }
+            other => panic!("expected EpicUnknown, got {other:?}"),
+        }
+    }
+
+    /// The transient-`gh` fallback judges the epic by tracker status alone.
+    #[test]
+    fn check_transient_gh_failure_still_blocks_a_child_of_a_locked_epic() {
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new().with_pr_list_all(Err(GhError::Command {
+            command: "gh pr list".to_string(),
+            exit_code: Some(1),
+            stderr: "network down".to_string(),
+        }));
+
+        assert!(matches!(
+            check_child(&jira, &gh),
+            Err(ReadyCliError::NotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn list_json_blocks_every_child_of_a_locked_epic_fetching_it_once() {
+        let jira = epic_fixture::provider("indeterminate").with_search_result(search_result(vec![
+            epic_fixture::child_keyed("PROJ-41"),
+            epic_fixture::child_keyed("PROJ-42"),
+            epic_fixture::child_keyed("PROJ-43"),
+        ]));
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let mut out = Vec::new();
+
+        list_json(&ready_ctx(&jira, &gh, &bots), &mut out).expect("should succeed");
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        for ticket in value["tickets"].as_array().expect("tickets") {
+            assert_eq!(ticket["decision"], "blocked", "{ticket}");
+            assert_eq!(ticket["blocker_keys"], serde_json::json!([UNLOCKER]));
+            assert_eq!(
+                ticket["reason"],
+                format!("blocked by {UNLOCKER} (via epic {EPIC})")
+            );
+        }
+        assert_eq!(jira.get_issue_calls(), [EPIC]);
+    }
+
+    /// The lane-run half of the same fixture: `tm work run` refuses what
+    /// `tm ready` reports blocked.
+    #[test]
+    fn check_ready_and_resolve_blocker_stacking_agree_a_child_of_a_locked_epic_is_blocked() {
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        assert!(matches!(
+            check_child(&jira, &gh),
+            Err(ReadyCliError::NotReady { .. })
+        ));
+        let err = crate::work::run::resolve_blocker_stacking(
+            Some(&jira),
+            &gh,
+            std::path::Path::new("/repo"),
+            Some(CHILD),
+            &crate::blocker_stacking::InFlight::new(),
+            &|_| false,
+            true,
+        )
+        .expect_err("a lane must refuse a child of a locked epic");
+        assert!(
+            matches!(err, crate::work::run::RunLaneError::EpicLocked { .. }),
+            "{err}"
         );
     }
 

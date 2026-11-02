@@ -207,6 +207,7 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
+| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -232,7 +233,7 @@ tm auth status
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
 | `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `c` toggles lifecycle columns, `s` attaches, `v`/`L` show the run detail/log, `B` opens `tm board` for the row's repo in a new tmux window, `V`/`F`/`M`/`Space` review, fix and merge in the row's own repo, `Tab` switches to `tm runs watch` |
-| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file; `--transcript` adds the agent's messages and tool calls |
+| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file, `--transcript` adds the agent's messages and tool calls, or an interactive run's Claude Code transcript as readable text |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -244,7 +245,7 @@ tm auth status
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
-| `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2) whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round `review` at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
+| `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
 **Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and both backends support them. In Jira, an epic is an issue of type `Epic` (or whatever `epic_issue_type` names, see "Configuration"), a child points at its epic through Jira's `parent` field, and `tm ticket children` lists every ticket under the epic, done ones included, in backlog rank order. In GitHub, an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
@@ -661,11 +662,30 @@ Runs started before the `log_path` column existed have it as `NULL`; for
 by-convention path above, so even a run predating this feature stays
 viewable. Other kinds have no derivable fallback (a lane run's filename also
 bears a worktree name and timestamp that don't survive anywhere recoverable)
-and report a distinct "no recorded log path" error in that case. A
-zero-byte log file (the poll loop having emitted nothing) is reported
-distinctly too, pointing at `tm runs show <KEY>` for the recorded event
-timeline. On the board, pressing `L` on a ticket opens its latest run's log
-in `less` the same way `a`/`b` attach to a live tmux session.
+and fall through to the transcript fallback below. A zero-byte log file
+(the poll loop having emitted nothing) is reported distinctly too, pointing
+at `tm runs show <KEY>` for the recorded event timeline. On the board,
+pressing `L` on a ticket opens its latest run's log in `less` the same way
+`a`/`b` attach to a live tmux session.
+
+Interactive runs (an agent session in a tmux window rather than a detached
+process) have no detached log at all. For those, `tm runs logs` prints the
+run's Claude Code transcript as readable text instead: user and assistant
+messages, with tool calls (`  -> Bash cargo test`) and their results
+(`  <- result: ...`) in brief; thinking blocks and bookkeeping entries are
+left out. `--tail` counts rendered lines, and `--follow` renders new
+messages as they land. The transcript is found via the path the SessionEnd
+hook records on the run (`tm runs finish --transcript`), or, failing that,
+by the run's session id under `$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`
+(`$CLAUDE_CONFIG_DIR` defaults to `~/.claude`). The session-id lookup is
+what keeps it working for runs whose SessionEnd hook never fired, such as
+those hibernated by the idle sweep or cleaned up by `tm merge`: Claude
+Code's transcript file outlives the killed session. The transcript is read
+by the agent that recorded the run (falling back to the configured `[agent]
+runner` for rows that recorded none), so a claude run still renders under an
+opencode config. Only Claude Code transcripts are supported: an opencode run
+with no log still reports the distinct "no recorded log path or transcript"
+error, as does any run with neither a log nor a transcript.
 
 ### Per-model token/cost usage
 
@@ -1674,15 +1694,19 @@ Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
 stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
 classification `tm ready <KEY>` reports, computed by the same rule
 (`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
-board repo's PR list. Pressing `w` on a blocked ticket opens a confirmation
-listing the blocking keys; `y`/`Enter` launches anyway, `n`/`Esc` launches
-nothing. Ready, stackable, and unknown tickets launch without a prompt.
+board repo's PR list, plus the blockers a card inherits from a locked
+parent epic (see [Inherited blockers](#inherited-blockers-children-of-a-locked-epic)).
+Pressing `w` on a blocked ticket opens a confirmation listing the blocking
+keys, an inherited one as `PROJ-12 (via epic PROJ-30)`; `y`/`Enter`
+launches anyway, `n`/`Esc` launches nothing. Ready, stackable, and unknown tickets launch without a prompt.
 
 The lookup runs on the board's network worker with each ticket refresh and
 costs a fixed number of calls, not one per ticket: at most one `gh pr list`
 (skipped when no listed ticket has a blocker), and on the GitHub backend one
-batched GraphQL `blockedBy` query for every listed issue. If either lookup
-fails, the affected cards show `?`, never `✓`, and the status line says why.
+batched GraphQL `blockedBy` query for every listed issue, plus one ticket
+lookup per distinct parent epic. If a lookup fails, the affected cards show
+`?`, never `✓`, and the status line says why; unknown parents make every
+card `?` while `[ready] inherit_epic_blockers` is on.
 Unlike `tm ready <KEY>`, the board has no Jira-status-only fallback when the
 PR list fails, because a guessed "ready" is worse than no answer. GitHub
 dependency data only records open or closed, so an open blocker counts as
@@ -1961,8 +1985,10 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
    (`review-2` for round 2). Round 1 uses the `thatch-code-review` skill.
    Later rounds use `thatch-review-followup` and are pointed at the previous
    round's archived comments. The agent writes its confirmed findings to
-   `<git-dir>/vdiff/auto-review/findings-<round>.json`, and the round is
-   done once that file exists and parses.
+   `<git-dir>/vdiff/auto-review/findings-<loop>-<round>.json`, and the
+   round is done once that file exists and parses. `<loop>` is the loop's
+   pid and start time, so an agent left over from an earlier loop can never
+   signal a later loop's step.
 2. Appends the findings to the comment store with vdiff schema v1's rules
    (`c<n>` ids after the existing ones, `created_at`, sorted by
    `(path, start_line)`, pretty-printed). Your own comments are kept. Each
@@ -1972,37 +1998,48 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
    the store for you to read in `V`.
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
-   `<git-dir>/vdiff/auto-review/fix-<round>.done`, holding
+   `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
    `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
    round never re-reads comments with stale line anchors.
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
-to exit: it polls the step's signal file, marks the step's run `done` when
-the file appears, and moves on. The window stays open. Idle finished
-windows are hibernated like any other interactive window, and `tm merge`
-removes them with the rest of the ticket's session, which also ends the
-loop.
+to exit: it polls the step's signal file, records an
+`auto_review_signalled` event on the step's run when the file appears, and
+moves on. The window stays open, and its run stays `running` until you exit
+claude there, so memory admission still counts the agent and the idle sweep
+hibernates it like any other interactive window. A later step opens beside
+a signalled window (`review-2`, `fix-2`), never beside one still working.
+`tm merge` removes the windows with the rest of the ticket's session, which
+also ends the loop.
 
 tm appends a completion section to every round and fix prompt, so a custom
 `prompt_file` that never mentions the signal files still produces them. It
 names the exact path and tells the agent to write `<file>.tmp` and rename
-it into place. A findings file that exists but does not parse yet counts as
-not ready.
+it into place. A signal file whose JSON is cut short counts as not ready.
+One that is complete JSON of the wrong shape (a finding without `body`, a
+string `start_line`) can never become ready, so tm flags the step and
+stops the loop with the parse error in its log.
 
 **A step that never signals stops the loop.** If a round or fix pass
-writes nothing within `round_timeout_mins` (default 60, per step), or the
-idle sweep hibernates it before it signals, tm flags its run `review`
-("needs review" in the overview), records the round as `stuck`, and stops.
-The window is left open for you. If the step's run is ended by something
-else, such as you exiting claude before it signalled, or the ticket's
-session is gone, the loop records `stopped` and exits without flagging.
-Exiting a window's claude after tm already set its run's status never
-changes that status.
+writes nothing within `round_timeout_mins` (default 60, per step; `0`
+turns the timeout off), or the
+idle sweep hibernates it before it signals, tm flags its run for review,
+records the round as `stuck`, and stops. The agent may still be working, so
+the flag waits: the run ends as `review` ("needs review" in the overview)
+when you exit its claude. Until then its window is left open for you, and
+blocks a second fix pass from opening beside it. A hibernated step stays
+hibernated, so attaching to the session resumes its conversation. A flagged
+step that already ended moves to `review` at once. If the step's run is
+ended by something else, such as you exiting claude before it signalled, or
+the ticket's session is gone, the loop records `stopped` and exits without
+flagging. Exiting a window's claude after its run already ended never
+changes that run's status.
 
 At `max_review_rounds` with findings still above the threshold, the loop
-stops and marks that round's run `review` instead of fixing again. Each
+stops and flags that round's run for review the same way, instead of
+fixing again. Each
 round records an `auto_review_round` event (`1/2 fix`, `2/2 clean`,
 `2/2 capped`, `1/2 fix-failed`, `1/2 stuck`, `1/2 stopped`), and the overview row shows the newest one as
 `review 2/2 capped`, drawn as a warning when the loop stopped short of
@@ -2030,7 +2067,7 @@ so the badge stays at `needs you` until another round runs.
 # max_review_rounds = 2
 # publish = false                 # post each round with vdiff --publish-comments
 # auto = false                    # chain from a clean tm pr watch
-# round_timeout_mins = 60         # per round and per fix pass, then flag and stop
+# round_timeout_mins = 60         # per round and per fix pass, then flag and stop; 0 = no timeout
 ```
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
@@ -2401,6 +2438,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 
 # [ready]                             # optional, see below
 # require_audit = true                # the default
+# inherit_epic_blockers = true        # the default
 
 # [backend]                           # optional, see below; "jira" is the default
 # provider = "jira"
@@ -3012,6 +3050,40 @@ Then, across the ticket's unmerged blockers:
   exists to build on, and nobody is building it.
 - **two or more** → **blocked**: a single branch can only be stacked on one
   dependency at a time, so this refuses rather than guessing which one.
+
+#### Inherited blockers: children of a locked epic
+
+A ticket also inherits its **parent epic's** blockers. When epic A blocks
+(unlocks) epic B, B's work should not start until A is done, so every child
+of B is **blocked** while A is unfinished, even with no links of its own.
+`tm ready`, `tm ready <KEY>`, `tm work run`, and the board all apply this
+through the same shared rule:
+
+- The epic's direct `Blocks` blockers are judged by the same satisfaction
+  rule as a ticket's own (done status, merged PR, or a closed PR already in
+  the base). Once every one is satisfied, the child depends only on its own
+  links again.
+- An inherited blocker is **never stackable**, even with an open PR: a lane
+  can't stack a branch on a whole epic. `tm work run` refuses the run.
+- **One level only.** A child inherits its epic's direct blockers, not the
+  epic's whole upstream chain, matching how direct blockers work.
+- An epic counts as finished by its own status, never by its children's
+  progress. This is the same "locked" the epic graph (`tm graph`) reports.
+- Each distinct parent epic is fetched once per readiness check, however
+  many of its children are being checked.
+
+The reason names the epic:
+
+```
+PROJ-40  Build the screen  [blocked by PROJ-12 (via epic PROJ-30)]
+```
+
+If a parent epic can't be loaded, `tm ready <KEY>` exits `1` rather than
+guessing, the list marks that ticket blocked with the lookup error, the
+board shows `?`, and `tm work run` warns and runs on the normal base (as it
+does when the ticket itself can't be loaded). Set `[ready]
+inherit_epic_blockers = false` to judge every ticket by its own links only,
+as before.
 
 `tm ready` (no key) lists your "To Do" tickets (something already In
 Progress has already been picked up), each classified by the stack decision

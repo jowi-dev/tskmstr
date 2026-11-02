@@ -942,6 +942,33 @@ pub trait AgentRunner: Sync {
     /// value. `Ok(())` accepts. `model` is already trimmed and non-empty
     /// (an empty answer means "leave `model` unset", handled by the caller).
     fn validate_lane_model(&self, model: &str) -> Result<(), String>;
+
+    /// This agent's own per-session transcripts for a user whose home dir
+    /// is `home`, read by `tm runs logs` for runs that have no detached log
+    /// file (GitHub issue #155). Any agent-specific config-dir override is
+    /// resolved inside the adapter. `None` (the default) means the adapter
+    /// has no transcript reader, so such runs report no log at all.
+    fn transcripts(&self, _home: &Path) -> Option<Box<dyn Transcripts>> {
+        None
+    }
+}
+
+/// Picks the [`Transcripts`] reader for a run from its recorded agent name
+/// ([`AgentRunner::name`], `None` when the run recorded none). `None` means
+/// that agent has no transcript reader. Taken by `tm runs logs`.
+pub type TranscriptsFor<'a> = dyn Fn(Option<&str>) -> Option<Box<dyn Transcripts>> + 'a;
+
+/// An agent's per-session transcripts, as handed out by
+/// [`AgentRunner::transcripts`]: where the agent keeps a session's
+/// transcript, and how to turn its raw contents into readable text.
+pub trait Transcripts {
+    /// Finds the transcript the agent wrote for `session_id`, if one exists.
+    fn locate(&self, session_id: &str) -> Option<PathBuf>;
+
+    /// Renders a transcript's raw contents as readable text lines, one per
+    /// element, with no trailing newlines. Content the renderer cannot
+    /// parse is skipped rather than reported.
+    fn render(&self, raw: &str) -> Vec<String>;
 }
 
 #[cfg(test)]

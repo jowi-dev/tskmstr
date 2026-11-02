@@ -231,7 +231,8 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         suggested_default: |_| None,
     },
     // GitHub issue #150: how long the loop waits on one interactive round
-    // or fix pass's signal file.
+    // or fix pass's signal file. `0` means no timeout, as
+    // `idle_hibernate_mins = 0` turns the idle sweep off.
     ExpectedConfigKey {
         path: &["work", "auto_review", "round_timeout_mins"],
         since_schema_version: 2,

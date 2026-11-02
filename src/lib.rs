@@ -5,6 +5,7 @@ pub mod blocker_stacking;
 pub mod cli;
 pub mod config;
 pub mod github;
+pub mod graph;
 pub mod jira;
 pub mod keychain;
 pub mod overview_poll;

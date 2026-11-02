@@ -14,7 +14,6 @@ use thiserror::Error;
 
 use crate::config::{AutoReviewConfig, Severity};
 use crate::work::comment_store::{self, CommentStoreError, NewComment};
-use crate::work::signal::{Signal, StepWatch, read_done_marker, temporary_name, wait_for_signal};
 
 /// Run `kind` of each review round's agent run.
 pub const AUTO_REVIEW_KIND: &str = "auto-review";
@@ -29,6 +28,13 @@ pub const ROUND_EVENT: &str = "auto_review_round";
 /// board's `review:` badge reads the loop's liveness from this event.
 pub const LOOP_PID_EVENT: &str = "auto_review_loop_pid";
 
+/// Event kind the loop records on a review or fix row once its step's
+/// signal file is read, its detail `review` or `fix` (GitHub issue #150).
+/// The row itself stays `running` until its agent exits, so the idle sweep
+/// hibernates the agent and admission counts it; this event is what marks
+/// the window as finished for [`crate::work::hibernate::ended_launch_windows`].
+pub const SIGNAL_EVENT: &str = "auto_review_signalled";
+
 /// Skill a first round reviews with.
 pub const FIRST_ROUND_SKILL: &str = "thatch-code-review";
 
@@ -40,19 +46,18 @@ pub const FOLLOWUP_SKILL: &str = "thatch-review-followup";
 /// `prompt` nor `prompt_file`. Placeholders are those of [`render_prompt`].
 pub const DEFAULT_PROMPT: &str = "\
 Review the changes on this branch for {key} (auto-review round {round}) \
-with the `{skill}` skill. This is unattended: do not ask questions, do not \
-post anything to GitHub, and do not change any code.
+with the `{skill}` skill. Do not post anything to GitHub and do not change \
+any code.
 
-{prior}When the review is done, write every CONFIRMED finding to \
-`{findings_file}` as a JSON array, one object per finding:
+{prior}Report every CONFIRMED finding as one object in a JSON array:
 
     {\"path\": \"src/lib.rs\", \"start_line\": 10, \"end_line\": 12,
      \"severity\": \"MEDIUM\", \"specialist\": \"state-flow\",
      \"body\": \"What is wrong, why, and what to change.\"}
 
 `path` is repo-relative; lines are 1-based and inclusive, anchored to the \
-head SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. Write `[]` when \
-there are no findings. Write the file even if the review is clean.
+head SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. The completion \
+signal section below says where and how to write the array.
 ";
 
 /// Errors from [`run_loop`].
@@ -62,10 +67,11 @@ pub enum AutoReviewError {
     #[error(transparent)]
     Store(#[from] CommentStoreError),
 
-    /// A round's findings file was missing or not a JSON array of findings.
-    #[error("auto-review findings file {path} is unusable: {message}")]
+    /// A step's signal file (a round's findings file or a fix pass's
+    /// marker) was unreadable, or complete JSON of the wrong shape.
+    #[error("auto-review signal file {path} is unusable: {message}")]
     Findings {
-        /// The findings file.
+        /// The signal file.
         path: PathBuf,
         /// What was wrong with it.
         message: String,
@@ -141,47 +147,88 @@ impl Finding {
     }
 }
 
-/// Reads a round's findings file.
+/// Reads signal file `path` if it is ready: `Ok(None)` while it is missing
+/// or ends before its JSON does, so a half-written file reads as "not done"
+/// (GitHub issue #150).
 ///
 /// # Errors
 ///
-/// [`AutoReviewError::Findings`] if the file is missing or isn't a JSON
-/// array of [`Finding`]s.
-pub fn read_findings(path: &Path) -> Result<Vec<Finding>, AutoReviewError> {
+/// [`AutoReviewError::Findings`] for a file that cannot be read, or whose
+/// JSON is complete but not a `T`: waiting longer would never fix it.
+fn read_signal<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, AutoReviewError> {
     let unusable = |message: String| AutoReviewError::Findings {
         path: path.to_path_buf(),
         message,
     };
-    let raw = std::fs::read_to_string(path).map_err(|e| unusable(e.to_string()))?;
-    serde_json::from_str(&raw).map_err(|e| unusable(e.to_string()))
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unusable(e.to_string())),
+    };
+    match serde_json::from_str(&raw) {
+        Ok(signal) => Ok(Some(signal)),
+        Err(e) if e.is_eof() => Ok(None),
+        Err(e) => Err(unusable(e.to_string())),
+    }
 }
 
-/// Where round `round` writes its findings:
-/// `<git_dir>/vdiff/auto-review/findings-<round>.json`. Under the git dir,
-/// like the comment store, so it never shows in `git status`.
-pub fn findings_path(git_dir: &Path, round: u32) -> PathBuf {
+/// Where round `round` of loop `loop_id` writes its findings:
+/// `<git_dir>/vdiff/auto-review/findings-<loop_id>-<round>.json`. Under the
+/// git dir, like the comment store, so it never shows in `git status`.
+///
+/// `loop_id` (see [`run_loop`]) keeps each loop's signal files apart, so an
+/// agent left behind by an earlier loop, still working after its step timed
+/// out, can never write a file a later loop reads as its own step's signal.
+pub fn findings_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
         .join("auto-review")
-        .join(format!("findings-{round}.json"))
+        .join(format!("findings-{loop_id}-{round}.json"))
 }
 
-/// Reads a round's findings file if it is ready: `None` while it is
-/// missing or does not parse yet, so a half-written file reads as "not
-/// done" rather than as a failure (GitHub issue #150).
-pub fn try_read_findings(path: &Path) -> Option<Vec<Finding>> {
-    read_findings(path).ok()
+/// Reads a round's findings file if it is ready; see [`read_signal`].
+///
+/// # Errors
+///
+/// [`AutoReviewError::Findings`] if the file is complete but not a JSON
+/// array of [`Finding`]s.
+pub fn try_read_findings(path: &Path) -> Result<Option<Vec<Finding>>, AutoReviewError> {
+    read_signal(path)
 }
 
-/// Where round `round`'s fix pass writes its completion marker:
-/// `<git_dir>/vdiff/auto-review/fix-<round>.done`, next to the findings
-/// files (GitHub issue #150). It holds `{"succeeded": true}` or
-/// `{"succeeded": false}`; see [`crate::work::signal::read_done_marker`].
-pub fn fix_marker_path(git_dir: &Path, round: u32) -> PathBuf {
+/// Where round `round`'s fix pass in loop `loop_id` writes its completion
+/// marker: `<git_dir>/vdiff/auto-review/fix-<loop_id>-<round>.done`, next to
+/// the findings files and keyed the same way (GitHub issue #150). It holds
+/// `{"succeeded": true}` or `{"succeeded": false}`; see [`read_fix_marker`].
+pub fn fix_marker_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
         .join("auto-review")
-        .join(format!("fix-{round}.done"))
+        .join(format!("fix-{loop_id}-{round}.done"))
+}
+
+#[derive(Deserialize)]
+struct FixMarker {
+    succeeded: bool,
+}
+
+/// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
+/// exists and parses, `None` before then; see [`read_signal`].
+///
+/// # Errors
+///
+/// [`AutoReviewError::Findings`] if the file is complete JSON but not a
+/// marker.
+pub fn read_fix_marker(path: &Path) -> Result<Option<bool>, AutoReviewError> {
+    Ok(read_signal::<FixMarker>(path)?.map(|marker| marker.succeeded))
+}
+
+/// The temporary name an agent writes a signal file under before renaming
+/// it into place.
+fn temporary_name(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// The section tm appends to every review round's prompt, whatever the
@@ -260,15 +307,31 @@ pub fn render_prompt(
         + &review_completion_section(findings_file)
 }
 
+/// Seconds between two checks for a step's signal file.
+pub const SIGNAL_POLL_SECS: u64 = 10;
+
+/// A step's run row, as the loop sees it while waiting for the step's
+/// signal file (GitHub issue #150).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    /// Still running: keep waiting.
+    Running,
+    /// The idle sweep hibernated the agent before it signalled: the step is
+    /// stuck.
+    Hibernated,
+    /// Something other than the loop ended the row (`tm merge` finishing
+    /// the ticket's runs, the user exiting the session), or the ticket's
+    /// session no longer exists: the loop has nothing left to drive.
+    Gone,
+}
+
 /// Everything [`run_loop`] needs done outside the comment store.
 ///
 /// A review round and a fix pass are each launched, not run to completion:
 /// [`run_loop`] then polls the step's signal file (the round's findings
 /// file, the fix pass's [`fix_marker_path`] marker), checking
-/// [`crate::work::signal::StepWatch::step_state`] between polls. The
-/// [`StepWatch`] supertrait's `now_unix_secs` also stamps comments'
-/// `created_at`.
-pub trait AutoReviewOps: StepWatch<Error = AutoReviewError> {
+/// [`AutoReviewOps::step_state`] between polls.
+pub trait AutoReviewOps {
     /// Launches one review round's agent with `prompt` and returns its run
     /// row id. The agent writes its findings to the `findings_file` the
     /// prompt names.
@@ -278,8 +341,14 @@ pub trait AutoReviewOps: StepWatch<Error = AutoReviewError> {
     /// prompt, and returns its run row id. `None` when the store had nothing
     /// to fix, so there is nothing to wait for.
     fn fix(&self, round: u32, completion: String) -> Result<Option<i64>, AutoReviewError>;
-    /// Marks run `run_id` done: its step signalled success.
-    fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError>;
+    /// The state of a launched step's run row `run_id`.
+    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError>;
+    /// Records that run `run_id`'s `step` (`review` or `fix`) signalled, as
+    /// a [`SIGNAL_EVENT`]. The row keeps its status: its agent is still
+    /// open in its window.
+    fn mark_signalled(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError>;
+    /// Waits `secs` seconds between two signal polls.
+    fn sleep(&self, secs: u64);
     /// Posts the store with `vdiff --publish-comments <pr>`.
     fn publish(&self) -> Result<(), AutoReviewError>;
     /// Records an event on run `run_id`.
@@ -290,10 +359,56 @@ pub trait AutoReviewOps: StepWatch<Error = AutoReviewError> {
     /// Whether the ticket has used up `[dispatch] max_fix_rounds`, the fix
     /// cap shared by every automatic trigger (GitHub issue #120).
     fn fix_cap_reached(&self) -> Result<bool, AutoReviewError>;
+    /// Seconds since the Unix epoch, for comments' `created_at` and the
+    /// signal timeout.
+    fn now_unix_secs(&self) -> i64;
     /// Imports the PR's not-yet-imported, unresolved review-bot threads into
     /// the comment store, so the fix about to run addresses them too
     /// (GitHub issue #145). Returns how many were imported.
     fn import_bot_comments(&self) -> Result<usize, AutoReviewError>;
+}
+
+/// How waiting on one step's signal ended.
+enum Signal<T> {
+    /// The signal file was read.
+    Received(T),
+    /// No signal before the timeout, or the agent was hibernated first.
+    Stuck,
+    /// See [`StepState::Gone`].
+    Gone,
+}
+
+/// Polls `read` every [`SIGNAL_POLL_SECS`] until it yields the step's
+/// signal, the step's row stops running, or `timeout_secs` pass. The signal
+/// is read first on every poll, so a step that signalled before being
+/// hibernated or ended still counts as done. A signal file that can never
+/// parse flags the step and returns `read`'s error.
+fn wait_for_signal<T>(
+    ops: &dyn AutoReviewOps,
+    run_id: i64,
+    timeout_secs: i64,
+    read: impl Fn() -> Result<Option<T>, AutoReviewError>,
+) -> Result<Signal<T>, AutoReviewError> {
+    let start = ops.now_unix_secs();
+    loop {
+        match read() {
+            Ok(Some(signal)) => return Ok(Signal::Received(signal)),
+            Ok(None) => {}
+            Err(err) => {
+                ops.flag(run_id)?;
+                return Err(err);
+            }
+        }
+        match ops.step_state(run_id)? {
+            StepState::Running => {}
+            StepState::Hibernated => return Ok(Signal::Stuck),
+            StepState::Gone => return Ok(Signal::Gone),
+        }
+        if ops.now_unix_secs() - start >= timeout_secs {
+            return Ok(Signal::Stuck);
+        }
+        ops.sleep(SIGNAL_POLL_SECS);
+    }
 }
 
 /// How one round ended, recorded as the tail of its [`ROUND_EVENT`]
@@ -342,13 +457,18 @@ pub struct LoopOutcome {
 
 /// Runs review rounds until one is clean, the fix round fails, or
 /// `cfg.max_review_rounds` is reached. See the plan doc for the round
-/// sequence; `git_dir` is the worktree's resolved git directory.
+/// sequence; `git_dir` is the worktree's resolved git directory, and
+/// `loop_id` names this loop's signal files ([`findings_path`]), unique
+/// per loop.
 ///
 /// Each round and each fix pass is launched and then waited on through its
-/// signal file, for at most `cfg.round_timeout_mins` each. A step that
-/// signals is marked done; one that times out or is hibernated first is
-/// flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose row is
-/// ended by something else ends it as [`RoundVerdict::Stopped`].
+/// signal file, for at most `cfg.round_timeout_mins` each (`0`: no limit).
+/// A step that
+/// signals gets a [`SIGNAL_EVENT`]; one that times out or is hibernated
+/// first is flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose
+/// row is ended by something else ends it as [`RoundVerdict::Stopped`]. The
+/// loop never ends a row itself: each one stays in flight until its agent
+/// exits, and a flag on it applies then ([`crate::runs::RunStore::flag_for_review`]).
 ///
 /// # Errors
 ///
@@ -359,20 +479,22 @@ pub fn run_loop(
     template: &str,
     key: &str,
     git_dir: &Path,
+    loop_id: &str,
 ) -> Result<LoopOutcome, AutoReviewError> {
     let max = cfg.max_review_rounds.max(1);
-    let timeout_secs = i64::try_from(cfg.round_timeout_mins.saturating_mul(60)).unwrap_or(i64::MAX);
+    // `0` turns the timeout off, as `idle_hibernate_mins = 0` turns off the
+    // idle sweep.
+    let timeout_secs = match cfg.round_timeout_mins {
+        0 => i64::MAX,
+        mins => i64::try_from(mins.saturating_mul(60)).unwrap_or(i64::MAX),
+    };
     let mut archive: Option<PathBuf> = None;
     for round in 1..=max {
-        let findings_file = findings_path(git_dir, round);
-        let marker = fix_marker_path(git_dir, round);
+        let findings_file = findings_path(git_dir, loop_id, round);
+        let marker = fix_marker_path(git_dir, loop_id, round);
         if let Some(dir) = findings_file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| AutoReviewError::step("review", e))?;
         }
-        // A stale file from an earlier loop must never stand in for this
-        // round's output.
-        let _ = std::fs::remove_file(&findings_file);
-        let _ = std::fs::remove_file(&marker);
 
         let prompt = render_prompt(template, key, round, &findings_file, archive.as_deref());
         let run_id = ops.review(round, prompt)?;
@@ -387,7 +509,7 @@ pub fn run_loop(
             try_read_findings(&findings_file)
         })? {
             Signal::Received(findings) => {
-                ops.finish_step(run_id)?;
+                ops.mark_signalled(run_id, "review")?;
                 findings
             }
             Signal::Stuck => {
@@ -425,14 +547,13 @@ pub fn run_loop(
         let fixed = match ops.fix(round, fix_completion_section(&marker))? {
             None => true,
             Some(fix_run) => {
-                match wait_for_signal(ops, fix_run, timeout_secs, || read_done_marker(&marker))? {
-                    Signal::Received(true) => {
-                        ops.finish_step(fix_run)?;
-                        true
-                    }
-                    Signal::Received(false) => {
-                        ops.flag(fix_run)?;
-                        false
+                match wait_for_signal(ops, fix_run, timeout_secs, || read_fix_marker(&marker))? {
+                    Signal::Received(succeeded) => {
+                        ops.mark_signalled(fix_run, "fix")?;
+                        if !succeeded {
+                            ops.flag(fix_run)?;
+                        }
+                        succeeded
                     }
                     Signal::Stuck => {
                         ops.flag(fix_run)?;
@@ -462,7 +583,6 @@ fn round_detail(round: u32, max: u32, verdict: RoundVerdict) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::signal::StepState;
     use std::cell::RefCell;
     use tempfile::TempDir;
 
@@ -493,7 +613,7 @@ mod tests {
         elapsed: std::cell::Cell<i64>,
         sleeps: std::cell::Cell<u32>,
         states: RefCell<std::collections::HashMap<i64, StepState>>,
-        finished: RefCell<Vec<i64>>,
+        signalled: RefCell<Vec<i64>>,
         completions: RefCell<Vec<String>>,
         /// Whether a fix pass writes its marker at all.
         fix_signals: bool,
@@ -519,7 +639,7 @@ mod tests {
                 elapsed: std::cell::Cell::new(0),
                 sleeps: std::cell::Cell::new(0),
                 states: RefCell::new(std::collections::HashMap::new()),
-                finished: RefCell::new(Vec::new()),
+                signalled: RefCell::new(Vec::new()),
                 completions: RefCell::new(Vec::new()),
                 fix_signals: true,
                 nothing_to_fix: false,
@@ -542,42 +662,15 @@ mod tests {
         }
     }
 
-    impl StepWatch for FakeOps {
-        type Error = AutoReviewError;
-
-        fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
-            Ok(self
-                .states
-                .borrow()
-                .get(&run_id)
-                .copied()
-                .unwrap_or(StepState::Running))
-        }
-
-        fn sleep(&self, secs: u64) {
-            self.elapsed.set(self.elapsed.get() + secs as i64);
-            self.sleeps.set(self.sleeps.get() + 1);
-            let mut pending = self.pending.borrow_mut();
-            for (left, path, body) in pending.iter_mut() {
-                *left -= 1;
-                if *left == 0 {
-                    std::fs::write(path, &*body).unwrap();
-                }
-            }
-            pending.retain(|(left, _, _)| *left > 0);
-        }
-
-        fn now_unix_secs(&self) -> i64 {
-            1_787_054_400 + self.elapsed.get()
-        }
-    }
-
     impl AutoReviewOps for FakeOps {
         fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
             self.log.borrow_mut().push(format!("review {round}"));
             self.prompts.borrow_mut().push(prompt);
             let body = self.findings[(round - 1) as usize];
-            self.signal(findings_path(&self.git_dir, round), body.to_string());
+            self.signal(
+                findings_path(&self.git_dir, LOOP_ID, round),
+                body.to_string(),
+            );
             Ok(100 + i64::from(round))
         }
 
@@ -598,16 +691,38 @@ mod tests {
             }
             if self.fix_signals {
                 self.signal(
-                    fix_marker_path(&self.git_dir, round),
+                    fix_marker_path(&self.git_dir, LOOP_ID, round),
                     format!(r#"{{"succeeded": {succeeded}}}"#),
                 );
             }
             Ok(Some(200 + i64::from(round)))
         }
 
-        fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
-            self.finished.borrow_mut().push(run_id);
+        fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
+            Ok(self
+                .states
+                .borrow()
+                .get(&run_id)
+                .copied()
+                .unwrap_or(StepState::Running))
+        }
+
+        fn mark_signalled(&self, run_id: i64, _step: &'static str) -> Result<(), AutoReviewError> {
+            self.signalled.borrow_mut().push(run_id);
             Ok(())
+        }
+
+        fn sleep(&self, secs: u64) {
+            self.elapsed.set(self.elapsed.get() + secs as i64);
+            self.sleeps.set(self.sleeps.get() + 1);
+            let mut pending = self.pending.borrow_mut();
+            for (left, path, body) in pending.iter_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    std::fs::write(path, &*body).unwrap();
+                }
+            }
+            pending.retain(|(left, _, _)| *left > 0);
         }
 
         fn publish(&self) -> Result<(), AutoReviewError> {
@@ -639,7 +754,13 @@ mod tests {
             }
             Ok(comments.len())
         }
+
+        fn now_unix_secs(&self) -> i64 {
+            1_787_054_400 + self.elapsed.get()
+        }
     }
+
+    const LOOP_ID: &str = "42-1787054400";
 
     const MEDIUM: &str = r#"[{"path": "src/a.rs", "start_line": 4, "end_line": 6,
         "severity": "MEDIUM", "specialist": "state-flow", "body": "race"}]"#;
@@ -677,12 +798,42 @@ mod tests {
     }
 
     #[test]
-    fn read_findings_rejects_a_missing_file() {
+    fn try_read_findings_rejects_complete_json_of_the_wrong_shape() {
         let tmp = TempDir::new().unwrap();
-        assert!(matches!(
-            read_findings(&tmp.path().join("nope.json")),
-            Err(AutoReviewError::Findings { .. })
-        ));
+        let path = tmp.path().join("findings-1.json");
+        for invalid in [
+            r#"[{"path": "src/a.rs", "start_line": 1, "severity": "LOW"}]"#,
+            r#"[{"path": "a", "start_line": "1", "severity": "LOW", "body": "b"}]"#,
+            r#"{"findings": []}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(
+                matches!(
+                    try_read_findings(&path),
+                    Err(AutoReviewError::Findings { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        std::fs::write(&path, r#"{"succeeded": "yes"}"#).unwrap();
+        assert!(read_fix_marker(&path).is_err());
+    }
+
+    #[test]
+    fn a_findings_file_that_can_never_parse_flags_the_round_and_fails() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec![r#"[{"path": "a"}]"#]);
+
+        let err = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap_err();
+
+        assert!(matches!(err, AutoReviewError::Findings { .. }), "{err}");
+        assert!(err.to_string().contains("missing field"), "{err}");
+        assert_eq!(ops.log(), vec!["review 1", "flag 101"]);
+        assert_eq!(
+            ops.sleeps.get(),
+            0,
+            "no waiting for a file that cannot parse"
+        );
     }
 
     #[test]
@@ -698,13 +849,13 @@ mod tests {
 
     #[test]
     fn the_fix_completion_section_names_the_marker_and_its_temporary_name() {
-        let marker = fix_marker_path(Path::new("/g"), 2);
-        assert_eq!(marker, Path::new("/g/vdiff/auto-review/fix-2.done"));
+        let marker = fix_marker_path(Path::new("/g"), "7-9", 2);
+        assert_eq!(marker, Path::new("/g/vdiff/auto-review/fix-7-9-2.done"));
 
         let section = fix_completion_section(&marker);
 
-        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done.tmp`"));
-        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done`"));
+        assert!(section.contains("`/g/vdiff/auto-review/fix-7-9-2.done.tmp`"));
+        assert!(section.contains("`/g/vdiff/auto-review/fix-7-9-2.done`"));
         assert!(section.contains(r#"{"succeeded": true}"#));
         assert!(section.contains(r#"{"succeeded": false}"#));
     }
@@ -713,13 +864,29 @@ mod tests {
     fn try_read_findings_is_none_until_the_file_parses() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("findings-1.json");
-        assert_eq!(try_read_findings(&path), None);
+        assert_eq!(try_read_findings(&path).unwrap(), None);
 
         std::fs::write(&path, "[{\"path\": \"src/a.rs\"").unwrap();
-        assert_eq!(try_read_findings(&path), None, "half-written");
+        assert_eq!(try_read_findings(&path).unwrap(), None, "half-written");
 
         std::fs::write(&path, "[]").unwrap();
-        assert_eq!(try_read_findings(&path), Some(Vec::new()));
+        assert_eq!(try_read_findings(&path).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_fix_marker_reads_succeeded_and_is_none_until_it_parses() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fix-1.done");
+        assert_eq!(read_fix_marker(&path).unwrap(), None);
+
+        std::fs::write(&path, "{\"succ").unwrap();
+        assert_eq!(read_fix_marker(&path).unwrap(), None);
+
+        std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
+        assert_eq!(read_fix_marker(&path).unwrap(), Some(false));
+
+        std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
+        assert_eq!(read_fix_marker(&path).unwrap(), Some(true));
     }
 
     #[test]
@@ -728,6 +895,12 @@ mod tests {
         assert!(first.contains("`thatch-code-review`"));
         assert!(first.contains("/g/f-1.json"));
         assert!(first.contains("GH-1"));
+        assert!(!first.contains("unattended"));
+        assert_eq!(
+            first.matches("/g/f-1.json`").count(),
+            1,
+            "only the completion section names the file: {first}"
+        );
         assert!(!first.contains("prior round"));
         for placeholder in [
             "{{",
@@ -759,7 +932,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![LOW]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -783,7 +956,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -835,7 +1008,7 @@ mod tests {
             ..cfg()
         };
 
-        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             *ops.import_at.borrow(),
@@ -856,7 +1029,7 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec!["[]"]);
         *ops.bot_comments.borrow_mut() = vec![bot_comment("off by one")];
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert!(ops.import_at.borrow().is_empty());
@@ -868,7 +1041,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM]);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -894,7 +1067,7 @@ mod tests {
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, MEDIUM]);
         ops.fix_cap_reached = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -930,7 +1103,7 @@ mod tests {
         .unwrap();
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
 
-        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(*ops.store_at_fix.borrow(), vec![2]);
     }
@@ -941,7 +1114,7 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.fix_results.borrow_mut().push(false);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::FixFailed);
         assert_eq!(
@@ -969,7 +1142,7 @@ mod tests {
             ..cfg()
         };
 
-        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(ops.log()[..2], ["review 1", "publish"]);
         assert_eq!(
@@ -988,19 +1161,19 @@ mod tests {
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert!(!ops.log().contains(&"fix".to_string()));
     }
 
     #[test]
-    fn steps_that_signal_after_a_delay_let_the_loop_advance_and_end_their_rows() {
+    fn steps_that_signal_after_a_delay_let_the_loop_advance_and_mark_their_rows() {
         let tmp = TempDir::new().unwrap();
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.signal_after = Some(3);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -1009,11 +1182,11 @@ mod tests {
                 verdict: RoundVerdict::Clean
             }
         );
-        assert_eq!(*ops.finished.borrow(), vec![101, 201, 102]);
+        assert_eq!(*ops.signalled.borrow(), vec![101, 201, 102]);
         assert_eq!(ops.sleeps.get(), 9, "three polls' sleeps per step");
         assert!(
             ops.completions.borrow()[0]
-                .contains(&*fix_marker_path(tmp.path(), 1).to_string_lossy())
+                .contains(&*fix_marker_path(tmp.path(), LOOP_ID, 1).to_string_lossy())
         );
     }
 
@@ -1024,7 +1197,7 @@ mod tests {
         ops.signal_after = Some(2);
         ops.half_written = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
         assert_eq!(comment_store::load(tmp.path()).unwrap().len(), 1);
@@ -1041,7 +1214,7 @@ mod tests {
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(
             outcome,
@@ -1059,7 +1232,24 @@ mod tests {
             ]
         );
         assert_eq!(ops.elapsed.get(), 60);
-        assert!(ops.finished.borrow().is_empty());
+        assert!(ops.signalled.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_zero_round_timeout_waits_without_a_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![LOW]);
+        // Well past what a one-minute timeout would allow.
+        ops.signal_after = Some(500);
+        let cfg = AutoReviewConfig {
+            round_timeout_mins: 0,
+            ..cfg()
+        };
+
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert_eq!(ops.sleeps.get(), 500);
     }
 
     #[test]
@@ -1069,7 +1259,7 @@ mod tests {
         ops.signal_after = Some(5);
         ops.states.borrow_mut().insert(101, StepState::Hibernated);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stuck);
         assert_eq!(ops.log()[1], "flag 101");
@@ -1082,10 +1272,10 @@ mod tests {
         let ops = FakeOps::new(tmp.path(), vec![LOW]);
         ops.states.borrow_mut().insert(101, StepState::Hibernated);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
-        assert_eq!(*ops.finished.borrow(), vec![101]);
+        assert_eq!(*ops.signalled.borrow(), vec![101]);
     }
 
     #[test]
@@ -1095,7 +1285,7 @@ mod tests {
         ops.signal_after = None;
         ops.states.borrow_mut().insert(101, StepState::Gone);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stopped);
         assert_eq!(
@@ -1109,15 +1299,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.fix_signals = false;
-        // A stale marker from an earlier loop must not count as this pass's.
-        std::fs::create_dir_all(fix_marker_path(tmp.path(), 1).parent().unwrap()).unwrap();
-        std::fs::write(fix_marker_path(tmp.path(), 1), r#"{"succeeded": true}"#).unwrap();
+        // A marker an earlier loop's agent writes must not count as this
+        // pass's.
+        let earlier = fix_marker_path(tmp.path(), "1-1", 1);
+        std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        std::fs::write(earlier, r#"{"succeeded": true}"#).unwrap();
         let cfg = AutoReviewConfig {
             round_timeout_mins: 1,
             ..cfg()
         };
 
-        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stuck);
         assert_eq!(
@@ -1129,7 +1321,7 @@ mod tests {
                 "record 101 auto_review_round 1/2 stuck"
             ]
         );
-        assert_eq!(*ops.finished.borrow(), vec![101]);
+        assert_eq!(*ops.signalled.borrow(), vec![101]);
     }
 
     #[test]
@@ -1139,7 +1331,7 @@ mod tests {
         ops.fix_signals = false;
         ops.states.borrow_mut().insert(201, StepState::Gone);
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Stopped);
         assert!(!ops.log().iter().any(|line| line.starts_with("flag")));
@@ -1151,9 +1343,9 @@ mod tests {
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.nothing_to_fix = true;
 
-        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
-        assert_eq!(*ops.finished.borrow(), vec![101, 102]);
+        assert_eq!(*ops.signalled.borrow(), vec![101, 102]);
     }
 }

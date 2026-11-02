@@ -63,13 +63,36 @@
 //! - **two or more** → [`StackDecision::BlockedMultiple`]: a single run
 //!   branch can only be stacked on one dependency at a time, so this refuses
 //!   rather than guessing which one.
+//!
+//! # Inherited blockers (GitHub issue #178)
+//!
+//! A ticket also inherits its parent epic's direct blockers: when an
+//! unlocks link says epic A must finish before epic B, every child of B
+//! waits on A too, even with no links of its own. [`ParentEpics`] fetches
+//! each distinct parent epic once per readiness pass, [`ParentEpics::lock`]
+//! judges the epic's blockers by the same satisfaction rule as above, and
+//! [`decide_with_epic`] turns a locked epic into
+//! [`StackDecision::BlockedByEpic`] before looking at direct blockers.
+//!
+//! - An inherited blocker always means blocked, never stackable: a lane
+//!   cannot stack a branch on top of a whole epic.
+//! - Only one level: a ticket inherits its parent's direct blockers, not the
+//!   epic's whole upstream chain, the same "nearest step" rule as direct
+//!   blockers.
+//! - An epic counts as finished by its own status only, never by its
+//!   children's progress. This agrees with the epic graph's `Locked`
+//!   (`crate::graph::state::Availability`): an epic with an unfinished
+//!   unlocker is locked in both places.
+//! - `[ready] inherit_epic_blockers = false` turns it off
+//!   ([`ParentEpics::disabled`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::github::gh_cli::{PrLifecycle, PrSummary};
 use crate::runs::{RunStatus, RunSummary};
+use crate::ticketing::provider::TicketProvider;
 use crate::ticketing::types::{Issue, LinkedIssue};
 use crate::work::git::GitOps;
 
@@ -292,6 +315,10 @@ pub enum StackDecision {
         /// found them.
         blockers: Vec<UnmergedBlocker>,
     },
+    /// The ticket's parent epic still has unsatisfied blockers of its own
+    /// (see [`decide_with_epic`]). Never stackable, whatever PRs those
+    /// blockers have.
+    BlockedByEpic(EpicLock),
 }
 
 /// Classify a ticket's unmerged direct blockers per this module's decision
@@ -317,6 +344,175 @@ pub fn decide(unmerged: Vec<UnmergedBlocker>, in_flight: &InFlight) -> StackDeci
             }
         }
         _ => StackDecision::BlockedMultiple { blockers: unmerged },
+    }
+}
+
+/// Like [`decide`], but a locked parent epic wins: `Some(lock)` is always
+/// [`StackDecision::BlockedByEpic`], whatever the ticket's own blockers say.
+/// `epic_lock` is normally [`ParentEpics::lock`]'s answer.
+pub fn decide_with_epic(
+    unmerged: Vec<UnmergedBlocker>,
+    epic_lock: Option<EpicLock>,
+    in_flight: &InFlight,
+) -> StackDecision {
+    match epic_lock {
+        Some(lock) => StackDecision::BlockedByEpic(lock),
+        None => decide(unmerged, in_flight),
+    }
+}
+
+/// A parent epic that still waits on unsatisfied blockers of its own: what
+/// its children inherit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpicLock {
+    /// The parent epic's key.
+    pub epic_key: String,
+    /// The epic's unsatisfied direct blockers, never empty, in
+    /// [`unmerged_direct_blockers`] order.
+    pub blockers: Vec<UnmergedBlocker>,
+}
+
+impl EpicLock {
+    /// Every inherited blocker as `GH-12 (via epic GH-30)`, comma-separated.
+    pub fn describe(&self) -> String {
+        self.blockers
+            .iter()
+            .map(|b| format!("{} (via epic {})", b.key, self.epic_key))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The inherited blockers' keys.
+    pub fn blocker_keys(&self) -> Vec<String> {
+        self.blockers.iter().map(|b| b.key.clone()).collect()
+    }
+}
+
+/// Why a ticket's parent epic couldn't be judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpicLookupError {
+    /// The parent epic's key.
+    pub epic_key: String,
+    /// The provider's error, as text.
+    pub message: String,
+}
+
+impl std::error::Error for EpicLookupError {}
+
+impl std::fmt::Display for EpicLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not load parent epic {} ({})",
+            self.epic_key, self.message
+        )
+    }
+}
+
+/// The epic fetcher [`ParentEpics::new`] takes: one ticket by key.
+type FetchEpic<'a> = Box<dyn Fn(&str) -> Result<Issue, String> + 'a>;
+
+/// Each ticket's parent epic, fetched at most once per key for one
+/// readiness pass (one `tm ready`, one board refresh, one lane run), so
+/// several children under one epic cost one lookup.
+pub struct ParentEpics<'a> {
+    /// `None` when inheritance is off.
+    fetch: Option<FetchEpic<'a>>,
+    cache: RefCell<HashMap<String, Result<Issue, String>>>,
+}
+
+impl<'a> ParentEpics<'a> {
+    /// Fetch parent epics with `fetch` (normally
+    /// [`Self::from_provider`]'s `get_issue`).
+    pub fn new(fetch: impl Fn(&str) -> Result<Issue, String> + 'a) -> Self {
+        Self {
+            fetch: Some(Box::new(fetch)),
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Fetch parent epics with `provider`'s
+    /// [`TicketProvider::get_issue`], or never when `enabled` is false
+    /// (`[ready] inherit_epic_blockers = false`).
+    pub fn from_provider(provider: &'a dyn TicketProvider, enabled: bool) -> Self {
+        if enabled {
+            Self::new(move |key| provider.get_issue(key).map_err(|err| err.to_string()))
+        } else {
+            Self::disabled()
+        }
+    }
+
+    /// Inheritance off: no ticket is ever locked by its epic, which is
+    /// readiness as it was before GitHub issue #178.
+    pub fn disabled() -> Self {
+        Self {
+            fetch: None,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Whether inheritance is on at all.
+    pub fn enabled(&self) -> bool {
+        self.fetch.is_some()
+    }
+
+    /// Run `f` on `issue`'s parent epic, fetching it on first use. `None`
+    /// when inheritance is off or `issue` has no parent.
+    fn with_epic<T>(
+        &self,
+        issue: &Issue,
+        f: impl FnOnce(&Issue) -> T,
+    ) -> Option<Result<T, EpicLookupError>> {
+        let fetch = self.fetch.as_ref()?;
+        let epic_key = &issue.fields.parent.as_ref()?.key;
+        let mut cache = self.cache.borrow_mut();
+        let epic = cache
+            .entry(epic_key.clone())
+            .or_insert_with(|| fetch(epic_key));
+        Some(match epic {
+            Ok(epic) => Ok(f(epic)),
+            Err(message) => Err(EpicLookupError {
+                epic_key: epic_key.clone(),
+                message: message.clone(),
+            }),
+        })
+    }
+
+    /// Whether judging `issue` needs a PR list: it has a direct blocker, or
+    /// its parent epic does. A failed epic lookup needs none, since
+    /// [`Self::lock`] reports the failure without looking at PRs.
+    pub fn needs_prs(&self, issue: &Issue) -> bool {
+        !direct_blockers(issue).is_empty()
+            || matches!(
+                self.with_epic(issue, |epic| !direct_blockers(epic).is_empty()),
+                Some(Ok(true))
+            )
+    }
+
+    /// `issue`'s parent epic's unsatisfied blockers, judged against `prs`
+    /// and `in_base` exactly like [`unmerged_direct_blockers`]. `Ok(None)`
+    /// when inheritance is off, `issue` has no parent, or every one of the
+    /// epic's blockers is satisfied.
+    ///
+    /// With `prs` `None` (the PR lookup failed), only the blockers' tracker
+    /// status counts: a blocker done in the tracker clears, any other stays.
+    /// That can only over-block, never let a locked child through.
+    pub fn lock(
+        &self,
+        issue: &Issue,
+        prs: Option<&[PrSummary]>,
+        in_base: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<EpicLock>, EpicLookupError> {
+        let Some(result) = self.with_epic(issue, |epic| {
+            let blockers = unmerged_direct_blockers(epic, prs.unwrap_or_default(), in_base);
+            (!blockers.is_empty()).then(|| EpicLock {
+                epic_key: epic.key.clone(),
+                blockers,
+            })
+        }) else {
+            return Ok(None);
+        };
+        result
     }
 }
 
@@ -376,27 +572,38 @@ pub struct UnblockCounts {
 /// visited); a member counts the rest of its cycle but never itself, and is
 /// listed in [`UnblockCounts::cycle_members`].
 pub fn unblock_counts(issues: &[Issue]) -> UnblockCounts {
-    let keys: HashSet<&str> = issues.iter().map(|i| i.key.as_str()).collect();
-    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
-    for issue in issues {
-        for blocker in direct_blockers(issue) {
-            if keys.contains(blocker.key.as_str()) {
-                blocks
-                    .entry(blocker.key.as_str())
-                    .or_default()
-                    .push(issue.key.as_str());
-            }
+    let keys: Vec<&str> = issues.iter().map(|i| i.key.as_str()).collect();
+    let links = issues.iter().flat_map(|issue| {
+        direct_blockers(issue)
+            .into_iter()
+            .map(move |blocker| (blocker.key.as_str(), issue.key.as_str()))
+    });
+    unblock_counts_by_key(&keys, links)
+}
+
+/// [`unblock_counts`] over bare keys: `blocks` holds `(blocker, blocked)`
+/// pairs, and only pairs whose ends are both in `keys` count. The epic
+/// graph's downstream counts (`crate::graph::state`) use this, so they
+/// follow the same rule as `tm ready`.
+pub fn unblock_counts_by_key<'a>(
+    keys: &[&'a str],
+    blocks: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> UnblockCounts {
+    let members: HashSet<&str> = keys.iter().copied().collect();
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (blocker, blocked) in blocks {
+        if members.contains(blocker) && members.contains(blocked) {
+            edges.entry(blocker).or_default().push(blocked);
         }
     }
 
     let mut result = UnblockCounts::default();
-    for issue in issues {
-        let start = issue.key.as_str();
+    for &start in keys {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = blocks.get(start).cloned().unwrap_or_default();
+        let mut stack: Vec<&str> = edges.get(start).cloned().unwrap_or_default();
         while let Some(key) = stack.pop() {
             if seen.insert(key)
-                && let Some(next) = blocks.get(key)
+                && let Some(next) = edges.get(key)
             {
                 stack.extend(next);
             }
@@ -422,11 +629,15 @@ pub enum Readiness {
         blocker_key: String,
     },
     /// [`StackDecision::BlockedNoPr`], [`StackDecision::WaitingOnInFlight`],
-    /// or [`StackDecision::BlockedMultiple`]: the board draws one glyph for
-    /// all three.
+    /// [`StackDecision::BlockedMultiple`], or
+    /// [`StackDecision::BlockedByEpic`]: the board draws one glyph for all
+    /// four.
     Blocked {
-        /// Every unmerged blocker, in [`unmerged_direct_blockers`] order.
+        /// Every unmerged blocker, in [`unmerged_direct_blockers`] order,
+        /// or the parent epic's for [`StackDecision::BlockedByEpic`].
         blocker_keys: Vec<String>,
+        /// The parent epic the blockers are inherited from, if they are.
+        via_epic: Option<String>,
     },
     /// The blocker or PR lookup failed, so [`decide`] never ran. Never
     /// treated as ready: a false "ready" launches a lane on stuck work.
@@ -434,34 +645,172 @@ pub enum Readiness {
     Unknown,
 }
 
-/// Classify `issue` via [`decide`], the same rule `tm ready <KEY>` uses.
-/// `prs` is the blockers' repo PR list, or `None` when that lookup failed.
-/// A ticket with no direct blockers is [`Readiness::Ready`] without
-/// consulting `prs` at all (matching `tm ready`, which never shells out for
-/// one); a ticket with blockers and no PR list is [`Readiness::Unknown`].
-pub fn readiness(issue: &Issue, prs: Option<&[PrSummary]>) -> Readiness {
-    if direct_blockers(issue).is_empty() {
-        return Readiness::Ready;
+impl Readiness {
+    /// A [`Readiness::Blocked`] ticket's blockers for display, inherited
+    /// ones as `GH-12 (via epic GH-30)`; `None` for any other state.
+    pub fn blocker_labels(&self) -> Option<Vec<String>> {
+        match self {
+            Readiness::Blocked {
+                blocker_keys,
+                via_epic: None,
+            } => Some(blocker_keys.clone()),
+            Readiness::Blocked {
+                blocker_keys,
+                via_epic: Some(epic),
+            } => Some(
+                blocker_keys
+                    .iter()
+                    .map(|key| format!("{key} (via epic {epic})"))
+                    .collect(),
+            ),
+            _ => None,
+        }
     }
-    let Some(prs) = prs else {
+}
+
+/// Classify `issue` via [`decide_with_epic`], the same rule `tm ready
+/// <KEY>` uses, with its parent epic from `epics`. `prs` is the blockers'
+/// repo PR list, or `None` when that lookup failed.
+///
+/// A ticket with no direct blockers is classified without consulting `prs`
+/// for itself (matching `tm ready`, which never shells out for one); a
+/// ticket with direct blockers and no PR list is [`Readiness::Unknown`],
+/// unless its epic is locked. A failed epic lookup is
+/// [`Readiness::Unknown`]. See [`ParentEpics::lock`] for how an epic is
+/// judged without a PR list.
+pub fn readiness(issue: &Issue, prs: Option<&[PrSummary]>, epics: &ParentEpics) -> Readiness {
+    // The board has no lane base to check against, so a closed PR reads as
+    // abandoned (see GitHub issue #168).
+    let epic_lock = match epics.lock(issue, prs, &|_| false) {
+        Ok(lock) => lock,
+        Err(_) => return Readiness::Unknown,
+    };
+    let unmerged = if epic_lock.is_some() || direct_blockers(issue).is_empty() {
+        Vec::new()
+    } else if let Some(prs) = prs {
+        unmerged_direct_blockers(issue, prs, &|_| false)
+    } else {
         return Readiness::Unknown;
     };
     // The board shows waiting and blocked alike, so live runs are moot here.
-    // It has no lane base to check against, so a closed PR reads as
-    // abandoned (see GitHub issue #168).
-    match decide(
-        unmerged_direct_blockers(issue, prs, &|_| false),
-        &InFlight::new(),
-    ) {
+    match decide_with_epic(unmerged, epic_lock, &InFlight::new()) {
         StackDecision::Ready => Readiness::Ready,
         StackDecision::Stackable { blocker_key, .. } => Readiness::Stackable { blocker_key },
         StackDecision::BlockedNoPr { blocker }
         | StackDecision::WaitingOnInFlight { blocker, .. } => Readiness::Blocked {
             blocker_keys: vec![blocker.key],
+            via_epic: None,
         },
         StackDecision::BlockedMultiple { blockers } => Readiness::Blocked {
             blocker_keys: blockers.into_iter().map(|b| b.key).collect(),
+            via_epic: None,
         },
+        StackDecision::BlockedByEpic(lock) => Readiness::Blocked {
+            blocker_keys: lock.blocker_keys(),
+            via_epic: Some(lock.epic_key),
+        },
+    }
+}
+
+/// One locked-epic fixture shared by every readiness caller's test (GitHub
+/// issue #178), so `tm ready`, lane runs, and the board are checked against
+/// the same shape: [`CHILD`] sits under [`EPIC`], which [`UNLOCKER`] blocks.
+/// The child has no links of its own.
+#[cfg(test)]
+pub(crate) mod epic_fixture {
+    use crate::jira::fake::FakeJiraClient;
+    use crate::ticketing::types::{
+        Issue, IssueFields, IssueLink, IssueLinkType, LinkedIssue, LinkedIssueFields, ParentRef,
+        Status, StatusCategory,
+    };
+
+    /// The child ticket.
+    pub const CHILD: &str = "PROJ-40";
+    /// Its parent epic.
+    pub const EPIC: &str = "PROJ-30";
+    /// The ticket that unlocks the epic.
+    pub const UNLOCKER: &str = "PROJ-12";
+
+    fn status(name: &str, category: &str) -> Status {
+        Status {
+            name: name.to_string(),
+            status_category: StatusCategory {
+                key: category.to_string(),
+            },
+        }
+    }
+
+    /// A bare `To Do` ticket keyed `key`.
+    pub fn ticket(key: &str) -> Issue {
+        Issue {
+            key: key.to_string(),
+            fields: IssueFields {
+                summary: format!("Summary for {key}"),
+                status: status("To Do", "new"),
+                description: None,
+                assignee: None,
+                issue_links: Vec::new(),
+                parent: None,
+                labels: Vec::new(),
+                issue_type: None,
+            },
+        }
+    }
+
+    /// An inward `Blocks` link from `key` in status category `category`.
+    pub fn blocked_by(key: &str, category: &str) -> IssueLink {
+        let name = if category == "done" {
+            "Done"
+        } else {
+            "In Progress"
+        };
+        IssueLink {
+            id: format!("link-{key}"),
+            link_type: IssueLinkType {
+                name: "Blocks".to_string(),
+                inward: "is blocked by".to_string(),
+                outward: "blocks".to_string(),
+            },
+            inward_issue: Some(LinkedIssue {
+                key: key.to_string(),
+                fields: LinkedIssueFields {
+                    summary: format!("Summary for {key}"),
+                    status: status(name, category),
+                },
+            }),
+            outward_issue: None,
+        }
+    }
+
+    /// [`CHILD`], under [`EPIC`], with no links of its own.
+    pub fn child() -> Issue {
+        child_keyed(CHILD)
+    }
+
+    /// A child of [`EPIC`] keyed `key`.
+    pub fn child_keyed(key: &str) -> Issue {
+        let mut child = ticket(key);
+        child.fields.parent = Some(ParentRef {
+            key: EPIC.to_string(),
+            summary: format!("Summary for {EPIC}"),
+        });
+        child
+    }
+
+    /// [`EPIC`], blocked by [`UNLOCKER`] in status category
+    /// `unlocker_category` (`done` once the unlocking work is finished).
+    pub fn epic(unlocker_category: &str) -> Issue {
+        let mut epic = ticket(EPIC);
+        epic.fields.issue_links = vec![blocked_by(UNLOCKER, unlocker_category)];
+        epic
+    }
+
+    /// A fake provider holding [`child`] and [`epic`].
+    pub fn provider(unlocker_category: &str) -> FakeJiraClient {
+        FakeJiraClient::new()
+            .with_issue(CHILD, child())
+            .with_issue(EPIC, epic(unlocker_category))
+            .with_parent(CHILD, EPIC)
     }
 }
 
@@ -820,13 +1169,19 @@ mod tests {
     #[test]
     fn readiness_with_no_blockers_is_ready_even_without_a_pr_list() {
         let issue = issue_blocked_by(vec![]);
-        assert_eq!(readiness(&issue, None), Readiness::Ready);
+        assert_eq!(
+            readiness(&issue, None, &ParentEpics::disabled()),
+            Readiness::Ready
+        );
     }
 
     #[test]
     fn readiness_with_a_blocker_but_no_pr_list_is_unknown_never_ready() {
         let issue = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
-        assert_eq!(readiness(&issue, None), Readiness::Unknown);
+        assert_eq!(
+            readiness(&issue, None, &ParentEpics::disabled()),
+            Readiness::Unknown
+        );
     }
 
     #[test]
@@ -834,7 +1189,7 @@ mod tests {
         let stackable = issue_blocked_by(vec![linked_issue("AX-408", "Code Review")]);
         let prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Open)];
         assert_eq!(
-            readiness(&stackable, Some(&prs)),
+            readiness(&stackable, Some(&prs), &ParentEpics::disabled()),
             Readiness::Stackable {
                 blocker_key: "AX-408".to_string()
             }
@@ -842,9 +1197,10 @@ mod tests {
 
         let blocked_no_pr = issue_blocked_by(vec![linked_issue("AX-408", "In Progress")]);
         assert_eq!(
-            readiness(&blocked_no_pr, Some(&[])),
+            readiness(&blocked_no_pr, Some(&[]), &ParentEpics::disabled()),
             Readiness::Blocked {
-                blocker_keys: vec!["AX-408".to_string()]
+                blocker_keys: vec!["AX-408".to_string()],
+                via_epic: None,
             }
         );
 
@@ -853,15 +1209,19 @@ mod tests {
             linked_issue("AX-409", "In Progress"),
         ]);
         assert_eq!(
-            readiness(&blocked_multiple, Some(&prs)),
+            readiness(&blocked_multiple, Some(&prs), &ParentEpics::disabled()),
             Readiness::Blocked {
-                blocker_keys: vec!["AX-408".to_string(), "AX-409".to_string()]
+                blocker_keys: vec!["AX-408".to_string(), "AX-409".to_string()],
+                via_epic: None,
             }
         );
 
         let merged = issue_blocked_by(vec![linked_issue("AX-408", "Done")]);
         let merged_prs = vec![pr(490, "jowi-dev/ax-408-thing", PrLifecycle::Merged)];
-        assert_eq!(readiness(&merged, Some(&merged_prs)), Readiness::Ready);
+        assert_eq!(
+            readiness(&merged, Some(&merged_prs), &ParentEpics::disabled()),
+            Readiness::Ready
+        );
     }
 
     fn no_runs() -> InFlight {
@@ -1019,6 +1379,211 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             ["A", "B", "C"]
+        );
+    }
+
+    // --- Inherited blockers (GitHub issue #178) ---
+
+    use super::epic_fixture::{self, EPIC, UNLOCKER};
+
+    /// [`ParentEpics`] over a fixed epic, counting fetches.
+    fn epics_of<'a>(epic: Issue, calls: &'a Cell<usize>) -> ParentEpics<'a> {
+        ParentEpics::new(move |key| {
+            calls.set(calls.get() + 1);
+            assert_eq!(key, epic.key);
+            Ok(epic.clone())
+        })
+    }
+
+    #[test]
+    fn a_child_of_a_locked_epic_is_blocked_by_the_epic() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        let child = epic_fixture::child();
+        let lock = epics
+            .lock(&child, Some(&[]), &never_landed)
+            .unwrap()
+            .expect("the epic is locked");
+        assert_eq!(lock.epic_key, EPIC);
+        assert_eq!(lock.blocker_keys(), [UNLOCKER]);
+        assert_eq!(lock.describe(), format!("{UNLOCKER} (via epic {EPIC})"));
+        assert_eq!(
+            decide_with_epic(Vec::new(), Some(lock.clone()), &no_runs()),
+            StackDecision::BlockedByEpic(lock)
+        );
+    }
+
+    #[test]
+    fn finishing_the_unlocking_ticket_clears_the_child() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("done"), &calls);
+        let child = epic_fixture::child();
+        assert_eq!(epics.lock(&child, Some(&[]), &never_landed), Ok(None));
+        assert_eq!(
+            decide_with_epic(Vec::new(), None, &no_runs()),
+            StackDecision::Ready
+        );
+    }
+
+    #[test]
+    fn a_merged_pr_satisfies_an_inherited_blocker_like_a_direct_one() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        let prs = vec![pr(5, "jowi-dev/proj-12-thing", PrLifecycle::Merged)];
+        assert_eq!(
+            epics.lock(&epic_fixture::child(), Some(&prs), &never_landed),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn an_inherited_blocker_with_an_open_pr_is_blocked_never_stackable() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        let prs = vec![pr(5, "jowi-dev/proj-12-thing", PrLifecycle::Open)];
+        let lock = epics
+            .lock(&epic_fixture::child(), Some(&prs), &never_landed)
+            .unwrap();
+        assert!(matches!(
+            decide_with_epic(Vec::new(), lock, &no_runs()),
+            StackDecision::BlockedByEpic(_)
+        ));
+    }
+
+    #[test]
+    fn a_locked_epic_wins_over_a_stackable_direct_blocker() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        let mut child = epic_fixture::child();
+        child.fields.issue_links = vec![epic_fixture::blocked_by("PROJ-50", "indeterminate")];
+        let prs = vec![pr(6, "jowi-dev/proj-50-thing", PrLifecycle::Open)];
+        let lock = epics.lock(&child, Some(&prs), &never_landed).unwrap();
+        let unmerged = unmerged_direct_blockers(&child, &prs, &never_landed);
+        assert!(matches!(
+            decide_with_epic(unmerged, lock, &no_runs()),
+            StackDecision::BlockedByEpic(_)
+        ));
+    }
+
+    #[test]
+    fn several_children_of_one_epic_fetch_it_once() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        for key in ["PROJ-41", "PROJ-42", "PROJ-43"] {
+            let child = epic_fixture::child_keyed(key);
+            assert!(epics.needs_prs(&child));
+            assert!(
+                epics
+                    .lock(&child, Some(&[]), &never_landed)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_ticket_without_a_parent_never_fetches() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        let orphan = epic_fixture::ticket("PROJ-99");
+        assert!(!epics.needs_prs(&orphan));
+        assert_eq!(epics.lock(&orphan, None, &never_landed), Ok(None));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn disabled_inheritance_never_locks_or_fetches() {
+        let epics = ParentEpics::disabled();
+        let child = epic_fixture::child();
+        assert!(!epics.needs_prs(&child));
+        assert_eq!(epics.lock(&child, Some(&[]), &never_landed), Ok(None));
+    }
+
+    #[test]
+    fn a_failed_epic_lookup_is_an_error_naming_the_epic() {
+        let epics = ParentEpics::new(|_| Err("boom".to_string()));
+        let err = epics
+            .lock(&epic_fixture::child(), Some(&[]), &never_landed)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("could not load parent epic {EPIC} (boom)")
+        );
+    }
+
+    /// Without a PR list, an epic is judged by its blockers' tracker status.
+    #[test]
+    fn without_prs_an_epic_is_judged_by_status_alone() {
+        let calls = Cell::new(0);
+        let locked = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        assert!(
+            locked
+                .lock(&epic_fixture::child(), None, &never_landed)
+                .unwrap()
+                .is_some()
+        );
+        let clear = epics_of(epic_fixture::epic("done"), &calls);
+        assert_eq!(
+            clear.lock(&epic_fixture::child(), None, &never_landed),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn from_provider_reads_the_epic_through_get_issue() {
+        let jira = epic_fixture::provider("indeterminate");
+        let epics = ParentEpics::from_provider(&jira, true);
+        assert!(
+            epics
+                .lock(&epic_fixture::child(), Some(&[]), &never_landed)
+                .unwrap()
+                .is_some()
+        );
+        let off = ParentEpics::from_provider(&jira, false);
+        assert_eq!(
+            off.lock(&epic_fixture::child(), Some(&[]), &never_landed),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn readiness_marks_a_child_of_a_locked_epic_blocked_via_the_epic() {
+        let calls = Cell::new(0);
+        let epics = epics_of(epic_fixture::epic("indeterminate"), &calls);
+        assert_eq!(
+            readiness(&epic_fixture::child(), None, &epics),
+            Readiness::Blocked {
+                blocker_keys: vec![UNLOCKER.to_string()],
+                via_epic: Some(EPIC.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn blocker_labels_name_the_epic_an_inherited_blocker_comes_through() {
+        let inherited = Readiness::Blocked {
+            blocker_keys: vec![UNLOCKER.to_string()],
+            via_epic: Some(EPIC.to_string()),
+        };
+        assert_eq!(
+            inherited.blocker_labels(),
+            Some(vec![format!("{UNLOCKER} (via epic {EPIC})")])
+        );
+        let direct = Readiness::Blocked {
+            blocker_keys: vec!["PROJ-9".to_string()],
+            via_epic: None,
+        };
+        assert_eq!(direct.blocker_labels(), Some(vec!["PROJ-9".to_string()]));
+        assert_eq!(Readiness::Ready.blocker_labels(), None);
+    }
+
+    #[test]
+    fn readiness_is_unknown_when_the_epic_lookup_fails() {
+        let epics = ParentEpics::new(|_| Err("boom".to_string()));
+        assert_eq!(
+            readiness(&epic_fixture::child(), Some(&[]), &epics),
+            Readiness::Unknown
         );
     }
 

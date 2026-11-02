@@ -17,6 +17,7 @@ pub mod backend;
 pub mod check;
 pub mod dispatch;
 pub mod drift;
+pub mod graph;
 pub mod init;
 pub mod pr;
 pub mod ready;
@@ -130,6 +131,26 @@ pub enum Command {
         /// warnings) instead of text.
         #[arg(long, conflicts_with = "key")]
         json: bool,
+    },
+    /// Show the epic unlock graph: epics, their tickets, and which epics
+    /// unlock which (`tm ticket link A --blocks B` records that A unlocks
+    /// B).
+    ///
+    /// Prints one line per epic by default. Unlocks cycles are reported
+    /// as warnings on stderr and never change the exit code. The JSON
+    /// format is documented in docs/graph-format.md.
+    Graph {
+        /// Epic key to scope the graph to, e.g. `PROJ-12` (case-insensitive):
+        /// keeps the epics connected to it through unlocks links in either
+        /// direction, plus their children. Omit for every epic.
+        epic: Option<String>,
+        /// Print the versioned JSON document instead of text.
+        #[arg(long, conflicts_with = "mermaid")]
+        json: bool,
+        /// Print a Mermaid flowchart of the epics and unlocks links
+        /// instead of text.
+        #[arg(long)]
+        mermaid: bool,
     },
     /// Open the interactive terminal board.
     Board,
@@ -397,13 +418,16 @@ pub enum ReviewCmd {
     },
     /// Run thatch auto-review rounds over KEY's PR branch.
     ///
-    /// Each round reviews the branch headlessly (`thatch-code-review`, then
-    /// `thatch-review-followup`), writes the confirmed findings into the
-    /// worktree's vdiff comment store, and runs `tm review fix` when any
-    /// finding is at or above `[work.auto_review].fix_threshold`. Stops when
-    /// a round is clean, or flags the ticket for review at
-    /// `max_review_rounds`. Detaches by default, logging to
-    /// `~/.local/state/tskmstr/auto-review/<key>.log`.
+    /// Each round is an interactive review (`thatch-code-review`, then
+    /// `thatch-review-followup`) in a `review` window of the ticket's
+    /// `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed
+    /// findings go into the worktree's vdiff comment store, and any finding
+    /// at or above `[work.auto_review].fix_threshold` starts an interactive
+    /// `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for
+    /// each step's signal file for up to `round_timeout_mins` and leaves the
+    /// windows open. Stops when a round is clean, or flags the round for
+    /// review at `max_review_rounds` or when a step never signals. Detaches
+    /// by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`.
     Auto {
         /// Ticket key whose lane-run worktree to review, e.g. `GH-124`
         /// (case-insensitive).
@@ -1061,10 +1085,11 @@ pub enum RunsCmd {
         /// and exit 0.
         #[arg(long, value_name = "KIND")]
         if_kind: Option<String>,
-        /// Leave an already-ended run's status (review, done, failed,
-        /// interrupted) as it is, recording only the rest of the outcome.
-        /// The session-end hooks pass this so exiting a session never
-        /// overwrites a status tm already set.
+        /// Leave an already-ended run's status (blocked, review, done,
+        /// failed, interrupted) as it is, recording only the rest of the
+        /// outcome, and end a run tm flagged for review while it ran as
+        /// review. The session-end hooks pass this so exiting a session
+        /// never overwrites a status tm already set.
         #[arg(long)]
         keep_status: bool,
     },
@@ -1169,6 +1194,10 @@ pub enum RunsCmd {
     /// the run has no recorded `log_path` (every run started before that
     /// column existed) -- this is what makes a `tm pr watch` cron's log
     /// viewable even though it predates this feature.
+    ///
+    /// An interactive run with no log prints its Claude Code transcript as
+    /// readable text instead, found via the recorded transcript path or the
+    /// run's session id under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
     Logs {
         /// Jira ticket key or run row id, e.g. `PROJ-123` or `42`.
         ticket_or_id: String,
@@ -2426,6 +2455,58 @@ mod tests {
     fn parses_ready_json_conflicts_with_key() {
         Cli::try_parse_from(["tm", "ready", "proj-20", "--json"])
             .expect_err("--json is for the list form only");
+    }
+
+    #[test]
+    fn parses_graph_with_no_arguments() {
+        let cli = Cli::try_parse_from(["tm", "graph"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph {
+                epic,
+                json,
+                mermaid,
+            }) => {
+                assert!(epic.is_none());
+                assert!(!json);
+                assert!(!mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_epic_with_json() {
+        let cli = Cli::try_parse_from(["tm", "graph", "PROJ-1", "--json"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph {
+                epic,
+                json,
+                mermaid,
+            }) => {
+                assert_eq!(epic, Some("PROJ-1".to_string()));
+                assert!(json);
+                assert!(!mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_mermaid() {
+        let cli = Cli::try_parse_from(["tm", "graph", "--mermaid"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph { json, mermaid, .. }) => {
+                assert!(!json);
+                assert!(mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_json_conflicts_with_mermaid() {
+        Cli::try_parse_from(["tm", "graph", "--json", "--mermaid"])
+            .expect_err("--json and --mermaid pick different outputs");
     }
 
     #[test]
