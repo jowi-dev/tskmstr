@@ -47,7 +47,7 @@ use crate::runs::{RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
     AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LOOP_PID_EVENT, LoopOutcome,
-    StepState, run_loop,
+    run_loop,
 };
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::{GitError, GitOps};
@@ -62,6 +62,7 @@ use crate::work::run::{
     prepare_review_fix, run_agent_and_finish, run_log_path,
 };
 use crate::work::runner::ProcessSpawner;
+use crate::work::signal::{StepState, StepWatch, step_state_of};
 use crate::work::tmux::{TmuxError, TmuxOps};
 use crate::work::vdiff::{VdiffError, VdiffOps};
 
@@ -794,6 +795,30 @@ impl CliAutoReviewOps<'_, '_> {
     }
 }
 
+impl StepWatch for CliAutoReviewOps<'_, '_> {
+    type Error = AutoReviewError;
+
+    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
+        let run = self
+            .deps
+            .run_store
+            .run_by_id(run_id)
+            .map_err(|e| AutoReviewError::step("wait", e))?;
+        // `tm merge` kills the ticket's session along with every window in
+        // it; the loop has nothing left to wait on then.
+        step_state_of(run.as_ref(), |s| self.deps.tmux.has_session(s))
+            .map_err(|e| AutoReviewError::step("wait", e))
+    }
+
+    fn sleep(&self, secs: u64) {
+        self.deps.sleeper.sleep(secs);
+    }
+
+    fn now_unix_secs(&self) -> i64 {
+        self.deps.clock.now_unix_secs()
+    }
+}
+
 impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
     fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
         let deps = self.deps;
@@ -869,37 +894,6 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
         Ok(run_id)
     }
 
-    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
-        let run = self
-            .deps
-            .run_store
-            .run_by_id(run_id)
-            .map_err(|e| AutoReviewError::step("wait", e))?;
-        let Some(run) = run else {
-            return Ok(StepState::Gone);
-        };
-        match run.status {
-            RunStatus::Hibernated => return Ok(StepState::Hibernated),
-            RunStatus::Running | RunStatus::Queued => {}
-            _ => return Ok(StepState::Gone),
-        }
-        // `tm merge` kills the ticket's session along with every window in
-        // it; the loop has nothing left to wait on then.
-        let session_alive = match run.tmux_session.as_deref() {
-            Some(session) => self
-                .deps
-                .tmux
-                .has_session(session)
-                .map_err(|e| AutoReviewError::step("wait", e))?,
-            None => true,
-        };
-        Ok(if session_alive {
-            StepState::Running
-        } else {
-            StepState::Gone
-        })
-    }
-
     fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
         // Leaves a row something else already ended alone, the rule
         // `finish_run_from_supervisor` keeps.
@@ -914,10 +908,6 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
                 false,
             )
             .map_err(|e| AutoReviewError::step("record", e))
-    }
-
-    fn sleep(&self, secs: u64) {
-        self.deps.sleeper.sleep(secs);
     }
 
     fn publish(&self) -> Result<(), AutoReviewError> {
@@ -960,10 +950,6 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
             self.max_fix_rounds,
         )
         .map_err(|e| AutoReviewError::step("fix", e))
-    }
-
-    fn now_unix_secs(&self) -> i64 {
-        self.deps.clock.now_unix_secs()
     }
 
     fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {

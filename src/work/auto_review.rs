@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::config::{AutoReviewConfig, Severity};
 use crate::work::comment_store::{self, CommentStoreError, NewComment};
+use crate::work::signal::{Signal, StepWatch, read_done_marker, temporary_name, wait_for_signal};
 
 /// Run `kind` of each review round's agent run.
 pub const AUTO_REVIEW_KIND: &str = "auto-review";
@@ -183,26 +184,11 @@ pub fn fix_marker_path(git_dir: &Path, round: u32) -> PathBuf {
         .join(format!("fix-{round}.done"))
 }
 
-#[derive(Deserialize)]
-struct FixMarker {
-    succeeded: bool,
-}
-
 /// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
-/// exists and parses, `None` before then.
+/// exists and parses, `None` before then; see
+/// [`crate::work::signal::read_done_marker`].
 pub fn read_fix_marker(path: &Path) -> Option<bool> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<FixMarker>(&raw)
-        .ok()
-        .map(|marker| marker.succeeded)
-}
-
-/// The temporary name an agent writes a signal file under before renaming
-/// it into place.
-fn temporary_name(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".tmp");
-    PathBuf::from(name)
+    read_done_marker(path)
 }
 
 /// The section tm appends to every review round's prompt, whatever the
@@ -281,31 +267,15 @@ pub fn render_prompt(
         + &review_completion_section(findings_file)
 }
 
-/// Seconds between two checks for a step's signal file.
-pub const SIGNAL_POLL_SECS: u64 = 10;
-
-/// A step's run row, as the loop sees it while waiting for the step's
-/// signal file (GitHub issue #150).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepState {
-    /// Still running: keep waiting.
-    Running,
-    /// The idle sweep hibernated the agent before it signalled: the step is
-    /// stuck.
-    Hibernated,
-    /// Something other than the loop ended the row (`tm merge` finishing
-    /// the ticket's runs, the user exiting the session), or the ticket's
-    /// session no longer exists: the loop has nothing left to drive.
-    Gone,
-}
-
 /// Everything [`run_loop`] needs done outside the comment store.
 ///
 /// A review round and a fix pass are each launched, not run to completion:
 /// [`run_loop`] then polls the step's signal file (the round's findings
 /// file, the fix pass's [`fix_marker_path`] marker), checking
-/// [`AutoReviewOps::step_state`] between polls.
-pub trait AutoReviewOps {
+/// [`crate::work::signal::StepWatch::step_state`] between polls. The
+/// [`StepWatch`] supertrait's `now_unix_secs` also stamps comments'
+/// `created_at`.
+pub trait AutoReviewOps: StepWatch<Error = AutoReviewError> {
     /// Launches one review round's agent with `prompt` and returns its run
     /// row id. The agent writes its findings to the `findings_file` the
     /// prompt names.
@@ -315,12 +285,8 @@ pub trait AutoReviewOps {
     /// prompt, and returns its run row id. `None` when the store had nothing
     /// to fix, so there is nothing to wait for.
     fn fix(&self, round: u32, completion: String) -> Result<Option<i64>, AutoReviewError>;
-    /// The state of a launched step's run row `run_id`.
-    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError>;
     /// Marks run `run_id` done: its step signalled success.
     fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError>;
-    /// Waits `secs` seconds between two signal polls.
-    fn sleep(&self, secs: u64);
     /// Posts the store with `vdiff --publish-comments <pr>`.
     fn publish(&self) -> Result<(), AutoReviewError>;
     /// Records an event on run `run_id`.
@@ -331,50 +297,10 @@ pub trait AutoReviewOps {
     /// Whether the ticket has used up `[dispatch] max_fix_rounds`, the fix
     /// cap shared by every automatic trigger (GitHub issue #120).
     fn fix_cap_reached(&self) -> Result<bool, AutoReviewError>;
-    /// Seconds since the Unix epoch, for comments' `created_at` and the
-    /// signal timeout.
-    fn now_unix_secs(&self) -> i64;
     /// Imports the PR's not-yet-imported, unresolved review-bot threads into
     /// the comment store, so the fix about to run addresses them too
     /// (GitHub issue #145). Returns how many were imported.
     fn import_bot_comments(&self) -> Result<usize, AutoReviewError>;
-}
-
-/// How waiting on one step's signal ended.
-enum Signal<T> {
-    /// The signal file was read.
-    Received(T),
-    /// No signal before the timeout, or the agent was hibernated first.
-    Stuck,
-    /// See [`StepState::Gone`].
-    Gone,
-}
-
-/// Polls `read` every [`SIGNAL_POLL_SECS`] until it yields the step's
-/// signal, the step's row stops running, or `timeout_secs` pass. The signal
-/// is read first on every poll, so a step that signalled before being
-/// hibernated or ended still counts as done.
-fn wait_for_signal<T>(
-    ops: &dyn AutoReviewOps,
-    run_id: i64,
-    timeout_secs: i64,
-    read: impl Fn() -> Option<T>,
-) -> Result<Signal<T>, AutoReviewError> {
-    let start = ops.now_unix_secs();
-    loop {
-        if let Some(signal) = read() {
-            return Ok(Signal::Received(signal));
-        }
-        match ops.step_state(run_id)? {
-            StepState::Running => {}
-            StepState::Hibernated => return Ok(Signal::Stuck),
-            StepState::Gone => return Ok(Signal::Gone),
-        }
-        if ops.now_unix_secs() - start >= timeout_secs {
-            return Ok(Signal::Stuck);
-        }
-        ops.sleep(SIGNAL_POLL_SECS);
-    }
 }
 
 /// How one round ended, recorded as the tail of its [`ROUND_EVENT`]
@@ -543,6 +469,7 @@ fn round_detail(round: u32, max: u32, verdict: RoundVerdict) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::signal::StepState;
     use std::cell::RefCell;
     use tempfile::TempDir;
 
@@ -622,6 +549,36 @@ mod tests {
         }
     }
 
+    impl StepWatch for FakeOps {
+        type Error = AutoReviewError;
+
+        fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
+            Ok(self
+                .states
+                .borrow()
+                .get(&run_id)
+                .copied()
+                .unwrap_or(StepState::Running))
+        }
+
+        fn sleep(&self, secs: u64) {
+            self.elapsed.set(self.elapsed.get() + secs as i64);
+            self.sleeps.set(self.sleeps.get() + 1);
+            let mut pending = self.pending.borrow_mut();
+            for (left, path, body) in pending.iter_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    std::fs::write(path, &*body).unwrap();
+                }
+            }
+            pending.retain(|(left, _, _)| *left > 0);
+        }
+
+        fn now_unix_secs(&self) -> i64 {
+            1_787_054_400 + self.elapsed.get()
+        }
+    }
+
     impl AutoReviewOps for FakeOps {
         fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
             self.log.borrow_mut().push(format!("review {round}"));
@@ -655,31 +612,9 @@ mod tests {
             Ok(Some(200 + i64::from(round)))
         }
 
-        fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
-            Ok(self
-                .states
-                .borrow()
-                .get(&run_id)
-                .copied()
-                .unwrap_or(StepState::Running))
-        }
-
         fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
             self.finished.borrow_mut().push(run_id);
             Ok(())
-        }
-
-        fn sleep(&self, secs: u64) {
-            self.elapsed.set(self.elapsed.get() + secs as i64);
-            self.sleeps.set(self.sleeps.get() + 1);
-            let mut pending = self.pending.borrow_mut();
-            for (left, path, body) in pending.iter_mut() {
-                *left -= 1;
-                if *left == 0 {
-                    std::fs::write(path, &*body).unwrap();
-                }
-            }
-            pending.retain(|(left, _, _)| *left > 0);
         }
 
         fn publish(&self) -> Result<(), AutoReviewError> {
@@ -710,10 +645,6 @@ mod tests {
                 comment_store::append(&self.git_dir, &comments, "2026-10-20T00:00:00Z")?;
             }
             Ok(comments.len())
-        }
-
-        fn now_unix_secs(&self) -> i64 {
-            1_787_054_400 + self.elapsed.get()
         }
     }
 
