@@ -494,9 +494,10 @@ pub fn run(
     // runner; priority routing may hand the run to a fallback agent.
     if let Some(lane_config) = ctx.config.lanes.get(lane) {
         let repo = crate::work::run::lane_repo_key(lane, lane_config);
-        if let Some(refusal) = crate::work::admission::check_lane_admission(
+        if let Some(refusal) = crate::work::admission::check_memory_admission(
             deps.run_store,
             &ctx.config.memory,
+            "lane",
             deps.runner.name(),
             &repo,
             deps.memory_pressure,

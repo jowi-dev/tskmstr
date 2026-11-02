@@ -1675,7 +1675,7 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
 /// #86, ADR-0009 decision 7). Lane memory is the latest footprint the
 /// reaper recorded, CPU is sampled here per lane process tree, and the
 /// budget figure is what admission would count (see
-/// [`crate::work::admission::running_lane_estimate`]). A probe that can't
+/// [`crate::work::admission::running_agent_estimate`]). A probe that can't
 /// read on this platform shows as unknown, never as an error.
 fn load_system(deps: &WatchDeps) -> Vec<Msg> {
     use crate::runs::system::{BudgetUse, SlotUse, SystemHeader, lane_totals};
@@ -1691,7 +1691,7 @@ fn load_system(deps: &WatchDeps) -> Vec<Msg> {
     );
     let budget = match deps.memory.budget_bytes {
         Some(budget_bytes) => {
-            match crate::work::admission::running_lane_estimate(&deps.store, &deps.memory) {
+            match crate::work::admission::running_agent_estimate(&deps.store, &deps.memory) {
                 Ok(running) => Some(BudgetUse {
                     committed_bytes: running.bytes,
                     budget_bytes,

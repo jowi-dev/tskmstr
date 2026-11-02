@@ -35,12 +35,12 @@ use crate::runs::footprint::{MemoryPressure, format_bytes};
 use crate::runs::{RunStore, RunStoreError};
 use crate::work::runner::{ProcessSpawner, SpawnRequest};
 
-/// Why a lane launch was refused.
+/// Why an agent launch was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionRefusal {
     /// The kernel reports warn or critical memory pressure.
     Pressure(MemoryPressure),
-    /// The new lane's estimate plus the running lanes' would exceed the
+    /// The new run's estimate plus the running agents' would exceed the
     /// budget.
     OverBudget(OverBudget),
 }
@@ -48,18 +48,20 @@ pub enum AdmissionRefusal {
 /// The numbers behind an [`AdmissionRefusal::OverBudget`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverBudget {
-    /// The new lane's agent.
+    /// The new run's kind, e.g. `lane` or `audit`.
+    pub kind: String,
+    /// The new run's agent.
     pub agent: String,
-    /// The new lane's repo.
+    /// The new run's repo.
     pub repo: String,
-    /// The new lane's estimated peak.
+    /// The new run's estimated peak.
     pub estimate_bytes: u64,
     /// Whether `estimate_bytes` came from recorded runs (`true`) or the
-    /// configured default (`false`).
+    /// kind's default (`false`).
     pub from_history: bool,
-    /// How many lanes are running.
+    /// How many agents are running.
     pub running_count: usize,
-    /// The running lanes' summed estimates.
+    /// The running agents' summed estimates.
     pub running_bytes: u64,
     /// The configured budget.
     pub budget_bytes: u64,
@@ -74,16 +76,20 @@ impl fmt::Display for AdmissionRefusal {
                 level.as_str()
             ),
             AdmissionRefusal::OverBudget(o) => {
+                let runs = match o.kind.as_str() {
+                    "lane" => "lanes".to_string(),
+                    kind => format!("{kind} runs"),
+                };
                 let estimate = if o.from_history {
                     format!(
-                        "{}/{} lanes peak ~{}",
+                        "{}/{} {runs} peak ~{}",
                         o.repo,
                         o.agent,
                         format_bytes(o.estimate_bytes)
                     )
                 } else {
                     format!(
-                        "{}/{} lanes have no recorded peak, assuming ~{}",
+                        "{}/{} {runs} have no recorded peak, assuming ~{}",
                         o.repo,
                         o.agent,
                         format_bytes(o.estimate_bytes)
@@ -103,8 +109,36 @@ impl fmt::Display for AdmissionRefusal {
 
 impl std::error::Error for AdmissionRefusal {}
 
-/// Decides whether a lane for `agent` against `repo` may launch now.
-/// Returns `None` to admit it, or the reason it was refused.
+/// The estimate for a `kind` run with no recorded peaks (GitHub issue
+/// #149): the configured lane default for `lane` and `review-fix`, which
+/// build and test like a lane, and 1 GB for every other agent kind.
+pub fn default_estimate_bytes(kind: &str, memory: &MemoryConfig) -> u64 {
+    match kind {
+        "lane" | "review-fix" => memory.default_lane_estimate_bytes,
+        _ => crate::runs::footprint::GIB,
+    }
+}
+
+/// The expected peak of a `kind` run for `agent` against `repo`: its recent
+/// recorded peak ([`RunStore::peak_estimate`]), or `None` with no history.
+fn history_estimate(
+    store: &RunStore,
+    cache: &mut HashMap<(String, String, String), Option<u64>>,
+    kind: &str,
+    agent: &str,
+    repo: &str,
+) -> Result<Option<u64>, RunStoreError> {
+    let key = (kind.to_string(), agent.to_string(), repo.to_string());
+    if let Some(cached) = cache.get(&key) {
+        return Ok(*cached);
+    }
+    let estimate = store.peak_estimate(kind, agent, repo)?;
+    cache.insert(key, estimate);
+    Ok(estimate)
+}
+
+/// Decides whether a `kind` agent run for `agent` against `repo` may launch
+/// now. Returns `None` to admit it, or the reason it was refused.
 ///
 /// `pressure` is only read when a budget is configured, so a machine with
 /// admission off never pays for the sysctl.
@@ -112,9 +146,10 @@ impl std::error::Error for AdmissionRefusal {}
 /// # Errors
 ///
 /// Returns a [`RunStoreError`] if the run store can't be read.
-pub fn check_lane_admission(
+pub fn check_memory_admission(
     store: &RunStore,
     memory: &MemoryConfig,
+    kind: &str,
     agent: &str,
     repo: &str,
     pressure: &dyn Fn() -> MemoryPressure,
@@ -128,14 +163,15 @@ pub fn check_lane_admission(
         return Ok(Some(AdmissionRefusal::Pressure(level)));
     }
 
-    let running = running_lane_estimate(store, memory)?;
-    let history = store.lane_peak_estimate(agent, repo)?;
-    let estimate_bytes = history.unwrap_or(memory.default_lane_estimate_bytes);
+    let running = running_agent_estimate(store, memory)?;
+    let history = store.peak_estimate(kind, agent, repo)?;
+    let estimate_bytes = history.unwrap_or_else(|| default_estimate_bytes(kind, memory));
     if running.bytes + estimate_bytes <= budget_bytes {
         return Ok(None);
     }
 
     Ok(Some(AdmissionRefusal::OverBudget(OverBudget {
+        kind: kind.to_string(),
         agent: agent.to_string(),
         repo: repo.to_string(),
         estimate_bytes,
@@ -146,49 +182,42 @@ pub fn check_lane_admission(
     })))
 }
 
-/// What the running lanes count against the memory budget; see
-/// [`running_lane_estimate`].
+/// What the running agents count against the memory budget; see
+/// [`running_agent_estimate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunningEstimate {
-    /// How many lanes are running.
+    /// How many agents are running.
     pub count: usize,
     /// Their summed estimates, in bytes.
     pub bytes: u64,
 }
 
-/// Sums the running lanes' estimated cost the way admission does: each
-/// lane at the larger of its own peak so far and its `(agent, repo)` key's
-/// estimate, falling back to [`MemoryConfig::default_lane_estimate_bytes`]
-/// with no history. Shared with the overview's system header (GitHub issue
-/// #86), which shows it against the budget.
+/// Sums the running agents' estimated cost the way admission does: every
+/// running row of an agent kind ([`RunStore::running_agents`]), each at the
+/// larger of its own peak so far and its `(kind, agent, repo)` key's
+/// estimate, falling back to [`default_estimate_bytes`] with no history.
+/// Shared with the overview's system header (GitHub issue #86), which shows
+/// it against the budget.
 ///
 /// # Errors
 ///
 /// Returns a [`RunStoreError`] if the run store can't be read.
-pub fn running_lane_estimate(
+pub fn running_agent_estimate(
     store: &RunStore,
     memory: &MemoryConfig,
 ) -> Result<RunningEstimate, RunStoreError> {
-    let mut estimates: HashMap<(String, String), Option<u64>> = HashMap::new();
-    let running = store.running_lanes()?;
+    let mut cache = HashMap::new();
+    let running = store.running_agents()?;
     let mut bytes = 0u64;
-    for lane in &running {
-        let key_estimate = match (&lane.agent, &lane.repo) {
+    for run in &running {
+        let key_estimate = match (&run.agent, &run.repo) {
             (Some(agent), Some(repo)) => {
-                let key = (agent.clone(), repo.clone());
-                match estimates.get(&key) {
-                    Some(cached) => *cached,
-                    None => {
-                        let estimate = store.lane_peak_estimate(agent, repo)?;
-                        estimates.insert(key, estimate);
-                        estimate
-                    }
-                }
+                history_estimate(store, &mut cache, &run.kind, agent, repo)?
             }
             _ => None,
         };
-        let estimate = key_estimate.unwrap_or(memory.default_lane_estimate_bytes);
-        bytes += estimate.max(lane.mem_peak_bytes.unwrap_or(0));
+        let estimate = key_estimate.unwrap_or_else(|| default_estimate_bytes(&run.kind, memory));
+        bytes += estimate.max(run.mem_peak_bytes.unwrap_or(0));
     }
     Ok(RunningEstimate {
         count: running.len(),
@@ -600,9 +629,10 @@ mod tests {
             start_lane(&store, "opencode", "lemma");
         }
 
-        let verdict = check_lane_admission(
+        let verdict = check_memory_admission(
             &store,
             &MemoryConfig::default(),
+            "lane",
             "opencode",
             "lemma",
             &|| panic!("pressure must not be read with admission off"),
@@ -617,10 +647,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = store(dir.path());
 
-        let verdict = check_lane_admission(&store, &budget(1000), "claude", "tskmstr", &|| {
-            MemoryPressure::Warn
-        })
-        .unwrap();
+        let verdict =
+            check_memory_admission(&store, &budget(1000), "lane", "claude", "tskmstr", &|| {
+                MemoryPressure::Warn
+            })
+            .unwrap();
 
         assert_eq!(
             verdict,
@@ -635,7 +666,8 @@ mod tests {
         start_lane(&store, "claude", "tskmstr");
 
         let verdict =
-            check_lane_admission(&store, &budget(4), "claude", "tskmstr", &normal).unwrap();
+            check_memory_admission(&store, &budget(4), "lane", "claude", "tskmstr", &normal)
+                .unwrap();
 
         assert_eq!(verdict, None, "2 GB running + 2 GB new fits 4 GB");
     }
@@ -651,13 +683,15 @@ mod tests {
 
         // 7 x 2.5 GB running + 2.5 GB new = 20 GB: fits exactly.
         let verdict =
-            check_lane_admission(&store, &budget(20), "opencode", "lemma", &normal).unwrap();
+            check_memory_admission(&store, &budget(20), "lane", "opencode", "lemma", &normal)
+                .unwrap();
         assert_eq!(verdict, None);
 
         start_lane(&store, "opencode", "lemma");
-        let verdict = check_lane_admission(&store, &budget(20), "opencode", "lemma", &normal)
-            .unwrap()
-            .expect("8 x 2.5 GB running + 2.5 GB new exceeds 20 GB");
+        let verdict =
+            check_memory_admission(&store, &budget(20), "lane", "opencode", "lemma", &normal)
+                .unwrap()
+                .expect("8 x 2.5 GB running + 2.5 GB new exceeds 20 GB");
 
         let AdmissionRefusal::OverBudget(over) = &verdict else {
             panic!("expected OverBudget, got {verdict:?}");
@@ -679,9 +713,10 @@ mod tests {
         let store = store(dir.path());
         start_lane(&store, "claude", "other");
 
-        let verdict = check_lane_admission(&store, &budget(3), "claude", "tskmstr", &normal)
-            .unwrap()
-            .unwrap();
+        let verdict =
+            check_memory_admission(&store, &budget(3), "lane", "claude", "tskmstr", &normal)
+                .unwrap()
+                .unwrap();
 
         assert_eq!(
             verdict.to_string(),
@@ -697,9 +732,10 @@ mod tests {
         let id = start_lane(&store, "claude", "tskmstr");
         store.record_footprint(id, 6 * GIB).unwrap();
 
-        let verdict = check_lane_admission(&store, &budget(7), "claude", "tskmstr", &normal)
-            .unwrap()
-            .unwrap();
+        let verdict =
+            check_memory_admission(&store, &budget(7), "lane", "claude", "tskmstr", &normal)
+                .unwrap()
+                .unwrap();
 
         let AdmissionRefusal::OverBudget(over) = verdict else {
             panic!("expected OverBudget");
@@ -715,7 +751,8 @@ mod tests {
         finished_lane(&store, "claude", "tskmstr", GIB);
 
         let verdict =
-            check_lane_admission(&store, &budget(1), "claude", "tskmstr", &normal).unwrap();
+            check_memory_admission(&store, &budget(1), "lane", "claude", "tskmstr", &normal)
+                .unwrap();
 
         assert_eq!(verdict, None);
     }
@@ -730,7 +767,7 @@ mod tests {
         store.record_footprint(big, 6 * GIB).unwrap();
         start_lane(&store, "opencode", "lemma");
 
-        let running = running_lane_estimate(&store, &budget(100)).unwrap();
+        let running = running_agent_estimate(&store, &budget(100)).unwrap();
 
         assert_eq!(
             running,
@@ -739,6 +776,163 @@ mod tests {
                 bytes: GIB + 6 * GIB + 2 * GIB,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use crate::runs::footprint::GIB;
+    use crate::runs::{FinishRun, RunStatus, StartRun};
+    use tempfile::tempdir;
+
+    fn store(dir: &std::path::Path) -> RunStore {
+        RunStore::open(&dir.join("runs.db")).unwrap()
+    }
+
+    fn budget(gb: u64) -> MemoryConfig {
+        MemoryConfig {
+            budget_bytes: Some(gb * GIB),
+            default_lane_estimate_bytes: 2 * GIB,
+        }
+    }
+
+    fn normal() -> MemoryPressure {
+        MemoryPressure::Normal
+    }
+
+    fn start(store: &RunStore, kind: &str) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                scope: String::new(),
+                lane: kind.to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: kind.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_agent_repo(id, "claude", "tskmstr").unwrap();
+        id
+    }
+
+    fn finished(store: &RunStore, kind: &str, peak: u64) {
+        let id = start(store, kind);
+        store.record_footprint(id, peak).unwrap();
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn built_in_defaults_are_the_lane_default_for_lane_and_review_fix_and_1_gb_otherwise() {
+        let memory = budget(100);
+        assert_eq!(default_estimate_bytes("lane", &memory), 2 * GIB);
+        assert_eq!(default_estimate_bytes("review-fix", &memory), 2 * GIB);
+        for kind in [
+            "auto-review",
+            "audit",
+            "create",
+            "bugbot-cleanup",
+            "merge-conflict",
+            "setup",
+        ] {
+            assert_eq!(default_estimate_bytes(kind, &memory), GIB, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_lane_is_refused_when_a_running_review_round_and_audit_fill_the_budget() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        start(&store, "auto-review");
+        start(&store, "audit");
+        start(&store, "review-watch");
+
+        // 1 GB review + 1 GB audit + 2 GB lane = 4 GB; the watcher is free.
+        let fits = check_memory_admission(&store, &budget(4), "lane", "claude", "tskmstr", &normal)
+            .unwrap();
+        assert_eq!(fits, None);
+
+        let refused =
+            check_memory_admission(&store, &budget(3), "lane", "claude", "tskmstr", &normal)
+                .unwrap()
+                .expect("4 GB does not fit 3 GB");
+        let AdmissionRefusal::OverBudget(over) = refused else {
+            panic!("expected OverBudget");
+        };
+        assert_eq!(over.running_count, 2);
+        assert_eq!(over.running_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn a_kind_with_recorded_peaks_is_estimated_at_its_recent_peak() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        finished(&store, "audit", 3 * GIB);
+        start(&store, "audit");
+
+        let refused =
+            check_memory_admission(&store, &budget(5), "audit", "claude", "tskmstr", &normal)
+                .unwrap()
+                .expect("3 GB running + 3 GB new exceeds 5 GB");
+
+        let AdmissionRefusal::OverBudget(over) = &refused else {
+            panic!("expected OverBudget");
+        };
+        assert_eq!(over.estimate_bytes, 3 * GIB);
+        assert!(over.from_history);
+        assert_eq!(over.running_bytes, 3 * GIB);
+        assert_eq!(
+            refused.to_string(),
+            "not launching: memory budget exceeded: tskmstr/claude audit runs peak ~3.0 GB; \
+             1 running (~3.0 GB); budget 5.0 GB"
+        );
+    }
+
+    #[test]
+    fn a_kind_without_recorded_peaks_is_estimated_at_its_built_in_default() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        finished(&store, "lane", 5 * GIB);
+
+        let refused =
+            check_memory_admission(&store, &budget(1), "create", "claude", "tskmstr", &|| {
+                MemoryPressure::Normal
+            })
+            .unwrap();
+        assert_eq!(refused, None, "1 GB create default fits 1 GB");
+
+        start(&store, "setup");
+        let refused =
+            check_memory_admission(&store, &budget(1), "create", "claude", "tskmstr", &normal)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            refused.to_string(),
+            "not launching: memory budget exceeded: tskmstr/claude create runs have no \
+             recorded peak, assuming ~1.0 GB; 1 running (~1.0 GB); budget 1.0 GB"
+        );
+    }
+
+    #[test]
+    fn a_hibernated_run_frees_its_share() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let id = start(&store, "lane");
+        assert!(store.hibernate_run(id).unwrap());
+
+        let running = running_agent_estimate(&store, &budget(100)).unwrap();
+
+        assert_eq!(running, RunningEstimate { count: 0, bytes: 0 });
     }
 }
 
