@@ -540,10 +540,13 @@ pub enum WorkCmd {
         #[arg(long)]
         fg: bool,
         /// Hidden: launched by the autopilot dispatcher (GitHub issue #115).
-        /// Implies `--headless`, routes only to runners an unattended launch
-        /// may use (no metered runner unless `[dispatch]
-        /// allow_paid_fallback`), and refuses instead of warning when usage
-        /// admission says no.
+        /// Routes only to runners an unattended launch may use (no metered
+        /// runner unless `[dispatch] allow_paid_fallback`), and refuses
+        /// instead of warning when usage admission says no. Since GitHub
+        /// issue #184 it no longer implies `--headless`: the lane runs
+        /// interactively in the ticket's `work` window unless `--headless`
+        /// or `--fg` is given, and a detached awaiter (`tm work
+        /// __await-lane`) finishes its run row on its done marker.
         #[arg(long, hide = true)]
         unattended: bool,
     },
@@ -557,6 +560,18 @@ pub enum WorkCmd {
         /// Path to the JSON-serialized
         /// `tskmstr::work::run::PreparedRun` state file written by the
         /// foreground half of `tm work run`.
+        #[arg(long = "state-file")]
+        state_file: String,
+    },
+    /// Hidden: the detached lane awaiter (GitHub issue #184). Not a
+    /// user-facing command — `tm work run --unattended` spawns this itself
+    /// after launching an interactive lane in the ticket's `work` window; it
+    /// deserializes `--state-file`'s state, waits for the lane's done
+    /// marker, and finishes the run (see `tskmstr::work::lane_await`).
+    #[command(name = "__await-lane", hide = true)]
+    AwaitLane {
+        /// Path to the JSON-serialized `tskmstr::work::detach::SupervisorState`
+        /// written by `tm work run --unattended`.
         #[arg(long = "state-file")]
         state_file: String,
     },
@@ -3286,6 +3301,24 @@ mod tests {
                 cmd: WorkCmd::Supervise { state_file },
             }) => assert_eq!(state_file, "/tmp/mylane-20260101.supervisor.json"),
             other => panic!("expected Work Supervise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_await_lane_hidden_subcommand() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "work",
+            "__await-lane",
+            "--state-file",
+            "/tmp/mylane-20260101.await.json",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::AwaitLane { state_file },
+            }) => assert_eq!(state_file, "/tmp/mylane-20260101.await.json"),
+            other => panic!("expected Work AwaitLane, got {other:?}"),
         }
     }
 

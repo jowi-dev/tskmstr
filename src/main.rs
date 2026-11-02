@@ -863,6 +863,10 @@ fn run_work(
                 max_turns,
                 permission_mode,
                 prompt_override: prompt,
+                // GitHub issue #184: an unattended lane runs interactively
+                // like any other, and signals when it is done so a
+                // detached awaiter can finish its run row.
+                done_signal: unattended,
                 // `run` sets `mode` from the resolved dispatch below.
                 ..Default::default()
             };
@@ -871,7 +875,7 @@ fn run_work(
                 &run_deps,
                 &lane,
                 request,
-                Dispatch::from_flags(headless || unattended, fg),
+                Dispatch::from_flags(headless, fg),
                 &mut stdout,
             )?;
             if !succeeded {
@@ -927,6 +931,50 @@ fn run_work(
             if !succeeded {
                 return Err("lane run failed".into());
             }
+        }
+        WorkCmd::AwaitLane { state_file } => {
+            let raw = std::fs::read_to_string(&state_file)?;
+            let state: tskmstr::work::detach::SupervisorState = serde_json::from_str(&raw)?;
+            let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
+            let gh = ShellGhCli::new();
+            // Best-effort, like the supervisor's: only `status_on_pr` needs
+            // it, never finishing the run itself.
+            let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
+                .as_ref()
+                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()).ok());
+            // The same post-PR tail `__supervise` runs (GitHub issues #118
+            // and #145).
+            let current_exe = std::env::current_exe()?;
+            let detach = tskmstr::work::detach::RealDetachSpawner;
+            let watch_armer = tskmstr::cli::pr::DetachedWatchArmer {
+                detach: &detach,
+                current_exe: &current_exe,
+                home: &home,
+            };
+            let auto_arm = full_config
+                .as_ref()
+                .is_some_and(|cfg| cfg.work.review_watch.auto_arm);
+            let review_starter = tskmstr::cli::pr::DetachedAutoReviewStarter {
+                detach: &detach,
+                current_exe: &current_exe,
+                home: &home,
+            };
+            let deps = tskmstr::work::lane_await::AwaitLaneDeps {
+                run_store: &run_store,
+                gh: &gh,
+                ticket_provider: ticket_provider.as_deref(),
+                tmux: &tmux,
+                sleeper: &tskmstr::work::review_watch::RealSleeper,
+                clock: &tskmstr::work::run::SystemClock,
+                watch_armer: auto_arm
+                    .then_some(&watch_armer as &dyn tskmstr::work::run::WatchArmer),
+                review_starter: Some(&review_starter),
+                pid: std::process::id(),
+            };
+            tskmstr::cli::work::await_lane(&deps, &state, &mut stdout)?;
+            // One-shot handoff, like `__supervise`'s state file; on a crash
+            // it survives for debugging.
+            let _ = std::fs::remove_file(&state_file);
         }
         WorkCmd::Hooks { cmd } => match cmd {
             tskmstr::cli::HooksCmd::Install { user, dry_run } => {

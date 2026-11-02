@@ -177,6 +177,19 @@ pub fn supervisor_argv(state_file: &Path) -> Vec<String> {
     ]
 }
 
+/// Builds the argv for the hidden `tm work __await-lane` subcommand (GitHub
+/// issue #184), given the path to a JSON-serialized [`SupervisorState`]
+/// whose [`crate::work::run::PreparedRun::done_marker`] is set. Pure, like
+/// [`supervisor_argv`], and likewise excludes the program name.
+pub fn await_lane_argv(state_file: &Path) -> Vec<String> {
+    vec![
+        "work".to_string(),
+        "__await-lane".to_string(),
+        "--state-file".to_string(),
+        state_file.to_string_lossy().into_owned(),
+    ]
+}
+
 /// Spawns a detached supervisor process. [`RealDetachSpawner`] is the
 /// production implementation (re-exec + `setsid` + stdio redirection);
 /// [`FakeDetachSpawner`] records the call for tests instead of spawning
@@ -416,6 +429,21 @@ mod tests {
                 "__supervise".to_string(),
                 "--state-file".to_string(),
                 "/tmp/lane-20260101.supervisor.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn await_lane_argv_points_at_the_hidden_subcommand_and_state_file() {
+        let argv = await_lane_argv(Path::new("/tmp/lane-20260101.await.json"));
+
+        assert_eq!(
+            argv,
+            vec![
+                "work".to_string(),
+                "__await-lane".to_string(),
+                "--state-file".to_string(),
+                "/tmp/lane-20260101.await.json".to_string(),
             ]
         );
     }

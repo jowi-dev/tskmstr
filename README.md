@@ -1182,9 +1182,22 @@ it. A tick:
    Notifications use `notify-send` on Linux and `osascript` on macOS. If
    the command is not installed, the tick sends nothing and carries on.
 
-`--unattended` is a hidden `tm work run` flag. It implies `--headless`. It
-drops metered runners from the fallback chain unless `allow_paid_fallback`
-is set. It also refuses, rather than warns, when usage admission says no.
+`--unattended` is a hidden `tm work run` flag. It drops metered runners
+from the fallback chain unless `allow_paid_fallback` is set. It also
+refuses, rather than warns, when usage admission says no.
+
+An unattended lane runs interactively, in the ticket's `work` window, so
+you can attach to it like any other lane (GitHub issue #184). Its prompt
+ends by asking the agent to write a done marker once its PR is open, or
+to write a failure marker if it stops without one. A detached `tm work
+__await-lane` process waits for that marker. Then it finishes the run row
+(`done`, or `blocked` with no PR) and runs what a headless run does once
+its PR is open: `status_on_pr`, `tm pr watch` when `auto_arm` is on, and
+`tm review auto` under autopilot. A status the agent set itself with `tm
+runs finish` is kept. Until the marker appears, the row stays `running`
+and counts toward `max_lanes`. If the session ends first, the awaiter
+stops and leaves the row alone. Pass `--headless` as well to get the old
+supervisor-driven `claude -p` run.
 
 ```toml
 [dispatch]

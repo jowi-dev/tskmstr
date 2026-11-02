@@ -112,6 +112,11 @@ pub enum WorkCliError {
     #[error(transparent)]
     Detach(#[from] DetachError),
 
+    /// The detached lane awaiter failed (GitHub issue #184). See
+    /// [`crate::work::lane_await::AwaitLaneError`] for the specific cause.
+    #[error(transparent)]
+    AwaitLane(#[from] crate::work::lane_await::AwaitLaneError),
+
     /// The supervisor's `--state-file` could not be serialized/deserialized
     /// as JSON.
     #[error("failed to (de)serialize supervisor state: {0}")]
@@ -444,7 +449,9 @@ impl From<crate::work::admission::AdmissionError> for WorkCliError {
 ///
 /// [`Dispatch::Interactive`] (the default) hosts `claude` in a window of the
 /// ticket's `tm-<scope>-<key>` session and returns as soon as the window is launched;
-/// see [`run_interactive`]. [`Dispatch::HeadlessForeground`] runs
+/// see [`run_interactive`]. With [`RunLaneRequest::done_signal`] set (`tm
+/// work run --unattended`, GitHub issue #184) it also spawns a detached
+/// awaiter that finishes the run on the lane's done marker. [`Dispatch::HeadlessForeground`] runs
 /// synchronously in this process ([`crate::work::run::run_lane_fg`]) and
 /// returns once `claude` has finished. [`Dispatch::Headless`] does
 /// provisioning/preflight/`start_run` in this process — so a bad lane,
@@ -533,7 +540,7 @@ pub fn run(
 
     match dispatch {
         Dispatch::Interactive => {
-            return run_interactive(ctx, &run_deps, &admitted, &paths, lane, request, out);
+            return run_interactive(ctx, deps, &run_deps, &admitted, &paths, lane, request, out);
         }
         Dispatch::HeadlessForeground => {
             let outcome = crate::work::run::run_lane_fg(
@@ -648,8 +655,19 @@ pub fn run(
 /// to attribute a pid to, and the session stamps its own `CLAUDE_PID` when
 /// it adopts the row. Window existence, not a live pid, is what says a
 /// tmux-hosted run is still going.
+///
+/// An unattended lane ([`RunLaneRequest::done_signal`], set by `tm work run
+/// --unattended`; GitHub issue #184) is prepared with a
+/// [`crate::work::run::PreparedRun::done_marker`]. Once its window is
+/// launched, a detached `tm work __await-lane` is spawned through
+/// `deps.detach` with a [`crate::work::detach::SupervisorState`] state file:
+/// it waits for the marker and finishes the row, since the agent stays at
+/// its prompt and the SessionEnd hook would only fire when someone exits
+/// the session. Its output goes to the run's log, recorded on the row.
+#[allow(clippy::too_many_arguments)]
 fn run_interactive(
     ctx: &WorkContext<'_>,
+    deps: &RunDeps<'_>,
     run_deps: &crate::work::run::RunLaneDeps<'_>,
     admitted: &crate::work::admission::Admitted,
     paths: &crate::work::run::RunLanePaths,
@@ -692,6 +710,9 @@ fn run_interactive(
             resume: run_deps.runner.resume_spec(&prepared.invocation),
         },
     )?;
+    if prepared.done_marker.is_some() {
+        spawn_lane_awaiter(deps, paths, &prepared)?;
+    }
 
     writeln!(
         out,
@@ -705,10 +726,45 @@ fn run_interactive(
         "window    {}:{}",
         target.session_name, target.window_name
     )?;
+    if let Some(marker) = &prepared.done_marker {
+        writeln!(out, "awaiting  {}", marker.display())?;
+    }
     writeln!(out, "attach:   tmux attach -t {}", target.session_name)?;
     writeln!(out, "watch:    tm runs watch")?;
 
     Ok(true)
+}
+
+/// Spawns the detached `tm work __await-lane` for an unattended interactive
+/// lane (GitHub issue #184; see [`run_interactive`]): records the run's log
+/// path on its row, writes the awaiter's state file next to it, and spawns
+/// the awaiter with its output appended to that log.
+fn spawn_lane_awaiter(
+    deps: &RunDeps<'_>,
+    paths: &crate::work::run::RunLanePaths,
+    prepared: &crate::work::run::PreparedRun,
+) -> Result<(), WorkCliError> {
+    std::fs::create_dir_all(&paths.state_dir)?;
+    let log_path =
+        crate::work::run::run_log_path(&paths.state_dir, &prepared.wt_name, &prepared.timestamp);
+    deps.run_store
+        .update_log_path(prepared.run_id, &log_path.to_string_lossy())?;
+    let state_path = paths.state_dir.join(format!(
+        "{}-{}.await.json",
+        prepared.wt_name, prepared.timestamp
+    ));
+    let state = crate::work::detach::SupervisorState {
+        prepared: prepared.clone(),
+        run_db_path: deps.run_db_path.to_path_buf(),
+    };
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+    deps.detach.spawn_detached(
+        deps.current_exe,
+        &crate::work::detach::await_lane_argv(&state_path),
+        &prepared.worktree,
+        &log_path,
+    )?;
+    Ok(())
 }
 
 /// `tm work __supervise --state-file <path>`: the detached run's re-exec'd
@@ -748,6 +804,26 @@ pub fn supervise(
         out,
     )?;
     Ok(!outcome.is_error)
+}
+
+/// `tm work __await-lane --state-file <path>`: the detached lane awaiter's
+/// entry point (GitHub issue #184). Runs
+/// [`crate::work::lane_await::await_lane`] over the
+/// [`crate::work::detach::SupervisorState`] [`run_interactive`] wrote: wait
+/// for the lane's done marker, then finish its run and run the post-PR tail.
+///
+/// Split from the thin `main.rs`-level dispatch (which reads the state file
+/// and builds the real dependencies), like [`supervise`].
+pub fn await_lane(
+    deps: &crate::work::lane_await::AwaitLaneDeps<'_>,
+    state: &crate::work::detach::SupervisorState,
+    out: &mut dyn Write,
+) -> Result<crate::work::lane_await::AwaitOutcome, WorkCliError> {
+    Ok(crate::work::lane_await::await_lane(
+        deps,
+        &state.prepared,
+        out,
+    )?)
 }
 
 /// `tm work session <KEY>`: rebuild `key`'s `tm-<scope>-<key>` tmux session and its
@@ -2957,6 +3033,112 @@ mod tests {
         let printed = out_string(&out);
         assert!(printed.contains("window    tm-proj-proj-1:work"));
         assert!(printed.contains("attach:   tmux attach -t tm-proj-proj-1"));
+    }
+
+    #[test]
+    fn run_interactive_with_done_signal_spawns_the_lane_awaiter() {
+        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            "mylane".to_string(),
+            lane_config_for_run(&repo_root.to_string_lossy()),
+        );
+        let config = WorkConfig {
+            worktree_root: Some(tmp.path().join("Worktrees").to_string_lossy().into_owned()),
+            ..config_with_lanes(lanes)
+        };
+
+        let git = FakeGitOps::new();
+        let tmux = FakeTmuxOps::new();
+        let ctx = WorkContext {
+            git: &git,
+            tmux: &tmux,
+            config: &config,
+            home: &home,
+        };
+
+        let gh = FakeGhCli::new();
+        let spawner = FakeProcessSpawner::success(canned_claude_json());
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let run_db_path = tmp.path().join("runs.db");
+        let deps = RunDeps {
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+            memory_pressure: &normal_pressure,
+            usage: &crate::config::UsageConfig::default(),
+            usage_prober: &NoUsageProbe,
+            usage_gate: crate::work::admission::UsageGateMode::Enforce,
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            done_signal: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+
+        let succeeded = run(
+            &ctx,
+            &deps,
+            "mylane",
+            request,
+            Dispatch::Interactive,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(succeeded);
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+        let state_dir = tmp.path().join("home/.local/state/tskmstr/work");
+        let state_path = state_dir.join("proj-1-20260806-090503.await.json");
+        let recorded = detach.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one awaiter");
+        assert_eq!(recorded[0].program, current_exe);
+        assert_eq!(
+            recorded[0].argv,
+            crate::work::detach::await_lane_argv(&state_path)
+        );
+
+        let marker = state_dir.join("proj-1-20260806-090503.done");
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        let state: SupervisorState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            state.prepared.done_marker.as_deref(),
+            Some(marker.as_path())
+        );
+        assert_eq!(state.run_db_path, run_db_path);
+
+        let run_row = run_store.run_by_id(state.prepared.run_id).unwrap().unwrap();
+        assert_eq!(run_row.status, RunStatus::Running);
+        assert_eq!(
+            run_row.log_path.as_deref(),
+            Some(recorded[0].log_path.to_string_lossy()).as_deref()
+        );
+
+        let printed = out_string(&out);
+        assert!(
+            printed.contains(&format!("awaiting  {}", marker.display())),
+            "{printed}"
+        );
+        assert!(printed.contains("window    tm-proj-proj-1:work"));
     }
 
     #[test]

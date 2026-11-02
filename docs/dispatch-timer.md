@@ -115,8 +115,9 @@ Why 5 minutes:
 - **Cost.** Most of a tick is `tm ready`'s classification: one tracker
   search plus `gh` calls. On this project that measured 1.7 to 1.9 seconds
   per scope. A launch adds the time `tm work run --unattended` takes to
-  create a worktree and hand the agent to its supervisor. At 5 minutes
-  that is about 2 seconds of work every 300 seconds per scope.
+  create a worktree, open the lane's `work` window and spawn its awaiter.
+  At 5 minutes that is about 2 seconds of work every 300 seconds per
+  scope.
 - **Latency.** A lane run takes tens of minutes. Waiting up to 5 more
   minutes for the next slot to fill changes little, and a lane that
   finishes is replaced on the next tick.
