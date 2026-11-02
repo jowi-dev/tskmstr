@@ -374,7 +374,7 @@ re-checks it at the tmux seam.
 
 ## Auto-review windows (GitHub issue #150)
 
-`tm review auto`'s rounds and fix passes now take windows in the ticket's
+`tm review auto`'s rounds and fix passes run in windows of the ticket's
 session too: a `review` window per round (`review-2`, ...) and the usual
 `fix` / `fix-N` window per fix pass, launched through the same interactive
 path as `tm review fix`, each with a hibernation `LaunchRecord`. The loop

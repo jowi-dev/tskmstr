@@ -14,13 +14,13 @@ review round is an interactive agent run in the ticket's existing worktree,
 hosted in a `review` / `review-N` window of the ticket's `tm-<scope>-<key>`
 session and recorded as `kind = "auto-review"`. Each fix round is an
 interactive `tm review fix <KEY>` pass in a `fix` / `fix-N` window,
-recorded as `kind = "review-fix"` (GitHub issue #150; the rounds were
-headless before).
+recorded as `kind = "review-fix"` (GitHub issue #150).
 
 The loop waits for each step's **signal file**, not for claude to exit: the
 round's findings file, or the fix pass's
-`<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done` marker (`<loop>` is the loop's pid and start time, so a leftover agent from an earlier loop never signals a later one)
-(`{"succeeded": true|false}`). tm appends a completion section to every
+`<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done` marker
+(`{"succeeded": true|false}`). `<loop>` is the loop's pid and start time,
+so a leftover agent from an earlier loop never signals a later one. tm appends a completion section to every
 round and fix prompt naming the file and the write-to-`.tmp`-then-rename
 step, so a custom prompt still signals. A file whose JSON is cut short
 counts as not ready; complete JSON of the wrong shape flags the step and
