@@ -47,7 +47,7 @@ use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
     AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LOOP_PID_EVENT, LoopOutcome,
-    StepState, run_loop,
+    SIGNAL_EVENT, StepState, run_loop,
 };
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::{GitError, GitOps};
@@ -924,20 +924,8 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
         })
     }
 
-    fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
-        // Leaves a row something else already ended alone, the rule
-        // `finish_run_from_supervisor` keeps.
-        self.deps
-            .run_store
-            .finish_run_from_supervisor(
-                run_id,
-                &crate::runs::FinishRun {
-                    status: RunStatus::Done,
-                    ..crate::runs::FinishRun::default()
-                },
-                false,
-            )
-            .map_err(|e| AutoReviewError::step("record", e))
+    fn mark_signalled(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError> {
+        self.record(run_id, SIGNAL_EVENT, step)
     }
 
     fn sleep(&self, secs: u64) {
@@ -2406,7 +2394,11 @@ mod tests {
             .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
             .unwrap()
             .unwrap();
-        assert_eq!(round.status, RunStatus::Done);
+        assert_eq!(
+            round.status,
+            RunStatus::Running,
+            "the row stays in flight until the window's agent exits"
+        );
         assert_eq!(round.pid, None, "the agent registers its own pid");
         assert_eq!(round.tmux_session.as_deref(), Some("tm-proj-proj-1"));
         assert_eq!(round.worktree, worktree.to_string_lossy());
@@ -2422,6 +2414,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(detail("auto_review_round"), vec!["1/2 clean"]);
+        assert_eq!(detail(SIGNAL_EVENT), vec!["review"]);
         assert_eq!(detail(LOOP_PID_EVENT), vec![std::process::id().to_string()]);
         assert_eq!(
             crate::work::hibernate::launch_record(&run_store, round.id)
@@ -2497,7 +2490,6 @@ mod tests {
             .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
             .unwrap()
             .unwrap();
-        assert_eq!(fix_run.status, RunStatus::Done);
         assert!(
             run_store
                 .events_for_run(fix_run.id)
@@ -2514,10 +2506,14 @@ mod tests {
         assert!(fix_prompt.contains("fix-1.done"), "{fix_prompt}");
         for run in run_store.all_runs().unwrap() {
             if run.kind != "lane" {
-                assert_ne!(
-                    run.status,
-                    RunStatus::Running,
-                    "run {} left running",
+                assert_eq!(run.status, RunStatus::Running, "run {}", run.id);
+                assert!(
+                    run_store
+                        .events_for_run(run.id)
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.kind == SIGNAL_EVENT),
+                    "run {} has no signal event",
                     run.id
                 );
             }
@@ -2553,7 +2549,19 @@ mod tests {
             .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
             .unwrap()
             .unwrap();
-        assert_eq!(round.status, RunStatus::Review);
+        assert_eq!(
+            round.status,
+            RunStatus::Running,
+            "the agent may still be working: the flag waits for it to exit"
+        );
+        let kinds: Vec<String> = run_store
+            .events_for_run(round.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&crate::runs::REVIEW_FLAG_EVENT.to_string()));
+        assert!(!kinds.contains(&SIGNAL_EVENT.to_string()));
         assert_eq!(*fakes.sleeper.sleeps.borrow(), 6);
         assert!(
             !fakes

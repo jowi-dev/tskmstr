@@ -28,6 +28,13 @@ pub const ROUND_EVENT: &str = "auto_review_round";
 /// board's `review:` badge reads the loop's liveness from this event.
 pub const LOOP_PID_EVENT: &str = "auto_review_loop_pid";
 
+/// Event kind the loop records on a review or fix row once its step's
+/// signal file is read, its detail `review` or `fix` (GitHub issue #150).
+/// The row itself stays `running` until its agent exits, so the idle sweep
+/// hibernates the agent and admission counts it; this event is what marks
+/// the window as finished for [`crate::work::hibernate::ended_launch_windows`].
+pub const SIGNAL_EVENT: &str = "auto_review_signalled";
+
 /// Skill a first round reviews with.
 pub const FIRST_ROUND_SKILL: &str = "thatch-code-review";
 
@@ -317,8 +324,10 @@ pub trait AutoReviewOps {
     fn fix(&self, round: u32, completion: String) -> Result<Option<i64>, AutoReviewError>;
     /// The state of a launched step's run row `run_id`.
     fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError>;
-    /// Marks run `run_id` done: its step signalled success.
-    fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError>;
+    /// Records that run `run_id`'s `step` (`review` or `fix`) signalled, as
+    /// a [`SIGNAL_EVENT`]. The row keeps its status: its agent is still
+    /// open in its window.
+    fn mark_signalled(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError>;
     /// Waits `secs` seconds between two signal polls.
     fn sleep(&self, secs: u64);
     /// Posts the store with `vdiff --publish-comments <pr>`.
@@ -427,9 +436,11 @@ pub struct LoopOutcome {
 ///
 /// Each round and each fix pass is launched and then waited on through its
 /// signal file, for at most `cfg.round_timeout_mins` each. A step that
-/// signals is marked done; one that times out or is hibernated first is
-/// flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose row is
-/// ended by something else ends it as [`RoundVerdict::Stopped`].
+/// signals gets a [`SIGNAL_EVENT`]; one that times out or is hibernated
+/// first is flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose
+/// row is ended by something else ends it as [`RoundVerdict::Stopped`]. The
+/// loop never ends a row itself: each one stays in flight until its agent
+/// exits, and a flag on it applies then ([`crate::runs::RunStore::flag_for_review`]).
 ///
 /// # Errors
 ///
@@ -468,7 +479,7 @@ pub fn run_loop(
             try_read_findings(&findings_file)
         })? {
             Signal::Received(findings) => {
-                ops.finish_step(run_id)?;
+                ops.mark_signalled(run_id, "review")?;
                 findings
             }
             Signal::Stuck => {
@@ -507,13 +518,12 @@ pub fn run_loop(
             None => true,
             Some(fix_run) => {
                 match wait_for_signal(ops, fix_run, timeout_secs, || read_fix_marker(&marker))? {
-                    Signal::Received(true) => {
-                        ops.finish_step(fix_run)?;
-                        true
-                    }
-                    Signal::Received(false) => {
-                        ops.flag(fix_run)?;
-                        false
+                    Signal::Received(succeeded) => {
+                        ops.mark_signalled(fix_run, "fix")?;
+                        if !succeeded {
+                            ops.flag(fix_run)?;
+                        }
+                        succeeded
                     }
                     Signal::Stuck => {
                         ops.flag(fix_run)?;
@@ -573,7 +583,7 @@ mod tests {
         elapsed: std::cell::Cell<i64>,
         sleeps: std::cell::Cell<u32>,
         states: RefCell<std::collections::HashMap<i64, StepState>>,
-        finished: RefCell<Vec<i64>>,
+        signalled: RefCell<Vec<i64>>,
         completions: RefCell<Vec<String>>,
         /// Whether a fix pass writes its marker at all.
         fix_signals: bool,
@@ -599,7 +609,7 @@ mod tests {
                 elapsed: std::cell::Cell::new(0),
                 sleeps: std::cell::Cell::new(0),
                 states: RefCell::new(std::collections::HashMap::new()),
-                finished: RefCell::new(Vec::new()),
+                signalled: RefCell::new(Vec::new()),
                 completions: RefCell::new(Vec::new()),
                 fix_signals: true,
                 nothing_to_fix: false,
@@ -664,8 +674,8 @@ mod tests {
                 .unwrap_or(StepState::Running))
         }
 
-        fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
-            self.finished.borrow_mut().push(run_id);
+        fn mark_signalled(&self, run_id: i64, _step: &'static str) -> Result<(), AutoReviewError> {
+            self.signalled.borrow_mut().push(run_id);
             Ok(())
         }
 
@@ -1087,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn steps_that_signal_after_a_delay_let_the_loop_advance_and_end_their_rows() {
+    fn steps_that_signal_after_a_delay_let_the_loop_advance_and_mark_their_rows() {
         let tmp = TempDir::new().unwrap();
         let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
         ops.signal_after = Some(3);
@@ -1101,7 +1111,7 @@ mod tests {
                 verdict: RoundVerdict::Clean
             }
         );
-        assert_eq!(*ops.finished.borrow(), vec![101, 201, 102]);
+        assert_eq!(*ops.signalled.borrow(), vec![101, 201, 102]);
         assert_eq!(ops.sleeps.get(), 9, "three polls' sleeps per step");
         assert!(
             ops.completions.borrow()[0]
@@ -1151,7 +1161,7 @@ mod tests {
             ]
         );
         assert_eq!(ops.elapsed.get(), 60);
-        assert!(ops.finished.borrow().is_empty());
+        assert!(ops.signalled.borrow().is_empty());
     }
 
     #[test]
@@ -1177,7 +1187,7 @@ mod tests {
         let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
-        assert_eq!(*ops.finished.borrow(), vec![101]);
+        assert_eq!(*ops.signalled.borrow(), vec![101]);
     }
 
     #[test]
@@ -1221,7 +1231,7 @@ mod tests {
                 "record 101 auto_review_round 1/2 stuck"
             ]
         );
-        assert_eq!(*ops.finished.borrow(), vec![101]);
+        assert_eq!(*ops.signalled.borrow(), vec![101]);
     }
 
     #[test]
@@ -1246,6 +1256,6 @@ mod tests {
         let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
 
         assert_eq!(outcome.verdict, RoundVerdict::Clean);
-        assert_eq!(*ops.finished.borrow(), vec![101, 102]);
+        assert_eq!(*ops.signalled.borrow(), vec![101, 102]);
     }
 }

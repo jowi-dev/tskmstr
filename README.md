@@ -1937,11 +1937,14 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
-to exit: it polls the step's signal file, marks the step's run `done` when
-the file appears, and moves on. The window stays open. Idle finished
-windows are hibernated like any other interactive window, and `tm merge`
-removes them with the rest of the ticket's session, which also ends the
-loop.
+to exit: it polls the step's signal file, records an
+`auto_review_signalled` event on the step's run when the file appears, and
+moves on. The window stays open, and its run stays `running` until you exit
+claude there, so memory admission still counts the agent and the idle sweep
+hibernates it like any other interactive window. A later step opens beside
+a signalled window (`review-2`, `fix-2`), never beside one still working.
+`tm merge` removes the windows with the rest of the ticket's session, which
+also ends the loop.
 
 tm appends a completion section to every round and fix prompt, so a custom
 `prompt_file` that never mentions the signal files still produces them. It
@@ -1951,16 +1954,21 @@ not ready.
 
 **A step that never signals stops the loop.** If a round or fix pass
 writes nothing within `round_timeout_mins` (default 60, per step), or the
-idle sweep hibernates it before it signals, tm flags its run `review`
-("needs review" in the overview), records the round as `stuck`, and stops.
-The window is left open for you. If the step's run is ended by something
-else, such as you exiting claude before it signalled, or the ticket's
-session is gone, the loop records `stopped` and exits without flagging.
-Exiting a window's claude after tm already set its run's status never
-changes that status.
+idle sweep hibernates it before it signals, tm flags its run for review,
+records the round as `stuck`, and stops. The agent may still be working, so
+the flag waits: the run ends as `review` ("needs review" in the overview)
+when you exit its claude. Until then its window is left open for you, and
+blocks a second fix pass from opening beside it. A hibernated step stays
+hibernated, so attaching to the session resumes its conversation. A flagged
+step that already ended moves to `review` at once. If the step's run is
+ended by something else, such as you exiting claude before it signalled, or
+the ticket's session is gone, the loop records `stopped` and exits without
+flagging. Exiting a window's claude after its run already ended never
+changes that run's status.
 
 At `max_review_rounds` with findings still above the threshold, the loop
-stops and marks that round's run `review` instead of fixing again. Each
+stops and flags that round's run for review the same way, instead of
+fixing again. Each
 round records an `auto_review_round` event (`1/2 fix`, `2/2 clean`,
 `2/2 capped`, `1/2 fix-failed`, `1/2 stuck`, `1/2 stopped`), and the overview row shows the newest one as
 `review 2/2 capped`, drawn as a warning when the loop stopped short of

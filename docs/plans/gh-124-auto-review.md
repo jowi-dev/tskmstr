@@ -23,10 +23,14 @@ round's findings file, or the fix pass's
 (`{"succeeded": true|false}`). tm appends a completion section to every
 round and fix prompt naming the file and the write-to-`.tmp`-then-rename
 step, so a custom prompt still signals. A file that exists but does not
-parse counts as not ready. When the signal arrives, the step's row is
-finished `done` and its window stays open. With no signal within
-`round_timeout_mins`, or a row hibernated before its signal, the step's row
-is flagged `review` and the loop ends **stuck**. A row ended by something
+parse counts as not ready. When the signal arrives, the step's row gets an
+`auto_review_signalled` event and its window stays open. The row stays
+`running` until its agent exits, so the idle sweep and memory admission
+still see the agent. With no signal within `round_timeout_mins`, or a row
+hibernated before its signal, the step's row is flagged for review and the
+loop ends **stuck**. A row still in flight keeps its status and gets a
+`review_flag` event, applied when the session-end hook finishes it; a
+hibernated row stays wakeable. A row ended by something
 else, or a ticket session that no longer exists (`tm merge`), ends the loop
 **stopped**, unflagged. The loop records its pid on every row it creates as
 an `auto_review_loop_pid` event, which the board's `review:` badge reads
@@ -48,8 +52,8 @@ One round:
 5. If no finding is at or above `fix_threshold`, the loop ends **clean**.
    LOW findings stay in the store for the human to see in `V`.
 6. If this was round `max_review_rounds`, the loop ends **capped**. The
-   round's run row is finished as `review` and gets an `auto_review_capped`
-   event, and the store is left in place for the human.
+   round's run row is flagged for review, as for a stuck step, and the
+   store is left in place for the human.
 7. Otherwise tm starts an interactive `tm review fix <KEY>` pass and waits
    for its marker. Then it moves the whole
    store to `<git-dir>/vdiff/archive/<round>.json` and leaves an empty

@@ -1048,9 +1048,10 @@ pub enum RunsCmd {
         #[arg(long, value_name = "KIND")]
         if_kind: Option<String>,
         /// Leave an already-ended run's status (blocked, review, done,
-        /// failed, interrupted) as it is, recording only the rest of the outcome.
-        /// The session-end hooks pass this so exiting a session never
-        /// overwrites a status tm already set.
+        /// failed, interrupted) as it is, recording only the rest of the
+        /// outcome, and end a run tm flagged for review while it ran as
+        /// review. The session-end hooks pass this so exiting a session
+        /// never overwrites a status tm already set.
         #[arg(long)]
         keep_status: bool,
     },

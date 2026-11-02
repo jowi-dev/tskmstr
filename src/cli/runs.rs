@@ -203,9 +203,10 @@ pub struct FinishGuard {
     pub if_kind: Option<String>,
     /// A run that has already ended ([`RunStatus::has_ended`]) keeps its
     /// status; the rest of the outcome (usage, session id, ...) is still
-    /// recorded. The SessionEnd hooks pass this so
-    /// the user exiting a session never turns the auto-review loop's
-    /// `review` flag back into `done` (GitHub issue #150).
+    /// recorded. A run flagged while in flight
+    /// ([`RunStore::flag_for_review`]) ends as `review`. The SessionEnd
+    /// hooks pass this so the user exiting a session never turns the
+    /// auto-review loop's flag into `done` (GitHub issue #150).
     pub keep_status: bool,
 }
 

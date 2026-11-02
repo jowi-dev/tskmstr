@@ -450,6 +450,10 @@ impl RunStatus {
     }
 }
 
+/// `run_events.kind` of the event [`RunStore::flag_for_review`] records on
+/// a run still in flight, applied when the run ends.
+pub const REVIEW_FLAG_EVENT: &str = "review_flag";
+
 /// [`RunStatus::has_ended`]'s statuses, as an SQL list for `status IN (...)`.
 const ENDED_STATUSES_SQL: &str = "('blocked', 'review', 'done', 'failed', 'interrupted')";
 
@@ -1943,7 +1947,8 @@ impl RunStore {
 
     /// Finishes run `run_id` with `outcome`, except that a run that has
     /// already ended ([`RunStatus::has_ended`]) keeps its status and its
-    /// first `ended_at`. One `UPDATE`, so a status another writer sets
+    /// first `ended_at`, and a run [`RunStore::flag_for_review`] flagged
+    /// while it was in flight ends as `review`. One `UPDATE`, so a status another writer sets
     /// between a read and the finish is never overwritten. Returns the
     /// status the row ends with. `tm runs finish --keep-status` (the
     /// SessionEnd hooks, GitHub issue #150).
@@ -1963,6 +1968,10 @@ impl RunStore {
                     "UPDATE runs SET
                         status = CASE
                             WHEN status IN {ENDED_STATUSES_SQL} THEN status
+                            WHEN EXISTS (
+                                SELECT 1 FROM run_events e
+                                 WHERE e.run_id = runs.id AND e.kind = '{REVIEW_FLAG_EVENT}'
+                            ) THEN 'review'
                             ELSE ?1
                         END,
                         ended_at = COALESCE(ended_at, {NOW_SQL}),
@@ -1998,22 +2007,46 @@ impl RunStore {
         Ok(RunStatus::parse(&status).unwrap_or(RunStatus::Interrupted))
     }
 
-    /// Mark run `run_id` as [`RunStatus::Review`], leaving `ended_at` as it
-    /// is: `tm review auto` (GitHub issue #124) flags a finished review
-    /// round this way when it hits its round cap, so the overview shows the
+    /// Flags run `run_id` for a human as [`RunStatus::Review`]: `tm review
+    /// auto` (GitHub issue #124) flags a round that hit its cap, a failed
+    /// fix pass, or a step that never signalled, so the overview shows the
     /// ticket as needing a human.
+    ///
+    /// A run that has ended moves to `review` now, keeping its `ended_at`.
+    /// A run still in flight (`queued`, `running`, `hibernated`) keeps its
+    /// status, so the idle sweep and admission still see its live agent
+    /// (GitHub issue #150): the flag is recorded as a [`REVIEW_FLAG_EVENT`]
+    /// instead, and [`RunStore::finish_keeping_status`] ends the run as
+    /// `review` when its agent exits. Both in one transaction, so a run
+    /// ending in between is still flagged.
     ///
     /// # Errors
     ///
     /// [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
     pub fn flag_for_review(&self, run_id: i64) -> Result<(), RunStoreError> {
-        let changes = self.conn.execute(
-            "UPDATE runs SET status = ?1 WHERE id = ?2",
-            params![RunStatus::Review.as_str(), run_id],
-        )?;
-        if changes == 0 {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
             return Err(RunStoreError::RunNotFound(run_id));
         }
+        tx.execute(
+            &format!(
+                "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, ?2, NULL)"
+            ),
+            params![run_id, REVIEW_FLAG_EVENT],
+        )?;
+        tx.execute(
+            "UPDATE runs SET status = ?1
+              WHERE id = ?2 AND status NOT IN ('queued', 'running', 'hibernated')",
+            params![RunStatus::Review.as_str(), run_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -5084,6 +5117,34 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Review);
         assert_eq!(run.ended_at, ended_at);
+    }
+
+    /// GitHub issue #150: flagging an interactive step whose agent is still
+    /// in its window must leave the row where the idle sweep and admission
+    /// see it, and apply when the agent exits.
+    #[test]
+    fn flag_for_review_defers_on_a_run_in_flight_until_it_finishes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let running = store.start_run(&start_params("PROJ-1")).unwrap();
+        let hibernated = store.start_run(&start_params("PROJ-2")).unwrap();
+        store.hibernate_run(hibernated).unwrap();
+
+        store.flag_for_review(running).unwrap();
+        store.flag_for_review(hibernated).unwrap();
+
+        let status = |id| store.run_by_id(id).unwrap().unwrap().status;
+        assert_eq!(status(running), RunStatus::Running);
+        assert_eq!(status(hibernated), RunStatus::Hibernated);
+        let done = FinishRun {
+            status: RunStatus::Done,
+            ..FinishRun::default()
+        };
+        assert_eq!(
+            store.finish_keeping_status(running, &done).unwrap(),
+            RunStatus::Review
+        );
+        assert_eq!(status(running), RunStatus::Review);
     }
 
     #[test]

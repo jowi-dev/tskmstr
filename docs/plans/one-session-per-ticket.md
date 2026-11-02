@@ -382,16 +382,19 @@ itself stays a detached process with no window.
 
 - **Finished windows stay open and do not block the next one.**
   `resolve_action_window` takes the names of windows whose run row has
-  already ended (`hibernate::ended_launch_windows`, decided by each window
-  name's newest launch record), so a live but finished `fix` window lets
-  `fix-2` open beside it. A window whose row is still running still
-  refuses.
+  already ended, or whose step has signalled (`hibernate::ended_launch_windows`,
+  decided by each window name's newest launch record), so a live but
+  finished `fix` window lets `fix-2` open beside it. A window whose row is
+  still working, including a step flagged stuck, still refuses.
 - **Done is a signal file, not claude exiting.** An interactive session sits
   at its prompt when finished, so the loop polls the round's findings file
-  or the fix pass's `fix-<round>.done` marker, then finishes the row itself.
+  or the fix pass's `fix-<round>.done` marker, then records an
+  `auto_review_signalled` event. It never ends the row: the row stays
+  `running` while the agent lives, so hibernation and admission see it.
 - **SessionEnd keeps a status tm already set.** The hooks call `tm runs
-  finish --keep-status`, so exiting a window after the loop flagged its row
-  `review` records usage without turning the flag back into `done`.
+  finish --keep-status`, which keeps an ended row's status and ends a row
+  the loop flagged while it was running (a `review_flag` event) as
+  `review`.
 
 ## Manual verification (open)
 
