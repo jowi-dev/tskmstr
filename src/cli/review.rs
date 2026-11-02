@@ -1602,7 +1602,7 @@ mod tests {
         assert_eq!(
             command,
             format!(
-                "'/usr/local/bin/tm' runs logs {} --follow",
+                "'/usr/local/bin/tm' runs logs {} --follow --transcript",
                 review_fix_run.id
             )
         );

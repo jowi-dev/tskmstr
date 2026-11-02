@@ -524,6 +524,13 @@ pub struct RunLaneRequest {
     /// explicitly; the conservative default is for programmatic callers that
     /// have not thought about window hosting.
     pub mode: RunMode,
+    /// Set by `tm work run --unattended` (GitHub issue #184) so a caller can
+    /// tell when the lane is done although claude stays at its prompt: an
+    /// interactive run's prompt then ends with
+    /// [`crate::work::lane_await::lane_completion_section`] and its
+    /// [`PreparedRun::done_marker`] is set. A headless run exits when it is
+    /// done, so it ignores this.
+    pub done_signal: bool,
 }
 
 /// Everything [`run_agent_and_finish`] needs to spawn the agent, wait, parse
@@ -583,6 +590,15 @@ pub struct PreparedRun {
     /// [`PreparedRun::fallbacks`].
     #[serde(default)]
     pub status_on_pr: Option<String>,
+    /// Where the lane's agent writes its done marker (GitHub issue #184):
+    /// `Some` only for an interactive run prepared with
+    /// [`RunLaneRequest::done_signal`], read by
+    /// [`crate::work::lane_await::await_lane`].
+    ///
+    /// `#[serde(default)]` for the same pre-existing-state-file reason as
+    /// [`PreparedRun::fallbacks`].
+    #[serde(default)]
+    pub done_marker: Option<PathBuf>,
 }
 
 /// One not-yet-attempted priority-routing fallback, carried on
@@ -1470,6 +1486,23 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
+    // GitHub issue #184: an unattended interactive lane never exits, so its
+    // prompt ends by telling the agent to write a done marker, after the
+    // interactive wrapping. An interactive lane has no in-run fallback:
+    // launch-time routing already skips an exhausted runner, but one that
+    // hits its limit mid-run stays at its prompt until the idle sweep
+    // hibernates it. Only the headless `run_agent_and_finish` walks
+    // `fallbacks`.
+    let done_marker = (request.done_signal && request.mode == RunMode::Interactive)
+        .then(|| paths.state_dir.join(format!("{wt_name}-{timestamp}.done")));
+    let prompt = match &done_marker {
+        Some(marker) => format!(
+            "{prompt}{}",
+            crate::work::lane_await::lane_completion_section(marker)
+        ),
+        None => prompt,
+    };
+
     let mut invocation = primary_runner.build_invocation(
         admitted,
         InvocationInputs {
@@ -1578,6 +1611,7 @@ pub fn prepare_run_lane(
             .ticket
             .as_ref()
             .and(deps.status_on_pr.map(str::to_string)),
+        done_marker,
     })
 }
 
@@ -1827,6 +1861,7 @@ pub fn prepare_existing_branch_run(
         out_json_path,
         fallbacks: Vec::new(),
         status_on_pr: None,
+        done_marker: None,
     })
 }
 
@@ -1843,7 +1878,11 @@ fn pr_url_regex() -> regex::Regex {
 /// first GitHub pull-request URL out of the run's result text. Both steps
 /// degrade to `None` on any failure — a missing PR is the normal case for a
 /// run that never opened one, never an error worth surfacing.
-fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Option<String> {
+pub(crate) fn resolve_pr_url(
+    gh: &dyn GhCli,
+    branch: &str,
+    result_text: Option<&str>,
+) -> Option<String> {
     if let Ok(Some(url)) = gh.pr_url_for_branch(branch)
         && !url.is_empty()
     {
@@ -1997,6 +2036,11 @@ pub fn run_agent_and_finish(
     let mut parsed = None;
     let mut all_attempts_rate_limited = false;
     for (index, attempt) in attempts.iter().enumerate() {
+        // A fallback truncates the output stream and writes another
+        // runner's format into it; the row says which.
+        if index > 0 {
+            run_store.update_agent(prepared.run_id, attempt.runner.name())?;
+        }
         let attempt_status = spawner.spawn(SpawnRequest {
             program: &attempt.invocation.program,
             args: &attempt.invocation.args,
@@ -2126,32 +2170,7 @@ pub fn run_agent_and_finish(
         force_status,
     )?;
 
-    // GitHub issue #92: `tm pr create` is the only other place
-    // `status_on_pr` fires, so a run whose agent opened its PR with plain
-    // `gh pr create` would otherwise leave its ticket wherever run start
-    // left it. Advisory, like `status_on_run_start` in `prepare_run_lane`:
-    // the run is already recorded, a ticket already in the target status
-    // (say, `tm pr create` moved it) is silent, and a failure only warns.
-    // `out` is the run log for a detached run, so both lines land there.
-    if let (true, Some(provider), Some(ticket), Some(target)) = (
-        has_pr,
-        ticket_provider,
-        prepared.ticket.as_deref(),
-        prepared.status_on_pr.as_deref(),
-    ) {
-        match crate::ticketing::reconcile_status(provider, ticket, target) {
-            crate::ticketing::StatusTransition::Applied(status) => {
-                writeln!(out, "moved {ticket} to {status}")?;
-            }
-            crate::ticketing::StatusTransition::AlreadyInStatus(_) => {}
-            crate::ticketing::StatusTransition::Warning(message) => {
-                writeln!(
-                    out,
-                    "warning: could not move {ticket} to \"{target}\" after its PR opened: {message}"
-                )?;
-            }
-        }
-    }
+    apply_status_on_pr(ticket_provider, prepared, has_pr, out)?;
 
     // Print the summary, mirroring work.ml's final printf block.
     let session_id = parsed.as_ref().map(|o| o.session_id.clone());
@@ -2202,6 +2221,44 @@ pub fn run_agent_and_finish(
     })
 }
 
+/// Advisorily moves a finished run's ticket to its `status_on_pr` once the
+/// run has a PR (GitHub issue #92). `tm pr create` is the only other place
+/// `status_on_pr` fires, so a run whose agent opened its PR with plain
+/// `gh pr create` would otherwise leave its ticket wherever run start left
+/// it. Advisory, like `status_on_run_start` in [`prepare_run_lane`]: the run
+/// is already recorded, a ticket already in the target status (say, `tm pr
+/// create` moved it) is silent, and a failure only warns. `out` is the run
+/// log for a detached run, so both lines land there. Shared by
+/// [`run_agent_and_finish`] and, for an unattended interactive lane,
+/// [`crate::work::lane_await::await_lane`] (GitHub issue #184).
+pub(crate) fn apply_status_on_pr(
+    ticket_provider: Option<&dyn TicketProvider>,
+    prepared: &PreparedRun,
+    has_pr: bool,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    if let (true, Some(provider), Some(ticket), Some(target)) = (
+        has_pr,
+        ticket_provider,
+        prepared.ticket.as_deref(),
+        prepared.status_on_pr.as_deref(),
+    ) {
+        match crate::ticketing::reconcile_status(provider, ticket, target) {
+            crate::ticketing::StatusTransition::Applied(status) => {
+                writeln!(out, "moved {ticket} to {status}")?;
+            }
+            crate::ticketing::StatusTransition::AlreadyInStatus(_) => {}
+            crate::ticketing::StatusTransition::Warning(message) => {
+                writeln!(
+                    out,
+                    "warning: could not move {ticket} to \"{target}\" after its PR opened: {message}"
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The detached supervisor's core: record this process's own pid on the
 /// already-created run row (see [`prepare_run_lane`]'s doc comment on why
 /// the pid recorded at `start_run` time is `None` for this path), then run
@@ -2218,9 +2275,12 @@ pub fn run_agent_and_finish(
 /// `tm pr watch` started here, the same point `status_on_pr` is applied —
 /// see [`auto_arm_watch`]. This covers lane runs and `tm review fix` passes
 /// alike, since both are supervised by this one function, so a fix pass
-/// re-arms bot review on its new push. `--fg` runs and interactive runs
-/// never reach it: an interactive run ends through `tm runs finish`, which
-/// is not hooked, the same gap `status_on_pr` has (GitHub issue #92).
+/// re-arms bot review on its new push. `--fg` runs and attended interactive
+/// runs never reach it: such a run ends through `tm runs finish`, which is
+/// not hooked, the same gap `status_on_pr` has (GitHub issue #92). An
+/// unattended interactive lane (`tm work run --unattended`) gets the same
+/// tail from [`crate::work::lane_await::await_lane`] once its agent writes
+/// its done marker (GitHub issue #184).
 ///
 /// `review_starter` starts `tm review auto` for a lane run that finished
 /// with a PR while its scope's autopilot flag is on (GitHub issue #145), so
@@ -2250,13 +2310,30 @@ pub fn supervise_run(
         runner,
         out,
     )?;
+    post_pr_tail(run_store, watch_armer, review_starter, prepared, out)?;
+    Ok(outcome)
+}
+
+/// What runs after a lane's row is finished and its `status_on_pr` is
+/// applied: `tm pr watch` when `watch_armer` is given, then `tm review
+/// auto` when `review_starter` is. Shared by the headless supervisor
+/// ([`supervise_run`]) and the unattended interactive lane's awaiter
+/// (`crate::work::lane_await::await_lane`), so a new post-PR step lands in
+/// both.
+pub fn post_pr_tail(
+    run_store: &RunStore,
+    watch_armer: Option<&dyn WatchArmer>,
+    review_starter: Option<&dyn AutoReviewStarter>,
+    prepared: &PreparedRun,
+    out: &mut dyn Write,
+) -> Result<(), RunLaneError> {
     if let Some(armer) = watch_armer {
         auto_arm_watch(run_store, armer, prepared, out)?;
     }
     if let Some(starter) = review_starter {
         autopilot_start_review(run_store, starter, prepared, out)?;
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Event kind [`autopilot_start_review`] records on the lane run. Its
@@ -2280,7 +2357,7 @@ pub trait AutoReviewStarter {
 /// takes this path too while autopilot is on. `tm review auto` refuses a
 /// second loop itself, so no dedup is needed here. A failed start only
 /// warns: the run itself is already recorded.
-fn autopilot_start_review(
+pub(crate) fn autopilot_start_review(
     run_store: &RunStore,
     starter: &dyn AutoReviewStarter,
     prepared: &PreparedRun,
@@ -2333,7 +2410,7 @@ pub trait WatchArmer {
 /// running. `tm pr watch` dedups too, but checking here keeps a duplicate
 /// spawn from appending a refusal to the watcher's log. A failed arm only
 /// warns: the run itself is already recorded.
-fn auto_arm_watch(
+pub(crate) fn auto_arm_watch(
     run_store: &RunStore,
     armer: &dyn WatchArmer,
     prepared: &PreparedRun,
@@ -3434,6 +3511,11 @@ mod tests {
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Done);
         assert_eq!(run.session_id.as_deref(), Some("ses-opencode"));
+        assert_eq!(
+            run.agent.as_deref(),
+            Some("opencode"),
+            "the row names the agent that actually ran"
+        );
 
         assert_eq!(
             run_store.agent_exhausted_until("claude").unwrap(),
@@ -5919,6 +6001,108 @@ mod tests {
         assert_eq!(run.pid, None, "no supervisor process to attribute a pid to");
     }
 
+    /// Prepares a `PROJ-1` run of `mylane` in `mode`, with `done_signal`
+    /// as given (GitHub issue #184), returning the state dir alongside.
+    fn prepare_with_done_signal(
+        mode: RunMode,
+        done_signal: bool,
+    ) -> (TempDir, PathBuf, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+            inherit_epic_blockers: true,
+        };
+        let state_dir = tmp.path().join("state");
+        let paths = RunLanePaths {
+            home,
+            state_dir: state_dir.clone(),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            mode,
+            done_signal,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        (tmp, state_dir, prepared)
+    }
+
+    #[test]
+    fn prepare_run_lane_interactive_with_done_signal_appends_the_lane_completion_section() {
+        let (_tmp, state_dir, prepared) = prepare_with_done_signal(RunMode::Interactive, true);
+
+        let marker = state_dir.join(format!("{}-{}.done", prepared.wt_name, prepared.timestamp));
+        assert_eq!(prepared.done_marker.as_deref(), Some(marker.as_path()));
+        let prompt = &prepared.invocation.args[0];
+        assert!(
+            prompt.ends_with(&crate::work::lane_await::lane_completion_section(&marker)),
+            "the section follows the interactive wrapping: {prompt}"
+        );
+        assert!(prompt.contains("tm runs register --kind lane PROJ-1"));
+    }
+
+    #[test]
+    fn prepare_run_lane_headless_ignores_done_signal() {
+        let (_tmp, _state_dir, prepared) = prepare_with_done_signal(RunMode::Headless, true);
+
+        assert_eq!(prepared.done_marker, None);
+        assert!(
+            !prepared
+                .invocation
+                .args
+                .iter()
+                .any(|arg| arg.contains("## Completion signal"))
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_interactive_without_done_signal_has_no_marker() {
+        let (_tmp, _state_dir, prepared) = prepare_with_done_signal(RunMode::Interactive, false);
+
+        assert_eq!(prepared.done_marker, None);
+        assert!(!prepared.invocation.args[0].contains("## Completion signal"));
+    }
+
     #[test]
     fn prepare_run_lane_interactive_registers_a_ticketless_run_under_its_lane_name() {
         // With no ticket the run row's `ticket` column holds the lane name,
@@ -6379,6 +6563,7 @@ mod tests {
         assert_eq!(round_tripped.worktree, prepared.worktree);
         assert_eq!(round_tripped.invocation, prepared.invocation);
         assert_eq!(round_tripped.out_json_path, prepared.out_json_path);
+        assert_eq!(round_tripped.done_marker, prepared.done_marker);
     }
 
     #[test]
@@ -6407,6 +6592,10 @@ mod tests {
         let prepared: PreparedRun = serde_json::from_str(json).unwrap();
 
         assert!(prepared.fallbacks.is_empty());
+        assert_eq!(
+            prepared.done_marker, None,
+            "a pre-#184 state file has no done_marker key"
+        );
     }
 
     #[test]

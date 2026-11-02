@@ -233,7 +233,7 @@ tm auth status
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
 | `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `c` toggles lifecycle columns, `s` attaches, `v`/`L` show the run detail/log, `B` opens `tm board` for the row's repo in a new tmux window, `V`/`F`/`M`/`Space` review, fix and merge in the row's own repo, `Tab` switches to `tm runs watch` |
-| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file, or an interactive run's Claude Code transcript as readable text |
+| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file, `--transcript` adds the agent's messages and tool calls, or an interactive run's Claude Code transcript as readable text |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -609,17 +609,22 @@ deliberate `blocked` status back to `done`.
 
 ### Log files
 
-Every detached run (`tm pr watch <KEY>`, and `tm work run <lane> ...
---headless`) redirects its stdout/stderr to a log file, recorded on the run
-row as `log_path`:
+Every detached process (`tm pr watch <KEY>`, `tm work run <lane> ...
+--headless`, and an unattended lane's awaiter) redirects its
+stdout/stderr to a log file, recorded on the run row as `log_path`:
 
 - `tm pr watch` (`kind = review-watch`): `<home>/.local/state/tskmstr/review-watch/<lowercased key>.log`
 - `tm work run --headless` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
+- `tm work run --unattended` without `--headless` (`kind = lane`, the
+  dispatcher's launch): the same `<state_dir>/<worktree name>-<timestamp>.log`,
+  holding only the lane awaiter's own lines (`tm work __await-lane`; see
+  [Autopilot dispatcher](#autopilot-dispatcher-dispatch)). The agent's output is its window's scrollback.
 
-Interactive runs (`tm work run` and `tm review fix` without `--headless`)
-have no log file: their output is the tmux window's scrollback, and their
-prompt is kept at `<state_dir>/<worktree name>-<timestamp>.prompt.md`. `tm
-runs show` remains the durable record of what happened.
+Attended interactive runs (`tm work run` and `tm review fix` without
+`--headless` or `--unattended`) have no log file: their output is the tmux
+window's scrollback, and their prompt is kept at
+`<state_dir>/<worktree name>-<timestamp>.prompt.md`. `tm runs show`
+remains the durable record of what happened.
 
 For `tm work run`, that file can already have content in it by the time the
 detached process's stdio is redirected there: the blocked-ticket
@@ -632,7 +637,7 @@ terminal, which for a detached run is gone the moment its launching shell
 closes. A permanent `gh` failure during that resolution (see below) fails
 the run outright, and that failure is logged here too before it propagates.
 
-`tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]`
+`tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]`
 resolves a run the same way `tm runs reopen` does (numeric row id, or ticket
 key optionally disambiguated with `--kind`) and prints its log:
 
@@ -640,7 +645,17 @@ key optionally disambiguated with `--kind`) and prints its log:
 tm runs logs AX-408                    # last 200 lines
 tm runs logs AX-408 --kind review-watch --tail 500
 tm runs logs AX-408 --follow           # like tail -f
+tm runs logs AX-408 --follow --transcript  # plus the agent's tool calls
 ```
+
+A headless run's log holds only tm's own status lines; everything the agent
+does goes to its output stream, the `.json` file beside the log.
+`--transcript` prints that stream too, one readable line per message or
+tool call (`→ Bash cargo test`, `✗ tool error: ...`, `result: done`),
+rendered by the run's agent adapter. If the run falls back to another
+agent, the stream starts over in that agent's format and `--follow`
+starts over with it. Without `--follow` it prints the last `--tail` rendered lines
+after the log tail; a stream that doesn't exist yet prints nothing extra.
 
 Runs started before the `log_path` column existed have it as `NULL`; for
 `kind = review-watch` specifically, `tm runs logs` falls back to the same
@@ -980,8 +995,7 @@ prompt opens by telling the session to run `tm runs register --kind lane
 for it. A second `work` run is refused while one is still live in the
 session, before anything is provisioned.
 
-`--headless` keeps the previous behavior for CI, cron, and unattended
-batches: a one-shot `claude -p` under a `setsid`'d supervisor that runs
+`--headless` keeps the previous behavior for CI and cron: a one-shot `claude -p` under a `setsid`'d supervisor that runs
 `claude`, records the outcome, and is bounded by `--max-turns`. `--fg` runs
 that same headless pass synchronously and reports the run's outcome in the
 command's exit code — it implies `--headless`, since an interactive session
@@ -1202,9 +1216,33 @@ it. A tick:
    Notifications use `notify-send` on Linux and `osascript` on macOS. If
    the command is not installed, the tick sends nothing and carries on.
 
-`--unattended` is a hidden `tm work run` flag. It implies `--headless`. It
-drops metered runners from the fallback chain unless `allow_paid_fallback`
-is set. It also refuses, rather than warns, when usage admission says no.
+`--unattended` is a hidden `tm work run` flag. It drops metered runners
+from the fallback chain unless `allow_paid_fallback` is set. It also
+refuses, rather than warns, when usage admission says no.
+
+An unattended lane runs interactively, in the ticket's `work` window, so
+you can attach to it like any other lane (GitHub issue #184). Its prompt
+ends by asking the agent to write a done marker once its PR is open, or
+to write a failure marker if it stops without one. A detached `tm work
+__await-lane` process waits for that marker. Then it finishes the run row
+(`done`, or `blocked` with no PR) and runs what a headless run does once
+its PR is open: `status_on_pr`, `tm pr watch` when `auto_arm` is on, and
+`tm review auto` under autopilot. A status the agent set itself with `tm
+runs finish` is kept, and a marker written up to two minutes after that
+still counts. Until the marker appears, the row stays `running` and
+counts toward `max_lanes`. If the session ends first, or the row stays
+ended past those two minutes, the awaiter stops and leaves the row
+alone. Every dispatch tick restarts the awaiter of a live lane that lost
+its own (a failed spawn, a crash, a reboot while the lane was
+hibernated), from the `<wt>-<ts>.await.json` state file kept beside the
+run's log until the awaiter finishes.
+
+An interactive lane has no in-run fallback. The launch still routes past
+an agent already known to be exhausted, but an agent that hits its usage
+limit partway through stays at its prompt, holding its `max_lanes` slot,
+until the idle sweep hibernates it; resume it once the limit resets.
+Headless lanes (`--headless`) still fall back to the next runner mid-run. Pass `--headless` as well to get the old
+supervisor-driven `claude -p` run.
 
 ```toml
 [dispatch]
@@ -1537,7 +1575,8 @@ Binding it to a window would make `tmux kill-session` (or a reboot) silently
 kill a run mid-flight.
 
 So a headless run gets a window too, but a **viewer**: it runs
-`tm runs logs <id> --follow` and owns nothing. Kill it, or kill the whole
+`tm runs logs <id> --follow --transcript`, which shows the agent's messages
+and tool calls as they happen, and owns nothing. Kill it, or kill the whole
 session, and the run carries on. If tmux is unavailable the viewer is simply
 skipped, reported as a `window none` line — the run is unaffected either way.
 
@@ -1866,9 +1905,12 @@ the same detached `tm pr watch <KEY>`, unless a watcher for the ticket is
 already running. A fix pass therefore re-arms bot review for the commits
 it pushed. Each attempt is recorded as an `auto_arm` event on the run
 (`armed tm pr watch`, `already watching (run N)`, or `failed: ...`); a
-failure only warns and never fails the run. Interactive runs and `--fg`
-runs are not covered: an interactive run ends through `tm runs finish`,
-which is not hooked, the same gap `status_on_pr` has. Combined with
+failure only warns and never fails the run. An unattended interactive
+lane (the dispatcher's launch) is covered too: its lane awaiter (`tm work
+__await-lane`) arms the watch once the agent signals it is done.
+Attended interactive runs and `--fg` runs are not: an attended run ends
+through `tm runs finish`, which is not hooked, the same gap
+`status_on_pr` has. Combined with
 `on_bots_done = "launch"`, a run can go from PR to cleanup session
 unattended, so it is off by default.
 
@@ -2036,11 +2078,15 @@ the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
 
 **Under autopilot, review bots never gate the review.** While the ticket's
-scope has autopilot on, a detached lane run that finishes with a PR starts
-`tm review auto` straight from its supervisor, without waiting for any
-review bot, and records an `autopilot_review` event on the run
-(`started tm review auto` or `failed: ...`). This keys on the flag, not on
-how the lane was launched, so a lane you start by hand takes this path too.
+scope has autopilot on, a lane run that finishes with a PR starts `tm
+review auto` straight away, without waiting for any review bot, and
+records an `autopilot_review` event on the run (`started tm review auto`
+or `failed: ...`). A headless lane starts it from its supervisor; the
+dispatcher's interactive lanes start it from their lane awaiter (`tm work
+__await-lane`). This keys on the flag, not on how the lane was launched,
+so a headless lane you start by hand takes this path too. An attended
+interactive lane (no `--headless`, no `--unattended`) has neither, so it
+does not.
 Before each fix round, the loop imports the PR's unresolved `review_bots`
 threads into the comment store the same way `tm review import` imports
 human ones, so one fix pass handles thatch's findings and bugbot's comments

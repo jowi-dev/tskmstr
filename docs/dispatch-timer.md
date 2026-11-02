@@ -82,11 +82,14 @@ tm-dispatch.timer`, and `journalctl --user -u tm-dispatch.service`.
 
 Three settings in `tm-dispatch.service` matter:
 
-- **`KillMode=process`.** The lane runs a tick launches are detached
-  supervisors, but `setsid` does not move them out of the service's cgroup.
-  Under the default `KillMode=control-group`, systemd kills every one of
-  them the moment the oneshot tick exits. This was checked with a oneshot
-  unit that starts a `setsid` child: the child died under
+- **`KillMode=process`.** A tick launches each lane into a tmux window
+  and spawns a detached lane awaiter (`tm work __await-lane`) beside it.
+  When no tmux server is running yet, the tick's `tmux new-session` also
+  starts the server, which then hosts every lane's agent. `setsid` moves
+  neither out of the service's cgroup, so under the default
+  `KillMode=control-group` systemd kills the awaiter, the tmux server and
+  every agent in it the moment the oneshot tick exits. This was checked
+  with a oneshot unit that starts a `setsid` child: the child died under
   `control-group` and survived under `process`.
 - **`PATH`.** A user service gets a minimal `PATH`. `tm`, `git`, `gh`,
   `tmux`, and your agent CLI must all be on it. The shipped value covers
@@ -115,8 +118,9 @@ Why 5 minutes:
 - **Cost.** Most of a tick is `tm ready`'s classification: one tracker
   search plus `gh` calls. On this project that measured 1.7 to 1.9 seconds
   per scope. A launch adds the time `tm work run --unattended` takes to
-  create a worktree and hand the agent to its supervisor. At 5 minutes
-  that is about 2 seconds of work every 300 seconds per scope.
+  create a worktree, open the lane's `work` window and spawn its awaiter.
+  At 5 minutes that is about 2 seconds of work every 300 seconds per
+  scope.
 - **Latency.** A lane run takes tens of minutes. Waiting up to 5 more
   minutes for the next slot to fill changes little, and a lane that
   finishes is replaced on the next tick.

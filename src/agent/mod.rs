@@ -75,6 +75,62 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// `text` as one display line for the headless viewer (GitHub issue #184):
+/// every run of whitespace, newlines included, collapsed to a single space,
+/// then cut to at most `max_chars` characters, the last of which is `…`
+/// when anything was cut. Shared by each adapter's
+/// [`AgentRunner::progress_lines`].
+pub(crate) fn one_line(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut cut: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
+    cut.push('…');
+    cut
+}
+
+/// The keys of a tool call's input that best say what the call does, in
+/// preference order: a shell command, then a file or path, a search
+/// pattern, a URL, and the free-text description or prompt a subagent call
+/// carries. Shared by both adapters' [`AgentRunner::progress_lines`], since
+/// the two CLIs' built-in tools name their inputs alike, except that
+/// opencode spells the file key `filePath`.
+const TOOL_SUMMARY_KEYS: &[&str] = &[
+    "command",
+    "file_path",
+    "filePath",
+    "path",
+    "pattern",
+    "url",
+    "description",
+    "prompt",
+];
+
+/// One-line summary of a tool call's `input` object for the viewer (GitHub
+/// issue #184): the first [`TOOL_SUMMARY_KEYS`] entry holding a string,
+/// through [`one_line`] at 120 characters. Empty when none does.
+pub(crate) fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
+    TOOL_SUMMARY_KEYS
+        .iter()
+        .find_map(|key| input?.get(key)?.as_str())
+        .map(|value| one_line(value, 120))
+        .unwrap_or_default()
+}
+
+/// `→ <name> <summary>`, or `→ <name>` when the summary is empty: one tool
+/// call as a viewer line (GitHub issue #184).
+pub(crate) fn tool_call_line(name: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("→ {name}")
+    } else {
+        format!("→ {name} {summary}")
+    }
+}
+
 /// The house delegation constraints every scaffolded subagent definition
 /// carries in its body, regardless of runner (GitHub issue #52). Shared by
 /// each adapter's [`AgentRunner::agent_definition_template`] so the two
@@ -870,6 +926,16 @@ pub trait AgentRunner: Sync {
     /// the `--yes` default. See [`LaneModelPrompt`].
     fn lane_model_prompt(&self) -> LaneModelPrompt;
 
+    /// Renders one line of this runner's headless output stream (the
+    /// `<wt>-<ts>.json` file a detached lane writes) as zero or more
+    /// human-readable lines for the viewer window (GitHub issue #184), so
+    /// `tm runs logs --transcript` shows the agent's messages and tool
+    /// calls as they happen. Unparseable or uninteresting lines render as
+    /// nothing. The default renders nothing at all.
+    fn progress_lines(&self, _line: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Validate a lane `model` spelling a user entered for this runner,
     /// returning a human-readable reason when it's rejected so an
     /// interactive `tm init` re-prompts instead of writing an unusable
@@ -943,6 +1009,45 @@ mod tests {
             claude.contains("{ticket_list}"),
             "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
         );
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_and_newlines() {
+        assert_eq!(super::one_line("  a\n\n b\t c  ", 200), "a b c");
+    }
+
+    #[test]
+    fn one_line_truncates_with_an_ellipsis_within_the_limit() {
+        assert_eq!(super::one_line("abcdef", 6), "abcdef");
+        assert_eq!(super::one_line("abcdefg", 6), "abcde…");
+        assert_eq!(super::one_line("ééééééé", 4).chars().count(), 4);
+    }
+
+    #[test]
+    fn tool_input_summary_takes_the_first_present_key_in_order() {
+        let input = serde_json::json!({"description": "d", "file_path": "/a/b.rs"});
+        assert_eq!(super::tool_input_summary(Some(&input)), "/a/b.rs");
+        let input = serde_json::json!({"command": "git\nstatus", "description": "d"});
+        assert_eq!(super::tool_input_summary(Some(&input)), "git status");
+    }
+
+    #[test]
+    fn tool_input_summary_is_empty_without_a_known_string_key() {
+        let input = serde_json::json!({"todos": [], "command": 3});
+        assert_eq!(super::tool_input_summary(Some(&input)), "");
+        assert_eq!(super::tool_input_summary(None), "");
+    }
+
+    #[test]
+    fn tool_input_summary_truncates_at_120_chars() {
+        let input = serde_json::json!({"command": "x".repeat(500)});
+        assert_eq!(super::tool_input_summary(Some(&input)).chars().count(), 120);
+    }
+
+    #[test]
+    fn tool_call_line_omits_an_empty_summary() {
+        assert_eq!(super::tool_call_line("Read", "/a"), "→ Read /a");
+        assert_eq!(super::tool_call_line("TodoWrite", ""), "→ TodoWrite");
     }
 
     #[test]

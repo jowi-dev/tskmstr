@@ -101,10 +101,13 @@ pub trait Launcher {
 }
 
 /// Production [`Launcher`]: runs `<program> work run --unattended <lane>
-/// <ticket>` in `cwd` and waits for it. `tm work run --unattended` is
-/// headless, so it returns once it has started the run row and handed the
-/// agent to a detached supervisor. It also re-checks memory and usage
-/// admission, and keeps metered runners out of the fallback chain.
+/// <ticket>` in `cwd` and waits for it. `tm work run --unattended` opens
+/// the lane interactively in the ticket's `work` window (GitHub issue #184)
+/// and returns once the window is launched and the lane's awaiter is
+/// spawned. The run row stays `running`, so it counts toward `max_lanes`
+/// and `in_hand`, until the lane writes its done marker, its session ends,
+/// or it is hibernated. It also re-checks memory and usage admission, and
+/// keeps metered runners out of the fallback chain.
 pub struct CommandLauncher {
     /// The `tm` binary, normally `std::env::current_exe()`.
     pub program: PathBuf,

@@ -13,15 +13,18 @@
 //! So a headless run still *gets* a window in the ticket's `tm-<scope>-<key>`
 //! session — otherwise the session stops being the ticket's whole action
 //! history — but the window is a **viewer**: it runs `tm runs logs <id>
-//! --follow` and owns nothing. Two consequences follow, and both are the
-//! point rather than limitations to fix later:
+//! --follow --transcript` and owns nothing. `--transcript` is what puts the
+//! agent's messages and tool calls in the window as they happen (GitHub
+//! issue #184): a headless run's log holds only tm's own status lines, and
+//! everything the agent does is in its output stream. Two consequences
+//! follow, and both are the point rather than limitations to fix later:
 //!
 //! - **A viewer is disposable.** Killing it, or killing the whole session,
 //!   costs nothing but the tail. This is exactly what makes
 //!   [`crate::cli::work::session`]'s reconstruction safe to run at any time.
 //! - **Log files, not scrollback, are the archive.** tmux scrollback is
-//!   capped by `history-limit` and dies with the server; the log file is what
-//!   `tm runs logs` reads and what survives a reboot.
+//!   capped by `history-limit` and dies with the server; the log and stream
+//!   files are what `tm runs logs` reads and what survives a reboot.
 //!
 //! # Mixed ownership is deliberate
 //!
@@ -50,9 +53,10 @@ use crate::work::interactive::ActionWindow;
 use crate::work::tmux::{TmuxError, TmuxOps};
 
 /// The shell command line a viewer window runs: `tm runs logs <run_id>
-/// --follow`, with `tm_program` and every argument [`shell_quote`]d (tmux
-/// hands the window's command to the user's `$SHELL -c`, so it must be valid
-/// shell).
+/// --follow --transcript`, with `tm_program` and every argument
+/// [`shell_quote`]d (tmux hands the window's command to the user's `$SHELL
+/// -c`, so it must be valid shell). `--transcript` shows the agent's
+/// messages and tool calls alongside tm's log lines (GitHub issue #184).
 ///
 /// **Addressed by run id, not `<KEY> --kind <kind>`.** The issue's sketch
 /// uses the ticket key plus a kind, but that resolves to "the *latest* run of
@@ -68,12 +72,13 @@ use crate::work::tmux::{TmuxError, TmuxOps};
 /// still be able to find it.
 pub fn viewer_command(tm_program: &Path, run_id: i64) -> String {
     format!(
-        "{} runs logs {run_id} --follow",
+        "{} runs logs {run_id} --follow --transcript",
         shell_quote(&tm_program.to_string_lossy())
     )
 }
 
-/// Create `target`'s viewer window, following `run_id`'s log from `dir`.
+/// Create `target`'s viewer window, following `run_id`'s log and agent
+/// stream from `dir`.
 ///
 /// Creates the ticket's session (plus its
 /// [`crate::work::audit::SHELL_WINDOW_NAME`] window) when this is the
@@ -283,10 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn viewer_command_follows_the_runs_log_by_id() {
+    fn viewer_command_follows_the_runs_log_and_transcript_by_id() {
         let command = viewer_command(Path::new("/usr/local/bin/tm"), 42);
 
-        assert_eq!(command, "'/usr/local/bin/tm' runs logs 42 --follow");
+        assert_eq!(
+            command,
+            "'/usr/local/bin/tm' runs logs 42 --follow --transcript"
+        );
     }
 
     #[test]
@@ -311,7 +319,7 @@ mod tests {
                     dir: "/wt/proj-1".to_string(),
                     window_name: "work".to_string(),
                     env: Vec::new(),
-                    command: "'/bin/tm' runs logs 9 --follow".to_string(),
+                    command: "'/bin/tm' runs logs 9 --follow --transcript".to_string(),
                 },
                 TmuxCall::NewWindow {
                     name: "tm-proj-proj-1".to_string(),
@@ -346,7 +354,7 @@ mod tests {
                 window_name: "work".to_string(),
                 dir: "/wt/proj-1".to_string(),
                 env: Vec::new(),
-                command: "'/bin/tm' runs logs 9 --follow".to_string(),
+                command: "'/bin/tm' runs logs 9 --follow --transcript".to_string(),
             }]
         );
     }

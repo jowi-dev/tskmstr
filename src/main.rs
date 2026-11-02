@@ -385,6 +385,45 @@ fn dispatch_current_repo() -> Option<tskmstr::cli::dispatch::CurrentRepo> {
     })
 }
 
+/// The detached launchers of a finished lane's post-PR tail
+/// (`tskmstr::work::run::post_pr_tail`), shared by `tm work __supervise`
+/// and `tm work __await-lane`.
+struct PostPrLaunchers<'a> {
+    /// Starts `tm pr watch` once the run has a PR (GitHub issue #118).
+    watch_armer: tskmstr::cli::pr::DetachedWatchArmer<'a>,
+    /// Starts `tm review auto` under autopilot (GitHub issue #145); the
+    /// tail checks the scope's flag itself.
+    review_starter: tskmstr::cli::pr::DetachedAutoReviewStarter<'a>,
+}
+
+impl<'a> PostPrLaunchers<'a> {
+    fn new(
+        detach: &'a tskmstr::work::detach::RealDetachSpawner,
+        current_exe: &'a Path,
+        home: &'a Path,
+    ) -> Self {
+        PostPrLaunchers {
+            watch_armer: tskmstr::cli::pr::DetachedWatchArmer {
+                detach,
+                current_exe,
+                home,
+            },
+            review_starter: tskmstr::cli::pr::DetachedAutoReviewStarter {
+                detach,
+                current_exe,
+                home,
+            },
+        }
+    }
+
+    /// The watch armer, only when `[work.review_watch].auto_arm` opts in.
+    fn watch_armer(&self, config: Option<&Config>) -> Option<&dyn tskmstr::work::run::WatchArmer> {
+        config
+            .is_some_and(|cfg| cfg.work.review_watch.auto_arm)
+            .then_some(&self.watch_armer as &dyn tskmstr::work::run::WatchArmer)
+    }
+}
+
 /// [`tskmstr::cli::dispatch::ScopeTicker`] with real dependencies: loads the
 /// scope's config from its repo, builds `tm ready`'s candidates and the
 /// tick's lanes and runner from it, and launches lanes with `tm work run
@@ -481,6 +520,22 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             memory: &config.work.memory,
             usage: &config.usage,
         };
+        // Before launching: an unattended lane that lost its awaiter would
+        // never finish, and keeps its `max_lanes` slot meanwhile.
+        match tskmstr::work::lane_await::revive_awaiters(
+            self.store,
+            scope,
+            &tskmstr::work::detach::RealDetachSpawner,
+            &self.current_exe,
+            &tskmstr::runs::pid::pid_alive,
+        ) {
+            Ok(revived) => {
+                for run_id in revived {
+                    eprintln!("{scope}: restarted the lane awaiter of run {run_id}");
+                }
+            }
+            Err(err) => eprintln!("{scope}: could not restart lane awaiters: {err}"),
+        }
         tskmstr::work::dispatch::tick(&deps, &cfg).map_err(|err| err.to_string())
     }
 }
@@ -875,6 +930,10 @@ fn run_work(
                 max_turns,
                 permission_mode,
                 prompt_override: prompt,
+                // GitHub issue #184: an unattended lane runs interactively
+                // like any other, and signals when it is done so a
+                // detached awaiter can finish its run row.
+                done_signal: unattended,
                 // `run` sets `mode` from the resolved dispatch below.
                 ..Default::default()
             };
@@ -883,7 +942,7 @@ fn run_work(
                 &run_deps,
                 &lane,
                 request,
-                Dispatch::from_flags(headless || unattended, fg),
+                Dispatch::from_flags(headless, fg),
                 &mut stdout,
             )?;
             if !succeeded {
@@ -902,25 +961,9 @@ fn run_work(
             let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
                 .as_ref()
                 .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()).ok());
-            // GitHub issue #118: start `tm pr watch` once the run has a PR,
-            // only when `[work.review_watch].auto_arm` opts in.
             let current_exe = std::env::current_exe()?;
             let detach = tskmstr::work::detach::RealDetachSpawner;
-            let watch_armer = tskmstr::cli::pr::DetachedWatchArmer {
-                detach: &detach,
-                current_exe: &current_exe,
-                home: &home,
-            };
-            let auto_arm = full_config
-                .as_ref()
-                .is_some_and(|cfg| cfg.work.review_watch.auto_arm);
-            // GitHub issue #145: under autopilot, start `tm review auto`
-            // straight away. The supervisor checks the scope's flag itself.
-            let review_starter = tskmstr::cli::pr::DetachedAutoReviewStarter {
-                detach: &detach,
-                current_exe: &current_exe,
-                home: &home,
-            };
+            let tail = PostPrLaunchers::new(&detach, &current_exe, &home);
             let succeeded = tskmstr::cli::work::supervise(
                 &spawner,
                 &gh,
@@ -928,8 +971,8 @@ fn run_work(
                 ticket_provider.as_deref(),
                 &state,
                 agent_runner_or_default(full_config.as_ref()),
-                auto_arm.then_some(&watch_armer as &dyn tskmstr::work::run::WatchArmer),
-                Some(&review_starter),
+                tail.watch_armer(full_config.as_ref()),
+                Some(&tail.review_starter),
                 &mut stdout,
             )?;
             // The state file has served its one-shot handoff purpose; a
@@ -939,6 +982,35 @@ fn run_work(
             if !succeeded {
                 return Err("lane run failed".into());
             }
+        }
+        WorkCmd::AwaitLane { state_file } => {
+            let raw = std::fs::read_to_string(&state_file)?;
+            let state: tskmstr::work::detach::SupervisorState = serde_json::from_str(&raw)?;
+            let run_store = tskmstr::runs::RunStore::open(&state.run_db_path)?;
+            let gh = ShellGhCli::new();
+            // Best-effort, like the supervisor's: only `status_on_pr` needs
+            // it, never finishing the run itself.
+            let ticket_provider: Option<Box<dyn TicketProvider>> = full_config
+                .as_ref()
+                .and_then(|cfg| run_ticket_provider(cfg, keychain, env_token.clone()).ok());
+            let current_exe = std::env::current_exe()?;
+            let detach = tskmstr::work::detach::RealDetachSpawner;
+            let tail = PostPrLaunchers::new(&detach, &current_exe, &home);
+            let deps = tskmstr::work::lane_await::AwaitLaneDeps {
+                run_store: &run_store,
+                gh: &gh,
+                ticket_provider: ticket_provider.as_deref(),
+                tmux: &tmux,
+                sleeper: &tskmstr::work::review_watch::RealSleeper,
+                clock: &tskmstr::work::run::SystemClock,
+                watch_armer: tail.watch_armer(full_config.as_ref()),
+                review_starter: Some(&tail.review_starter),
+            };
+            tskmstr::cli::work::await_lane(&deps, &state, &mut stdout)?;
+            // Removed once the awaiter is done with it. On a crash it
+            // survives, and the next dispatch tick restarts the awaiter
+            // from it (`lane_await::revive_awaiters`).
+            let _ = std::fs::remove_file(&state_file);
         }
         WorkCmd::Hooks { cmd } => match cmd {
             tskmstr::cli::HooksCmd::Install { user, dry_run } => {
@@ -2763,6 +2835,7 @@ fn run_runs(
             kind,
             tail,
             follow,
+            transcript,
         }) => {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -2787,6 +2860,7 @@ fn run_runs(
                 kind.as_deref(),
                 tail,
                 follow,
+                transcript,
                 &sleeper,
                 &mut stdout,
             )?;
@@ -2994,6 +3068,15 @@ impl AutopilotTicker {
             memory: &config.work.memory,
             usage: &config.usage,
         };
+        // As `tm dispatch tick` does; best-effort, with no terminal to
+        // report to under the TUI.
+        let _ = tskmstr::work::lane_await::revive_awaiters(
+            &store,
+            &scope,
+            &tskmstr::work::detach::RealDetachSpawner,
+            &launcher.program,
+            &tskmstr::runs::pid::pid_alive,
+        );
         Ok(dispatch::tick(&deps, &cfg)?)
     }
 }

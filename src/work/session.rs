@@ -28,8 +28,8 @@
 //!   Reconstruction restores working state, not history. A ticket with five
 //!   finished runs would otherwise come back as five dead panes whose only
 //!   content is a log file that `tm runs logs` (and the board's `L`) already
-//!   open on demand. For a finished *interactive* run there is not even a log
-//!   — its durable artifact is its prompt file — so a window for it would be
+//!   open on demand. A finished *interactive* run has at most its awaiter's
+//!   log — its durable artifact is its prompt file — so a window for it would be
 //!   an empty shell claiming to be an action. The run table is the history;
 //!   tmux is where live things are.
 //!
@@ -115,6 +115,10 @@ pub struct SessionPlan {
 /// name lists. `viewer_command` builds a headless run's follow command
 /// (injected rather than called directly so this stays independent of how the
 /// `tm` binary is addressed — see [`crate::work::viewer::viewer_command`]).
+/// `launched` says whether a run was launched into a window, i.e. has a
+/// [`crate::work::hibernate::launch_record`]. A run is headless when it has
+/// a `log_path` and no launch: an unattended interactive lane has both,
+/// since its awaiter logs there (GitHub issue #184).
 ///
 /// The `shell` window is planned last and rooted at the newest run's
 /// worktree, which is the ticket's current worktree; windows are append-only,
@@ -125,6 +129,7 @@ pub fn plan_session(
     runs: &[Run],
     windows: &[crate::work::tmux::TmuxWindow],
     viewer_command: &dyn Fn(i64) -> String,
+    launched: &dyn Fn(i64) -> bool,
 ) -> SessionPlan {
     let session_name = ticket_session_name(scope_slug, session_key);
     let mut existing = session_window_names(windows, &session_name);
@@ -141,7 +146,7 @@ pub fn plan_session(
         }
         let name = unique_window_name(action, &existing);
         existing.push(name.clone());
-        let is_headless = run.log_path.is_some();
+        let is_headless = run.log_path.is_some() && !launched(run.id);
         planned.push(PlannedWindow {
             name,
             dir: run.worktree.clone(),
@@ -238,6 +243,10 @@ mod tests {
         format!("tm runs logs {run_id} --follow")
     }
 
+    fn no_launch(_run_id: i64) -> bool {
+        false
+    }
+
     /// A [`Run`] with only the fields reconstruction reads set to anything
     /// meaningful.
     fn run(id: i64, kind: &str, status: RunStatus, log: Option<&str>) -> Run {
@@ -299,7 +308,7 @@ mod tests {
     fn a_live_headless_run_is_rebuilt_as_a_log_viewer() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
 
         assert_eq!(plan.session_name, "tm-proj-proj-1");
         assert!(!plan.session_exists);
@@ -333,7 +342,7 @@ mod tests {
         lane.session_id = Some("sess-abc".to_string());
         let runs = vec![lane];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
 
         assert_eq!(plan.windows[0].name, "work");
         assert_eq!(
@@ -341,6 +350,24 @@ mod tests {
             "nothing can resurrect a dead claude pane, and auto-resuming \
              would start billing and editing unasked"
         );
+        assert_eq!(
+            plan.windows[0].resume_session_id,
+            Some("sess-abc".to_string())
+        );
+    }
+
+    /// An unattended interactive lane records its awaiter's log path on
+    /// its row (GitHub issue #184), but it was launched into a window, so
+    /// it comes back as a shell with its resume hint, not as a log viewer.
+    #[test]
+    fn a_launched_interactive_run_with_a_log_path_is_rebuilt_as_a_shell() {
+        let mut lane = run(7, "lane", RunStatus::Running, Some("/state/a.log"));
+        lane.session_id = Some("sess-abc".to_string());
+
+        let plan = plan_session("proj", "PROJ-1", &[lane], &[], &viewer, &|id| id == 7);
+
+        assert_eq!(plan.windows[0].name, "work");
+        assert_eq!(plan.windows[0].command, None);
         assert_eq!(
             plan.windows[0].resume_session_id,
             Some("sess-abc".to_string())
@@ -358,7 +385,7 @@ mod tests {
             run(3, "review-fix", RunStatus::Interrupted, None),
         ];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -375,7 +402,7 @@ mod tests {
             run(3, "review-fix", RunStatus::Queued, Some("/state/b.log")),
         ];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -388,7 +415,7 @@ mod tests {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("work", false), window("shell", false)];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer, &no_launch);
 
         assert!(plan.session_exists);
         assert!(
@@ -403,7 +430,7 @@ mod tests {
         let runs = vec![run(7, "review-fix", RunStatus::Running, Some("/s/a.log"))];
         let windows = vec![window("fix-2", false), window("shell", false)];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer, &no_launch);
 
         assert!(plan.windows.is_empty());
     }
@@ -413,7 +440,7 @@ mod tests {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("work", true), window("shell", false)];
 
-        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer, &no_launch);
 
         assert_eq!(
             plan.windows.iter().map(|w| &w.name).collect::<Vec<_>>(),
@@ -424,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_ticket_with_no_runs_plans_nothing() {
-        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer, &no_launch);
 
         assert!(plan.windows.is_empty());
     }
@@ -436,7 +463,7 @@ mod tests {
         let mut lane = run(2, "lane", RunStatus::Done, Some("/s/a.log"));
         lane.worktree = "/wt/proj-1".to_string();
 
-        let plan = plan_session("proj", "PROJ-1", &[audit, lane], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[audit, lane], &[], &viewer, &no_launch);
 
         assert_eq!(plan.windows[0].name, "shell");
         assert_eq!(plan.windows[0].dir, "/wt/proj-1");
@@ -445,7 +472,7 @@ mod tests {
     #[test]
     fn reconstruct_creates_the_session_from_the_first_planned_window() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -477,7 +504,7 @@ mod tests {
     fn reconstruct_appends_every_window_when_the_session_survives() {
         let runs = vec![run(7, "lane", RunStatus::Running, Some("/state/a.log"))];
         let windows = vec![window("shell", false)];
-        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &windows, &viewer, &no_launch);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -503,7 +530,7 @@ mod tests {
     #[test]
     fn reconstruct_creates_a_shell_only_session_when_nothing_is_in_flight() {
         let runs = vec![run(1, "lane", RunStatus::Done, Some("/s/a.log"))];
-        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &runs, &[], &viewer, &no_launch);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();
@@ -526,7 +553,7 @@ mod tests {
 
     #[test]
     fn reconstruct_touches_nothing_for_an_empty_plan() {
-        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer);
+        let plan = plan_session("proj", "PROJ-1", &[], &[], &viewer, &no_launch);
         let tmux = FakeTmuxOps::new();
 
         reconstruct_session(&tmux, &plan).unwrap();

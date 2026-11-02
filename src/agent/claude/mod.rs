@@ -71,7 +71,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, UsageSnapshot, UsageWindow, shell_quote,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, UsageSnapshot, UsageWindow, one_line,
+    shell_quote, tool_call_line, tool_input_summary,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -396,6 +397,72 @@ impl AgentRunner for ClaudeRunner {
         })
     }
 
+    /// One stream-json line as viewer lines (GitHub issue #184): an
+    /// `assistant` message's `text` blocks as their text and its
+    /// `tool_use` blocks as `→ <name> <summary>`; a `user` message's
+    /// errored `tool_result` blocks as `✗ tool error: <first line>`; the
+    /// `result` line as `result: done`, or `result: error[: <text>]` when
+    /// it failed. A success's `result` text is the final assistant
+    /// message, already shown as its `text` block. Everything else (`system`,
+    /// `rate_limit_event`, successful tool results, non-JSON) renders as
+    /// nothing.
+    fn progress_lines(&self, line: &str) -> Vec<String> {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return Vec::new();
+        };
+        let blocks = || {
+            value
+                .pointer("/message/content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        };
+        let str_field = |v: &serde_json::Value, key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("assistant") => blocks()
+                .filter_map(|block| match block.get("type")?.as_str()? {
+                    "text" => Some(one_line(block.get("text")?.as_str()?, 200))
+                        .filter(|text| !text.is_empty()),
+                    "tool_use" => Some(tool_call_line(
+                        &str_field(block, "name").unwrap_or_else(|| "tool".to_string()),
+                        &tool_input_summary(block.get("input")),
+                    )),
+                    _ => None,
+                })
+                .collect(),
+            Some("user") => blocks()
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                        && block.get("is_error").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+                .map(|block| {
+                    let first = tool_result_text(block.get("content"))
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(|line| one_line(line, 200))
+                        .unwrap_or_default();
+                    format!("✗ tool error: {first}")
+                })
+                .collect(),
+            Some("result") => {
+                let text = str_field(&value, "result")
+                    .map(|text| one_line(&text, 200))
+                    .filter(|text| !text.is_empty());
+                let is_error = value.get("is_error").and_then(serde_json::Value::as_bool);
+                match (is_error, text) {
+                    (Some(true), Some(text)) => vec![format!("result: error: {text}")],
+                    (Some(true), None) => vec!["result: error".to_string()],
+                    _ => vec!["result: done".to_string()],
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn resume_command(&self, session_id: &str) -> String {
         format!("claude --resume {session_id}")
     }
@@ -679,6 +746,20 @@ fn scan_stream(raw: &str) -> Result<Stream, serde_json::Error> {
         }
     }
     Ok(stream)
+}
+
+/// A `tool_result` block's `content` as plain text: either a string, or an
+/// array of content blocks whose `text` fields are joined by newlines.
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text")?.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Raw `rate_limit_info` of a stream-json `rate_limit_event`. The top-level
@@ -1600,6 +1681,98 @@ mod tests {
     }
 
     // --- session identity ---
+
+    #[test]
+    fn progress_lines_render_assistant_text_and_tool_use_blocks_in_order() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking at\n\nthe   runner."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test","description":"Run tests"}},{"type":"tool_use","id":"t2","name":"TodoWrite","input":{"todos":[]}}]}}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(line),
+            vec![
+                "Looking at the runner.".to_string(),
+                "→ Bash cargo test".to_string(),
+                "→ TodoWrite".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_lines_truncate_long_assistant_text_to_200_chars() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "y".repeat(1000)}]},
+        })
+        .to_string();
+        let lines = ClaudeRunner.progress_lines(&line);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), 200);
+        assert!(lines[0].ends_with('…'));
+    }
+
+    #[test]
+    fn progress_lines_render_only_errored_tool_results() {
+        let errored = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nerror[E0425]: cannot find value"}]}}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(errored),
+            vec!["✗ tool error: Exit code 1".to_string()]
+        );
+        let block_content = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"File does not exist."}]}]}}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(block_content),
+            vec!["✗ tool error: File does not exist.".to_string()]
+        );
+        let ok = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"fine"}]}}"#;
+        assert!(ClaudeRunner.progress_lines(ok).is_empty());
+    }
+
+    #[test]
+    fn progress_lines_render_the_result_line() {
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"opened\nPR #42","session_id":"s"}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(ok),
+            vec!["result: done".to_string()],
+            "a success's text is the final assistant message, already shown"
+        );
+        let err =
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(err),
+            vec!["result: error".to_string()]
+        );
+        let limited =
+            r#"{"type":"result","is_error":true,"result":"usage limit\nreached","session_id":"s"}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(limited),
+            vec!["result: error: usage limit reached".to_string()]
+        );
+    }
+
+    #[test]
+    fn progress_lines_skip_system_rate_limit_and_garbage_lines() {
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            "not json at all",
+            r#"{"type":"assistant","message":"#,
+            "",
+        ] {
+            assert!(
+                ClaudeRunner.progress_lines(line).is_empty(),
+                "expected nothing for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_lines_render_the_unified_fixture_stream() {
+        let lines: Vec<String> = STREAM_UNIFIED
+            .lines()
+            .flat_map(|line| ClaudeRunner.progress_lines(line))
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["Working on it.".to_string(), "result: done".to_string(),]
+        );
+    }
 
     #[test]
     fn session_env_vars_name_the_claude_variables() {

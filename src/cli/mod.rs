@@ -528,7 +528,7 @@ pub enum WorkCmd {
     /// away.
     ///
     /// `--headless` instead runs the autonomous one-shot `claude -p` under
-    /// a detached supervisor, for CI, cron, and unattended batches. `--fg`
+    /// a detached supervisor, for CI and cron. `--fg`
     /// runs that same headless pass synchronously, so this command's exit
     /// code reports the run's outcome.
     Run {
@@ -564,10 +564,12 @@ pub enum WorkCmd {
         #[arg(long)]
         fg: bool,
         /// Hidden: launched by the autopilot dispatcher (GitHub issue #115).
-        /// Implies `--headless`, routes only to runners an unattended launch
-        /// may use (no metered runner unless `[dispatch]
-        /// allow_paid_fallback`), and refuses instead of warning when usage
-        /// admission says no.
+        /// Routes only to runners an unattended launch may use (no metered
+        /// runner unless `[dispatch] allow_paid_fallback`), and refuses
+        /// instead of warning when usage admission says no. Runs
+        /// interactively in the ticket's `work` window unless `--headless`
+        /// or `--fg` is given; a detached awaiter (`tm work __await-lane`)
+        /// finishes the run row on its done marker (GitHub issue #184).
         #[arg(long, hide = true)]
         unattended: bool,
     },
@@ -581,6 +583,18 @@ pub enum WorkCmd {
         /// Path to the JSON-serialized
         /// `tskmstr::work::run::PreparedRun` state file written by the
         /// foreground half of `tm work run`.
+        #[arg(long = "state-file")]
+        state_file: String,
+    },
+    /// Hidden: the detached lane awaiter (GitHub issue #184). Not a
+    /// user-facing command: `tm work run --unattended` spawns it after
+    /// launching an interactive lane in the ticket's `work` window; it
+    /// deserializes `--state-file`'s state, waits for the lane's done
+    /// marker, and finishes the run (see `tskmstr::work::lane_await`).
+    #[command(name = "__await-lane", hide = true)]
+    AwaitLane {
+        /// Path to the JSON-serialized `tskmstr::work::detach::SupervisorState`
+        /// written by `tm work run --unattended`.
         #[arg(long = "state-file")]
         state_file: String,
     },
@@ -1173,7 +1187,8 @@ pub enum RunsCmd {
     },
     /// Live board of lane runs (polls the local run db).
     Watch,
-    /// Print (or follow) a run's detached-process log file.
+    /// Print (or follow) a run's detached-process log file, and with
+    /// `--transcript` the agent's own output stream.
     ///
     /// Falls back to the by-convention path for `kind = "review-watch"` when
     /// the run has no recorded `log_path` (every run started before that
@@ -1197,6 +1212,12 @@ pub enum RunsCmd {
         /// Keep printing new lines as they're appended, like `tail -f`.
         #[arg(long)]
         follow: bool,
+        /// Also show the agent's own output stream, rendered readably
+        /// through its runner (one line per message or tool call). For a
+        /// headless run that is where the tool calls and messages are; the
+        /// log holds only tm's status lines.
+        #[arg(long)]
+        transcript: bool,
     },
 }
 
@@ -3367,6 +3388,24 @@ mod tests {
                 cmd: WorkCmd::Supervise { state_file },
             }) => assert_eq!(state_file, "/tmp/mylane-20260101.supervisor.json"),
             other => panic!("expected Work Supervise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_work_await_lane_hidden_subcommand() {
+        let cli = Cli::try_parse_from([
+            "tm",
+            "work",
+            "__await-lane",
+            "--state-file",
+            "/tmp/mylane-20260101.await.json",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Some(Command::Work {
+                cmd: WorkCmd::AwaitLane { state_file },
+            }) => assert_eq!(state_file, "/tmp/mylane-20260101.await.json"),
+            other => panic!("expected Work AwaitLane, got {other:?}"),
         }
     }
 

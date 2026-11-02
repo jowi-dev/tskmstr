@@ -2318,6 +2318,25 @@ impl RunStore {
         Ok(())
     }
 
+    /// Re-stamps only `run_id`'s `agent`: a headless run that falls back to
+    /// another agent mid-run (GitHub issue #54) names the one now writing
+    /// its output stream, which is how `tm runs logs --transcript` picks
+    /// its renderer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn update_agent(&self, run_id: i64, agent: &str) -> Result<(), RunStoreError> {
+        let changes = self.conn.execute(
+            "UPDATE runs SET agent = ?1 WHERE id = ?2",
+            params![agent, run_id],
+        )?;
+        if changes == 0 {
+            return Err(RunStoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
     /// Re-stamps `run_id`'s `ticket`. Exists for board create sessions
     /// (GitHub issue #156): their row is pre-registered under
     /// [`crate::runs::session::CREATE_PLACEHOLDER_TICKET`] because no ticket
@@ -9487,6 +9506,24 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.agent.as_deref(), Some("opencode"));
         assert_eq!(run.repo.as_deref(), Some("lemma"));
+    }
+
+    #[test]
+    fn update_agent_restamps_only_the_agent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = start_lane_with_pid(&store, "PROJ-1", None);
+        store.update_agent_repo(id, "claude", "lemma").unwrap();
+
+        store.update_agent(id, "opencode").unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.agent.as_deref(), Some("opencode"));
+        assert_eq!(run.repo.as_deref(), Some("lemma"));
+        assert!(matches!(
+            store.update_agent(id + 100, "opencode"),
+            Err(RunStoreError::RunNotFound(_))
+        ));
     }
 
     #[test]

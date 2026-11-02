@@ -79,7 +79,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, shell_quote,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, one_line, shell_quote, tool_call_line,
+    tool_input_summary,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -476,6 +477,36 @@ impl AgentRunner for OpencodeRunner {
             // opencode reports no usage windows.
             usage: None,
         })
+    }
+
+    /// One `--format json` event as viewer lines (GitHub issue #184): a
+    /// `text` event as its `part.text`, a `tool_use` event as `→ <tool>
+    /// <summary>` from `part.state.input` (just `→ tool` when the event
+    /// names no tool), an `error` event as `error: <data.message or
+    /// name>`. Step events and non-JSON render as nothing.
+    fn progress_lines(&self, line: &str) -> Vec<String> {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return Vec::new();
+        };
+        let part = value.get("part");
+        let rendered = match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => part
+                .and_then(|part| part.get("text")?.as_str())
+                .map(|text| one_line(text, 200))
+                .filter(|text| !text.is_empty()),
+            Some("tool_use") => Some(tool_call_line(
+                part.and_then(|part| part.get("tool")?.as_str())
+                    .unwrap_or("tool"),
+                &tool_input_summary(part.and_then(|part| part.pointer("/state/input"))),
+            )),
+            Some("error") => value
+                .pointer("/error/data/message")
+                .or_else(|| value.pointer("/error/name"))
+                .and_then(serde_json::Value::as_str)
+                .map(|message| format!("error: {}", one_line(message, 200))),
+            _ => None,
+        };
+        rendered.into_iter().collect()
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1495,6 +1526,68 @@ mod tests {
     }
 
     // --- interactive_shell_command ---
+
+    #[test]
+    fn progress_lines_render_a_text_event_as_its_text() {
+        let line = r#"{"type":"text","timestamp":1,"sessionID":"ses_a","part":{"type":"text","text":"Reading\n  the runner."}}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(line),
+            vec!["Reading the runner.".to_string()]
+        );
+    }
+
+    #[test]
+    fn progress_lines_render_a_tool_use_event_from_its_state_input() {
+        let line = r#"{"type":"tool_use","timestamp":2,"sessionID":"ses_a","part":{"type":"tool","tool":"bash","callID":"c1","state":{"status":"completed","input":{"command":"cargo test","description":"Run tests"},"output":"ok"}}}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(line),
+            vec!["→ bash cargo test".to_string()]
+        );
+        let read = r#"{"type":"tool_use","sessionID":"ses_a","part":{"tool":"read","state":{"input":{"filePath":"/a"}}}}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(read),
+            vec!["→ read /a".to_string()]
+        );
+    }
+
+    #[test]
+    fn progress_lines_render_a_tool_use_event_without_a_part_as_just_tool() {
+        let line = r#"{"type":"tool_use","timestamp":2,"sessionID":"ses_a"}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(line),
+            vec!["→ tool".to_string()]
+        );
+    }
+
+    #[test]
+    fn progress_lines_render_an_error_event_from_its_message_or_name() {
+        let message = r#"{"type":"error","sessionID":"ses_x","error":{"name":"APIError","data":{"message":"boom"}}}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(message),
+            vec!["error: boom".to_string()]
+        );
+        let name_only = r#"{"type":"error","sessionID":"ses_x","error":{"name":"APIError"}}"#;
+        assert_eq!(
+            OpencodeRunner.progress_lines(name_only),
+            vec!["error: APIError".to_string()]
+        );
+    }
+
+    #[test]
+    fn progress_lines_skip_step_events_and_garbage() {
+        for line in [
+            r#"{"type":"step_start","timestamp":1,"sessionID":"ses_a"}"#,
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"cost":0.01}}"#,
+            r#"{"type":"text","sessionID":"ses_a","part":{"text":"   "}}"#,
+            "garbage",
+            "",
+        ] {
+            assert!(
+                OpencodeRunner.progress_lines(line).is_empty(),
+                "expected nothing for {line:?}"
+            );
+        }
+    }
 
     #[test]
     fn interactive_shell_command_quotes_model_and_prompt() {
