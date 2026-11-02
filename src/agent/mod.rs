@@ -281,7 +281,14 @@ impl ResumeSpec {
     /// The leading `exec` replaces the window's shell with the agent, so the
     /// pane's pid *is* the agent's pid — the liveness signal the woken run
     /// records, and the process a later hibernation stops.
-    pub fn command_line(&self, session_id: &str) -> String {
+    ///
+    /// `_admitted` is the proof the wake passed admission (GitHub issue
+    /// #149).
+    pub fn command_line(
+        &self,
+        _admitted: &crate::work::admission::Admitted,
+        session_id: &str,
+    ) -> String {
         let mut parts = vec!["exec".to_string()];
         if !self.env_remove.is_empty() {
             parts.push("env".to_string());
@@ -622,8 +629,14 @@ pub trait AgentRunner: Sync {
     /// runner-specific, which is why this is adapter-owned.
     fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String;
 
-    /// Build one run's argv/env (headless or interactive).
-    fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation;
+    /// Build one run's argv/env (headless or interactive). `admitted` is
+    /// the proof the launch passed memory and usage admission (GitHub issue
+    /// #149); see [`crate::work::admission::Admitted`].
+    fn build_invocation(
+        &self,
+        admitted: &crate::work::admission::Admitted,
+        inputs: InvocationInputs,
+    ) -> AgentInvocation;
 
     /// Parse a finished headless run's raw result text into a
     /// [`RunOutcome`].
@@ -651,8 +664,14 @@ pub trait AgentRunner: Sync {
 
     /// Shell command string for a tmux-hosted audit/bugbot session: the
     /// adapter's CLI with `--model <model>` and `prompt` as its positional
-    /// argument. Replaces `work::audit::claude_command`.
-    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String;
+    /// argument. Replaces `work::audit::claude_command`. `admitted` is the
+    /// proof the launch passed admission (GitHub issue #149).
+    fn interactive_shell_command(
+        &self,
+        admitted: &crate::work::admission::Admitted,
+        model: &str,
+        prompt: &str,
+    ) -> String;
 
     /// The cheapest headless invocation whose output carries a usage
     /// snapshot ([`RunOutcome::usage`]), for usage admission to refresh a
@@ -936,7 +955,7 @@ mod tests {
         };
 
         assert_eq!(
-            spec.command_line("sess-1"),
+            spec.command_line(&crate::work::admission::Admitted::for_test(), "sess-1"),
             "exec env -u SECRET_KEY -u OTHER agent '--resume' 'sess-1' '--model' 'it'\\''s'"
         );
     }
@@ -950,7 +969,10 @@ mod tests {
             env_remove: Vec::new(),
         };
 
-        assert_eq!(spec.command_line("ses_9"), "exec agent '--session' 'ses_9'");
+        assert_eq!(
+            spec.command_line(&crate::work::admission::Admitted::for_test(), "ses_9"),
+            "exec agent '--session' 'ses_9'"
+        );
     }
 
     /// Files allowed to carry a functional (non-test) `claude`/`anthropic`/
@@ -1121,6 +1143,44 @@ mod tests {
                 out.push(path);
             }
         }
+    }
+
+    /// Guard for GitHub issue #149: an
+    /// [`crate::work::admission::Admitted`] is the proof every agent
+    /// command line requires, so only the admission module may make one.
+    /// Outside test code, nothing else may call its constructor or its
+    /// test-only `for_test`; a launch path that wants an `Admitted` has to
+    /// go through `AdmissionGate` or `AdmissionDeps`.
+    #[test]
+    fn admitted_is_only_constructed_by_admission() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest_dir.join("src"), &mut files);
+
+        let mut violations = Vec::new();
+        for path in &files {
+            let rel = path
+                .strip_prefix(manifest_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "src/work/admission.rs" {
+                continue;
+            }
+            let contents = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            for (line_no, line) in strip_comments_and_tests(&contents) {
+                if line.contains("Admitted(") || line.contains("Admitted::for_test") {
+                    violations.push(format!("{rel}:{line_no}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Admitted constructed outside src/work/admission.rs; admit the \
+             launch through AdmissionGate or AdmissionDeps instead:\n{}",
+            violations.join("\n")
+        );
     }
 
     /// Guard for GitHub issue #144: model names live only in the built-in

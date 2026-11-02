@@ -279,15 +279,18 @@ mod tests {
     }
 
     fn interactive_invocation(prompt: &str) -> AgentInvocation {
-        ClaudeRunner.build_invocation(InvocationInputs {
-            prompt: prompt.to_string(),
-            model: "fable".to_string(),
-            max_turns: Some("200".to_string()),
-            permission_mode: Some("acceptEdits".to_string()),
-            settings_path: Some(PathBuf::from("/hooks/settings.json")),
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        })
+        ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: prompt.to_string(),
+                model: "fable".to_string(),
+                max_turns: Some("200".to_string()),
+                permission_mode: Some("acceptEdits".to_string()),
+                settings_path: Some(PathBuf::from("/hooks/settings.json")),
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        )
     }
 
     fn prepared(worktree: &Path, prompt: &str) -> PreparedRun {
@@ -312,6 +315,7 @@ mod tests {
     /// exists to read without assuming either convention.
     fn opencode_prepared(worktree: &Path, prompt: &str) -> PreparedRun {
         let invocation = crate::agent::opencode::OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
             crate::agent::InvocationInputs {
                 prompt: prompt.to_string(),
                 model: "venice/glm".to_string(),

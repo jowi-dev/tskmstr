@@ -289,6 +289,12 @@ pub struct TuiDeps {
     /// The autopilot host thread ticking the board's own scope, and
     /// `max_lanes` (GitHub issue #116).
     pub autopilot: AutopilotDeps,
+    /// Memory and usage admission for the agents the board starts in
+    /// process: audit, create and bugbot-cleanup sessions, and hibernate
+    /// wake (GitHub issue #149). A refusal or warning shows in the status
+    /// line. Lane runs, fix passes and merges go through their `tm`
+    /// commands' own admission.
+    pub admission: crate::work::admission::OwnedAdmission,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, `tm review fix`,
@@ -627,6 +633,7 @@ fn run_cmds<B: Backend>(
                 crate::runs::session::sessions_dir(&deps.home, deps.xdg_data_home.as_deref());
             let message = wake_and_attach(
                 terminal,
+                &deps.admission,
                 deps.store.as_ref(),
                 deps.tmux.as_ref(),
                 &session_name,
@@ -667,6 +674,7 @@ fn run_cmds<B: Backend>(
                     );
                     let message = wake_and_attach(
                         terminal,
+                        &deps.admission,
                         deps.store.as_ref(),
                         deps.tmux.as_ref(),
                         &outcome.session_name,
@@ -912,37 +920,58 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 /// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
 /// Returns a status-line prefix naming what was resumed, or the failure;
 /// `None` when there was nothing to resume (or no store), in which case no
-/// tmux call is made. A failure never blocks the attach that follows.
+/// tmux call is made. A failure never blocks the attach that follows,
+/// except an admission refusal (GitHub issue #149): that is `Err`, the
+/// status line to show instead of attaching.
 fn wake_hibernated(
+    admission: &crate::work::admission::OwnedAdmission,
     store: Option<&crate::runs::RunStore>,
     tmux: &dyn TmuxOps,
     session_name: &str,
     sessions_dir: &std::path::Path,
-) -> Option<String> {
-    let store = store?;
-    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
-        Ok(woken) if woken.is_empty() => None,
+) -> Result<Option<String>, String> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let mut warning = Vec::new();
+    match crate::work::hibernate::wake_session(
+        &admission.deps(),
+        store,
+        tmux,
+        session_name,
+        sessions_dir,
+        &mut warning,
+    ) {
+        Ok(woken) if woken.is_empty() => Ok(None),
         Ok(woken) => {
             let windows: Vec<String> = woken
                 .iter()
                 .map(|run| format!("{session_name}:{}", run.window))
                 .collect();
-            Some(format!("resumed hibernated run in {}", windows.join(", ")))
+            Ok(Some(with_warning(
+                format!("resumed hibernated run in {}", windows.join(", ")),
+                crate::work::admission::warning_text(&warning),
+            )))
         }
-        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
+        Err(crate::work::hibernate::WakeError::Admission(err)) => Err(err.to_string()),
+        Err(err) => Ok(Some(format!("resuming hibernated run failed: {err}"))),
     }
 }
 
 /// [`attach_session`], preceded by [`wake_hibernated`]; the status line
-/// reports both.
+/// reports both. A wake admission refused does not attach.
 fn wake_and_attach<B: Backend>(
     terminal: &mut Terminal<B>,
+    admission: &crate::work::admission::OwnedAdmission,
     store: Option<&crate::runs::RunStore>,
     tmux: &dyn TmuxOps,
     session_name: &str,
     sessions_dir: &std::path::Path,
 ) -> String {
-    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
+    let woke = match wake_hibernated(admission, store, tmux, session_name, sessions_dir) {
+        Ok(woke) => woke,
+        Err(refusal) => return refusal,
+    };
     let attached = attach_session(terminal, tmux, session_name);
     match woke {
         Some(woke) => format!("{woke}; {attached}"),
@@ -1269,6 +1298,9 @@ pub struct WatchDeps {
     /// overview hands the host its rows' scopes; `tm runs watch` shares
     /// the loop, so `Tab` keeps ticking whatever the overview last set.
     pub autopilot: AutopilotDeps,
+    /// Memory and usage admission for hibernate wake on attach (GitHub
+    /// issue #149); see [`TuiDeps::admission`].
+    pub admission: crate::work::admission::OwnedAdmission,
 }
 
 /// The autopilot host a board or overview runs (GitHub issue #116).
@@ -1517,6 +1549,7 @@ fn run_watch_cmds<B: Backend>(
             let sessions_dir = crate::runs::session::sessions_dir_from_process_env();
             let message = wake_and_attach(
                 terminal,
+                &deps.admission,
                 Some(&deps.store),
                 deps.tmux.as_ref(),
                 &session_name,
@@ -1678,7 +1711,7 @@ fn load_overview(deps: &WatchDeps) -> Vec<Msg> {
 /// #86, ADR-0009 decision 7). Lane memory is the latest footprint the
 /// reaper recorded, CPU is sampled here per lane process tree, and the
 /// budget figure is what admission would count (see
-/// [`crate::work::admission::running_lane_estimate`]). A probe that can't
+/// [`crate::work::admission::running_agent_estimate`]). A probe that can't
 /// read on this platform shows as unknown, never as an error.
 fn load_system(deps: &WatchDeps) -> Vec<Msg> {
     use crate::runs::system::{BudgetUse, SlotUse, SystemHeader, lane_totals};
@@ -1694,7 +1727,7 @@ fn load_system(deps: &WatchDeps) -> Vec<Msg> {
     );
     let budget = match deps.memory.budget_bytes {
         Some(budget_bytes) => {
-            match crate::work::admission::running_lane_estimate(&deps.store, &deps.memory) {
+            match crate::work::admission::running_agent_estimate(&deps.store, &deps.memory) {
                 Ok(running) => Some(BudgetUse {
                     committed_bytes: running.bytes,
                     budget_bytes,
@@ -2366,6 +2399,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     };
 
     let message = match crate::work::audit::launch_audit(
+        &deps.admission.deps(),
         store,
         deps.tmux.as_ref(),
         &deps.audit,
@@ -2375,11 +2409,17 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         model_defaults(deps),
         key,
     ) {
-        Ok(_) if deps.audit_dir_fallback => format!(
-            "launched audit for {key} in the current repo (configured audit dir is \
-             backend-incompatible) -- press a to attach"
+        Ok(outcome) if deps.audit_dir_fallback => with_warning(
+            format!(
+                "launched audit for {key} in the current repo (configured audit dir is \
+                 backend-incompatible) -- press a to attach"
+            ),
+            outcome.warning,
         ),
-        Ok(_) => format!("launched audit for {key} -- press a to attach"),
+        Ok(outcome) => with_warning(
+            format!("launched audit for {key} -- press a to attach"),
+            outcome.warning,
+        ),
         Err(crate::work::audit::AuditLaunchError::AlreadyRunning {
             session_name,
             window_name,
@@ -2399,12 +2439,14 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// An [`AlreadyRunning`](crate::work::create::CreateLaunchError::AlreadyRunning)
 /// outcome attaches too — a second `c` press is "take me back to my draft",
 /// never a duplicate session. Only `NotConfigured` and tmux failures skip
-/// the attach, surfacing as a plain status line. Unlike [`launch_audit_cmd`]
+/// the attach, surfacing as a plain status line; so does an admission
+/// refusal (GitHub issue #149). Unlike [`launch_audit_cmd`]
 /// there is no `deps.store` guard: the `create` row the launch pre-registers
 /// (GitHub issue #156) is telemetry, skipped when the store is unavailable,
 /// so a broken runs DB never blocks creating tickets.
 fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDeps) -> String {
-    let session_name = match crate::work::create::launch_create(
+    let (session_name, warning) = match crate::work::create::launch_create(
+        &deps.admission.deps(),
         deps.store.as_ref(),
         deps.tmux.as_ref(),
         &deps.create,
@@ -2413,13 +2455,16 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
         deps.runner,
         model_defaults(deps),
     ) {
-        Ok(outcome) => outcome.session_name,
+        Ok(outcome) => (outcome.session_name, outcome.warning),
         Err(crate::work::create::CreateLaunchError::AlreadyRunning { session_name, .. }) => {
-            session_name
+            (session_name, None)
         }
         Err(err) => return err.to_string(),
     };
-    let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+    let message = with_warning(
+        attach_session(terminal, deps.tmux.as_ref(), &session_name),
+        warning,
+    );
     if deps.create_dir_fallback {
         format!(
             "{message} (create session ran in the current repo; configured create dir is \
@@ -2427,6 +2472,15 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
         )
     } else {
         message
+    }
+}
+
+/// Appends an admission warning (GitHub issue #149) to a launch's status
+/// message.
+fn with_warning(message: String, warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("{message} ({warning})"),
+        None => message,
     }
 }
 
@@ -2445,6 +2499,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         tmux: deps.tmux.as_ref(),
         runner: deps.runner,
         model_defaults: model_defaults(deps),
+        admission: deps.admission.deps(),
     };
     let request = crate::work::bugbot::CleanupLaunchRequest {
         cfg: &deps.review_watch,
@@ -2452,10 +2507,14 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         xdg_data_home: deps.xdg_data_home.as_deref(),
         identity: &deps.backend_identity,
         key,
+        unattended: false,
     };
 
     let message = match crate::work::bugbot::launch_cleanup(&launch_deps, &request) {
-        Ok(_) => format!("launched bugbot cleanup for {key} -- press b to attach"),
+        Ok(outcome) => with_warning(
+            format!("launched bugbot cleanup for {key} -- press b to attach"),
+            outcome.warning,
+        ),
         Err(crate::work::bugbot::CleanupLaunchError::AlreadyRunning {
             session_name,
             window_name,
@@ -3066,6 +3125,7 @@ mod tests {
             runner: &crate::agent::claude::ClaudeRunner,
             status_on_merge: None,
             autopilot: AutopilotDeps::default(),
+            admission: crate::work::admission::OwnedAdmission::off(),
         }
     }
 
@@ -4600,6 +4660,7 @@ mod tests {
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             session_slug: String::new(),
             idle_hibernate_mins: 0,
+            admission: crate::work::admission::OwnedAdmission::off(),
             kill_pid: |_| {},
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             memory: crate::config::MemoryConfig::default(),
@@ -4662,6 +4723,7 @@ mod tests {
         let tmux = crate::work::tmux::FakeTmuxOps::new();
 
         let message = wake_hibernated(
+            &crate::work::admission::OwnedAdmission::off(),
             Some(&store),
             &tmux,
             "tm-proj-proj-1",
@@ -4669,8 +4731,10 @@ mod tests {
         );
 
         assert_eq!(
-            message.as_deref(),
-            Some("resumed hibernated run in tm-proj-proj-1:work")
+            message,
+            Ok(Some(
+                "resumed hibernated run in tm-proj-proj-1:work".to_string()
+            ))
         );
         assert_eq!(
             store.run_by_id(run_id).unwrap().unwrap().status,
@@ -4679,16 +4743,67 @@ mod tests {
     }
 
     #[test]
+    fn wake_hibernated_refuses_over_the_memory_budget_so_the_attach_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+
+        let mut admission = crate::work::admission::OwnedAdmission::off();
+        admission.memory.budget_bytes = Some(1);
+        let message = wake_hibernated(
+            &admission,
+            Some(&store),
+            &tmux,
+            "tm-proj-proj-1",
+            &dir.path().join("sessions"),
+        );
+
+        let refusal = message.unwrap_err();
+        assert!(
+            refusal.starts_with("not launching: memory budget exceeded"),
+            "{refusal}"
+        );
+        assert_eq!(
+            store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Hibernated
+        );
+        assert!(!tmux.calls().iter().any(|c| matches!(
+            c,
+            crate::work::tmux::TmuxCall::NewWindowWithCommand { .. }
+                | crate::work::tmux::TmuxCall::NewSessionWithCommand { .. }
+        )));
+    }
+
+    #[test]
     fn wake_hibernated_is_silent_when_nothing_is_hibernated() {
         let tmux = crate::work::tmux::FakeTmuxOps::new();
         assert_eq!(
             wake_hibernated(
+                &crate::work::admission::OwnedAdmission::off(),
                 None,
                 &tmux,
                 "tm-proj-proj-1",
                 std::path::Path::new("/nowhere")
             ),
-            None
+            Ok(None)
         );
         assert!(tmux.calls().is_empty());
     }
@@ -5214,6 +5329,7 @@ mod tests {
             memory: crate::config::MemoryConfig {
                 budget_bytes: Some(8 * GIB),
                 default_lane_estimate_bytes: 2 * GIB,
+                admission_wait_mins: 60,
             },
             build_slots: Some(3),
             build_slot_lock_dir: dir.path().join("locks"),
@@ -6743,6 +6859,49 @@ mod tests {
                 "launched bugbot cleanup for PROJ-1 -- press b to attach".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn launch_cleanup_cmd_surfaces_an_admission_refusal_and_a_usage_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        deps.store = Some(store);
+        deps.review_watch = crate::config::ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            ..crate::config::ReviewWatchConfig::default()
+        };
+        deps.admission.memory.budget_bytes = Some(1);
+
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::BotsActionResult(message)] => {
+                assert!(
+                    message.starts_with("not launching: memory budget exceeded"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BotsActionResult, got {other:?}"),
+        }
+
+        deps.admission.memory.budget_bytes = None;
+        deps.store
+            .as_ref()
+            .unwrap()
+            .set_agent_exhausted_until("claude", i64::MAX / 2)
+            .unwrap();
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::BotsActionResult(message)] => {
+                assert!(
+                    message.starts_with("launched bugbot cleanup for PROJ-1")
+                        && message.contains("usage window exhausted")
+                        && message.contains("launching anyway"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BotsActionResult, got {other:?}"),
+        }
     }
 
     #[test]

@@ -77,6 +77,10 @@ pub enum CleanupLaunchError {
     #[error(transparent)]
     Store(#[from] RunStoreError),
 
+    /// Memory or usage admission refused the session (GitHub issue #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
+
     /// Shelling out to `tmux` failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
@@ -99,6 +103,9 @@ pub struct LaunchOutcome {
     /// suffixed variant when a dead predecessor still holds that name (see
     /// [`crate::work::tmux::unique_window_name`]).
     pub window_name: String,
+    /// Admission's warning for a human launch that went ahead anyway (over
+    /// a usage ceiling, or usage unknown), for the board's status line.
+    pub warning: Option<String>,
 }
 
 /// Substitutes `{key}` and `{findings_file}` in `template`, producing the
@@ -128,6 +135,9 @@ pub struct CleanupLaunchDeps<'a> {
     /// The end of the session's model chain after `req.cfg.model` (GitHub
     /// issue #143, [`crate::work::model`]).
     pub model_defaults: crate::work::model::ModelDefaults<'a>,
+    /// Memory and usage admission for the session's agent (GitHub issue
+    /// #149).
+    pub admission: crate::work::admission::AdmissionDeps<'a>,
 }
 
 /// Everything [`launch_cleanup`] needs to know about *this* launch, mirroring
@@ -150,6 +160,10 @@ pub struct CleanupLaunchRequest<'a> {
     pub identity: &'a BackendIdentity,
     /// The ticket key this cleanup session is for, e.g. `PROJ-372`.
     pub key: &'a str,
+    /// Whether tm is launching with nobody present (`tm pr watch` with
+    /// `on_bots_done = "launch"`) rather than a human (the board key). See
+    /// [`launch_cleanup`]'s admission step.
+    pub unattended: bool,
 }
 
 /// Launches (or refuses to double-launch) a bugbot-cleanup session for
@@ -173,6 +187,13 @@ pub struct CleanupLaunchRequest<'a> {
 ///    [`crate::work::audit::SESSION_RUN_ID_ENV`] set to the new run's id so
 ///    the in-session `/bugbot-triage` skill's `tm runs register --kind
 ///    bugbot-cleanup` step can adopt it.
+///
+/// Admission (GitHub issue #149) runs before the tmux session starts. A
+/// human launch is admitted before the row is pre-registered, so a refusal
+/// leaves none; over a usage ceiling it warns into the outcome. An
+/// unattended launch pre-registers the row first and waits on it
+/// ([`crate::work::admission::LaunchOrigin::Unattended`]), recording
+/// `admission_wait` there; if the wait gives up the row ends failed.
 ///
 /// The prompt template is `req.cfg.prompt_file`'s contents, else
 /// `req.cfg.prompt`, else
@@ -220,6 +241,25 @@ pub fn launch_cleanup(
         })
         .transpose()?;
 
+    let repo = crate::work::run::dir_repo_key(&dir);
+    let request = |own_run| crate::work::admission::LaunchRequest {
+        kind: CLEANUP_KIND,
+        agent: deps.runner.name(),
+        repo: &repo,
+        own_run,
+    };
+    let mut warning = Vec::new();
+    let human_admitted = if req.unattended {
+        None
+    } else {
+        Some(deps.admission.admit(
+            deps.store,
+            &request(None),
+            crate::work::admission::LaunchOrigin::Human,
+            &mut warning,
+        )?)
+    };
+
     let run_id = deps.store.start_run(&StartRun {
         ticket: req.key.to_string(),
         scope: req.identity.scope(),
@@ -232,11 +272,33 @@ pub fn launch_cleanup(
     })?;
     // Every agent row carries its estimate key (GitHub issue #156): the
     // cleanup directory's name stands in for a lane's repo.
-    deps.store.update_agent_repo(
-        run_id,
-        deps.runner.name(),
-        &crate::work::run::dir_repo_key(&dir),
-    )?;
+    deps.store
+        .update_agent_repo(run_id, deps.runner.name(), &repo)?;
+
+    let admitted = match human_admitted {
+        Some(admitted) => admitted,
+        None => match deps.admission.admit(
+            deps.store,
+            &request(Some(run_id)),
+            crate::work::admission::LaunchOrigin::Unattended {
+                event_run: Some(run_id),
+            },
+            &mut std::io::sink(),
+        ) {
+            Ok(admitted) => admitted,
+            Err(err) => {
+                deps.store.finish_run(
+                    run_id,
+                    &crate::runs::FinishRun {
+                        status: crate::runs::RunStatus::Failed,
+                        blocker: Some(format!("bugbot-cleanup never admitted: {err}")),
+                        ..crate::runs::FinishRun::default()
+                    },
+                )?;
+                return Err(err.into());
+            }
+        },
+    };
 
     let template = prompt_file_contents
         .as_deref()
@@ -250,7 +312,9 @@ pub fn launch_cleanup(
             model: req.cfg.model.as_deref(),
         }],
     );
-    let command = deps.runner.interactive_shell_command(&model.model, &prompt);
+    let command = deps
+        .runner
+        .interactive_shell_command(&admitted, &model.model, &prompt);
     let env = [(
         crate::work::audit::SESSION_RUN_ID_ENV.to_string(),
         run_id.to_string(),
@@ -279,6 +343,7 @@ pub fn launch_cleanup(
         run_id,
         session_name,
         window_name,
+        warning: crate::work::admission::warning_text(&warning),
     })
 }
 
@@ -311,6 +376,9 @@ pub struct RealCleanupLauncher<'a> {
     pub runner: &'a dyn AgentRunner,
     /// See [`CleanupLaunchDeps::model_defaults`].
     pub model_defaults: crate::work::model::ModelDefaults<'a>,
+    /// See [`CleanupLaunchDeps::admission`]. `tm pr watch` launches
+    /// unattended, so a refused session waits.
+    pub admission: crate::work::admission::AdmissionDeps<'a>,
 }
 
 impl CleanupLauncher for RealCleanupLauncher<'_> {
@@ -320,6 +388,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
             tmux: self.tmux,
             runner: self.runner,
             model_defaults: self.model_defaults,
+            admission: self.admission,
         };
         let req = CleanupLaunchRequest {
             cfg: self.cfg,
@@ -327,6 +396,7 @@ impl CleanupLauncher for RealCleanupLauncher<'_> {
             xdg_data_home: self.xdg_data_home,
             identity: self.identity,
             key,
+            unattended: true,
         };
         if let Err(err) = launch_cleanup(&deps, &req) {
             eprintln!("warning: failed to launch bugbot-cleanup session for {key}: {err}");
@@ -393,6 +463,92 @@ mod tests {
     }
 
     #[test]
+    fn a_human_cleanup_over_the_memory_budget_is_refused_before_its_row() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = configured("~/Projects/axiom");
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+            runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::with_budget(1),
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            identity: test_identity(),
+            key: "PROJ-1",
+            unattended: false,
+        };
+
+        let err = launch_cleanup(&deps, &req).unwrap_err();
+
+        assert!(
+            err.to_string().starts_with(
+                "not launching: memory budget exceeded: axiom/claude bugbot-cleanup runs"
+            ),
+            "{err}"
+        );
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+        );
+    }
+
+    #[test]
+    fn an_unattended_cleanup_that_is_never_admitted_waits_on_its_row_then_fails_it() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let cfg = configured("~/Projects/axiom");
+        let deps = CleanupLaunchDeps {
+            store: &store,
+            tmux: &tmux,
+            runner: &ClaudeRunner,
+            model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::with_budget(1),
+        };
+        let req = CleanupLaunchRequest {
+            cfg: &cfg,
+            home: &home,
+            xdg_data_home: None,
+            identity: test_identity(),
+            key: "PROJ-1",
+            unattended: true,
+        };
+
+        let err = launch_cleanup(&deps, &req).unwrap_err();
+
+        assert!(err.to_string().contains("memory budget exceeded"), "{err}");
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = store.run_by_id(runs[0].id).unwrap().unwrap();
+        assert_eq!(run.kind, "bugbot-cleanup");
+        assert_eq!(run.status, RunStatus::Failed);
+        let kinds: Vec<String> = store
+            .events_for_run(run.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["admission_wait", "admission_timeout"]);
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+        );
+    }
+
+    #[test]
     fn launch_cleanup_creates_run_and_starts_tmux_session() {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
@@ -404,6 +560,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -411,6 +568,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-1",
+            unattended: false,
         };
 
         let outcome = launch_cleanup(&deps, &req).expect("launch should succeed");
@@ -475,6 +633,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -482,6 +641,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-1",
+            unattended: false,
         };
 
         let err = launch_cleanup(&deps, &req).expect_err("should refuse to launch");
@@ -507,6 +667,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -514,6 +675,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-1",
+            unattended: false,
         };
 
         let err = launch_cleanup(&deps, &req).expect_err("should refuse to double-launch");
@@ -550,6 +712,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -557,6 +720,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-1",
+            unattended: false,
         };
 
         let outcome = launch_cleanup(&deps, &req).expect("launch should succeed");
@@ -599,6 +763,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -606,6 +771,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-9",
+            unattended: false,
         };
 
         launch_cleanup(&deps, &req).unwrap();
@@ -648,6 +814,7 @@ mod tests {
                 work_default: Some("sonnet"),
                 models: &models,
             },
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -655,6 +822,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-9",
+            unattended: false,
         };
 
         launch_cleanup(&deps, &req).unwrap();
@@ -688,6 +856,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -695,6 +864,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-9",
+            unattended: false,
         };
 
         launch_cleanup(&deps, &req).unwrap();
@@ -731,6 +901,7 @@ mod tests {
             identity: test_identity(),
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
 
         launcher.launch_cleanup("PROJ-1");
@@ -765,6 +936,7 @@ mod tests {
             identity: test_identity(),
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
 
         // Must not propagate/panic per the `CleanupLauncher` contract.
@@ -793,6 +965,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -800,6 +973,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-9",
+            unattended: false,
         };
 
         launch_cleanup(&deps, &req).unwrap();
@@ -838,6 +1012,7 @@ mod tests {
             tmux: &tmux,
             runner: &ClaudeRunner,
             model_defaults: crate::work::model::ModelDefaults::none(),
+            admission: crate::work::admission::AdmissionDeps::off(),
         };
         let req = CleanupLaunchRequest {
             cfg: &cfg,
@@ -845,6 +1020,7 @@ mod tests {
             xdg_data_home: None,
             identity: test_identity(),
             key: "PROJ-9",
+            unattended: false,
         };
 
         let err = launch_cleanup(&deps, &req).expect_err("missing prompt file should error");

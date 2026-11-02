@@ -93,6 +93,10 @@ pub enum AuditLaunchError {
     /// [`RunStore::start_run`], so a bad path leaves no orphaned run row.
     #[error(transparent)]
     PromptFile(#[from] crate::work::prompt::PromptFileError),
+
+    /// Memory admission refused the session (GitHub issue #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
 }
 
 /// Successful outcome of [`launch_audit`].
@@ -108,6 +112,9 @@ pub struct LaunchOutcome {
     /// [`unique_window_name`] suffixed variant when a previous audit's dead
     /// window still holds that name.
     pub window_name: String,
+    /// Admission's warning for a launch that went ahead anyway (over a
+    /// usage ceiling, or usage unknown), for the board's status line.
+    pub warning: Option<String>,
 }
 
 /// Substitutes `{key}` in `template` with `key`, producing the prompt text
@@ -163,6 +170,7 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 /// `--model` is always passed.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_audit(
+    admission: &crate::work::admission::AdmissionDeps<'_>,
     store: &RunStore,
     tmux: &dyn TmuxOps,
     audit_cfg: &AuditConfig,
@@ -200,6 +208,23 @@ pub fn launch_audit(
         .map(|raw| crate::work::prompt::read_prompt_file(raw, home, "[work.audit].prompt_file"))
         .transpose()?;
 
+    // Admission (GitHub issue #149) before the row, so a refusal leaves
+    // none. A board audit is human-started: over the memory budget it
+    // refuses, over a usage ceiling it warns and launches.
+    let repo = crate::work::run::dir_repo_key(&dir);
+    let mut warning = Vec::new();
+    let admitted = admission.admit(
+        store,
+        &crate::work::admission::LaunchRequest {
+            kind: "audit",
+            agent: runner.name(),
+            repo: &repo,
+            own_run: None,
+        },
+        crate::work::admission::LaunchOrigin::Human,
+        &mut warning,
+    )?;
+
     let run_id = store.start_run(&StartRun {
         ticket: key.to_string(),
         scope: identity.scope(),
@@ -212,7 +237,7 @@ pub fn launch_audit(
     })?;
     // Every agent row carries its estimate key (GitHub issue #156): the
     // audit directory's name stands in for a lane's repo.
-    store.update_agent_repo(run_id, runner.name(), &crate::work::run::dir_repo_key(&dir))?;
+    store.update_agent_repo(run_id, runner.name(), &repo)?;
 
     let template = prompt_file_contents
         .as_deref()
@@ -226,7 +251,7 @@ pub fn launch_audit(
             model: audit_cfg.model.as_deref(),
         }],
     );
-    let command = runner.interactive_shell_command(&model.model, &prompt);
+    let command = runner.interactive_shell_command(&admitted, &model.model, &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
     if existing_windows.is_empty() {
@@ -244,6 +269,7 @@ pub fn launch_audit(
         run_id,
         session_name,
         window_name,
+        warning: crate::work::admission::warning_text(&warning),
     })
 }
 
@@ -305,6 +331,41 @@ mod tests {
     }
 
     #[test]
+    fn launch_audit_over_the_memory_budget_is_refused_before_its_row() {
+        let db_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let tmux = FakeTmuxOps::new();
+        let home = PathBuf::from("/Users/jowi");
+        let audit_cfg = configured("~/Projects/axiom");
+
+        let err = launch_audit(
+            &crate::work::admission::AdmissionDeps::with_budget(1),
+            &store,
+            &tmux,
+            &audit_cfg,
+            &home,
+            &test_identity(),
+            &ClaudeRunner,
+            crate::work::model::ModelDefaults::none(),
+            "PROJ-1",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded: axiom/claude audit runs"),
+            "{err}"
+        );
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+        );
+    }
+
+    #[test]
     fn launch_audit_creates_run_and_starts_tmux_session() {
         let db_dir = tempdir().unwrap();
         let store = open_store(db_dir.path());
@@ -313,6 +374,7 @@ mod tests {
         let audit_cfg = configured("~/Projects/axiom");
 
         let outcome = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -374,6 +436,7 @@ mod tests {
         let audit_cfg = AuditConfig::default();
 
         let err = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -412,6 +475,7 @@ mod tests {
         let audit_cfg = configured("~/Projects/axiom");
 
         let err = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -451,6 +515,7 @@ mod tests {
         let audit_cfg = configured("/repo/axiom");
 
         let outcome = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -489,6 +554,7 @@ mod tests {
         let audit_cfg = configured("/repo/axiom");
 
         let outcome = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -513,6 +579,7 @@ mod tests {
         let audit_cfg = configured("/repo/axiom");
 
         launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -547,6 +614,7 @@ mod tests {
         };
 
         launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -578,6 +646,7 @@ mod tests {
         };
 
         launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -617,6 +686,7 @@ mod tests {
             };
 
             launch_audit(
+                &crate::work::admission::AdmissionDeps::off(),
                 &store,
                 &tmux,
                 &audit_cfg,
@@ -654,6 +724,7 @@ mod tests {
         };
 
         launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,
@@ -687,6 +758,7 @@ mod tests {
         };
 
         let err = launch_audit(
+            &crate::work::admission::AdmissionDeps::off(),
             &store,
             &tmux,
             &audit_cfg,

@@ -179,7 +179,7 @@ actions, and read-only actions land before ones that change state.
      (~2s after the overview opens).
    - Lane memory is the latest footprint the reaper recorded (every ~30s),
      not a fresh sample.
-   - The budget figure reuses admission's `running_lane_estimate`, so the
+   - The budget figure reuses admission's `running_agent_estimate`, so the
      header and a refused launch always agree.
    - Build slots in use are counted by probing each lock file with a
      non-blocking `flock` that is released at once. Budget and slot totals

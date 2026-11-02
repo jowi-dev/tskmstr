@@ -167,6 +167,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
     let tmux = ShellTmuxOps::new();
     let git = ShellGitOps::new();
     let backend_identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let cleanup_admission = owned_admission(Some(&config), agent_runner_for(&config));
     let cleanup_launcher = tskmstr::work::bugbot::RealCleanupLauncher {
         store: &run_store,
         tmux: &tmux,
@@ -176,6 +177,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         identity: &backend_identity,
         runner: agent_runner_for(&config),
         model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+        admission: cleanup_admission.deps(),
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -743,6 +745,8 @@ fn run_work(
             let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
             let current_exe = std::env::current_exe()?;
             let identity = backend_identity_or_placeholder(full_config.as_ref());
+            let runner = agent_runner_or_default(full_config.as_ref());
+            let admission = owned_admission(full_config.as_ref(), runner);
             tskmstr::cli::work::session(
                 &ctx,
                 &run_store,
@@ -750,7 +754,8 @@ fn run_work(
                 &current_exe,
                 &tskmstr::runs::session::sessions_dir_from_process_env(),
                 &key,
-                agent_runner_or_default(full_config.as_ref()),
+                runner,
+                &admission.deps(),
                 &mut stdout,
             )?;
         }
@@ -979,6 +984,7 @@ fn run_board(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let runner = agent_runner_for(&config);
+    let admission = owned_admission(Some(&config), runner);
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
     let home = std::env::var_os("HOME")
@@ -1086,6 +1092,7 @@ fn run_board(
             runner,
             status_on_merge: config.status_on_merge,
             autopilot,
+            admission,
         },
         net,
     )?;
@@ -1446,13 +1453,11 @@ fn run_init(
     };
 
     let setup_repo_dir = repo_dir.clone();
-    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(
-            invocation,
-            setup_repo_dir.as_deref(),
-            paths,
-            init_runner.name(),
-        )
+    let setup_launcher = move |build: &dyn Fn(
+        &tskmstr::work::admission::Admitted,
+    ) -> tskmstr::agent::AgentInvocation|
+          -> Result<(), String> {
+        launch_setup_session(build, setup_repo_dir.as_deref(), paths, init_runner)
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -1475,9 +1480,12 @@ fn run_init(
     Ok(())
 }
 
-/// Run an agent invocation in the foreground from `dir` (when known) and
-/// wait for it to exit — the real setup-session launcher behind `tm init`'s
-/// and `tm update`'s agent-assisted asset setup.
+/// Admit the setup session, build its invocation with `build`, run it in
+/// the foreground from `dir` (when known) and wait for it to exit — the
+/// real setup-session launcher behind `tm init`'s and `tm update`'s
+/// agent-assisted asset setup. Admission (GitHub issue #149) refuses over
+/// the memory budget and warns over a usage ceiling, through
+/// [`tskmstr::work::setup_session::admit_setup_session`].
 ///
 /// Records the session as a `setup` run row through
 /// [`tskmstr::work::setup_session::run_setup_session`] (GitHub issue #156).
@@ -1487,10 +1495,10 @@ fn run_init(
 /// records under scope `""` in the default database, and a database that
 /// won't open runs the session untracked.
 fn launch_setup_session(
-    invocation: &tskmstr::agent::AgentInvocation,
+    build: &dyn Fn(&tskmstr::work::admission::Admitted) -> tskmstr::agent::AgentInvocation,
     dir: Option<&Path>,
     paths: &ConfigPaths,
-    agent: &str,
+    runner: &'static dyn AgentRunner,
 ) -> Result<(), String> {
     let config = config::load(paths).ok();
     let scope = config
@@ -1502,15 +1510,24 @@ fn launch_setup_session(
         .map(run_db_path_from_config)
         .unwrap_or_else(default_xdg_run_db_path);
     let store = tskmstr::runs::RunStore::open(&db_path).ok();
-    let session = tskmstr::work::setup_session::SetupSession {
+    let mut session = tskmstr::work::setup_session::SetupSession {
         store: store.as_ref(),
         scope: &scope,
-        agent,
+        agent: runner.name(),
         dir,
-        program: &invocation.program,
+        program: runner.name(),
     };
+    let admitted = with_admission(config.as_ref(), runner, |admission| {
+        tskmstr::work::setup_session::admit_setup_session(
+            &admission,
+            &session,
+            &mut std::io::stdout(),
+        )
+    })?;
+    let invocation = build(&admitted);
+    session.program = &invocation.program;
     tskmstr::work::setup_session::run_setup_session(&session, &mut || {
-        let child = tskmstr::work::setup_session::setup_command(invocation, dir).spawn()?;
+        let child = tskmstr::work::setup_session::setup_command(&invocation, dir).spawn()?;
         Ok(Box::new(child))
     })
 }
@@ -1533,8 +1550,11 @@ fn run_update_cmd(yes: bool) -> ExitCode {
         .as_deref()
         .and_then(|repo_config| repo_config.parent().map(PathBuf::from));
     let setup_paths = paths.clone();
-    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(invocation, repo_dir.as_deref(), &setup_paths, runner.name())
+    let setup_launcher = move |build: &dyn Fn(
+        &tskmstr::work::admission::Admitted,
+    ) -> tskmstr::agent::AgentInvocation|
+          -> Result<(), String> {
+        launch_setup_session(build, repo_dir.as_deref(), &setup_paths, runner)
     };
 
     let ctx = tskmstr::cli::update::UpdateContext {
@@ -2288,54 +2308,58 @@ fn run_merge_cmd(keys: Vec<String>) -> ExitCode {
     let state_dir = home.join(".local/state/tskmstr/work");
     let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();
 
-    let deps = tskmstr::work::merge::MergeDeps {
-        git: &git,
-        gh: &gh,
-        tmux: &tmux,
-        jira: jira.as_ref(),
-        runner: agent_runner_for(&config),
-        run_store: Some(&run_store),
-        clock: &clock,
-        sleeper: &sleeper,
-        cwd: &cwd,
-        home: &home,
-        identity: &identity,
-        lanes: &config.work.lanes,
-        merge_cfg: &config.work.merge,
-        model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
-        status_on_merge: config.status_on_merge.as_deref(),
-        state_dir: &state_dir,
-        sessions_dir: &sessions_dir,
-        kill_pid: &tskmstr::runs::pid::kill_pid,
-    };
-    let mut stdout = std::io::stdout();
+    let runner = agent_runner_for(&config);
+    with_admission(Some(&config), runner, |admission| {
+        let deps = tskmstr::work::merge::MergeDeps {
+            git: &git,
+            gh: &gh,
+            tmux: &tmux,
+            jira: jira.as_ref(),
+            runner,
+            run_store: Some(&run_store),
+            clock: &clock,
+            sleeper: &sleeper,
+            cwd: &cwd,
+            home: &home,
+            identity: &identity,
+            lanes: &config.work.lanes,
+            merge_cfg: &config.work.merge,
+            admission,
+            model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+            status_on_merge: config.status_on_merge.as_deref(),
+            state_dir: &state_dir,
+            sessions_dir: &sessions_dir,
+            kill_pid: &tskmstr::runs::pid::kill_pid,
+        };
+        let mut stdout = std::io::stdout();
 
-    let key = match keys.as_slice() {
-        [key] => key.clone(),
-        _ => {
-            return match tskmstr::work::merge::run_merge_batch(&deps, &keys, &mut stdout) {
-                Ok(report) => ExitCode::from(report.exit_code()),
-                Err(err) => {
-                    eprintln!("{err}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
-    };
+        let key = match keys.as_slice() {
+            [key] => key.clone(),
+            _ => {
+                return match tskmstr::work::merge::run_merge_batch(&deps, &keys, &mut stdout) {
+                    Ok(report) => ExitCode::from(report.exit_code()),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+        };
 
-    match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
-        Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
-        Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
-            eprintln!(
-                "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
-            );
-            ExitCode::from(MERGE_EXIT_CONFLICTS)
+        match tskmstr::work::merge::run_merge(&deps, &key, &mut stdout) {
+            Ok(tskmstr::work::merge::MergeFlowOutcome::Merged) => ExitCode::SUCCESS,
+            Ok(tskmstr::work::merge::MergeFlowOutcome::ConflictsHandedBack) => {
+                eprintln!(
+                    "conflicts handed back for {key}: resolve in the merge tmux window, then rerun `tm merge {key}`"
+                );
+                ExitCode::from(MERGE_EXIT_CONFLICTS)
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
         }
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
-    }
+    })
 }
 
 /// Exit code for `tm review fix <KEY>` reporting that `vdiff` captured no
@@ -2359,7 +2383,14 @@ const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
 fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
     let result = with_review_deps(|deps, run_paths, _config| {
         let mut stdout = std::io::stdout();
-        tskmstr::cli::review::fix(deps, run_paths, &key, dispatch, &mut stdout)
+        tskmstr::cli::review::fix(
+            deps,
+            run_paths,
+            &key,
+            dispatch,
+            tskmstr::work::admission::LaunchOrigin::Human,
+            &mut stdout,
+        )
     });
     match result {
         Ok(Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true })) => {
@@ -2470,22 +2501,61 @@ fn with_review_deps<T>(
     // just degrades the session name to an unscoped slug.
     let full_config = config::load(&default_config_paths()).ok();
     let backend_identity = backend_identity_or_placeholder(full_config.as_ref());
-    let deps = tskmstr::cli::review::ReviewFixDeps {
-        git: &git,
-        gh: &gh,
-        spawner: &spawner,
-        run_store: &run_store,
-        clock: &clock,
-        vdiff: &vdiff,
-        detach: &detach,
-        current_exe: &current_exe,
-        run_db_path: &run_db_path,
-        tmux: &tmux,
-        backend_identity: &backend_identity,
-        runner: agent_runner_or_default(full_config.as_ref()),
-        config: full_config.as_ref(),
-    };
-    Ok(f(&deps, &run_paths, full_config.as_ref()))
+    let runner = agent_runner_or_default(full_config.as_ref());
+    Ok(with_admission(full_config.as_ref(), runner, |admission| {
+        let deps = tskmstr::cli::review::ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+            backend_identity: &backend_identity,
+            runner,
+            config: full_config.as_ref(),
+            admission,
+        };
+        f(&deps, &run_paths, full_config.as_ref())
+    }))
+}
+
+/// Production memory and usage admission (GitHub issue #149) for launches
+/// of `runner`: the loaded config's `[work]` memory and `[agent.<runner>]`
+/// usage settings (the defaults with no config), a
+/// [`tskmstr::work::admission::SpawnUsageProber`], and the kernel's memory
+/// pressure. The configured models the prober resolves its model from are
+/// leaked: they live as long as the process does anyway.
+fn owned_admission(
+    config: Option<&tskmstr::config::Config>,
+    runner: &'static dyn tskmstr::agent::AgentRunner,
+) -> tskmstr::work::admission::OwnedAdmission {
+    let models: &'static tskmstr::config::ModelsConfig = Box::leak(Box::new(
+        config.map(|c| c.models.clone()).unwrap_or_default(),
+    ));
+    tskmstr::work::admission::OwnedAdmission {
+        memory: config.map(|c| c.work.memory.clone()).unwrap_or_default(),
+        usage: config.map(|c| c.usage.clone()).unwrap_or_default(),
+        prober: Box::new(tskmstr::work::admission::SpawnUsageProber {
+            runners: vec![runner],
+            models,
+            spawner: &tskmstr::work::runner::StdProcessSpawner,
+        }),
+        pressure: tskmstr::runs::footprint::memory_pressure,
+    }
+}
+
+/// Runs `f` with [`owned_admission`]'s admission for launches of `runner`.
+fn with_admission<T>(
+    config: Option<&tskmstr::config::Config>,
+    runner: &'static dyn tskmstr::agent::AgentRunner,
+    f: impl FnOnce(tskmstr::work::admission::AdmissionDeps<'_>) -> T,
+) -> T {
+    let owned = owned_admission(config, runner);
+    f(owned.deps())
 }
 
 /// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.
@@ -2772,6 +2842,7 @@ fn watch_deps(
                 .flatten()
         })),
         autopilot: autopilot_deps(config, Vec::new()),
+        admission: owned_admission(config, agent_runner_or_default(config)),
     }
 }
 

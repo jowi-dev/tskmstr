@@ -49,7 +49,7 @@ use crate::runs::footprint::MemoryPressure;
 use crate::runs::overview::OverviewRun;
 use crate::runs::{RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{
-    AdmissionRefusal, UsageProber, UsageRefusal, UsageVerdict, check_lane_admission,
+    AdmissionRefusal, UsageProber, UsageRefusal, UsageVerdict, check_memory_admission,
     check_usage_admission,
 };
 use crate::work::auto_review::RoundVerdict;
@@ -525,9 +525,10 @@ fn admit<'c>(
     let Some(agent) = cfg.agent else {
         return Ok(Err(Refusal::NoUnattendedRunner));
     };
-    if let Some(refusal) = check_lane_admission(
+    if let Some(refusal) = check_memory_admission(
         deps.store,
         cfg.memory,
+        "lane",
         agent,
         &lane.repo,
         deps.memory_pressure,

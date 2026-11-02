@@ -165,81 +165,11 @@ pub struct ClaudeRunner;
 /// [`ClaudeRunner`]'s [`AgentRunner::name`].
 pub const NAME: &str = "claude";
 
-impl AgentRunner for ClaudeRunner {
-    fn name(&self) -> &'static str {
-        NAME
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Claude Code"
-    }
-
-    /// `claude -p 'ok' --model <model> --max-turns 1 --output-format
-    /// stream-json --verbose`: one turn (about $0.003 list price on haiku,
-    /// the built-in probe model, when measured), whose `rate_limit_event`
-    /// is the snapshot. Built through
-    /// [`ClaudeRunner::build_invocation`] so it keeps the billing-safety env
-    /// stripping. No settings, so no telemetry hooks fire, and no run id, so
-    /// it is untracked. See `docs/plans/gh-113-proactive-usage-signal.md`.
-    fn usage_probe_invocation(&self, model: &str) -> Option<AgentInvocation> {
-        Some(self.build_invocation(InvocationInputs {
-            prompt: "ok".to_string(),
-            model: model.to_string(),
-            max_turns: Some("1".to_string()),
-            permission_mode: None,
-            settings_path: None,
-            run_id: None,
-            mode: RunMode::Headless,
-        }))
-    }
-
-    fn skills_dir(&self, base: &Path) -> PathBuf {
-        base.join(".claude/skills")
-    }
-
-    /// `<base>/.claude/agents/<name>.md` — claude discovers subagent
-    /// definitions under `.claude/agents/`.
-    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
-        base.join(".claude/agents").join(format!("{name}.md"))
-    }
-
-    /// A `.claude/agents/<name>.md` definition: claude's frontmatter carries
-    /// `name`, `description`, and `model`, then the shared delegation body.
-    fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String {
-        let model = model.unwrap_or(crate::agent::SUBAGENT_MODEL_PLACEHOLDER);
-        format!(
-            "---\n\
-             name: {name}\n\
-             description: Implementation subagent for delegated coding, test-writing, and mechanical edits.\n\
-             model: {model}\n\
-             ---\n\
-             \n\
-             {}",
-            crate::agent::SUBAGENT_DEFINITION_BODY
-        )
-    }
-
-    /// Build the [`AgentInvocation`] for one run from already-resolved
-    /// [`InvocationInputs`], applying the same max-turns/permission-mode
-    /// defaults `work.ml`'s `run_lane` applies when a
-    /// lane/run option is absent.
-    ///
-    /// [`InvocationInputs::mode`] forks both halves of the result:
-    ///
-    /// | | [`RunMode::Headless`] | [`RunMode::Interactive`] |
-    /// |---|---|---|
-    /// | prompt | `-p <prompt>` | positional, `args[0]` |
-    /// | `--output-format stream-json --verbose` | yes (JSONL, parsed by [`AgentRunner::parse_outcome`]) | no — nothing parses an interactive session's stdout |
-    /// | `--max-turns` | yes | no — meaningless for a steerable session |
-    /// | run id travels as | `TSKMSTR_RUN_ID` | `TSKMSTR_SESSION_RUN_ID` |
-    ///
-    /// `--model`, `--settings` and `--permission-mode` are common to both.
-    /// `--settings` especially: it is what deploys the SessionEnd hook that
-    /// finishes an interactive run, so an interactive invocation needs it at
-    /// least as much as a headless one does.
-    ///
-    /// Read [`RunMode`] before touching the env-set fork.
-    fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
+impl ClaudeRunner {
+    /// [`AgentRunner::build_invocation`] without the admission proof, for
+    /// that method and the usage probe, which is part of admission
+    /// (GitHub issue #149).
+    fn invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
         let permission_mode = inputs
             .permission_mode
             .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string());
@@ -308,6 +238,92 @@ impl AgentRunner for ClaudeRunner {
                 "CLAUDECODE".to_string(),
             ],
         }
+    }
+}
+
+impl AgentRunner for ClaudeRunner {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    /// `claude -p 'ok' --model <model> --max-turns 1 --output-format
+    /// stream-json --verbose`: one turn (about $0.003 list price on haiku,
+    /// the built-in probe model, when measured), whose `rate_limit_event`
+    /// is the snapshot. Built through
+    /// [`ClaudeRunner::build_invocation`] so it keeps the billing-safety env
+    /// stripping. No settings, so no telemetry hooks fire, and no run id, so
+    /// it is untracked. See `docs/plans/gh-113-proactive-usage-signal.md`.
+    fn usage_probe_invocation(&self, model: &str) -> Option<AgentInvocation> {
+        Some(self.invocation(InvocationInputs {
+            prompt: "ok".to_string(),
+            model: model.to_string(),
+            max_turns: Some("1".to_string()),
+            permission_mode: None,
+            settings_path: None,
+            run_id: None,
+            mode: RunMode::Headless,
+        }))
+    }
+
+    fn skills_dir(&self, base: &Path) -> PathBuf {
+        base.join(".claude/skills")
+    }
+
+    /// `<base>/.claude/agents/<name>.md` — claude discovers subagent
+    /// definitions under `.claude/agents/`.
+    fn agent_definition_path(&self, base: &Path, name: &str) -> PathBuf {
+        base.join(".claude/agents").join(format!("{name}.md"))
+    }
+
+    /// A `.claude/agents/<name>.md` definition: claude's frontmatter carries
+    /// `name`, `description`, and `model`, then the shared delegation body.
+    fn agent_definition_template(&self, name: &str, model: Option<&str>) -> String {
+        let model = model.unwrap_or(crate::agent::SUBAGENT_MODEL_PLACEHOLDER);
+        format!(
+            "---\n\
+             name: {name}\n\
+             description: Implementation subagent for delegated coding, test-writing, and mechanical edits.\n\
+             model: {model}\n\
+             ---\n\
+             \n\
+             {}",
+            crate::agent::SUBAGENT_DEFINITION_BODY
+        )
+    }
+
+    /// Build the [`AgentInvocation`] for one run from already-resolved
+    /// [`InvocationInputs`], applying the same max-turns/permission-mode
+    /// defaults `work.ml`'s `run_lane` applies when a
+    /// lane/run option is absent.
+    ///
+    /// [`InvocationInputs::mode`] forks both halves of the result:
+    ///
+    /// | | [`RunMode::Headless`] | [`RunMode::Interactive`] |
+    /// |---|---|---|
+    /// | prompt | `-p <prompt>` | positional, `args[0]` |
+    /// | `--output-format stream-json --verbose` | yes (JSONL, parsed by [`AgentRunner::parse_outcome`]) | no — nothing parses an interactive session's stdout |
+    /// | `--max-turns` | yes | no — meaningless for a steerable session |
+    /// | run id travels as | `TSKMSTR_RUN_ID` | `TSKMSTR_SESSION_RUN_ID` |
+    ///
+    /// `--model`, `--settings` and `--permission-mode` are common to both.
+    /// `--settings` especially: it is what deploys the SessionEnd hook that
+    /// finishes an interactive run, so an interactive invocation needs it at
+    /// least as much as a headless one does.
+    ///
+    /// Read [`RunMode`] before touching the env-set fork.
+    ///
+    /// Delegates to `ClaudeRunner::invocation`, which the usage probe
+    /// shares: the probe is part of admission, so it has no `Admitted`.
+    fn build_invocation(
+        &self,
+        _admitted: &crate::work::admission::Admitted,
+        inputs: InvocationInputs,
+    ) -> AgentInvocation {
+        self.invocation(inputs)
     }
 
     /// Parses a `claude -p` result (`raw`, the raw stdout contents) into a
@@ -404,7 +420,12 @@ impl AgentRunner for ClaudeRunner {
     /// [`crate::work::audit::launch_audit`] and
     /// [`crate::work::bugbot::launch_cleanup`], which host their sessions
     /// the same way.
-    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String {
+    fn interactive_shell_command(
+        &self,
+        _admitted: &crate::work::admission::Admitted,
+        model: &str,
+        prompt: &str,
+    ) -> String {
         format!(
             "claude --model {} {}",
             shell_quote(model),
@@ -816,10 +837,13 @@ mod tests {
 
     #[test]
     fn resume_spec_keeps_every_launch_flag_but_the_prompt() {
-        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         let spec = ClaudeRunner.resume_spec(&invocation);
 
@@ -841,7 +865,11 @@ mod tests {
     #[test]
     fn interactive_shell_command_quotes_model_and_prompt() {
         assert_eq!(
-            ClaudeRunner.interactive_shell_command("opus", "/ticket-audit PROJ-9"),
+            ClaudeRunner.interactive_shell_command(
+                &crate::work::admission::Admitted::for_test(),
+                "opus",
+                "/ticket-audit PROJ-9"
+            ),
             "claude --model 'opus' '/ticket-audit PROJ-9'"
         );
     }
@@ -877,15 +905,18 @@ mod tests {
 
     #[test]
     fn tmux_command_line_strips_billing_env_and_reads_the_prompt_from_the_file() {
-        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
-            prompt: "do the thing".to_string(),
-            model: "fable".to_string(),
-            max_turns: Some("200".to_string()),
-            permission_mode: Some("acceptEdits".to_string()),
-            settings_path: Some(PathBuf::from("/hooks/settings.json")),
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        });
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: "do the thing".to_string(),
+                model: "fable".to_string(),
+                max_turns: Some("200".to_string()),
+                permission_mode: Some("acceptEdits".to_string()),
+                settings_path: Some(PathBuf::from("/hooks/settings.json")),
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
 
         let command =
             ClaudeRunner.tmux_command_line(&invocation, Path::new("/state/proj-1.prompt.md"));
@@ -904,15 +935,18 @@ mod tests {
 
     #[test]
     fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
-        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
-            prompt: "prompt".to_string(),
-            model: "fable".to_string(),
-            max_turns: Some("200".to_string()),
-            permission_mode: Some("acceptEdits".to_string()),
-            settings_path: Some(PathBuf::from("/hooks/settings.json")),
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        });
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: "prompt".to_string(),
+                model: "fable".to_string(),
+                max_turns: Some("200".to_string()),
+                permission_mode: Some("acceptEdits".to_string()),
+                settings_path: Some(PathBuf::from("/hooks/settings.json")),
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
 
         let command =
             ClaudeRunner.tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));
@@ -922,7 +956,8 @@ mod tests {
 
     #[test]
     fn fully_specified_lane_produces_exact_argv() {
-        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
 
         assert_eq!(invocation.program, "claude");
         assert_eq!(
@@ -953,7 +988,8 @@ mod tests {
             ..base_inputs()
         };
 
-        let invocation = ClaudeRunner.build_invocation(inputs);
+        let invocation =
+            ClaudeRunner.build_invocation(&crate::work::admission::Admitted::for_test(), inputs);
 
         // work.ml never omits these flags when the option is absent — it
         // substitutes a hardcoded default and still passes the flag. The
@@ -993,7 +1029,8 @@ mod tests {
             ..base_inputs()
         };
 
-        let invocation = ClaudeRunner.build_invocation(inputs);
+        let invocation =
+            ClaudeRunner.build_invocation(&crate::work::admission::Admitted::for_test(), inputs);
 
         let p_index = invocation.args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(
@@ -1004,7 +1041,8 @@ mod tests {
 
     #[test]
     fn settings_flag_carries_the_deployed_hooks_settings_path() {
-        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
 
         let settings_index = invocation
             .args
@@ -1019,7 +1057,8 @@ mod tests {
 
     #[test]
     fn run_id_present_sets_tskmstr_run_id_env_var() {
-        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
 
         assert_eq!(
             invocation.env_set,
@@ -1034,7 +1073,8 @@ mod tests {
             ..base_inputs()
         };
 
-        let invocation = ClaudeRunner.build_invocation(inputs);
+        let invocation =
+            ClaudeRunner.build_invocation(&crate::work::admission::Admitted::for_test(), inputs);
 
         assert!(invocation.env_set.is_empty());
     }
@@ -1048,7 +1088,8 @@ mod tests {
             ..base_inputs()
         };
 
-        let invocation = ClaudeRunner.build_invocation(inputs);
+        let invocation =
+            ClaudeRunner.build_invocation(&crate::work::admission::Admitted::for_test(), inputs);
 
         assert!(invocation.env_set.is_empty());
     }
@@ -1071,14 +1112,20 @@ mod tests {
     /// variable — or setting both — fails here.
     #[test]
     fn run_mode_decides_which_run_id_env_var_claude_receives() {
-        let headless = ClaudeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Headless,
-            ..base_inputs()
-        });
-        let interactive = ClaudeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let headless = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Headless,
+                ..base_inputs()
+            },
+        );
+        let interactive = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         assert_eq!(
             headless.env_set,
@@ -1095,10 +1142,13 @@ mod tests {
 
     #[test]
     fn interactive_prompt_returns_the_positional_prompt() {
-        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         assert_eq!(
             ClaudeRunner.interactive_prompt(&invocation),
@@ -1108,10 +1158,13 @@ mod tests {
 
     #[test]
     fn interactive_mode_passes_the_prompt_positionally_and_drops_max_turns() {
-        let invocation = ClaudeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         assert_eq!(
             invocation.args,
@@ -1161,7 +1214,9 @@ mod tests {
         assert!(probe.env_set.is_empty(), "an untracked run");
         assert_eq!(
             probe.env_remove,
-            ClaudeRunner.build_invocation(base_inputs()).env_remove,
+            ClaudeRunner
+                .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs())
+                .env_remove,
             "the same billing-safety stripping as a lane run"
         );
     }
@@ -1174,7 +1229,8 @@ mod tests {
         // (or claude misbehaves as if already nested in a session), with no
         // error and no nonzero exit to catch it. This must hold regardless
         // of what inputs the caller supplies.
-        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
 
         assert_eq!(
             invocation.env_remove,
@@ -1198,7 +1254,8 @@ mod tests {
             ..base_inputs()
         };
 
-        let invocation = ClaudeRunner.build_invocation(inputs);
+        let invocation =
+            ClaudeRunner.build_invocation(&crate::work::admission::Admitted::for_test(), inputs);
 
         assert!(
             !invocation.args.iter().any(|a| a == "--settings"),
@@ -1460,7 +1517,8 @@ mod tests {
 
     #[test]
     fn headless_mode_asks_for_verbose_stream_json() {
-        let invocation = ClaudeRunner.build_invocation(base_inputs());
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
         let at = invocation
             .args
             .iter()

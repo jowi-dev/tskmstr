@@ -549,6 +549,11 @@ pub struct RawWorkConfig {
     /// history for its agent and repo. Defaults to 2 when unset. Only used
     /// when [`RawWorkConfig::memory_budget_gb`] is set.
     pub lane_memory_estimate_gb: Option<f64>,
+    /// How long, in minutes, an agent launch tm starts with no human present
+    /// (an autopilot review round or fix pass, a `tm pr watch` bugbot
+    /// cleanup) waits for memory or usage admission before giving up
+    /// (GitHub issue #149). Defaults to 60.
+    pub admission_wait_mins: Option<u64>,
 }
 
 /// Raw, partially-specified `[work.audit]` subsection as parsed directly from
@@ -1219,8 +1224,9 @@ pub struct WorkConfig {
     pub memory: MemoryConfig,
 }
 
-/// Validated memory-admission settings from [`RawWorkConfig::memory_budget_gb`]
-/// and [`RawWorkConfig::lane_memory_estimate_gb`], converted to bytes
+/// Validated memory-admission settings from [`RawWorkConfig::memory_budget_gb`],
+/// [`RawWorkConfig::lane_memory_estimate_gb`] and
+/// [`RawWorkConfig::admission_wait_mins`], converted to bytes
 /// (gigabytes here are [`crate::runs::footprint::GIB`]s).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryConfig {
@@ -1228,6 +1234,8 @@ pub struct MemoryConfig {
     pub budget_bytes: Option<u64>,
     /// The estimate for a lane with no history.
     pub default_lane_estimate_bytes: u64,
+    /// See [`RawWorkConfig::admission_wait_mins`].
+    pub admission_wait_mins: u64,
 }
 
 impl Default for MemoryConfig {
@@ -1236,6 +1244,7 @@ impl Default for MemoryConfig {
         MemoryConfig {
             budget_bytes: None,
             default_lane_estimate_bytes: DEFAULT_LANE_ESTIMATE_GB * crate::runs::footprint::GIB,
+            admission_wait_mins: DEFAULT_ADMISSION_WAIT_MINS,
         }
     }
 }
@@ -1244,6 +1253,9 @@ impl Default for MemoryConfig {
 /// measured 0.8-1 GB on its own, with about 1 GB more for the language
 /// server it starts, before any build.
 const DEFAULT_LANE_ESTIMATE_GB: u64 = 2;
+
+/// Default for [`RawWorkConfig::admission_wait_mins`].
+const DEFAULT_ADMISSION_WAIT_MINS: u64 = 60;
 
 /// Converts a configured gigabyte value to bytes, rejecting anything that
 /// isn't a positive, finite number.
@@ -1275,6 +1287,10 @@ fn merge_memory(global: &RawWorkConfig, repo: &RawWorkConfig) -> Result<MemoryCo
     Ok(MemoryConfig {
         budget_bytes,
         default_lane_estimate_bytes,
+        admission_wait_mins: repo
+            .admission_wait_mins
+            .or(global.admission_wait_mins)
+            .unwrap_or(DEFAULT_ADMISSION_WAIT_MINS),
     })
 }
 
@@ -5238,6 +5254,7 @@ mod tests {
             manual: None,
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
+            admission_wait_mins: None,
         };
         let repo = RawWorkConfig {
             build_slots: None,
@@ -5257,6 +5274,7 @@ mod tests {
             manual: None,
             memory_budget_gb: None,
             lane_memory_estimate_gb: None,
+            admission_wait_mins: None,
         };
         let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
         // Overridden field wins.
@@ -6386,6 +6404,14 @@ mod tests {
             cfg.work.memory.default_lane_estimate_bytes,
             3 * crate::runs::footprint::GIB / 2
         );
+    }
+
+    #[test]
+    fn admission_wait_defaults_to_60_minutes_and_is_configurable() {
+        let cfg = load_global_work("").expect("should load");
+        assert_eq!(cfg.work.memory.admission_wait_mins, 60);
+        let cfg = load_global_work("admission_wait_mins = 5").expect("should load");
+        assert_eq!(cfg.work.memory.admission_wait_mins, 5);
     }
 
     #[test]

@@ -365,7 +365,7 @@ minutes (default 10). An alive recorded pid always protects a run, however
 stale.
 
 `tm runs` also has a `MEM` column: a live run's current memory footprint, or
-a finished run's peak. See "Memory footprint and the lane memory budget"
+a finished run's peak. See "Memory footprint and the memory budget"
 below for how it is measured.
 
 ### Hibernating idle interactive runs
@@ -499,9 +499,9 @@ launch another lane":
 - **mem**: the running lanes' summed memory footprint (the latest sample the
   reaper recorded), against the host's memory
 - **pressure**: the kernel's memory-pressure level
-- **budget**: what the running lanes count against `[work]
-  memory_budget_gb`, computed the same way launch admission computes it
-  (`off` with no budget configured)
+- **budget**: what the running agents (every agent kind, not only lanes)
+  count against `[work] memory_budget_gb`, computed the same way launch
+  admission computes it (`off` with no budget configured)
 - **build slots**: `[work] build_slots` held right now out of the total
   (`off` when unset or `0`)
 
@@ -992,7 +992,7 @@ first by asking `gh` directly for the branch's open PR, falling back to
 scraping the first GitHub pull-request URL out of the run's result text —
 no PR is a normal outcome, not an error.
 
-### Memory footprint and the lane memory budget
+### Memory footprint and the memory budget
 
 tm records the memory footprint of every run that has a recorded pid
 (GitHub issue #66). **Footprint** is the macOS measure Activity Monitor and
@@ -1018,10 +1018,25 @@ Memory admission is off until you set a budget:
 [work]
 memory_budget_gb = 20          # turns admission on
 # lane_memory_estimate_gb = 2  # estimate for a lane with no history; default 2
+# admission_wait_mins = 60     # how long an unattended launch waits; default 60
 ```
 
-With a budget set, `tm work run` (and so the board's `w` key, which runs
-it) checks two things before provisioning anything:
+With a budget set, every agent tm starts is checked before it starts
+(GitHub issue #149), not only lanes:
+
+- lane runs: `tm work run`, the board's `w` key (which runs it), and the
+  autopilot dispatcher
+- `tm review auto` review rounds and the fix passes they start
+- `tm review fix` (CLI and the board's key) and `tm review import --fix`
+- `tm merge` conflict sessions, single and batch
+- bugbot cleanup, from the board's key and from `tm pr watch` with
+  `on_bots_done = "launch"`
+- the board's audit and create sessions
+- the `tm init` / `tm update` setup session
+- hibernate wake, from a board attach or `tm work session`
+
+Manual `m` sessions are not checked: they run your configured window
+commands, not an agent tm builds. Each launch checks two things:
 
 - **Memory pressure.** If the kernel reports warn or critical pressure, the
   launch is refused, whatever the budget says. On Linux the level comes
@@ -1029,23 +1044,51 @@ it) checks two things before provisioning anything:
   10% of the last ten seconds (`some avg10`), critical at 40%. Kernels
   without PSI fall back to `/proc/meminfo`: warn below 10% of memory
   available, critical below 5%.
-- **The budget.** The new lane is estimated at the largest peak among the
-  last five finished lanes for the same agent and repo, or at
-  `lane_memory_estimate_gb` when there are none. Each running lane counts at
-  the larger of its own peak so far and that same estimate, so a lane that
-  is quiet now but will build later still holds its share. If the running
-  total plus the new estimate exceeds the budget, the launch is refused with
-  the numbers, for example `not launching: memory budget exceeded:
-  lemma/opencode lanes peak ~2.5 GB; 8 running (~20.0 GB); budget 20.0 GB`.
+- **The budget.** The new run is estimated at the largest peak among the
+  last five finished runs of the same kind for the same agent and repo.
+  With no such runs it falls back to a built-in default for its kind:
+  `lane_memory_estimate_gb` for `lane` and `review-fix` runs, which build
+  and test like a lane, and 1 GB for `auto-review`, `audit`, `create`,
+  `bugbot-cleanup`, `merge-conflict` and `setup` runs. Every running agent
+  counts, whatever its kind, at the larger of its own peak so far and its
+  kind's estimate, so a run that is quiet now but will build later still
+  holds its share. A `review-watch` row is a small `gh` poller, not an
+  agent, and is not counted. If the running total plus the new estimate
+  exceeds the budget, the launch is refused with the numbers, for example
+  `not launching: memory budget exceeded: lemma/opencode lanes peak ~2.5
+  GB; 8 running (~20.0 GB); budget 20.0 GB`.
 
-Only `running` lane runs count, so a finished run frees its share at once.
-Gigabytes here are GiB, the same unit Activity Monitor labels "GB". A
-refused launch is not queued; launch it again once memory frees up.
+Only `running` rows count, so a finished or hibernated run frees its share
+at once. A pre-registered row whose agent hasn't reported a pid yet counts
+at its estimate, since the agent is booting. Gigabytes here are GiB, the
+same unit Activity Monitor labels "GB".
+
+What a refusal does depends on who started the launch:
+
+- **A human** (every path above except the two below): the launch is
+  refused, and is not queued; launch it again once memory frees up. Board
+  launches show the refusal in the status line, and a refused wake does
+  not attach.
+- **tm, with nobody present**: `tm review auto`'s rounds and fix passes
+  (including under autopilot), and a bugbot cleanup `tm pr watch` starts.
+  These wait instead of being dropped, rechecking every 30 seconds for up
+  to `admission_wait_mins`. An `admission_wait` run event records why
+  (`memory: ...` or `usage: ...`), on the ticket's lane run for a review
+  round or fix pass, and on its own row for a bugbot cleanup. If nothing
+  frees up in time, an `admission_timeout` event is recorded, the review
+  loop stops (no retry), and a waiting bugbot cleanup row ends failed.
+- **The dispatcher** keeps its own behavior: it refuses and tries again on
+  its next tick.
+
+Every command line tm builds for an agent requires proof that admission
+ran (an `Admitted` value only `src/work/admission.rs` can make), so a new
+launch path can't skip the check.
 
 ### Usage admission
 
-Before a lane launches, tm also checks how much of the subscription's usage
-windows are used (GitHub issue #114). It reads the `usage_snapshots` table,
+Before any agent launches (every path listed under "Memory footprint and
+the memory budget"), tm also checks how much of the subscription's usage
+windows are used (GitHub issues #114 and #149). It reads the `usage_snapshots` table,
 which claude lane runs fill from the `rate_limit_event` in their stream-json
 output. The check:
 
@@ -1064,9 +1107,14 @@ output. The check:
   verdict says `usage unknown`, and ADR-0008's reactive fallback still
   catches an exhausted window at run time.
 
-A manual `tm work run` only warns (`warning: not launching: ... (launching
-anyway)`), because you chose to launch. The dispatcher (GitHub issue #115)
-enforces the same check as a hard gate.
+A launch a human started only warns (`warning: not launching: ...
+(launching anyway)`), because you chose to launch: a manual `tm work run`,
+`tm review fix`, `tm merge`, the setup session, and the board's launches,
+which show the warning in the status line. The dispatcher (GitHub issue
+#115) and `tm work run --unattended` enforce the same check as a hard gate.
+A launch tm starts with nobody present (an auto-review round or fix pass,
+a `tm pr watch` bugbot cleanup) waits while refused, the same way it waits
+for memory.
 
 ```toml
 [agent.claude]

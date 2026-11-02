@@ -44,6 +44,7 @@ use crate::agent::{AgentRunner, RunMode};
 use crate::config::AutoReviewConfig;
 use crate::github::gh_cli::GhCli;
 use crate::runs::{RunStatus, RunStore, RunStoreError};
+use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
     AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LoopOutcome, run_loop,
 };
@@ -72,6 +73,11 @@ const NO_COMMENTS: &str = "No comments.";
 /// Errors surfaced by `tm review fix`.
 #[derive(Debug, Error)]
 pub enum ReviewCliError {
+    /// Memory or usage admission refused the agent launch (GitHub issue
+    /// #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
+
     /// Resolving KEY's latest lane run failed (no such run, or a `RunStore`
     /// error).
     #[error(transparent)]
@@ -231,6 +237,9 @@ pub struct ReviewFixDeps<'a> {
     /// auto-review run resolves its model from the lane's `model` through
     /// the shared chain ([`review_run_model`], GitHub issue #143).
     pub config: Option<&'a crate::config::Config>,
+    /// Memory and usage admission for every fix pass and auto-review round
+    /// (GitHub issue #149).
+    pub admission: AdmissionDeps<'a>,
 }
 
 /// The model a fix pass or auto-review round on `lane` passes: the lane's
@@ -306,6 +315,7 @@ pub fn fix(
     paths: &RunLanePaths,
     key: &str,
     dispatch: Dispatch,
+    origin: LaunchOrigin,
     out: &mut dyn Write,
 ) -> Result<FixOutcome, ReviewCliError> {
     let scope = deps.backend_identity.scope();
@@ -351,7 +361,24 @@ pub fn fix(
         Dispatch::HeadlessForeground => None,
     };
 
+    // Admission (GitHub issue #149) after every refusal that needs no
+    // agent, and before `prepare_review_fix` starts a run row, so a
+    // refusal leaves nothing behind.
+    let repo = review_run_repo(deps.config, &run);
+    let admitted = deps.admission.admit(
+        deps.run_store,
+        &LaunchRequest {
+            kind: "review-fix",
+            agent: deps.runner.name(),
+            repo: &repo,
+            own_run: None,
+        },
+        origin,
+        out,
+    )?;
+
     let prepared: PreparedRun = prepare_review_fix(
+        &admitted,
         deps.git,
         deps.run_store,
         deps.clock,
@@ -359,7 +386,7 @@ pub fn fix(
         &scope,
         &run.ticket,
         &run.lane,
-        &review_run_repo(deps.config, &run),
+        &repo,
         &worktree,
         &branch,
         prompt,
@@ -579,6 +606,7 @@ pub fn auto(
     let ops = CliAutoReviewOps {
         deps,
         paths,
+        lane_run_id: run.id,
         scope: &scope,
         ticket: &run.ticket,
         lane: &run.lane,
@@ -660,6 +688,9 @@ pub fn import_bot_threads(
 struct CliAutoReviewOps<'a, 'o> {
     deps: &'a ReviewFixDeps<'a>,
     paths: &'a RunLanePaths,
+    /// The ticket's lane run, which records any wait for admission: a
+    /// round has no row of its own until it is admitted.
+    lane_run_id: i64,
     scope: &'a str,
     ticket: &'a str,
     lane: &'a str,
@@ -673,10 +704,35 @@ struct CliAutoReviewOps<'a, 'o> {
     out: RefCell<&'o mut dyn Write>,
 }
 
+impl CliAutoReviewOps<'_, '_> {
+    /// The loop's rounds and fix passes are started by tm with nobody
+    /// present, so they wait for admission (GitHub issue #149).
+    fn unattended(&self) -> LaunchOrigin {
+        LaunchOrigin::Unattended {
+            event_run: Some(self.lane_run_id),
+        }
+    }
+}
+
 impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
     fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
         let deps = self.deps;
+        let admitted = deps
+            .admission
+            .admit(
+                deps.run_store,
+                &LaunchRequest {
+                    kind: AUTO_REVIEW_KIND,
+                    agent: deps.runner.name(),
+                    repo: self.repo,
+                    own_run: None,
+                },
+                self.unattended(),
+                &mut std::io::sink(),
+            )
+            .map_err(|e| AutoReviewError::step("review", e))?;
         let prepared = prepare_existing_branch_run(
+            &admitted,
             deps.git,
             deps.run_store,
             deps.clock,
@@ -726,6 +782,7 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
             self.paths,
             self.ticket,
             Dispatch::HeadlessForeground,
+            self.unattended(),
             &mut **out,
         ) {
             Ok(FixOutcome::Dispatched { succeeded }) => Ok(succeeded),
@@ -926,7 +983,14 @@ pub fn import(
     }
 
     let head_before = deps.git.rev_parse(&worktree, "HEAD").ok();
-    match fix(deps, paths, &run.ticket, Dispatch::HeadlessForeground, out)? {
+    match fix(
+        deps,
+        paths,
+        &run.ticket,
+        Dispatch::HeadlessForeground,
+        LaunchOrigin::Human,
+        out,
+    )? {
         FixOutcome::NoComments => done(ImportFix::NothingToFix),
         FixOutcome::Dispatched { succeeded: false } => {
             record("fix-failed")?;
@@ -1075,11 +1139,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
+        let err = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Runs(_)));
     }
@@ -1123,11 +1196,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
+        let err = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ReviewCliError::MissingBranch { ticket } if ticket == "PROJ-1"));
     }
@@ -1160,11 +1242,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
+        let outcome = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome, FixOutcome::NoComments);
         assert_eq!(run_store.list_runs().unwrap().len(), 1); // only the seeded lane run
@@ -1199,11 +1290,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
+        let err = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Vdiff(VdiffError::NotFound)));
         assert_eq!(run_store.list_runs().unwrap().len(), 1);
@@ -1239,11 +1339,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
+        let outcome = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
         // No claude process was spawned in this (short-lived, foreground)
@@ -1304,11 +1413,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap();
+        fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap();
 
         let review_fix_run = run_store
             .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
@@ -1385,11 +1503,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let outcome = fix(&deps, &paths, "PROJ-1", Dispatch::Interactive, &mut out).unwrap();
+        let outcome = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Interactive,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
         assert!(detach.recorded.lock().unwrap().is_empty());
@@ -1466,11 +1593,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Interactive, &mut out).unwrap_err();
+        let err = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Interactive,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Interactive(_)));
         // Only the seeded lane run: two concurrent fix passes on one
@@ -1508,6 +1644,7 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1517,6 +1654,7 @@ mod tests {
             &paths,
             "PROJ-1",
             Dispatch::HeadlessForeground,
+            LaunchOrigin::Human,
             &mut out,
         )
         .unwrap();
@@ -1617,12 +1755,14 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config,
+            admission: AdmissionDeps::off(),
         };
         fix(
             &deps,
             &paths(&tmp),
             "PROJ-1",
             Dispatch::HeadlessForeground,
+            LaunchOrigin::Human,
             &mut Vec::new(),
         )
         .unwrap();
@@ -1685,6 +1825,7 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1694,6 +1835,7 @@ mod tests {
             &paths,
             "PROJ-1",
             Dispatch::HeadlessForeground,
+            LaunchOrigin::Human,
             &mut out,
         )
         .unwrap();
@@ -1729,11 +1871,20 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
 
-        let err = fix(&deps, &paths, "PROJ-1", Dispatch::Headless, &mut out).unwrap_err();
+        let err = fix(
+            &deps,
+            &paths,
+            "PROJ-1",
+            Dispatch::Headless,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ReviewCliError::Prepare(_)));
         assert!(detach.recorded.lock().unwrap().is_empty());
@@ -1804,6 +1955,7 @@ mod tests {
             backend_identity: test_identity(),
             runner: &ClaudeRunner,
             config: None,
+            admission: AdmissionDeps::off(),
         }
     }
 
@@ -1944,6 +2096,118 @@ mod tests {
                 .is_none(),
             "a LOW finding never triggers a fix"
         );
+    }
+
+    #[test]
+    fn fix_over_the_memory_budget_is_refused_before_creating_a_run_row() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            admission: AdmissionDeps::with_budget(1),
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+        let mut out = Vec::new();
+
+        let err = fix(
+            &deps,
+            &paths(&tmp),
+            "PROJ-1",
+            Dispatch::HeadlessForeground,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded"),
+            "{err}"
+        );
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(spawner.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix_over_the_usage_limit_warns_and_runs() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        run_store
+            .set_agent_exhausted_until("claude", i64::MAX / 2)
+            .unwrap();
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = fix(
+            &deps,
+            &paths(&tmp),
+            "PROJ-1",
+            Dispatch::HeadlessForeground,
+            LaunchOrigin::Human,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, FixOutcome::Dispatched { succeeded: true });
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("warning: not launching: claude usage window exhausted"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn auto_foreground_round_that_is_never_admitted_times_out_and_stops_the_loop() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let lane = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("lane"))
+            .unwrap()
+            .unwrap();
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            admission: AdmissionDeps::with_budget(1),
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+        let mut out = Vec::new();
+
+        let err = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("memory budget exceeded"), "{err}");
+        let kinds: Vec<String> = run_store
+            .events_for_run(lane.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec!["admission_wait", "admission_timeout"]);
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
+                .unwrap()
+                .is_none(),
+            "a round that never started leaves no row"
+        );
+        assert!(spawner.recorded.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2269,6 +2533,42 @@ mod tests {
         assert!(crate::work::comment_store::named_archive_path(&git_dir, "import-1").exists());
         assert_eq!(import_events(&run_store), ["3 imported", "fix"]);
         assert!(fakes.gh.reply_and_resolve_thread_calls().is_empty());
+    }
+
+    #[test]
+    fn import_fix_over_the_memory_budget_is_refused_like_a_human_fix() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = import_fakes(&tmp, FakeGitOps::new());
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            admission: AdmissionDeps::with_budget(1),
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+        let mut out = Vec::new();
+
+        let err = import(
+            &deps,
+            &paths(&tmp),
+            &import_settings(3, false),
+            "PROJ-1",
+            true,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded"),
+            "{err}"
+        );
+        assert!(
+            run_store
+                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(spawner.recorded.lock().unwrap().is_empty());
     }
 
     #[test]

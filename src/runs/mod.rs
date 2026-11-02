@@ -281,6 +281,20 @@ const MIGRATIONS: &[&str] = &[
 /// usual peak.
 pub const LANE_ESTIMATE_WINDOW: i64 = 5;
 
+/// The run kinds whose rows stand for a running agent process, which
+/// memory admission counts against the budget (GitHub issue #149).
+/// `review-watch` is left out: it is a small `gh` poller, not an agent.
+pub const AGENT_KINDS: &[&str] = &[
+    "lane",
+    "review-fix",
+    "auto-review",
+    "audit",
+    "create",
+    "bugbot-cleanup",
+    "merge-conflict",
+    "setup",
+];
+
 /// A handle to the run-state SQLite database.
 ///
 /// Opened once per process via [`RunStore::open`]; safe to hold for the
@@ -736,13 +750,15 @@ pub struct ScopeActivity {
     pub worktrees: Vec<String>,
 }
 
-/// A running lane as seen by memory-budget admission (GitHub issue #66) and
-/// the overview's system header (GitHub issue #86); see
-/// [`RunStore::running_lanes`].
+/// A running agent as seen by memory-budget admission (GitHub issues #66
+/// and #149) and the overview's system header (GitHub issue #86); see
+/// [`RunStore::running_agents`] and [`RunStore::running_lanes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunningLane {
+pub struct RunningAgent {
     /// Row id.
     pub id: i64,
+    /// See [`Run::kind`].
+    pub kind: String,
     /// See [`Run::agent`].
     pub agent: Option<String>,
     /// See [`Run::repo`].
@@ -2239,15 +2255,16 @@ impl RunStore {
         Ok(())
     }
 
-    /// The expected peak footprint, in bytes, of a new lane run for `agent`
-    /// against `repo`: the largest recorded peak among the
-    /// [`LANE_ESTIMATE_WINDOW`] most recent finished lane runs with that
-    /// key, or `None` with no such history.
+    /// The expected peak footprint, in bytes, of a new `kind` run for
+    /// `agent` against `repo`: the largest recorded peak among the
+    /// [`LANE_ESTIMATE_WINDOW`] most recent finished runs with that key, or
+    /// `None` with no such history.
     ///
     /// Uses the peak, not an average, because admission has to hold room
-    /// for a lane's worst moment (a build), not its typical one.
-    pub fn lane_peak_estimate(
+    /// for a run's worst moment (a build), not its typical one.
+    pub fn peak_estimate(
         &self,
+        kind: &str,
         agent: &str,
         repo: &str,
     ) -> Result<Option<u64>, RunStoreError> {
@@ -2255,40 +2272,61 @@ impl RunStore {
             .query_row(
                 "SELECT MAX(mem_peak_bytes) FROM (
                     SELECT mem_peak_bytes FROM runs
-                     WHERE kind = 'lane' AND agent = ?1 AND repo = ?2
+                     WHERE kind = ?1 AND agent = ?2 AND repo = ?3
                        AND status NOT IN ('running', 'queued')
                        AND mem_peak_bytes IS NOT NULL
                      ORDER BY started_at DESC, id DESC
-                     LIMIT ?3
+                     LIMIT ?4
                  )",
-                params![agent, repo, LANE_ESTIMATE_WINDOW],
+                params![kind, agent, repo, LANE_ESTIMATE_WINDOW],
                 |row| row.get(0),
             )
             .map_err(RunStoreError::from)
     }
 
-    /// Every `running` lane-kind run, across every scope, for memory-budget
-    /// admission to total up. Other kinds (audits, review watchers) are left
-    /// out: admission budgets lanes, and a review watcher is a small `tm`
-    /// poller, not an agent.
+    /// [`RunStore::peak_estimate`] for lane runs.
+    pub fn lane_peak_estimate(
+        &self,
+        agent: &str,
+        repo: &str,
+    ) -> Result<Option<u64>, RunStoreError> {
+        self.peak_estimate("lane", agent, repo)
+    }
+
+    /// Every `running` lane-kind run, across every scope. The dispatcher's
+    /// `max_lanes` and the overview's lane count read it; memory admission
+    /// counts every agent kind through [`RunStore::running_agents`].
+    pub fn running_lanes(&self) -> Result<Vec<RunningAgent>, RunStoreError> {
+        self.running_of_kinds(&["lane"])
+    }
+
+    /// Every `running` run of an [`AGENT_KINDS`] kind, across every scope,
+    /// for memory-budget admission to total up (GitHub issue #149).
     ///
     /// Only `running` rows count, so a run moved to any other status (a
-    /// hibernated run from issue #64, once it exists, included) frees its
-    /// share of the budget.
-    pub fn running_lanes(&self) -> Result<Vec<RunningLane>, RunStoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, agent, repo, mem_peak_bytes, mem_current_bytes, pid FROM runs
-              WHERE status = 'running' AND kind = 'lane'
-              ORDER BY started_at ASC, id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(RunningLane {
+    /// hibernated run included) frees its share of the budget. A
+    /// pre-registered row with no pid yet is `running` and counts: its
+    /// agent is booting.
+    pub fn running_agents(&self) -> Result<Vec<RunningAgent>, RunStoreError> {
+        self.running_of_kinds(AGENT_KINDS)
+    }
+
+    fn running_of_kinds(&self, kinds: &[&str]) -> Result<Vec<RunningAgent>, RunStoreError> {
+        let placeholders = vec!["?"; kinds.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, kind, agent, repo, mem_peak_bytes, mem_current_bytes, pid FROM runs
+              WHERE status = 'running' AND kind IN ({placeholders})
+              ORDER BY started_at ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(kinds), |row| {
+            Ok(RunningAgent {
                 id: row.get(0)?,
-                agent: row.get(1)?,
-                repo: row.get(2)?,
-                mem_peak_bytes: row.get(3)?,
-                mem_current_bytes: row.get(4)?,
-                pid: row.get(5)?,
+                kind: row.get(1)?,
+                agent: row.get(2)?,
+                repo: row.get(3)?,
+                mem_peak_bytes: row.get(4)?,
+                mem_current_bytes: row.get(5)?,
+                pid: row.get(6)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -9658,5 +9696,89 @@ mod tests {
         assert_eq!(lanes[0].mem_peak_bytes, Some(700));
         assert_eq!(lanes[0].mem_current_bytes, Some(700));
         assert_eq!(lanes[0].pid, Some(1));
+    }
+
+    fn start_kind(store: &RunStore, kind: &str, agent: &str, repo: &str) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                kind: kind.to_string(),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_agent_repo(id, agent, repo).unwrap();
+        id
+    }
+
+    fn finish_done(store: &RunStore, id: i64) {
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn peak_estimate_keys_on_kind_as_well_as_agent_and_repo() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        finished_lane_with_peak(&store, "claude", "tskmstr", 3_000);
+        let audit = start_kind(&store, "audit", "claude", "tskmstr");
+        store.record_footprint(audit, 800).unwrap();
+        finish_done(&store, audit);
+
+        assert_eq!(
+            store.peak_estimate("lane", "claude", "tskmstr").unwrap(),
+            Some(3_000)
+        );
+        assert_eq!(
+            store.peak_estimate("audit", "claude", "tskmstr").unwrap(),
+            Some(800)
+        );
+        assert_eq!(
+            store.peak_estimate("create", "claude", "tskmstr").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn running_agents_lists_every_running_agent_kind_but_not_review_watch() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let mut expected = Vec::new();
+        for kind in AGENT_KINDS {
+            expected.push((
+                start_kind(&store, kind, "claude", "tskmstr"),
+                kind.to_string(),
+            ));
+        }
+        start_kind(&store, "review-watch", "claude", "tskmstr");
+        let finished = start_kind(&store, "audit", "claude", "tskmstr");
+        finish_done(&store, finished);
+
+        let running: Vec<(i64, String)> = store
+            .running_agents()
+            .unwrap()
+            .into_iter()
+            .map(|run| (run.id, run.kind))
+            .collect();
+
+        assert_eq!(running, expected);
+        assert_eq!(
+            AGENT_KINDS,
+            &[
+                "lane",
+                "review-fix",
+                "auto-review",
+                "audit",
+                "create",
+                "bugbot-cleanup",
+                "merge-conflict",
+                "setup"
+            ]
+        );
     }
 }

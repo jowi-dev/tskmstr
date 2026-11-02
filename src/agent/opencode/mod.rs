@@ -285,7 +285,11 @@ impl AgentRunner for OpencodeRunner {
     /// comment for the two argv shapes and `docs/plans/gh-41-opencode-runner.md`
     /// for the full contract; the permission-mode mapping, `max_turns`
     /// handling, and `settings_path` handling are documented inline below.
-    fn build_invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
+    fn build_invocation(
+        &self,
+        _admitted: &crate::work::admission::Admitted,
+        inputs: InvocationInputs,
+    ) -> AgentInvocation {
         // Permission mapping: `None` or `Some("bypassPermissions")` is a
         // bypass. Headless (`opencode run`) maps it to
         // `--dangerously-skip-permissions` (1.15.13's only CLI-level
@@ -493,7 +497,12 @@ impl AgentRunner for OpencodeRunner {
     /// Builds `opencode --model <model> --prompt <prompt>`, every value
     /// [`shell_quote`]d. Mirrors [`crate::agent::claude::ClaudeRunner`]'s
     /// same-named method.
-    fn interactive_shell_command(&self, model: &str, prompt: &str) -> String {
+    fn interactive_shell_command(
+        &self,
+        _admitted: &crate::work::admission::Admitted,
+        model: &str,
+        prompt: &str,
+    ) -> String {
         format!(
             "opencode --model {} --prompt {}",
             shell_quote(model),
@@ -879,15 +888,18 @@ mod tests {
 
     #[test]
     fn resume_spec_drops_the_prompt_flag_and_its_value() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            prompt: "do the thing".to_string(),
-            model: "anthropic/claude-sonnet-4-5".to_string(),
-            max_turns: None,
-            permission_mode: None,
-            settings_path: None,
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: "do the thing".to_string(),
+                model: "anthropic/claude-sonnet-4-5".to_string(),
+                max_turns: None,
+                permission_mode: None,
+                settings_path: None,
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
 
         let spec = OpencodeRunner.resume_spec(&invocation);
 
@@ -1119,7 +1131,8 @@ mod tests {
 
     #[test]
     fn headless_exact_argv_with_model_and_bypass_flag() {
-        let invocation = OpencodeRunner.build_invocation(base_inputs());
+        let invocation = OpencodeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
 
         assert_eq!(invocation.program, "opencode");
         assert_eq!(
@@ -1139,10 +1152,13 @@ mod tests {
 
     #[test]
     fn interactive_exact_argv_with_model_and_no_permission_flag() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         // The 1.15.13 TUI has no CLI permission flag at all — opencode's
         // own `permission` config governs an interactive session.
@@ -1159,10 +1175,13 @@ mod tests {
 
     #[test]
     fn permission_mode_none_maps_to_the_bypass_flag_headless_only() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            permission_mode: None,
-            ..base_inputs()
-        });
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: None,
+                ..base_inputs()
+            },
+        );
         assert!(
             headless
                 .args
@@ -1170,11 +1189,14 @@ mod tests {
                 .any(|a| a == "--dangerously-skip-permissions")
         );
 
-        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
-            permission_mode: None,
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let interactive = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: None,
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
         assert!(
             !interactive
                 .args
@@ -1187,10 +1209,13 @@ mod tests {
 
     #[test]
     fn permission_mode_bypass_permissions_maps_to_the_bypass_flag_headless_only() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            permission_mode: Some("bypassPermissions".to_string()),
-            ..base_inputs()
-        });
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: Some("bypassPermissions".to_string()),
+                ..base_inputs()
+            },
+        );
         assert!(
             headless
                 .args
@@ -1198,11 +1223,14 @@ mod tests {
                 .any(|a| a == "--dangerously-skip-permissions")
         );
 
-        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
-            permission_mode: Some("bypassPermissions".to_string()),
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let interactive = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: Some("bypassPermissions".to_string()),
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
         assert!(
             !interactive
                 .args
@@ -1213,10 +1241,13 @@ mod tests {
 
     #[test]
     fn permission_mode_accept_edits_maps_to_no_flag_at_all() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            permission_mode: Some("acceptEdits".to_string()),
-            ..base_inputs()
-        });
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: Some("acceptEdits".to_string()),
+                ..base_inputs()
+            },
+        );
         assert!(
             !headless
                 .args
@@ -1229,40 +1260,55 @@ mod tests {
 
     #[test]
     fn max_turns_is_ignored_entirely_in_both_modes() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            max_turns: Some("999".to_string()),
-            ..base_inputs()
-        });
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                max_turns: Some("999".to_string()),
+                ..base_inputs()
+            },
+        );
         assert!(!headless.args.iter().any(|a| a == "999"));
         assert!(!headless.args.iter().any(|a| a.contains("max-turn")));
 
-        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
-            max_turns: Some("999".to_string()),
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let interactive = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                max_turns: Some("999".to_string()),
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
         assert!(!interactive.args.iter().any(|a| a == "999"));
     }
 
     #[test]
     fn settings_path_never_emits_a_flag() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            settings_path: Some(PathBuf::from("/hooks/settings.json")),
-            ..base_inputs()
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                settings_path: Some(PathBuf::from("/hooks/settings.json")),
+                ..base_inputs()
+            },
+        );
         assert!(!invocation.args.iter().any(|a| a.contains("settings")));
     }
 
     #[test]
     fn run_mode_decides_which_run_id_env_var_opencode_receives() {
-        let headless = OpencodeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Headless,
-            ..base_inputs()
-        });
-        let interactive = OpencodeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Headless,
+                ..base_inputs()
+            },
+        );
+        let interactive = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         assert_eq!(
             headless.env_set,
@@ -1276,10 +1322,13 @@ mod tests {
 
     #[test]
     fn interactive_prompt_returns_the_prompt_value_not_the_flag() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            mode: RunMode::Interactive,
-            ..base_inputs()
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                mode: RunMode::Interactive,
+                ..base_inputs()
+            },
+        );
 
         assert_eq!(
             OpencodeRunner.interactive_prompt(&invocation),
@@ -1289,25 +1338,32 @@ mod tests {
 
     #[test]
     fn absent_run_id_sets_no_env_vars() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            run_id: None,
-            ..base_inputs()
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                run_id: None,
+                ..base_inputs()
+            },
+        );
         assert!(invocation.env_set.is_empty());
     }
 
     #[test]
     fn empty_run_id_is_treated_as_untracked() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            run_id: Some(String::new()),
-            ..base_inputs()
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                run_id: Some(String::new()),
+                ..base_inputs()
+            },
+        );
         assert!(invocation.env_set.is_empty());
     }
 
     #[test]
     fn env_remove_is_always_empty() {
-        let invocation = OpencodeRunner.build_invocation(base_inputs());
+        let invocation = OpencodeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
         assert!(invocation.env_remove.is_empty());
     }
 
@@ -1443,7 +1499,11 @@ mod tests {
     #[test]
     fn interactive_shell_command_quotes_model_and_prompt() {
         assert_eq!(
-            OpencodeRunner.interactive_shell_command("anthropic/opus", "/ticket-audit PROJ-9"),
+            OpencodeRunner.interactive_shell_command(
+                &crate::work::admission::Admitted::for_test(),
+                "anthropic/opus",
+                "/ticket-audit PROJ-9"
+            ),
             "opencode --model 'anthropic/opus' --prompt '/ticket-audit PROJ-9'"
         );
     }
@@ -1452,15 +1512,18 @@ mod tests {
 
     #[test]
     fn tmux_command_line_reads_the_prompt_from_the_file_with_no_env_prefix() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            prompt: "do the thing".to_string(),
-            model: "anthropic/claude-sonnet-4-5".to_string(),
-            max_turns: None,
-            permission_mode: Some("bypassPermissions".to_string()),
-            settings_path: None,
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: "do the thing".to_string(),
+                model: "anthropic/claude-sonnet-4-5".to_string(),
+                max_turns: None,
+                permission_mode: Some("bypassPermissions".to_string()),
+                settings_path: None,
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
 
         let command =
             OpencodeRunner.tmux_command_line(&invocation, Path::new("/state/proj-1.prompt.md"));
@@ -1482,15 +1545,18 @@ mod tests {
 
     #[test]
     fn tmux_command_line_quotes_a_prompt_path_with_a_quote_in_it() {
-        let invocation = OpencodeRunner.build_invocation(InvocationInputs {
-            prompt: "prompt".to_string(),
-            model: "venice/glm".to_string(),
-            max_turns: None,
-            permission_mode: Some("bypassPermissions".to_string()),
-            settings_path: None,
-            run_id: Some("7".to_string()),
-            mode: RunMode::Interactive,
-        });
+        let invocation = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                prompt: "prompt".to_string(),
+                model: "venice/glm".to_string(),
+                max_turns: None,
+                permission_mode: Some("bypassPermissions".to_string()),
+                settings_path: None,
+                run_id: Some("7".to_string()),
+                mode: RunMode::Interactive,
+            },
+        );
 
         let command =
             OpencodeRunner.tmux_command_line(&invocation, Path::new("/state/o'brien.prompt.md"));

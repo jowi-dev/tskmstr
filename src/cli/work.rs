@@ -429,6 +429,17 @@ pub struct RunDeps<'a> {
     pub usage_gate: crate::work::admission::UsageGateMode,
 }
 
+impl From<crate::work::admission::AdmissionError> for WorkCliError {
+    fn from(err: crate::work::admission::AdmissionError) -> Self {
+        use crate::work::admission::AdmissionError;
+        match err {
+            AdmissionError::Memory(refusal) => WorkCliError::MemoryAdmission(refusal),
+            AdmissionError::Usage(refusal) => WorkCliError::UsageAdmission(refusal),
+            AdmissionError::Store(err) => WorkCliError::RunStore(err),
+        }
+    }
+}
+
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
 /// [--permission-mode m] [--prompt path] [--fg]`: run one lane run. Thin CLI
 /// wiring over [`crate::work::run`], which owns the actual sequencing (see
@@ -491,47 +502,48 @@ pub fn run(
         ..request
     };
 
-    // Memory-budget admission (GitHub issue #66), ahead of every dispatch
-    // and of all provisioning, so a refusal leaves no worktree, branch, or
-    // run row behind. The board launches lanes through this same command,
-    // so this one check covers it too. An unknown lane is left for
-    // `prepare_run_lane` to report. The estimate is keyed by the preferred
-    // runner; priority routing may hand the run to a fallback agent.
-    if let Some(lane_config) = ctx.config.lanes.get(lane) {
-        let repo = crate::work::run::lane_repo_key(lane, lane_config);
-        if let Some(refusal) = crate::work::admission::check_lane_admission(
-            deps.run_store,
-            &ctx.config.memory,
-            deps.runner.name(),
-            &repo,
-            deps.memory_pressure,
-        )? {
-            return Err(refusal.into());
-        }
-    }
-
-    // Usage admission (GitHub issue #114), keyed by the preferred runner
-    // like memory admission. A manual run only warns, since a human chose
+    // Memory and usage admission (GitHub issues #66, #114 and #149), ahead
+    // of every dispatch and of all provisioning, so a refusal leaves no
+    // worktree, branch, or run row behind. The board launches lanes through
+    // this same command, so this one check covers it too. The estimate is
+    // keyed by the preferred runner; priority routing may hand the run to a
+    // fallback agent. A manual run only warns on usage, since a human chose
     // to launch; an `--unattended` run from the dispatcher (GitHub issue
     // #115) is refused. See `RunDeps::usage_gate`.
-    if let Some(usage) = deps.usage.for_agent(deps.runner.name()) {
-        let verdict = crate::work::admission::check_usage_admission(
-            deps.run_store,
-            deps.runner.name(),
-            usage,
-            deps.clock.now_unix_secs(),
-            deps.usage_prober,
-        )?;
-        crate::work::admission::apply_usage_gate(verdict, deps.usage_gate, out)?;
-    }
+    let lane_config = ctx
+        .config
+        .lanes
+        .get(lane)
+        .ok_or_else(|| RunLaneError::UnknownLane(lane.to_string()))?;
+    let repo = crate::work::run::lane_repo_key(lane, lane_config);
+    let now = || deps.clock.now_unix_secs();
+    let gate = crate::work::admission::AdmissionGate {
+        store: deps.run_store,
+        memory: &ctx.config.memory,
+        usage: deps.usage,
+        prober: deps.usage_prober,
+        pressure: deps.memory_pressure,
+        now: &now,
+    };
+    let admitted = gate.admit(
+        &crate::work::admission::LaunchRequest {
+            kind: "lane",
+            agent: deps.runner.name(),
+            repo: &repo,
+            own_run: None,
+        },
+        deps.usage_gate,
+        out,
+    )?;
 
     match dispatch {
         Dispatch::Interactive => {
-            return run_interactive(ctx, &run_deps, &paths, lane, request, out);
+            return run_interactive(ctx, &run_deps, &admitted, &paths, lane, request, out);
         }
         Dispatch::HeadlessForeground => {
-            let outcome =
-                crate::work::run::run_lane_fg(&run_deps, ctx.config, &paths, lane, request, out)?;
+            let outcome = crate::work::run::run_lane_fg(
+                &run_deps, &admitted, ctx.config, &paths, lane, request, out,
+            )?;
             return Ok(!outcome.is_error);
         }
         Dispatch::Headless => {}
@@ -558,7 +570,7 @@ pub fn run(
     // foreground, with pid = None (the supervisor records its own pid on
     // startup — see prepare_run_lane's doc comment on why).
     let prepared = crate::work::run::prepare_run_lane(
-        &run_deps, ctx.config, &paths, lane, request, None, out,
+        &run_deps, &admitted, ctx.config, &paths, lane, request, None, out,
     )?;
 
     std::fs::create_dir_all(&paths.state_dir)?;
@@ -643,6 +655,7 @@ pub fn run(
 fn run_interactive(
     ctx: &WorkContext<'_>,
     run_deps: &crate::work::run::RunLaneDeps<'_>,
+    admitted: &crate::work::admission::Admitted,
     paths: &crate::work::run::RunLanePaths,
     lane: &str,
     request: RunLaneRequest,
@@ -657,8 +670,9 @@ fn run_interactive(
         WORK_WINDOW_NAME,
     )?;
 
-    let prepared =
-        crate::work::run::prepare_run_lane(run_deps, ctx.config, paths, lane, request, None, out)?;
+    let prepared = crate::work::run::prepare_run_lane(
+        run_deps, admitted, ctx.config, paths, lane, request, None, out,
+    )?;
 
     // Stamp the hosting session a beat after `start_run` (which has no
     // tmux_session field — most of its callers have no tmux host), so a
@@ -771,6 +785,7 @@ pub fn session(
     sessions_dir: &Path,
     key: &str,
     runner: &dyn AgentRunner,
+    admission: &crate::work::admission::AdmissionDeps<'_>,
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
@@ -783,8 +798,14 @@ pub fn session(
     // (GitHub issue #64), before the snapshot the plan is built from; the
     // plan then sees them as live and leaves their windows alone.
     let session_name = crate::work::naming::ticket_session_name(&identity.session_slug(), &ticket);
-    for woken in crate::work::hibernate::wake_session(store, ctx.tmux, &session_name, sessions_dir)?
-    {
+    for woken in crate::work::hibernate::wake_session(
+        admission,
+        store,
+        ctx.tmux,
+        &session_name,
+        sessions_dir,
+        out,
+    )? {
         writeln!(
             out,
             "resumed   {session_name}:{} — hibernated run {} picked up where it left off",
@@ -2019,6 +2040,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "proj-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2092,6 +2114,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2170,6 +2193,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2233,6 +2257,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2271,6 +2296,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-404",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap_err();
@@ -3655,6 +3681,7 @@ mod tests {
         let mut prepare_out = Vec::new();
         let prepared = crate::work::run::prepare_run_lane(
             &run_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
