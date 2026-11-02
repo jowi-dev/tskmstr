@@ -361,25 +361,8 @@ fn dispatch_fix(
         Dispatch::Headless | Dispatch::Interactive => None,
     };
 
-    // Resolved before `prepare_review_fix` starts a run row, so a refusal to
-    // run a second concurrent fix pass leaves nothing behind — see
-    // `crate::work::interactive`'s module docs.
-    //
-    // Both tmux-windowed dispatches resolve a window here, and the refusal
-    // applies to both: whether the live `fix` window hosts `claude` or only
-    // tails its log, a fix pass for this ticket is in flight either way.
-    // `--fg` gets no window at all — it has no log file to follow, and its
-    // output is going to this very terminal.
-    let target = match dispatch {
-        Dispatch::Interactive | Dispatch::Headless => {
-            Some(resolve_review_window(deps, &run.ticket, FIX_WINDOW_NAME)?)
-        }
-        Dispatch::HeadlessForeground => None,
-    };
-
-    // Admission (GitHub issue #149) after every refusal that needs no
-    // agent, and before `prepare_review_fix` starts a run row, so a
-    // refusal leaves nothing behind.
+    // Admission (GitHub issue #149) before `prepare_review_fix` starts a run
+    // row, so a refusal leaves nothing behind.
     let repo = review_run_repo(deps.config, &run);
     let admitted = deps.admission.admit(
         deps.run_store,
@@ -392,6 +375,25 @@ fn dispatch_fix(
         origin,
         out,
     )?;
+
+    // Resolved after admission, which can wait up to `admission_wait_mins`
+    // for an unattended launch, so the tmux snapshot is fresh, and before
+    // `prepare_review_fix` starts a run row, so a refusal to run a second
+    // concurrent fix pass leaves nothing behind — see
+    // `crate::work::interactive`'s module docs. `review` (the auto-review
+    // round) orders the two the same way.
+    //
+    // Both tmux-windowed dispatches resolve a window here, and the refusal
+    // applies to both: whether the live `fix` window hosts `claude` or only
+    // tails its log, a fix pass for this ticket is in flight either way.
+    // `--fg` gets no window at all — it has no log file to follow, and its
+    // output is going to this very terminal.
+    let target = match dispatch {
+        Dispatch::Interactive | Dispatch::Headless => {
+            Some(resolve_review_window(deps, &run.ticket, FIX_WINDOW_NAME)?)
+        }
+        Dispatch::HeadlessForeground => None,
+    };
 
     let prepared: PreparedRun = prepare_review_fix(
         &admitted,
