@@ -149,15 +149,51 @@ pub fn run_setup_session<'c>(
     }
 }
 
+/// Admits the setup session (GitHub issue #149) before its row starts, so
+/// a refusal leaves none. `tm init` and `tm update` are human-started: over
+/// the memory budget the session is refused, over a usage ceiling it warns
+/// on `out` and launches. With no store it launches untracked.
+///
+/// # Errors
+///
+/// The refusal, rendered for the caller's "launching the setup session
+/// failed" warning.
+pub fn admit_setup_session(
+    admission: &crate::work::admission::AdmissionDeps<'_>,
+    session: &SetupSession<'_>,
+    out: &mut dyn std::io::Write,
+) -> Result<crate::work::admission::Admitted, String> {
+    let repo = crate::work::run::dir_repo_key(&session_dir(session));
+    admission
+        .admit_tracked(
+            session.store,
+            &crate::work::admission::LaunchRequest {
+                kind: SETUP_KIND,
+                agent: session.agent,
+                repo: &repo,
+                own_run: None,
+            },
+            crate::work::admission::LaunchOrigin::Human,
+            out,
+        )
+        .map_err(|err| err.to_string())
+}
+
+/// The directory the session runs in: [`SetupSession::dir`], else the
+/// current directory.
+fn session_dir(session: &SetupSession<'_>) -> PathBuf {
+    session
+        .dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
 /// Starts the setup row and stamps its estimate key, or `None` when the
 /// store refuses the insert. A failed key stamp keeps the row: an
 /// unestimable row still counts as a running agent.
 fn start_setup_row(store: &RunStore, session: &SetupSession<'_>) -> Option<i64> {
-    let dir: PathBuf = session
-        .dir
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_default();
+    let dir = session_dir(session);
     let run_id = store
         .start_run(&StartRun {
             ticket: SETUP_TICKET.to_string(),
@@ -252,6 +288,38 @@ mod tests {
         let runs = store.list_runs().unwrap();
         assert_eq!(runs.len(), 1, "exactly one setup row");
         store.run_by_id(runs[0].id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_setup_session_over_the_memory_budget_is_refused_before_its_row() {
+        let (_tmp, store, repo) = fixture();
+        let mut out = Vec::new();
+
+        let err = admit_setup_session(
+            &crate::work::admission::AdmissionDeps::with_budget(1),
+            &session(Some(&store), &repo),
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.starts_with("not launching: memory budget exceeded: axiom/claude setup runs"),
+            "{err}"
+        );
+        assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_setup_session_within_budget_is_admitted() {
+        let (_tmp, store, repo) = fixture();
+
+        let admitted = admit_setup_session(
+            &crate::work::admission::AdmissionDeps::off(),
+            &session(Some(&store), &repo),
+            &mut Vec::new(),
+        );
+
+        assert!(admitted.is_ok());
     }
 
     #[test]

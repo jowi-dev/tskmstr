@@ -25,7 +25,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::agent::{AgentInvocation, AgentRunner};
+use crate::agent::AgentRunner;
 use crate::config::ConfigPaths;
 use crate::config::manifest::{self, DefaultValue};
 use toml_edit::{DocumentMut, Item, Table, value};
@@ -52,7 +52,7 @@ pub struct UpdateContext<'a> {
     /// Injected so the command is testable without spawning a real agent.
     /// The real launcher records the session as a `setup` run row (see
     /// [`crate::work::setup_session`]).
-    pub setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
+    pub setup_launcher: &'a crate::cli::init::SetupLauncher<'a>,
 }
 
 /// `tm update`: compute `tm check`'s findings, apply every additive fix,
@@ -310,6 +310,7 @@ fn set_missing_key(doc: &mut DocumentMut, path: &[&str], val: DefaultValue) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentInvocation;
     use crate::agent::claude::ClaudeRunner;
     use crate::cli::FakePrompter;
     use crate::config::ConfigPaths;
@@ -347,7 +348,7 @@ mod tests {
     fn ctx<'a>(
         env: &'a TestEnv,
         runner: &'a dyn AgentRunner,
-        setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
+        setup_launcher: &'a crate::cli::init::SetupLauncher<'a>,
     ) -> UpdateContext<'a> {
         UpdateContext {
             paths: &env.paths,
@@ -358,7 +359,10 @@ mod tests {
     }
 
     /// A launcher for tests whose path must never reach the setup session.
-    fn no_launcher(invocation: &AgentInvocation) -> Result<(), String> {
+    fn no_launcher(
+        build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation,
+    ) -> Result<(), String> {
+        let invocation = build(&crate::work::admission::Admitted::for_test());
         panic!("setup session must not launch: {invocation:?}");
     }
 
@@ -668,7 +672,8 @@ mod tests {
         );
 
         let launched: RefCell<Vec<AgentInvocation>> = RefCell::new(Vec::new());
-        let launcher = |invocation: &AgentInvocation| {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| {
+            let invocation = &build(&crate::work::admission::Admitted::for_test());
             launched.borrow_mut().push(invocation.clone());
             Ok(())
         };
@@ -756,7 +761,8 @@ mod tests {
         // A setup session that actually authors the missing skill: the
         // post-session re-check must see it and report the repo clean.
         let skill_dir = env.repo_dir.join(".claude/skills/ticket-audit");
-        let launcher = |_: &AgentInvocation| {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| {
+            let _ = &build(&crate::work::admission::Admitted::for_test());
             std::fs::create_dir_all(&skill_dir).expect("author skill");
             Ok(())
         };

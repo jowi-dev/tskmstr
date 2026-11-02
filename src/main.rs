@@ -1435,13 +1435,11 @@ fn run_init(
     };
 
     let setup_repo_dir = repo_dir.clone();
-    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(
-            invocation,
-            setup_repo_dir.as_deref(),
-            paths,
-            init_runner.name(),
-        )
+    let setup_launcher = move |build: &dyn Fn(
+        &tskmstr::work::admission::Admitted,
+    ) -> tskmstr::agent::AgentInvocation|
+          -> Result<(), String> {
+        launch_setup_session(build, setup_repo_dir.as_deref(), paths, init_runner)
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -1464,9 +1462,12 @@ fn run_init(
     Ok(())
 }
 
-/// Run an agent invocation in the foreground from `dir` (when known) and
-/// wait for it to exit — the real setup-session launcher behind `tm init`'s
-/// and `tm update`'s agent-assisted asset setup.
+/// Admit the setup session, build its invocation with `build`, run it in
+/// the foreground from `dir` (when known) and wait for it to exit — the
+/// real setup-session launcher behind `tm init`'s and `tm update`'s
+/// agent-assisted asset setup. Admission (GitHub issue #149) refuses over
+/// the memory budget and warns over a usage ceiling, through
+/// [`tskmstr::work::setup_session::admit_setup_session`].
 ///
 /// Records the session as a `setup` run row through
 /// [`tskmstr::work::setup_session::run_setup_session`] (GitHub issue #156).
@@ -1476,10 +1477,10 @@ fn run_init(
 /// records under scope `""` in the default database, and a database that
 /// won't open runs the session untracked.
 fn launch_setup_session(
-    invocation: &tskmstr::agent::AgentInvocation,
+    build: &dyn Fn(&tskmstr::work::admission::Admitted) -> tskmstr::agent::AgentInvocation,
     dir: Option<&Path>,
     paths: &ConfigPaths,
-    agent: &str,
+    runner: &'static dyn AgentRunner,
 ) -> Result<(), String> {
     let config = config::load(paths).ok();
     let scope = config
@@ -1491,15 +1492,24 @@ fn launch_setup_session(
         .map(run_db_path_from_config)
         .unwrap_or_else(default_xdg_run_db_path);
     let store = tskmstr::runs::RunStore::open(&db_path).ok();
-    let session = tskmstr::work::setup_session::SetupSession {
+    let mut session = tskmstr::work::setup_session::SetupSession {
         store: store.as_ref(),
         scope: &scope,
-        agent,
+        agent: runner.name(),
         dir,
-        program: &invocation.program,
+        program: runner.name(),
     };
+    let admitted = with_admission(config.as_ref(), runner, |admission| {
+        tskmstr::work::setup_session::admit_setup_session(
+            &admission,
+            &session,
+            &mut std::io::stdout(),
+        )
+    })?;
+    let invocation = build(&admitted);
+    session.program = &invocation.program;
     tskmstr::work::setup_session::run_setup_session(&session, &mut || {
-        let child = tskmstr::work::setup_session::setup_command(invocation, dir).spawn()?;
+        let child = tskmstr::work::setup_session::setup_command(&invocation, dir).spawn()?;
         Ok(Box::new(child))
     })
 }
@@ -1522,8 +1532,11 @@ fn run_update_cmd(yes: bool) -> ExitCode {
         .as_deref()
         .and_then(|repo_config| repo_config.parent().map(PathBuf::from));
     let setup_paths = paths.clone();
-    let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(invocation, repo_dir.as_deref(), &setup_paths, runner.name())
+    let setup_launcher = move |build: &dyn Fn(
+        &tskmstr::work::admission::Admitted,
+    ) -> tskmstr::agent::AgentInvocation|
+          -> Result<(), String> {
+        launch_setup_session(build, repo_dir.as_deref(), &setup_paths, runner)
     };
 
     let ctx = tskmstr::cli::update::UpdateContext {

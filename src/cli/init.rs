@@ -87,10 +87,17 @@ pub struct InitContext<'a> {
     /// Launches the agent-assisted setup session in the foreground (from the
     /// repo root) and waits for it to exit; `Err` is a display message.
     /// Injected so the wizard is testable without spawning a real agent.
-    /// The real launcher records the session as a `setup` run row (see
-    /// [`crate::work::setup_session`]).
-    pub setup_launcher: &'a dyn Fn(&AgentInvocation) -> Result<(), String>,
+    /// The real launcher admits the session (GitHub issue #149), then
+    /// builds its invocation through the closure it is handed and records
+    /// it as a `setup` run row (see [`crate::work::setup_session`]).
+    pub setup_launcher: &'a SetupLauncher<'a>,
 }
+
+/// The setup-session launcher seam: given a builder that turns an
+/// [`crate::work::admission::Admitted`] into the session's invocation, it
+/// admits, builds, launches and waits. `Err` is a display message.
+pub type SetupLauncher<'a> = dyn Fn(&dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation) -> Result<(), String>
+    + 'a;
 
 /// `tm init`: inspect the repo, ask the questions the config files would
 /// otherwise force the user to remember, and write everything `tm board`
@@ -442,7 +449,7 @@ pub fn run_init(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn offer_agent_setup(
     runner: &dyn AgentRunner,
-    setup_launcher: &dyn Fn(&AgentInvocation) -> Result<(), String>,
+    setup_launcher: &SetupLauncher<'_>,
     paths: &ConfigPaths,
     rerun_hint: &str,
     yes: bool,
@@ -471,18 +478,23 @@ pub(crate) fn offer_agent_setup(
         return Ok(());
     }
 
-    let invocation = runner.build_invocation(InvocationInputs {
-        prompt: setup_session_prompt(tasks),
-        model: setup_session_model(runner, paths),
-        max_turns: None,
-        permission_mode: None,
-        settings_path: None,
-        // No run id in the session's env: the launcher finishes the setup
-        // row from the child's exit status itself, so no hook must.
-        run_id: None,
-        mode: RunMode::Interactive,
-    });
-    if let Err(message) = setup_launcher(&invocation) {
+    // The launcher admits the session (GitHub issue #149) before it builds
+    // the invocation through this closure.
+    let build = |_admitted: &crate::work::admission::Admitted| {
+        runner.build_invocation(InvocationInputs {
+            prompt: setup_session_prompt(tasks),
+            model: setup_session_model(runner, paths),
+            max_turns: None,
+            permission_mode: None,
+            settings_path: None,
+            // No run id in the session's env: the launcher finishes the
+            // setup row from the child's exit status itself, so no hook
+            // must.
+            run_id: None,
+            mode: RunMode::Interactive,
+        })
+    };
+    if let Err(message) = setup_launcher(&build) {
         writeln!(
             out,
             "warning: launching the setup session failed: {message}"
@@ -1883,11 +1895,15 @@ mod tests {
         panic!("hook installer should not be called in this test");
     }
 
-    fn noop_setup_launcher(_invocation: &AgentInvocation) -> Result<(), String> {
+    fn noop_setup_launcher(
+        _build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation,
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    fn panicking_setup_launcher(_invocation: &AgentInvocation) -> Result<(), String> {
+    fn panicking_setup_launcher(
+        _build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation,
+    ) -> Result<(), String> {
         panic!("setup launcher should not be called in this test");
     }
 
@@ -3127,7 +3143,8 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| -> Result<(), String> {
+            let invocation = &build(&crate::work::admission::Admitted::for_test());
             let scaffolded = repo_dir.join(".tskmstr/prompts/repo-lane.md");
             assert!(
                 scaffolded.exists(),
@@ -3277,7 +3294,8 @@ mod tests {
 
         let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
             std::cell::RefCell::new(Vec::new());
-        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| -> Result<(), String> {
+            let invocation = &build(&crate::work::admission::Admitted::for_test());
             recorded.borrow_mut().push(invocation.clone());
             Ok(())
         };
@@ -3320,7 +3338,7 @@ mod tests {
         let keychain = InMemoryKeychain::empty();
         let mut ctx = github_ctx(&env, &gh, &keychain);
         let launcher =
-            |_invocation: &AgentInvocation| -> Result<(), String> { Err("boom".to_string()) };
+            |_build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| -> Result<(), String> { Err("boom".to_string()) };
         ctx.setup_launcher = &launcher;
 
         let mut prompter = FakePrompter::new();
@@ -3607,7 +3625,8 @@ mod tests {
         let mut ctx = github_ctx(&env, &gh, &keychain);
         let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
             std::cell::RefCell::new(Vec::new());
-        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| -> Result<(), String> {
+            let invocation = &build(&crate::work::admission::Admitted::for_test());
             recorded.borrow_mut().push(invocation.clone());
             Ok(())
         };
@@ -3634,7 +3653,8 @@ mod tests {
         let mut ctx = github_ctx(&env, &gh, &keychain);
         let recorded: std::cell::RefCell<Vec<AgentInvocation>> =
             std::cell::RefCell::new(Vec::new());
-        let launcher = |invocation: &AgentInvocation| -> Result<(), String> {
+        let launcher = |build: &dyn Fn(&crate::work::admission::Admitted) -> AgentInvocation| -> Result<(), String> {
+            let invocation = &build(&crate::work::admission::Admitted::for_test());
             recorded.borrow_mut().push(invocation.clone());
             Ok(())
         };
