@@ -312,8 +312,9 @@ pub fn launch_cleanup(
             model: req.cfg.model.as_deref(),
         }],
     );
-    let _ = &admitted;
-    let command = deps.runner.interactive_shell_command(&model.model, &prompt);
+    let command = deps
+        .runner
+        .interactive_shell_command(&admitted, &model.model, &prompt);
     let env = [(
         crate::work::audit::SESSION_RUN_ID_ENV.to_string(),
         run_id.to_string(),

@@ -480,19 +480,22 @@ pub(crate) fn offer_agent_setup(
 
     // The launcher admits the session (GitHub issue #149) before it builds
     // the invocation through this closure.
-    let build = |_admitted: &crate::work::admission::Admitted| {
-        runner.build_invocation(InvocationInputs {
-            prompt: setup_session_prompt(tasks),
-            model: setup_session_model(runner, paths),
-            max_turns: None,
-            permission_mode: None,
-            settings_path: None,
-            // No run id in the session's env: the launcher finishes the
-            // setup row from the child's exit status itself, so no hook
-            // must.
-            run_id: None,
-            mode: RunMode::Interactive,
-        })
+    let build = |admitted: &crate::work::admission::Admitted| {
+        runner.build_invocation(
+            admitted,
+            InvocationInputs {
+                prompt: setup_session_prompt(tasks),
+                model: setup_session_model(runner, paths),
+                max_turns: None,
+                permission_mode: None,
+                settings_path: None,
+                // No run id in the session's env: the launcher finishes the
+                // setup row from the child's exit status itself, so no hook
+                // must.
+                run_id: None,
+                mode: RunMode::Interactive,
+            },
+        )
     };
     if let Err(message) = setup_launcher(&build) {
         writeln!(

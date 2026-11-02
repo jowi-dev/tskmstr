@@ -251,13 +251,12 @@ pub fn wake_session(
             crate::work::admission::LaunchOrigin::Human,
             out,
         )?;
-        let _ = &admitted;
         if !store.wake_run(run.id, None)? {
             continue;
         }
 
         let window = unique_window_name(&record.window, &existing);
-        let command = record.resume.command_line(session_id);
+        let command = record.resume.command_line(&admitted, session_id);
         let env = [(SESSION_RUN_ID_ENV.to_string(), run.id.to_string())];
         let created = if existing.is_empty() {
             tmux.new_session_with_command(session_name, &run.worktree, &window, &env, &command)
@@ -497,7 +496,7 @@ mod tests {
             window_name: "work".to_string(),
             dir: "/wt/proj-1".to_string(),
             env: vec![(SESSION_RUN_ID_ENV.to_string(), id.to_string())],
-            command: spec().command_line("sess-1"),
+            command: spec().command_line(&crate::work::admission::Admitted::for_test(), "sess-1"),
         }));
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Running);
@@ -537,7 +536,7 @@ mod tests {
             dir: "/wt/proj-1".to_string(),
             window_name: "work".to_string(),
             env: vec![(SESSION_RUN_ID_ENV.to_string(), id.to_string())],
-            command: spec().command_line("sess-1"),
+            command: spec().command_line(&crate::work::admission::Admitted::for_test(), "sess-1"),
         }));
     }
 

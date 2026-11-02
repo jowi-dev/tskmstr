@@ -251,8 +251,7 @@ pub fn launch_audit(
             model: audit_cfg.model.as_deref(),
         }],
     );
-    let _ = &admitted;
-    let command = runner.interactive_shell_command(&model.model, &prompt);
+    let command = runner.interactive_shell_command(&admitted, &model.model, &prompt);
     let env = [(SESSION_RUN_ID_ENV.to_string(), run_id.to_string())];
 
     if existing_windows.is_empty() {

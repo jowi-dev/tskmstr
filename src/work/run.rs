@@ -1049,7 +1049,7 @@ pub fn run_lane_fg(
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_run_lane(
     deps: &RunLaneDeps<'_>,
-    _admitted: &crate::work::admission::Admitted,
+    admitted: &crate::work::admission::Admitted,
     config: &WorkConfig,
     paths: &RunLanePaths,
     lane: &str,
@@ -1425,15 +1425,18 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
-    let mut invocation = primary_runner.build_invocation(InvocationInputs {
-        prompt: prompt.clone(),
-        model: lane_model(primary_runner),
-        max_turns: max_turns.clone(),
-        permission_mode: permission_mode.clone(),
-        settings_path,
-        run_id: Some(run_id.to_string()),
-        mode: request.mode,
-    });
+    let mut invocation = primary_runner.build_invocation(
+        admitted,
+        InvocationInputs {
+            prompt: prompt.clone(),
+            model: lane_model(primary_runner),
+            max_turns: max_turns.clone(),
+            permission_mode: permission_mode.clone(),
+            settings_path,
+            run_id: Some(run_id.to_string()),
+            mode: request.mode,
+        },
+    );
 
     // Remaining priority-routing attempts (GitHub issue #54): one
     // invocation per agent `plan_attempts` says to try next if the primary
@@ -1445,15 +1448,18 @@ pub fn prepare_run_lane(
     for kind in attempts.iter().skip(1) {
         let fallback_runner = crate::agent::routing::runner_for(*kind);
         let fallback_settings_path = fallback_runner.deploy_telemetry(&paths.hooks_deploy_dir)?;
-        let fallback_invocation = fallback_runner.build_invocation(InvocationInputs {
-            prompt: prompt.clone(),
-            model: lane_model(fallback_runner),
-            max_turns: max_turns.clone(),
-            permission_mode: permission_mode.clone(),
-            settings_path: fallback_settings_path,
-            run_id: Some(run_id.to_string()),
-            mode: request.mode,
-        });
+        let fallback_invocation = fallback_runner.build_invocation(
+            admitted,
+            InvocationInputs {
+                prompt: prompt.clone(),
+                model: lane_model(fallback_runner),
+                max_turns: max_turns.clone(),
+                permission_mode: permission_mode.clone(),
+                settings_path: fallback_settings_path,
+                run_id: Some(run_id.to_string()),
+                mode: request.mode,
+            },
+        );
         fallbacks.push(PlannedFallback {
             agent: fallback_runner.name().to_string(),
             invocation: fallback_invocation,
@@ -1697,7 +1703,7 @@ pub struct ExistingBranchRun<'a> {
 ///
 /// See [`prepare_review_fix`].
 pub fn prepare_existing_branch_run(
-    _admitted: &crate::work::admission::Admitted,
+    admitted: &crate::work::admission::Admitted,
     git: &dyn GitOps,
     run_store: &RunStore,
     clock: &dyn Clock,
@@ -1745,15 +1751,18 @@ pub fn prepare_existing_branch_run(
         RunMode::Interactive => interactive_prompt(kind, ticket, &prompt),
     };
 
-    let invocation = runner.build_invocation(InvocationInputs {
-        prompt,
-        model,
-        max_turns: None,
-        permission_mode: None,
-        settings_path,
-        run_id: Some(run_id.to_string()),
-        mode,
-    });
+    let invocation = runner.build_invocation(
+        admitted,
+        InvocationInputs {
+            prompt,
+            model,
+            max_turns: None,
+            permission_mode: None,
+            settings_path,
+            run_id: Some(run_id.to_string()),
+            mode,
+        },
+    );
 
     let (year, month, day, hour, min, sec) = clock.now_parts();
     let timestamp = naming::format_timestamp(year, month, day, hour, min, sec);

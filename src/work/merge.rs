@@ -604,7 +604,7 @@ struct AgentWindow {
 /// says nothing about whether the row is still live.
 fn open_agent_window(
     deps: &MergeDeps<'_>,
-    _admitted: &crate::work::admission::Admitted,
+    admitted: &crate::work::admission::Admitted,
     prompt: String,
     prompt_stem: &str,
     session_key: &str,
@@ -621,15 +621,18 @@ fn open_agent_window(
             }],
         )
         .model;
-    let invocation = deps.runner.build_invocation(InvocationInputs {
-        prompt,
-        model,
-        max_turns: None,
-        permission_mode: None,
-        settings_path: None,
-        run_id: run_id.map(|id| id.to_string()),
-        mode: RunMode::Interactive,
-    });
+    let invocation = deps.runner.build_invocation(
+        admitted,
+        InvocationInputs {
+            prompt,
+            model,
+            max_turns: None,
+            permission_mode: None,
+            settings_path: None,
+            run_id: run_id.map(|id| id.to_string()),
+            mode: RunMode::Interactive,
+        },
+    );
     let prompt_text = deps
         .runner
         .interactive_prompt(&invocation)

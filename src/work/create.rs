@@ -202,8 +202,7 @@ pub fn launch_create(
         crate::work::admission::LaunchOrigin::Human,
         &mut warning,
     )?;
-    let _ = &admitted;
-    let command = runner.interactive_shell_command(&model.model, prompt);
+    let command = runner.interactive_shell_command(&admitted, &model.model, prompt);
 
     let run_id = store.and_then(|store| preregister(store, identity, &dir, runner));
     let env: Vec<(String, String)> = run_id
