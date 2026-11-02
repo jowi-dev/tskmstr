@@ -12,6 +12,7 @@
 //! It never follows links one fetch at a time.
 
 mod render;
+pub mod state;
 
 use std::collections::{HashMap, HashSet};
 
@@ -313,26 +314,53 @@ fn cycle_warnings(graph: &Graph) -> Vec<GraphWarning> {
 }
 
 /// The strongly connected components of the graph's unlocks links, by
-/// Tarjan's algorithm with an explicit stack so deep chains cannot
-/// overflow the call stack.
+/// node key.
 fn unlocks_components(graph: &Graph) -> Vec<Vec<String>> {
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+    for (from, to) in unlocks_edges(graph) {
+        edges[from].push(to);
+    }
+    strongly_connected(&edges)
+        .into_iter()
+        .map(|component| {
+            component
+                .into_iter()
+                .map(|i| graph.nodes[i].key.clone())
+                .collect()
+        })
+        .collect()
+}
+
+/// Every unlocks link whose ends are both nodes, as `(from, to)` indexes
+/// into [`Graph::nodes`].
+fn unlocks_edges(graph: &Graph) -> Vec<(usize, usize)> {
     let index_of: HashMap<&str, usize> = graph
         .nodes
         .iter()
         .enumerate()
         .map(|(i, n)| (n.key.as_str(), i))
         .collect();
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
-    for link in graph.links.iter().filter(|l| l.kind == LinkKind::Unlocks) {
-        if let (Some(&from), Some(&to)) = (
-            index_of.get(link.from.as_str()),
-            index_of.get(link.to.as_str()),
-        ) {
-            edges[from].push(to);
-        }
-    }
+    graph
+        .links
+        .iter()
+        .filter(|l| l.kind == LinkKind::Unlocks)
+        .filter_map(|link| {
+            Some((
+                *index_of.get(link.from.as_str())?,
+                *index_of.get(link.to.as_str())?,
+            ))
+        })
+        .collect()
+}
 
-    let count = graph.nodes.len();
+/// The strongly connected components of the directed graph `edges` (node
+/// index to the indexes it points at), by Tarjan's algorithm with an
+/// explicit stack so deep chains cannot overflow the call stack.
+///
+/// Components come out in reverse topological order: a component appears
+/// after every component reachable from it.
+fn strongly_connected(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let count = edges.len();
     let mut order: Vec<Option<usize>> = vec![None; count];
     let mut low = vec![0; count];
     let mut on_stack = vec![false; count];
@@ -377,7 +405,7 @@ fn unlocks_components(graph: &Graph) -> Vec<Vec<String>> {
                 let mut component = Vec::new();
                 while let Some(member) = stack.pop() {
                     on_stack[member] = false;
-                    component.push(graph.nodes[member].key.clone());
+                    component.push(member);
                     if member == node {
                         break;
                     }
