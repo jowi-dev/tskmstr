@@ -64,6 +64,15 @@ use thiserror::Error;
 
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError, StartRun};
 
+/// The `ticket` a board create session's run row carries until the session
+/// creates its first ticket (GitHub issue #156).
+/// [`crate::work::create::launch_create`] pre-registers the row before any
+/// ticket exists; [`register_session`] swaps in the first key the session
+/// creates. Lowercase with a hyphen-joined word rather than a number, so it
+/// can never parse as a ticket key on any backend, and shell-safe, since it
+/// is printed and passed around like any other ticket value.
+pub const CREATE_PLACEHOLDER_TICKET: &str = "new-ticket";
+
 /// Errors returned by this module's functions.
 #[derive(Debug, Error)]
 pub enum SessionError {
