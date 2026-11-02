@@ -879,7 +879,9 @@ pub struct Run {
     /// [`crate::agent::AgentRunner::name`] of the agent driving the run, if
     /// recorded; see [`RunStore::update_agent_repo`].
     pub agent: Option<String>,
-    /// Directory name of the lane's repo, if recorded; see
+    /// Directory name of the repo the run works in (the lane's repo for a
+    /// lane, review-fix or auto-review row; the configured directory for an
+    /// audit, bugbot-cleanup or setup row), if recorded; see
     /// [`RunStore::update_agent_repo`].
     pub repo: Option<String>,
     /// Absolute path of the lane repo's main checkout, if recorded; see
@@ -2167,9 +2169,12 @@ impl RunStore {
     }
 
     /// Records which agent drives `run_id` and which repo it runs against,
-    /// the key [`RunStore::lane_peak_estimate`] groups by. A separate update
-    /// rather than [`StartRun`] fields for the same reason as
-    /// [`RunStore::update_tmux_session`]: only the lane-run path knows both.
+    /// the key [`RunStore::lane_peak_estimate`] groups by. Every path that
+    /// starts an agent row stamps it right after [`RunStore::start_run`]
+    /// (GitHub issue #156); rows that are not agents, such as a review-watch
+    /// poller, leave both `NULL`. A separate update rather than [`StartRun`]
+    /// fields because most `start_run` callers (tests, pollers, adoption)
+    /// have no agent to name.
     ///
     /// # Errors
     ///

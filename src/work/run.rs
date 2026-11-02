@@ -934,6 +934,16 @@ fn repo_name(repo_root: &Path) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
+/// The `repo` half of the memory-estimate key for an agent run that works
+/// in `dir` rather than in a lane's repo: an audit or bugbot-cleanup
+/// session's configured directory, or the repo a setup session runs in
+/// (GitHub issue #156). `dir`'s final component, the same rule as
+/// [`lane_repo_key`], falling back to the whole path when there is none
+/// (`/`), so the key is never empty.
+pub fn dir_repo_key(dir: &Path) -> String {
+    repo_name(dir).unwrap_or_else(|| dir.to_string_lossy().into_owned())
+}
+
 /// The run's durable log file path: `<state_dir>/<wt_name>-<timestamp>.log`.
 ///
 /// Pure and computed from `wt_name`/`timestamp` alone (not `PreparedRun`) so
@@ -1576,8 +1586,10 @@ pub enum ReviewFixError {
 ///   session and attributed to it. So the check stays, just worded for this
 ///   case ([`ReviewFixError::WorktreeDirty`]) instead of reused verbatim.
 /// - **Hook deployment, [`RunStore::start_run`],
+///   [`RunStore::update_agent_repo`],
 ///   [`crate::agent::AgentRunner::build_invocation`]: kept unchanged**,
-///   exactly as in `prepare_run_lane`.
+///   exactly as in `prepare_run_lane`. `repo` is the estimate-key repo to
+///   stamp; see [`ExistingBranchRun::repo`].
 ///
 /// Run rows are started with `kind = "review-fix"`, distinct from `"lane"`
 /// so this run never shadows the ticket's lane run in
@@ -1601,6 +1613,7 @@ pub fn prepare_review_fix(
     scope: &str,
     ticket: &str,
     lane: &str,
+    repo: &str,
     worktree: &Path,
     branch: &str,
     prompt: String,
@@ -1619,6 +1632,7 @@ pub fn prepare_review_fix(
             scope,
             ticket,
             lane,
+            repo,
             worktree,
             branch,
             prompt,
@@ -1641,6 +1655,12 @@ pub struct ExistingBranchRun<'a> {
     pub ticket: &'a str,
     /// The ticket's lane.
     pub lane: &'a str,
+    /// The `repo` half of the row's memory-estimate key, stamped with the
+    /// runner's name through [`RunStore::update_agent_repo`] (GitHub issue
+    /// #156). Callers pass the repo the ticket's lane row recorded, so a
+    /// fix or review round keys on the same repo as the lane run it
+    /// follows.
+    pub repo: &'a str,
     /// The ticket's existing worktree.
     pub worktree: &'a Path,
     /// The ticket's existing branch.
@@ -1677,6 +1697,7 @@ pub fn prepare_existing_branch_run(
         scope,
         ticket,
         lane,
+        repo,
         worktree,
         branch,
         prompt,
@@ -1700,6 +1721,9 @@ pub fn prepare_existing_branch_run(
         kind: kind.to_string(),
         log_path: None,
     })?;
+    // Every agent row carries its estimate key, not just lane rows (GitHub
+    // issue #156), so #149's admission can count and estimate this run too.
+    run_store.update_agent_repo(run_id, runner.name(), repo)?;
 
     // See `prepare_run_lane`'s equivalent: an interactive session adopts its
     // pre-registered row by running `tm runs register` itself.
@@ -7629,6 +7653,7 @@ mod tests {
             "",
             "PROJ-1",
             "mylane",
+            "axiom",
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
@@ -7682,6 +7707,7 @@ mod tests {
                 scope: "",
                 ticket: "PROJ-1",
                 lane: "mylane",
+                repo: "axiom",
                 worktree: &worktree,
                 branch: "jowi-dev/proj-1-slug",
                 prompt: "review it".to_string(),
@@ -7701,6 +7727,94 @@ mod tests {
     }
 
     #[test]
+    fn prepare_review_fix_stamps_the_agent_and_repo() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+
+        let prepared = prepare_review_fix(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            "",
+            "PROJ-1",
+            "mylane",
+            "axiom",
+            &worktree,
+            "jowi-dev/proj-1-slug",
+            "fix the review comments".to_string(),
+            "opus".to_string(),
+            None,
+            RunMode::Headless,
+            &ClaudeRunner,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.kind, "review-fix");
+        assert_eq!(run.agent.as_deref(), Some("claude"));
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
+    }
+
+    #[test]
+    fn prepare_existing_branch_run_stamps_the_agent_and_repo_on_an_auto_review_row() {
+        let tmp = TempDir::new().unwrap();
+        let paths = review_fix_paths(&tmp);
+        let git = FakeGitOps::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 18, 10, 0, 0));
+        let worktree = tmp.path().join("Worktrees/axiom/proj-1");
+
+        let prepared = prepare_existing_branch_run(
+            &git,
+            &run_store,
+            &clock,
+            &paths,
+            ExistingBranchRun {
+                kind: "auto-review",
+                scope: "",
+                ticket: "PROJ-1",
+                lane: "mylane",
+                repo: "axiom",
+                worktree: &worktree,
+                branch: "jowi-dev/proj-1-slug",
+                prompt: "review it".to_string(),
+                model: "opus".to_string(),
+                pid: Some(77),
+                mode: RunMode::Headless,
+            },
+            &ClaudeRunner,
+        )
+        .unwrap();
+
+        let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.kind, "auto-review");
+        assert_eq!(run.agent.as_deref(), Some("claude"));
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
+    }
+
+    #[test]
+    fn dir_repo_key_is_the_final_path_component() {
+        assert_eq!(
+            dir_repo_key(Path::new("/Users/jowi/Projects/axiom")),
+            "axiom"
+        );
+        assert_eq!(
+            dir_repo_key(Path::new("/Users/jowi/Projects/axiom/")),
+            "axiom"
+        );
+    }
+
+    #[test]
+    fn dir_repo_key_falls_back_to_the_whole_path_without_a_final_component() {
+        assert_eq!(dir_repo_key(Path::new("/")), "/");
+    }
+
+    #[test]
     fn prepare_review_fix_refuses_a_dirty_worktree_and_creates_no_run_row() {
         let tmp = TempDir::new().unwrap();
         let paths = review_fix_paths(&tmp);
@@ -7717,6 +7831,7 @@ mod tests {
             "",
             "PROJ-1",
             "mylane",
+            "axiom",
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
@@ -7748,6 +7863,7 @@ mod tests {
             "",
             "PROJ-1",
             "mylane",
+            "axiom",
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
@@ -7787,6 +7903,7 @@ mod tests {
             "",
             "PROJ-1",
             "mylane",
+            "axiom",
             &worktree,
             "jowi-dev/proj-1-slug",
             "fix the review comments".to_string(),
