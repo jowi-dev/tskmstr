@@ -68,10 +68,11 @@ pub enum AutoReviewError {
     #[error(transparent)]
     Store(#[from] CommentStoreError),
 
-    /// A round's findings file was missing or not a JSON array of findings.
-    #[error("auto-review findings file {path} is unusable: {message}")]
+    /// A step's signal file (a round's findings file or a fix pass's
+    /// marker) was unreadable, or complete JSON of the wrong shape.
+    #[error("auto-review signal file {path} is unusable: {message}")]
     Findings {
-        /// The findings file.
+        /// The signal file.
         path: PathBuf,
         /// What was wrong with it.
         message: String,
@@ -147,19 +148,29 @@ impl Finding {
     }
 }
 
-/// Reads a round's findings file.
+/// Reads signal file `path` if it is ready: `Ok(None)` while it is missing
+/// or ends before its JSON does, so a half-written file reads as "not done"
+/// (GitHub issue #150).
 ///
 /// # Errors
 ///
-/// [`AutoReviewError::Findings`] if the file is missing or isn't a JSON
-/// array of [`Finding`]s.
-pub fn read_findings(path: &Path) -> Result<Vec<Finding>, AutoReviewError> {
+/// [`AutoReviewError::Findings`] for a file that cannot be read, or whose
+/// JSON is complete but not a `T`: waiting longer would never fix it.
+fn read_signal<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, AutoReviewError> {
     let unusable = |message: String| AutoReviewError::Findings {
         path: path.to_path_buf(),
         message,
     };
-    let raw = std::fs::read_to_string(path).map_err(|e| unusable(e.to_string()))?;
-    serde_json::from_str(&raw).map_err(|e| unusable(e.to_string()))
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unusable(e.to_string())),
+    };
+    match serde_json::from_str(&raw) {
+        Ok(signal) => Ok(Some(signal)),
+        Err(e) if e.is_eof() => Ok(None),
+        Err(e) => Err(unusable(e.to_string())),
+    }
 }
 
 /// Where round `round` of loop `loop_id` writes its findings:
@@ -176,11 +187,14 @@ pub fn findings_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
         .join(format!("findings-{loop_id}-{round}.json"))
 }
 
-/// Reads a round's findings file if it is ready: `None` while it is
-/// missing or does not parse yet, so a half-written file reads as "not
-/// done" rather than as a failure (GitHub issue #150).
-pub fn try_read_findings(path: &Path) -> Option<Vec<Finding>> {
-    read_findings(path).ok()
+/// Reads a round's findings file if it is ready; see [`read_signal`].
+///
+/// # Errors
+///
+/// [`AutoReviewError::Findings`] if the file is complete but not a JSON
+/// array of [`Finding`]s.
+pub fn try_read_findings(path: &Path) -> Result<Option<Vec<Finding>>, AutoReviewError> {
+    read_signal(path)
 }
 
 /// Where round `round`'s fix pass in loop `loop_id` writes its completion
@@ -200,12 +214,14 @@ struct FixMarker {
 }
 
 /// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
-/// exists and parses, `None` before then.
-pub fn read_fix_marker(path: &Path) -> Option<bool> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<FixMarker>(&raw)
-        .ok()
-        .map(|marker| marker.succeeded)
+/// exists and parses, `None` before then; see [`read_signal`].
+///
+/// # Errors
+///
+/// [`AutoReviewError::Findings`] if the file is complete JSON but not a
+/// marker.
+pub fn read_fix_marker(path: &Path) -> Result<Option<bool>, AutoReviewError> {
+    Ok(read_signal::<FixMarker>(path)?.map(|marker| marker.succeeded))
 }
 
 /// The temporary name an agent writes a signal file under before renaming
@@ -366,17 +382,23 @@ enum Signal<T> {
 /// Polls `read` every [`SIGNAL_POLL_SECS`] until it yields the step's
 /// signal, the step's row stops running, or `timeout_secs` pass. The signal
 /// is read first on every poll, so a step that signalled before being
-/// hibernated or ended still counts as done.
+/// hibernated or ended still counts as done. A signal file that can never
+/// parse flags the step and returns `read`'s error.
 fn wait_for_signal<T>(
     ops: &dyn AutoReviewOps,
     run_id: i64,
     timeout_secs: i64,
-    read: impl Fn() -> Option<T>,
+    read: impl Fn() -> Result<Option<T>, AutoReviewError>,
 ) -> Result<Signal<T>, AutoReviewError> {
     let start = ops.now_unix_secs();
     loop {
-        if let Some(signal) = read() {
-            return Ok(Signal::Received(signal));
+        match read() {
+            Ok(Some(signal)) => return Ok(Signal::Received(signal)),
+            Ok(None) => {}
+            Err(err) => {
+                ops.flag(run_id)?;
+                return Err(err);
+            }
         }
         match ops.step_state(run_id)? {
             StepState::Running => {}
@@ -771,12 +793,42 @@ mod tests {
     }
 
     #[test]
-    fn read_findings_rejects_a_missing_file() {
+    fn try_read_findings_rejects_complete_json_of_the_wrong_shape() {
         let tmp = TempDir::new().unwrap();
-        assert!(matches!(
-            read_findings(&tmp.path().join("nope.json")),
-            Err(AutoReviewError::Findings { .. })
-        ));
+        let path = tmp.path().join("findings-1.json");
+        for invalid in [
+            r#"[{"path": "src/a.rs", "start_line": 1, "severity": "LOW"}]"#,
+            r#"[{"path": "a", "start_line": "1", "severity": "LOW", "body": "b"}]"#,
+            r#"{"findings": []}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(
+                matches!(
+                    try_read_findings(&path),
+                    Err(AutoReviewError::Findings { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        std::fs::write(&path, r#"{"succeeded": "yes"}"#).unwrap();
+        assert!(read_fix_marker(&path).is_err());
+    }
+
+    #[test]
+    fn a_findings_file_that_can_never_parse_flags_the_round_and_fails() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec![r#"[{"path": "a"}]"#]);
+
+        let err = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap_err();
+
+        assert!(matches!(err, AutoReviewError::Findings { .. }), "{err}");
+        assert!(err.to_string().contains("missing field"), "{err}");
+        assert_eq!(ops.log(), vec!["review 1", "flag 101"]);
+        assert_eq!(
+            ops.sleeps.get(),
+            0,
+            "no waiting for a file that cannot parse"
+        );
     }
 
     #[test]
@@ -807,29 +859,29 @@ mod tests {
     fn try_read_findings_is_none_until_the_file_parses() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("findings-1.json");
-        assert_eq!(try_read_findings(&path), None);
+        assert_eq!(try_read_findings(&path).unwrap(), None);
 
         std::fs::write(&path, "[{\"path\": \"src/a.rs\"").unwrap();
-        assert_eq!(try_read_findings(&path), None, "half-written");
+        assert_eq!(try_read_findings(&path).unwrap(), None, "half-written");
 
         std::fs::write(&path, "[]").unwrap();
-        assert_eq!(try_read_findings(&path), Some(Vec::new()));
+        assert_eq!(try_read_findings(&path).unwrap(), Some(Vec::new()));
     }
 
     #[test]
     fn read_fix_marker_reads_succeeded_and_is_none_until_it_parses() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("fix-1.done");
-        assert_eq!(read_fix_marker(&path), None);
+        assert_eq!(read_fix_marker(&path).unwrap(), None);
 
         std::fs::write(&path, "{\"succ").unwrap();
-        assert_eq!(read_fix_marker(&path), None);
+        assert_eq!(read_fix_marker(&path).unwrap(), None);
 
         std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
-        assert_eq!(read_fix_marker(&path), Some(false));
+        assert_eq!(read_fix_marker(&path).unwrap(), Some(false));
 
         std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
-        assert_eq!(read_fix_marker(&path), Some(true));
+        assert_eq!(read_fix_marker(&path).unwrap(), Some(true));
     }
 
     #[test]

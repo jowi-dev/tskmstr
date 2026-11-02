@@ -1951,8 +1951,10 @@ also ends the loop.
 tm appends a completion section to every round and fix prompt, so a custom
 `prompt_file` that never mentions the signal files still produces them. It
 names the exact path and tells the agent to write `<file>.tmp` and rename
-it into place. A findings file that exists but does not parse yet counts as
-not ready.
+it into place. A signal file whose JSON is cut short counts as not ready.
+One that is complete JSON of the wrong shape (a finding without `body`, a
+string `start_line`) can never become ready, so tm flags the step and
+stops the loop with the parse error in its log.
 
 **A step that never signals stops the loop.** If a round or fix pass
 writes nothing within `round_timeout_mins` (default 60, per step), or the

@@ -22,8 +22,9 @@ round's findings file, or the fix pass's
 `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done` marker (`<loop>` is the loop's pid and start time, so a leftover agent from an earlier loop never signals a later one)
 (`{"succeeded": true|false}`). tm appends a completion section to every
 round and fix prompt naming the file and the write-to-`.tmp`-then-rename
-step, so a custom prompt still signals. A file that exists but does not
-parse counts as not ready. When the signal arrives, the step's row gets an
+step, so a custom prompt still signals. A file whose JSON is cut short
+counts as not ready; complete JSON of the wrong shape flags the step and
+fails the loop. When the signal arrives, the step's row gets an
 `auto_review_signalled` event and its window stays open. The row stays
 `running` until its agent exits, so the idle sweep and memory admission
 still see the agent. With no signal within `round_timeout_mins`, or a row
