@@ -19,6 +19,7 @@ pub mod git;
 pub mod hibernate;
 pub mod interactive;
 pub mod kill_safety;
+pub mod lane_await;
 pub mod manual;
 pub mod merge;
 pub mod model;

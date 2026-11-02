@@ -507,6 +507,13 @@ pub struct RunLaneRequest {
     /// explicitly; the conservative default is for programmatic callers that
     /// have not thought about window hosting.
     pub mode: RunMode,
+    /// Set by `tm work run --unattended` (GitHub issue #184) so a caller can
+    /// tell when the lane is done although claude stays at its prompt: an
+    /// interactive run's prompt then ends with
+    /// [`crate::work::lane_await::lane_completion_section`] and its
+    /// [`PreparedRun::done_marker`] is set. A headless run exits when it is
+    /// done, so it ignores this.
+    pub done_signal: bool,
 }
 
 /// Everything [`run_agent_and_finish`] needs to spawn the agent, wait, parse
@@ -566,6 +573,15 @@ pub struct PreparedRun {
     /// [`PreparedRun::fallbacks`].
     #[serde(default)]
     pub status_on_pr: Option<String>,
+    /// Where the lane's agent writes its done marker (GitHub issue #184):
+    /// `Some` only for an interactive run prepared with
+    /// [`RunLaneRequest::done_signal`], read by
+    /// [`crate::work::lane_await::await_lane`].
+    ///
+    /// `#[serde(default)]` for the same pre-existing-state-file reason as
+    /// [`PreparedRun::fallbacks`].
+    #[serde(default)]
+    pub done_marker: Option<PathBuf>,
 }
 
 /// One not-yet-attempted priority-routing fallback, carried on
@@ -1425,6 +1441,20 @@ pub fn prepare_run_lane(
         RunMode::Interactive => interactive_prompt("lane", &ticket_field, &prompt),
     };
 
+    // GitHub issue #184: an unattended interactive lane never exits, so its
+    // prompt ends by telling the agent to write a done marker, after the
+    // interactive wrapping. Every attempt below shares `prompt`, so
+    // fallbacks signal the same way.
+    let done_marker = (request.done_signal && request.mode == RunMode::Interactive)
+        .then(|| paths.state_dir.join(format!("{wt_name}-{timestamp}.done")));
+    let prompt = match &done_marker {
+        Some(marker) => format!(
+            "{prompt}{}",
+            crate::work::lane_await::lane_completion_section(marker)
+        ),
+        None => prompt,
+    };
+
     let mut invocation = primary_runner.build_invocation(
         admitted,
         InvocationInputs {
@@ -1533,6 +1563,7 @@ pub fn prepare_run_lane(
             .ticket
             .as_ref()
             .and(deps.status_on_pr.map(str::to_string)),
+        done_marker,
     })
 }
 
@@ -1782,6 +1813,7 @@ pub fn prepare_existing_branch_run(
         out_json_path,
         fallbacks: Vec::new(),
         status_on_pr: None,
+        done_marker: None,
     })
 }
 
@@ -5833,6 +5865,107 @@ mod tests {
         assert_eq!(run.pid, None, "no supervisor process to attribute a pid to");
     }
 
+    /// Prepares a `PROJ-1` run of `mylane` in `mode`, with `done_signal`
+    /// as given (GitHub issue #184), returning the state dir alongside.
+    fn prepare_with_done_signal(
+        mode: RunMode,
+        done_signal: bool,
+    ) -> (TempDir, PathBuf, PreparedRun) {
+        let (tmp, home, repo_root, worktree_root, _prompt_path) = setup();
+        let config = config_with_lane(
+            "mylane",
+            lane_config(&repo_root.to_string_lossy()),
+            &worktree_root,
+        );
+
+        let git = FakeGitOps::new();
+        let gh = FakeGhCli::new();
+        let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
+        let clock = FakeClock((2026, 8, 6, 9, 5, 3));
+        let spawner = FakeProcessSpawner::success(canned_json());
+
+        let deps = RunLaneDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            ticket_provider: None,
+            current_repo_dir: Path::new("/irrelevant-in-tests"),
+            current_backend_identity: compatible_test_identity(),
+            backend_identity_resolver: compatible_test_resolver(),
+            runner: &ClaudeRunner,
+
+            status_on_run_start: None,
+            status_on_pr: None,
+            ticket_provider_error: None,
+            fallback_runners: Vec::new(),
+            models: &crate::config::ModelsConfig::default(),
+        };
+        let state_dir = tmp.path().join("state");
+        let paths = RunLanePaths {
+            home,
+            state_dir: state_dir.clone(),
+            hooks_deploy_dir: tmp.path().join("hooks"),
+        };
+        let request = RunLaneRequest {
+            ticket: Some("PROJ-1".to_string()),
+            mode,
+            done_signal,
+            ..RunLaneRequest::default()
+        };
+        let mut out = Vec::new();
+
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        (tmp, state_dir, prepared)
+    }
+
+    #[test]
+    fn prepare_run_lane_interactive_with_done_signal_appends_the_lane_completion_section() {
+        let (_tmp, state_dir, prepared) = prepare_with_done_signal(RunMode::Interactive, true);
+
+        let marker = state_dir.join(format!("{}-{}.done", prepared.wt_name, prepared.timestamp));
+        assert_eq!(prepared.done_marker.as_deref(), Some(marker.as_path()));
+        let prompt = &prepared.invocation.args[0];
+        assert!(
+            prompt.ends_with(&crate::work::lane_await::lane_completion_section(&marker)),
+            "the section follows the interactive wrapping: {prompt}"
+        );
+        assert!(prompt.contains("tm runs register --kind lane PROJ-1"));
+    }
+
+    #[test]
+    fn prepare_run_lane_headless_ignores_done_signal() {
+        let (_tmp, _state_dir, prepared) = prepare_with_done_signal(RunMode::Headless, true);
+
+        assert_eq!(prepared.done_marker, None);
+        assert!(
+            !prepared
+                .invocation
+                .args
+                .iter()
+                .any(|arg| arg.contains("## Completion signal"))
+        );
+    }
+
+    #[test]
+    fn prepare_run_lane_interactive_without_done_signal_has_no_marker() {
+        let (_tmp, _state_dir, prepared) = prepare_with_done_signal(RunMode::Interactive, false);
+
+        assert_eq!(prepared.done_marker, None);
+        assert!(!prepared.invocation.args[0].contains("## Completion signal"));
+    }
+
     #[test]
     fn prepare_run_lane_interactive_registers_a_ticketless_run_under_its_lane_name() {
         // With no ticket the run row's `ticket` column holds the lane name,
@@ -6286,6 +6419,7 @@ mod tests {
         assert_eq!(round_tripped.worktree, prepared.worktree);
         assert_eq!(round_tripped.invocation, prepared.invocation);
         assert_eq!(round_tripped.out_json_path, prepared.out_json_path);
+        assert_eq!(round_tripped.done_marker, prepared.done_marker);
     }
 
     #[test]
@@ -6314,6 +6448,10 @@ mod tests {
         let prepared: PreparedRun = serde_json::from_str(json).unwrap();
 
         assert!(prepared.fallbacks.is_empty());
+        assert_eq!(
+            prepared.done_marker, None,
+            "a pre-#184 state file has no done_marker key"
+        );
     }
 
     #[test]

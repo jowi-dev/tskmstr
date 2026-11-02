@@ -385,6 +385,7 @@ mod tests {
             out_json_path: PathBuf::from("/state/abc-123-20260101-120000.json"),
             fallbacks: Vec::new(),
             status_on_pr: None,
+            done_marker: None,
         }
     }
 
