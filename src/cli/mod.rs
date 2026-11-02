@@ -504,7 +504,7 @@ pub enum WorkCmd {
     /// away.
     ///
     /// `--headless` instead runs the autonomous one-shot `claude -p` under
-    /// a detached supervisor, for CI, cron, and unattended batches. `--fg`
+    /// a detached supervisor, for CI and cron. `--fg`
     /// runs that same headless pass synchronously, so this command's exit
     /// code reports the run's outcome.
     Run {
@@ -542,11 +542,10 @@ pub enum WorkCmd {
         /// Hidden: launched by the autopilot dispatcher (GitHub issue #115).
         /// Routes only to runners an unattended launch may use (no metered
         /// runner unless `[dispatch] allow_paid_fallback`), and refuses
-        /// instead of warning when usage admission says no. Since GitHub
-        /// issue #184 it no longer implies `--headless`: the lane runs
+        /// instead of warning when usage admission says no. Runs
         /// interactively in the ticket's `work` window unless `--headless`
-        /// or `--fg` is given, and a detached awaiter (`tm work
-        /// __await-lane`) finishes its run row on its done marker.
+        /// or `--fg` is given; a detached awaiter (`tm work __await-lane`)
+        /// finishes the run row on its done marker (GitHub issue #184).
         #[arg(long, hide = true)]
         unattended: bool,
     },
@@ -564,8 +563,8 @@ pub enum WorkCmd {
         state_file: String,
     },
     /// Hidden: the detached lane awaiter (GitHub issue #184). Not a
-    /// user-facing command — `tm work run --unattended` spawns this itself
-    /// after launching an interactive lane in the ticket's `work` window; it
+    /// user-facing command: `tm work run --unattended` spawns it after
+    /// launching an interactive lane in the ticket's `work` window; it
     /// deserializes `--state-file`'s state, waits for the lane's done
     /// marker, and finishes the run (see `tskmstr::work::lane_await`).
     #[command(name = "__await-lane", hide = true)]

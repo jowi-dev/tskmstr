@@ -970,8 +970,7 @@ prompt opens by telling the session to run `tm runs register --kind lane
 for it. A second `work` run is refused while one is still live in the
 session, before anything is provisioned.
 
-`--headless` keeps the previous behavior for CI, cron, and unattended
-batches: a one-shot `claude -p` under a `setsid`'d supervisor that runs
+`--headless` keeps the previous behavior for CI and cron: a one-shot `claude -p` under a `setsid`'d supervisor that runs
 `claude`, records the outcome, and is bounded by `--max-turns`. `--fg` runs
 that same headless pass synchronously and reports the run's outcome in the
 command's exit code — it implies `--headless`, since an interactive session

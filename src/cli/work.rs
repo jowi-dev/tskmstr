@@ -447,11 +447,12 @@ impl From<crate::work::admission::AdmissionError> for WorkCliError {
 /// that module's doc comment) so it stays callable from a future TUI
 /// without going through this CLI layer at all.
 ///
-/// [`Dispatch::Interactive`] (the default) hosts `claude` in a window of the
-/// ticket's `tm-<scope>-<key>` session and returns as soon as the window is launched;
-/// see [`run_interactive`]. With [`RunLaneRequest::done_signal`] set (`tm
-/// work run --unattended`, GitHub issue #184) it also spawns a detached
-/// awaiter that finishes the run on the lane's done marker. [`Dispatch::HeadlessForeground`] runs
+/// [`Dispatch::Interactive`] (the default) hosts `claude` in a window of
+/// the ticket's `tm-<scope>-<key>` session and returns as soon as the
+/// window is launched; see [`run_interactive`]. With
+/// [`RunLaneRequest::done_signal`] set (`tm work run --unattended`, GitHub
+/// issue #184) it also spawns a detached awaiter that finishes the run on
+/// the lane's done marker. [`Dispatch::HeadlessForeground`] runs
 /// synchronously in this process ([`crate::work::run::run_lane_fg`]) and
 /// returns once `claude` has finished. [`Dispatch::Headless`] does
 /// provisioning/preflight/`start_run` in this process — so a bad lane,
