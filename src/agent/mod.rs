@@ -868,6 +868,11 @@ pub trait AgentRunner: Sync {
     }
 }
 
+/// Picks the [`Transcripts`] reader for a run from its recorded agent name
+/// ([`AgentRunner::name`], `None` when the run recorded none). `None` means
+/// that agent has no transcript reader. Taken by `tm runs logs`.
+pub type TranscriptsFor<'a> = dyn Fn(Option<&str>) -> Option<Box<dyn Transcripts>> + 'a;
+
 /// An agent's per-session transcripts, as handed out by
 /// [`AgentRunner::transcripts`]: where the agent keeps a session's
 /// transcript, and how to turn its raw contents into readable text.

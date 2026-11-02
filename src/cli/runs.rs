@@ -161,7 +161,7 @@ pub enum RunsCliError {
     /// `tm runs logs` resolved a log path or a recorded transcript path,
     /// but nothing exists there (also `tm runs scrollback` for an archive
     /// file that was deleted).
-    #[error("log file {path} does not exist")]
+    #[error("{path} does not exist")]
     LogFileMissing {
         /// The path that was resolved but not found.
         path: std::path::PathBuf,
@@ -1195,14 +1195,17 @@ fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
 ///    predate it.
 /// 2. The recorded `transcript` column (filled by the SessionEnd hook's
 ///    `tm runs finish --transcript`).
-/// 3. The run's session id looked up via `transcripts` (the configured
-///    agent's [`crate::agent::AgentRunner::transcripts`]). This covers runs
-///    whose SessionEnd hook never fired, such as those hibernated by the
-///    idle sweep or cleaned up by `tm merge`: Claude Code's transcript file
-///    outlives the killed session.
+/// 3. The run's session id looked up via the transcript reader. This
+///    covers runs whose SessionEnd hook never fired, such as those
+///    hibernated by the idle sweep or cleaned up by `tm merge`: Claude
+///    Code's transcript file outlives the killed session.
 ///
-/// Steps 2 and 3 apply only when `transcripts` is `Some`; an agent with no
-/// transcript reader skips straight to [`RunsCliError::NoLogPath`]. A
+/// Steps 2 and 3 read through the [`crate::agent::Transcripts`] that
+/// `transcripts_for` returns for the run's recorded
+/// [`Run::agent`] (`None` when the run recorded
+/// none; the caller then picks the configured agent). It is called only
+/// once step 1 fails, and an agent with no transcript reader (`None`) skips
+/// straight to [`RunsCliError::NoLogPath`]. A
 /// transcript is printed through [`crate::agent::Transcripts::render`]
 /// (user/assistant messages, tool calls and results in brief), with `tail`
 /// applied to the rendered lines rather than the raw file.
@@ -1230,7 +1233,7 @@ pub fn logs(
     store: &RunStore,
     scope: Option<&str>,
     home: &Path,
-    transcripts: Option<&dyn crate::agent::Transcripts>,
+    transcripts_for: &crate::agent::TranscriptsFor,
     ticket_or_id: &str,
     kind: Option<&str>,
     tail: usize,
@@ -1246,7 +1249,7 @@ pub fn logs(
         ticket: run.ticket.clone(),
         id: run.id,
     };
-    let transcripts = transcripts.ok_or_else(no_log)?;
+    let transcripts = transcripts_for(run.agent.as_deref()).ok_or_else(no_log)?;
     let path = run
         .transcript
         .as_deref()
@@ -1257,7 +1260,15 @@ pub fn logs(
                 .and_then(|sid| transcripts.locate(sid))
         })
         .ok_or_else(no_log)?;
-    print_transcript(&run, &path, transcripts, tail, follow, sleeper, out)
+    print_transcript(
+        &run,
+        &path,
+        transcripts.as_ref(),
+        tail,
+        follow,
+        sleeper,
+        out,
+    )
 }
 
 /// [`logs`] for a resolved detached-process log file at `path`: prints its
@@ -3786,7 +3797,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             2,
@@ -3821,7 +3832,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "ax-408",
             None,
             200,
@@ -3853,7 +3864,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "ax-408",
             None,
             200,
@@ -3887,7 +3898,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -3916,7 +3927,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -3946,6 +3957,20 @@ mod tests {
         .iter()
         .map(|entry| format!("{entry}\n"))
         .collect()
+    }
+
+    /// A `transcripts_for` for [`logs`] that hands out Claude Code
+    /// transcripts under `config_dir` whatever the run's agent.
+    fn claude_transcripts(
+        config_dir: std::path::PathBuf,
+    ) -> impl Fn(Option<&str>) -> Option<Box<dyn crate::agent::Transcripts>> {
+        move |_| Some(Box::new(ClaudeTranscripts::new(config_dir.clone())))
+    }
+
+    /// A `transcripts_for` for [`logs`] modelling an agent with no
+    /// transcript reader.
+    fn no_transcripts(_agent: Option<&str>) -> Option<Box<dyn crate::agent::Transcripts>> {
+        None
     }
 
     /// Starts an interactive-style run for `ticket` (no `log_path`) and
@@ -3983,7 +4008,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -4012,7 +4037,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             2,
@@ -4049,7 +4074,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(claude_dir.clone())),
+            &claude_transcripts(claude_dir.clone()),
             "proj-1",
             None,
             200,
@@ -4095,7 +4120,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -4121,7 +4146,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -4149,7 +4174,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(dir.path().join("claude"))),
+            &claude_transcripts(dir.path().join("claude")),
             "proj-1",
             None,
             200,
@@ -4184,7 +4209,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            Some(&ClaudeTranscripts::new(claude_dir.clone())),
+            &claude_transcripts(claude_dir.clone()),
             "proj-1",
             None,
             200,
@@ -4210,7 +4235,7 @@ mod tests {
             &store,
             None,
             dir.path(),
-            None,
+            &no_transcripts,
             "proj-1",
             None,
             200,
@@ -4221,6 +4246,112 @@ mod tests {
         .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::NoLogPath { .. }), "{err}");
+    }
+
+    #[test]
+    fn logs_picks_the_transcript_reader_by_the_run_s_recorded_agent() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        let id = start_run_with_transcript(&store, "PROJ-1", &transcript);
+        store.update_agent_repo(id, "claude", "repo").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let transcripts_for = |agent: Option<&str>| {
+            asked.borrow_mut().push(agent.map(str::to_string));
+            claude_transcripts(dir.path().join("claude"))(agent)
+        };
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            &transcripts_for,
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(*asked.borrow(), [Some("claude".to_string())]);
+        assert!(String::from_utf8(out).unwrap().contains("user: fix it"));
+    }
+
+    #[test]
+    fn logs_passes_no_agent_when_the_run_recorded_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, sample_transcript()).unwrap();
+        start_run_with_transcript(&store, "PROJ-1", &transcript);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let transcripts_for = |agent: Option<&str>| {
+            asked.borrow_mut().push(agent.map(str::to_string));
+            claude_transcripts(dir.path().join("claude"))(agent)
+        };
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            &transcripts_for,
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(*asked.borrow(), [None]);
+    }
+
+    #[test]
+    fn logs_does_not_ask_for_a_transcript_reader_when_a_log_resolves() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let log_file = dir.path().join("lane.log");
+        std::fs::write(&log_file, "from the log\n").unwrap();
+        store
+            .start_run(&StartRun {
+                log_path: Some(log_file.to_string_lossy().into_owned()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        let transcripts_for = |_: Option<&str>| -> Option<Box<dyn crate::agent::Transcripts>> {
+            panic!("transcript reader requested although a log resolved")
+        };
+        let mut out = Vec::new();
+
+        logs(
+            &store,
+            None,
+            dir.path(),
+            &transcripts_for,
+            "proj-1",
+            None,
+            200,
+            false,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "from the log\n");
+    }
+
+    #[test]
+    fn log_file_missing_reads_neutrally_for_a_transcript_path() {
+        let err = RunsCliError::LogFileMissing {
+            path: std::path::PathBuf::from("/x/sess-1.jsonl"),
+        };
+        assert_eq!(err.to_string(), "/x/sess-1.jsonl does not exist");
     }
 
     #[test]

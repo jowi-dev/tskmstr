@@ -662,11 +662,12 @@ by the run's session id under `$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`
 (`$CLAUDE_CONFIG_DIR` defaults to `~/.claude`). The session-id lookup is
 what keeps it working for runs whose SessionEnd hook never fired, such as
 those hibernated by the idle sweep or cleaned up by `tm merge`: Claude
-Code's transcript file outlives the killed session. Only Claude Code
-transcripts are supported, read through the configured `[agent] runner`:
-under opencode, a run with no log still reports the distinct "no recorded
-log path or transcript" error, as does any run with neither a log nor a
-transcript.
+Code's transcript file outlives the killed session. The transcript is read
+by the agent that recorded the run (falling back to the configured `[agent]
+runner` for rows that recorded none), so a claude run still renders under an
+opencode config. Only Claude Code transcripts are supported: an opencode run
+with no log still reports the distinct "no recorded log path or transcript"
+error, as does any run with neither a log nor a transcript.
 
 ### Per-model token/cost usage
 
