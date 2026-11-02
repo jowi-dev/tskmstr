@@ -144,6 +144,7 @@ mod tests {
             url: format!("https://example.atlassian.net/browse/{key}"),
             is_epic: children.is_some(),
             children: children.map(|(done, total)| ChildProgress { done, total }),
+            assignee: None,
         }
     }
 

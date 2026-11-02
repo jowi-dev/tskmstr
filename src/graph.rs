@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::config::BackendIdentity;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
-use crate::ticketing::types::{Issue, LinkedIssue, Status};
+use crate::ticketing::types::{Issue, LinkedIssue, Status, UserRef};
 use crate::work::comment_store::iso8601_utc;
 
 pub use render::{render_mermaid, render_text};
@@ -125,6 +125,19 @@ pub struct GraphNode {
     /// Child progress for an epic in the graph's epic set; `None` (JSON
     /// `null`) for every other node.
     pub children: Option<ChildProgress>,
+    /// Who the ticket is assigned to; `None` (JSON `null`) when unassigned,
+    /// and for a plain ticket known only from an unlocks link, whose link
+    /// data carries no assignee.
+    pub assignee: Option<GraphAssignee>,
+}
+
+/// The user a [`GraphNode`] is assigned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphAssignee {
+    /// The backend's user id: a Jira account ID or a GitHub login.
+    pub id: String,
+    /// Display name: the Jira display name, or the GitHub login again.
+    pub name: String,
 }
 
 /// How many of an epic's children are done.
@@ -510,7 +523,14 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
-    fn node(&self, key: &str, title: &str, status: &Status, is_epic: bool) -> GraphNode {
+    fn node(
+        &self,
+        key: &str,
+        title: &str,
+        status: &Status,
+        is_epic: bool,
+        assignee: Option<&UserRef>,
+    ) -> GraphNode {
         GraphNode {
             key: key.to_string(),
             backend: self.backend.clone(),
@@ -520,6 +540,10 @@ impl<'a> GraphBuilder<'a> {
             url: self.provider.issue_url(key),
             is_epic,
             children: None,
+            assignee: assignee.map(|user| GraphAssignee {
+                id: user.account_id.clone(),
+                name: user.display_name.clone(),
+            }),
         }
     }
 
@@ -529,6 +553,7 @@ impl<'a> GraphBuilder<'a> {
             &issue.fields.summary,
             &issue.fields.status,
             is_epic,
+            issue.fields.assignee.as_ref(),
         )
     }
 
@@ -538,6 +563,7 @@ impl<'a> GraphBuilder<'a> {
             &linked.fields.summary,
             &linked.fields.status,
             false,
+            None,
         )
     }
 
@@ -744,6 +770,34 @@ mod tests {
         assert_eq!(epic.title, "Summary for PROJ-1");
         assert_eq!(epic.status, "To Do");
         assert_eq!(epic.status_category, "new");
+    }
+
+    #[test]
+    fn node_carries_the_assignee_and_null_when_unassigned() {
+        let mut assigned = issue("PROJ-1", "new", vec![blocks("PROJ-8", "new")]);
+        assigned.fields.assignee = Some(crate::ticketing::types::UserRef {
+            account_id: "acct-1".to_string(),
+            display_name: "Ada".to_string(),
+        });
+        let fake = fake_with_epics(vec![assigned, issue("PROJ-2", "new", vec![])]);
+
+        let graph = build(&fake, None).unwrap();
+
+        assert_eq!(
+            node(&graph, "PROJ-1").assignee,
+            Some(GraphAssignee {
+                id: "acct-1".to_string(),
+                name: "Ada".to_string(),
+            })
+        );
+        assert_eq!(node(&graph, "PROJ-2").assignee, None);
+        assert_eq!(node(&graph, "PROJ-8").assignee, None);
+        let json = serde_json::to_value(GraphDocument::new(graph, &jira_identity(), 0)).unwrap();
+        assert_eq!(
+            json["nodes"][0]["assignee"],
+            serde_json::json!({"id": "acct-1", "name": "Ada"})
+        );
+        assert_eq!(json["nodes"][1]["assignee"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1028,6 +1082,7 @@ mod tests {
                 "url": "https://example.atlassian.net/browse/PROJ-1",
                 "is_epic": true,
                 "children": {"done": 1, "total": 1},
+                "assignee": null,
             })
         );
         assert_eq!(json["nodes"][1]["key"], "PROJ-9");
@@ -1074,6 +1129,10 @@ mod tests {
                 url: "https://example.atlassian.net/browse/PROJ-1".to_string(),
                 is_epic: true,
                 children: Some(ChildProgress { done: 0, total: 1 }),
+                assignee: Some(GraphAssignee {
+                    id: "acct-1".to_string(),
+                    name: "Ada".to_string(),
+                }),
             }],
             links: vec![parent("PROJ-1", "PROJ-2")],
             warnings: vec![GraphWarning {
