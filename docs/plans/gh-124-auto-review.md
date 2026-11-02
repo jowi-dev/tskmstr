@@ -10,16 +10,40 @@ the confirmed findings into the worktree's vdiff comment store, and drives
 re-execs a detached `tm review auto <KEY> --foreground` child that logs to
 `~/.local/state/tskmstr/auto-review/<key>.log`, and the foreground child
 runs the loop synchronously. The loop has no tmux window of its own. Each
-review round is a headless agent run in the ticket's existing worktree,
-recorded as `kind = "auto-review"`. Each fix round is an unchanged
-`tm review fix <KEY> --fg`, recorded as `kind = "review-fix"`.
+review round is an interactive agent run in the ticket's existing worktree,
+hosted in a `review` / `review-N` window of the ticket's `tm-<scope>-<key>`
+session and recorded as `kind = "auto-review"`. Each fix round is an
+interactive `tm review fix <KEY>` pass in a `fix` / `fix-N` window,
+recorded as `kind = "review-fix"` (GitHub issue #150).
+
+The loop waits for each step's **signal file**, not for claude to exit: the
+round's findings file, or the fix pass's
+`<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done` marker
+(`{"succeeded": true|false}`). `<loop>` is the loop's pid and start time,
+so a leftover agent from an earlier loop never signals a later one. tm appends a completion section to every
+round and fix prompt naming the file and the write-to-`.tmp`-then-rename
+step, so a custom prompt still signals. A file whose JSON is cut short
+counts as not ready; complete JSON of the wrong shape flags the step and
+fails the loop. When the signal arrives, the step's row gets an
+`auto_review_signalled` event and its window stays open. The row stays
+`running` until its agent exits, so the idle sweep and memory admission
+still see the agent. With no signal within `round_timeout_mins`, or a row
+hibernated before its signal, the step's row is flagged for review and the
+loop ends **stuck**. A row still in flight keeps its status and gets a
+`review_flag` event, applied when the session-end hook finishes it; a
+hibernated row stays wakeable. A row ended by something
+else, or a ticket session that no longer exists (`tm merge`), ends the loop
+**stopped**, unflagged. The loop records its pid on every row it creates as
+an `auto_review_loop_pid` event, which the board's `review:` badge reads
+because an interactive row's own pid is its agent's.
 
 One round:
 
 1. Pick the prompt. Round 1 renders `{skill}` as `thatch-code-review`.
    Later rounds render it as `thatch-review-followup` and point `{archive}`
    at the previous round's archive file.
-2. Run the review agent. It writes its confirmed findings to
+2. Launch the review agent and wait for its findings file. It writes its
+   confirmed findings to
    `{findings_file}`, a JSON array of
    `{path, start_line, end_line, severity, specialist, body}`, anchored to
    the head SHA.
@@ -29,9 +53,10 @@ One round:
 5. If no finding is at or above `fix_threshold`, the loop ends **clean**.
    LOW findings stay in the store for the human to see in `V`.
 6. If this was round `max_review_rounds`, the loop ends **capped**. The
-   round's run row is finished as `review` and gets an `auto_review_capped`
-   event, and the store is left in place for the human.
-7. Otherwise tm runs `tm review fix <KEY> --fg`. Then it moves the whole
+   round's run row is flagged for review, as for a stuck step, and the
+   store is left in place for the human.
+7. Otherwise tm starts an interactive `tm review fix <KEY>` pass and waits
+   for its marker. Then it moves the whole
    store to `<git-dir>/vdiff/archive/<round>.json` and leaves an empty
    store behind.
 
@@ -67,6 +92,7 @@ the prefix needs no schema change.
 | `max_review_rounds` | `2`                | round cap                                              |
 | `publish`           | `false`            | run `vdiff --publish-comments <pr>` after each round   |
 | `auto`              | `false`            | chain from a `review-watch` that finishes              |
+| `round_timeout_mins`| `60`               | wait per round and per fix pass for its signal file    |
 
 The severities, low to high, are `low`, `medium`, `high` and `blocking`
 (thatch's synthesizer scale). An unknown severity on a finding counts as

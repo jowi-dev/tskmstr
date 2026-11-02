@@ -2260,9 +2260,12 @@ fn load_bot_watch_status(deps: &TuiDeps) -> Vec<Msg> {
 /// [`auto_review_indicator`]'s pure mapping.
 ///
 /// The loop-liveness input is a local [`crate::runs::pid::pid_alive`] check
-/// on the run's recorded pid (every round row carries the loop's pid), so a
-/// fix pass between rounds still reads as reviewing; nothing here calls
-/// GitHub. Same leniency as [`load_bot_watch_status`]: a store error yields
+/// on the loop's pid, so a fix pass between rounds still reads as
+/// reviewing; nothing here calls GitHub. The loop records its pid as a
+/// [`crate::work::auto_review::LOOP_PID_EVENT`] on each row it creates,
+/// because an interactive round's own pid is its agent's (GitHub issue
+/// #150); a row from before that event falls back to its recorded pid,
+/// which was the loop's. Same leniency as [`load_bot_watch_status`]: a store error yields
 /// an empty map rather than an error.
 fn load_auto_review_status(deps: &TuiDeps) -> Vec<Msg> {
     let Some(store) = &deps.store else {
@@ -2277,7 +2280,10 @@ fn load_auto_review_status(deps: &TuiDeps) -> Vec<Msg> {
         .unwrap_or_default()
         .into_iter()
         .map(|run| {
-            let loop_alive = run.pid.is_some_and(crate::runs::pid::pid_alive);
+            let loop_alive = run
+                .loop_pid
+                .or(run.pid)
+                .is_some_and(crate::runs::pid::pid_alive);
             let badge = auto_review_indicator(run.status, run.round.as_deref(), loop_alive);
             (run.ticket, badge)
         })
@@ -7475,6 +7481,59 @@ mod tests {
         assert_eq!(
             status.get("PROJ-1").map(|badge| badge.indicator),
             Some(crate::tui::app::AutoReviewIndicator::NeedsYou)
+        );
+    }
+
+    /// An interactive round (GitHub issue #150): the row's own pid is its
+    /// agent's, still alive in the open window, while the loop that owns the
+    /// round recorded its pid as an event.
+    fn interactive_round(store: &crate::runs::RunStore, agent_pid: u32, loop_pid: u32) {
+        let run_id = store
+            .start_run(&crate::runs::StartRun {
+                kind: crate::work::auto_review::AUTO_REVIEW_KIND.to_string(),
+                pid: Some(agent_pid),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store
+            .add_event(
+                run_id,
+                crate::work::auto_review::LOOP_PID_EVENT,
+                Some(&loop_pid.to_string()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn load_auto_review_status_reads_liveness_from_the_loop_pid_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        interactive_round(&store, std::process::id(), dead_pid());
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let status = auto_review_map(load_auto_review_status(&deps));
+        assert_eq!(
+            status.get("PROJ-1").map(|badge| badge.indicator),
+            Some(crate::tui::app::AutoReviewIndicator::NeedsYou),
+            "a live agent in the window must not read as a live loop"
+        );
+    }
+
+    #[test]
+    fn load_auto_review_status_interactive_round_with_a_live_loop_is_reviewing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        interactive_round(&store, dead_pid(), std::process::id());
+
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let status = auto_review_map(load_auto_review_status(&deps));
+        assert_eq!(
+            status.get("PROJ-1").map(|badge| badge.indicator),
+            Some(crate::tui::app::AutoReviewIndicator::Reviewing)
         );
     }
 

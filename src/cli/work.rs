@@ -561,6 +561,7 @@ pub fn run(
     let windows = ctx.tmux.list_windows()?;
     let viewer_target = resolve_action_window(
         &windows,
+        &[],
         &run_deps.current_backend_identity.session_slug(),
         &session_key,
         WORK_WINDOW_NAME,
@@ -665,6 +666,7 @@ fn run_interactive(
     let windows = ctx.tmux.list_windows()?;
     let target = resolve_action_window(
         &windows,
+        &[],
         &run_deps.current_backend_identity.session_slug(),
         &session_key,
         WORK_WINDOW_NAME,

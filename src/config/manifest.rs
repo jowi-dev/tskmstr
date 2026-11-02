@@ -230,6 +230,15 @@ pub const EXPECTED_CONFIG_KEYS: &[ExpectedConfigKey] = &[
         severity: KeySeverity::Recommended,
         suggested_default: |_| None,
     },
+    // GitHub issue #150: how long the loop waits on one interactive round
+    // or fix pass's signal file. `0` means no timeout, as
+    // `idle_hibernate_mins = 0` turns the idle sweep off.
+    ExpectedConfigKey {
+        path: &["work", "auto_review", "round_timeout_mins"],
+        since_schema_version: 2,
+        severity: KeySeverity::Recommended,
+        suggested_default: |_| None,
+    },
     // GitHub issue #114. Opt-in spend, so there is no default to suggest.
     // The `[agent.<runner>]` usage keys (ceilings, snapshot max age,
     // billing, token budget) aren't registered: each has a built-in
@@ -355,6 +364,7 @@ mod tests {
             "max_review_rounds",
             "publish",
             "auto",
+            "round_timeout_mins",
         ] {
             let key = expected(&["work", "auto_review", key]);
             assert_eq!(key.severity, KeySeverity::Recommended);

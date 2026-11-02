@@ -50,8 +50,9 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::agent::ResumeSpec;
-use crate::runs::{RunStatus, RunStore, RunStoreError};
+use crate::runs::{RunEvent, RunStatus, RunStore, RunStoreError};
 use crate::work::audit::SESSION_RUN_ID_ENV;
+use crate::work::auto_review::SIGNAL_EVENT;
 use crate::work::tmux::{TmuxError, TmuxOps, session_window_names, unique_window_name};
 
 /// `run_events.kind` of the event [`record_launch`] writes.
@@ -128,12 +129,55 @@ pub fn record_launch(
 /// The most recent [`LaunchRecord`] recorded for `run_id`, or `None` when
 /// it has none (or its detail does not parse).
 pub fn launch_record(store: &RunStore, run_id: i64) -> Result<Option<LaunchRecord>, RunStoreError> {
-    Ok(store
-        .events_for_run(run_id)?
+    Ok(launch_record_in(&store.events_for_run(run_id)?))
+}
+
+/// [`launch_record`] over a run's already-read events, oldest first.
+fn launch_record_in(events: &[RunEvent]) -> Option<LaunchRecord> {
+    events
         .iter()
         .rev()
         .filter(|event| event.kind == LAUNCH_EVENT_KIND)
-        .find_map(|event| serde_json::from_str(event.detail.as_deref()?).ok()))
+        .find_map(|event| serde_json::from_str(event.detail.as_deref()?).ok())
+}
+
+/// The launch windows of tmux session `session_name` with nothing left
+/// running in them, which [`crate::work::interactive::resolve_action_window`]
+/// lets a new action open beside (GitHub issue #150): windows whose run has
+/// ended ([`RunStatus::has_ended`]), or whose `tm review auto` step has
+/// signalled ([`SIGNAL_EVENT`]) and whose agent sits idle at its prompt. A
+/// step that never signalled still counts as running, even once the loop
+/// flags it, so no second agent opens beside one still editing the
+/// worktree. Each window name is judged by its newest run, so a name reused
+/// by a run that is still running does not count as ended.
+///
+/// # Errors
+///
+/// A `RunStore` failure.
+pub fn ended_launch_windows(
+    store: &RunStore,
+    session_name: &str,
+) -> Result<Vec<String>, RunStoreError> {
+    let mut seen = Vec::new();
+    let mut ended = Vec::new();
+    // `all_runs` is newest-first, so the first run seen per window decides.
+    for run in store.all_runs()? {
+        if run.tmux_session.as_deref() != Some(session_name) {
+            continue;
+        }
+        let events = store.events_for_run(run.id)?;
+        let Some(record) = launch_record_in(&events) else {
+            continue;
+        };
+        if seen.contains(&record.window) {
+            continue;
+        }
+        if run.status.has_ended() || events.iter().any(|event| event.kind == SIGNAL_EVENT) {
+            ended.push(record.window.clone());
+        }
+        seen.push(record.window);
+    }
+    Ok(ended)
 }
 
 /// Hibernate every idle interactive run (see the module docs for the exact
@@ -360,6 +404,59 @@ mod tests {
         let id = interactive_run(&store, 0, true);
 
         assert_eq!(launch_record(&store, id).unwrap(), Some(record()));
+    }
+
+    #[test]
+    fn ended_launch_windows_names_windows_whose_newest_run_has_ended_or_signalled() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let with_window = |window: &str, status: Option<RunStatus>| {
+            let id = interactive_run(&store, 0, false);
+            record_launch(
+                &store,
+                id,
+                &LaunchRecord {
+                    window: window.to_string(),
+                    resume: spec(),
+                },
+            )
+            .unwrap();
+            if let Some(status) = status {
+                store
+                    .finish_run(
+                        id,
+                        &crate::runs::FinishRun {
+                            status,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            id
+        };
+        with_window("review", Some(RunStatus::Done));
+        with_window("fix", Some(RunStatus::Review));
+        // A later run reusing `work` is still running.
+        with_window("work", Some(RunStatus::Done));
+        with_window("work", None);
+        // A tm review auto step that signalled, its agent idle in the window.
+        let signalled = with_window("review-2", None);
+        store
+            .add_event(signalled, SIGNAL_EVENT, Some("review"))
+            .unwrap();
+        // A step flagged stuck, its agent possibly still editing.
+        let stuck = with_window("fix-2", None);
+        store.flag_for_review(stuck).unwrap();
+
+        let mut ended = ended_launch_windows(&store, SESSION).unwrap();
+        ended.sort();
+
+        assert_eq!(ended, vec!["fix", "review", "review-2"]);
+        assert!(
+            ended_launch_windows(&store, "tm-proj-other")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

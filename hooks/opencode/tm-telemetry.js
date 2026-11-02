@@ -124,7 +124,9 @@ export default async () => {
     if (finished || !finishRunId) return;
     finished = true;
     const map = aggregate();
-    const args = ["runs", "finish", finishRunId, "--status", "done"];
+    // --keep-status: never overwrite a status tm already set on the run,
+    // such as the auto-review loop's review flag (GitHub issue #150).
+    const args = ["runs", "finish", finishRunId, "--status", "done", "--keep-status"];
     if (!isEmpty(map)) {
       args.push("--model-usage", JSON.stringify(map));
     }

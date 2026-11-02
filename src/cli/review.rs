@@ -43,17 +43,20 @@ use thiserror::Error;
 use crate::agent::{AgentRunner, RunMode};
 use crate::config::AutoReviewConfig;
 use crate::github::gh_cli::GhCli;
-use crate::runs::{RunStatus, RunStore, RunStoreError};
+use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
-    AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LoopOutcome, run_loop,
+    AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LOOP_PID_EVENT, LoopOutcome,
+    SIGNAL_EVENT, StepState, run_loop,
 };
 use crate::work::detach::{DetachError, DetachSpawner, SupervisorState, supervisor_argv};
 use crate::work::git::{GitError, GitOps};
 use crate::work::interactive::{
-    FIX_WINDOW_NAME, InteractiveLaunchError, launch_interactive_run, resolve_action_window,
+    ActionWindow, FIX_WINDOW_NAME, InteractiveLaunchError, REVIEW_WINDOW_NAME,
+    launch_interactive_run, resolve_action_window,
 };
 use crate::work::prompt::{PromptFileError, read_prompt_file};
+use crate::work::review_watch::Sleeper;
 use crate::work::run::{
     Clock, ExistingBranchRun, PreparedRun, RunLaneError, RunLanePaths, prepare_existing_branch_run,
     prepare_review_fix, run_agent_and_finish, run_log_path,
@@ -138,13 +141,13 @@ pub enum ReviewCliError {
     #[error(transparent)]
     Interactive(#[from] InteractiveLaunchError),
 
-    /// `tm review auto`: an auto-review round for this ticket is already
-    /// running; a second loop would race it over the same comment store.
-    #[error("an auto-review round for {ticket} is already running (run {run_id})")]
+    /// `tm review auto`: the auto-review loop for this ticket is still
+    /// alive; a second loop would race it over the same comment store.
+    #[error("an auto-review loop for {ticket} is already running (round run {run_id})")]
     AutoReviewRunning {
         /// The ticket key.
         ticket: String,
-        /// The running round's run id.
+        /// The live loop's newest round's run id.
         run_id: i64,
     },
 
@@ -240,6 +243,9 @@ pub struct ReviewFixDeps<'a> {
     /// Memory and usage admission for every fix pass and auto-review round
     /// (GitHub issue #149).
     pub admission: AdmissionDeps<'a>,
+    /// Waits between `tm review auto`'s polls for a round's or fix pass's
+    /// signal file (GitHub issue #150).
+    pub sleeper: &'a dyn Sleeper,
 }
 
 /// The model a fix pass or auto-review round on `lane` passes: the lane's
@@ -318,6 +324,22 @@ pub fn fix(
     origin: LaunchOrigin,
     out: &mut dyn Write,
 ) -> Result<FixOutcome, ReviewCliError> {
+    dispatch_fix(deps, paths, key, dispatch, origin, None, out).map(|(outcome, _)| outcome)
+}
+
+/// [`fix`], with `completion` appended to the fix prompt when set (`tm
+/// review auto`'s [`crate::work::auto_review::fix_completion_section`]),
+/// also returning the dispatched run's id (`None` for
+/// [`FixOutcome::NoComments`]).
+fn dispatch_fix(
+    deps: &ReviewFixDeps<'_>,
+    paths: &RunLanePaths,
+    key: &str,
+    dispatch: Dispatch,
+    origin: LaunchOrigin,
+    completion: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(FixOutcome, Option<i64>), ReviewCliError> {
     let scope = deps.backend_identity.scope();
     let run = resolve_run(deps.run_store, Some(&scope), key, Some("lane"))?;
     let branch = run
@@ -330,40 +352,17 @@ pub fn fix(
 
     let export = deps.vdiff.export_comments(&worktree)?;
     if export.trim() == NO_COMMENTS {
-        return Ok(FixOutcome::NoComments);
+        return Ok((FixOutcome::NoComments, None));
     }
 
-    let prompt = build_fix_prompt(&export);
+    let prompt = build_fix_prompt(&export) + completion.unwrap_or_default();
     let pid = match dispatch {
         Dispatch::HeadlessForeground => Some(std::process::id()),
         Dispatch::Headless | Dispatch::Interactive => None,
     };
 
-    // Resolved before `prepare_review_fix` starts a run row, so a refusal to
-    // run a second concurrent fix pass leaves nothing behind — see
-    // `crate::work::interactive`'s module docs.
-    //
-    // Both tmux-windowed dispatches resolve a window here, and the refusal
-    // applies to both: whether the live `fix` window hosts `claude` or only
-    // tails its log, a fix pass for this ticket is in flight either way.
-    // `--fg` gets no window at all — it has no log file to follow, and its
-    // output is going to this very terminal.
-    let target = match dispatch {
-        Dispatch::Interactive | Dispatch::Headless => {
-            let windows = deps.tmux.list_windows()?;
-            Some(resolve_action_window(
-                &windows,
-                &deps.backend_identity.session_slug(),
-                &run.ticket,
-                FIX_WINDOW_NAME,
-            )?)
-        }
-        Dispatch::HeadlessForeground => None,
-    };
-
-    // Admission (GitHub issue #149) after every refusal that needs no
-    // agent, and before `prepare_review_fix` starts a run row, so a
-    // refusal leaves nothing behind.
+    // Admission (GitHub issue #149) before `prepare_review_fix` starts a run
+    // row, so a refusal leaves nothing behind.
     let repo = review_run_repo(deps.config, &run);
     let admitted = deps.admission.admit(
         deps.run_store,
@@ -376,6 +375,25 @@ pub fn fix(
         origin,
         out,
     )?;
+
+    // Resolved after admission, which can wait up to `admission_wait_mins`
+    // for an unattended launch, so the tmux snapshot is fresh, and before
+    // `prepare_review_fix` starts a run row, so a refusal to run a second
+    // concurrent fix pass leaves nothing behind — see
+    // `crate::work::interactive`'s module docs. `review` (the auto-review
+    // round) orders the two the same way.
+    //
+    // Both tmux-windowed dispatches resolve a window here, and the refusal
+    // applies to both: whether the live `fix` window hosts `claude` or only
+    // tails its log, a fix pass for this ticket is in flight either way.
+    // `--fg` gets no window at all — it has no log file to follow, and its
+    // output is going to this very terminal.
+    let target = match dispatch {
+        Dispatch::Interactive | Dispatch::Headless => {
+            Some(resolve_review_window(deps, &run.ticket, FIX_WINDOW_NAME)?)
+        }
+        Dispatch::HeadlessForeground => None,
+    };
 
     let prepared: PreparedRun = prepare_review_fix(
         &admitted,
@@ -400,23 +418,7 @@ pub fn fix(
         let target = target
             .as_ref()
             .expect("an interactive dispatch always resolves a window");
-        // Same post-`start_run` stamp as `tm work run`'s interactive path:
-        // a killed ticket session reaps this row immediately (issue #26).
-        deps.run_store
-            .update_tmux_session(prepared.run_id, &target.session_name)?;
-        let prompt_path = paths.state_dir.join(format!(
-            "{}-{}.prompt.md",
-            prepared.wt_name, prepared.timestamp
-        ));
-        launch_interactive_run(deps.tmux, target, &prepared, &prompt_path, deps.runner)?;
-        crate::work::hibernate::record_launch(
-            deps.run_store,
-            prepared.run_id,
-            &crate::work::hibernate::LaunchRecord {
-                window: target.window_name.clone(),
-                resume: deps.runner.resume_spec(&prepared.invocation),
-            },
-        )?;
+        launch_in_ticket_session(deps, paths, target, &prepared)?;
 
         writeln!(out, "started   review-fix {} on {branch}", run.ticket)?;
         writeln!(out, "worktree  {}", worktree.display())?;
@@ -427,7 +429,10 @@ pub fn fix(
         )?;
         writeln!(out, "attach:   tmux attach -t {}", target.session_name)?;
         writeln!(out, "watch:    tm runs watch")?;
-        return Ok(FixOutcome::Dispatched { succeeded: true });
+        return Ok((
+            FixOutcome::Dispatched { succeeded: true },
+            Some(prepared.run_id),
+        ));
     }
 
     if dispatch == Dispatch::HeadlessForeground {
@@ -440,9 +445,12 @@ pub fn fix(
             deps.runner,
             out,
         )?;
-        return Ok(FixOutcome::Dispatched {
-            succeeded: !outcome.is_error,
-        });
+        return Ok((
+            FixOutcome::Dispatched {
+                succeeded: !outcome.is_error,
+            },
+            Some(prepared.run_id),
+        ));
     }
 
     // Detached: mirrors crate::cli::work::run's detached branch exactly,
@@ -485,7 +493,60 @@ pub fn fix(
     }
     writeln!(out, "watch:    tm runs watch")?;
 
-    Ok(FixOutcome::Dispatched { succeeded: true })
+    Ok((
+        FixOutcome::Dispatched { succeeded: true },
+        Some(prepared.run_id),
+    ))
+}
+
+/// Hosts `prepared`'s agent in `target`, a window of the ticket's session,
+/// the way every interactive review step launches: stamp the row's tmux
+/// session (so a killed session reaps it, issue #26), write the prompt
+/// file, open the window, and record the [`LaunchRecord`] hibernation
+/// resumes it from (issue #64).
+///
+/// [`LaunchRecord`]: crate::work::hibernate::LaunchRecord
+fn launch_in_ticket_session(
+    deps: &ReviewFixDeps<'_>,
+    paths: &RunLanePaths,
+    target: &ActionWindow,
+    prepared: &PreparedRun,
+) -> Result<(), ReviewCliError> {
+    deps.run_store
+        .update_tmux_session(prepared.run_id, &target.session_name)?;
+    let prompt_path = paths.state_dir.join(format!(
+        "{}-{}.prompt.md",
+        prepared.wt_name, prepared.timestamp
+    ));
+    launch_interactive_run(deps.tmux, target, prepared, &prompt_path, deps.runner)?;
+    crate::work::hibernate::record_launch(
+        deps.run_store,
+        prepared.run_id,
+        &crate::work::hibernate::LaunchRecord {
+            window: target.window_name.clone(),
+            resume: deps.runner.resume_spec(&prepared.invocation),
+        },
+    )?;
+    Ok(())
+}
+
+/// The window a ticket session's next `action` step opens in, from one
+/// tmux snapshot, letting finished steps' windows stay open beside it (see
+/// [`crate::work::hibernate::ended_launch_windows`]).
+fn resolve_review_window(
+    deps: &ReviewFixDeps<'_>,
+    ticket: &str,
+    action: &str,
+) -> Result<ActionWindow, ReviewCliError> {
+    let windows = deps.tmux.list_windows()?;
+    let slug = deps.backend_identity.session_slug();
+    let ended = crate::work::hibernate::ended_launch_windows(
+        deps.run_store,
+        &crate::work::naming::ticket_session_name(&slug, ticket),
+    )?;
+    Ok(resolve_action_window(
+        &windows, &ended, &slug, ticket, action,
+    )?)
 }
 
 /// How a `tm review auto` invocation ended.
@@ -521,6 +582,29 @@ pub fn detached_auto_review_argv(key: &str) -> Vec<String> {
     ]
 }
 
+/// Whether the `tm review auto` loop that created auto-review row `run` is
+/// still alive: the pid of the row's latest [`LOOP_PID_EVENT`], or for a
+/// row from before that event, a running row's own pid, which was the
+/// loop's. The same rule as the board's `review:` badge. An interactive
+/// row's status follows its agent, which outlives the loop in its window,
+/// so status alone says nothing about the loop (GitHub issue #150). A store
+/// error reads as not alive, so it never blocks a new loop.
+fn auto_review_loop_alive(store: &RunStore, run: &Run) -> bool {
+    let loop_pid = store.events_for_run(run.id).ok().and_then(|events| {
+        events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == LOOP_PID_EVENT)
+            .find_map(|event| event.detail.as_deref()?.trim().parse::<u32>().ok())
+    });
+    let pid = match loop_pid {
+        Some(pid) => Some(pid),
+        None if run.status == RunStatus::Running => run.pid,
+        None => None,
+    };
+    pid.is_some_and(crate::runs::pid::pid_alive)
+}
+
 /// The PR number at the end of a GitHub pull-request URL.
 fn pr_number_from_url(url: &str) -> Option<u64> {
     url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
@@ -529,12 +613,18 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 /// `tm review auto <KEY> [--foreground]` (GitHub issue #124): see
 /// `docs/plans/gh-124-auto-review.md`.
 ///
-/// Without `foreground`, refuses if an auto-review round for KEY is already
-/// running, then re-execs a detached `tm review auto <KEY> --foreground` in
+/// Without `foreground`, refuses if the loop behind KEY's newest
+/// auto-review round is still alive ([`auto_review_loop_alive`]), then
+/// re-execs a detached `tm review auto <KEY> --foreground` in
 /// the ticket's worktree, the same shape as `tm pr watch`. With it, runs
-/// [`run_loop`] here: each review round is a headless `auto-review` run on
-/// the ticket's lane worktree and branch, and each fix round is [`fix`]
-/// with [`Dispatch::HeadlessForeground`]. A round that needs a fix after the
+/// [`run_loop`] here: each review round is an interactive `auto-review` run
+/// on the ticket's lane worktree and branch, hosted in a `review` window of
+/// the ticket's session (`review-2` for round 2), and each fix round is
+/// [`fix`] with [`Dispatch::Interactive`], in a `fix` / `fix-N` window
+/// (GitHub issue #150). The loop waits for each step's signal file, at most
+/// `round_timeout_mins` each, and leaves the windows open. Every row it
+/// creates records the loop's pid as a [`LOOP_PID_EVENT`]. A round that
+/// needs a fix after the
 /// ticket already has `max_fix_rounds` `review-fix` runs (`[dispatch]`,
 /// see [`crate::work::fix_cap`]) ends the loop as capped instead. Under
 /// autopilot, each fix round first imports the PR's unresolved
@@ -573,7 +663,7 @@ pub fn auto(
             &run.ticket,
             Some(AUTO_REVIEW_KIND),
         )?;
-        if let Some(live) = live.filter(|r| r.status == RunStatus::Running) {
+        if let Some(live) = live.filter(|r| auto_review_loop_alive(deps.run_store, r)) {
             return Err(ReviewCliError::AutoReviewRunning {
                 ticket: run.ticket.clone(),
                 run_id: live.id,
@@ -618,7 +708,8 @@ pub fn auto(
         max_fix_rounds,
         out: RefCell::new(out),
     };
-    let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir)?;
+    let loop_id = format!("{}-{}", std::process::id(), deps.clock.now_unix_secs());
+    let outcome = run_loop(&ops, cfg, &template, &run.ticket, &git_dir, &loop_id)?;
     let out = ops.out.into_inner();
     writeln!(
         out,
@@ -712,11 +803,27 @@ impl CliAutoReviewOps<'_, '_> {
             event_run: Some(self.lane_run_id),
         }
     }
+
+    /// Records this loop's pid on `run_id`, a row it just created, for the
+    /// board's `review:` badge (see [`LOOP_PID_EVENT`]).
+    fn record_loop_pid(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError> {
+        self.deps
+            .run_store
+            .add_event(
+                run_id,
+                LOOP_PID_EVENT,
+                Some(&std::process::id().to_string()),
+            )
+            .map(|_| ())
+            .map_err(|e| AutoReviewError::step(step, e))
+    }
 }
 
 impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
     fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError> {
         let deps = self.deps;
+        // Admitted before anything else, so a round waiting for admission
+        // has neither a row nor a window.
         let admitted = deps
             .admission
             .admit(
@@ -730,6 +837,8 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
                 self.unattended(),
                 &mut std::io::sink(),
             )
+            .map_err(|e| AutoReviewError::step("review", e))?;
+        let target = resolve_review_window(deps, self.ticket, REVIEW_WINDOW_NAME)
             .map_err(|e| AutoReviewError::step("review", e))?;
         let prepared = prepare_existing_branch_run(
             &admitted,
@@ -747,48 +856,81 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
                 branch: self.branch,
                 prompt,
                 model: review_run_model(deps, self.lane),
-                pid: Some(std::process::id()),
-                mode: RunMode::Headless,
+                pid: None,
+                mode: RunMode::Interactive,
             },
             deps.runner,
         )
         .map_err(|e| AutoReviewError::step("review", e))?;
-        let mut out = self.out.borrow_mut();
-        writeln!(out, "auto-review round {round}: run {}", prepared.run_id)
+        self.record_loop_pid(prepared.run_id, "review")?;
+        launch_in_ticket_session(deps, self.paths, &target, &prepared)
             .map_err(|e| AutoReviewError::step("review", e))?;
-        let outcome = run_agent_and_finish(
-            deps.spawner,
-            deps.gh,
-            deps.run_store,
-            None,
-            &prepared,
-            deps.runner,
-            &mut **out,
+        writeln!(
+            self.out.borrow_mut(),
+            "auto-review round {round}: run {} in {}:{}",
+            prepared.run_id,
+            target.session_name,
+            target.window_name
         )
         .map_err(|e| AutoReviewError::step("review", e))?;
-        if outcome.is_error {
-            return Err(AutoReviewError::step(
-                "review",
-                format!("round {round}'s agent run {} failed", prepared.run_id),
-            ));
-        }
         Ok(prepared.run_id)
     }
 
-    fn fix(&self) -> Result<bool, AutoReviewError> {
+    fn fix(&self, _round: u32, completion: String) -> Result<Option<i64>, AutoReviewError> {
         let mut out = self.out.borrow_mut();
-        match fix(
+        let (_, run_id) = dispatch_fix(
             self.deps,
             self.paths,
             self.ticket,
-            Dispatch::HeadlessForeground,
+            Dispatch::Interactive,
             self.unattended(),
+            Some(&completion),
             &mut **out,
-        ) {
-            Ok(FixOutcome::Dispatched { succeeded }) => Ok(succeeded),
-            Ok(FixOutcome::NoComments) => Ok(true),
-            Err(err) => Err(AutoReviewError::step("fix", err)),
+        )
+        .map_err(|e| AutoReviewError::step("fix", e))?;
+        if let Some(run_id) = run_id {
+            self.record_loop_pid(run_id, "fix")?;
         }
+        Ok(run_id)
+    }
+
+    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
+        let run = self
+            .deps
+            .run_store
+            .run_by_id(run_id)
+            .map_err(|e| AutoReviewError::step("wait", e))?;
+        let Some(run) = run else {
+            return Ok(StepState::Gone);
+        };
+        match run.status {
+            RunStatus::Hibernated => return Ok(StepState::Hibernated),
+            RunStatus::Running | RunStatus::Queued => {}
+            _ => return Ok(StepState::Gone),
+        }
+        // `tm merge` kills the ticket's session along with every window in
+        // it; the loop has nothing left to wait on then.
+        let session_alive = match run.tmux_session.as_deref() {
+            Some(session) => self
+                .deps
+                .tmux
+                .has_session(session)
+                .map_err(|e| AutoReviewError::step("wait", e))?,
+            None => true,
+        };
+        Ok(if session_alive {
+            StepState::Running
+        } else {
+            StepState::Gone
+        })
+    }
+
+    fn mark_signalled(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError> {
+        self.record(run_id, SIGNAL_EVENT, step)
+    }
+
+    fn sleep(&self, secs: u64) {
+        self.deps.sleeper.sleep(secs);
     }
 
     fn publish(&self) -> Result<(), AutoReviewError> {
@@ -1140,6 +1282,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1197,6 +1340,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1243,6 +1387,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1291,6 +1436,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1340,6 +1486,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1414,6 +1561,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1504,6 +1652,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1594,6 +1743,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1645,6 +1795,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1756,6 +1907,7 @@ mod tests {
             runner: &ClaudeRunner,
             config,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         fix(
             &deps,
@@ -1826,6 +1978,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1872,6 +2025,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &crate::work::review_watch::FakeSleeper::default(),
         };
         let paths = paths(&tmp);
         let mut out = Vec::new();
@@ -1894,21 +2048,50 @@ mod tests {
 
     // --- tm review auto (GitHub issue #124) ---
 
-    /// A fake agent: writes `findings` to `findings_file` (round 1's), then
-    /// defers to a [`FakeProcessSpawner`] for the result JSON.
-    struct FindingsWritingSpawner {
-        inner: FakeProcessSpawner,
-        findings_file: PathBuf,
-        findings: &'static str,
+    /// The id a foreground loop gets in this process at
+    /// [`SignalSleeper`]'s starting time.
+    fn loop_id() -> String {
+        format!("{}-1787047200", std::process::id())
     }
 
-    impl ProcessSpawner for FindingsWritingSpawner {
-        fn spawn(
-            &self,
-            request: crate::work::runner::SpawnRequest<'_>,
-        ) -> Result<std::process::ExitStatus, crate::work::runner::SpawnError> {
-            std::fs::write(&self.findings_file, self.findings).unwrap();
-            self.inner.spawn(request)
+    /// A fake interactive agent's clock: each sleep of the loop's signal
+    /// poll writes the next scripted `(path, body)` signal file, as an agent
+    /// in its window would some time after launch (GitHub issue #150).
+    #[derive(Default)]
+    struct SignalSleeper {
+        signals: RefCell<Vec<(PathBuf, String)>>,
+        sleeps: RefCell<u32>,
+    }
+
+    impl SignalSleeper {
+        fn script(&self, signals: Vec<(PathBuf, &str)>) {
+            *self.signals.borrow_mut() = signals
+                .into_iter()
+                .map(|(path, body)| (path, body.to_string()))
+                .collect();
+        }
+    }
+
+    /// Time moves only with the loop's sleeps, ten seconds each.
+    impl Clock for SignalSleeper {
+        fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32) {
+            (2026, 8, 18, 10, 0, 0)
+        }
+
+        fn now_unix_secs(&self) -> i64 {
+            1_787_047_200 + 10 * i64::from(*self.sleeps.borrow())
+        }
+    }
+
+    impl Sleeper for SignalSleeper {
+        fn sleep(&self, _secs: u64) {
+            *self.sleeps.borrow_mut() += 1;
+            let mut signals = self.signals.borrow_mut();
+            if !signals.is_empty() {
+                let (path, body) = signals.remove(0);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
         }
     }
 
@@ -1921,6 +2104,7 @@ mod tests {
         tmux: FakeTmuxOps,
         current_exe: PathBuf,
         run_db_path: PathBuf,
+        sleeper: SignalSleeper,
     }
 
     fn auto_fakes(tmp: &TempDir) -> AutoFakes {
@@ -1933,6 +2117,7 @@ mod tests {
             tmux: FakeTmuxOps::new(),
             current_exe: PathBuf::from("/usr/local/bin/tm"),
             run_db_path: tmp.path().join("runs.db"),
+            sleeper: SignalSleeper::default(),
         }
     }
 
@@ -1956,6 +2141,7 @@ mod tests {
             runner: &ClaudeRunner,
             config: None,
             admission: AdmissionDeps::off(),
+            sleeper: &fakes.sleeper,
         }
     }
 
@@ -1999,8 +2185,103 @@ mod tests {
         assert!(spawner.recorded.lock().unwrap().is_empty());
     }
 
+    /// Starts an auto-review row for PROJ-1 whose loop pid is `loop_pid`.
+    fn seed_auto_review_row(run_store: &RunStore, worktree: &Path, loop_pid: u32) -> i64 {
+        let id = run_store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: Some("jowi-dev/proj-1-slug".to_string()),
+                pid: Some(std::process::id()),
+                kind: AUTO_REVIEW_KIND.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        run_store
+            .add_event(id, LOOP_PID_EVENT, Some(&loop_pid.to_string()))
+            .unwrap();
+        id
+    }
+
+    /// A pid with no process behind it: a child that has already exited.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
     #[test]
-    fn auto_refuses_a_second_loop_while_a_round_is_running() {
+    fn auto_refuses_a_second_loop_while_the_first_loop_is_alive() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let id = seed_auto_review_row(&run_store, &worktree, std::process::id());
+        // The step signalled and its agent exited, but the loop is between
+        // steps.
+        run_store
+            .finish_run(
+                id,
+                &crate::runs::FinishRun {
+                    status: RunStatus::Done,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let err = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ReviewCliError::AutoReviewRunning { run_id, .. } if run_id == id));
+        assert!(fakes.detach.recorded.lock().unwrap().is_empty());
+    }
+
+    /// GitHub issue #150: an interactive round's row stays `running` while
+    /// its agent idles in the window, so a loop that died leaves a running
+    /// row behind; that must not block a new loop.
+    #[test]
+    fn auto_starts_a_new_loop_over_a_running_round_whose_loop_died() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        seed_auto_review_row(&run_store, &worktree, dead_pid());
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, AutoOutcome::Detached { .. }));
+        assert_eq!(fakes.detach.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// A row from before [`LOOP_PID_EVENT`] carries the loop's pid itself.
+    #[test]
+    fn auto_refuses_a_second_loop_over_a_running_pre_event_round() {
         let (tmp, run_store, worktree) = setup();
         seed_lane_run(&run_store, &worktree);
         run_store
@@ -2010,7 +2291,7 @@ mod tests {
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
                 branch: Some("jowi-dev/proj-1-slug".to_string()),
-                pid: None,
+                pid: Some(std::process::id()),
                 kind: AUTO_REVIEW_KIND.to_string(),
                 log_path: None,
             })
@@ -2036,33 +2317,78 @@ mod tests {
         assert!(fakes.detach.recorded.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn auto_foreground_runs_a_clean_round_and_records_it() {
-        let (tmp, run_store, worktree) = setup();
-        seed_lane_run(&run_store, &worktree);
-        let fakes = auto_fakes(&tmp);
-        let git_dir = worktree.join(".git");
-        let findings_file = crate::work::auto_review::findings_path(&git_dir, 1);
-        let spawner = FindingsWritingSpawner {
-            inner: FakeProcessSpawner::success(canned_json()),
-            findings_file,
-            findings: r#"[{"path": "src/a.rs", "start_line": 2,
-                "severity": "LOW", "specialist": "pedantic", "body": "typo"}]"#,
-        };
-        let deps = auto_deps(&fakes, &run_store, &spawner);
-        let mut out = Vec::new();
+    const LOW_FINDING: &str = r#"[{"path": "src/a.rs", "start_line": 2,
+        "severity": "LOW", "specialist": "pedantic", "body": "typo"}]"#;
+    const MEDIUM_FINDING: &str = r#"[{"path": "src/a.rs", "start_line": 2,
+        "severity": "MEDIUM", "specialist": "state-flow", "body": "race"}]"#;
 
-        let outcome = auto(
-            &deps,
-            &paths(&tmp),
-            &AutoReviewConfig::default(),
+    fn run_auto(
+        deps: &ReviewFixDeps<'_>,
+        tmp: &TempDir,
+        cfg: &AutoReviewConfig,
+    ) -> Result<AutoOutcome, ReviewCliError> {
+        auto(
+            deps,
+            &paths(tmp),
+            cfg,
             crate::config::DEFAULT_MAX_FIX_ROUNDS,
             &[],
             "PROJ-1",
             true,
-            &mut out,
+            &mut Vec::new(),
         )
-        .unwrap();
+    }
+
+    /// The window name and pane command of every agent window `tmux`
+    /// opened, in order.
+    fn opened_windows(tmux: &FakeTmuxOps) -> Vec<(String, String)> {
+        tmux.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                crate::work::tmux::TmuxCall::NewSessionWithCommand {
+                    window_name,
+                    command,
+                    ..
+                }
+                | crate::work::tmux::TmuxCall::NewWindowWithCommand {
+                    window_name,
+                    command,
+                    ..
+                } => Some((window_name, command)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn live(name: &str) -> crate::work::tmux::TmuxWindow {
+        crate::work::tmux::TmuxWindow {
+            session: "tm-proj-proj-1".to_string(),
+            name: name.to_string(),
+            dead: false,
+        }
+    }
+
+    /// GitHub issue #150: a round runs as an interactive agent in a
+    /// `review` window of the ticket's session, and the loop advances once
+    /// the agent writes its findings file, with nobody attaching.
+    #[test]
+    fn auto_foreground_runs_a_clean_round_in_a_review_window_and_records_it() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let mut fakes = auto_fakes(&tmp);
+        fakes.tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let git_dir = worktree.join(".git");
+        fakes.sleeper.script(vec![(
+            crate::work::auto_review::findings_path(&git_dir, &loop_id(), 1),
+            LOW_FINDING,
+        )]);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            clock: &fakes.sleeper,
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+
+        let outcome = run_auto(&deps, &tmp, &AutoReviewConfig::default()).unwrap();
 
         assert_eq!(
             outcome,
@@ -2075,27 +2401,216 @@ mod tests {
             .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
             .unwrap()
             .unwrap();
+        assert_eq!(
+            round.status,
+            RunStatus::Running,
+            "the row stays in flight until the window's agent exits"
+        );
+        assert_eq!(round.pid, None, "the agent registers its own pid");
+        assert_eq!(round.tmux_session.as_deref(), Some("tm-proj-proj-1"));
         assert_eq!(round.worktree, worktree.to_string_lossy());
         assert_eq!(round.branch, Some("jowi-dev/proj-1-slug".to_string()));
         assert_eq!(round.agent.as_deref(), Some("claude"));
         assert_eq!(round.repo.as_deref(), Some("mylane"));
         let events = run_store.events_for_run(round.id).unwrap();
-        assert!(
+        let detail = |kind: &str| {
             events
                 .iter()
-                .any(|e| e.kind == "auto_review_round" && e.detail.as_deref() == Some("1/2 clean"))
+                .filter(|e| e.kind == kind)
+                .map(|e| e.detail.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(detail("auto_review_round"), vec!["1/2 clean"]);
+        assert_eq!(detail(SIGNAL_EVENT), vec!["review"]);
+        assert_eq!(detail(LOOP_PID_EVENT), vec![std::process::id().to_string()]);
+        assert_eq!(
+            crate::work::hibernate::launch_record(&run_store, round.id)
+                .unwrap()
+                .map(|record| record.window),
+            Some("review".to_string())
         );
-        let args = &spawner.inner.recorded.lock().unwrap()[0].args;
-        assert!(args.iter().any(|a| a.contains("thatch-code-review")));
+        let windows = opened_windows(&fakes.tmux);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].0, "review");
+        assert!(
+            spawner.recorded.lock().unwrap().is_empty(),
+            "nothing headless"
+        );
+        let prompt = std::fs::read_dir(&paths(&tmp).state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".prompt.md"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        assert!(prompt.contains("tm runs register --kind auto-review PROJ-1"));
+        assert!(prompt.contains("thatch-code-review"));
+        assert!(prompt.contains("## Completion signal"));
         let store = crate::work::comment_store::load(&git_dir).unwrap();
         assert_eq!(store[0]["text"], "[auto-review · pedantic · LOW] typo");
+    }
+
+    /// A round needing a fix opens a `fix` window, and round 2 opens
+    /// `review-2` beside the still-open round-1 windows.
+    #[test]
+    fn auto_foreground_fix_round_opens_fix_then_review_2_beside_the_finished_windows() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let mut fakes = auto_fakes(&tmp);
+        fakes.tmux = FakeTmuxOps::new()
+            .with_has_session(Ok(true))
+            .with_list_windows_sequence(vec![
+                Ok(vec![]),
+                Ok(vec![live("review"), live("shell")]),
+                Ok(vec![live("review"), live("shell"), live("fix")]),
+            ]);
+        let git_dir = worktree.join(".git");
+        fakes.sleeper.script(vec![
+            (
+                crate::work::auto_review::findings_path(&git_dir, &loop_id(), 1),
+                MEDIUM_FINDING,
+            ),
+            (
+                crate::work::auto_review::fix_marker_path(&git_dir, &loop_id(), 1),
+                r#"{"succeeded": true}"#,
+            ),
+            (
+                crate::work::auto_review::findings_path(&git_dir, &loop_id(), 2),
+                "[]",
+            ),
+        ]);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            clock: &fakes.sleeper,
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+
+        let outcome = run_auto(&deps, &tmp, &AutoReviewConfig::default()).unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoOutcome::Finished(LoopOutcome {
+                rounds: 2,
+                verdict: crate::work::auto_review::RoundVerdict::Clean,
+            })
+        );
+        let windows = opened_windows(&fakes.tmux);
+        let names: Vec<&str> = windows.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["review", "fix", "review-2"]);
+        let fix_run = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+            .unwrap()
+            .unwrap();
         assert!(
             run_store
-                .latest_run_for_ticket_kind(None, "PROJ-1", Some("review-fix"))
+                .events_for_run(fix_run.id)
                 .unwrap()
-                .is_none(),
-            "a LOW finding never triggers a fix"
+                .iter()
+                .any(|e| e.kind == LOOP_PID_EVENT)
         );
+        let fix_prompt = std::fs::read_dir(&paths(&tmp).state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().contains("review-fix"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap();
+        assert!(
+            fix_prompt.contains(&format!("fix-{}-1.done", loop_id())),
+            "{fix_prompt}"
+        );
+        for run in run_store.all_runs().unwrap() {
+            if run.kind != "lane" {
+                assert_eq!(run.status, RunStatus::Running, "run {}", run.id);
+                assert!(
+                    run_store
+                        .events_for_run(run.id)
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.kind == SIGNAL_EVENT),
+                    "run {} has no signal event",
+                    run.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_foreground_round_that_never_signals_is_flagged_for_review_and_left_open() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let mut fakes = auto_fakes(&tmp);
+        fakes.tmux = FakeTmuxOps::new().with_has_session(Ok(true));
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            clock: &fakes.sleeper,
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+        let cfg = AutoReviewConfig {
+            round_timeout_mins: 1,
+            ..AutoReviewConfig::default()
+        };
+
+        let outcome = run_auto(&deps, &tmp, &cfg).unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoOutcome::Finished(LoopOutcome {
+                rounds: 1,
+                verdict: crate::work::auto_review::RoundVerdict::Stuck,
+            })
+        );
+        let round = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            round.status,
+            RunStatus::Running,
+            "the agent may still be working: the flag waits for it to exit"
+        );
+        let kinds: Vec<String> = run_store
+            .events_for_run(round.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&crate::runs::REVIEW_FLAG_EVENT.to_string()));
+        assert!(!kinds.contains(&SIGNAL_EVENT.to_string()));
+        assert_eq!(*fakes.sleeper.sleeps.borrow(), 6);
+        assert!(
+            !fakes
+                .tmux
+                .calls()
+                .iter()
+                .any(|call| matches!(call, crate::work::tmux::TmuxCall::KillWindow { .. })),
+            "the window is left for the user"
+        );
+    }
+
+    #[test]
+    fn auto_foreground_stops_without_flagging_once_the_ticket_session_is_gone() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = ReviewFixDeps {
+            clock: &fakes.sleeper,
+            ..auto_deps(&fakes, &run_store, &spawner)
+        };
+
+        let outcome = run_auto(&deps, &tmp, &AutoReviewConfig::default()).unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoOutcome::Finished(LoopOutcome {
+                rounds: 1,
+                verdict: crate::work::auto_review::RoundVerdict::Stopped,
+            })
+        );
+        let round = run_store
+            .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(round.status, RunStatus::Running, "not flagged");
     }
 
     #[test]
@@ -2201,6 +2716,10 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["admission_wait", "admission_timeout"]);
         assert!(
+            opened_windows(&fakes.tmux).is_empty(),
+            "no window opens before admission"
+        );
+        assert!(
             run_store
                 .latest_run_for_ticket_kind(None, "PROJ-1", Some(AUTO_REVIEW_KIND))
                 .unwrap()
@@ -2208,33 +2727,6 @@ mod tests {
             "a round that never started leaves no row"
         );
         assert!(spawner.recorded.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn auto_foreground_errors_when_the_agent_writes_no_findings() {
-        let (tmp, run_store, worktree) = setup();
-        seed_lane_run(&run_store, &worktree);
-        let fakes = auto_fakes(&tmp);
-        let spawner = FakeProcessSpawner::success(canned_json());
-        let deps = auto_deps(&fakes, &run_store, &spawner);
-        let mut out = Vec::new();
-
-        let err = auto(
-            &deps,
-            &paths(&tmp),
-            &AutoReviewConfig::default(),
-            crate::config::DEFAULT_MAX_FIX_ROUNDS,
-            &[],
-            "PROJ-1",
-            true,
-            &mut out,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            ReviewCliError::AutoReview(AutoReviewError::Findings { .. })
-        ));
     }
 
     #[test]

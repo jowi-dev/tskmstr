@@ -772,6 +772,13 @@ pub struct RawAutoReviewConfig {
     /// Whether a finished `tm pr watch` launches `tm review auto` on its
     /// own. Defaults to `false`.
     pub auto: Option<bool>,
+    /// Minutes the loop waits for one review round's findings file, or one
+    /// fix pass's marker file, before it flags the step's run for review and
+    /// stops (GitHub issue #150). Applies to each round and each fix pass
+    /// separately. `0` means no timeout, like `idle_hibernate_mins = 0`: the
+    /// loop then waits until the step signals, its agent is hibernated, or
+    /// its row ends. Defaults to 60.
+    pub round_timeout_mins: Option<u64>,
 }
 
 /// Raw, partially-specified `[work.lanes.<name>]` subsection as parsed
@@ -1447,6 +1454,8 @@ pub struct AutoReviewConfig {
     pub publish: bool,
     /// See [`RawAutoReviewConfig::auto`]. Defaults to `false`.
     pub auto: bool,
+    /// See [`RawAutoReviewConfig::round_timeout_mins`]. Defaults to 60.
+    pub round_timeout_mins: u64,
 }
 
 impl Default for AutoReviewConfig {
@@ -1458,6 +1467,7 @@ impl Default for AutoReviewConfig {
             max_review_rounds: 2,
             publish: false,
             auto: false,
+            round_timeout_mins: 60,
         }
     }
 }
@@ -2826,6 +2836,10 @@ fn merge_auto_review(
             .unwrap_or(defaults.max_review_rounds),
         publish: repo.publish.or(global.publish).unwrap_or(defaults.publish),
         auto: repo.auto.or(global.auto).unwrap_or(defaults.auto),
+        round_timeout_mins: repo
+            .round_timeout_mins
+            .or(global.round_timeout_mins)
+            .unwrap_or(defaults.round_timeout_mins),
     })
 }
 
@@ -5074,6 +5088,7 @@ mod tests {
         assert_eq!(auto.max_review_rounds, 2);
         assert!(!auto.publish);
         assert!(!auto.auto);
+        assert_eq!(auto.round_timeout_mins, 60);
         assert_eq!(auto.prompt, None);
         assert_eq!(auto.prompt_file, None);
     }
@@ -5088,11 +5103,13 @@ mod tests {
             max_review_rounds = 3
             publish = true
             auto = true
+            round_timeout_mins = 15
             "#,
         )
         .expect("should load");
 
         let auto = &cfg.work.auto_review;
+        assert_eq!(auto.round_timeout_mins, 15);
         assert_eq!(auto.prompt.as_deref(), Some("review {key}"));
         assert_eq!(auto.fix_threshold, Severity::High);
         assert_eq!(auto.max_review_rounds, 3);

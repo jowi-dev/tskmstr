@@ -589,9 +589,13 @@ pub struct AutoReviewBadge {
 /// [`AutoReviewBadge`]. `round` is the latest `auto_review_round` event
 /// detail (`"<round>/<max> <verdict>"`, see
 /// [`crate::work::auto_review::ROUND_EVENT`]); `loop_alive` is whether the
-/// run's recorded pid (the round loop's) is still alive. Rules, in order:
+/// round loop's pid is still alive (see
+/// [`crate::work::auto_review::LOOP_PID_EVENT`]). Rules, in order:
 ///
-/// 1. [`RunStatus::Running`] -> [`AutoReviewIndicator::Reviewing`].
+/// 1. [`RunStatus::Running`] with a live loop ->
+///    [`AutoReviewIndicator::Reviewing`]. An interactive round's row stays
+///    running while its window's agent lives, even after the loop died
+///    (GitHub issue #150), so a dead loop falls through.
 /// 2. Verdict `clean` -> [`AutoReviewIndicator::Clean`].
 /// 3. No verdict yet, or `fix`, with a live loop ->
 ///    [`AutoReviewIndicator::Reviewing`]: the fix pass runs after the round
@@ -610,7 +614,7 @@ pub fn auto_review_indicator(
         None => (None, round),
     };
     let indicator = match (status, verdict) {
-        (RunStatus::Running, _) => AutoReviewIndicator::Reviewing,
+        (RunStatus::Running, _) if loop_alive => AutoReviewIndicator::Reviewing,
         (_, Some("clean")) => AutoReviewIndicator::Clean,
         (_, None | Some("fix")) if loop_alive => AutoReviewIndicator::Reviewing,
         _ => AutoReviewIndicator::NeedsYou,
@@ -7577,14 +7581,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_indicator_running_is_reviewing() {
+    fn auto_review_indicator_running_with_a_live_loop_is_reviewing() {
         assert_eq!(
-            auto_review_indicator(RunStatus::Running, Some("1/3 fix"), false),
+            auto_review_indicator(RunStatus::Running, Some("1/3 fix"), true),
             review_badge(AutoReviewIndicator::Reviewing, Some("1/3"))
         );
         assert_eq!(
-            auto_review_indicator(RunStatus::Running, None, false),
+            auto_review_indicator(RunStatus::Running, None, true),
             review_badge(AutoReviewIndicator::Reviewing, None)
+        );
+    }
+
+    /// GitHub issue #150: an interactive round's row stays running while
+    /// its window's agent is alive, so a running row whose loop died is no
+    /// longer being reviewed.
+    #[test]
+    fn auto_review_indicator_running_with_a_dead_loop_needs_you() {
+        assert_eq!(
+            auto_review_indicator(RunStatus::Running, None, false),
+            review_badge(AutoReviewIndicator::NeedsYou, None)
         );
     }
 

@@ -440,7 +440,22 @@ impl RunStatus {
             RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted
         )
     }
+
+    /// Whether the run has ended: [`RunStatus::is_terminal`], or set aside
+    /// for a human as [`RunStatus::Blocked`] or [`RunStatus::Review`]. Only
+    /// `queued`, `running` and `hibernated` runs are still in flight. See
+    /// [`ENDED_STATUSES_SQL`] for the same set in SQL.
+    pub fn has_ended(self) -> bool {
+        self.is_terminal() || matches!(self, RunStatus::Blocked | RunStatus::Review)
+    }
 }
+
+/// `run_events.kind` of the event [`RunStore::flag_for_review`] records on
+/// a run still in flight, applied when the run ends.
+pub const REVIEW_FLAG_EVENT: &str = "review_flag";
+
+/// [`RunStatus::has_ended`]'s statuses, as an SQL list for `status IN (...)`.
+const ENDED_STATUSES_SQL: &str = "('blocked', 'review', 'done', 'failed', 'interrupted')";
 
 /// Parameters for starting a new run.
 #[derive(Debug, Clone)]
@@ -732,8 +747,13 @@ pub struct RoundRun {
     pub ticket: String,
     /// Current status of the newest run.
     pub status: RunStatus,
-    /// PID recorded for the run (the round loop's), if any.
+    /// PID recorded for the run: the round loop's for a headless round, the
+    /// agent's for an interactive one.
     pub pid: Option<u32>,
+    /// The round loop's pid, from the run's latest `auto_review_loop_pid`
+    /// event, or `None` for a run from before that event (GitHub issue
+    /// #150).
+    pub loop_pid: Option<u32>,
     /// Detail of the run's latest `auto_review_round` event
     /// (`"<round>/<max> <verdict>"`), or `None` before its first round ends.
     pub round: Option<String>,
@@ -1925,22 +1945,108 @@ impl RunStore {
         Ok(())
     }
 
-    /// Mark run `run_id` as [`RunStatus::Review`], leaving `ended_at` as it
-    /// is: `tm review auto` (GitHub issue #124) flags a finished review
-    /// round this way when it hits its round cap, so the overview shows the
+    /// Finishes run `run_id` with `outcome`, except that a run that has
+    /// already ended ([`RunStatus::has_ended`]) keeps its status and its
+    /// first `ended_at`, and a run [`RunStore::flag_for_review`] flagged
+    /// while it was in flight ends as `review`. One `UPDATE`, so a status another writer sets
+    /// between a read and the finish is never overwritten. Returns the
+    /// status the row ends with. `tm runs finish --keep-status` (the
+    /// SessionEnd hooks, GitHub issue #150).
+    ///
+    /// # Errors
+    ///
+    /// [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn finish_keeping_status(
+        &self,
+        run_id: i64,
+        outcome: &FinishRun,
+    ) -> Result<RunStatus, RunStoreError> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE runs SET
+                        status = CASE
+                            WHEN status IN {ENDED_STATUSES_SQL} THEN status
+                            WHEN EXISTS (
+                                SELECT 1 FROM run_events e
+                                 WHERE e.run_id = runs.id AND e.kind = '{REVIEW_FLAG_EVENT}'
+                            ) THEN 'review'
+                            ELSE ?1
+                        END,
+                        ended_at = COALESCE(ended_at, {NOW_SQL}),
+                        exit_code = COALESCE(?2, exit_code),
+                        session_id = COALESCE(?3, session_id),
+                        cost_usd = COALESCE(?4, cost_usd),
+                        num_turns = COALESCE(?5, num_turns),
+                        blocker = COALESCE(?6, blocker),
+                        pr_url = COALESCE(?7, pr_url),
+                        transcript = COALESCE(?8, transcript),
+                        model_usage = COALESCE(?9, model_usage),
+                        findings_count = COALESCE(?10, findings_count)
+                     WHERE id = ?11
+                     RETURNING status"
+                ),
+                params![
+                    outcome.status.as_str(),
+                    outcome.exit_code,
+                    outcome.session_id,
+                    outcome.cost_usd,
+                    outcome.num_turns,
+                    outcome.blocker,
+                    outcome.pr_url,
+                    outcome.transcript,
+                    outcome.model_usage,
+                    outcome.findings_count,
+                    run_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = status.ok_or(RunStoreError::RunNotFound(run_id))?;
+        Ok(RunStatus::parse(&status).unwrap_or(RunStatus::Interrupted))
+    }
+
+    /// Flags run `run_id` for a human as [`RunStatus::Review`]: `tm review
+    /// auto` (GitHub issue #124) flags a round that hit its cap, a failed
+    /// fix pass, or a step that never signalled, so the overview shows the
     /// ticket as needing a human.
+    ///
+    /// A run that has ended moves to `review` now, keeping its `ended_at`.
+    /// A run still in flight (`queued`, `running`, `hibernated`) keeps its
+    /// status, so the idle sweep and admission still see its live agent
+    /// (GitHub issue #150): the flag is recorded as a [`REVIEW_FLAG_EVENT`]
+    /// instead, and [`RunStore::finish_keeping_status`] ends the run as
+    /// `review` when its agent exits. Both in one transaction, so a run
+    /// ending in between is still flagged.
     ///
     /// # Errors
     ///
     /// [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
     pub fn flag_for_review(&self, run_id: i64) -> Result<(), RunStoreError> {
-        let changes = self.conn.execute(
-            "UPDATE runs SET status = ?1 WHERE id = ?2",
-            params![RunStatus::Review.as_str(), run_id],
-        )?;
-        if changes == 0 {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
             return Err(RunStoreError::RunNotFound(run_id));
         }
+        tx.execute(
+            &format!(
+                "INSERT INTO run_events (run_id, at, kind, detail) VALUES (?1, {NOW_SQL}, ?2, NULL)"
+            ),
+            params![run_id, REVIEW_FLAG_EVENT],
+        )?;
+        tx.execute(
+            "UPDATE runs SET status = ?1
+              WHERE id = ?2 AND status NOT IN ('queued', 'running', 'hibernated')",
+            params![RunStatus::Review.as_str(), run_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2412,8 +2518,9 @@ impl RunStore {
     }
 
     /// The newest run of `kind` per ticket, with the detail of its latest
-    /// `auto_review_round` event, for the board's `review:` badge (GitHub
-    /// issue #153). `scope` filters like [`RunStore::list_runs_filtered`].
+    /// `auto_review_round` event and the pid of its latest
+    /// `auto_review_loop_pid` event, for the board's `review:` badge (GitHub
+    /// issues #153, #150). `scope` filters like [`RunStore::list_runs_filtered`].
     ///
     /// "Newest" is strictly `started_at DESC, id DESC`: unlike
     /// [`RunStore::list_runs_filtered`], status never affects the order, so
@@ -2429,7 +2536,10 @@ impl RunStore {
                 r.pid,
                 (SELECT e.detail FROM run_events e
                     WHERE e.run_id = r.id AND e.kind = 'auto_review_round'
-                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS round
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS round,
+                (SELECT e.detail FROM run_events e
+                    WHERE e.run_id = r.id AND e.kind = 'auto_review_loop_pid'
+                    ORDER BY e.at DESC, e.id DESC LIMIT 1) AS loop_pid
              FROM runs r
              WHERE r.kind = ?1
                 AND (?2 IS NULL OR r.scope = ?2 OR r.scope = '')
@@ -2448,10 +2558,12 @@ impl RunStore {
             let status_str: String = row.get(1)?;
             // Same forward-compat fallback as list_runs_filtered.
             let status = RunStatus::parse(&status_str).unwrap_or(RunStatus::Interrupted);
+            let loop_pid: Option<String> = row.get(4)?;
             Ok(RoundRun {
                 ticket: row.get(0)?,
                 status,
                 pid: row.get(2)?,
+                loop_pid: loop_pid.and_then(|pid| pid.trim().parse().ok()),
                 round: row.get(3)?,
             })
         })?;
@@ -4900,6 +5012,52 @@ mod tests {
     }
 
     #[test]
+    fn finish_keeping_status_keeps_every_ended_status_and_finishes_the_rest() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let done = FinishRun {
+            status: RunStatus::Done,
+            session_id: Some("sess".to_string()),
+            ..FinishRun::default()
+        };
+        for status in [
+            RunStatus::Blocked,
+            RunStatus::Review,
+            RunStatus::Done,
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+        ] {
+            assert!(status.has_ended(), "{status:?}");
+            let id = store.start_run(&start_params("PROJ-1")).unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE runs SET status = ?1 WHERE id = ?2",
+                    params![status.as_str(), id],
+                )
+                .unwrap();
+
+            assert_eq!(store.finish_keeping_status(id, &done).unwrap(), status);
+            let run = store.run_by_id(id).unwrap().unwrap();
+            assert_eq!(run.status, status);
+            assert_eq!(run.session_id.as_deref(), Some("sess"));
+            assert!(run.ended_at.is_some());
+        }
+        for status in [RunStatus::Queued, RunStatus::Running, RunStatus::Hibernated] {
+            assert!(!status.has_ended(), "{status:?}");
+        }
+        let running = store.start_run(&start_params("PROJ-2")).unwrap();
+        assert_eq!(
+            store.finish_keeping_status(running, &done).unwrap(),
+            RunStatus::Done
+        );
+        assert!(matches!(
+            store.finish_keeping_status(999, &done),
+            Err(RunStoreError::RunNotFound(999))
+        ));
+    }
+
+    #[test]
     fn finish_run_from_supervisor_unknown_id_returns_run_not_found() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
@@ -4985,6 +5143,34 @@ mod tests {
         let run = store.run_by_id(id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Review);
         assert_eq!(run.ended_at, ended_at);
+    }
+
+    /// GitHub issue #150: flagging an interactive step whose agent is still
+    /// in its window must leave the row where the idle sweep and admission
+    /// see it, and apply when the agent exits.
+    #[test]
+    fn flag_for_review_defers_on_a_run_in_flight_until_it_finishes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let running = store.start_run(&start_params("PROJ-1")).unwrap();
+        let hibernated = store.start_run(&start_params("PROJ-2")).unwrap();
+        store.hibernate_run(hibernated).unwrap();
+
+        store.flag_for_review(running).unwrap();
+        store.flag_for_review(hibernated).unwrap();
+
+        let status = |id| store.run_by_id(id).unwrap().unwrap().status;
+        assert_eq!(status(running), RunStatus::Running);
+        assert_eq!(status(hibernated), RunStatus::Hibernated);
+        let done = FinishRun {
+            status: RunStatus::Done,
+            ..FinishRun::default()
+        };
+        assert_eq!(
+            store.finish_keeping_status(running, &done).unwrap(),
+            RunStatus::Review
+        );
+        assert_eq!(status(running), RunStatus::Review);
     }
 
     #[test]
@@ -9481,7 +9667,10 @@ mod tests {
         store
             .add_event(newer, "auto_review_round", Some("1/3 clean"))
             .unwrap();
-        store.start_run(&auto_review("GH-2", "me/proj")).unwrap();
+        let interactive = store.start_run(&auto_review("GH-2", "me/proj")).unwrap();
+        store
+            .add_event(interactive, "auto_review_loop_pid", Some("4242"))
+            .unwrap();
         store.start_run(&auto_review("GH-3", "other/repo")).unwrap();
         store
             .start_run(&StartRun {
@@ -9502,12 +9691,14 @@ mod tests {
                     ticket: "GH-1".to_string(),
                     status: RunStatus::Running,
                     pid: Some(42),
+                    loop_pid: None,
                     round: Some("1/3 clean".to_string()),
                 },
                 RoundRun {
                     ticket: "GH-2".to_string(),
                     status: RunStatus::Running,
                     pid: Some(42),
+                    loop_pid: Some(4242),
                     round: None,
                 },
             ],

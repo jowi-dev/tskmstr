@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(
             calls,
             vec![
-                "runs finish 7 --status done".to_string(),
+                "runs finish 7 --status done --keep-status".to_string(),
                 "runs finish 7 --status done --if-running --if-kind create".to_string(),
             ]
         );
