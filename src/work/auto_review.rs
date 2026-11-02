@@ -281,30 +281,100 @@ pub fn render_prompt(
         + &review_completion_section(findings_file)
 }
 
+/// Seconds between two checks for a step's signal file.
+pub const SIGNAL_POLL_SECS: u64 = 10;
+
+/// A step's run row, as the loop sees it while waiting for the step's
+/// signal file (GitHub issue #150).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    /// Still running: keep waiting.
+    Running,
+    /// The idle sweep hibernated the agent before it signalled: the step is
+    /// stuck.
+    Hibernated,
+    /// Something other than the loop ended the row (`tm merge` finishing
+    /// the ticket's runs, the user exiting the session), or the ticket's
+    /// session no longer exists: the loop has nothing left to drive.
+    Gone,
+}
+
 /// Everything [`run_loop`] needs done outside the comment store.
+///
+/// A review round and a fix pass are each launched, not run to completion:
+/// [`run_loop`] then polls the step's signal file (the round's findings
+/// file, the fix pass's [`fix_marker_path`] marker), checking
+/// [`AutoReviewOps::step_state`] between polls.
 pub trait AutoReviewOps {
-    /// Runs one review round's agent with `prompt`, to completion, and
-    /// returns its run row id. The agent writes its findings to the
-    /// `findings_file` the prompt names.
+    /// Launches one review round's agent with `prompt` and returns its run
+    /// row id. The agent writes its findings to the `findings_file` the
+    /// prompt names.
     fn review(&self, round: u32, prompt: String) -> Result<i64, AutoReviewError>;
-    /// Runs `tm review fix` over the current store, to completion. `false`
-    /// when the fix run finished but failed.
-    fn fix(&self) -> Result<bool, AutoReviewError>;
+    /// Launches `tm review fix` over the current store for round `round`,
+    /// with `completion` ([`fix_completion_section`]) appended to its
+    /// prompt, and returns its run row id. `None` when the store had nothing
+    /// to fix, so there is nothing to wait for.
+    fn fix(&self, round: u32, completion: String) -> Result<Option<i64>, AutoReviewError>;
+    /// The state of a launched step's run row `run_id`.
+    fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError>;
+    /// Marks run `run_id` done: its step signalled success.
+    fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError>;
+    /// Waits `secs` seconds between two signal polls.
+    fn sleep(&self, secs: u64);
     /// Posts the store with `vdiff --publish-comments <pr>`.
     fn publish(&self) -> Result<(), AutoReviewError>;
     /// Records an event on run `run_id`.
     fn record(&self, run_id: i64, kind: &str, detail: &str) -> Result<(), AutoReviewError>;
-    /// Flags run `run_id` for a human: the loop hit its cap.
+    /// Flags run `run_id` for a human: the loop hit its cap, a fix pass
+    /// failed, or a step never signalled.
     fn flag(&self, run_id: i64) -> Result<(), AutoReviewError>;
     /// Whether the ticket has used up `[dispatch] max_fix_rounds`, the fix
     /// cap shared by every automatic trigger (GitHub issue #120).
     fn fix_cap_reached(&self) -> Result<bool, AutoReviewError>;
-    /// Seconds since the Unix epoch, for comments' `created_at`.
+    /// Seconds since the Unix epoch, for comments' `created_at` and the
+    /// signal timeout.
     fn now_unix_secs(&self) -> i64;
     /// Imports the PR's not-yet-imported, unresolved review-bot threads into
     /// the comment store, so the fix about to run addresses them too
     /// (GitHub issue #145). Returns how many were imported.
     fn import_bot_comments(&self) -> Result<usize, AutoReviewError>;
+}
+
+/// How waiting on one step's signal ended.
+enum Signal<T> {
+    /// The signal file was read.
+    Received(T),
+    /// No signal before the timeout, or the agent was hibernated first.
+    Stuck,
+    /// See [`StepState::Gone`].
+    Gone,
+}
+
+/// Polls `read` every [`SIGNAL_POLL_SECS`] until it yields the step's
+/// signal, the step's row stops running, or `timeout_secs` pass. The signal
+/// is read first on every poll, so a step that signalled before being
+/// hibernated or ended still counts as done.
+fn wait_for_signal<T>(
+    ops: &dyn AutoReviewOps,
+    run_id: i64,
+    timeout_secs: i64,
+    read: impl Fn() -> Option<T>,
+) -> Result<Signal<T>, AutoReviewError> {
+    let start = ops.now_unix_secs();
+    loop {
+        if let Some(signal) = read() {
+            return Ok(Signal::Received(signal));
+        }
+        match ops.step_state(run_id)? {
+            StepState::Running => {}
+            StepState::Hibernated => return Ok(Signal::Stuck),
+            StepState::Gone => return Ok(Signal::Gone),
+        }
+        if ops.now_unix_secs() - start >= timeout_secs {
+            return Ok(Signal::Stuck);
+        }
+        ops.sleep(SIGNAL_POLL_SECS);
+    }
 }
 
 /// How one round ended, recorded as the tail of its [`ROUND_EVENT`]
@@ -319,6 +389,13 @@ pub enum RoundVerdict {
     Capped,
     /// The fix round failed; the loop stopped.
     FixFailed,
+    /// The round or its fix pass never signalled before
+    /// `round_timeout_mins`, or was hibernated first; its run is flagged
+    /// and the loop stopped (GitHub issue #150).
+    Stuck,
+    /// The step's row was ended by something else, or the ticket's session
+    /// went away (`tm merge`); the loop stopped without flagging.
+    Stopped,
 }
 
 impl RoundVerdict {
@@ -329,6 +406,8 @@ impl RoundVerdict {
             RoundVerdict::Fix => "fix",
             RoundVerdict::Capped => "capped",
             RoundVerdict::FixFailed => "fix-failed",
+            RoundVerdict::Stuck => "stuck",
+            RoundVerdict::Stopped => "stopped",
         }
     }
 }
@@ -346,6 +425,12 @@ pub struct LoopOutcome {
 /// `cfg.max_review_rounds` is reached. See the plan doc for the round
 /// sequence; `git_dir` is the worktree's resolved git directory.
 ///
+/// Each round and each fix pass is launched and then waited on through its
+/// signal file, for at most `cfg.round_timeout_mins` each. A step that
+/// signals is marked done; one that times out or is hibernated first is
+/// flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose row is
+/// ended by something else ends it as [`RoundVerdict::Stopped`].
+///
 /// # Errors
 ///
 /// Any step's error stops the loop and is returned as is.
@@ -357,19 +442,41 @@ pub fn run_loop(
     git_dir: &Path,
 ) -> Result<LoopOutcome, AutoReviewError> {
     let max = cfg.max_review_rounds.max(1);
+    let timeout_secs = i64::try_from(cfg.round_timeout_mins.saturating_mul(60)).unwrap_or(i64::MAX);
     let mut archive: Option<PathBuf> = None;
     for round in 1..=max {
         let findings_file = findings_path(git_dir, round);
+        let marker = fix_marker_path(git_dir, round);
         if let Some(dir) = findings_file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| AutoReviewError::step("review", e))?;
         }
         // A stale file from an earlier loop must never stand in for this
         // round's output.
         let _ = std::fs::remove_file(&findings_file);
+        let _ = std::fs::remove_file(&marker);
 
         let prompt = render_prompt(template, key, round, &findings_file, archive.as_deref());
         let run_id = ops.review(round, prompt)?;
-        let findings = read_findings(&findings_file)?;
+        let stopped = |verdict: RoundVerdict| -> Result<LoopOutcome, AutoReviewError> {
+            ops.record(run_id, ROUND_EVENT, &round_detail(round, max, verdict))?;
+            Ok(LoopOutcome {
+                rounds: round,
+                verdict,
+            })
+        };
+        let findings = match wait_for_signal(ops, run_id, timeout_secs, || {
+            try_read_findings(&findings_file)
+        })? {
+            Signal::Received(findings) => {
+                ops.finish_step(run_id)?;
+                findings
+            }
+            Signal::Stuck => {
+                ops.flag(run_id)?;
+                return stopped(RoundVerdict::Stuck);
+            }
+            Signal::Gone => return stopped(RoundVerdict::Stopped),
+        };
         let comments: Vec<NewComment> = findings.iter().map(Finding::to_comment).collect();
         if !comments.is_empty() {
             let created_at = comment_store::iso8601_utc(ops.now_unix_secs());
@@ -390,29 +497,40 @@ pub fn run_loop(
             if verdict == RoundVerdict::Capped {
                 ops.flag(run_id)?;
             }
-            ops.record(run_id, ROUND_EVENT, &round_detail(round, max, verdict))?;
-            return Ok(LoopOutcome {
-                rounds: round,
-                verdict,
-            });
+            return stopped(verdict);
         }
 
         // Review bots' comments ride along with a fix but never start one:
         // only this round's own findings decided `verdict` above.
         ops.import_bot_comments()?;
-        let fixed = ops.fix()?;
-        let verdict = if fixed {
-            RoundVerdict::Fix
-        } else {
-            RoundVerdict::FixFailed
+        let fixed = match ops.fix(round, fix_completion_section(&marker))? {
+            None => true,
+            Some(fix_run) => {
+                match wait_for_signal(ops, fix_run, timeout_secs, || read_fix_marker(&marker))? {
+                    Signal::Received(true) => {
+                        ops.finish_step(fix_run)?;
+                        true
+                    }
+                    Signal::Received(false) => {
+                        ops.flag(fix_run)?;
+                        false
+                    }
+                    Signal::Stuck => {
+                        ops.flag(fix_run)?;
+                        return stopped(RoundVerdict::Stuck);
+                    }
+                    Signal::Gone => return stopped(RoundVerdict::Stopped),
+                }
+            }
         };
-        ops.record(run_id, ROUND_EVENT, &round_detail(round, max, verdict))?;
         if !fixed {
-            return Ok(LoopOutcome {
-                rounds: round,
-                verdict,
-            });
+            return stopped(RoundVerdict::FixFailed);
         }
+        ops.record(
+            run_id,
+            ROUND_EVENT,
+            &round_detail(round, max, RoundVerdict::Fix),
+        )?;
         archive = comment_store::archive(git_dir, round)?;
     }
     unreachable!("the last round always returns")
@@ -429,7 +547,10 @@ mod tests {
     use tempfile::TempDir;
 
     /// Scripted ops: round `n`'s agent "writes" `findings[n - 1]` to the
-    /// findings file the prompt names, and every call is logged.
+    /// findings file the prompt names, each fix pass writes its marker from
+    /// `fix_results` (`true` once they run out), and every call is logged.
+    /// A launched step writes its signal after `signal_after` sleeps, or
+    /// never with `None`.
     struct FakeOps {
         git_dir: PathBuf,
         findings: Vec<&'static str>,
@@ -444,6 +565,20 @@ mod tests {
         /// `log`'s length at each `import_bot_comments` call, so a test can
         /// place the import among the logged steps without changing them.
         import_at: RefCell<Vec<usize>>,
+        signal_after: Option<u32>,
+        /// Whether each signal file is first written half-way, as an agent
+        /// that skipped the rename would leave it.
+        half_written: bool,
+        pending: RefCell<Vec<(u32, PathBuf, String)>>,
+        elapsed: std::cell::Cell<i64>,
+        sleeps: std::cell::Cell<u32>,
+        states: RefCell<std::collections::HashMap<i64, StepState>>,
+        finished: RefCell<Vec<i64>>,
+        completions: RefCell<Vec<String>>,
+        /// Whether a fix pass writes its marker at all.
+        fix_signals: bool,
+        /// Whether `fix` reports an empty store (`None`).
+        nothing_to_fix: bool,
     }
 
     impl FakeOps {
@@ -458,11 +593,32 @@ mod tests {
                 fix_cap_reached: false,
                 bot_comments: RefCell::new(Vec::new()),
                 import_at: RefCell::new(Vec::new()),
+                signal_after: Some(0),
+                half_written: false,
+                pending: RefCell::new(Vec::new()),
+                elapsed: std::cell::Cell::new(0),
+                sleeps: std::cell::Cell::new(0),
+                states: RefCell::new(std::collections::HashMap::new()),
+                finished: RefCell::new(Vec::new()),
+                completions: RefCell::new(Vec::new()),
+                fix_signals: true,
+                nothing_to_fix: false,
             }
         }
 
         fn log(&self) -> Vec<String> {
             self.log.borrow().clone()
+        }
+
+        fn signal(&self, path: PathBuf, body: String) {
+            if self.half_written {
+                std::fs::write(&path, &body[..body.len() / 2]).unwrap();
+            }
+            match self.signal_after {
+                Some(0) => std::fs::write(path, body).unwrap(),
+                Some(sleeps) => self.pending.borrow_mut().push((sleeps, path, body)),
+                None => {}
+            }
         }
     }
 
@@ -471,21 +627,59 @@ mod tests {
             self.log.borrow_mut().push(format!("review {round}"));
             self.prompts.borrow_mut().push(prompt);
             let body = self.findings[(round - 1) as usize];
-            std::fs::write(findings_path(&self.git_dir, round), body).unwrap();
+            self.signal(findings_path(&self.git_dir, round), body.to_string());
             Ok(100 + i64::from(round))
         }
 
-        fn fix(&self) -> Result<bool, AutoReviewError> {
+        fn fix(&self, round: u32, completion: String) -> Result<Option<i64>, AutoReviewError> {
             self.log.borrow_mut().push("fix".to_string());
+            self.completions.borrow_mut().push(completion);
             self.store_at_fix
                 .borrow_mut()
                 .push(comment_store::load(&self.git_dir).unwrap().len());
             let mut results = self.fix_results.borrow_mut();
-            Ok(if results.is_empty() {
+            let succeeded = if results.is_empty() {
                 true
             } else {
                 results.remove(0)
-            })
+            };
+            if self.nothing_to_fix {
+                return Ok(None);
+            }
+            if self.fix_signals {
+                self.signal(
+                    fix_marker_path(&self.git_dir, round),
+                    format!(r#"{{"succeeded": {succeeded}}}"#),
+                );
+            }
+            Ok(Some(200 + i64::from(round)))
+        }
+
+        fn step_state(&self, run_id: i64) -> Result<StepState, AutoReviewError> {
+            Ok(self
+                .states
+                .borrow()
+                .get(&run_id)
+                .copied()
+                .unwrap_or(StepState::Running))
+        }
+
+        fn finish_step(&self, run_id: i64) -> Result<(), AutoReviewError> {
+            self.finished.borrow_mut().push(run_id);
+            Ok(())
+        }
+
+        fn sleep(&self, secs: u64) {
+            self.elapsed.set(self.elapsed.get() + secs as i64);
+            self.sleeps.set(self.sleeps.get() + 1);
+            let mut pending = self.pending.borrow_mut();
+            for (left, path, body) in pending.iter_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    std::fs::write(path, &*body).unwrap();
+                }
+            }
+            pending.retain(|(left, _, _)| *left > 0);
         }
 
         fn publish(&self) -> Result<(), AutoReviewError> {
@@ -519,7 +713,7 @@ mod tests {
         }
 
         fn now_unix_secs(&self) -> i64 {
-            1_787_054_400
+            1_787_054_400 + self.elapsed.get()
         }
     }
 
@@ -847,6 +1041,7 @@ mod tests {
             vec![
                 "review 1",
                 "fix",
+                "flag 201",
                 "record 101 auto_review_round 1/2 fix-failed"
             ]
         );
@@ -892,43 +1087,165 @@ mod tests {
     }
 
     #[test]
-    fn a_round_whose_agent_wrote_no_findings_file_is_an_error() {
-        struct SilentOps;
-        impl AutoReviewOps for SilentOps {
-            fn review(&self, _: u32, _: String) -> Result<i64, AutoReviewError> {
-                Ok(1)
-            }
-            fn fix(&self) -> Result<bool, AutoReviewError> {
-                unreachable!()
-            }
-            fn publish(&self) -> Result<(), AutoReviewError> {
-                unreachable!()
-            }
-            fn record(&self, _: i64, _: &str, _: &str) -> Result<(), AutoReviewError> {
-                unreachable!()
-            }
-            fn flag(&self, _: i64) -> Result<(), AutoReviewError> {
-                unreachable!()
-            }
-            fn fix_cap_reached(&self) -> Result<bool, AutoReviewError> {
-                unreachable!()
-            }
-            fn now_unix_secs(&self) -> i64 {
-                0
-            }
-            fn import_bot_comments(&self) -> Result<usize, AutoReviewError> {
-                unreachable!()
-            }
-        }
+    fn steps_that_signal_after_a_delay_let_the_loop_advance_and_end_their_rows() {
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(findings_path(tmp.path(), 1).parent().unwrap()).unwrap();
-        std::fs::write(findings_path(tmp.path(), 1), "[]").unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+        ops.signal_after = Some(3);
 
-        let err = run_loop(&SilentOps, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap_err();
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
 
-        assert!(
-            matches!(err, AutoReviewError::Findings { .. }),
-            "a stale findings file is cleared before the round: {err}"
+        assert_eq!(
+            outcome,
+            LoopOutcome {
+                rounds: 2,
+                verdict: RoundVerdict::Clean
+            }
         );
+        assert_eq!(*ops.finished.borrow(), vec![101, 201, 102]);
+        assert_eq!(ops.sleeps.get(), 9, "three polls' sleeps per step");
+        assert!(
+            ops.completions.borrow()[0]
+                .contains(&*fix_marker_path(tmp.path(), 1).to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn a_half_written_findings_file_is_retried_until_it_parses() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![LOW]);
+        ops.signal_after = Some(2);
+        ops.half_written = true;
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert_eq!(comment_store::load(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_round_that_never_signals_is_flagged_stuck_at_the_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM]);
+        ops.signal_after = None;
+        ops.half_written = true;
+        let cfg = AutoReviewConfig {
+            round_timeout_mins: 1,
+            ..cfg()
+        };
+
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(
+            outcome,
+            LoopOutcome {
+                rounds: 1,
+                verdict: RoundVerdict::Stuck
+            }
+        );
+        assert_eq!(
+            ops.log(),
+            vec![
+                "review 1",
+                "flag 101",
+                "record 101 auto_review_round 1/2 stuck"
+            ]
+        );
+        assert_eq!(ops.elapsed.get(), 60);
+        assert!(ops.finished.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_round_hibernated_before_its_signal_is_flagged_stuck() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM]);
+        ops.signal_after = Some(5);
+        ops.states.borrow_mut().insert(101, StepState::Hibernated);
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Stuck);
+        assert_eq!(ops.log()[1], "flag 101");
+        assert_eq!(ops.sleeps.get(), 0, "no waiting once hibernated");
+    }
+
+    #[test]
+    fn a_round_hibernated_after_its_signal_counts_as_done() {
+        let tmp = TempDir::new().unwrap();
+        let ops = FakeOps::new(tmp.path(), vec![LOW]);
+        ops.states.borrow_mut().insert(101, StepState::Hibernated);
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert_eq!(*ops.finished.borrow(), vec![101]);
+    }
+
+    #[test]
+    fn a_round_ended_by_something_else_stops_the_loop_without_flagging() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM]);
+        ops.signal_after = None;
+        ops.states.borrow_mut().insert(101, StepState::Gone);
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Stopped);
+        assert_eq!(
+            ops.log(),
+            vec!["review 1", "record 101 auto_review_round 1/2 stopped"]
+        );
+    }
+
+    #[test]
+    fn a_fix_pass_that_never_signals_is_flagged_and_stops_the_round_stuck() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+        ops.fix_signals = false;
+        // A stale marker from an earlier loop must not count as this pass's.
+        std::fs::create_dir_all(fix_marker_path(tmp.path(), 1).parent().unwrap()).unwrap();
+        std::fs::write(fix_marker_path(tmp.path(), 1), r#"{"succeeded": true}"#).unwrap();
+        let cfg = AutoReviewConfig {
+            round_timeout_mins: 1,
+            ..cfg()
+        };
+
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Stuck);
+        assert_eq!(
+            ops.log(),
+            vec![
+                "review 1",
+                "fix",
+                "flag 201",
+                "record 101 auto_review_round 1/2 stuck"
+            ]
+        );
+        assert_eq!(*ops.finished.borrow(), vec![101]);
+    }
+
+    #[test]
+    fn a_fix_pass_ended_by_something_else_stops_the_loop_without_flagging() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+        ops.fix_signals = false;
+        ops.states.borrow_mut().insert(201, StepState::Gone);
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Stopped);
+        assert!(!ops.log().iter().any(|line| line.starts_with("flag")));
+    }
+
+    #[test]
+    fn a_fix_with_nothing_to_fix_counts_as_fixed_without_waiting() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+        ops.nothing_to_fix = true;
+
+        let outcome = run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path()).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert_eq!(*ops.finished.borrow(), vec![101, 102]);
     }
 }

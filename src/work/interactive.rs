@@ -65,6 +65,10 @@ use crate::work::tmux::{
 /// Window name for an interactive `tm work run`.
 pub const WORK_WINDOW_NAME: &str = "work";
 
+/// Window name for a `tm review auto` review round (GitHub issue #150).
+/// Later rounds become `review-2`, `review-3`, … via [`unique_window_name`].
+pub const REVIEW_WINDOW_NAME: &str = "review";
+
 /// Window name for an interactive `tm review fix` pass. Repeat passes become
 /// `fix-2`, `fix-3`, … via [`unique_window_name`].
 pub const FIX_WINDOW_NAME: &str = "fix";

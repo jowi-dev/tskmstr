@@ -2460,6 +2460,7 @@ fn with_review_deps<T>(
             runner,
             config: full_config.as_ref(),
             admission,
+            sleeper: &tskmstr::work::review_watch::RealSleeper,
         };
         f(&deps, &run_paths, full_config.as_ref())
     }))
