@@ -1056,9 +1056,13 @@ fn ask_backend(
     }
 }
 
-/// Ask which AI coding agent runner `tm` launches (`[agent] runner`),
+/// Ask which AI coding agent runner `tm` launches (`[agent] default`),
 /// re-prompting until the answer names a runner [`AgentKind::parse`]
-/// recognizes. The default-named runner stays implicit: the key is written
+/// recognizes. A table that already lists `available` runners, or uses the
+/// legacy `strategy`/`order` keys (which `tm update` rewrites), already
+/// declares its routing and is left alone. A legacy `runner` key is read as
+/// the current value and replaced by `default` (GitHub issue #192). The
+/// default-named runner stays implicit: the key is written
 /// only when it is already present (so an answer can fix an invalid value in
 /// place) or the answer differs from the built-in default, keeping a
 /// default-accepting run free of an `[agent]` table. With `yes`, the current
@@ -1076,7 +1080,15 @@ fn ask_runner(
     out: &mut dyn Write,
 ) -> Result<(), InitCliError> {
     let names = AgentKind::names().join(", ");
-    let current = str_at(doc, &["agent", "runner"]).map(str::to_string);
+    if ["available", "strategy", "order"]
+        .iter()
+        .any(|key| agent_sets(doc, key))
+    {
+        return Ok(());
+    }
+    let current = str_at(doc, &["agent", "default"])
+        .or_else(|| str_at(doc, &["agent", "runner"]))
+        .map(str::to_string);
     let default = current
         .clone()
         .unwrap_or_else(|| AgentKind::default().as_str().to_string());
@@ -1095,9 +1107,19 @@ fn ask_runner(
         }
     };
     if current.is_some() || answer != AgentKind::default().as_str() {
-        set_str(doc, &["agent"], "runner", &answer, repo_config_path)?;
+        if let Some(agent) = doc.get_mut("agent").and_then(Item::as_table_like_mut) {
+            agent.remove("runner");
+        }
+        set_str(doc, &["agent"], "default", &answer, repo_config_path)?;
     }
     Ok(())
+}
+
+/// Whether the repo's `[agent]` table sets `key` at all.
+fn agent_sets(doc: &DocumentMut, key: &str) -> bool {
+    doc.get("agent")
+        .and_then(Item::as_table_like)
+        .is_some_and(|agent| agent.contains_key(key))
 }
 
 /// The GitHub-backend default for `status_on_pr`: the "In Review" workflow
@@ -2738,8 +2760,33 @@ mod tests {
 
         let repo_text = std::fs::read_to_string(env.paths.repo.as_ref().unwrap()).expect("read");
         assert!(
-            repo_text.contains("runner = \"claude\""),
-            "existing key rewritten with the answer: {repo_text}"
+            repo_text.contains("default = \"claude\""),
+            "answer written as [agent] default: {repo_text}"
+        );
+        assert!(
+            !repo_text.contains("runner ="),
+            "legacy runner key replaced: {repo_text}"
+        );
+    }
+
+    #[test]
+    fn runner_question_leaves_a_declared_available_list_alone() {
+        let env = test_env();
+        let gh = FakeGhCli::new();
+        let keychain = InMemoryKeychain::empty();
+        let ctx = github_ctx(&env, &gh, &keychain);
+
+        let original = "[backend]\nprovider = \"github\"\n\n[backend.github]\nrepo = \"jowi-dev/widget\"\n\n[agent]\ndefault = \"claude\"\navailable = [\"claude\", \"opencode\"]\n";
+        std::fs::write(env.paths.repo.as_ref().unwrap(), original).expect("write repo config");
+
+        let mut out = Vec::new();
+        run_init(&ctx, true, &mut FakePrompter::new(), &mut out).expect("init should succeed");
+
+        let config = config::load(&env.paths).expect("written config should load");
+        assert_eq!(config.agent, crate::config::AgentKind::Claude);
+        assert_eq!(
+            config.agent_fallbacks,
+            vec![crate::config::AgentKind::Opencode]
         );
     }
 
