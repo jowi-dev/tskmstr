@@ -104,6 +104,7 @@ and listed in the JSON document's `warnings`. The exit code stays `0`.
 | `url` | string | Browsable URL for the ticket. |
 | `is_epic` | boolean | Whether the backend says this ticket is an epic. |
 | `children` | object or null | Child progress for each epic in the graph's epic set; `null` for every other node. A child the backend reports as an epic, but that is not itself in the epic set, has `is_epic: true` and `children: null`. |
+| `assignee` | object or null | Who the ticket is assigned to; `null` when unassigned. Also `null` for a plain ticket known only from an unlocks link, since the link carries no assignee. |
 
 ### `children`
 
@@ -111,6 +112,13 @@ and listed in the JSON document's `warnings`. The exit code stays `0`.
 |---|---|---|
 | `done` | integer | Children whose `status_category` is `done`. |
 | `total` | integer | All children. |
+
+### `assignee`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | The backend's user id: a Jira account ID or a GitHub login. Compare this one when filtering for your own tickets. |
+| `name` | string | Display name: the Jira display name, or the GitHub login again. |
 
 ### Link
 
@@ -150,7 +158,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "done",
       "url": "https://example.atlassian.net/browse/PROJ-1",
       "is_epic": true,
-      "children": { "done": 1, "total": 1 }
+      "children": { "done": 1, "total": 1 },
+      "assignee": null
     },
     {
       "key": "PROJ-2",
@@ -160,7 +169,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "indeterminate",
       "url": "https://example.atlassian.net/browse/PROJ-2",
       "is_epic": true,
-      "children": { "done": 1, "total": 2 }
+      "children": { "done": 1, "total": 2 },
+      "assignee": { "id": "5b10ac8d82e05b22cc7d4ef5", "name": "Ada Lovelace" }
     },
     {
       "key": "PROJ-30",
@@ -170,7 +180,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "new",
       "url": "https://example.atlassian.net/browse/PROJ-30",
       "is_epic": false,
-      "children": null
+      "children": null,
+      "assignee": null
     },
     {
       "key": "PROJ-10",
@@ -180,7 +191,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "done",
       "url": "https://example.atlassian.net/browse/PROJ-10",
       "is_epic": false,
-      "children": null
+      "children": null,
+      "assignee": null
     },
     {
       "key": "PROJ-20",
@@ -190,7 +202,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "done",
       "url": "https://example.atlassian.net/browse/PROJ-20",
       "is_epic": false,
-      "children": null
+      "children": null,
+      "assignee": null
     },
     {
       "key": "PROJ-21",
@@ -200,7 +213,8 @@ unlocks the plain ticket PROJ-30.
       "status_category": "new",
       "url": "https://example.atlassian.net/browse/PROJ-21",
       "is_epic": false,
-      "children": null
+      "children": null,
+      "assignee": null
     }
   ],
   "links": [
