@@ -215,6 +215,11 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Ticket { key, cmd } => run_ticket(key, cmd, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key, json } => run_ready(key, json, &paths, &keychain, env_token),
+        Command::Graph {
+            epic,
+            json,
+            mermaid,
+        } => run_graph(epic, json, mermaid, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Overview => run_overview(),
         Command::Runs {
@@ -2070,6 +2075,41 @@ fn run_ready(
     } else {
         tskmstr::cli::ready::list(&ctx, &mut stdout)?;
     }
+    Ok(())
+}
+
+/// `tm graph [EPIC]`: build the configured backend's provider and run
+/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json` and
+/// `mermaid` pick the output format (clap keeps them exclusive); neither
+/// means text.
+fn run_graph(
+    epic: Option<String>,
+    json: bool,
+    mermaid: bool,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let provider = ticket_provider_for(&config, keychain, env_token)?;
+    let identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let format = if json {
+        tskmstr::cli::graph::GraphFormat::Json
+    } else if mermaid {
+        tskmstr::cli::graph::GraphFormat::Mermaid
+    } else {
+        tskmstr::cli::graph::GraphFormat::Text
+    };
+    tskmstr::cli::graph::run(
+        provider.as_ref(),
+        &identity,
+        &config.default_project_key,
+        epic.as_deref(),
+        format,
+        unix_now(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )?;
     Ok(())
 }
 
