@@ -244,7 +244,7 @@ tm auth status
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
 | `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
-| `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is a headless `auto-review` run whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` trigger `tm review fix <KEY> --fg`. Stops on a clean round, or flags the round `review` at `max_review_rounds`. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
+| `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2) whose confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round `review` at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
 **Epics and parents are backend-dependent.** The `--epic`/`--parent` create flags, `tm ticket parent <KEY> <EPIC>`/`--clear`, and `tm ticket children` go through the ticket backend, and both backends support them. In Jira, an epic is an issue of type `Epic` (or whatever `epic_issue_type` names, see "Configuration"), a child points at its epic through Jira's `parent` field, and `tm ticket children` lists every ticket under the epic, done ones included, in backlog rank order. In GitHub, an epic is an issue labeled `tm:epic` (`tm backend init-labels` creates the label), and a ticket's epic is its GitHub sub-issue parent. `tm ticket create --parent` creates the issue and then adds it as a sub-issue; if that second step fails, the error names the created issue so you can retry with `tm ticket parent`. Sub-issues can live in other repos: `tm ticket children` lists such a child as `owner/repo#N`, which is display-only, so `tm` won't accept it as a ticket key. A parent always means "this epic is made of these tickets"; ordering between epics is a `Blocks` link (`tm ticket link`).
@@ -1466,7 +1466,8 @@ Unassigned`).
 Every action tskmstr takes against a ticket runs in a window of that
 ticket's own detached tmux session, named `tm-<scope>-<lowercased key>` —
 the audit in a window named `audit`, the bugbot-cleanup session in
-`bugbot`, plus a plain `shell` window rooted where the session was created,
+`bugbot`, `tm review auto`'s rounds in `review` / `review-N` and its fix
+passes in `fix` / `fix-N`, plus a plain `shell` window rooted where the session was created,
 for `claude --resume`, manual git work, and running tests. So `tmux attach
 -t tm-proj-proj-123` shows one ticket's whole history, live windows
 included. The session lasts until the ticket is finished. `tm merge` and
@@ -1913,11 +1914,13 @@ status line without leaving a `review-fix` run behind.
 human does, and writes what it finds where `V` and `F` already look: the
 worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 
-1. Runs a headless `auto-review` agent run in the ticket's lane worktree.
-   Round 1 uses the `thatch-code-review` skill. Later rounds use
-   `thatch-review-followup` and are pointed at the previous round's
-   archived comments. The agent writes its confirmed findings to
-   `<git-dir>/vdiff/auto-review/findings-<round>.json`.
+1. Runs an interactive `auto-review` agent in a `review` window of the
+   ticket's `tm-<scope>-<key>` session, rooted in the ticket's lane worktree
+   (`review-2` for round 2). Round 1 uses the `thatch-code-review` skill.
+   Later rounds use `thatch-review-followup` and are pointed at the previous
+   round's archived comments. The agent writes its confirmed findings to
+   `<git-dir>/vdiff/auto-review/findings-<round>.json`, and the round is
+   done once that file exists and parses.
 2. Appends the findings to the comment store with vdiff schema v1's rules
    (`c<n>` ids after the existing ones, `created_at`, sorted by
    `(path, start_line)`, pretty-printed). Your own comments are kept. Each
@@ -1925,14 +1928,41 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 3. With `publish = true`, runs `vdiff --publish-comments <pr>`.
 4. Stops if no finding is at or above `fix_threshold`. LOW findings stay in
    the store for you to read in `V`.
-5. Otherwise runs `tm review fix <KEY> --fg`, then moves the consumed store
-   to `<git-dir>/vdiff/archive/<round>.json` so the next round never re-reads
-   comments with stale line anchors.
+5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
+   window (`fix-2` for round 2). The pass is done once the agent writes
+   `<git-dir>/vdiff/auto-review/fix-<round>.done`, holding
+   `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
+   consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
+   round never re-reads comments with stale line anchors.
+
+**The windows are yours to watch and steer.** Attach to the ticket's
+session to read a round or type into it. The loop does not wait for claude
+to exit: it polls the step's signal file, marks the step's run `done` when
+the file appears, and moves on. The window stays open. Idle finished
+windows are hibernated like any other interactive window, and `tm merge`
+removes them with the rest of the ticket's session, which also ends the
+loop.
+
+tm appends a completion section to every round and fix prompt, so a custom
+`prompt_file` that never mentions the signal files still produces them. It
+names the exact path and tells the agent to write `<file>.tmp` and rename
+it into place. A findings file that exists but does not parse yet counts as
+not ready.
+
+**A step that never signals stops the loop.** If a round or fix pass
+writes nothing within `round_timeout_mins` (default 60, per step), or the
+idle sweep hibernates it before it signals, tm flags its run `review`
+("needs review" in the overview), records the round as `stuck`, and stops.
+The window is left open for you. If the step's run is ended by something
+else, such as you exiting claude before it signalled, or the ticket's
+session is gone, the loop records `stopped` and exits without flagging.
+Exiting a window's claude after tm already set its run's status never
+changes that status.
 
 At `max_review_rounds` with findings still above the threshold, the loop
 stops and marks that round's run `review` instead of fixing again. Each
 round records an `auto_review_round` event (`1/2 fix`, `2/2 clean`,
-`2/2 capped`, `1/2 fix-failed`), and the overview row shows the newest one as
+`2/2 capped`, `1/2 fix-failed`, `1/2 stuck`, `1/2 stopped`), and the overview row shows the newest one as
 `review 2/2 capped`, drawn as a warning when the loop stopped short of
 clean.
 
@@ -1940,8 +1970,11 @@ On the board, a ticket with an auto-review run shows a `review:` badge.
 `review: reviewing` means the loop is alive, including during a fix pass
 between rounds. `review: clean` means the newest round came back clean.
 `review: needs you` (bold red) means the loop stopped without a clean
-verdict: it hit the round cap, the fix pass failed, or the loop process
-died. The round count follows once a round has finished, as in
+verdict: it hit the round cap, the fix pass failed, a step never
+signalled, or the loop process died. That holds even while a round's window
+and its claude are still open: liveness comes from the loop's pid, which
+the loop records on every row it creates as an `auto_review_loop_pid`
+event. The round count follows once a round has finished, as in
 `review: needs you 2/2`. The badge is computed from the run store and a
 local pid check, never from GitHub, and only the ticket's newest
 auto-review run counts. A fix you make by hand after a cap isn't detected,
@@ -1955,6 +1988,7 @@ so the badge stays at `needs you` until another round runs.
 # max_review_rounds = 2
 # publish = false                 # post each round with vdiff --publish-comments
 # auto = false                    # chain from a clean tm pr watch
+# round_timeout_mins = 60         # per round and per fix pass, then flag and stop
 ```
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,

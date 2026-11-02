@@ -372,6 +372,27 @@ re-checks it at the tmux seam.
   is a pure mechanical rename with the tests green throughout, and the struct
   docs now record what the old name was and why it went.
 
+## Auto-review windows (GitHub issue #150)
+
+`tm review auto`'s rounds and fix passes now take windows in the ticket's
+session too: a `review` window per round (`review-2`, ...) and the usual
+`fix` / `fix-N` window per fix pass, launched through the same interactive
+path as `tm review fix`, each with a hibernation `LaunchRecord`. The loop
+itself stays a detached process with no window.
+
+- **Finished windows stay open and do not block the next one.**
+  `resolve_action_window` takes the names of windows whose run row has
+  already ended (`hibernate::ended_launch_windows`, decided by each window
+  name's newest launch record), so a live but finished `fix` window lets
+  `fix-2` open beside it. A window whose row is still running still
+  refuses.
+- **Done is a signal file, not claude exiting.** An interactive session sits
+  at its prompt when finished, so the loop polls the round's findings file
+  or the fix pass's `fix-<round>.done` marker, then finishes the row itself.
+- **SessionEnd keeps a status tm already set.** The hooks call `tm runs
+  finish --keep-status`, so exiting a window after the loop flagged its row
+  `review` records usage without turning the flag back into `done`.
+
 ## Manual verification (open)
 
 ### Phases 1-2
