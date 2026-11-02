@@ -1432,7 +1432,12 @@ fn run_init(
 
     let setup_repo_dir = repo_dir.clone();
     let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(invocation, setup_repo_dir.as_deref())
+        launch_setup_session(
+            invocation,
+            setup_repo_dir.as_deref(),
+            paths,
+            init_runner.name(),
+        )
     };
 
     let ctx = tskmstr::cli::init::InitContext {
@@ -1458,29 +1463,41 @@ fn run_init(
 /// Run an agent invocation in the foreground from `dir` (when known) and
 /// wait for it to exit — the real setup-session launcher behind `tm init`'s
 /// and `tm update`'s agent-assisted asset setup.
+///
+/// Records the session as a `setup` run row through
+/// [`tskmstr::work::setup_session::run_setup_session`] (GitHub issue #156).
+/// The config is loaded here, at launch, rather than by the caller: `tm
+/// init` writes it moments before the offer, so it is the freshest source
+/// for the row's scope and the run database path. An unloadable config
+/// records under scope `""` in the default database, and a database that
+/// won't open runs the session untracked.
 fn launch_setup_session(
     invocation: &tskmstr::agent::AgentInvocation,
     dir: Option<&Path>,
+    paths: &ConfigPaths,
+    agent: &str,
 ) -> Result<(), String> {
-    let mut command = std::process::Command::new(&invocation.program);
-    command.args(&invocation.args);
-    for var in &invocation.env_remove {
-        command.env_remove(var);
-    }
-    for (key, value) in &invocation.env_set {
-        command.env(key, value);
-    }
-    if let Some(dir) = dir {
-        command.current_dir(dir);
-    }
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to launch {}: {err}", invocation.program))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{} exited with {status}", invocation.program))
-    }
+    let config = config::load(paths).ok();
+    let scope = config
+        .as_ref()
+        .map(|cfg| tskmstr::config::BackendIdentity::from_config(cfg).scope())
+        .unwrap_or_default();
+    let db_path = config
+        .as_ref()
+        .map(run_db_path_from_config)
+        .unwrap_or_else(default_xdg_run_db_path);
+    let store = tskmstr::runs::RunStore::open(&db_path).ok();
+    let session = tskmstr::work::setup_session::SetupSession {
+        store: store.as_ref(),
+        scope: &scope,
+        agent,
+        dir,
+        program: &invocation.program,
+    };
+    tskmstr::work::setup_session::run_setup_session(&session, &mut || {
+        let child = tskmstr::work::setup_session::setup_command(invocation, dir).spawn()?;
+        Ok(Box::new(child))
+    })
 }
 
 /// `tm update [--yes]`: build real dependencies and run
@@ -1500,8 +1517,9 @@ fn run_update_cmd(yes: bool) -> ExitCode {
         .repo
         .as_deref()
         .and_then(|repo_config| repo_config.parent().map(PathBuf::from));
+    let setup_paths = paths.clone();
     let setup_launcher = move |invocation: &tskmstr::agent::AgentInvocation| -> Result<(), String> {
-        launch_setup_session(invocation, repo_dir.as_deref())
+        launch_setup_session(invocation, repo_dir.as_deref(), &setup_paths, runner.name())
     };
 
     let ctx = tskmstr::cli::update::UpdateContext {
