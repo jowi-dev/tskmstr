@@ -1957,7 +1957,8 @@ string `start_line`) can never become ready, so tm flags the step and
 stops the loop with the parse error in its log.
 
 **A step that never signals stops the loop.** If a round or fix pass
-writes nothing within `round_timeout_mins` (default 60, per step), or the
+writes nothing within `round_timeout_mins` (default 60, per step; `0`
+turns the timeout off), or the
 idle sweep hibernates it before it signals, tm flags its run for review,
 records the round as `stuck`, and stops. The agent may still be working, so
 the flag waits: the run ends as `review` ("needs review" in the overview)
@@ -2000,7 +2001,7 @@ so the badge stays at `needs you` until another round runs.
 # max_review_rounds = 2
 # publish = false                 # post each round with vdiff --publish-comments
 # auto = false                    # chain from a clean tm pr watch
-# round_timeout_mins = 60         # per round and per fix pass, then flag and stop
+# round_timeout_mins = 60         # per round and per fix pass, then flag and stop; 0 = no timeout
 ```
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,

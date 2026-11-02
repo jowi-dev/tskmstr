@@ -463,7 +463,8 @@ pub struct LoopOutcome {
 /// per loop.
 ///
 /// Each round and each fix pass is launched and then waited on through its
-/// signal file, for at most `cfg.round_timeout_mins` each. A step that
+/// signal file, for at most `cfg.round_timeout_mins` each (`0`: no limit).
+/// A step that
 /// signals gets a [`SIGNAL_EVENT`]; one that times out or is hibernated
 /// first is flagged and ends the loop as [`RoundVerdict::Stuck`]; one whose
 /// row is ended by something else ends it as [`RoundVerdict::Stopped`]. The
@@ -482,7 +483,12 @@ pub fn run_loop(
     loop_id: &str,
 ) -> Result<LoopOutcome, AutoReviewError> {
     let max = cfg.max_review_rounds.max(1);
-    let timeout_secs = i64::try_from(cfg.round_timeout_mins.saturating_mul(60)).unwrap_or(i64::MAX);
+    // `0` turns the timeout off, as `idle_hibernate_mins = 0` turns off the
+    // idle sweep.
+    let timeout_secs = match cfg.round_timeout_mins {
+        0 => i64::MAX,
+        mins => i64::try_from(mins.saturating_mul(60)).unwrap_or(i64::MAX),
+    };
     let mut archive: Option<PathBuf> = None;
     for round in 1..=max {
         let findings_file = findings_path(git_dir, loop_id, round);
@@ -1222,6 +1228,23 @@ mod tests {
         );
         assert_eq!(ops.elapsed.get(), 60);
         assert!(ops.signalled.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_zero_round_timeout_waits_without_a_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![LOW]);
+        // Well past what a one-minute timeout would allow.
+        ops.signal_after = Some(500);
+        let cfg = AutoReviewConfig {
+            round_timeout_mins: 0,
+            ..cfg()
+        };
+
+        let outcome = run_loop(&ops, &cfg, DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
+
+        assert_eq!(outcome.verdict, RoundVerdict::Clean);
+        assert_eq!(ops.sleeps.get(), 500);
     }
 
     #[test]

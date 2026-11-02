@@ -770,7 +770,9 @@ pub struct RawAutoReviewConfig {
     /// Minutes the loop waits for one review round's findings file, or one
     /// fix pass's marker file, before it flags the step's run for review and
     /// stops (GitHub issue #150). Applies to each round and each fix pass
-    /// separately. Defaults to 60.
+    /// separately. `0` means no timeout, like `idle_hibernate_mins = 0`: the
+    /// loop then waits until the step signals, its agent is hibernated, or
+    /// its row ends. Defaults to 60.
     pub round_timeout_mins: Option<u64>,
 }
 
