@@ -1222,23 +1222,38 @@ fn tail_lines(content: &str, n: usize) -> Vec<&str> {
     all[start..].to_vec()
 }
 
-/// Reads whatever bytes have been appended to `path` since `offset`,
-/// returning them alongside the file's new length (the next call's
-/// `offset`). Used by [`logs`]'s `--follow` loop; pulled out as its own
-/// function so the "what's new since last time" logic is testable without
-/// an actual infinite polling loop.
-fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
+/// What [`read_appended`] found past a followed file's offset.
+struct Appended {
+    /// The raw bytes read, which may end mid-line or mid-character.
+    bytes: Vec<u8>,
+    /// The offset just past `bytes`: the next call's `offset`.
+    offset: u64,
+    /// The file had shrunk below `offset`, so `bytes` start at 0.
+    truncated: bool,
+}
+
+/// Reads whatever bytes have been appended to `path` since `offset`. The
+/// next offset counts only the bytes actually read, so a write landing
+/// mid-read is picked up next time rather than read twice. A file shorter
+/// than `offset` was truncated and re-created (a headless run's fallback
+/// attempt re-creates its output stream), so it is read from the start.
+/// Used by [`logs`]'s `--follow` loop; pulled out as its own function so
+/// the "what's new since last time" logic is testable without an actual
+/// infinite polling loop.
+fn read_appended(path: &Path, offset: u64) -> std::io::Result<Appended> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len <= offset {
-        return Ok((String::new(), offset));
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok((buf, len))
+    let truncated = file.metadata()?.len() < offset;
+    let start = if truncated { 0 } else { offset };
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Appended {
+        offset: start + bytes.len() as u64,
+        bytes,
+        truncated,
+    })
 }
 
 /// Where `run`'s agent output stream lives, for `tm runs logs
@@ -1269,15 +1284,20 @@ fn runner_for_agent(agent: Option<&str>) -> &'static dyn AgentRunner {
 /// terminated) line from it, leaving any trailing partial line in
 /// `pending` for the next call. A followed stream can be read mid-write,
 /// and half a JSON line renders as nothing, so `tm runs logs --follow
-/// --transcript` only renders a line once its newline has landed.
-fn split_complete_lines(pending: &mut String, appended: &str) -> Vec<String> {
-    pending.push_str(appended);
-    let Some(last_newline) = pending.rfind('\n') else {
+/// --transcript` only renders a line once its newline has landed. Only
+/// complete lines are decoded, so a multibyte character split across two
+/// reads decodes whole.
+fn split_complete_lines(pending: &mut Vec<u8>, appended: &[u8]) -> Vec<String> {
+    pending.extend_from_slice(appended);
+    let Some(last_newline) = pending.iter().rposition(|&byte| byte == b'\n') else {
         return Vec::new();
     };
     let rest = pending.split_off(last_newline + 1);
     let complete = std::mem::replace(pending, rest);
-    complete.lines().map(str::to_string).collect()
+    String::from_utf8_lossy(&complete)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Renders stream `lines` through `runner`'s
@@ -1317,7 +1337,9 @@ fn render_progress(runner: &dyn AgentRunner, lines: &[String]) -> Vec<String> {
 /// that stream. After the log tail it prints the last `tail` rendered
 /// lines. A stream that doesn't exist yet prints nothing rather than
 /// erroring, since a run may not have produced output; under `--follow` it
-/// is polled for until it appears. The headless viewer window runs this
+/// is polled for until it appears, and a stream a fallback attempt
+/// re-created is read again from its start through the renderer of the
+/// agent the row now names ([`RunStore::update_agent`]). The headless viewer window runs this
 /// with `--follow --transcript` (`crate::work::viewer::viewer_command`).
 ///
 /// `--follow`'s live loop is real (`sleeper.sleep`/re-reading the files
@@ -1349,8 +1371,9 @@ pub fn logs(
         return Err(RunsCliError::LogFileMissing { path });
     }
 
-    let content = std::fs::read_to_string(&path)?;
-    let mut offset = content.len() as u64;
+    let raw = std::fs::read(&path)?;
+    let mut offset = raw.len() as u64;
+    let content = String::from_utf8_lossy(&raw);
 
     if content.is_empty() {
         writeln!(
@@ -1369,20 +1392,19 @@ pub fn logs(
 
     // The agent's stream, when asked for: its path, its runner, how far it
     // has been read, and the partial line a mid-write read left behind.
-    let stream = if transcript {
+    let stream_path = if transcript {
         transcript_path(run.transcript.as_deref(), &path)
-            .map(|stream_path| (stream_path, runner_for_agent(run.agent.as_deref())))
     } else {
         None
     };
+    let mut runner = runner_for_agent(run.agent.as_deref());
     let mut stream_offset = 0;
-    let mut pending = String::new();
-    if let Some((stream_path, runner)) = &stream
+    let mut pending = Vec::new();
+    if let Some(stream_path) = &stream_path
         && let Ok(bytes) = std::fs::read(stream_path)
     {
         stream_offset = bytes.len() as u64;
-        let lines = split_complete_lines(&mut pending, &String::from_utf8_lossy(&bytes));
-        let rendered = render_progress(*runner, &lines);
+        let rendered = render_progress(runner, &split_complete_lines(&mut pending, &bytes));
         for line in &rendered[rendered.len().saturating_sub(tail)..] {
             writeln!(out, "{line}")?;
         }
@@ -1391,18 +1413,24 @@ pub fn logs(
     if follow {
         loop {
             sleeper.sleep(2);
-            let (appended, new_offset) = read_appended(&path, offset)?;
-            if !appended.is_empty() {
-                write!(out, "{appended}")?;
-                offset = new_offset;
-            }
-            // A stream not written yet, or read mid-way through a multibyte
-            // character, is skipped this tick and retried on the next.
-            if let Some((stream_path, runner)) = &stream
-                && let Ok((appended, new_offset)) = read_appended(stream_path, stream_offset)
+            let appended = read_appended(&path, offset)?;
+            out.write_all(&appended.bytes)?;
+            offset = appended.offset;
+            // A stream not written yet is skipped this tick and retried on
+            // the next. A truncated one is a fallback attempt starting
+            // over in another agent's format, which the row now names.
+            if let Some(stream_path) = &stream_path
+                && let Ok(appended) = read_appended(stream_path, stream_offset)
             {
-                stream_offset = new_offset;
-                for line in render_progress(*runner, &split_complete_lines(&mut pending, &appended))
+                if appended.truncated {
+                    pending.clear();
+                    if let Ok(Some(now)) = store.run_by_id(run.id) {
+                        runner = runner_for_agent(now.agent.as_deref());
+                    }
+                }
+                stream_offset = appended.offset;
+                for line in
+                    render_progress(runner, &split_complete_lines(&mut pending, &appended.bytes))
                 {
                     writeln!(out, "{line}")?;
                 }
@@ -4297,19 +4325,34 @@ mod tests {
 
     #[test]
     fn split_complete_lines_buffers_a_trailing_partial_line() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         assert_eq!(
-            split_complete_lines(&mut pending, "one\ntw"),
+            split_complete_lines(&mut pending, b"one\ntw"),
             vec!["one".to_string()]
         );
-        assert_eq!(pending, "tw");
-        assert!(split_complete_lines(&mut pending, "o-and-a-bit").is_empty());
+        assert_eq!(pending, b"tw");
+        assert!(split_complete_lines(&mut pending, b"o-and-a-bit").is_empty());
         assert_eq!(
-            split_complete_lines(&mut pending, "\nthree\n"),
+            split_complete_lines(&mut pending, b"\nthree\n"),
             vec!["two-and-a-bit".to_string(), "three".to_string()]
         );
-        assert_eq!(pending, "");
-        assert!(split_complete_lines(&mut pending, "").is_empty());
+        assert!(pending.is_empty());
+        assert!(split_complete_lines(&mut pending, b"").is_empty());
+    }
+
+    /// A read can end inside a multibyte character; its bytes wait in
+    /// `pending` and decode whole once the rest arrives.
+    #[test]
+    fn split_complete_lines_keeps_a_split_multibyte_character_intact() {
+        let line = "caf\u{e9} \u{2192} done\n".as_bytes();
+        let cut = line.iter().position(|&b| b == 0xe2).unwrap() + 1;
+        let mut pending = Vec::new();
+
+        assert!(split_complete_lines(&mut pending, &line[..cut]).is_empty());
+        assert_eq!(
+            split_complete_lines(&mut pending, &line[cut..]),
+            vec!["caf\u{e9} \u{2192} done".to_string()]
+        );
     }
 
     #[test]
@@ -4335,10 +4378,28 @@ mod tests {
         let offset = std::fs::metadata(&path).unwrap().len();
         std::fs::write(&path, "first\nsecond\n").unwrap();
 
-        let (appended, new_offset) = read_appended(&path, offset).unwrap();
+        let appended = read_appended(&path, offset).unwrap();
 
-        assert_eq!(appended, "second\n");
-        assert_eq!(new_offset, "first\nsecond\n".len() as u64);
+        assert_eq!(appended.bytes, b"second\n");
+        assert_eq!(appended.offset, "first\nsecond\n".len() as u64);
+        assert!(!appended.truncated);
+    }
+
+    /// A headless run that falls back to another agent re-creates its
+    /// output stream, so a follower past the new end starts over at 0.
+    #[test]
+    fn read_appended_starts_over_on_a_truncated_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.json");
+        std::fs::write(&path, "a long first attempt\n").unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(&path, "new\n").unwrap();
+
+        let appended = read_appended(&path, offset).unwrap();
+
+        assert!(appended.truncated);
+        assert_eq!(appended.bytes, b"new\n");
+        assert_eq!(appended.offset, 4);
     }
 
     #[test]
@@ -4348,10 +4409,11 @@ mod tests {
         std::fs::write(&path, "first\n").unwrap();
         let offset = std::fs::metadata(&path).unwrap().len();
 
-        let (appended, new_offset) = read_appended(&path, offset).unwrap();
+        let appended = read_appended(&path, offset).unwrap();
 
-        assert_eq!(appended, "");
-        assert_eq!(new_offset, offset);
+        assert!(appended.bytes.is_empty());
+        assert_eq!(appended.offset, offset);
+        assert!(!appended.truncated);
     }
 
     // --- register ---
