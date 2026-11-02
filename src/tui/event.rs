@@ -2397,11 +2397,12 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// outcome attaches too — a second `c` press is "take me back to my draft",
 /// never a duplicate session. Only `NotConfigured` and tmux failures skip
 /// the attach, surfacing as a plain status line. Unlike [`launch_audit_cmd`]
-/// there is no `deps.store` guard: no run row is pre-registered (the
-/// in-session `tm ticket create` registers its own `kind = "create"` run via
-/// the session marker), so a broken runs DB never blocks creating tickets.
+/// there is no `deps.store` guard: the `create` row the launch pre-registers
+/// (GitHub issue #156) is telemetry, skipped when the store is unavailable,
+/// so a broken runs DB never blocks creating tickets.
 fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDeps) -> String {
     let session_name = match crate::work::create::launch_create(
+        deps.store.as_ref(),
         deps.tmux.as_ref(),
         &deps.create,
         &deps.home,
