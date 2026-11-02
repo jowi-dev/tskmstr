@@ -158,6 +158,43 @@ an unattended dispatcher (GH-115) can't turn a used-up subscription window
 into pay-per-token spend. A manual `tm work run` still falls back as
 described above, and usage admission only warns there.
 
+## Amendment (2026-11-02, GH-192)
+
+The routing declaration is now `[agent] default` (the runner a launch
+prefers) and `[agent] available` (the runners routing may use, in
+fallback order). They replace `runner`/`strategy`/`order`. The legacy keys
+still load: `runner = X` means `default = X`, and `strategy = "priority"`
+with `order` means `default = order[0]` and `available = order`. Mixing
+old and new keys in one table is an error. Decision 4 still holds: the
+routing keys, now including `default` and `available`, are replaced as a
+whole table, repo over global. `tm check` notes the legacy keys and `tm
+update` rewrites them.
+
+Unattended launches now route proactively before launch.
+`route_unattended` in `src/work/admission.rs` checks memory and usage
+admission on each runner in the unattended order and launches on the
+first runner that passes both. A runner that refuses is skipped instead
+of refusing the launch. The launch is refused only when every runner
+refuses, and the reason names each one. The runners after the chosen one
+remain its in-run fallbacks, so this ADR's reactive path still backs up a
+runner that runs out mid-run. A manual `tm work run` still checks only
+the preferred runner and only warns.
+
+A routed lane with no `prompt_file` reads the routed runner's own default
+lane prompt. The reactive fallback above reuses the preferred runner's
+prompt, but a claude prompt can open with a claude-only `/skill`, which
+another runner can't run. Routing happens before launch, so a missing
+prompt file fails before anything is provisioned.
+
+Server mode for opencode (`opencode serve`) was considered and deferred.
+On opencode 1.18.32, with 3 concurrent text-only sessions on
+`venice/z-ai-glm-5-3-flash`, process mode peaked at 2,169 MB. One server
+plus `opencode run --attach` clients peaked at 1,897 MB: each client took
+about 360 MB, and the server started at 409 MB and grew about 140 MB per
+session. That is about 12% saved, not enough to justify the change.
+GitHub issue #194 tracks driving sessions through the server's HTTP API
+with no client process per lane.
+
 ## What this does not change
 
 `runs` gets no new runner column — `run_events` records the rate-limit and

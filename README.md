@@ -1130,6 +1130,29 @@ A launch tm starts with nobody present (an auto-review round or fix pass,
 a `tm pr watch` bugbot cleanup) waits while refused, the same way it waits
 for memory.
 
+Unattended launches (the dispatcher and `tm work run --unattended`) don't
+stop at the first runner that refuses (GitHub issue #192). They walk the
+unattended runner order: `[agent] default` first, then the rest of
+`available`, with metered runners already dropped unless `[dispatch]
+allow_paid_fallback` is set. Each runner gets the memory check and the
+usage check, and the lane launches on the first runner that passes both. A
+runner that is exhausted, over a usage ceiling, over its token budget, or
+over the memory budget is skipped for the next one. The launch is refused
+only when every runner refuses. With more than one runner, the reason
+names each one, for example `not launching: every runner refused: claude
+5h usage at 85% >= 80% ceiling, resets in 1h 12m; opencode used 5000000
+tokens in the last 5h, budget 5000000`. With a single runner the refusal
+reads exactly as before. For `--unattended`, the runners after the chosen
+one stay as its in-run fallbacks (ADR-0008); skipped ones are dropped. A
+manual `tm work run` still checks only the preferred runner, and only
+warns.
+
+A routed lane with no `prompt_file` reads the routed runner's own default
+lane prompt, such as `~/.config/opencode/prompts/<lane>.md`, because a
+claude prompt can open with a claude-only `/skill`. If that file is
+missing, the launch fails before anything is provisioned. Lanes with
+`prompt_file` (what `tm init` writes) are unaffected.
+
 ```toml
 [agent.claude]
 five_hour_ceiling = 0.80       # default; leaves headroom for interactive work
@@ -1151,8 +1174,8 @@ snapshot_max_age_secs = 600    # default; also the minimum gap between probes
 allow_paid_fallback = false
 ```
 
-These keys only set limits. They don't select a runner, so `[agent]`'s
-`runner`/`strategy`/`order` work as before.
+These keys only set limits. They don't select a runner; `[agent]`'s
+`default` and `available` do that.
 
 ### Autopilot dispatcher (`[dispatch]`)
 
@@ -1190,14 +1213,19 @@ it. A tick:
      backstop against a runaway dispatcher;
    - no lane matches the repo;
    - every runner is metered and `allow_paid_fallback` is off;
-   - memory admission refuses;
-   - usage admission refuses. This is a hard gate here, not a warning.
+   - memory or usage admission refuses on every runner the launch may
+     use. Each runner is checked in order, and the lane launches on the
+     first one that passes. This is a hard gate here, not a warning.
 
    A launch that fails, such as a dirty worktree, is recorded and the tick
    moves on to the next ticket.
 6. **Records what it did** in runs.db's `dispatch_events`: a `launch` row
-   per launch, and a `refused` row with the first refusal's reason and a
-   short reason code (`max_lanes`, `daily_cap`, `memory`, `usage`, ...).
+   per launch, whose detail names the lane and the runner (`lane backend on
+   opencode`), and a `refused` row with the first refusal's reason and a
+   short reason code (`max_lanes`, `daily_cap`, `memory`, `usage`,
+   `every_runner`, ...). When every runner refused for the same kind of
+   reason, the code is that kind (`memory` or `usage`); mixed reasons give
+   `every_runner`.
 7. **Sends desktop notifications** (GitHub issue #121,
    `src/work/notify.rs`) when:
    - a ticket enters "awaiting review": its PR is open, the bots have
@@ -1217,8 +1245,9 @@ it. A tick:
    the command is not installed, the tick sends nothing and carries on.
 
 `--unattended` is a hidden `tm work run` flag. It drops metered runners
-from the fallback chain unless `allow_paid_fallback` is set. It also
-refuses, rather than warns, when usage admission says no.
+from the fallback chain unless `allow_paid_fallback` is set. It walks
+the runners the same way the dispatcher does, and refuses, rather than
+warns, only when every runner fails memory or usage admission.
 
 An unattended lane runs interactively, in the ticket's `work` window, so
 you can attach to it like any other lane (GitHub issue #184). Its prompt
@@ -1314,7 +1343,11 @@ github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h1
 ```
 
 The `blocked` line appears only while the newest tick refused.
-`tick` also prints a `notified:` line for each notification it sent.
+`tick` prints one line per launch, naming the runner the lane landed on,
+for example `github:o/r: launched GH-1 in lane backend on opencode`. A
+stacked launch adds `(stacked on <base>)`. With `--json`, each launch
+carries a `"runner"` field. `tick` also prints a `notified:` line for each
+notification it sent.
 
 `tick` exits 0 when a scope is off, locked by another host, or refused by a
 gate. It exits 1 only when a scope can't tick at all. The flag and the lock
@@ -2444,7 +2477,8 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 # provider = "jira"
 
 # [agent]                              # optional, see below; "claude" is the default
-# runner = "claude"                    # or "opencode"
+# default = "claude"                   # or "opencode"
+# available = ["claude", "opencode"]   # fallback order; optional
 ```
 
 A repo can override any subset of these fields with a `.tskmstr.toml` in
@@ -2716,17 +2750,25 @@ this is an explicit command, not an automatic side effect.
 
 ### `[agent]`: choosing an AI coding runner
 
-`[agent].runner` selects which AI coding agent `tm work run`, `tm review
+`[agent].default` selects which AI coding agent `tm work run`, `tm review
 fix`, `tm ticket audit`/`create`, and `tm work hooks install --user` drive,
 mirroring `[backend].provider`'s shape: an unrecognized value is an
 invalid-runner error naming the value that was set, and it defaults to
 `"claude"` when `[agent]` is absent from both global and repo config, so an
 existing config with no `[agent]` table at all keeps working exactly as
-before.
+before. `[agent].available` optionally lists the runners routing may use,
+in fallback order (see "Priority routing between runners" below).
+
+The older `runner`, `strategy` and `order` keys still load unchanged.
+`tm check` notes a repo `[agent]` table that uses them and names the
+equivalent new keys. `tm update` rewrites the table to `default` and
+`available` after asking, keeping the runner order. `tm init`'s runner
+question writes `[agent] default`.
 
 ```toml
 # [agent]                              # optional, see below; "claude" is the default
-# runner = "claude"                    # or "opencode"
+# default = "claude"                   # or "opencode"
+# available = ["claude", "opencode"]   # fallback order; optional
 ```
 
 Two runners are implemented: `"claude"` (Claude Code) and `"opencode"`
@@ -2744,7 +2786,7 @@ work`" above) stay runner-neutral concepts — model, turn budget, and
 permission posture are meaningful for any agentic CLI — with each adapter
 mapping them onto its own flags.
 
-With `runner = "opencode"`, headless lane runs go through `opencode run
+With `default = "opencode"`, headless lane runs go through `opencode run
 --format json` and interactive sessions through the opencode TUI's
 `--prompt` flag; lane prompts default to `~/.config/opencode/prompts/
 <lane>.md` and the resume hint becomes `opencode --session <id>`. The
@@ -2785,35 +2827,47 @@ declared model.
 
 #### Priority routing between runners
 
-`[agent]` also accepts a priority mode that routes board-launched lane
-runs (`tm work run`, both `--fg` and the default detached/interactive
-dispatch) across more than one runner by usage availability, instead of
-picking exactly one runner via `[agent].runner`:
+`[agent]` can route board-launched lane runs (`tm work run`, both `--fg`
+and the default detached/interactive dispatch) across more than one
+runner by usage availability. List the runners in `available`, in
+fallback order:
 
 ```toml
 [agent]
-strategy = "priority"
-order = ["claude", "opencode"]
+default = "claude"
+available = ["claude", "opencode"]
 ```
 
-`strategy` and `runner` are mutually exclusive — set one or the other, not
-both — and `order` is required (non-empty, every entry a recognized
-runner name, no duplicates) whenever `strategy = "priority"` is set; an
-`order` key with no matching `strategy` is a config error too, rather than
-silently doing nothing. `order[0]` is still exposed as the ordinary
-preferred runner everywhere a single runner is expected (interactive
-sessions, `tm check`, board display, prompt template resolution, `tm work
-hooks install --user`), so only the lane-run dispatch path is aware
-priority mode exists at all — `tm review fix`, `tm ticket audit`/`create`,
-and interactive tmux sessions always use the preferred runner alone, no
-fallback.
+`default` is the runner a launch prefers, and it must be one of the
+`available` entries when both are set. `available` alone makes its first
+entry the default. `default` alone makes it the only runner, with no
+fallback. An empty `available`, an unknown runner name, or a duplicate
+entry is a config error. So is mixing `default` or `available` with the
+legacy `runner`, `strategy` or `order` keys in one `[agent]` table. The
+legacy priority form (`strategy = "priority"` with `order = [...]`) still
+loads: it means `default = order[0]` and `available = order`. A repo
+`[agent]` table that sets any of these routing keys replaces the global
+one as a whole.
+
+`default` is the runner used everywhere a single runner is expected
+(interactive sessions, `tm check`, board display, prompt template
+resolution, `tm work hooks install --user`), so only the lane-run dispatch
+path uses the rest of `available`. `tm review fix`, `tm ticket
+audit`/`create`, and interactive tmux sessions always use the default
+runner alone, no fallback.
+
+Unattended launches (the autopilot dispatcher and `tm work run
+--unattended`) also route before launch. They check memory and usage
+admission on each runner in turn and launch on the first one that passes.
+See "Usage admission" above. The reactive routing below still backs that
+up once a run has started.
 
 Routing is **reactive**, not a live quota check: no runner exposes a
 stable "how much usage do I have left" API. Instead, `tm` classifies each
 finished attempt's result for a usage-limit shape (Claude's `usage limit
 reached`/`credit balance too low`/`rate limit` text, opencode's
 `error`-event payload for `rate limit`/`429`/`quota`/`credit`), and on a
-match falls back to the next runner in `order` for that run, retrying the
+match falls back to the next runner in `available` for that run, retrying the
 same prompt from scratch (sessions aren't portable across runners). The
 exhausted runner is remembered in `runs.db` and skipped on subsequent
 runs until its window reopens — the reset timestamp Claude's legacy
@@ -2822,7 +2876,7 @@ otherwise, since re-probing is cheap (the run still completes on the
 fallback runner; a premature probe costs one spawn, not the whole run). A
 successful run on a runner clears its recorded window, so a stale
 "exhausted" record self-heals rather than sticking around after the
-window has actually reset. If every runner in `order` is still within its
+window has actually reset. If every runner in `available` is still within its
 window, `tm` still runs — it probes whichever one recovers soonest rather
 than refusing to run at all.
 
