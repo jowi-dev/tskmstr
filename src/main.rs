@@ -2572,6 +2572,7 @@ fn run_runs(
             force,
             if_running,
             if_kind,
+            keep_status,
         }) => {
             let outcome = tskmstr::runs::FinishRun {
                 status: status.into(),
@@ -2593,6 +2594,7 @@ fn run_runs(
                 &tskmstr::cli::runs::FinishGuard {
                     if_running,
                     if_kind,
+                    keep_status,
                 },
                 agent_runner_or_default(full_config.as_ref()),
                 &mut stdout,

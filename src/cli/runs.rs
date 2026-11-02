@@ -201,6 +201,12 @@ pub struct FinishGuard {
     pub if_running: bool,
     /// Only finish a run of this kind.
     pub if_kind: Option<String>,
+    /// A run that has already ended (`review`, `done`, `failed`,
+    /// `interrupted`) keeps its status; the rest of the outcome (usage,
+    /// session id, ...) is still recorded. The SessionEnd hooks pass this so
+    /// the user exiting a session never turns the auto-review loop's
+    /// `review` flag back into `done` (GitHub issue #150).
+    pub keep_status: bool,
 }
 
 /// `tm runs finish`: record a run's terminal outcome.
@@ -218,7 +224,10 @@ pub struct FinishGuard {
 /// a condition fails the run is left untouched, `Left run {id} alone: ...`
 /// is printed, and `Ok(())` returned, so a hook can fire it blind. The
 /// guard is checked before the hibernation refusal, so a guarded finish of a
-/// hibernated run is a quiet no-op rather than an error.
+/// hibernated run is a quiet no-op rather than an error. With
+/// [`FinishGuard::keep_status`] (`--keep-status`), an already-ended run
+/// keeps its status and its first `ended_at`, the rule
+/// [`RunStore::finish_run_from_supervisor`] applies.
 pub fn finish(
     store: &RunStore,
     run_id: i64,
@@ -247,15 +256,18 @@ pub fn finish(
         }
     }
 
-    if !force
-        && store
-            .run_by_id(run_id)?
-            .is_some_and(|run| run.status == RunStatus::Hibernated)
-    {
+    let existing = store.run_by_id(run_id)?.map(|run| run.status);
+    if !force && existing == Some(RunStatus::Hibernated) {
         return Err(RunsCliError::Hibernated(run_id));
     }
 
     let mut outcome = outcome.clone();
+    let kept = existing.filter(|status| {
+        guard.keep_status && (status.is_terminal() || *status == RunStatus::Review)
+    });
+    if let Some(status) = kept {
+        outcome.status = status;
+    }
 
     if let Some(model_usage) = &outcome.model_usage {
         let value: serde_json::Value = serde_json::from_str(model_usage)
@@ -285,7 +297,11 @@ pub fn finish(
         }
     }
 
-    store.finish_run(run_id, &outcome)?;
+    if kept.is_some() {
+        store.finish_run_from_supervisor(run_id, &outcome, false)?;
+    } else {
+        store.finish_run(run_id, &outcome)?;
+    }
     writeln!(out, "Finished run {run_id}: {}", outcome.status.as_str())?;
     Ok(())
 }
@@ -1481,6 +1497,75 @@ mod tests {
         }
     }
 
+    /// `--keep-status` (GitHub issue #150): a SessionEnd after the
+    /// auto-review loop flagged its round for review records the session's
+    /// usage but leaves the flag in place.
+    #[test]
+    fn finish_keep_status_keeps_a_flagged_runs_status_and_records_its_usage() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.flag_for_review(id).unwrap();
+        let guard = FinishGuard {
+            keep_status: true,
+            ..FinishGuard::default()
+        };
+        let outcome = FinishRun {
+            status: RunStatus::Done,
+            session_id: Some("sess-1".to_string()),
+            ..FinishRun::default()
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &outcome, false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        let run = store.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Review);
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert!(run.ended_at.is_some(), "the flagged row is now ended");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Finished run {id}: review\n")
+        );
+    }
+
+    #[test]
+    fn finish_keep_status_still_finishes_a_running_run_with_the_given_status() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let guard = FinishGuard {
+            keep_status: true,
+            ..FinishGuard::default()
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
+    #[test]
+    fn finish_keep_status_still_refuses_a_hibernated_run() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.hibernate_run(id).unwrap();
+        let guard = FinishGuard {
+            keep_status: true,
+            ..FinishGuard::default()
+        };
+        let mut out = Vec::new();
+
+        let err = finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out)
+            .expect_err("a hibernated run is not finished");
+
+        assert!(matches!(err, RunsCliError::Hibernated(run) if run == id));
+    }
+
     /// `--if-running`: the SessionEnd hook's create fallback must not
     /// overwrite a row merge or an in-session `tm ticket create` already
     /// finished (GitHub issue #156).
@@ -1501,6 +1586,7 @@ mod tests {
         let guard = FinishGuard {
             if_running: true,
             if_kind: None,
+            ..FinishGuard::default()
         };
         let mut out = Vec::new();
 
@@ -1521,6 +1607,7 @@ mod tests {
         let guard = FinishGuard {
             if_running: true,
             if_kind: None,
+            ..FinishGuard::default()
         };
         let mut out = Vec::new();
 
@@ -1536,6 +1623,7 @@ mod tests {
         let guard = FinishGuard {
             if_running: true,
             if_kind: None,
+            ..FinishGuard::default()
         };
         let mut out = Vec::new();
 
@@ -1559,6 +1647,7 @@ mod tests {
         let guard = FinishGuard {
             if_running: false,
             if_kind: Some("create".to_string()),
+            ..FinishGuard::default()
         };
         let mut out = Vec::new();
 
@@ -1580,6 +1669,7 @@ mod tests {
         let guard = FinishGuard {
             if_running: true,
             if_kind: Some("create".to_string()),
+            ..FinishGuard::default()
         };
         let mut out = Vec::new();
 

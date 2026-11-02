@@ -1047,6 +1047,12 @@ pub enum RunsCmd {
         /// and exit 0.
         #[arg(long, value_name = "KIND")]
         if_kind: Option<String>,
+        /// Leave an already-ended run's status (review, done, failed,
+        /// interrupted) as it is, recording only the rest of the outcome.
+        /// The session-end hooks pass this so exiting a session never
+        /// overwrites a status tm already set.
+        #[arg(long)]
+        keep_status: bool,
     },
     /// Appends a telemetry event to a run and bumps its heartbeat.
     Event {
@@ -2694,6 +2700,7 @@ mod tests {
             "--if-running",
             "--if-kind",
             "create",
+            "--keep-status",
         ])
         .expect("should parse");
         match cli.command {
@@ -2702,11 +2709,13 @@ mod tests {
                     Some(RunsCmd::Finish {
                         if_running,
                         if_kind,
+                        keep_status,
                         ..
                     }),
                 ..
             }) => {
                 assert!(if_running);
+                assert!(keep_status);
                 assert_eq!(if_kind.as_deref(), Some("create"));
             }
             other => panic!("expected Runs Finish, got {other:?}"),

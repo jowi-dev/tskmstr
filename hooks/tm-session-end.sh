@@ -26,6 +26,10 @@
 # already-finished row, or a pre-registered row of any other kind (an audit
 # that never recorded a verdict is not "done"), is left alone.
 #
+# --keep-status: a run tm already ended keeps its status, so a user exiting
+# an auto-review round's window after the loop flagged it for review does not
+# turn the flag back into done (GitHub issue #150).
+#
 # Always exits 0 — a telemetry hook must never disturb the session, and
 # never prints to stdout/stderr on success or failure.
 
@@ -81,9 +85,9 @@ if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
 fi
 
 if [ -n "$MAP" ] && [ "$MAP" != "{}" ]; then
-  tm runs finish "$RUN_ID" --status done --model-usage "$MAP" >/dev/null 2>&1
+  tm runs finish "$RUN_ID" --status done --keep-status --model-usage "$MAP" >/dev/null 2>&1
 else
-  tm runs finish "$RUN_ID" --status done >/dev/null 2>&1
+  tm runs finish "$RUN_ID" --status done --keep-status >/dev/null 2>&1
 fi
 
 rm -f "$MARKER" 2>/dev/null
