@@ -897,7 +897,8 @@ impl AdmissionDeps<'_> {
 
     /// [`AdmissionDeps::admit`] for a launch path whose run store is
     /// optional. With no store there is nothing to count or read usage
-    /// from, so the launch is admitted with a warning on `out`.
+    /// from, so the launch is admitted, with a warning on `out` when a
+    /// memory budget is configured.
     ///
     /// # Errors
     ///
@@ -912,10 +913,12 @@ impl AdmissionDeps<'_> {
         match store {
             Some(store) => self.admit(store, request, origin, out),
             None => {
-                let _ = writeln!(
-                    out,
-                    "warning: no run store; launching without memory or usage admission"
-                );
+                if self.memory.budget_bytes.is_some() {
+                    let _ = writeln!(
+                        out,
+                        "warning: no run store; launching without memory or usage admission"
+                    );
+                }
                 Ok(Admitted(()))
             }
         }

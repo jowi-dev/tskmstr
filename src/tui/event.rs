@@ -2369,6 +2369,7 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     };
 
     let message = match crate::work::audit::launch_audit(
+        &deps.admission.deps(),
         store,
         deps.tmux.as_ref(),
         &deps.audit,
@@ -2378,11 +2379,17 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         model_defaults(deps),
         key,
     ) {
-        Ok(_) if deps.audit_dir_fallback => format!(
-            "launched audit for {key} in the current repo (configured audit dir is \
-             backend-incompatible) -- press a to attach"
+        Ok(outcome) if deps.audit_dir_fallback => with_warning(
+            format!(
+                "launched audit for {key} in the current repo (configured audit dir is \
+                 backend-incompatible) -- press a to attach"
+            ),
+            outcome.warning,
         ),
-        Ok(_) => format!("launched audit for {key} -- press a to attach"),
+        Ok(outcome) => with_warning(
+            format!("launched audit for {key} -- press a to attach"),
+            outcome.warning,
+        ),
         Err(crate::work::audit::AuditLaunchError::AlreadyRunning {
             session_name,
             window_name,
@@ -2402,12 +2409,14 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
 /// An [`AlreadyRunning`](crate::work::create::CreateLaunchError::AlreadyRunning)
 /// outcome attaches too — a second `c` press is "take me back to my draft",
 /// never a duplicate session. Only `NotConfigured` and tmux failures skip
-/// the attach, surfacing as a plain status line. Unlike [`launch_audit_cmd`]
+/// the attach, surfacing as a plain status line; so does an admission
+/// refusal (GitHub issue #149). Unlike [`launch_audit_cmd`]
 /// there is no `deps.store` guard: the `create` row the launch pre-registers
 /// (GitHub issue #156) is telemetry, skipped when the store is unavailable,
 /// so a broken runs DB never blocks creating tickets.
 fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDeps) -> String {
-    let session_name = match crate::work::create::launch_create(
+    let (session_name, warning) = match crate::work::create::launch_create(
+        &deps.admission.deps(),
         deps.store.as_ref(),
         deps.tmux.as_ref(),
         &deps.create,
@@ -2416,13 +2425,16 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
         deps.runner,
         model_defaults(deps),
     ) {
-        Ok(outcome) => outcome.session_name,
+        Ok(outcome) => (outcome.session_name, outcome.warning),
         Err(crate::work::create::CreateLaunchError::AlreadyRunning { session_name, .. }) => {
-            session_name
+            (session_name, None)
         }
         Err(err) => return err.to_string(),
     };
-    let message = attach_session(terminal, deps.tmux.as_ref(), &session_name);
+    let message = with_warning(
+        attach_session(terminal, deps.tmux.as_ref(), &session_name),
+        warning,
+    );
     if deps.create_dir_fallback {
         format!(
             "{message} (create session ran in the current repo; configured create dir is \

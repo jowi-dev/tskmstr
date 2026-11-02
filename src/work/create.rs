@@ -70,6 +70,10 @@ pub enum CreateLaunchError {
     /// `create_cfg.prompt_file` was set but could not be read.
     #[error(transparent)]
     PromptFile(#[from] crate::work::prompt::PromptFileError),
+
+    /// Memory admission refused the session (GitHub issue #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
 }
 
 /// Successful outcome of [`launch_create`].
@@ -84,6 +88,10 @@ pub struct CreateLaunchOutcome {
     /// The pre-registered `create` row, or `None` when no store was given
     /// or registering failed (telemetry never blocks the launch).
     pub run_id: Option<i64>,
+    /// Admission's warning for a launch that went ahead anyway (over a
+    /// usage ceiling, usage unknown, or no store), for the board's status
+    /// line.
+    pub warning: Option<String>,
 }
 
 /// Launches (or refuses to double-launch) the scope's ticket-creation
@@ -132,7 +140,9 @@ pub struct CreateLaunchOutcome {
 ///
 /// The session's model is `create_cfg.model`, else the rest of the chain
 /// `model_defaults` ends (GitHub issue #143, [`crate::work::model`]).
+#[allow(clippy::too_many_arguments)]
 pub fn launch_create(
+    admission: &crate::work::admission::AdmissionDeps<'_>,
     store: Option<&RunStore>,
     tmux: &dyn TmuxOps,
     create_cfg: &CreateConfig,
@@ -177,6 +187,22 @@ pub fn launch_create(
             model: create_cfg.model.as_deref(),
         }],
     );
+    // Admission (GitHub issue #149) before the row, so a refusal leaves
+    // none. A create session is human-started: over the memory budget it
+    // refuses, over a usage ceiling it warns and launches.
+    let mut warning = Vec::new();
+    let admitted = admission.admit_tracked(
+        store,
+        &crate::work::admission::LaunchRequest {
+            kind: CREATE_KIND,
+            agent: runner.name(),
+            repo: &crate::work::run::dir_repo_key(&dir),
+            own_run: None,
+        },
+        crate::work::admission::LaunchOrigin::Human,
+        &mut warning,
+    )?;
+    let _ = &admitted;
     let command = runner.interactive_shell_command(&model.model, prompt);
 
     let run_id = store.and_then(|store| preregister(store, identity, &dir, runner));
@@ -215,6 +241,7 @@ pub fn launch_create(
         session_name,
         window_name,
         run_id,
+        warning: crate::work::admission::warning_text(&warning),
     })
 }
 
@@ -293,6 +320,7 @@ mod tests {
         let cfg = configured("~/Projects/axiom");
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -324,6 +352,39 @@ mod tests {
         RunStore::open(&dir.join("runs.db")).expect("open should succeed")
     }
 
+    #[test]
+    fn launch_create_over_the_memory_budget_is_refused_before_its_row() {
+        let db = tempfile::tempdir().unwrap();
+        let store = open_store(db.path());
+        let tmux = FakeTmuxOps::new();
+        let cfg = configured("/repo/axiom");
+
+        let err = launch_create(
+            &crate::work::admission::AdmissionDeps::with_budget(1),
+            Some(&store),
+            &tmux,
+            &cfg,
+            Path::new("/Users/jowi"),
+            &test_identity(),
+            RUNNER,
+            crate::work::model::ModelDefaults::none(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded: axiom/claude create runs"),
+            "{err}"
+        );
+        assert!(store.list_runs().unwrap().is_empty());
+        assert!(
+            !tmux
+                .calls()
+                .iter()
+                .any(|c| matches!(c, TmuxCall::NewSessionWithCommand { .. })),
+        );
+    }
+
     /// GitHub issue #156: pressing `c` leaves a running `create` row at
     /// once, before any ticket exists, for the session's first `tm ticket
     /// create` to adopt.
@@ -335,6 +396,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             Some(&store),
             &tmux,
             &cfg,
@@ -390,6 +452,7 @@ mod tests {
         let tmux = tmux_with_windows(&[("tm-proj-create", "create", true)]);
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             Some(&store),
             &tmux,
             &configured("/repo/axiom"),
@@ -419,6 +482,7 @@ mod tests {
         let tmux = FakeTmuxOps::new();
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &configured("/repo/axiom"),
@@ -445,6 +509,7 @@ mod tests {
         let tmux = tmux_with_windows(&[("tm-proj-create", "create", false)]);
 
         let result = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             Some(&store),
             &tmux,
             &configured("/repo/axiom"),
@@ -472,6 +537,7 @@ mod tests {
         };
 
         let result = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             Some(&store),
             &tmux,
             &cfg,
@@ -492,6 +558,7 @@ mod tests {
         let cfg = CreateConfig::default();
 
         let err = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -513,6 +580,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let err = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -545,6 +613,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -584,6 +653,7 @@ mod tests {
         let cfg = configured("/repo/axiom");
 
         let outcome = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -615,6 +685,7 @@ mod tests {
         };
 
         launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -647,6 +718,7 @@ mod tests {
         };
 
         launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -682,6 +754,7 @@ mod tests {
         };
 
         launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
@@ -716,6 +789,7 @@ mod tests {
         };
 
         let err = launch_create(
+            &crate::work::admission::AdmissionDeps::off(),
             None,
             &tmux,
             &cfg,
