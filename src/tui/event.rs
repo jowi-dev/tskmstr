@@ -286,6 +286,12 @@ pub struct TuiDeps {
     /// The autopilot host thread ticking the board's own scope, and
     /// `max_lanes` (GitHub issue #116).
     pub autopilot: AutopilotDeps,
+    /// Memory and usage admission for the agents the board starts in
+    /// process: audit, create and bugbot-cleanup sessions, and hibernate
+    /// wake (GitHub issue #149). A refusal or warning shows in the status
+    /// line. Lane runs, fix passes and merges go through their `tm`
+    /// commands' own admission.
+    pub admission: crate::work::admission::OwnedAdmission,
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, `tm review fix`,
@@ -2427,6 +2433,15 @@ fn launch_create_and_attach<B: Backend>(terminal: &mut Terminal<B>, deps: &TuiDe
     }
 }
 
+/// Appends an admission warning (GitHub issue #149) to a launch's status
+/// message.
+fn with_warning(message: String, warning: Option<String>) -> String {
+    match warning {
+        Some(warning) => format!("{message} ({warning})"),
+        None => message,
+    }
+}
+
 /// Run `Cmd::LaunchCleanup`: launch a bugbot-cleanup session for `key` via
 /// [`crate::work::bugbot::launch_cleanup`], mapping the outcome to a
 /// status-line message. Mirrors [`launch_audit_cmd`] exactly, including its
@@ -2442,6 +2457,7 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         tmux: deps.tmux.as_ref(),
         runner: deps.runner,
         model_defaults: model_defaults(deps),
+        admission: deps.admission.deps(),
     };
     let request = crate::work::bugbot::CleanupLaunchRequest {
         cfg: &deps.review_watch,
@@ -2449,10 +2465,14 @@ fn launch_cleanup_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         xdg_data_home: deps.xdg_data_home.as_deref(),
         identity: &deps.backend_identity,
         key,
+        unattended: false,
     };
 
     let message = match crate::work::bugbot::launch_cleanup(&launch_deps, &request) {
-        Ok(_) => format!("launched bugbot cleanup for {key} -- press b to attach"),
+        Ok(outcome) => with_warning(
+            format!("launched bugbot cleanup for {key} -- press b to attach"),
+            outcome.warning,
+        ),
         Err(crate::work::bugbot::CleanupLaunchError::AlreadyRunning {
             session_name,
             window_name,
@@ -3046,6 +3066,7 @@ mod tests {
             runner: &crate::agent::claude::ClaudeRunner,
             status_on_merge: None,
             autopilot: AutopilotDeps::default(),
+            admission: crate::work::admission::OwnedAdmission::off(),
         }
     }
 
@@ -6647,6 +6668,49 @@ mod tests {
                 "launched bugbot cleanup for PROJ-1 -- press b to attach".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn launch_cleanup_cmd_surfaces_an_admission_refusal_and_a_usage_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        deps.store = Some(store);
+        deps.review_watch = crate::config::ReviewWatchConfig {
+            dir: Some("/repo/axiom".to_string()),
+            ..crate::config::ReviewWatchConfig::default()
+        };
+        deps.admission.memory.budget_bytes = Some(1);
+
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::BotsActionResult(message)] => {
+                assert!(
+                    message.starts_with("not launching: memory budget exceeded"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BotsActionResult, got {other:?}"),
+        }
+
+        deps.admission.memory.budget_bytes = None;
+        deps.store
+            .as_ref()
+            .unwrap()
+            .set_agent_exhausted_until("claude", i64::MAX / 2)
+            .unwrap();
+        let msgs = launch_cleanup_cmd(&deps, "PROJ-1");
+        match msgs.as_slice() {
+            [Msg::BotsActionResult(message)] => {
+                assert!(
+                    message.starts_with("launched bugbot cleanup for PROJ-1")
+                        && message.contains("usage window exhausted")
+                        && message.contains("launching anyway"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BotsActionResult, got {other:?}"),
+        }
     }
 
     #[test]

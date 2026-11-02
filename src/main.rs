@@ -167,6 +167,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
     let tmux = ShellTmuxOps::new();
     let git = ShellGitOps::new();
     let backend_identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let cleanup_admission = owned_admission(Some(&config), agent_runner_for(&config));
     let cleanup_launcher = tskmstr::work::bugbot::RealCleanupLauncher {
         store: &run_store,
         tmux: &tmux,
@@ -176,6 +177,7 @@ fn run_pr_watch(key: String, foreground: bool) -> ExitCode {
         identity: &backend_identity,
         runner: agent_runner_for(&config),
         model_defaults: tskmstr::work::model::ModelDefaults::from_config(&config),
+        admission: cleanup_admission.deps(),
     };
     let deps = tskmstr::cli::pr::PrWatchDeps {
         run_store: &run_store,
@@ -967,6 +969,7 @@ fn run_board(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load(paths)?;
     let runner = agent_runner_for(&config);
+    let admission = owned_admission(Some(&config), runner);
     let store = tskmstr::runs::RunStore::open(&run_db_path_from_config(&config)).ok();
     let tmux = ShellTmuxOps::new();
     let home = std::env::var_os("HOME")
@@ -1074,6 +1077,7 @@ fn run_board(
             runner,
             status_on_merge: config.status_on_merge,
             autopilot,
+            admission,
         },
         net,
     )?;
@@ -2445,37 +2449,39 @@ fn with_review_deps<T>(
     }))
 }
 
-/// Runs `f` with production memory and usage admission (GitHub issue #149)
-/// for launches of `runner`: the loaded config's `[work]` memory and
-/// `[agent.<runner>]` usage settings (the defaults with no config), a
-/// [`tskmstr::work::admission::SpawnUsageProber`], the kernel's memory
-/// pressure, and a real sleeper for unattended waits.
+/// Production memory and usage admission (GitHub issue #149) for launches
+/// of `runner`: the loaded config's `[work]` memory and `[agent.<runner>]`
+/// usage settings (the defaults with no config), a
+/// [`tskmstr::work::admission::SpawnUsageProber`], and the kernel's memory
+/// pressure. The configured models the prober resolves its model from are
+/// leaked: they live as long as the process does anyway.
+fn owned_admission(
+    config: Option<&tskmstr::config::Config>,
+    runner: &'static dyn tskmstr::agent::AgentRunner,
+) -> tskmstr::work::admission::OwnedAdmission {
+    let models: &'static tskmstr::config::ModelsConfig = Box::leak(Box::new(
+        config.map(|c| c.models.clone()).unwrap_or_default(),
+    ));
+    tskmstr::work::admission::OwnedAdmission {
+        memory: config.map(|c| c.work.memory.clone()).unwrap_or_default(),
+        usage: config.map(|c| c.usage.clone()).unwrap_or_default(),
+        prober: Box::new(tskmstr::work::admission::SpawnUsageProber {
+            runners: vec![runner],
+            models,
+            spawner: &tskmstr::work::runner::StdProcessSpawner,
+        }),
+        pressure: tskmstr::runs::footprint::memory_pressure,
+    }
+}
+
+/// Runs `f` with [`owned_admission`]'s admission for launches of `runner`.
 fn with_admission<T>(
     config: Option<&tskmstr::config::Config>,
-    runner: &dyn tskmstr::agent::AgentRunner,
+    runner: &'static dyn tskmstr::agent::AgentRunner,
     f: impl FnOnce(tskmstr::work::admission::AdmissionDeps<'_>) -> T,
 ) -> T {
-    let memory = config.map(|c| c.work.memory.clone()).unwrap_or_default();
-    let usage = config.map(|c| c.usage.clone()).unwrap_or_default();
-    let models = config.map(|c| c.models.clone()).unwrap_or_default();
-    let spawner = tskmstr::work::runner::StdProcessSpawner;
-    let prober = tskmstr::work::admission::SpawnUsageProber {
-        runners: vec![runner],
-        models: &models,
-        spawner: &spawner,
-    };
-    f(tskmstr::work::admission::AdmissionDeps {
-        memory: &memory,
-        usage: &usage,
-        prober: &prober,
-        pressure: &tskmstr::runs::footprint::memory_pressure,
-        sleeper: &tskmstr::work::review_watch::RealSleeper,
-        now: &|| {
-            tskmstr::work::review_watch::Clock::now_unix_secs(
-                &tskmstr::work::review_watch::SystemClock,
-            )
-        },
-    })
+    let owned = owned_admission(config, runner);
+    f(owned.deps())
 }
 
 /// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.

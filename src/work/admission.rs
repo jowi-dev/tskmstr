@@ -658,6 +658,14 @@ impl AdmissionError {
     }
 }
 
+/// The warning lines admission wrote to an `out` buffer for a human launch,
+/// joined for a one-line status message, or `None` when there were none.
+pub fn warning_text(out: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(out);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
 /// How often an unattended launch rechecks admission while it waits.
 pub const ADMISSION_RECHECK_SECS: u64 = 30;
 
@@ -738,6 +746,59 @@ impl AdmissionGate<'_> {
                 }
                 other => return other,
             }
+        }
+    }
+}
+
+/// [`AdmissionDeps`] with owned settings, for a long-lived host that
+/// launches many times: the board and the runs overview (GitHub issue
+/// #149). [`OwnedAdmission::deps`] borrows it per launch.
+pub struct OwnedAdmission {
+    /// See [`AdmissionDeps::memory`].
+    pub memory: MemoryConfig,
+    /// See [`AdmissionDeps::usage`].
+    pub usage: crate::config::UsageConfig,
+    /// See [`AdmissionDeps::prober`].
+    pub prober: Box<dyn UsageProber>,
+    /// See [`AdmissionDeps::pressure`].
+    pub pressure: fn() -> MemoryPressure,
+}
+
+impl OwnedAdmission {
+    /// The [`AdmissionDeps`] for one launch, with a real sleeper and the
+    /// system clock.
+    pub fn deps(&self) -> AdmissionDeps<'_> {
+        AdmissionDeps {
+            memory: &self.memory,
+            usage: &self.usage,
+            prober: self.prober.as_ref(),
+            pressure: &self.pressure,
+            sleeper: &crate::work::review_watch::RealSleeper,
+            now: &|| {
+                crate::work::review_watch::Clock::now_unix_secs(
+                    &crate::work::review_watch::SystemClock,
+                )
+            },
+        }
+    }
+
+    /// Admission off and never probing, like [`AdmissionDeps::off`].
+    #[cfg(test)]
+    pub fn off() -> Self {
+        struct NeverProbe;
+        impl UsageProber for NeverProbe {
+            fn supports(&self, _agent: &str) -> bool {
+                false
+            }
+            fn probe(&self, agent: &str) -> Result<UsageSnapshot, String> {
+                Err(format!("{agent} is never probed in tests"))
+            }
+        }
+        OwnedAdmission {
+            memory: MemoryConfig::default(),
+            usage: crate::config::UsageConfig::default(),
+            prober: Box::new(NeverProbe),
+            pressure: || MemoryPressure::Normal,
         }
     }
 }
