@@ -43,7 +43,7 @@ use thiserror::Error;
 use crate::agent::{AgentRunner, RunMode};
 use crate::config::AutoReviewConfig;
 use crate::github::gh_cli::GhCli;
-use crate::runs::{RunStatus, RunStore, RunStoreError};
+use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
     AUTO_REVIEW_KIND, AutoReviewError, AutoReviewOps, DEFAULT_PROMPT, LOOP_PID_EVENT, LoopOutcome,
@@ -141,13 +141,13 @@ pub enum ReviewCliError {
     #[error(transparent)]
     Interactive(#[from] InteractiveLaunchError),
 
-    /// `tm review auto`: an auto-review round for this ticket is already
-    /// running; a second loop would race it over the same comment store.
-    #[error("an auto-review round for {ticket} is already running (run {run_id})")]
+    /// `tm review auto`: the auto-review loop for this ticket is still
+    /// alive; a second loop would race it over the same comment store.
+    #[error("an auto-review loop for {ticket} is already running (round run {run_id})")]
     AutoReviewRunning {
         /// The ticket key.
         ticket: String,
-        /// The running round's run id.
+        /// The live loop's newest round's run id.
         run_id: i64,
     },
 
@@ -580,6 +580,29 @@ pub fn detached_auto_review_argv(key: &str) -> Vec<String> {
     ]
 }
 
+/// Whether the `tm review auto` loop that created auto-review row `run` is
+/// still alive: the pid of the row's latest [`LOOP_PID_EVENT`], or for a
+/// row from before that event, a running row's own pid, which was the
+/// loop's. The same rule as the board's `review:` badge. An interactive
+/// row's status follows its agent, which outlives the loop in its window,
+/// so status alone says nothing about the loop (GitHub issue #150). A store
+/// error reads as not alive, so it never blocks a new loop.
+fn auto_review_loop_alive(store: &RunStore, run: &Run) -> bool {
+    let loop_pid = store.events_for_run(run.id).ok().and_then(|events| {
+        events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == LOOP_PID_EVENT)
+            .find_map(|event| event.detail.as_deref()?.trim().parse::<u32>().ok())
+    });
+    let pid = match loop_pid {
+        Some(pid) => Some(pid),
+        None if run.status == RunStatus::Running => run.pid,
+        None => None,
+    };
+    pid.is_some_and(crate::runs::pid::pid_alive)
+}
+
 /// The PR number at the end of a GitHub pull-request URL.
 fn pr_number_from_url(url: &str) -> Option<u64> {
     url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
@@ -588,8 +611,9 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
 /// `tm review auto <KEY> [--foreground]` (GitHub issue #124): see
 /// `docs/plans/gh-124-auto-review.md`.
 ///
-/// Without `foreground`, refuses if an auto-review round for KEY is already
-/// running, then re-execs a detached `tm review auto <KEY> --foreground` in
+/// Without `foreground`, refuses if the loop behind KEY's newest
+/// auto-review round is still alive ([`auto_review_loop_alive`]), then
+/// re-execs a detached `tm review auto <KEY> --foreground` in
 /// the ticket's worktree, the same shape as `tm pr watch`. With it, runs
 /// [`run_loop`] here: each review round is an interactive `auto-review` run
 /// on the ticket's lane worktree and branch, hosted in a `review` window of
@@ -637,7 +661,7 @@ pub fn auto(
             &run.ticket,
             Some(AUTO_REVIEW_KIND),
         )?;
-        if let Some(live) = live.filter(|r| r.status == RunStatus::Running) {
+        if let Some(live) = live.filter(|r| auto_review_loop_alive(deps.run_store, r)) {
             return Err(ReviewCliError::AutoReviewRunning {
                 ticket: run.ticket.clone(),
                 run_id: live.id,
@@ -2166,8 +2190,103 @@ mod tests {
         assert!(spawner.recorded.lock().unwrap().is_empty());
     }
 
+    /// Starts an auto-review row for PROJ-1 whose loop pid is `loop_pid`.
+    fn seed_auto_review_row(run_store: &RunStore, worktree: &Path, loop_pid: u32) -> i64 {
+        let id = run_store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: "PROJ-1".to_string(),
+                lane: "mylane".to_string(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                branch: Some("jowi-dev/proj-1-slug".to_string()),
+                pid: Some(std::process::id()),
+                kind: AUTO_REVIEW_KIND.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        run_store
+            .add_event(id, LOOP_PID_EVENT, Some(&loop_pid.to_string()))
+            .unwrap();
+        id
+    }
+
+    /// A pid with no process behind it: a child that has already exited.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
     #[test]
-    fn auto_refuses_a_second_loop_while_a_round_is_running() {
+    fn auto_refuses_a_second_loop_while_the_first_loop_is_alive() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        let id = seed_auto_review_row(&run_store, &worktree, std::process::id());
+        // The step signalled and its agent exited, but the loop is between
+        // steps.
+        run_store
+            .finish_run(
+                id,
+                &crate::runs::FinishRun {
+                    status: RunStatus::Done,
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let err = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ReviewCliError::AutoReviewRunning { run_id, .. } if run_id == id));
+        assert!(fakes.detach.recorded.lock().unwrap().is_empty());
+    }
+
+    /// GitHub issue #150: an interactive round's row stays `running` while
+    /// its agent idles in the window, so a loop that died leaves a running
+    /// row behind; that must not block a new loop.
+    #[test]
+    fn auto_starts_a_new_loop_over_a_running_round_whose_loop_died() {
+        let (tmp, run_store, worktree) = setup();
+        seed_lane_run(&run_store, &worktree);
+        seed_auto_review_row(&run_store, &worktree, dead_pid());
+        let fakes = auto_fakes(&tmp);
+        let spawner = FakeProcessSpawner::success(canned_json());
+        let deps = auto_deps(&fakes, &run_store, &spawner);
+        let mut out = Vec::new();
+
+        let outcome = auto(
+            &deps,
+            &paths(&tmp),
+            &AutoReviewConfig::default(),
+            crate::config::DEFAULT_MAX_FIX_ROUNDS,
+            &[],
+            "PROJ-1",
+            false,
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, AutoOutcome::Detached { .. }));
+        assert_eq!(fakes.detach.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// A row from before [`LOOP_PID_EVENT`] carries the loop's pid itself.
+    #[test]
+    fn auto_refuses_a_second_loop_over_a_running_pre_event_round() {
         let (tmp, run_store, worktree) = setup();
         seed_lane_run(&run_store, &worktree);
         run_store
@@ -2177,7 +2296,7 @@ mod tests {
                 lane: "mylane".to_string(),
                 worktree: worktree.to_string_lossy().into_owned(),
                 branch: Some("jowi-dev/proj-1-slug".to_string()),
-                pid: None,
+                pid: Some(std::process::id()),
                 kind: AUTO_REVIEW_KIND.to_string(),
                 log_path: None,
             })
