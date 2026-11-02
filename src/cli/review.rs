@@ -351,9 +351,17 @@ pub fn fix(
     let target = match dispatch {
         Dispatch::Interactive | Dispatch::Headless => {
             let windows = deps.tmux.list_windows()?;
+            let slug = deps.backend_identity.session_slug();
+            // A finished fix pass's window stays open beside the next one
+            // (GitHub issue #150).
+            let ended = crate::work::hibernate::ended_launch_windows(
+                deps.run_store,
+                &crate::work::naming::ticket_session_name(&slug, &run.ticket),
+            )?;
             Some(resolve_action_window(
                 &windows,
-                &deps.backend_identity.session_slug(),
+                &ended,
+                &slug,
                 &run.ticket,
                 FIX_WINDOW_NAME,
             )?)

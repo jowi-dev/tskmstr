@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn launch_and_report_viewer_reports_the_window_and_how_to_attach() {
-        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], &[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
         let mut out = Vec::new();
 
@@ -264,7 +264,7 @@ mod tests {
     /// running by now, so a tmux failure must not become a command failure.
     #[test]
     fn launch_and_report_viewer_reports_a_tmux_failure_without_failing() {
-        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], &[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let mut out = Vec::new();
 
         launch_and_report_viewer(
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn launch_viewer_window_creates_the_session_with_a_shell_window() {
-        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], &[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", Path::new("/bin/tm"), 9).unwrap();
@@ -333,7 +333,8 @@ mod tests {
             name: "audit".to_string(),
             dead: true,
         }];
-        let target = resolve_action_window(&windows, "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target =
+            resolve_action_window(&windows, &[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", Path::new("/bin/tm"), 9).unwrap();
@@ -356,7 +357,7 @@ mod tests {
     /// to start in this window to adopt a row that is already owned.
     #[test]
     fn launch_viewer_window_passes_no_run_id_environment() {
-        let target = resolve_action_window(&[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
+        let target = resolve_action_window(&[], &[], "proj", "PROJ-1", WORK_WINDOW_NAME).unwrap();
         let tmux = FakeTmuxOps::new();
 
         launch_viewer_window(&tmux, &target, "/wt/proj-1", &PathBuf::from("/bin/tm"), 9).unwrap();

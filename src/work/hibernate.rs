@@ -136,6 +136,40 @@ pub fn launch_record(store: &RunStore, run_id: i64) -> Result<Option<LaunchRecor
         .find_map(|event| serde_json::from_str(event.detail.as_deref()?).ok()))
 }
 
+/// The launch windows of tmux session `session_name` whose run has ended
+/// (`review`, `done`, `failed`, `interrupted`): open windows with nothing
+/// running in them, which [`crate::work::interactive::resolve_action_window`]
+/// lets a new action open beside (GitHub issue #150). A window name decides
+/// by its newest run, so a name reused by a still-running run is not ended.
+///
+/// # Errors
+///
+/// A `RunStore` failure.
+pub fn ended_launch_windows(
+    store: &RunStore,
+    session_name: &str,
+) -> Result<Vec<String>, RunStoreError> {
+    let mut seen = Vec::new();
+    let mut ended = Vec::new();
+    // `all_runs` is newest-first, so the first run seen per window decides.
+    for run in store.all_runs()? {
+        if run.tmux_session.as_deref() != Some(session_name) {
+            continue;
+        }
+        let Some(record) = launch_record(store, run.id)? else {
+            continue;
+        };
+        if seen.contains(&record.window) {
+            continue;
+        }
+        if run.status.is_terminal() || run.status == RunStatus::Review {
+            ended.push(record.window.clone());
+        }
+        seen.push(record.window);
+    }
+    Ok(ended)
+}
+
 /// Hibernate every idle interactive run (see the module docs for the exact
 /// rule). A no-op when `idle_mins` is `0`, the opt-out.
 ///
@@ -360,6 +394,52 @@ mod tests {
         let id = interactive_run(&store, 0, true);
 
         assert_eq!(launch_record(&store, id).unwrap(), Some(record()));
+    }
+
+    #[test]
+    fn ended_launch_windows_names_windows_whose_newest_run_has_ended() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let with_window = |window: &str, status: Option<RunStatus>| {
+            let id = interactive_run(&store, 0, false);
+            record_launch(
+                &store,
+                id,
+                &LaunchRecord {
+                    window: window.to_string(),
+                    resume: spec(),
+                },
+            )
+            .unwrap();
+            match status {
+                Some(RunStatus::Review) => store.flag_for_review(id).unwrap(),
+                Some(status) => store
+                    .finish_run(
+                        id,
+                        &crate::runs::FinishRun {
+                            status,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                None => {}
+            }
+        };
+        with_window("review", Some(RunStatus::Done));
+        with_window("fix", Some(RunStatus::Review));
+        // A later run reusing `work` is still running.
+        with_window("work", Some(RunStatus::Done));
+        with_window("work", None);
+
+        let mut ended = ended_launch_windows(&store, SESSION).unwrap();
+        ended.sort();
+
+        assert_eq!(ended, vec!["fix".to_string(), "review".to_string()]);
+        assert!(
+            ended_launch_windows(&store, "tm-proj-other")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
