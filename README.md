@@ -66,7 +66,9 @@ place, and author any session skills the config references but that exist
 nowhere on disk —
 asking you the things the repo can't answer (deploy rules, forbidden
 paths, review conventions). Declining keeps the static skeleton; review
-and commit whatever the session writes.
+and commit whatever the session writes. While it runs, the session shows in
+`tm runs` as a `setup` run (ticket `setup`), finished `done` or `failed`
+from the agent's exit status.
 
 When you configure a lane, `tm init` also offers to set up a **delegation
 subagent** for it: name the agent (e.g. `impl`) and the model its delegated
@@ -216,7 +218,7 @@ tm auth status
 | `tm dispatch on\|off [--scope S \| --all]` | Turn autopilot on or off. `on` inside a repo also records the repo for `tick --all`; `off --all` is the kill switch |
 | `tm dispatch status` | Per scope: on or off, running lanes, last tick, time since the last launch, and the refusal blocking it now (with how long it has lasted) |
 | `tm` / `tm board` | Open the interactive TUI board of your assigned tickets |
-| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `review-watch`, `bugbot-cleanup`) |
+| `tm runs [--kind <KIND>]` | List every recorded run in a table, optionally restricted to one `kind` (`lane`, `audit`, `create`, `review-fix`, `auto-review`, `review-watch`, `bugbot-cleanup`, `setup`) |
 | `tm runs --by-outcome [--kind <KIND>]` | Print cost totals grouped by bot-findings outcome (not measured / clean / findings) instead of listing individual runs |
 | `tm runs --by-retro [--kind <KIND>]` | Print cost totals grouped by shipped-ticket retro verdict (clean / defect, from `tm ticket retro`) instead of listing individual runs; tickets with a recorded verdict but no run are counted separately rather than as a `$0` run |
 | `tm runs start --ticket <KEY> --lane <LANE> --worktree <PATH> [--branch] [--pid] [--kind <KIND>]` | Record the start of a run (`--kind` defaults to `lane`); prints the new run id |
