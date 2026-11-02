@@ -177,6 +177,11 @@ pub struct RawReadyConfig {
     /// the gate is per-machine. Defaults to `true`; `false` restores the
     /// blockers-only check.
     pub require_audit: Option<bool>,
+    /// Whether a ticket inherits its parent epic's unsatisfied blockers, so
+    /// a child of an epic still waiting on another epic is not ready in
+    /// `tm ready`, lane runs, or the board (GitHub issue #178). Defaults to
+    /// `true`; `false` judges each ticket by its own links only.
+    pub inherit_epic_blockers: Option<bool>,
 }
 
 /// Raw, partially-specified `[backend]` section as parsed directly from
@@ -900,6 +905,9 @@ pub struct Config {
     /// [`RawReadyConfig::require_audit`]; defaults to `true` when `[ready]`
     /// is absent from both global and repo config.
     pub require_audit: bool,
+    /// Whether readiness inherits a parent epic's blockers. See
+    /// [`RawReadyConfig::inherit_epic_blockers`]; defaults to `true`.
+    pub inherit_epic_blockers: bool,
     /// Validated `[agent.<runner>]` usage-admission settings. See
     /// [`UsageConfig`] and GitHub issue #114.
     pub usage: UsageConfig,
@@ -2051,6 +2059,15 @@ fn merge_with_repo_dir(
         .and_then(|ready| ready.require_audit)
         .or(global.ready.as_ref().and_then(|ready| ready.require_audit))
         .unwrap_or(true);
+    let inherit_epic_blockers = repo
+        .ready
+        .as_ref()
+        .and_then(|ready| ready.inherit_epic_blockers)
+        .or(global
+            .ready
+            .as_ref()
+            .and_then(|ready| ready.inherit_epic_blockers))
+        .unwrap_or(true);
     let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
     let usage = merge_usage(global.agent.as_ref(), repo.agent.as_ref())?;
     let models = merge_models(global.agent.as_ref(), repo.agent.as_ref())?;
@@ -2135,6 +2152,7 @@ fn merge_with_repo_dir(
             agent,
             agent_fallbacks,
             require_audit,
+            inherit_epic_blockers,
             usage,
             models,
             dispatch,
@@ -2178,6 +2196,7 @@ fn merge_with_repo_dir(
                 agent,
                 agent_fallbacks,
                 require_audit,
+                inherit_epic_blockers,
                 usage,
                 models,
                 dispatch,
@@ -3047,10 +3066,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_inherit_epic_blockers_defaults_to_true() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert!(cfg.inherit_epic_blockers);
+    }
+
+    #[test]
+    fn merge_repo_ready_inherit_epic_blockers_overrides_global() {
+        let global = RawConfig {
+            ready: Some(RawReadyConfig {
+                inherit_epic_blockers: Some(true),
+                ..RawReadyConfig::default()
+            }),
+            ..raw_full()
+        };
+        let repo: RawConfig =
+            toml::from_str("[ready]\ninherit_epic_blockers = false\n").expect("toml");
+        let cfg = merge(global, Some(repo)).expect("should merge");
+        assert!(!cfg.inherit_epic_blockers);
+        assert!(cfg.require_audit, "the other [ready] key keeps its default");
+    }
+
+    #[test]
     fn merge_repo_ready_require_audit_overrides_global() {
         let global = RawConfig {
             ready: Some(RawReadyConfig {
                 require_audit: Some(true),
+                ..RawReadyConfig::default()
             }),
             ..raw_full()
         };

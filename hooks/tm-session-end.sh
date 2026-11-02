@@ -13,6 +13,8 @@
 # Aggregates the transcript into a bare per-model map (same aggregation as
 # tm-usage.sh, without the {"models": ...} wrapper) and finishes the run with
 # --model-usage when that map is non-empty; otherwise finishes without it.
+# Also records the transcript path (--transcript) whenever the hook input
+# carries one, so `tm runs logs` can render the session afterwards.
 # The marker is removed either way so a dead session never shadows a future
 # one with the same id. No marker means nothing to finish here: either the
 # session never registered, or a supervisor (tm merge) already finished the
@@ -84,11 +86,14 @@ if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
   ' "$TRANSCRIPT" 2>/dev/null)
 fi
 
+ARGS=(runs finish "$RUN_ID" --status done --keep-status)
 if [ -n "$MAP" ] && [ "$MAP" != "{}" ]; then
-  tm runs finish "$RUN_ID" --status done --keep-status --model-usage "$MAP" >/dev/null 2>&1
-else
-  tm runs finish "$RUN_ID" --status done --keep-status >/dev/null 2>&1
+  ARGS+=(--model-usage "$MAP")
 fi
+if [ -n "$TRANSCRIPT" ]; then
+  ARGS+=(--transcript "$TRANSCRIPT")
+fi
+tm "${ARGS[@]}" >/dev/null 2>&1
 
 rm -f "$MARKER" 2>/dev/null
 

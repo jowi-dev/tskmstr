@@ -191,14 +191,19 @@ pub fn user_hooks_dir(xdg_data_home: Option<&Path>, home: &Path) -> PathBuf {
     data_home.join("tskmstr").join("hooks")
 }
 
-/// Resolves Claude Code's own settings file: `$CLAUDE_CONFIG_DIR/settings.json`
-/// when set, else `<home>/.claude/settings.json`. Pure function of its
+/// Resolves Claude Code's config dir: `$CLAUDE_CONFIG_DIR` when set (passed
+/// in as `claude_config_dir`), else `<home>/.claude`. Pure function of its
 /// inputs, for the same testability reason as [`user_hooks_dir`].
-pub fn user_settings_path(claude_config_dir: Option<&Path>, home: &Path) -> PathBuf {
-    let config_dir = claude_config_dir
+pub fn config_dir(claude_config_dir: Option<&Path>, home: &Path) -> PathBuf {
+    claude_config_dir
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.join(".claude"));
-    config_dir.join("settings.json")
+        .unwrap_or_else(|| home.join(".claude"))
+}
+
+/// Resolves Claude Code's own settings file: `settings.json` under
+/// [`config_dir`].
+pub fn user_settings_path(claude_config_dir: Option<&Path>, home: &Path) -> PathBuf {
+    config_dir(claude_config_dir, home).join("settings.json")
 }
 
 /// Which of [`hook_scripts`]' embedded scripts are missing or stale (not
@@ -414,6 +419,14 @@ mod tests {
         let home = PathBuf::from("/home/joe");
         let got = user_hooks_dir(None, &home);
         assert_eq!(got, PathBuf::from("/home/joe/.local/share/tskmstr/hooks"));
+    }
+
+    #[test]
+    fn config_dir_prefers_claude_config_dir_else_home_dot_claude() {
+        let home = PathBuf::from("/home/u");
+        let cfg = PathBuf::from("/custom/claude");
+        assert_eq!(config_dir(Some(&cfg), &home), cfg);
+        assert_eq!(config_dir(None, &home), home.join(".claude"));
     }
 
     #[test]

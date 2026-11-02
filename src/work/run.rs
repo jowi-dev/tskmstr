@@ -190,6 +190,20 @@ pub enum RunLaneError {
         blockers: Vec<String>,
     },
 
+    /// The run's ticket sits under an epic that still waits on unfinished
+    /// work (GitHub issue #178, see [`resolve_blocker_stacking`]). A run
+    /// can't stack on a whole epic, so this refuses before any run row is
+    /// created. `[ready] inherit_epic_blockers = false` turns the check off.
+    #[error("{ticket} is not ready: its epic {epic} is still locked, blocked by {blockers}")]
+    EpicLocked {
+        /// The ticket the run was requested for.
+        ticket: String,
+        /// The ticket's parent epic.
+        epic: String,
+        /// The inherited blockers, `<KEY> (via epic <EPIC>)` each.
+        blockers: String,
+    },
+
     /// `request.ticket` was given as an empty (or all-whitespace) string.
     /// Lowercased, this becomes the worktree/branch-name component
     /// (`wt_name`), and `naming::worktree_path` silently collapses an empty
@@ -458,6 +472,9 @@ pub struct RunLaneDeps<'a> {
     /// [`crate::config::Config::models`]), which every attempt's model
     /// resolution ends in (GitHub issue #143, [`crate::work::model`]).
     pub models: &'a crate::config::ModelsConfig,
+    /// `[ready] inherit_epic_blockers`: whether a ticket under a locked epic
+    /// refuses to run (GitHub issue #178, see [`resolve_blocker_stacking`]).
+    pub inherit_epic_blockers: bool,
 }
 
 /// Already-resolved filesystem locations [`run_lane_fg`] needs, per
@@ -748,8 +765,13 @@ impl BlockerResolution {
 ///   blocker and its PR state — two parallel unmerged dependencies can't
 ///   both be stacked on, so blocker resolution refuses the run outright
 ///   rather than falling back (as it does for the in-flight case above).
+/// - [`StackDecision::BlockedByEpic`] → `Err(RunLaneError::EpicLocked)`:
+///   the ticket's parent epic still waits on another ticket (GitHub issue
+///   #178), and there is no branch to stack a whole epic on. Only checked
+///   when `inherit_epic_blockers` (`[ready] inherit_epic_blockers`) is set.
 ///
-/// Any ticket-provider failure while resolving blockers (a bad `get_issue`), or a
+/// Any ticket-provider failure while resolving blockers (a bad `get_issue`,
+/// including the parent epic's), or a
 /// **transient** `gh` failure from [`GhCli::pr_list_all`] (network error,
 /// rate limit, a `5xx`, expired auth, `gh` missing, a timeout — see
 /// [`GhError::is_permanent`]), short-circuits to `stacked_base: None` plus a
@@ -792,6 +814,7 @@ pub fn resolve_blocker_stacking(
     ticket: Option<&str>,
     in_flight: &InFlight,
     in_base: &dyn Fn(&str) -> bool,
+    inherit_epic_blockers: bool,
 ) -> Result<BlockerResolution, RunLaneError> {
     let Some(ticket_provider) = ticket_provider else {
         return Ok(BlockerResolution::default());
@@ -809,7 +832,15 @@ pub fn resolve_blocker_stacking(
         }
     };
 
-    if blocker_stacking::direct_blockers(&issue).is_empty() {
+    let epics =
+        blocker_stacking::ParentEpics::from_provider(ticket_provider, inherit_epic_blockers);
+    if !epics.needs_prs(&issue) {
+        // No PRs to look at, but a failed epic lookup still warns.
+        if let Err(err) = epics.lock(&issue, None, in_base) {
+            return Ok(BlockerResolution::warning(format!(
+                "warning: {err} for {ticket} — using normal base"
+            )));
+        }
         return Ok(BlockerResolution::default());
     }
 
@@ -834,8 +865,16 @@ pub fn resolve_blocker_stacking(
         }
     };
 
+    let epic_lock = match epics.lock(&issue, Some(&prs), in_base) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return Ok(BlockerResolution::warning(format!(
+                "warning: {err} for {ticket} — using normal base"
+            )));
+        }
+    };
     let unmerged = blocker_stacking::unmerged_direct_blockers(&issue, &prs, in_base);
-    match blocker_stacking::decide(unmerged, in_flight) {
+    match blocker_stacking::decide_with_epic(unmerged, epic_lock, in_flight) {
         StackDecision::Ready => Ok(BlockerResolution::default()),
         StackDecision::Stackable {
             blocker_key,
@@ -869,6 +908,11 @@ pub fn resolve_blocker_stacking(
                     .collect(),
             })
         }
+        StackDecision::BlockedByEpic(lock) => Err(RunLaneError::EpicLocked {
+            ticket: ticket.to_string(),
+            epic: lock.epic_key.clone(),
+            blockers: lock.describe(),
+        }),
     }
 }
 
@@ -1176,6 +1220,7 @@ pub fn prepare_run_lane(
             request.ticket.as_deref(),
             &in_flight,
             &|sha| containment.contains(sha),
+            deps.inherit_epic_blockers,
         ) {
             Ok(resolution) => resolution,
             Err(err) => {
@@ -2647,6 +2692,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -2722,6 +2768,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -2782,6 +2829,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -2841,6 +2889,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -2899,6 +2948,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -2959,6 +3009,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3022,6 +3073,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -3115,6 +3167,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -3201,6 +3254,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -3311,6 +3365,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -3655,6 +3710,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3711,6 +3767,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3780,6 +3837,7 @@ mod tests {
         let current_repo_dir = tmp.path().join("current-repo");
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3847,6 +3905,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3902,6 +3961,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -3963,6 +4023,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4021,6 +4082,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4079,6 +4141,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4135,6 +4198,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4220,6 +4284,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4291,6 +4356,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -4351,6 +4417,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4414,6 +4481,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4501,6 +4569,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4573,6 +4642,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4640,6 +4710,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4708,6 +4779,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4780,6 +4852,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4837,6 +4910,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4896,6 +4970,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -4958,6 +5033,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -5025,6 +5101,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -5090,6 +5167,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5180,6 +5258,7 @@ mod tests {
         let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5322,6 +5401,7 @@ mod tests {
         let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -5393,6 +5473,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5452,6 +5533,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5513,6 +5595,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5576,6 +5659,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let spawner = FakeProcessSpawner::success(canned_json());
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5654,6 +5738,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let spawner = FakeProcessSpawner::success(canned_json());
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5771,6 +5856,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5852,6 +5938,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5920,6 +6007,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -5988,6 +6076,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6050,6 +6139,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6110,6 +6200,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6183,6 +6274,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6242,6 +6334,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6332,6 +6425,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6397,6 +6491,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let spawner = FakeProcessSpawner::success(canned_json());
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6485,6 +6580,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6553,6 +6649,7 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_json());
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,
@@ -6611,6 +6708,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -6764,6 +6862,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -7069,6 +7168,7 @@ mod tests {
         let prepare_spawner = FakeProcessSpawner::success(canned_json());
 
         let prepare_deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,
@@ -7143,6 +7243,7 @@ mod tests {
             None,
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7161,11 +7262,87 @@ mod tests {
             Some("AX-1"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
         assert_eq!(resolution, BlockerResolution::default());
         assert!(gh.pr_list_all_calls().is_empty());
+    }
+
+    fn resolve_child_of_epic(
+        jira: &FakeJiraClient,
+        gh: &FakeGhCli,
+        inherit_epic_blockers: bool,
+    ) -> Result<BlockerResolution, RunLaneError> {
+        resolve_blocker_stacking(
+            Some(jira),
+            gh,
+            Path::new("/repo"),
+            Some(crate::blocker_stacking::epic_fixture::CHILD),
+            &InFlight::new(),
+            &|_| false,
+            inherit_epic_blockers,
+        )
+    }
+
+    /// GitHub issue #178: a lane refuses a child of a locked epic, naming
+    /// the epic and the blocker it inherits.
+    #[test]
+    fn resolve_blocker_stacking_refuses_a_child_of_a_locked_epic() {
+        use crate::blocker_stacking::epic_fixture::{self, CHILD, EPIC, UNLOCKER};
+        let jira = epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        let err = resolve_child_of_epic(&jira, &gh, true).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{CHILD} is not ready: its epic {EPIC} is still locked, blocked by {UNLOCKER} (via epic {EPIC})"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_runs_a_child_once_its_epic_is_unlocked() {
+        let jira = crate::blocker_stacking::epic_fixture::provider("done");
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+
+        assert_eq!(
+            resolve_child_of_epic(&jira, &gh, true).unwrap(),
+            BlockerResolution::default()
+        );
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_with_inheritance_off_ignores_the_epic() {
+        let jira = crate::blocker_stacking::epic_fixture::provider("indeterminate");
+        let gh = FakeGhCli::new();
+
+        assert_eq!(
+            resolve_child_of_epic(&jira, &gh, false).unwrap(),
+            BlockerResolution::default()
+        );
+        assert!(gh.pr_list_all_calls().is_empty());
+    }
+
+    #[test]
+    fn resolve_blocker_stacking_warns_when_the_epic_fails_to_load() {
+        use crate::blocker_stacking::epic_fixture::{self, CHILD, EPIC};
+        let jira = FakeJiraClient::new()
+            .with_issue(CHILD, epic_fixture::child())
+            .with_parent(CHILD, EPIC);
+        let gh = FakeGhCli::new();
+
+        let resolution = resolve_child_of_epic(&jira, &gh, true).unwrap();
+
+        assert_eq!(resolution.stacked_base, None);
+        assert!(
+            resolution.messages[0].contains(&format!("could not load parent epic {EPIC}")),
+            "{:?}",
+            resolution.messages
+        );
     }
 
     #[test]
@@ -7180,6 +7357,7 @@ mod tests {
             Some("AX-1"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7204,6 +7382,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7227,6 +7406,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|sha| sha == "aaa111",
+            true,
         )
         .unwrap();
 
@@ -7251,6 +7431,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7276,6 +7457,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
         assert_eq!(gh.pr_list_all_calls(), vec![repo_root.to_path_buf()]);
@@ -7308,6 +7490,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7338,6 +7521,7 @@ mod tests {
             Some("AX-2"),
             &in_flight,
             &|_| false,
+            true,
         )
         .unwrap_err();
 
@@ -7372,6 +7556,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap_err();
 
@@ -7398,6 +7583,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7425,6 +7611,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap();
 
@@ -7457,6 +7644,7 @@ mod tests {
             Some("AX-2"),
             &InFlight::new(),
             &|_| false,
+            true,
         )
         .unwrap_err();
 
@@ -7492,6 +7680,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -7575,6 +7764,7 @@ mod tests {
         let clock = FakeClock((2026, 10, 22, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -7653,6 +7843,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -7734,6 +7925,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -7813,6 +8005,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &FakeProcessSpawner::success(canned_json()),
@@ -7881,6 +8074,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
 
         let deps = RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &spawner,

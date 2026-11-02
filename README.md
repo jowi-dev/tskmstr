@@ -207,6 +207,7 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
+| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -232,7 +233,7 @@ tm auth status
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
 | `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `c` toggles lifecycle columns, `s` attaches, `v`/`L` show the run detail/log, `B` opens `tm board` for the row's repo in a new tmux window, `V`/`F`/`M`/`Space` review, fix and merge in the row's own repo, `Tab` switches to `tm runs watch` |
-| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
+| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file, or an interactive run's Claude Code transcript as readable text |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -646,11 +647,30 @@ Runs started before the `log_path` column existed have it as `NULL`; for
 by-convention path above, so even a run predating this feature stays
 viewable. Other kinds have no derivable fallback (a lane run's filename also
 bears a worktree name and timestamp that don't survive anywhere recoverable)
-and report a distinct "no recorded log path" error in that case. A
-zero-byte log file (the poll loop having emitted nothing) is reported
-distinctly too, pointing at `tm runs show <KEY>` for the recorded event
-timeline. On the board, pressing `L` on a ticket opens its latest run's log
-in `less` the same way `a`/`b` attach to a live tmux session.
+and fall through to the transcript fallback below. A zero-byte log file
+(the poll loop having emitted nothing) is reported distinctly too, pointing
+at `tm runs show <KEY>` for the recorded event timeline. On the board,
+pressing `L` on a ticket opens its latest run's log in `less` the same way
+`a`/`b` attach to a live tmux session.
+
+Interactive runs (an agent session in a tmux window rather than a detached
+process) have no detached log at all. For those, `tm runs logs` prints the
+run's Claude Code transcript as readable text instead: user and assistant
+messages, with tool calls (`  -> Bash cargo test`) and their results
+(`  <- result: ...`) in brief; thinking blocks and bookkeeping entries are
+left out. `--tail` counts rendered lines, and `--follow` renders new
+messages as they land. The transcript is found via the path the SessionEnd
+hook records on the run (`tm runs finish --transcript`), or, failing that,
+by the run's session id under `$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`
+(`$CLAUDE_CONFIG_DIR` defaults to `~/.claude`). The session-id lookup is
+what keeps it working for runs whose SessionEnd hook never fired, such as
+those hibernated by the idle sweep or cleaned up by `tm merge`: Claude
+Code's transcript file outlives the killed session. The transcript is read
+by the agent that recorded the run (falling back to the configured `[agent]
+runner` for rows that recorded none), so a claude run still renders under an
+opencode config. Only Claude Code transcripts are supported: an opencode run
+with no log still reports the distinct "no recorded log path or transcript"
+error, as does any run with neither a log nor a transcript.
 
 ### Per-model token/cost usage
 
@@ -1635,15 +1655,19 @@ Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
 stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
 classification `tm ready <KEY>` reports, computed by the same rule
 (`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
-board repo's PR list. Pressing `w` on a blocked ticket opens a confirmation
-listing the blocking keys; `y`/`Enter` launches anyway, `n`/`Esc` launches
-nothing. Ready, stackable, and unknown tickets launch without a prompt.
+board repo's PR list, plus the blockers a card inherits from a locked
+parent epic (see [Inherited blockers](#inherited-blockers-children-of-a-locked-epic)).
+Pressing `w` on a blocked ticket opens a confirmation listing the blocking
+keys, an inherited one as `PROJ-12 (via epic PROJ-30)`; `y`/`Enter`
+launches anyway, `n`/`Esc` launches nothing. Ready, stackable, and unknown tickets launch without a prompt.
 
 The lookup runs on the board's network worker with each ticket refresh and
 costs a fixed number of calls, not one per ticket: at most one `gh pr list`
 (skipped when no listed ticket has a blocker), and on the GitHub backend one
-batched GraphQL `blockedBy` query for every listed issue. If either lookup
-fails, the affected cards show `?`, never `✓`, and the status line says why.
+batched GraphQL `blockedBy` query for every listed issue, plus one ticket
+lookup per distinct parent epic. If a lookup fails, the affected cards show
+`?`, never `✓`, and the status line says why; unknown parents make every
+card `?` while `[ready] inherit_epic_blockers` is on.
 Unlike `tm ready <KEY>`, the board has no Jira-status-only fallback when the
 PR list fails, because a guessed "ready" is worse than no answer. GitHub
 dependency data only records open or closed, so an open blocker counts as
@@ -2368,6 +2392,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 
 # [ready]                             # optional, see below
 # require_audit = true                # the default
+# inherit_epic_blockers = true        # the default
 
 # [backend]                           # optional, see below; "jira" is the default
 # provider = "jira"
@@ -2979,6 +3004,40 @@ Then, across the ticket's unmerged blockers:
   exists to build on, and nobody is building it.
 - **two or more** → **blocked**: a single branch can only be stacked on one
   dependency at a time, so this refuses rather than guessing which one.
+
+#### Inherited blockers: children of a locked epic
+
+A ticket also inherits its **parent epic's** blockers. When epic A blocks
+(unlocks) epic B, B's work should not start until A is done, so every child
+of B is **blocked** while A is unfinished, even with no links of its own.
+`tm ready`, `tm ready <KEY>`, `tm work run`, and the board all apply this
+through the same shared rule:
+
+- The epic's direct `Blocks` blockers are judged by the same satisfaction
+  rule as a ticket's own (done status, merged PR, or a closed PR already in
+  the base). Once every one is satisfied, the child depends only on its own
+  links again.
+- An inherited blocker is **never stackable**, even with an open PR: a lane
+  can't stack a branch on a whole epic. `tm work run` refuses the run.
+- **One level only.** A child inherits its epic's direct blockers, not the
+  epic's whole upstream chain, matching how direct blockers work.
+- An epic counts as finished by its own status, never by its children's
+  progress. This is the same "locked" the epic graph (`tm graph`) reports.
+- Each distinct parent epic is fetched once per readiness check, however
+  many of its children are being checked.
+
+The reason names the epic:
+
+```
+PROJ-40  Build the screen  [blocked by PROJ-12 (via epic PROJ-30)]
+```
+
+If a parent epic can't be loaded, `tm ready <KEY>` exits `1` rather than
+guessing, the list marks that ticket blocked with the lookup error, the
+board shows `?`, and `tm work run` warns and runs on the normal base (as it
+does when the ticket itself can't be loaded). Set `[ready]
+inherit_epic_blockers = false` to judge every ticket by its own links only,
+as before.
 
 `tm ready` (no key) lists your "To Do" tickets (something already In
 Progress has already been picked up), each classified by the stack decision

@@ -40,7 +40,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
-use crate::blocker_stacking::{Readiness, direct_blockers, readiness};
+use crate::blocker_stacking::{ParentEpics, Readiness, readiness};
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
@@ -160,6 +160,9 @@ pub struct NetDeps {
     /// `&'static` value as [`TuiDeps::runner`]; sharing it across threads is
     /// what [`crate::agent::AgentRunner`]'s `Sync` supertrait exists for.
     pub runner: &'static dyn crate::agent::AgentRunner,
+    /// `[ready] inherit_epic_blockers`: whether [`board_readiness`] marks a
+    /// child of a locked epic blocked (GitHub issue #178).
+    pub inherit_epic_blockers: bool,
 }
 
 /// Builds the network worker thread's [`NetDeps`] in place on that thread --
@@ -2589,7 +2592,8 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
         .hydrate_parents(&mut issues)
         .err()
         .map(|err| format!("epics unknown: could not load parents ({err})"));
-    let (readiness, readiness_degraded) = board_readiness(deps, &mut issues);
+    let (readiness, readiness_degraded) =
+        board_readiness(deps, &mut issues, epics_degraded.is_none());
     let degraded = [readiness_degraded, epics_degraded]
         .into_iter()
         .flatten()
@@ -2622,13 +2626,25 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
 /// the board's own repo (`deps.cwd`), skipped entirely when no issue has a
 /// direct blocker.
 ///
+/// A card under an epic inherits the epic's blockers (GitHub issue #178,
+/// [`ParentEpics`]): each distinct parent epic costs one
+/// [`TicketProvider::get_issue`] per refresh, however many of its children
+/// are on the board.
+///
 /// Failure never reads as ready: a failed blocker fetch makes every card
-/// [`Readiness::Unknown`] (no blocker data at all), and a failed PR list
-/// makes every card *with* blockers unknown (a card with none is still
-/// ready, since `decide` never needs PRs for it).
+/// [`Readiness::Unknown`] (no blocker data at all), and so do unknown
+/// parents (`parents_known` false) while inheritance is on, since any card
+/// might sit under a locked epic. A failed PR list makes every card *with*
+/// blockers unknown (a card with none is still ready, since `decide` never
+/// needs PRs for it), and a failed epic lookup makes that epic's children
+/// unknown.
 ///
 /// [`GhCli::pr_list_all`]: crate::github::gh_cli::GhCli::pr_list_all
-fn board_readiness(deps: &NetDeps, issues: &mut [Issue]) -> (Vec<Readiness>, Option<String>) {
+fn board_readiness(
+    deps: &NetDeps,
+    issues: &mut [Issue],
+    parents_known: bool,
+) -> (Vec<Readiness>, Option<String>) {
     if let Err(err) = deps.jira.hydrate_blockers(issues) {
         return (
             vec![Readiness::Unknown; issues.len()],
@@ -2637,11 +2653,15 @@ fn board_readiness(deps: &NetDeps, issues: &mut [Issue]) -> (Vec<Readiness>, Opt
             )),
         );
     }
+    if deps.inherit_epic_blockers && !parents_known {
+        return (
+            vec![Readiness::Unknown; issues.len()],
+            Some("readiness unknown: parent epics unknown".to_string()),
+        );
+    }
+    let epics = ParentEpics::from_provider(deps.jira.as_ref(), deps.inherit_epic_blockers);
     let mut degraded = None;
-    let prs = if issues
-        .iter()
-        .any(|issue| !direct_blockers(issue).is_empty())
-    {
+    let prs = if issues.iter().any(|issue| epics.needs_prs(issue)) {
         match deps.gh.pr_list_all(&deps.cwd) {
             Ok(prs) => Some(prs),
             Err(err) => {
@@ -2657,7 +2677,7 @@ fn board_readiness(deps: &NetDeps, issues: &mut [Issue]) -> (Vec<Readiness>, Opt
     };
     let readiness = issues
         .iter()
-        .map(|issue| readiness(issue, prs.as_deref()))
+        .map(|issue| readiness(issue, prs.as_deref(), &epics))
         .collect();
     (readiness, degraded)
 }
@@ -3132,6 +3152,7 @@ mod tests {
                 project_key: "PROJ".to_string(),
             },
             runner: &crate::agent::claude::ClaudeRunner,
+            inherit_epic_blockers: true,
         }
     }
 
@@ -3292,7 +3313,8 @@ mod tests {
                 (
                     "PROJ-2".to_string(),
                     Readiness::Blocked {
-                        blocker_keys: vec!["PROJ-8".to_string()]
+                        blocker_keys: vec!["PROJ-8".to_string()],
+                        via_epic: None,
                     }
                 ),
                 (
@@ -3413,7 +3435,8 @@ mod tests {
             (
                 "GH-2".to_string(),
                 Readiness::Blocked {
-                    blocker_keys: vec!["GH-7".to_string()]
+                    blocker_keys: vec!["GH-7".to_string()],
+                    via_epic: None,
                 }
             )
         );
@@ -3524,8 +3547,8 @@ mod tests {
         assert_eq!(provider_gh.issues_parents_calls().len(), 1);
     }
 
-    #[test]
-    fn fetch_tickets_parent_fetch_failure_still_loads_cards_and_notes_it() {
+    /// A board whose parents failed to load, over the GitHub backend.
+    fn deps_with_failing_parents(inherit_epic_blockers: bool) -> NetDeps {
         use crate::github::gh_cli::{FakeGhCli, GhError, IssueInfo, IssueState};
         use crate::ticketing::github_provider::GithubProvider;
 
@@ -3547,18 +3570,26 @@ mod tests {
                     stderr: "rate limited".to_string(),
                 }),
         ));
-        let mut deps = net_deps(FakeJiraClient::new());
-        deps.jira = Box::new(GithubProvider::new(
-            provider_gh,
-            "jowi-dev/tskmstr".to_string(),
-        ));
+        NetDeps {
+            jira: Box::new(GithubProvider::new(
+                provider_gh,
+                "jowi-dev/tskmstr".to_string(),
+            )),
+            inherit_epic_blockers,
+            ..net_deps(FakeJiraClient::new())
+        }
+    }
 
-        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+    /// GitHub issue #178: with inheritance on, an unknown parent may be a
+    /// locked epic, so the card is unknown rather than ready.
+    #[test]
+    fn fetch_tickets_parent_fetch_failure_still_loads_cards_as_unknown_and_notes_it() {
+        let msgs = fetch_tickets(&deps_with_failing_parents(true), &TicketQuery::MyOpen);
 
         assert_eq!(
             loaded_readiness(&msgs),
-            vec![("GH-2".to_string(), Readiness::Ready)],
-            "a failed epic lookup must not affect readiness"
+            vec![("GH-2".to_string(), Readiness::Unknown)],
+            "an unknown epic may be locked, so it never reads as ready"
         );
         match msgs.last() {
             Some(Msg::BoardDegraded(note)) => {
@@ -3567,6 +3598,72 @@ mod tests {
             }
             other => panic!("expected a trailing BoardDegraded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetch_tickets_parent_fetch_failure_leaves_readiness_alone_with_inheritance_off() {
+        let msgs = fetch_tickets(&deps_with_failing_parents(false), &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![("GH-2".to_string(), Readiness::Ready)],
+        );
+    }
+
+    /// GitHub issue #178's board half, from the shared locked-epic fixture:
+    /// every child of the locked epic is blocked via the epic.
+    #[test]
+    fn fetch_tickets_marks_children_of_a_locked_epic_blocked() {
+        use crate::blocker_stacking::epic_fixture::{self, EPIC, UNLOCKER};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new()
+            .with_search_result(SearchResult {
+                issues: vec![
+                    epic_fixture::child_keyed("PROJ-41"),
+                    epic_fixture::child_keyed("PROJ-42"),
+                    issue("PROJ-1", "To Do"),
+                ],
+                next_page_token: None,
+            })
+            .with_issue(EPIC, epic_fixture::epic("indeterminate"));
+        let msgs = fetch_tickets(&net_deps(jira), &TicketQuery::MyOpen);
+
+        let locked = Readiness::Blocked {
+            blocker_keys: vec![UNLOCKER.to_string()],
+            via_epic: Some(EPIC.to_string()),
+        };
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![
+                ("PROJ-41".to_string(), locked.clone()),
+                ("PROJ-42".to_string(), locked),
+                ("PROJ-1".to_string(), Readiness::Ready),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_tickets_ignores_a_locked_epic_with_inheritance_off() {
+        use crate::blocker_stacking::epic_fixture::{self, EPIC};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new()
+            .with_search_result(SearchResult {
+                issues: vec![epic_fixture::child()],
+                next_page_token: None,
+            })
+            .with_issue(EPIC, epic_fixture::epic("indeterminate"));
+        let deps = NetDeps {
+            inherit_epic_blockers: false,
+            ..net_deps(jira)
+        };
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![(epic_fixture::CHILD.to_string(), Readiness::Ready)]
+        );
     }
 
     #[test]

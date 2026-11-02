@@ -59,6 +59,7 @@ type ClearedLabelsOutcome = Result<Vec<String>, (u16, String)>;
 /// exercise them.
 pub struct FakeJiraClient {
     issues: RefCell<HashMap<String, IssueOutcome>>,
+    get_issue_calls: RefCell<Vec<String>>,
     create_issue_result: RefCell<Option<Issue>>,
     create_issue_calls: RefCell<Vec<CreateIssueRequest>>,
     add_remote_link_calls: RefCell<Vec<(String, RemoteLinkRequest)>>,
@@ -92,6 +93,7 @@ impl Default for FakeJiraClient {
     fn default() -> Self {
         Self {
             issues: RefCell::new(HashMap::new()),
+            get_issue_calls: RefCell::new(Vec::new()),
             create_issue_result: RefCell::new(None),
             create_issue_calls: RefCell::new(Vec::new()),
             add_remote_link_calls: RefCell::new(Vec::new()),
@@ -241,6 +243,11 @@ impl FakeJiraClient {
     pub fn with_transition_error(self, status: u16, message: &str) -> Self {
         *self.transition_result.borrow_mut() = Err((status, message.to_string()));
         self
+    }
+
+    /// The keys passed to `get_issue`, in call order.
+    pub fn get_issue_calls(&self) -> Vec<String> {
+        self.get_issue_calls.borrow().clone()
     }
 
     /// The `(key, transition_id)` pairs passed to `transition`, in call
@@ -472,6 +479,7 @@ impl JiraClient for FakeJiraClient {
     }
 
     fn get_issue(&self, key: &str) -> Result<Issue, JiraError> {
+        self.get_issue_calls.borrow_mut().push(key.to_string());
         match self.issues.borrow().get(key) {
             Some(IssueOutcome::Found(issue)) => Ok(issue.as_ref().clone()),
             Some(IssueOutcome::Error { status, message }) => Err(JiraError::Api {
