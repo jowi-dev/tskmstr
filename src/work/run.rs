@@ -1830,7 +1830,11 @@ fn pr_url_regex() -> regex::Regex {
 /// first GitHub pull-request URL out of the run's result text. Both steps
 /// degrade to `None` on any failure — a missing PR is the normal case for a
 /// run that never opened one, never an error worth surfacing.
-fn resolve_pr_url(gh: &dyn GhCli, branch: &str, result_text: Option<&str>) -> Option<String> {
+pub(crate) fn resolve_pr_url(
+    gh: &dyn GhCli,
+    branch: &str,
+    result_text: Option<&str>,
+) -> Option<String> {
     if let Ok(Some(url)) = gh.pr_url_for_branch(branch)
         && !url.is_empty()
     {
@@ -2113,32 +2117,7 @@ pub fn run_agent_and_finish(
         force_status,
     )?;
 
-    // GitHub issue #92: `tm pr create` is the only other place
-    // `status_on_pr` fires, so a run whose agent opened its PR with plain
-    // `gh pr create` would otherwise leave its ticket wherever run start
-    // left it. Advisory, like `status_on_run_start` in `prepare_run_lane`:
-    // the run is already recorded, a ticket already in the target status
-    // (say, `tm pr create` moved it) is silent, and a failure only warns.
-    // `out` is the run log for a detached run, so both lines land there.
-    if let (true, Some(provider), Some(ticket), Some(target)) = (
-        has_pr,
-        ticket_provider,
-        prepared.ticket.as_deref(),
-        prepared.status_on_pr.as_deref(),
-    ) {
-        match crate::ticketing::reconcile_status(provider, ticket, target) {
-            crate::ticketing::StatusTransition::Applied(status) => {
-                writeln!(out, "moved {ticket} to {status}")?;
-            }
-            crate::ticketing::StatusTransition::AlreadyInStatus(_) => {}
-            crate::ticketing::StatusTransition::Warning(message) => {
-                writeln!(
-                    out,
-                    "warning: could not move {ticket} to \"{target}\" after its PR opened: {message}"
-                )?;
-            }
-        }
-    }
+    apply_status_on_pr(ticket_provider, prepared, has_pr, out)?;
 
     // Print the summary, mirroring work.ml's final printf block.
     let session_id = parsed.as_ref().map(|o| o.session_id.clone());
@@ -2189,6 +2168,44 @@ pub fn run_agent_and_finish(
     })
 }
 
+/// Advisorily moves a finished run's ticket to its `status_on_pr` once the
+/// run has a PR (GitHub issue #92). `tm pr create` is the only other place
+/// `status_on_pr` fires, so a run whose agent opened its PR with plain
+/// `gh pr create` would otherwise leave its ticket wherever run start left
+/// it. Advisory, like `status_on_run_start` in [`prepare_run_lane`]: the run
+/// is already recorded, a ticket already in the target status (say, `tm pr
+/// create` moved it) is silent, and a failure only warns. `out` is the run
+/// log for a detached run, so both lines land there. Shared by
+/// [`run_agent_and_finish`] and, for an unattended interactive lane,
+/// [`crate::work::lane_await::await_lane`] (GitHub issue #184).
+pub(crate) fn apply_status_on_pr(
+    ticket_provider: Option<&dyn TicketProvider>,
+    prepared: &PreparedRun,
+    has_pr: bool,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    if let (true, Some(provider), Some(ticket), Some(target)) = (
+        has_pr,
+        ticket_provider,
+        prepared.ticket.as_deref(),
+        prepared.status_on_pr.as_deref(),
+    ) {
+        match crate::ticketing::reconcile_status(provider, ticket, target) {
+            crate::ticketing::StatusTransition::Applied(status) => {
+                writeln!(out, "moved {ticket} to {status}")?;
+            }
+            crate::ticketing::StatusTransition::AlreadyInStatus(_) => {}
+            crate::ticketing::StatusTransition::Warning(message) => {
+                writeln!(
+                    out,
+                    "warning: could not move {ticket} to \"{target}\" after its PR opened: {message}"
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The detached supervisor's core: record this process's own pid on the
 /// already-created run row (see [`prepare_run_lane`]'s doc comment on why
 /// the pid recorded at `start_run` time is `None` for this path), then run
@@ -2205,9 +2222,12 @@ pub fn run_agent_and_finish(
 /// `tm pr watch` started here, the same point `status_on_pr` is applied —
 /// see [`auto_arm_watch`]. This covers lane runs and `tm review fix` passes
 /// alike, since both are supervised by this one function, so a fix pass
-/// re-arms bot review on its new push. `--fg` runs and interactive runs
-/// never reach it: an interactive run ends through `tm runs finish`, which
-/// is not hooked, the same gap `status_on_pr` has (GitHub issue #92).
+/// re-arms bot review on its new push. `--fg` runs and attended interactive
+/// runs never reach it: such a run ends through `tm runs finish`, which is
+/// not hooked, the same gap `status_on_pr` has (GitHub issue #92). An
+/// unattended interactive lane (`tm work run --unattended`) gets the same
+/// tail from [`crate::work::lane_await::await_lane`] once its agent writes
+/// its done marker (GitHub issue #184).
 ///
 /// `review_starter` starts `tm review auto` for a lane run that finished
 /// with a PR while its scope's autopilot flag is on (GitHub issue #145), so
@@ -2267,7 +2287,7 @@ pub trait AutoReviewStarter {
 /// takes this path too while autopilot is on. `tm review auto` refuses a
 /// second loop itself, so no dedup is needed here. A failed start only
 /// warns: the run itself is already recorded.
-fn autopilot_start_review(
+pub(crate) fn autopilot_start_review(
     run_store: &RunStore,
     starter: &dyn AutoReviewStarter,
     prepared: &PreparedRun,
@@ -2320,7 +2340,7 @@ pub trait WatchArmer {
 /// running. `tm pr watch` dedups too, but checking here keeps a duplicate
 /// spawn from appending a refusal to the watcher's log. A failed arm only
 /// warns: the run itself is already recorded.
-fn auto_arm_watch(
+pub(crate) fn auto_arm_watch(
     run_store: &RunStore,
     armer: &dyn WatchArmer,
     prepared: &PreparedRun,
