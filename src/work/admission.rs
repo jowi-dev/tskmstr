@@ -645,8 +645,9 @@ pub struct AdmissionGate<'a> {
     pub prober: &'a dyn UsageProber,
     /// Reads the kernel's memory pressure.
     pub pressure: &'a dyn Fn() -> MemoryPressure,
-    /// The usage check's "now".
-    pub clock: &'a dyn crate::work::review_watch::Clock,
+    /// The usage check's "now", in unix seconds; read on every check, so
+    /// a waiting launch sees the clock move.
+    pub now: &'a dyn Fn() -> i64,
 }
 
 impl AdmissionGate<'_> {
@@ -675,13 +676,8 @@ impl AdmissionGate<'_> {
             return Err(refusal.into());
         }
         if let Some(usage) = self.usage.for_agent(request.agent) {
-            let verdict = check_usage_admission(
-                self.store,
-                request.agent,
-                usage,
-                self.clock.now_unix_secs(),
-                self.prober,
-            )?;
+            let verdict =
+                check_usage_admission(self.store, request.agent, usage, (self.now)(), self.prober)?;
             apply_usage_gate(verdict, mode, out)?;
         }
         Ok(Admitted(()))
@@ -1101,17 +1097,10 @@ mod gate_tests {
     use crate::config::UsageConfig;
     use crate::runs::footprint::GIB;
     use crate::runs::{FinishRun, RunStatus, StartRun};
-    use crate::work::review_watch::{Clock, Sleeper};
+    use crate::work::review_watch::Sleeper;
     use tempfile::tempdir;
 
     const NOW: i64 = 1_000_000;
-
-    struct FixedClock;
-    impl Clock for FixedClock {
-        fn now_unix_secs(&self) -> i64 {
-            NOW
-        }
-    }
 
     struct NoProbe;
     impl UsageProber for NoProbe {
@@ -1198,7 +1187,7 @@ mod gate_tests {
                 usage: &self.usage,
                 prober: &NoProbe,
                 pressure: &|| MemoryPressure::Normal,
-                clock: &FixedClock,
+                now: &|| NOW,
             }
         }
     }

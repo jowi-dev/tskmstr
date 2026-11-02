@@ -1000,6 +1000,7 @@ fn append_log_line(log_path: &Path, line: &str) {
 /// calling [`run_agent_and_finish`] itself.
 pub fn run_lane_fg(
     deps: &RunLaneDeps<'_>,
+    admitted: &crate::work::admission::Admitted,
     config: &WorkConfig,
     paths: &RunLanePaths,
     lane: &str,
@@ -1008,6 +1009,7 @@ pub fn run_lane_fg(
 ) -> Result<RunLaneOutcome, RunLaneError> {
     let prepared = prepare_run_lane(
         deps,
+        admitted,
         config,
         paths,
         lane,
@@ -1041,8 +1043,13 @@ pub fn run_lane_fg(
 /// [`RunStore::update_pid`] immediately on startup — see
 /// `src/work/detach.rs`'s module doc for why a two-step pid handoff, not the
 /// parent's pid, is what keeps `tm runs reap` accurate.
+///
+/// `admitted` is the caller's proof that the launch passed admission
+/// (GitHub issue #149); the invocations are built with it.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_run_lane(
     deps: &RunLaneDeps<'_>,
+    _admitted: &crate::work::admission::Admitted,
     config: &WorkConfig,
     paths: &RunLanePaths,
     lane: &str,
@@ -2651,6 +2658,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -2725,6 +2733,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -2784,6 +2793,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -2842,6 +2852,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -2899,6 +2910,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -2958,6 +2970,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3020,6 +3033,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3112,6 +3126,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3197,6 +3212,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3305,6 +3321,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3649,6 +3666,7 @@ mod tests {
 
         let err = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3704,6 +3722,7 @@ mod tests {
 
         let err = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3772,6 +3791,7 @@ mod tests {
 
         let err = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3838,6 +3858,7 @@ mod tests {
 
         let err = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3892,6 +3913,7 @@ mod tests {
 
         run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -3952,6 +3974,7 @@ mod tests {
 
         run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -4009,6 +4032,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -4066,6 +4090,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -4124,7 +4149,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+        let outcome = run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(outcome.worktree.ends_with("abc-123"));
         assert!(outcome.branch.contains("abc-123-"));
@@ -4200,7 +4234,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+        let outcome = run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            &mut out,
+        )
+        .unwrap();
 
         // Same shape as the Jira case: wt_name is the lowercased ticket,
         // the slug comes from the GitHub issue's title via GithubProvider's
@@ -4262,7 +4305,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+        let outcome = run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            &mut out,
+        )
+        .unwrap();
 
         // No configured branch-owner source resolves ("claude" fallback);
         // wt_name is the lowercased ticket; the slug carries no timestamp.
@@ -4313,8 +4365,17 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
     }
@@ -4364,6 +4425,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -4452,7 +4514,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             jira.transition_calls(),
@@ -4514,7 +4586,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(jira.transition_calls().is_empty());
         let printed = String::from_utf8(out).unwrap();
@@ -4572,8 +4654,17 @@ mod tests {
         };
 
         // The run is still prepared despite the transition failure.
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
         assert!(run_store.run_by_id(prepared.run_id).unwrap().is_some());
 
         let printed = String::from_utf8(out).unwrap();
@@ -4631,8 +4722,17 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
         assert!(run_store.run_by_id(prepared.run_id).unwrap().is_some());
 
         let expected = "warning: could not move ABC-123 to \"In Progress\" at run start: \
@@ -4691,6 +4791,7 @@ mod tests {
         // No ticket: a lane-only run has nothing to move.
         prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -4749,7 +4850,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(jira.transition_calls().is_empty());
     }
@@ -4801,8 +4912,17 @@ mod tests {
 
         // A Jira lookup failure must not fail the run at all, let alone in
         // a way that surfaces as an Err here.
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
     }
@@ -4852,8 +4972,17 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(prepared.branch, "claude/abc-123-20260806-090503");
     }
@@ -4910,8 +5039,17 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(prepared.branch, "claude/abc-123-delete-bid-connector-3");
     }
@@ -4963,6 +5101,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5053,7 +5192,16 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let outcome = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap();
+        let outcome = run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            &mut out,
+        )
+        .unwrap();
 
         let run = run_store.run_by_id(outcome.run_id).unwrap().unwrap();
         (run, String::from_utf8(out).unwrap())
@@ -5186,12 +5334,22 @@ mod tests {
             ticket: Some("ABC-123".to_string()),
             ..Default::default()
         };
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", ticketed, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            ticketed,
+            None,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(prepared.status_on_pr.as_deref(), Some("In Review"));
 
         let ticketless = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5246,6 +5404,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5304,6 +5463,7 @@ mod tests {
 
         let outcome = run_lane_fg(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5364,6 +5524,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5427,8 +5588,17 @@ mod tests {
             ..RunLaneRequest::default()
         };
         let mut out = Vec::new();
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
         (tmp, home, prepared)
     }
 
@@ -5496,8 +5666,17 @@ mod tests {
             ..RunLaneRequest::default()
         };
         let mut out = Vec::new();
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
         (tmp, prepared)
     }
 
@@ -5606,8 +5785,17 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             prepared.invocation.env_set,
@@ -5677,8 +5865,17 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(
             prepared.invocation.args[0].contains("tm runs register --kind lane mylane"),
@@ -5733,8 +5930,17 @@ mod tests {
         let request = RunLaneRequest::default();
         let mut out = Vec::new();
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         let flag_index = prepared
             .invocation
@@ -5792,8 +5998,17 @@ mod tests {
         let request = RunLaneRequest::default();
         let mut out = Vec::new();
 
-        let prepared =
-            prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        let prepared = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         let flag_index = prepared
             .invocation
@@ -5846,6 +6061,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5905,6 +6121,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -5977,6 +6194,7 @@ mod tests {
 
         let err = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6035,6 +6253,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6123,6 +6342,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6185,6 +6405,7 @@ mod tests {
         };
         prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6274,6 +6495,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6341,6 +6563,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6400,6 +6623,7 @@ mod tests {
         // As the detached CLI path does: prepare with no pid yet...
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6553,6 +6777,7 @@ mod tests {
         let mut prepare_out = Vec::new();
         let prepared = prepare_run_lane(
             &deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -6855,6 +7080,7 @@ mod tests {
 
         let prepared = prepare_run_lane(
             &prepare_deps,
+            &crate::work::admission::Admitted::for_test(),
             &config,
             &paths,
             "mylane",
@@ -7280,7 +7506,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         // gh must be asked about lane_config.repo (repo_root), not whatever
         // directory the test process happens to be running in — see
@@ -7353,7 +7589,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         let calls = git.switch_new_branch_calls();
         assert_eq!(calls.len(), 1);
@@ -7422,7 +7668,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         let log_path = run_log_path(&state_dir, "ax-2", "20260806-090503");
         let log_contents = std::fs::read_to_string(&log_path)
@@ -7493,8 +7749,17 @@ mod tests {
             ..Default::default()
         };
 
-        let err = prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out)
-            .unwrap_err();
+        let err = prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap_err();
         assert!(matches!(err, RunLaneError::Gh(ref e) if e.is_permanent()));
 
         // No run row exists to leak (prepare_run_lane's whole design point,
@@ -7563,7 +7828,17 @@ mod tests {
             ..Default::default()
         };
 
-        prepare_run_lane(&deps, &config, &paths, "mylane", request, None, &mut out).unwrap();
+        prepare_run_lane(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            None,
+            &mut out,
+        )
+        .unwrap();
 
         assert!(gh.pr_list_all_calls().is_empty());
         let calls = git.switch_new_branch_calls();
@@ -7620,7 +7895,16 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_lane_fg(&deps, &config, &paths, "mylane", request, &mut out).unwrap_err();
+        let err = run_lane_fg(
+            &deps,
+            &crate::work::admission::Admitted::for_test(),
+            &config,
+            &paths,
+            "mylane",
+            request,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, RunLaneError::MultipleUnmergedBlockers { .. }));
         assert!(spawner.recorded.lock().unwrap().is_empty());
