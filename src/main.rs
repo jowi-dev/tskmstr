@@ -478,19 +478,10 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             home: self.home.clone(),
         };
         let lanes = tskmstr::cli::dispatch::lane_choices(&config, &resolver);
-        let agent = tskmstr::cli::dispatch::unattended_agent(&config);
+        let runners = tskmstr::cli::dispatch::unattended_runners(&config);
         let spawner = tskmstr::work::runner::StdProcessSpawner;
         let usage_prober = tskmstr::work::admission::SpawnUsageProber {
-            runners: tskmstr::agent::routing::configured_unattended_order(
-                config.agent,
-                &config.agent_fallbacks,
-                &config.usage,
-                &config.dispatch,
-            )
-            .first()
-            .map(|kind| tskmstr::agent::routing::runner_for(*kind))
-            .into_iter()
-            .collect(),
+            runners: unattended_runner_impls(&config),
             models: &config.models,
             spawner: &spawner,
         };
@@ -516,7 +507,7 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             lanes: &lanes,
-            agent,
+            runners: &runners,
             memory: &config.work.memory,
             usage: &config.usage,
         };
@@ -1303,6 +1294,21 @@ fn agent_fallback_runners_for(config: Option<&Config>) -> Vec<&'static dyn Agent
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// [`tskmstr::cli::dispatch::unattended_runners`] as live runners, for the
+/// dispatcher's usage prober: every runner a tick may route to can have its
+/// stale usage refreshed (GitHub issue #192).
+fn unattended_runner_impls(config: &Config) -> Vec<&'static dyn AgentRunner> {
+    tskmstr::agent::routing::configured_unattended_order(
+        config.agent,
+        &config.agent_fallbacks,
+        &config.usage,
+        &config.dispatch,
+    )
+    .into_iter()
+    .map(tskmstr::agent::routing::runner_for)
+    .collect()
 }
 
 /// A preferred runner and its fallbacks.
@@ -3020,17 +3026,10 @@ impl AutopilotTicker {
                 name,
             })
             .collect();
-        let runner = tskmstr::agent::routing::configured_unattended_order(
-            config.agent,
-            &config.agent_fallbacks,
-            &config.usage,
-            &config.dispatch,
-        )
-        .first()
-        .map(|kind| tskmstr::agent::routing::runner_for(*kind));
+        let runners = tskmstr::cli::dispatch::unattended_runners(&config);
         let spawner = tskmstr::work::runner::StdProcessSpawner;
         let usage_prober = tskmstr::work::admission::SpawnUsageProber {
-            runners: runner.into_iter().collect(),
+            runners: unattended_runner_impls(&config),
             models: &config.models,
             spawner: &spawner,
         };
@@ -3064,7 +3063,7 @@ impl AutopilotTicker {
             max_fix_rounds: config.dispatch.max_fix_rounds,
             stall_notify_mins: config.dispatch.stall_notify_mins,
             lanes: &lanes,
-            agent: runner.map(|runner| runner.name()),
+            runners: &runners,
             memory: &config.work.memory,
             usage: &config.usage,
         };

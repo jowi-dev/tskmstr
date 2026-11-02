@@ -977,6 +977,114 @@ impl AdmissionDeps<'_> {
     }
 }
 
+/// Why one runner of an unattended route refused a lane (GitHub issue
+/// #192).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunnerRefusal {
+    /// Memory admission refused.
+    Memory(AdmissionRefusal),
+    /// Usage admission refused.
+    Usage(UsageRefusal),
+}
+
+impl fmt::Display for RunnerRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunnerRefusal::Memory(refusal) => refusal.fmt(f),
+            RunnerRefusal::Usage(refusal) => refusal.fmt(f),
+        }
+    }
+}
+
+/// Every runner of an unattended route refused, each with its reason, in
+/// route order. Never empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteRefusal(pub Vec<(String, RunnerRefusal)>);
+
+impl fmt::Display for RouteRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let [(_, only)] = self.0.as_slice() {
+            return only.fmt(f);
+        }
+        write!(f, "not launching: every runner refused: ")?;
+        for (i, (_, refusal)) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, "; ")?;
+            }
+            let reason = refusal.to_string();
+            write!(
+                f,
+                "{}",
+                reason.strip_prefix("not launching: ").unwrap_or(&reason)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RouteRefusal {}
+
+/// The runner an unattended route picked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Routed {
+    /// Its index in the route's `runners`.
+    pub index: usize,
+    /// Why its usage couldn't be confirmed
+    /// ([`UsageVerdict::AdmitUnknown`]), for the caller to warn with.
+    pub warning: Option<String>,
+}
+
+/// Picks the runner an unattended lane launches on (GitHub issue #192):
+/// the first of `runners` that passes memory admission
+/// ([`check_memory_admission`]) and usage admission
+/// ([`check_usage_admission`]), in order. A runner over its usage ceiling
+/// is skipped for the next, instead of refusing the launch outright as
+/// before. Only when every runner refuses is the launch refused, with each
+/// runner's reason.
+///
+/// `runners` are [`AgentRunner::name`]s, already filtered by
+/// [`crate::agent::routing::unattended_order`]. An empty `runners` returns
+/// an empty [`RouteRefusal`]; callers check for that first.
+///
+/// # Errors
+///
+/// Returns a [`RunStoreError`] if the run store can't be read or written.
+#[allow(clippy::too_many_arguments)]
+pub fn route_unattended(
+    store: &RunStore,
+    memory: &MemoryConfig,
+    usage: &crate::config::UsageConfig,
+    runners: &[&str],
+    repo: &str,
+    pressure: &dyn Fn() -> MemoryPressure,
+    now: i64,
+    prober: &dyn UsageProber,
+) -> Result<Result<Routed, RouteRefusal>, RunStoreError> {
+    let mut refused = Vec::new();
+    for (index, agent) in runners.iter().enumerate() {
+        if let Some(refusal) =
+            check_memory_admission(store, memory, "lane", agent, repo, pressure)?
+        {
+            refused.push((agent.to_string(), RunnerRefusal::Memory(refusal)));
+            continue;
+        }
+        let verdict = match usage.for_agent(agent) {
+            Some(cfg) => check_usage_admission(store, agent, cfg, now, prober)?,
+            None => UsageVerdict::Admit,
+        };
+        let warning = match verdict {
+            UsageVerdict::Refuse(refusal) => {
+                refused.push((agent.to_string(), RunnerRefusal::Usage(refusal)));
+                continue;
+            }
+            UsageVerdict::AdmitUnknown(reason) => Some(reason),
+            UsageVerdict::Admit => None,
+        };
+        return Ok(Ok(Routed { index, warning }));
+    }
+    Ok(Err(RouteRefusal(refused)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

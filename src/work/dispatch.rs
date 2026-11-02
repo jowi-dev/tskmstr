@@ -49,8 +49,7 @@ use crate::runs::footprint::MemoryPressure;
 use crate::runs::overview::OverviewRun;
 use crate::runs::{RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{
-    AdmissionRefusal, UsageProber, UsageRefusal, UsageVerdict, check_memory_admission,
-    check_usage_admission,
+    AdmissionRefusal, RouteRefusal, RunnerRefusal, UsageProber, UsageRefusal, route_unattended,
 };
 use crate::work::auto_review::RoundVerdict;
 use crate::work::notify::{self, Notifier};
@@ -232,10 +231,11 @@ pub struct TickConfig<'a> {
     /// launches directly when there is one and asks when there are more; a
     /// tick can't ask, so it takes the first.
     pub lanes: &'a [LaneChoice],
-    /// The runner an unattended launch prefers: the first of
-    /// [`crate::agent::routing::unattended_order`], or `None` when every
-    /// runner is metered and paid fallback is off.
-    pub agent: Option<&'a str>,
+    /// The runners an unattended launch may use, in fallback order:
+    /// [`crate::agent::routing::unattended_order`]. Admission walks them and
+    /// launches on the first that passes (GitHub issue #192). Empty when
+    /// every runner is metered and paid fallback is off.
+    pub runners: &'a [&'a str],
     /// `[work] memory_budget_gb` and friends.
     pub memory: &'a MemoryConfig,
     /// `[agent.<runner>]` usage ceilings.
@@ -299,6 +299,9 @@ pub enum Refusal {
     Memory(AdmissionRefusal),
     /// Usage admission refused.
     Usage(UsageRefusal),
+    /// With more than one runner, every runner refused (GitHub issue
+    /// #192); each entry is a runner and its reason.
+    EveryRunner(RouteRefusal),
     /// The launcher failed for one ticket.
     LaunchFailed {
         /// The ticket that failed to launch.
@@ -326,6 +329,7 @@ impl fmt::Display for Refusal {
             ),
             Refusal::Memory(refusal) => refusal.fmt(f),
             Refusal::Usage(refusal) => refusal.fmt(f),
+            Refusal::EveryRunner(refusal) => refusal.fmt(f),
             Refusal::LaunchFailed { ticket, error } => {
                 write!(f, "launching {ticket} failed: {error}")
             }
@@ -345,8 +349,26 @@ impl Refusal {
             Refusal::NoUnattendedRunner => "no_unattended_runner",
             Refusal::Memory(_) => "memory",
             Refusal::Usage(_) => "usage",
+            Refusal::EveryRunner(refusal) => every_runner_code(refusal),
             Refusal::LaunchFailed { .. } => "launch_failed",
         }
+    }
+}
+
+/// [`Refusal::code`] of [`Refusal::EveryRunner`]: `memory` or `usage` when
+/// every runner refused for that one kind of reason, so a streak of them is
+/// one stall, or `every_runner` when the reasons are mixed.
+fn every_runner_code(refusal: &RouteRefusal) -> &'static str {
+    let code = |r: &RunnerRefusal| match r {
+        RunnerRefusal::Memory(_) => "memory",
+        RunnerRefusal::Usage(_) => "usage",
+    };
+    let mut codes = refusal.0.iter().map(|(_, r)| code(r));
+    let first = codes.next().unwrap_or("every_runner");
+    if codes.all(|c| c == first) {
+        first
+    } else {
+        "every_runner"
     }
 }
 
@@ -357,6 +379,10 @@ pub struct Launch {
     pub ticket: String,
     /// The lane it launched in.
     pub lane: String,
+    /// The runner admission picked for it (GitHub issue #192). `tm work run
+    /// --unattended` walks the same runners and normally lands on the same
+    /// one; this is for display.
+    pub runner: String,
     /// The branch it stacks on, for a stackable ticket. `tm work run`
     /// resolves the stacking itself; this is for display.
     pub stacked_on: Option<String>,
@@ -429,15 +455,15 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
     let mut running = deps.store.running_lanes()?.len();
     for candidate in queue {
         match admit(deps, cfg, running)? {
-            Ok(lane) => match deps.launcher.launch(&lane.name, &candidate.key) {
+            Ok((lane, runner)) => match deps.launcher.launch(&lane.name, &candidate.key) {
                 Ok(()) => {
                     let stacked_on = match candidate.decision {
                         ListDecision::Stackable { base, .. } => Some(base),
                         _ => None,
                     };
                     let detail = match &stacked_on {
-                        Some(base) => format!("lane {} stacked on {base}", lane.name),
-                        None => format!("lane {}", lane.name),
+                        Some(base) => format!("lane {} on {runner} stacked on {base}", lane.name),
+                        None => format!("lane {} on {runner}", lane.name),
                     };
                     deps.store.record_dispatch_event(
                         cfg.scope,
@@ -448,6 +474,7 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
                     report.launched.push(Launch {
                         ticket: candidate.key,
                         lane: lane.name.clone(),
+                        runner: runner.to_string(),
                         stacked_on,
                     });
                     running += 1;
@@ -500,13 +527,16 @@ fn skipped(skip: Skip) -> TickReport {
 }
 
 /// Whether one more lane may launch now, with `running` lanes running:
-/// the lane to launch into, or the first gate that refuses. Gates run
-/// cheapest first, so a full machine never spawns a usage probe.
+/// the lane to launch into and the runner to launch it on, or the first
+/// gate that refuses. Gates run cheapest first, so a full machine never
+/// spawns a usage probe. Memory and usage admission run per runner
+/// ([`route_unattended`]), so an over-ceiling runner falls through to the
+/// next.
 fn admit<'c>(
     deps: &TickDeps,
     cfg: &'c TickConfig,
     running: usize,
-) -> Result<Result<&'c LaneChoice, Refusal>, DispatchError> {
+) -> Result<Result<(&'c LaneChoice, &'c str), Refusal>, DispatchError> {
     if running >= cfg.max_lanes {
         return Ok(Err(Refusal::MaxLanes {
             running,
@@ -525,26 +555,27 @@ fn admit<'c>(
     let Some(lane) = cfg.lanes.first() else {
         return Ok(Err(Refusal::NoLane));
     };
-    let Some(agent) = cfg.agent else {
+    if cfg.runners.is_empty() {
         return Ok(Err(Refusal::NoUnattendedRunner));
-    };
-    if let Some(refusal) = check_memory_admission(
+    }
+    let routed = route_unattended(
         deps.store,
         cfg.memory,
-        "lane",
-        agent,
+        cfg.usage,
+        cfg.runners,
         &lane.repo,
         deps.memory_pressure,
-    )? {
-        return Ok(Err(Refusal::Memory(refusal)));
-    }
-    if let Some(usage) = cfg.usage.for_agent(agent)
-        && let UsageVerdict::Refuse(refusal) =
-            check_usage_admission(deps.store, agent, usage, deps.now, deps.usage_prober)?
-    {
-        return Ok(Err(Refusal::Usage(refusal)));
-    }
-    Ok(Ok(lane))
+        deps.now,
+        deps.usage_prober,
+    )?;
+    Ok(match routed {
+        Ok(routed) => Ok((lane, cfg.runners[routed.index])),
+        Err(mut refusal) if refusal.0.len() == 1 => Err(match refusal.0.remove(0).1 {
+            RunnerRefusal::Memory(refusal) => Refusal::Memory(refusal),
+            RunnerRefusal::Usage(refusal) => Refusal::Usage(refusal),
+        }),
+        Err(refusal) => Err(Refusal::EveryRunner(refusal)),
+    })
 }
 
 /// What a scope's dispatcher is doing, for `tm dispatch status` and the
@@ -748,7 +779,7 @@ mod tests {
         memory: MemoryConfig,
         usage: UsageConfig,
         max_lanes: usize,
-        agent: Option<&'static str>,
+        runners: Vec<&'static str>,
         pressure: MemoryPressure,
         max_launches_per_day: usize,
         now: i64,
@@ -772,7 +803,7 @@ mod tests {
                 memory: MemoryConfig::default(),
                 usage: UsageConfig::default(),
                 max_lanes: 5,
-                agent: Some("claude"),
+                runners: vec!["claude"],
                 pressure: MemoryPressure::Normal,
                 max_launches_per_day: 20,
                 now: NOW,
@@ -810,7 +841,7 @@ mod tests {
                 max_fix_rounds: self.max_fix_rounds,
                 stall_notify_mins: self.stall_notify_mins,
                 lanes: &self.lanes,
-                agent: self.agent,
+                runners: &self.runners,
                 memory: &self.memory,
                 usage: &self.usage,
             };
@@ -1119,7 +1150,7 @@ mod tests {
             vec![(
                 Some("GH-2".to_string()),
                 LAUNCH_EVENT.to_string(),
-                "lane backend stacked on origin/gh-1-x".to_string()
+                "lane backend on claude stacked on origin/gh-1-x".to_string()
             )]
         );
     }
@@ -1237,7 +1268,7 @@ mod tests {
     #[test]
     fn no_unattended_runner_refuses() {
         let mut fx = Fixture::new();
-        fx.agent = None;
+        fx.runners = Vec::new();
         let launcher = FakeLauncher::new(&fx.store);
 
         let report = fx.tick(&[ready("GH-1", 0)], &launcher);
@@ -1320,10 +1351,67 @@ mod tests {
         ));
     }
 
+    fn over_ceiling(store: &RunStore, agent: &str, utilization: f64) {
+        store
+            .upsert_usage_snapshot(&UsageSnapshotRow {
+                agent: agent.to_string(),
+                window: "five_hour".to_string(),
+                utilization,
+                resets_at: NOW + 3600,
+                observed_at: NOW - 10,
+                source: "stream".to_string(),
+                status: Some("allowed".to_string()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn an_over_ceiling_runner_falls_through_to_the_next_one() {
+        let mut fx = Fixture::new();
+        fx.runners = vec!["claude", "opencode"];
+        over_ceiling(&fx.store, "claude", 0.85);
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        assert_eq!(report.refused, None);
+        assert_eq!(launcher.tickets(), vec!["GH-1"]);
+        assert_eq!(report.launched[0].runner, "opencode");
+        let (_, kind, detail) = fx.events().pop().unwrap();
+        assert_eq!(kind, LAUNCH_EVENT);
+        assert!(detail.contains("opencode"), "{detail}");
+    }
+
+    #[test]
+    fn a_tick_every_runner_refuses_names_each_reason() {
+        let mut fx = Fixture::new();
+        fx.runners = vec!["claude", "opencode"];
+        over_ceiling(&fx.store, "claude", 0.85);
+        fx.usage.opencode.token_budget = Some(crate::config::TokenBudget {
+            tokens: 0,
+            window_secs: 3600,
+        });
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        assert!(launcher.tickets().is_empty());
+        let Some(Refusal::EveryRunner(refusal)) = &report.refused else {
+            panic!("expected every runner to refuse: {:?}", report.refused);
+        };
+        let runners: Vec<&str> = refusal.0.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(runners, vec!["claude", "opencode"]);
+        assert_eq!(report.refused.as_ref().unwrap().code(), "usage");
+        let (_, kind, detail) = fx.events().pop().unwrap();
+        assert_eq!(kind, REFUSED_EVENT);
+        assert!(detail.contains("claude 5h usage at 85%"), "{detail}");
+        assert!(detail.contains("opencode used 0 tokens"), "{detail}");
+    }
+
     #[test]
     fn a_token_budget_refuses_a_signal_less_runner() {
         let mut fx = Fixture::new();
-        fx.agent = Some("opencode");
+        fx.runners = vec!["opencode"];
         fx.usage.opencode.token_budget = Some(crate::config::TokenBudget {
             tokens: 0,
             window_secs: 3600,
@@ -1360,7 +1448,7 @@ mod tests {
                 (
                     Some("GH-2".to_string()),
                     LAUNCH_EVENT.to_string(),
-                    "lane backend".to_string()
+                    "lane backend on claude".to_string()
                 ),
                 (
                     Some("GH-1".to_string()),

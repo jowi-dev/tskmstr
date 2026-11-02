@@ -395,6 +395,7 @@ mod tests {
                     launched: vec![Launch {
                         ticket: "GH-7".to_string(),
                         lane: "a".to_string(),
+                        runner: "claude".to_string(),
                         stacked_on: None,
                     }],
                     ..TickReport::default()

@@ -205,6 +205,7 @@ fn tick_json(scope: &str, outcome: &TickOutcome) -> serde_json::Value {
             "launched": report.launched.iter().map(|launch| json!({
                 "ticket": launch.ticket,
                 "lane": launch.lane,
+                "runner": launch.runner,
                 "stacked_on": launch.stacked_on,
             })).collect::<Vec<_>>(),
             "refused": report.refused.as_ref().map(ToString::to_string),
@@ -239,13 +240,13 @@ fn write_tick_text(scope: &str, outcome: &TickOutcome, out: &mut dyn Write) -> i
         match &launch.stacked_on {
             Some(base) => writeln!(
                 out,
-                "{scope}: launched {} in lane {} (stacked on {base})",
-                launch.ticket, launch.lane
+                "{scope}: launched {} in lane {} on {} (stacked on {base})",
+                launch.ticket, launch.lane, launch.runner
             )?,
             None => writeln!(
                 out,
-                "{scope}: launched {} in lane {}",
-                launch.ticket, launch.lane
+                "{scope}: launched {} in lane {} on {}",
+                launch.ticket, launch.lane, launch.runner
             )?,
         }
     }
@@ -365,18 +366,20 @@ pub fn lane_choices(config: &Config, resolver: &dyn BackendIdentityResolver) -> 
         .collect()
 }
 
-/// The runner an unattended launch from `config` prefers, or `None` when
-/// every configured runner is metered and paid fallback is off. Matches
-/// what `tm work run --unattended` picks.
-pub fn unattended_agent(config: &Config) -> Option<&'static str> {
+/// The runners an unattended launch from `config` may use, in fallback
+/// order, with every metered runner dropped unless `[dispatch]
+/// allow_paid_fallback` is set. Empty when none may. Matches what `tm work
+/// run --unattended` walks (GitHub issue #192).
+pub fn unattended_runners(config: &Config) -> Vec<&'static str> {
     crate::agent::routing::configured_unattended_order(
         config.agent,
         &config.agent_fallbacks,
         &config.usage,
         &config.dispatch,
     )
-    .first()
+    .into_iter()
     .map(|kind| kind.as_str())
+    .collect()
 }
 
 #[cfg(test)]
@@ -534,11 +537,13 @@ mod tests {
                 Launch {
                     ticket: "GH-1".to_string(),
                     lane: "backend".to_string(),
+                    runner: "claude".to_string(),
                     stacked_on: None,
                 },
                 Launch {
                     ticket: "GH-2".to_string(),
                     lane: "backend".to_string(),
+                    runner: "opencode".to_string(),
                     stacked_on: Some("gh-1-branch".to_string()),
                 },
             ],
@@ -579,8 +584,8 @@ mod tests {
         assert!(!ok);
         assert_eq!(
             out,
-            "github:o/one: launched GH-1 in lane backend\n\
-             github:o/one: launched GH-2 in lane backend (stacked on gh-1-branch)\n\
+            "github:o/one: launched GH-1 in lane backend on claude\n\
+             github:o/one: launched GH-2 in lane backend on opencode (stacked on gh-1-branch)\n\
              github:o/one: not launching: 2 lanes running, [dispatch] max_lanes is 2\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
@@ -640,8 +645,8 @@ mod tests {
                 {
                     "scope": ONE,
                     "launched": [
-                        {"ticket": "GH-1", "lane": "backend", "stacked_on": null},
-                        {"ticket": "GH-2", "lane": "backend", "stacked_on": "gh-1-branch"},
+                        {"ticket": "GH-1", "lane": "backend", "runner": "claude", "stacked_on": null},
+                        {"ticket": "GH-2", "lane": "backend", "runner": "opencode", "stacked_on": "gh-1-branch"},
                     ],
                     "refused": "not launching: 2 lanes running, [dispatch] max_lanes is 2",
                     "skipped": null,
@@ -752,7 +757,7 @@ mod tests {
                 max_fix_rounds: 3,
                 stall_notify_mins: 30,
                 lanes: &lanes,
-                agent: Some("claude"),
+                runners: &["claude"],
                 memory: &memory,
                 usage: &usage,
             };
@@ -796,7 +801,7 @@ mod tests {
         assert_eq!(*ticker.launched.borrow(), vec![format!("{ONE}/GH-1")]);
         assert_eq!(
             out,
-            "github:o/one: launched GH-1 in lane backend\n\
+            "github:o/one: launched GH-1 in lane backend on claude\n\
              github:o/two: skipped: another host is ticking this scope\n"
         );
         drop(held);
@@ -1032,15 +1037,21 @@ mod tests {
     }
 
     #[test]
-    fn unattended_agent_skips_metered_runners() {
+    fn unattended_runners_lists_every_runner_and_skips_metered_ones() {
         let mut cfg = config("o/one");
-        assert_eq!(unattended_agent(&cfg), Some("claude"));
+        cfg.agent_fallbacks = vec![crate::config::AgentKind::Opencode];
+        assert_eq!(unattended_runners(&cfg), vec!["claude"]);
+
+        cfg.usage.opencode.billing = Billing::Subscription;
+        assert_eq!(unattended_runners(&cfg), vec!["claude", "opencode"]);
 
         cfg.usage.claude.billing = Billing::Metered;
-        assert_eq!(unattended_agent(&cfg), None);
+        assert_eq!(unattended_runners(&cfg), vec!["opencode"]);
 
-        cfg.agent_fallbacks = vec![crate::config::AgentKind::Opencode];
-        cfg.usage.opencode.billing = Billing::Subscription;
-        assert_eq!(unattended_agent(&cfg), Some("opencode"));
+        cfg.usage.opencode.billing = Billing::Metered;
+        assert!(unattended_runners(&cfg).is_empty());
+
+        cfg.dispatch.allow_paid_fallback = true;
+        assert_eq!(unattended_runners(&cfg), vec!["claude", "opencode"]);
     }
 }
