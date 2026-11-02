@@ -11,6 +11,7 @@
 //! (`crate::work::run::supervise_run`): `status_on_pr`, `tm pr watch` and,
 //! under autopilot, `tm review auto`.
 
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -25,7 +26,7 @@ use crate::work::run::{
     auto_arm_watch, autopilot_start_review, resolve_pr_url,
 };
 use crate::work::signal::{
-    Signal, StepState, StepWatch, read_done_marker, step_state_of, temporary_name, wait_for_signal,
+    Signal, StepState, StepWatch, read_done_marker, temporary_name, wait_for_signal,
 };
 use crate::work::tmux::{TmuxError, TmuxOps};
 
@@ -36,8 +37,20 @@ pub const LANE_AWAIT_PID_EVENT: &str = "lane_await_pid";
 
 /// Event kind [`await_lane`] records on the lane's run row when it stops
 /// waiting. Its detail is `succeeded`, `stopped without a pull request`, or
-/// `row ended before the done signal`.
+/// [`GONE_DETAIL`].
 pub const LANE_DONE_EVENT: &str = "lane_done";
+
+/// [`LANE_DONE_EVENT`]'s detail when [`await_lane`] stops with no done
+/// marker: the row is missing, its tmux session is gone, or it stayed ended
+/// for [`ENDED_GRACE_SECS`] without the marker landing.
+pub const GONE_DETAIL: &str =
+    "stopped waiting: the row ended or its session is gone, no done marker";
+
+/// How long [`await_lane`] keeps polling for the marker after the row has
+/// ended. An agent that runs `tm runs finish` itself writes its marker a
+/// moment later, usually more than one poll apart, and that marker should
+/// still finish the lane.
+pub const ENDED_GRACE_SECS: i64 = 120;
 
 /// The blocker [`await_lane`] records on a lane whose agent signalled
 /// `{"succeeded": false}`.
@@ -92,8 +105,8 @@ pub enum AwaitOutcome {
         /// The marker's `succeeded` value.
         succeeded: bool,
     },
-    /// The row ended, or its session went away, before any marker: nothing
-    /// was touched.
+    /// No marker: the row is missing, its session went away, or it stayed
+    /// ended past [`ENDED_GRACE_SECS`]. Nothing was touched.
     Gone,
 }
 
@@ -124,9 +137,9 @@ pub enum AwaitLaneError {
 /// Records [`LANE_AWAIT_PID_EVENT`] first, then polls the marker with no
 /// timeout: an autopilot lane has no deadline, and its row stays `running`
 /// (counting toward `max_lanes`) until the marker, the row ending, or the
-/// session going away. On the marker the row is finished `done`, or
-/// `blocked` with [`NO_PR_BLOCKER`] for `{"succeeded": false}`, with the
-/// branch's PR URL, through
+/// session going away (see [`LaneWatch`]). On the marker the row is
+/// finished `done`, or `blocked` with [`NO_PR_BLOCKER`] for
+/// `{"succeeded": false}`, with the branch's PR URL, through
 /// [`RunStore::finish_run_from_supervisor`] without forcing, so a status the
 /// agent already set with `tm runs finish` wins. Then `status_on_pr`,
 /// `tm pr watch` and `tm review auto` run as they do after a headless lane.
@@ -143,20 +156,25 @@ pub fn await_lane(
     deps.run_store
         .add_event(run_id, LANE_AWAIT_PID_EVENT, Some(&deps.pid.to_string()))?;
 
-    let signal = wait_for_signal(&LaneWatch { deps }, run_id, i64::MAX, || {
-        read_done_marker(marker)
-    })?;
+    let watch = LaneWatch {
+        deps,
+        ended_since: Cell::new(None),
+    };
+    let signal = wait_for_signal(&watch, run_id, i64::MAX, || read_done_marker(marker))?;
     let succeeded = match signal {
         Signal::Received(succeeded) => succeeded,
-        // `Stuck` needs a timeout or a hibernated step, and `LaneWatch`
-        // reports neither, so it only appears here for completeness.
-        Signal::Gone | Signal::Stuck => {
-            let detail = "row ended before the done signal";
+        Signal::Gone => {
             deps.run_store
-                .add_event(run_id, LANE_DONE_EVENT, Some(detail))?;
-            writeln!(out, "lane done: {detail}; leaving its run row as it is")?;
+                .add_event(run_id, LANE_DONE_EVENT, Some(GONE_DETAIL))?;
+            writeln!(
+                out,
+                "lane awaiter {GONE_DETAIL}; leaving its run row as it is"
+            )?;
             return Ok(AwaitOutcome::Gone);
         }
+        Signal::Stuck => unreachable!(
+            "the timeout is i64::MAX and LaneWatch reports a hibernated lane as running"
+        ),
     };
 
     let pr_url = resolve_pr_url(deps.gh, &prepared.branch, None);
@@ -205,22 +223,46 @@ pub fn await_lane(
 /// The [`StepWatch`] [`await_lane`] polls through.
 struct LaneWatch<'a, 'b> {
     deps: &'a AwaitLaneDeps<'b>,
+    /// When a poll first saw the row ended, for [`ENDED_GRACE_SECS`].
+    ended_since: Cell<Option<i64>>,
 }
 
 impl StepWatch for LaneWatch<'_, '_> {
     type Error = AwaitLaneError;
 
-    /// [`step_state_of`] the lane's row, except that a hibernated lane
-    /// counts as running. `tm review auto` gives up on a hibernated step,
-    /// but a hibernated lane is resumed in place when someone attaches to
-    /// it (GitHub issue #64), and its agent can still write the marker
-    /// then, so the awaiter keeps waiting through hibernation.
+    /// The lane's own idea of [`StepState::Gone`]: a missing row or a dead
+    /// tmux session, or a row that has stayed ended for
+    /// [`ENDED_GRACE_SECS`]. Two differences from
+    /// [`crate::work::signal::step_state_of`]:
+    ///
+    /// - A hibernated lane counts as running. `tm review auto` gives up on
+    ///   a hibernated step, but a hibernated lane is resumed in place when
+    ///   someone attaches to it (GitHub issue #64), and its agent can still
+    ///   write the marker then.
+    /// - An ended row is waited on for a grace period, since the agent may
+    ///   run `tm runs finish` before it writes the marker.
     fn step_state(&self, run_id: i64) -> Result<StepState, AwaitLaneError> {
-        let run = self.deps.run_store.run_by_id(run_id)?;
-        let state = step_state_of(run.as_ref(), |session| self.deps.tmux.has_session(session))?;
-        Ok(match state {
-            StepState::Hibernated => StepState::Running,
-            other => other,
+        let Some(run) = self.deps.run_store.run_by_id(run_id)? else {
+            return Ok(StepState::Gone);
+        };
+        if let Some(session) = run.tmux_session.as_deref()
+            && !self.deps.tmux.has_session(session)?
+        {
+            return Ok(StepState::Gone);
+        }
+        if matches!(
+            run.status,
+            RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
+        ) {
+            return Ok(StepState::Running);
+        }
+        let now = self.now_unix_secs();
+        let since = self.ended_since.get().unwrap_or(now);
+        self.ended_since.set(Some(since));
+        Ok(if now - since < ENDED_GRACE_SECS {
+            StepState::Running
+        } else {
+            StepState::Gone
         })
     }
 
@@ -336,15 +378,26 @@ mod tests {
         }
     }
 
-    struct FixedClock;
+    /// A [`Clock`] that moves one signal poll forward every time it is
+    /// read, so [`ENDED_GRACE_SECS`] runs out.
+    struct TickingClock(Cell<i64>);
 
-    impl Clock for FixedClock {
+    impl TickingClock {
+        fn new() -> Self {
+            TickingClock(Cell::new(1_000))
+        }
+    }
+
+    impl Clock for TickingClock {
         fn now_parts(&self) -> (i32, u32, u32, u32, u32, u32) {
             (2026, 8, 6, 9, 5, 3)
         }
 
         fn now_unix_secs(&self) -> i64 {
-            1_000
+            let now = self.0.get();
+            self.0
+                .set(now + crate::work::signal::SIGNAL_POLL_SECS as i64);
+            now
         }
     }
 
@@ -429,7 +482,7 @@ mod tests {
             ticket_provider: provider,
             tmux,
             sleeper,
-            clock: &FixedClock,
+            clock: &TickingClock::new(),
             watch_armer: Some(&armer),
             review_starter: Some(&starter),
             pid: 4242,
@@ -550,6 +603,30 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_written_after_the_agent_finished_its_own_row_still_counts() {
+        let fx = fixture();
+        fx.store
+            .finish_run(
+                fx.prepared.run_id,
+                &FinishRun {
+                    status: RunStatus::Blocked,
+                    blocker: Some("needs a schema decision".to_string()),
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        let sleeper = MarkerSleeper::on(3, fx.marker.clone(), r#"{"succeeded": false}"#);
+
+        let got = await_with(&fx, &FakeTmuxOps::new(), &sleeper, None);
+
+        assert_eq!(got.outcome, AwaitOutcome::Done { succeeded: false });
+        let run = fx.store.run_by_id(fx.prepared.run_id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Blocked);
+        assert_eq!(run.blocker.as_deref(), Some("needs a schema decision"));
+        assert_eq!(run.pr_url.as_deref(), Some(PR_URL));
+    }
+
+    #[test]
     fn a_hibernated_lane_keeps_the_awaiter_waiting_until_its_marker() {
         let fx = fixture();
         assert!(fx.store.hibernate_run(fx.prepared.run_id).unwrap());
@@ -576,16 +653,18 @@ mod tests {
             )
             .unwrap();
 
-        let got = await_with(&fx, &FakeTmuxOps::new(), &MarkerSleeper::never(), None);
+        let sleeper = MarkerSleeper::never();
+        let got = await_with(&fx, &FakeTmuxOps::new(), &sleeper, None);
 
         assert_eq!(got.outcome, AwaitOutcome::Gone);
+        assert!(sleeper.sleeps.get() > 0, "waited out the grace period");
         let run = fx.store.run_by_id(fx.prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Interrupted);
         assert_eq!(run.pr_url, None);
         assert!(got.armed.is_empty() && got.reviewed.is_empty());
         assert_eq!(
             events(&fx.store, fx.prepared.run_id, LANE_DONE_EVENT),
-            vec![Some("row ended before the done signal".to_string())]
+            vec![Some(GONE_DETAIL.to_string())]
         );
     }
 
@@ -603,6 +682,7 @@ mod tests {
         let run = fx.store.run_by_id(fx.prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Running);
         assert!(got.armed.is_empty() && got.reviewed.is_empty());
+        assert!(got.printed.contains(GONE_DETAIL), "{}", got.printed);
     }
 
     #[test]
@@ -616,7 +696,7 @@ mod tests {
             ticket_provider: None,
             tmux: &FakeTmuxOps::new(),
             sleeper: &MarkerSleeper::never(),
-            clock: &FixedClock,
+            clock: &TickingClock::new(),
             watch_armer: None,
             review_starter: None,
             pid: 1,

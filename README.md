@@ -1203,9 +1203,11 @@ __await-lane` process waits for that marker. Then it finishes the run row
 (`done`, or `blocked` with no PR) and runs what a headless run does once
 its PR is open: `status_on_pr`, `tm pr watch` when `auto_arm` is on, and
 `tm review auto` under autopilot. A status the agent set itself with `tm
-runs finish` is kept. Until the marker appears, the row stays `running`
-and counts toward `max_lanes`. If the session ends first, the awaiter
-stops and leaves the row alone. Pass `--headless` as well to get the old
+runs finish` is kept, and a marker written up to two minutes after that
+still counts. Until the marker appears, the row stays `running` and
+counts toward `max_lanes`. If the session ends first, or the row stays
+ended past those two minutes, the awaiter stops and leaves the row
+alone. Pass `--headless` as well to get the old
 supervisor-driven `claude -p` run.
 
 ```toml
