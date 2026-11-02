@@ -563,7 +563,7 @@ fn admit<'c>(
         cfg.memory,
         cfg.usage,
         cfg.runners,
-        &lane.repo,
+        Some(&lane.repo),
         deps.memory_pressure,
         deps.now,
         deps.usage_prober,

@@ -139,6 +139,13 @@ pub enum WorkCliError {
     #[error(transparent)]
     UsageAdmission(#[from] crate::work::admission::UsageRefusal),
 
+    /// Every runner an unattended lane may route to refused it (GitHub
+    /// issue #192), each for its own memory or usage reason. A route with
+    /// only one runner reports [`WorkCliError::MemoryAdmission`] or
+    /// [`WorkCliError::UsageAdmission`] instead.
+    #[error(transparent)]
+    RouteAdmission(#[from] crate::work::admission::RouteRefusal),
+
     /// `tm work new`/`remove` was given an empty (or all-whitespace) name.
     /// See [`worktree_path_for`]'s doc comment for why this is rejected
     /// before ever calling `naming::worktree_path`.
@@ -445,6 +452,105 @@ impl From<crate::work::admission::AdmissionError> for WorkCliError {
     }
 }
 
+/// Memory and usage admission for `tm work run` (GitHub issues #66, #114
+/// and #149), ahead of every dispatch and of all provisioning, so a refusal
+/// leaves no worktree, branch, or run row behind. Returns the runner to
+/// launch on, its fallbacks, and the [`crate::work::admission::Admitted`]
+/// proof the launch needs.
+///
+/// A manual run checks only the preferred runner and only warns about
+/// usage, since a human chose to launch; the estimate is keyed by the
+/// preferred runner, and priority routing may hand the run to a fallback
+/// agent. An `--unattended` run
+/// ([`crate::work::admission::UsageGateMode::Enforce`], from the dispatcher)
+/// walks the preferred runner then its fallbacks and launches on the first
+/// that passes both gates (GitHub issue #192), keeping only the runners
+/// after it as fallbacks. It is refused only when every runner refuses.
+///
+/// The board launches lanes through this same command, so this covers it
+/// too.
+///
+/// # Errors
+///
+/// [`RunLaneError::UnknownLane`] for a lane missing from the config, the
+/// refusal, or a store error.
+#[allow(clippy::type_complexity)]
+fn admit_run<'d>(
+    ctx: &WorkContext<'_>,
+    deps: &RunDeps<'d>,
+    lane: &str,
+    out: &mut dyn Write,
+) -> Result<
+    (
+        &'d dyn AgentRunner,
+        Vec<&'d dyn AgentRunner>,
+        crate::work::admission::Admitted,
+    ),
+    WorkCliError,
+> {
+    let lane_config = ctx
+        .config
+        .lanes
+        .get(lane)
+        .ok_or_else(|| RunLaneError::UnknownLane(lane.to_string()))?;
+    let repo = crate::work::run::lane_repo_key(lane, lane_config);
+    let now = || deps.clock.now_unix_secs();
+
+    if deps.usage_gate == crate::work::admission::UsageGateMode::Enforce {
+        let runners: Vec<&'d dyn AgentRunner> = std::iter::once(deps.runner)
+            .chain(deps.fallback_runners.iter().copied())
+            .collect();
+        let names: Vec<&str> = runners.iter().map(|runner| runner.name()).collect();
+        let routed = crate::work::admission::route_unattended(
+            deps.run_store,
+            &ctx.config.memory,
+            deps.usage,
+            &names,
+            Some(&repo),
+            deps.memory_pressure,
+            now(),
+            deps.usage_prober,
+        )?;
+        return match routed {
+            Ok(routed) => {
+                if let Some(warning) = routed.warning {
+                    writeln!(out, "warning: {warning}")?;
+                }
+                Ok((
+                    runners[routed.index],
+                    runners[routed.index + 1..].to_vec(),
+                    routed.admitted,
+                ))
+            }
+            Err(mut refusal) if refusal.0.len() == 1 => Err(match refusal.0.remove(0).1 {
+                crate::work::admission::RunnerRefusal::Memory(r) => r.into(),
+                crate::work::admission::RunnerRefusal::Usage(r) => r.into(),
+            }),
+            Err(refusal) => Err(refusal.into()),
+        };
+    }
+
+    let gate = crate::work::admission::AdmissionGate {
+        store: deps.run_store,
+        memory: &ctx.config.memory,
+        usage: deps.usage,
+        prober: deps.usage_prober,
+        pressure: deps.memory_pressure,
+        now: &now,
+    };
+    let admitted = gate.admit(
+        &crate::work::admission::LaunchRequest {
+            kind: "lane",
+            agent: deps.runner.name(),
+            repo: &repo,
+            own_run: None,
+        },
+        deps.usage_gate,
+        out,
+    )?;
+    Ok((deps.runner, deps.fallback_runners.clone(), admitted))
+}
+
 /// `tm work run <lane> [ticket] [--from base] [--model m] [--max-turns n]
 /// [--permission-mode m] [--prompt path] [--fg]`: run one lane run. Thin CLI
 /// wiring over [`crate::work::run`], which owns the actual sequencing (see
@@ -487,6 +593,7 @@ pub fn run(
         state_dir: ctx.home.join(".local/state/tskmstr/work"),
         hooks_deploy_dir: ctx.home.join(".local/share/tskmstr/hooks"),
     };
+    let (runner, fallback_runners, admitted) = admit_run(ctx, deps, lane, out)?;
     let run_deps = crate::work::run::RunLaneDeps {
         git: ctx.git,
         gh: deps.gh,
@@ -497,11 +604,11 @@ pub fn run(
         current_repo_dir: deps.current_repo_dir,
         current_backend_identity: deps.current_backend_identity,
         backend_identity_resolver: deps.backend_identity_resolver,
-        runner: deps.runner,
+        runner,
         status_on_run_start: deps.status_on_run_start,
         status_on_pr: deps.status_on_pr,
         ticket_provider_error: deps.ticket_provider_error,
-        fallback_runners: deps.fallback_runners.clone(),
+        fallback_runners,
         models: deps.models,
         inherit_epic_blockers: deps.inherit_epic_blockers,
     };
@@ -509,40 +616,6 @@ pub fn run(
         mode: dispatch.run_mode(),
         ..request
     };
-
-    // Memory and usage admission (GitHub issues #66, #114 and #149), ahead
-    // of every dispatch and of all provisioning, so a refusal leaves no
-    // worktree, branch, or run row behind. The board launches lanes through
-    // this same command, so this one check covers it too. The estimate is
-    // keyed by the preferred runner; priority routing may hand the run to a
-    // fallback agent. A manual run only warns on usage, since a human chose
-    // to launch; an `--unattended` run from the dispatcher (GitHub issue
-    // #115) is refused. See `RunDeps::usage_gate`.
-    let lane_config = ctx
-        .config
-        .lanes
-        .get(lane)
-        .ok_or_else(|| RunLaneError::UnknownLane(lane.to_string()))?;
-    let repo = crate::work::run::lane_repo_key(lane, lane_config);
-    let now = || deps.clock.now_unix_secs();
-    let gate = crate::work::admission::AdmissionGate {
-        store: deps.run_store,
-        memory: &ctx.config.memory,
-        usage: deps.usage,
-        prober: deps.usage_prober,
-        pressure: deps.memory_pressure,
-        now: &now,
-    };
-    let admitted = gate.admit(
-        &crate::work::admission::LaunchRequest {
-            kind: "lane",
-            agent: deps.runner.name(),
-            repo: &repo,
-            own_run: None,
-        },
-        deps.usage_gate,
-        out,
-    )?;
 
     match dispatch {
         Dispatch::Interactive => {
@@ -2761,7 +2834,37 @@ mod tests {
         Vec<crate::runs::RunSummary>,
         String,
     ) {
-        let (tmp, home, repo_root, _prompt_path) = run_setup();
+        let (result, runs, out, _) = run_with_routing(
+            memory,
+            pressure,
+            seed,
+            usage_gate,
+            Vec::new(),
+            &crate::config::UsageConfig::default(),
+        );
+        (result, runs, out)
+    }
+
+    /// [`run_with_admission`] with `fallback_runners` after claude and
+    /// `usage`, also returning the programs spawned.
+    fn run_with_routing(
+        memory: crate::config::MemoryConfig,
+        pressure: &dyn Fn() -> crate::runs::footprint::MemoryPressure,
+        seed: &dyn Fn(&RunStore),
+        usage_gate: crate::work::admission::UsageGateMode,
+        fallback_runners: Vec<&dyn AgentRunner>,
+        usage: &crate::config::UsageConfig,
+    ) -> (
+        Result<bool, WorkCliError>,
+        Vec<crate::runs::RunSummary>,
+        String,
+        Vec<String>,
+    ) {
+        let (tmp, home, repo_root, prompt_path) = run_setup();
+        // A routed run reads the routed runner's own default lane prompt.
+        let opencode_prompt = home.join(".config/opencode/prompts/mylane.md");
+        std::fs::create_dir_all(opencode_prompt.parent().unwrap()).unwrap();
+        std::fs::copy(&prompt_path, &opencode_prompt).unwrap();
         let mut lanes = BTreeMap::new();
         lanes.insert(
             "mylane".to_string(),
@@ -2807,10 +2910,10 @@ mod tests {
             status_on_run_start: None,
             status_on_pr: None,
             ticket_provider_error: None,
-            fallback_runners: Vec::new(),
+            fallback_runners,
             models: &crate::config::ModelsConfig::default(),
             memory_pressure: pressure,
-            usage: &crate::config::UsageConfig::default(),
+            usage,
             usage_prober: &NoUsageProbe,
             usage_gate,
         };
@@ -2828,10 +2931,18 @@ mod tests {
             Dispatch::HeadlessForeground,
             &mut out,
         );
+        let programs = spawner
+            .recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|spawn| spawn.program.clone())
+            .collect();
         (
             result,
             run_store.list_runs().unwrap(),
             String::from_utf8(out).unwrap(),
+            programs,
         )
     }
 
@@ -2917,6 +3028,77 @@ mod tests {
             "{err:?}"
         );
         assert!(runs.is_empty(), "no run row may be left behind: {runs:?}");
+    }
+
+    fn claude_over_ceiling(store: &RunStore) {
+        store
+            .upsert_usage_snapshot(&crate::runs::UsageSnapshotRow {
+                agent: "claude".to_string(),
+                window: "five_hour".to_string(),
+                utilization: 0.85,
+                resets_at: i64::MAX,
+                observed_at: i64::MAX - 1,
+                source: "stream".to_string(),
+                status: Some("allowed".to_string()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unattended_run_routes_past_an_over_ceiling_runner() {
+        let (result, runs, _, programs) = run_with_routing(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &claude_over_ceiling,
+            crate::work::admission::UsageGateMode::Enforce,
+            vec![&crate::agent::opencode::OpencodeRunner],
+            &crate::config::UsageConfig::default(),
+        );
+
+        result.expect("opencode admits the lane");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(programs, vec!["opencode"]);
+    }
+
+    #[test]
+    fn an_unattended_run_every_runner_refuses_names_each_reason() {
+        let mut usage = crate::config::UsageConfig::default();
+        usage.opencode.token_budget = Some(crate::config::TokenBudget {
+            tokens: 0,
+            window_secs: 3600,
+        });
+        let (result, runs, _, programs) = run_with_routing(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &claude_over_ceiling,
+            crate::work::admission::UsageGateMode::Enforce,
+            vec![&crate::agent::opencode::OpencodeRunner],
+            &usage,
+        );
+
+        let err = result.expect_err("every runner refuses");
+        assert!(matches!(err, WorkCliError::RouteAdmission(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("claude 5h usage at 85%"), "{message}");
+        assert!(message.contains("opencode used 0 tokens"), "{message}");
+        assert!(runs.is_empty());
+        assert!(programs.is_empty());
+    }
+
+    #[test]
+    fn a_manual_run_does_not_route_past_an_over_ceiling_runner() {
+        let (result, _, out, programs) = run_with_routing(
+            crate::config::MemoryConfig::default(),
+            &normal_pressure,
+            &claude_over_ceiling,
+            crate::work::admission::UsageGateMode::Warn,
+            vec![&crate::agent::opencode::OpencodeRunner],
+            &crate::config::UsageConfig::default(),
+        );
+
+        assert!(result.unwrap());
+        assert_eq!(programs, vec!["claude"]);
+        assert!(out.contains("(launching anyway)"), "{out}");
     }
 
     #[test]

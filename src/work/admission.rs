@@ -1025,10 +1025,12 @@ impl fmt::Display for RouteRefusal {
 impl std::error::Error for RouteRefusal {}
 
 /// The runner an unattended route picked.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Routed {
     /// Its index in the route's `runners`.
     pub index: usize,
+    /// The proof it passed admission (GitHub issue #149).
+    pub admitted: Admitted,
     /// Why its usage couldn't be confirmed
     /// ([`UsageVerdict::AdmitUnknown`]), for the caller to warn with.
     pub warning: Option<String>,
@@ -1042,7 +1044,9 @@ pub struct Routed {
 /// before. Only when every runner refuses is the launch refused, with each
 /// runner's reason.
 ///
-/// `runners` are [`AgentRunner::name`]s, already filtered by
+/// `repo` is the lane's memory-admission repo key; `None` (an unknown lane)
+/// skips memory admission. `runners` are [`AgentRunner::name`]s, already
+/// filtered by
 /// [`crate::agent::routing::unattended_order`]. An empty `runners` returns
 /// an empty [`RouteRefusal`]; callers check for that first.
 ///
@@ -1055,15 +1059,16 @@ pub fn route_unattended(
     memory: &MemoryConfig,
     usage: &crate::config::UsageConfig,
     runners: &[&str],
-    repo: &str,
+    repo: Option<&str>,
     pressure: &dyn Fn() -> MemoryPressure,
     now: i64,
     prober: &dyn UsageProber,
 ) -> Result<Result<Routed, RouteRefusal>, RunStoreError> {
     let mut refused = Vec::new();
     for (index, agent) in runners.iter().enumerate() {
-        if let Some(refusal) =
-            check_memory_admission(store, memory, "lane", agent, repo, pressure)?
+        if let Some(repo) = repo
+            && let Some(refusal) =
+                check_memory_admission(store, memory, "lane", agent, repo, pressure)?
         {
             refused.push((agent.to_string(), RunnerRefusal::Memory(refusal)));
             continue;
@@ -1080,7 +1085,11 @@ pub fn route_unattended(
             UsageVerdict::AdmitUnknown(reason) => Some(reason),
             UsageVerdict::Admit => None,
         };
-        return Ok(Ok(Routed { index, warning }));
+        return Ok(Ok(Routed {
+            index,
+            admitted: Admitted(()),
+            warning,
+        }));
     }
     Ok(Err(RouteRefusal(refused)))
 }

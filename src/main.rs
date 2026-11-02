@@ -861,7 +861,9 @@ fn run_work(
                 .map(|cfg| cfg.usage.clone())
                 .unwrap_or_default();
             // `--unattended` (GitHub issue #115) routes only to runners an
-            // unattended launch may use and enforces usage admission.
+            // unattended launch may use, enforces usage admission, and
+            // launches on the first runner that passes it (GitHub issue
+            // #192).
             let (runner, fallback_runners) = if unattended {
                 unattended_runners(full_config.as_ref())?
             } else {
@@ -879,8 +881,12 @@ fn run_work(
                 .as_ref()
                 .map(|cfg| cfg.models.clone())
                 .unwrap_or_default();
+            // An unattended run routes across its fallbacks (GitHub issue
+            // #192), so each may need a fresh usage snapshot.
             let usage_prober = tskmstr::work::admission::SpawnUsageProber {
-                runners: vec![runner],
+                runners: std::iter::once(runner)
+                    .chain(fallback_runners.iter().copied())
+                    .collect(),
                 models: &models,
                 spawner: &spawner,
             };
