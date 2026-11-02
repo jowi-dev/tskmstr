@@ -131,8 +131,9 @@ pub fn audit_prompt(template: &str, key: &str) -> String {
 ///    [`crate::work::prompt::read_prompt_file`]) *before* pre-registering a
 ///    run, so a bad path leaves no orphaned run row (same posture as
 ///    [`crate::work::run::prepare_run_lane`]'s prompt preflight), pre-
-///    registers a run (`kind = "audit"`, `lane = "audit"`, `pid = None`; see
-///    the module docs) and starts `claude <prompt>` (with `--model` when
+///    registers a run (`kind = "audit"`, `lane = "audit"`, `pid = None`,
+///    `agent`/`repo` the runner's name and the audit directory's name via
+///    [`crate::work::run::dir_repo_key`]; see the module docs) and starts `claude <prompt>` (with `--model` when
 ///    `audit_cfg.model` is set — see
 ///    [`AgentRunner::interactive_shell_command`]) in
 ///    that window, with `SESSION_RUN_ID_ENV` set to the new run's id so the
@@ -209,6 +210,9 @@ pub fn launch_audit(
         kind: "audit".to_string(),
         log_path: None,
     })?;
+    // Every agent row carries its estimate key (GitHub issue #156): the
+    // audit directory's name stands in for a lane's repo.
+    store.update_agent_repo(run_id, runner.name(), &crate::work::run::dir_repo_key(&dir))?;
 
     let template = prompt_file_contents
         .as_deref()
@@ -332,6 +336,9 @@ mod tests {
         assert_eq!(run.status, RunStatus::Running);
         assert_eq!(run.pid, None);
         assert_eq!(run.worktree, "/Users/jowi/Projects/axiom");
+        // GitHub issue #156: the audit row carries its estimate key.
+        assert_eq!(run.agent.as_deref(), Some("claude"));
+        assert_eq!(run.repo.as_deref(), Some("axiom"));
 
         assert_eq!(outcome.window_name, "audit");
         assert_eq!(
