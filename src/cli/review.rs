@@ -367,11 +367,11 @@ pub fn fix(
     let repo = review_run_repo(deps.config, &run);
     let admitted = deps.admission.admit(
         deps.run_store,
-        &|| deps.clock.now_unix_secs(),
         &LaunchRequest {
             kind: "review-fix",
             agent: deps.runner.name(),
             repo: &repo,
+            own_run: None,
         },
         origin,
         out,
@@ -721,11 +721,11 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
             .admission
             .admit(
                 deps.run_store,
-                &|| deps.clock.now_unix_secs(),
                 &LaunchRequest {
                     kind: AUTO_REVIEW_KIND,
                     agent: deps.runner.name(),
                     repo: self.repo,
+                    own_run: None,
                 },
                 self.unattended(),
                 &mut std::io::sink(),

@@ -482,11 +482,11 @@ fn admit_conflict_session(
     let repo = crate::work::run::dir_repo_key(repo_root);
     Ok(deps.admission.admit_tracked(
         deps.run_store,
-        &|| deps.clock.now_unix_secs(),
         &crate::work::admission::LaunchRequest {
             kind: MERGE_CONFLICT_KIND,
             agent: deps.runner.name(),
             repo: &repo,
+            own_run: None,
         },
         crate::work::admission::LaunchOrigin::Human,
         out,

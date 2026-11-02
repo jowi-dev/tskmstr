@@ -154,6 +154,23 @@ pub fn check_memory_admission(
     repo: &str,
     pressure: &dyn Fn() -> MemoryPressure,
 ) -> Result<Option<AdmissionRefusal>, RunStoreError> {
+    let request = LaunchRequest {
+        kind,
+        agent,
+        repo,
+        own_run: None,
+    };
+    check_memory(store, memory, &request, pressure)
+}
+
+/// [`check_memory_admission`] for a [`LaunchRequest`], leaving its
+/// `own_run` out of the running total.
+fn check_memory(
+    store: &RunStore,
+    memory: &MemoryConfig,
+    request: &LaunchRequest<'_>,
+    pressure: &dyn Fn() -> MemoryPressure,
+) -> Result<Option<AdmissionRefusal>, RunStoreError> {
     let Some(budget_bytes) = memory.budget_bytes else {
         return Ok(None);
     };
@@ -163,17 +180,17 @@ pub fn check_memory_admission(
         return Ok(Some(AdmissionRefusal::Pressure(level)));
     }
 
-    let running = running_agent_estimate(store, memory)?;
-    let history = store.peak_estimate(kind, agent, repo)?;
-    let estimate_bytes = history.unwrap_or_else(|| default_estimate_bytes(kind, memory));
+    let running = running_estimate(store, memory, request.own_run)?;
+    let history = store.peak_estimate(request.kind, request.agent, request.repo)?;
+    let estimate_bytes = history.unwrap_or_else(|| default_estimate_bytes(request.kind, memory));
     if running.bytes + estimate_bytes <= budget_bytes {
         return Ok(None);
     }
 
     Ok(Some(AdmissionRefusal::OverBudget(OverBudget {
-        kind: kind.to_string(),
-        agent: agent.to_string(),
-        repo: repo.to_string(),
+        kind: request.kind.to_string(),
+        agent: request.agent.to_string(),
+        repo: request.repo.to_string(),
         estimate_bytes,
         from_history: history.is_some(),
         running_count: running.count,
@@ -206,8 +223,17 @@ pub fn running_agent_estimate(
     store: &RunStore,
     memory: &MemoryConfig,
 ) -> Result<RunningEstimate, RunStoreError> {
+    running_estimate(store, memory, None)
+}
+
+fn running_estimate(
+    store: &RunStore,
+    memory: &MemoryConfig,
+    exclude: Option<i64>,
+) -> Result<RunningEstimate, RunStoreError> {
     let mut cache = HashMap::new();
-    let running = store.running_agents()?;
+    let mut running = store.running_agents()?;
+    running.retain(|run| Some(run.id) != exclude);
     let mut bytes = 0u64;
     for run in &running {
         let key_estimate = match (&run.agent, &run.repo) {
@@ -600,6 +626,10 @@ pub struct LaunchRequest<'a> {
     pub agent: &'a str,
     /// The repo key the run is stamped with.
     pub repo: &'a str,
+    /// The launch's own pre-registered row, when it has one before it is
+    /// admitted (a waiting bugbot cleanup records its wait there). It is
+    /// left out of the running total, so the launch never counts twice.
+    pub own_run: Option<i64>,
 }
 
 /// Why [`AdmissionGate`] refused a launch.
@@ -665,14 +695,7 @@ impl AdmissionGate<'_> {
         mode: UsageGateMode,
         out: &mut dyn Write,
     ) -> Result<Admitted, AdmissionError> {
-        if let Some(refusal) = check_memory_admission(
-            self.store,
-            self.memory,
-            request.kind,
-            request.agent,
-            request.repo,
-            self.pressure,
-        )? {
+        if let Some(refusal) = check_memory(self.store, self.memory, request, self.pressure)? {
             return Err(refusal.into());
         }
         if let Some(usage) = self.usage.for_agent(request.agent) {
@@ -762,6 +785,8 @@ pub struct AdmissionDeps<'a> {
     pub pressure: &'a dyn Fn() -> MemoryPressure,
     /// Waits between rechecks of an unattended launch.
     pub sleeper: &'a dyn crate::work::review_watch::Sleeper,
+    /// "Now", in unix seconds, for the usage check.
+    pub now: &'a dyn Fn() -> i64,
 }
 
 impl AdmissionDeps<'_> {
@@ -789,6 +814,11 @@ impl AdmissionDeps<'_> {
             prober: &NeverProbe,
             pressure: &|| MemoryPressure::Normal,
             sleeper: &NoSleep,
+            now: &|| {
+                crate::work::review_watch::Clock::now_unix_secs(
+                    &crate::work::review_watch::SystemClock,
+                )
+            },
         }
     }
 
@@ -814,13 +844,12 @@ impl AdmissionDeps<'_> {
     pub fn admit_tracked(
         &self,
         store: Option<&RunStore>,
-        now: &dyn Fn() -> i64,
         request: &LaunchRequest<'_>,
         origin: LaunchOrigin,
         out: &mut dyn Write,
     ) -> Result<Admitted, AdmissionError> {
         match store {
-            Some(store) => self.admit(store, now, request, origin, out),
+            Some(store) => self.admit(store, request, origin, out),
             None => {
                 let _ = writeln!(
                     out,
@@ -842,7 +871,6 @@ impl AdmissionDeps<'_> {
     pub fn admit(
         &self,
         store: &RunStore,
-        now: &dyn Fn() -> i64,
         request: &LaunchRequest<'_>,
         origin: LaunchOrigin,
         out: &mut dyn Write,
@@ -853,7 +881,7 @@ impl AdmissionDeps<'_> {
             usage: self.usage,
             prober: self.prober,
             pressure: self.pressure,
-            now,
+            now: self.now,
         };
         let LaunchOrigin::Unattended { event_run } = origin else {
             return gate.admit(request, UsageGateMode::Warn, out);
@@ -1235,6 +1263,51 @@ mod kind_tests {
     }
 
     #[test]
+    fn a_launch_does_not_count_its_own_pre_registered_row() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let own = start(&store, "bugbot-cleanup");
+        let memory = budget(1);
+        let gate = AdmissionGate {
+            store: &store,
+            memory: &memory,
+            usage: &crate::config::UsageConfig::default(),
+            prober: &NeverProbes,
+            pressure: &normal,
+            now: &|| 0,
+        };
+        let request = LaunchRequest {
+            kind: "bugbot-cleanup",
+            agent: "claude",
+            repo: "tskmstr",
+            own_run: Some(own),
+        };
+
+        let admitted = gate.admit(&request, UsageGateMode::Enforce, &mut Vec::new());
+
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
+        let refused = gate.admit(
+            &LaunchRequest {
+                own_run: None,
+                ..request
+            },
+            UsageGateMode::Enforce,
+            &mut Vec::new(),
+        );
+        assert!(refused.is_err(), "without own_run the row counts");
+    }
+
+    struct NeverProbes;
+    impl UsageProber for NeverProbes {
+        fn supports(&self, _agent: &str) -> bool {
+            false
+        }
+        fn probe(&self, _agent: &str) -> Result<UsageSnapshot, String> {
+            Err("never".to_string())
+        }
+    }
+
+    #[test]
     fn a_hibernated_run_frees_its_share() {
         let dir = tempdir().unwrap();
         let store = store(dir.path());
@@ -1355,6 +1428,7 @@ mod gate_tests {
             kind: "auto-review",
             agent: "claude",
             repo: "tskmstr",
+            own_run: None,
         }
     }
 
@@ -1539,11 +1613,11 @@ mod gate_tests {
             prober: &NoProbe,
             pressure: &|| MemoryPressure::Normal,
             sleeper: &sleeper,
+            now: &|| NOW,
         };
 
         let admitted = deps.admit(
             &store,
-            &|| NOW,
             &review_round(),
             LaunchOrigin::Unattended {
                 event_run: Some(lane),
@@ -1596,12 +1670,12 @@ mod gate_tests {
             prober: &NoProbe,
             pressure: &|| MemoryPressure::Normal,
             sleeper: &sleeper,
+            now: &|| NOW,
         };
 
         let err = deps
             .admit(
                 &store,
-                &|| NOW,
                 &review_round(),
                 LaunchOrigin::Unattended {
                     event_run: Some(lane),
@@ -1622,7 +1696,6 @@ mod gate_tests {
 
         let admitted = AdmissionDeps::with_budget(1).admit_tracked(
             None,
-            &|| NOW,
             &review_round(),
             LaunchOrigin::Human,
             &mut out,
@@ -1653,12 +1726,12 @@ mod gate_tests {
             prober: &NoProbe,
             pressure: &|| MemoryPressure::Normal,
             sleeper: &sleeper,
+            now: &|| NOW,
         };
 
         let err = deps
             .admit(
                 &store,
-                &|| NOW,
                 &review_round(),
                 LaunchOrigin::Human,
                 &mut Vec::new(),

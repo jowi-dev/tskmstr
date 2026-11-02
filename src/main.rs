@@ -2470,6 +2470,11 @@ fn with_admission<T>(
         prober: &prober,
         pressure: &tskmstr::runs::footprint::memory_pressure,
         sleeper: &tskmstr::work::review_watch::RealSleeper,
+        now: &|| {
+            tskmstr::work::review_watch::Clock::now_unix_secs(
+                &tskmstr::work::review_watch::SystemClock,
+            )
+        },
     })
 }
 

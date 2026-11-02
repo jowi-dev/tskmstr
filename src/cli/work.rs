@@ -525,6 +525,7 @@ pub fn run(
             kind: "lane",
             agent: deps.runner.name(),
             repo: &repo,
+            own_run: None,
         },
         deps.usage_gate,
         out,
