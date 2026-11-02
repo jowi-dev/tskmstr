@@ -408,6 +408,10 @@ pub struct RunDeps<'a> {
     /// The configured per-runner models, passed through to
     /// [`crate::work::run::RunLaneDeps::models`]. See GitHub issue #143.
     pub models: &'a crate::config::ModelsConfig,
+    /// `[ready] inherit_epic_blockers`, passed through to
+    /// [`crate::work::run::RunLaneDeps::inherit_epic_blockers`]. See GitHub
+    /// issue #178.
+    pub inherit_epic_blockers: bool,
     /// Reads the kernel's memory-pressure level for memory-budget admission
     /// (GitHub issue #66); production passes
     /// [`crate::runs::footprint::memory_pressure`]. Only called when
@@ -480,6 +484,7 @@ pub fn run(
         ticket_provider_error: deps.ticket_provider_error,
         fallback_runners: deps.fallback_runners.clone(),
         models: deps.models,
+        inherit_epic_blockers: deps.inherit_epic_blockers,
     };
     let request = RunLaneRequest {
         mode: dispatch.run_mode(),
@@ -2659,6 +2664,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -2828,6 +2834,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -2965,6 +2972,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3042,6 +3050,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3210,6 +3219,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3293,6 +3303,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3362,6 +3373,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3481,6 +3493,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3551,6 +3564,7 @@ mod tests {
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
+            inherit_epic_blockers: true,
             gh: &gh,
             spawner: &spawner,
             run_store: &run_store,
@@ -3615,6 +3629,7 @@ mod tests {
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
         let prepare_spawner = FakeProcessSpawner::success(canned_claude_json());
         let run_deps = crate::work::run::RunLaneDeps {
+            inherit_epic_blockers: true,
             git: &git,
             gh: &gh,
             spawner: &prepare_spawner,

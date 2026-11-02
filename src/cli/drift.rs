@@ -324,6 +324,7 @@ mod tests {
             agent: crate::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            inherit_epic_blockers: true,
             usage: Default::default(),
             models: Default::default(),
             dispatch: Default::default(),

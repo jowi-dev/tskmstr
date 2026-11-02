@@ -428,6 +428,10 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             in_flight: ready_in_flight(&config),
             in_base: &|sha| containment.contains(sha),
             audit: ready_audit_gate(&config, &audit_store),
+            epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
+                provider.as_ref(),
+                config.inherit_epic_blockers,
+            ),
         };
         let resolver = tskmstr::config::FsBackendIdentityResolver {
             home: self.home.clone(),
@@ -851,6 +855,9 @@ fn run_work(
                 ticket_provider_error: ticket_provider_error.as_deref(),
                 fallback_runners,
                 models: &models,
+                inherit_epic_blockers: full_config
+                    .as_ref()
+                    .is_none_or(|cfg| cfg.inherit_epic_blockers),
                 memory_pressure: &tskmstr::runs::footprint::memory_pressure,
                 usage: &usage,
                 usage_prober: &usage_prober,
@@ -1118,6 +1125,7 @@ fn net_deps_builder(
     ctx: NetDepsContext,
 ) -> Result<NetDepsBuilder, Box<dyn std::error::Error>> {
     let db_path = run_db_path_from_config(config);
+    let inherit_epic_blockers = config.inherit_epic_blockers;
     match config.backend {
         BackendKind::Jira => {
             let token = resolve_token(keychain, env_token)?;
@@ -1140,6 +1148,7 @@ fn net_deps_builder(
                 cwd: ctx.cwd,
                 backend_identity: ctx.backend_identity,
                 runner: ctx.runner,
+                inherit_epic_blockers,
             }))
         }
         BackendKind::Github => {
@@ -1166,6 +1175,7 @@ fn net_deps_builder(
                     cwd: ctx.cwd,
                     backend_identity: ctx.backend_identity,
                     runner: ctx.runner,
+                    inherit_epic_blockers,
                 }
             }))
         }
@@ -2068,6 +2078,10 @@ fn run_ready(
         in_flight: ready_in_flight(&config),
         in_base: &|sha| containment.contains(sha),
         audit: ready_audit_gate(&config, &audit_store),
+        epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
+            jira.as_ref(),
+            config.inherit_epic_blockers,
+        ),
     };
     let mut stdout = std::io::stdout();
     if json {
@@ -2173,6 +2187,10 @@ fn run_ready_check(key: String) -> ExitCode {
         in_flight: ready_in_flight(&config),
         in_base: &|sha| containment.contains(sha),
         audit: ready_audit_gate(&config, &audit_store),
+        epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
+            jira.as_ref(),
+            config.inherit_epic_blockers,
+        ),
     };
     let mut stdout = std::io::stdout();
 
@@ -2808,6 +2826,10 @@ impl AutopilotTicker {
             in_flight: ready_in_flight(&config),
             in_base: &|sha| containment.contains(sha),
             audit: ready_audit_gate(&config, &audit_store),
+            epics: tskmstr::blocker_stacking::ParentEpics::from_provider(
+                jira.as_ref(),
+                config.inherit_epic_blockers,
+            ),
         };
 
         let (lane_names, _hidden) = tskmstr::config::compatible_lane_names(
@@ -2986,6 +3008,7 @@ mod tests {
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            inherit_epic_blockers: true,
             usage: Default::default(),
             models: Default::default(),
             dispatch: Default::default(),
@@ -3013,6 +3036,7 @@ mod tests {
             agent: tskmstr::config::AgentKind::Claude,
             agent_fallbacks: Vec::new(),
             require_audit: true,
+            inherit_epic_blockers: true,
             usage: Default::default(),
             models: Default::default(),
             dispatch: Default::default(),

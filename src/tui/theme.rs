@@ -369,6 +369,7 @@ mod tests {
             },
             Readiness::Blocked {
                 blocker_keys: vec!["PROJ-9".to_string()],
+                via_epic: None,
             },
             Readiness::Unknown,
         ]

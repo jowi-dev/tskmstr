@@ -3103,10 +3103,7 @@ fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     };
     let key = ticket.key.clone();
-    let blocker_keys = match &ticket.readiness {
-        Readiness::Blocked { blocker_keys } => Some(blocker_keys.clone()),
-        _ => None,
-    };
+    let blocker_keys = ticket.readiness.blocker_labels();
 
     let active = app.pending_lane_launches.contains(&key)
         || matches!(
@@ -8391,6 +8388,7 @@ mod tests {
         TicketSummary {
             readiness: Readiness::Blocked {
                 blocker_keys: blockers.iter().map(|b| b.to_string()).collect(),
+                via_epic: None,
             },
             ..ticket(key)
         }

@@ -1604,15 +1604,19 @@ Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
 stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
 classification `tm ready <KEY>` reports, computed by the same rule
 (`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
-board repo's PR list. Pressing `w` on a blocked ticket opens a confirmation
-listing the blocking keys; `y`/`Enter` launches anyway, `n`/`Esc` launches
-nothing. Ready, stackable, and unknown tickets launch without a prompt.
+board repo's PR list, plus the blockers a card inherits from a locked
+parent epic (see [Inherited blockers](#inherited-blockers-children-of-a-locked-epic)).
+Pressing `w` on a blocked ticket opens a confirmation listing the blocking
+keys, an inherited one as `PROJ-12 (via epic PROJ-30)`; `y`/`Enter`
+launches anyway, `n`/`Esc` launches nothing. Ready, stackable, and unknown tickets launch without a prompt.
 
 The lookup runs on the board's network worker with each ticket refresh and
 costs a fixed number of calls, not one per ticket: at most one `gh pr list`
 (skipped when no listed ticket has a blocker), and on the GitHub backend one
-batched GraphQL `blockedBy` query for every listed issue. If either lookup
-fails, the affected cards show `?`, never `✓`, and the status line says why.
+batched GraphQL `blockedBy` query for every listed issue, plus one ticket
+lookup per distinct parent epic. If a lookup fails, the affected cards show
+`?`, never `✓`, and the status line says why; unknown parents make every
+card `?` while `[ready] inherit_epic_blockers` is on.
 Unlike `tm ready <KEY>`, the board has no Jira-status-only fallback when the
 PR list fails, because a guessed "ready" is worse than no answer. GitHub
 dependency data only records open or closed, so an open blocker counts as
@@ -2286,6 +2290,7 @@ default_assignee_account_id = "..."   # filled in by `tm auth login`
 
 # [ready]                             # optional, see below
 # require_audit = true                # the default
+# inherit_epic_blockers = true        # the default
 
 # [backend]                           # optional, see below; "jira" is the default
 # provider = "jira"
@@ -2897,6 +2902,40 @@ Then, across the ticket's unmerged blockers:
   exists to build on, and nobody is building it.
 - **two or more** → **blocked**: a single branch can only be stacked on one
   dependency at a time, so this refuses rather than guessing which one.
+
+#### Inherited blockers: children of a locked epic
+
+A ticket also inherits its **parent epic's** blockers. When epic A blocks
+(unlocks) epic B, B's work should not start until A is done, so every child
+of B is **blocked** while A is unfinished, even with no links of its own.
+`tm ready`, `tm ready <KEY>`, `tm work run`, and the board all apply this
+through the same shared rule:
+
+- The epic's direct `Blocks` blockers are judged by the same satisfaction
+  rule as a ticket's own (done status, merged PR, or a closed PR already in
+  the base). Once every one is satisfied, the child depends only on its own
+  links again.
+- An inherited blocker is **never stackable**, even with an open PR: a lane
+  can't stack a branch on a whole epic. `tm work run` refuses the run.
+- **One level only.** A child inherits its epic's direct blockers, not the
+  epic's whole upstream chain, matching how direct blockers work.
+- An epic counts as finished by its own status, never by its children's
+  progress. This is the same "locked" the epic graph (`tm graph`) reports.
+- Each distinct parent epic is fetched once per readiness check, however
+  many of its children are being checked.
+
+The reason names the epic:
+
+```
+PROJ-40  Build the screen  [blocked by PROJ-12 (via epic PROJ-30)]
+```
+
+If a parent epic can't be loaded, `tm ready <KEY>` exits `1` rather than
+guessing, the list marks that ticket blocked with the lookup error, the
+board shows `?`, and `tm work run` warns and runs on the normal base (as it
+does when the ticket itself can't be loaded). Set `[ready]
+inherit_epic_blockers = false` to judge every ticket by its own links only,
+as before.
 
 `tm ready` (no key) lists your "To Do" tickets (something already In
 Progress has already been picked up), each classified by the stack decision
