@@ -82,11 +82,14 @@ tm-dispatch.timer`, and `journalctl --user -u tm-dispatch.service`.
 
 Three settings in `tm-dispatch.service` matter:
 
-- **`KillMode=process`.** The lane runs a tick launches are detached
-  supervisors, but `setsid` does not move them out of the service's cgroup.
-  Under the default `KillMode=control-group`, systemd kills every one of
-  them the moment the oneshot tick exits. This was checked with a oneshot
-  unit that starts a `setsid` child: the child died under
+- **`KillMode=process`.** A tick launches each lane into a tmux window
+  and spawns a detached lane awaiter (`tm work __await-lane`) beside it.
+  When no tmux server is running yet, the tick's `tmux new-session` also
+  starts the server, which then hosts every lane's agent. `setsid` moves
+  neither out of the service's cgroup, so under the default
+  `KillMode=control-group` systemd kills the awaiter, the tmux server and
+  every agent in it the moment the oneshot tick exits. This was checked
+  with a oneshot unit that starts a `setsid` child: the child died under
   `control-group` and survived under `process`.
 - **`PATH`.** A user service gets a minimal `PATH`. `tm`, `git`, `gh`,
   `tmux`, and your agent CLI must all be on it. The shipped value covers

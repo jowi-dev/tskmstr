@@ -608,17 +608,22 @@ deliberate `blocked` status back to `done`.
 
 ### Log files
 
-Every detached run (`tm pr watch <KEY>`, and `tm work run <lane> ...
---headless`) redirects its stdout/stderr to a log file, recorded on the run
-row as `log_path`:
+Every detached process (`tm pr watch <KEY>`, `tm work run <lane> ...
+--headless`, and an unattended lane's awaiter) redirects its
+stdout/stderr to a log file, recorded on the run row as `log_path`:
 
 - `tm pr watch` (`kind = review-watch`): `<home>/.local/state/tskmstr/review-watch/<lowercased key>.log`
 - `tm work run --headless` (`kind = lane`): `<state_dir>/<worktree name>-<timestamp>.log`, printed as the `log` line when the run starts
+- `tm work run --unattended` without `--headless` (`kind = lane`, the
+  dispatcher's launch): the same `<state_dir>/<worktree name>-<timestamp>.log`,
+  holding only the lane awaiter's own lines (`tm work __await-lane`; see
+  [Autopilot dispatcher](#autopilot-dispatcher-dispatch)). The agent's output is its window's scrollback.
 
-Interactive runs (`tm work run` and `tm review fix` without `--headless`)
-have no log file: their output is the tmux window's scrollback, and their
-prompt is kept at `<state_dir>/<worktree name>-<timestamp>.prompt.md`. `tm
-runs show` remains the durable record of what happened.
+Attended interactive runs (`tm work run` and `tm review fix` without
+`--headless` or `--unattended`) have no log file: their output is the tmux
+window's scrollback, and their prompt is kept at
+`<state_dir>/<worktree name>-<timestamp>.prompt.md`. `tm runs show`
+remains the durable record of what happened.
 
 For `tm work run`, that file can already have content in it by the time the
 detached process's stdio is redirected there: the blocked-ticket
@@ -1876,9 +1881,12 @@ the same detached `tm pr watch <KEY>`, unless a watcher for the ticket is
 already running. A fix pass therefore re-arms bot review for the commits
 it pushed. Each attempt is recorded as an `auto_arm` event on the run
 (`armed tm pr watch`, `already watching (run N)`, or `failed: ...`); a
-failure only warns and never fails the run. Interactive runs and `--fg`
-runs are not covered: an interactive run ends through `tm runs finish`,
-which is not hooked, the same gap `status_on_pr` has. Combined with
+failure only warns and never fails the run. An unattended interactive
+lane (the dispatcher's launch) is covered too: its lane awaiter (`tm work
+__await-lane`) arms the watch once the agent signals it is done.
+Attended interactive runs and `--fg` runs are not: an attended run ends
+through `tm runs finish`, which is not hooked, the same gap
+`status_on_pr` has. Combined with
 `on_bots_done = "launch"`, a run can go from PR to cleanup session
 unattended, so it is off by default.
 
@@ -2033,11 +2041,15 @@ the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
 
 **Under autopilot, review bots never gate the review.** While the ticket's
-scope has autopilot on, a detached lane run that finishes with a PR starts
-`tm review auto` straight from its supervisor, without waiting for any
-review bot, and records an `autopilot_review` event on the run
-(`started tm review auto` or `failed: ...`). This keys on the flag, not on
-how the lane was launched, so a lane you start by hand takes this path too.
+scope has autopilot on, a lane run that finishes with a PR starts `tm
+review auto` straight away, without waiting for any review bot, and
+records an `autopilot_review` event on the run (`started tm review auto`
+or `failed: ...`). A headless lane starts it from its supervisor; the
+dispatcher's interactive lanes start it from their lane awaiter (`tm work
+__await-lane`). This keys on the flag, not on how the lane was launched,
+so a headless lane you start by hand takes this path too. An attended
+interactive lane (no `--headless`, no `--unattended`) has neither, so it
+does not.
 Before each fix round, the loop imports the PR's unresolved `review_bots`
 threads into the comment store the same way `tm review import` imports
 human ones, so one fix pass handles thatch's findings and bugbot's comments
