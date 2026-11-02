@@ -643,11 +643,12 @@ tm runs logs AX-408 --follow --transcript  # plus the agent's tool calls
 ```
 
 A headless run's log holds only tm's own status lines; everything the agent
-does goes to its output stream, the `.json` file beside the log (or the
-run's recorded transcript once it has finished). `--transcript` prints that
-stream too, one readable line per message or tool call (`→ Bash cargo
-test`, `✗ tool error: ...`, `result: ...`), rendered by the run's agent
-adapter. Without `--follow` it prints the last `--tail` rendered lines
+does goes to its output stream, the `.json` file beside the log.
+`--transcript` prints that stream too, one readable line per message or
+tool call (`→ Bash cargo test`, `✗ tool error: ...`, `result: done`),
+rendered by the run's agent adapter. If the run falls back to another
+agent, the stream starts over in that agent's format and `--follow`
+starts over with it. Without `--follow` it prints the last `--tail` rendered lines
 after the log tail; a stream that doesn't exist yet prints nothing extra.
 
 Runs started before the `log_path` column existed have it as `NULL`; for

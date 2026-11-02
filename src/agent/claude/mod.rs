@@ -400,7 +400,9 @@ impl AgentRunner for ClaudeRunner {
     /// `assistant` message's `text` blocks as their text and its
     /// `tool_use` blocks as `→ <name> <summary>`; a `user` message's
     /// errored `tool_result` blocks as `✗ tool error: <first line>`; the
-    /// `result` line as `result: <text>`. Everything else (`system`,
+    /// `result` line as `result: done`, or `result: error[: <text>]` when
+    /// it failed. A success's `result` text is the final assistant
+    /// message, already shown as its `text` block. Everything else (`system`,
     /// `rate_limit_event`, successful tool results, non-JSON) renders as
     /// nothing.
     fn progress_lines(&self, line: &str) -> Vec<String> {
@@ -450,10 +452,10 @@ impl AgentRunner for ClaudeRunner {
                     .map(|text| one_line(&text, 200))
                     .filter(|text| !text.is_empty());
                 let is_error = value.get("is_error").and_then(serde_json::Value::as_bool);
-                match (text, is_error) {
-                    (Some(text), _) => vec![format!("result: {text}")],
-                    (None, Some(true)) => vec!["result: error".to_string()],
-                    (None, _) => Vec::new(),
+                match (is_error, text) {
+                    (Some(true), Some(text)) => vec![format!("result: error: {text}")],
+                    (Some(true), None) => vec!["result: error".to_string()],
+                    _ => vec!["result: done".to_string()],
                 }
             }
             _ => Vec::new(),
@@ -1718,13 +1720,20 @@ mod tests {
         let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"opened\nPR #42","session_id":"s"}"#;
         assert_eq!(
             ClaudeRunner.progress_lines(ok),
-            vec!["result: opened PR #42".to_string()]
+            vec!["result: done".to_string()],
+            "a success's text is the final assistant message, already shown"
         );
         let err =
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#;
         assert_eq!(
             ClaudeRunner.progress_lines(err),
             vec!["result: error".to_string()]
+        );
+        let limited =
+            r#"{"type":"result","is_error":true,"result":"usage limit\nreached","session_id":"s"}"#;
+        assert_eq!(
+            ClaudeRunner.progress_lines(limited),
+            vec!["result: error: usage limit reached".to_string()]
         );
     }
 
@@ -1752,10 +1761,7 @@ mod tests {
             .collect();
         assert_eq!(
             lines,
-            vec![
-                "Working on it.".to_string(),
-                "result: opened https://github.com/example/repo/pull/42".to_string(),
-            ]
+            vec!["Working on it.".to_string(), "result: done".to_string(),]
         );
     }
 
