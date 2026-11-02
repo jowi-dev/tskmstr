@@ -212,6 +212,7 @@ fn settings_json(deploy_dir: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn all_hook_names() -> Vec<&'static str> {
         vec![
@@ -676,6 +677,127 @@ mod tests {
             !contents.contains(r#"[ -z "${TSKMSTR_RUN_ID:-}" ] && exit 0"#),
             "tm-session-end.sh must not exit on unset TSKMSTR_RUN_ID — that would skip every interactive session"
         );
+    }
+
+    /// Runs the embedded `tm-session-end.sh` with a fake `tm` on `PATH`
+    /// that appends each invocation's arguments to a log, a fresh
+    /// `XDG_DATA_HOME` (so the sessions dir starts empty unless `marker`
+    /// writes one), and `session_run_id` as `TSKMSTR_SESSION_RUN_ID`.
+    /// Returns the `tm` invocations, one line each, and whether the marker
+    /// survived. The hook must exit 0 and print nothing either way.
+    fn run_session_end(
+        session_run_id: Option<&str>,
+        marker: Option<(&str, &str)>,
+    ) -> (Vec<String>, bool) {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = tmp.path().join("tm.log");
+        let tm = bin.join("tm");
+        std::fs::write(
+            &tm,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let xdg = tmp.path().join("data");
+        let sessions = xdg.join("tskmstr").join("sessions");
+        if let Some((session_id, run_id)) = marker {
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::fs::write(sessions.join(session_id), run_id).unwrap();
+        }
+
+        let (_, script) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "tm-session-end.sh")
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .env("XDG_DATA_HOME", &xdg)
+            .env_remove("TSKMSTR_RUN_ID")
+            .env_remove("TSKMSTR_SESSION_RUN_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(id) = session_run_id {
+            command.env("TSKMSTR_SESSION_RUN_ID", id);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"sess-1"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        let survived = marker.is_some_and(|(session_id, _)| sessions.join(session_id).exists());
+        (calls, survived)
+    }
+
+    fn jq_on_path() -> bool {
+        std::process::Command::new("jq")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// GitHub issue #156: a board create session that never ran `tm ticket
+    /// create` has no marker, so the hook falls back to its pre-registered
+    /// row, guarded so it can only close a still-running `create` row.
+    #[test]
+    fn session_end_without_a_marker_finishes_the_preregistered_create_row() {
+        let (calls, _) = run_session_end(Some("7"), None);
+
+        assert_eq!(
+            calls,
+            vec!["runs finish 7 --status done --if-running --if-kind create".to_string()]
+        );
+    }
+
+    #[test]
+    fn session_end_without_a_marker_or_session_run_id_does_nothing() {
+        let (calls, _) = run_session_end(None, None);
+
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn session_end_with_a_marker_finishes_it_then_tries_the_create_fallback() {
+        if !jq_on_path() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
+        let (calls, survived) = run_session_end(Some("7"), Some(("sess-1", "7")));
+
+        assert_eq!(
+            calls,
+            vec![
+                "runs finish 7 --status done".to_string(),
+                "runs finish 7 --status done --if-running --if-kind create".to_string(),
+            ]
+        );
+        assert!(!survived, "the marker is removed");
     }
 
     #[test]
