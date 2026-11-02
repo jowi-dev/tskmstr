@@ -1373,6 +1373,7 @@ mod tests {
     fn config_with_lanes(lanes: BTreeMap<String, LaneConfig>) -> WorkConfig {
         WorkConfig {
             build_slots: None,
+            agent_servers: BTreeMap::new(),
             worktree_root: Some("/Worktrees".to_string()),
             default_model: None,
             default_max_turns: None,

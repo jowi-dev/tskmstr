@@ -345,6 +345,31 @@ pub struct RawRunnerConfig {
     /// [`DEFAULT_TOKEN_BUDGET_WINDOW_HOURS`]; ignored without
     /// `token_budget`.
     pub token_budget_window_hours: Option<u64>,
+    /// How headless lanes run (GitHub issue #192): `"process"` (default),
+    /// one agent process per lane, or `"server"`, every lane attached to
+    /// one shared server. Only a runner with a server mode accepts
+    /// `"server"` ([`ConfigError::ServerModeUnsupported`]). See
+    /// [`WorkConfig::agent_servers`].
+    pub mode: Option<String>,
+    /// The shared server's URL in server mode, `http://<host>:<port>`.
+    /// Defaults to [`DEFAULT_AGENT_SERVER_URL`]; ignored in process mode.
+    pub server_url: Option<String>,
+}
+
+/// [`RawRunnerConfig::server_url`] when unset.
+pub const DEFAULT_AGENT_SERVER_URL: &str = "http://127.0.0.1:4096";
+
+/// The host and port of a server URL of the form `http://<host>:<port>`
+/// (a trailing `/` is allowed), or `None` when it has another shape. The
+/// port must be explicit, since tm starts the server on it.
+pub fn parse_server_url(url: &str) -> Option<(&str, u16)> {
+    let rest = url.strip_prefix("http://")?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.is_empty() || host.contains('/') {
+        return None;
+    }
+    Some((host, port.parse().ok()?))
 }
 
 /// Raw `[dispatch]` section (GitHub issues #114 and #115).
@@ -416,6 +441,12 @@ impl AgentKind {
     /// [`AgentKind::parse`]: every entry must parse.
     pub fn names() -> &'static [&'static str] {
         &["claude", "opencode"]
+    }
+
+    /// Whether this runner has a shared-server mode (GitHub issue #192), so
+    /// `[agent.<runner>] mode = "server"` is legal for it.
+    pub fn supports_server_mode(self) -> bool {
+        matches!(self, AgentKind::Opencode)
     }
 
     /// The models tm launches on this runner when nothing in config names
@@ -1203,6 +1234,11 @@ pub struct ReviewConfig {
 pub struct WorkConfig {
     /// See [`RawWorkConfig::worktree_root`].
     pub worktree_root: Option<String>,
+    /// The shared server URL of every runner in server mode, keyed by
+    /// runner name (GitHub issue #192), from `[agent.<runner>] mode` and
+    /// `server_url`. A runner absent here runs one process per lane.
+    /// Resolved alongside `[work]` because lane runs are what read it.
+    pub agent_servers: BTreeMap<String, String>,
     /// See [`RawWorkConfig::default_model`].
     pub default_model: Option<String>,
     /// See [`RawWorkConfig::default_max_turns`].
@@ -1681,6 +1717,32 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// `[agent.<runner>] mode` was neither `"process"` nor `"server"`.
+    #[error("invalid [agent.{runner}] mode `{value}`; expected \"process\" or \"server\"")]
+    InvalidRunnerMode {
+        /// The runner whose table set the key.
+        runner: &'static str,
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[agent.<runner>] mode = "server"` was set for a runner with no
+    /// server mode (GitHub issue #192).
+    #[error("[agent.{runner}] mode = \"server\" is set, but {runner} has no server mode")]
+    ServerModeUnsupported {
+        /// The runner whose table set the key.
+        runner: &'static str,
+    },
+
+    /// `[agent.<runner>] server_url` isn't `http://<host>:<port>`.
+    #[error("invalid [agent.{runner}] server_url `{value}`; expected http://<host>:<port>")]
+    InvalidServerUrl {
+        /// The runner whose table set the key.
+        runner: &'static str,
+        /// The value as written in config.
+        value: String,
+    },
+
     /// `[agent.<runner>] usage_probe_model` was set for a runner that has
     /// no usage probe, so the key would never take effect (GitHub issue
     /// #143).
@@ -2118,7 +2180,8 @@ fn merge_with_repo_dir(
             .as_ref()
             .and_then(|ready| ready.inherit_epic_blockers))
         .unwrap_or(true);
-    let work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
+    let mut work = merge_work(global.work.clone(), repo.work.clone(), repo_dir)?;
+    work.agent_servers = merge_servers(global.agent.as_ref(), repo.agent.as_ref())?;
     let usage = merge_usage(global.agent.as_ref(), repo.agent.as_ref())?;
     let models = merge_models(global.agent.as_ref(), repo.agent.as_ref())?;
     let dispatch = DispatchConfig {
@@ -2351,6 +2414,50 @@ fn merge_models(
         claude: merge_one(AgentKind::Claude)?,
         opencode: merge_one(AgentKind::Opencode)?,
     })
+}
+
+/// Resolves each runner's `[agent.<runner>] mode` and `server_url`,
+/// repo-over-global per key, into [`WorkConfig::agent_servers`]: the
+/// server URL of every runner in server mode (GitHub issue #192).
+fn merge_servers(
+    global: Option<&RawAgentConfig>,
+    repo: Option<&RawAgentConfig>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let pick = |kind: AgentKind, raw: Option<&RawAgentConfig>| {
+        raw.and_then(|agent| match kind {
+            AgentKind::Claude => agent.claude.clone(),
+            AgentKind::Opencode => agent.opencode.clone(),
+        })
+        .unwrap_or_default()
+    };
+    let mut servers = BTreeMap::new();
+    for kind in [AgentKind::Claude, AgentKind::Opencode] {
+        let global = pick(kind, global);
+        let repo = pick(kind, repo);
+        let runner = kind.as_str();
+        match repo.mode.or(global.mode).as_deref() {
+            None | Some("process") => continue,
+            Some("server") => {}
+            Some(value) => {
+                return Err(ConfigError::InvalidRunnerMode {
+                    runner,
+                    value: value.to_string(),
+                });
+            }
+        }
+        if !kind.supports_server_mode() {
+            return Err(ConfigError::ServerModeUnsupported { runner });
+        }
+        let url = repo
+            .server_url
+            .or(global.server_url)
+            .unwrap_or_else(|| DEFAULT_AGENT_SERVER_URL.to_string());
+        if parse_server_url(&url).is_none() {
+            return Err(ConfigError::InvalidServerUrl { runner, value: url });
+        }
+        servers.insert(runner.to_string(), url);
+    }
+    Ok(servers)
 }
 
 /// Merge a repo-local `[backend]` section on top of a global one, field by
@@ -2625,6 +2732,8 @@ fn merge_work(
 
     Ok(WorkConfig {
         worktree_root,
+        // Filled from `[agent.<runner>]` by `merge`.
+        agent_servers: BTreeMap::new(),
         default_model,
         default_max_turns,
         default_permission_mode,
@@ -5039,6 +5148,96 @@ mod tests {
         assert_eq!(
             cfg.models.opencode.default_model.as_deref(),
             Some("venice/z-ai-glm-5-3-flash")
+        );
+    }
+
+    fn with_runner_table(kind: AgentKind, runner: RawRunnerConfig) -> RawConfig {
+        let mut agent = RawAgentConfig::default();
+        match kind {
+            AgentKind::Claude => agent.claude = Some(runner),
+            AgentKind::Opencode => agent.opencode = Some(runner),
+        }
+        RawConfig {
+            agent: Some(agent),
+            ..raw_full()
+        }
+    }
+
+    #[test]
+    fn runner_mode_defaults_to_process_with_no_servers() {
+        let cfg = merge(raw_full(), None).expect("should merge");
+        assert!(cfg.work.agent_servers.is_empty());
+    }
+
+    #[test]
+    fn opencode_server_mode_uses_the_default_url_unless_one_is_set() {
+        let raw = RawRunnerConfig {
+            mode: Some("server".to_string()),
+            ..Default::default()
+        };
+        let cfg = merge(with_runner_table(AgentKind::Opencode, raw), None).expect("merge");
+        assert_eq!(
+            cfg.work.agent_servers.get("opencode").map(String::as_str),
+            Some(DEFAULT_AGENT_SERVER_URL)
+        );
+
+        let raw = RawRunnerConfig {
+            mode: Some("server".to_string()),
+            server_url: Some("http://127.0.0.1:5000".to_string()),
+            ..Default::default()
+        };
+        let cfg = merge(with_runner_table(AgentKind::Opencode, raw), None).expect("merge");
+        assert_eq!(
+            cfg.work.agent_servers.get("opencode").map(String::as_str),
+            Some("http://127.0.0.1:5000")
+        );
+    }
+
+    #[test]
+    fn process_mode_ignores_server_url() {
+        let raw = RawRunnerConfig {
+            mode: Some("process".to_string()),
+            server_url: Some("http://127.0.0.1:5000".to_string()),
+            ..Default::default()
+        };
+        let cfg = merge(with_runner_table(AgentKind::Opencode, raw), None).expect("merge");
+        assert!(cfg.work.agent_servers.is_empty());
+    }
+
+    #[test]
+    fn server_mode_on_a_runner_without_one_errors() {
+        let raw = RawRunnerConfig {
+            mode: Some("server".to_string()),
+            ..Default::default()
+        };
+        let err = merge(with_runner_table(AgentKind::Claude, raw), None).expect_err("claude");
+        assert!(
+            matches!(err, ConfigError::ServerModeUnsupported { runner: "claude" }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn bad_mode_and_server_url_values_error() {
+        let raw = RawRunnerConfig {
+            mode: Some("cluster".to_string()),
+            ..Default::default()
+        };
+        let err = merge(with_runner_table(AgentKind::Opencode, raw), None).expect_err("mode");
+        assert!(
+            matches!(err, ConfigError::InvalidRunnerMode { .. }),
+            "{err:?}"
+        );
+
+        let raw = RawRunnerConfig {
+            mode: Some("server".to_string()),
+            server_url: Some("localhost:4096".to_string()),
+            ..Default::default()
+        };
+        let err = merge(with_runner_table(AgentKind::Opencode, raw), None).expect_err("url");
+        assert!(
+            matches!(err, ConfigError::InvalidServerUrl { .. }),
+            "{err:?}"
         );
     }
 
