@@ -6,7 +6,9 @@
 //! with a completion section telling it to write a signal file, and the
 //! caller polls for that file with [`wait_for_signal`], checking the step's
 //! run row between polls ([`StepWatch::step_state`]). `tm review auto` waits
-//! on its rounds and fix passes this way.
+//! on its rounds and fix passes this way, and `tm work __await-lane`
+//! ([`crate::work::lane_await::await_lane`]) on an unattended lane's done
+//! marker.
 //!
 //! Signal files are written under a temporary name ([`temporary_name`]) and
 //! renamed into place, so a poll never reads a half-written file.
@@ -229,6 +231,9 @@ mod tests {
 
         std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
         assert_eq!(read_done_marker(&path), Some(false));
+
+        std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
+        assert_eq!(read_done_marker(&path), Some(true));
     }
 
     #[test]

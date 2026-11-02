@@ -176,19 +176,12 @@ pub fn try_read_findings(path: &Path) -> Option<Vec<Finding>> {
 /// Where round `round`'s fix pass writes its completion marker:
 /// `<git_dir>/vdiff/auto-review/fix-<round>.done`, next to the findings
 /// files (GitHub issue #150). It holds `{"succeeded": true}` or
-/// `{"succeeded": false}`; see [`read_fix_marker`].
+/// `{"succeeded": false}`; see [`crate::work::signal::read_done_marker`].
 pub fn fix_marker_path(git_dir: &Path, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
         .join("auto-review")
         .join(format!("fix-{round}.done"))
-}
-
-/// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
-/// exists and parses, `None` before then; see
-/// [`crate::work::signal::read_done_marker`].
-pub fn read_fix_marker(path: &Path) -> Option<bool> {
-    read_done_marker(path)
 }
 
 /// The section tm appends to every review round's prompt, whatever the
@@ -432,7 +425,7 @@ pub fn run_loop(
         let fixed = match ops.fix(round, fix_completion_section(&marker))? {
             None => true,
             Some(fix_run) => {
-                match wait_for_signal(ops, fix_run, timeout_secs, || read_fix_marker(&marker))? {
+                match wait_for_signal(ops, fix_run, timeout_secs, || read_done_marker(&marker))? {
                     Signal::Received(true) => {
                         ops.finish_step(fix_run)?;
                         true
@@ -727,22 +720,6 @@ mod tests {
 
         std::fs::write(&path, "[]").unwrap();
         assert_eq!(try_read_findings(&path), Some(Vec::new()));
-    }
-
-    #[test]
-    fn read_fix_marker_reads_succeeded_and_is_none_until_it_parses() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("fix-1.done");
-        assert_eq!(read_fix_marker(&path), None);
-
-        std::fs::write(&path, "{\"succ").unwrap();
-        assert_eq!(read_fix_marker(&path), None);
-
-        std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
-        assert_eq!(read_fix_marker(&path), Some(false));
-
-        std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
-        assert_eq!(read_fix_marker(&path), Some(true));
     }
 
     #[test]
