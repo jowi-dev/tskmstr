@@ -5117,6 +5117,7 @@ mod tests {
             memory: crate::config::MemoryConfig {
                 budget_bytes: Some(8 * GIB),
                 default_lane_estimate_bytes: 2 * GIB,
+                admission_wait_mins: 60,
             },
             build_slots: Some(3),
             build_slot_lock_dir: dir.path().join("locks"),

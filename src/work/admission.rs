@@ -738,6 +738,7 @@ mod tests {
         MemoryConfig {
             budget_bytes: Some(gb * GIB),
             default_lane_estimate_bytes: 2 * GIB,
+            admission_wait_mins: 60,
         }
     }
 
@@ -949,6 +950,7 @@ mod kind_tests {
         MemoryConfig {
             budget_bytes: Some(gb * GIB),
             default_lane_estimate_bytes: 2 * GIB,
+            admission_wait_mins: 60,
         }
     }
 
@@ -1183,6 +1185,7 @@ mod gate_tests {
                 memory: MemoryConfig {
                     budget_bytes: gb.map(|gb| gb * GIB),
                     default_lane_estimate_bytes: 2 * GIB,
+                    admission_wait_mins: 60,
                 },
                 usage: UsageConfig::default(),
             }
