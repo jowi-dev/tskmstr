@@ -172,6 +172,15 @@ pub enum DriftFinding {
         reason: String,
         fallback_only: bool,
     },
+    /// The repo's `[agent]` table uses the legacy `runner` / `strategy` /
+    /// `order` keys (GitHub issue #192), which still load. `default` and
+    /// `available` are the equivalent new keys; `available` is `None` for
+    /// a lone `runner`. Advisory, since nothing is broken; `tm update`
+    /// rewrites the table after confirmation.
+    LegacyAgentKeys {
+        default: String,
+        available: Option<Vec<String>>,
+    },
 }
 
 impl DriftFinding {
@@ -188,7 +197,7 @@ impl DriftFinding {
             } | DriftFinding::RejectedModel {
                 fallback_only: true,
                 ..
-            }
+            } | DriftFinding::LegacyAgentKeys { .. }
         )
     }
 }
@@ -285,6 +294,19 @@ impl std::fmt::Display for DriftFinding {
                         f,
                         " ({runner} is a fallback runner; expected when the model is spelled for the preferred one)"
                     )?;
+                }
+                Ok(())
+            }
+            DriftFinding::LegacyAgentKeys { default, available } => {
+                write!(
+                    f,
+                    "[agent] uses the legacy runner/strategy/order keys; \
+                     `tm update` rewrites them to: default = \"{default}\""
+                )?;
+                if let Some(available) = available {
+                    let quoted: Vec<String> =
+                        available.iter().map(|name| format!("\"{name}\"")).collect();
+                    write!(f, ", available = [{}]", quoted.join(", "))?;
                 }
                 Ok(())
             }
@@ -629,7 +651,44 @@ pub(crate) fn collect_findings(
         global.as_ref(),
         manifest::EXPECTED_CONFIG_KEYS,
     ));
+    findings.extend(legacy_agent_finding(doc));
     findings
+}
+
+/// Reports the repo's `[agent]` table when it routes with the legacy keys
+/// (GitHub issue #192): a lone `runner`, or `strategy = "priority"` with
+/// `order`. A table that doesn't parse into either form is left for
+/// config loading to reject.
+pub(crate) fn legacy_agent_finding(doc: &DocumentMut) -> Option<DriftFinding> {
+    let agent = doc.get("agent")?.as_table_like()?;
+    if agent.contains_key("default") || agent.contains_key("available") {
+        return None;
+    }
+    let order: Option<Vec<String>> = agent.get("order").and_then(|item| {
+        item.as_array().map(|array| {
+            array
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+    });
+    match (
+        str_at(doc, &["agent", "runner"]),
+        str_at(doc, &["agent", "strategy"]),
+        order,
+    ) {
+        (Some(runner), None, None) => Some(DriftFinding::LegacyAgentKeys {
+            default: runner.to_string(),
+            available: None,
+        }),
+        (None, Some("priority"), Some(order)) if !order.is_empty() => {
+            Some(DriftFinding::LegacyAgentKeys {
+                default: order[0].clone(),
+                available: Some(order),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The stamp half of the report: read the top-level `schema_version` key
@@ -925,6 +984,53 @@ mod tests {
 
     fn write_repo_config(env: &TestEnv, contents: &str) {
         std::fs::write(env.paths.repo.as_ref().unwrap(), contents).expect("write repo config");
+    }
+
+    fn agent_findings(toml: &str) -> Vec<DriftFinding> {
+        let doc: DocumentMut = toml.parse().expect("toml");
+        legacy_agent_finding(&doc).into_iter().collect()
+    }
+
+    #[test]
+    fn legacy_runner_key_is_an_advisory_note_with_its_replacement() {
+        let findings = agent_findings("[agent]\nrunner = \"opencode\"\n");
+        assert_eq!(
+            findings,
+            vec![DriftFinding::LegacyAgentKeys {
+                default: "opencode".to_string(),
+                available: None,
+            }]
+        );
+        assert!(findings[0].is_advisory());
+        let rendered = findings[0].to_string();
+        assert!(rendered.contains("default = \"opencode\""), "{rendered}");
+        assert!(rendered.contains("tm update"), "{rendered}");
+    }
+
+    #[test]
+    fn legacy_priority_keys_map_to_default_and_available() {
+        let findings = agent_findings(
+            "[agent]\nstrategy = \"priority\"\norder = [\"claude\", \"opencode\"]\n",
+        );
+        assert_eq!(
+            findings,
+            vec![DriftFinding::LegacyAgentKeys {
+                default: "claude".to_string(),
+                available: Some(vec!["claude".to_string(), "opencode".to_string()]),
+            }]
+        );
+        assert!(
+            findings[0]
+                .to_string()
+                .contains("available = [\"claude\", \"opencode\"]")
+        );
+    }
+
+    #[test]
+    fn default_and_available_keys_are_not_reported() {
+        assert!(agent_findings("[agent]\ndefault = \"claude\"\n").is_empty());
+        assert!(agent_findings("[agent.opencode]\nmode = \"server\"\n").is_empty());
+        assert!(agent_findings("").is_empty());
     }
 
     #[test]

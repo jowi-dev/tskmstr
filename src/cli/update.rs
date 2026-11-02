@@ -9,10 +9,15 @@
 //! - write the suggested default for each missing expected config key
 //!   (GitHub issue #74), after one batch confirmation, and
 //! - bump the `.tskmstr.toml` `schema_version` stamp to
-//!   [`manifest::CURRENT_SCHEMA_VERSION`].
+//!   [`manifest::CURRENT_SCHEMA_VERSION`], and
+//! - rewrite a legacy `[agent]` routing table (`runner`, or `strategy` +
+//!   `order`) to `default` / `available` (GitHub issue #192), after
+//!   confirmation.
 //!
-//! Strictly additive: it only ever writes files that don't exist, config
-//! keys that are set nowhere, and the stamp key. Existing user-customized
+//! Otherwise strictly additive: it only ever writes files that don't
+//! exist, config keys that are set nowhere, and the stamp key. The
+//! `[agent]` rewrite is the one exception, and it keeps the same runners
+//! in the same order. Existing user-customized
 //! assets (edited lane prompts, skill bodies, config values, comments) are
 //! never touched — the same reasoning that keeps `tm check` from
 //! content-diffing them (see
@@ -149,10 +154,13 @@ pub fn run_update(
             // Which model to configure is the operator's call; reported
             // only (GitHub issue #143).
             DriftFinding::RejectedModel { .. } => {}
+            // A content rewrite, so confirmed separately below.
+            DriftFinding::LegacyAgentKeys { .. } => {}
         }
     }
 
     reconcile_config_keys(&findings, &mut doc, yes, prompter, out)?;
+    rewrite_legacy_agent_keys(&findings, &mut doc, yes, prompter, out)?;
 
     let before_stamp = doc.to_string();
     if !newer_stamp {
@@ -211,6 +219,53 @@ pub fn run_update(
         }
     }
     Ok(remaining)
+}
+
+/// Rewrites a legacy `[agent]` routing table (`runner`, or `strategy` +
+/// `order`) to the equivalent `default` / `available` keys (GitHub issue
+/// #192), after confirmation (skipped under `yes`). The one non-additive
+/// fix `tm update` makes: it replaces existing keys, but the runners and
+/// their order are unchanged, and the `[agent.<runner>]` sub-tables are
+/// left alone.
+fn rewrite_legacy_agent_keys(
+    findings: &[DriftFinding],
+    doc: &mut DocumentMut,
+    yes: bool,
+    prompter: &mut dyn Prompter,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let Some(finding @ DriftFinding::LegacyAgentKeys { default, available }) = findings
+        .iter()
+        .find(|finding| matches!(finding, DriftFinding::LegacyAgentKeys { .. }))
+    else {
+        return Ok(());
+    };
+    if !yes {
+        writeln!(out, "{finding}")?;
+        if !prompter.confirm_with_default("Rewrite [agent] in .tskmstr.toml?", true)? {
+            return Ok(());
+        }
+    }
+    let Some(agent) = doc.get_mut("agent").and_then(Item::as_table_like_mut) else {
+        return Ok(());
+    };
+    for legacy in ["runner", "strategy", "order"] {
+        agent.remove(legacy);
+    }
+    agent.insert("default", value(default.as_str()));
+    if let Some(available) = available {
+        agent.insert(
+            "available",
+            value(
+                available
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<toml_edit::Array>(),
+            ),
+        );
+    }
+    writeln!(out, "Rewrote [agent] to default/available")?;
+    Ok(())
 }
 
 /// Write the suggested default for every [`DriftFinding::MissingConfigKey`]
@@ -414,6 +469,72 @@ mod tests {
             rendered.contains("up to date"),
             "clean close in: {rendered}"
         );
+    }
+
+    #[test]
+    fn rewrites_legacy_agent_keys_to_default_and_available() {
+        let env = test_env();
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [agent]\n\
+             strategy = \"priority\"\n\
+             order = [\"claude\", \"opencode\"]\n\
+             \n\
+             [agent.opencode]\n\
+             billing = \"subscription\"\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut out = Vec::new();
+        let remaining = run_update(&ctx, true, &mut FakePrompter::new(), &mut out)
+            .expect("update should succeed");
+
+        assert!(
+            !remaining
+                .iter()
+                .any(|f| matches!(f, DriftFinding::LegacyAgentKeys { .. })),
+            "{remaining:?}"
+        );
+        let written = read_repo_config(&env);
+        assert!(!written.contains("strategy"), "{written}");
+        assert!(!written.contains("order ="), "{written}");
+        assert!(written.contains("default = \"claude\""), "{written}");
+        assert!(
+            written.contains("available = [\"claude\", \"opencode\"]"),
+            "{written}"
+        );
+        assert!(written.contains("billing = \"subscription\""), "{written}");
+        let global = &env.paths.global;
+        std::fs::create_dir_all(global.parent().unwrap()).expect("mkdir global");
+        std::fs::write(
+            global,
+            "jira_base_url = \"https://x.atlassian.net\"\n\
+             jira_email = \"x@example.com\"\n\
+             default_project_key = \"X\"\n",
+        )
+        .expect("write global");
+        let cfg = crate::config::load(&env.paths).expect("rewritten config loads");
+        assert_eq!(cfg.agent, crate::config::AgentKind::Claude);
+        assert_eq!(
+            cfg.agent_fallbacks,
+            vec![crate::config::AgentKind::Opencode]
+        );
+    }
+
+    #[test]
+    fn a_declined_legacy_agent_rewrite_leaves_the_table_alone() {
+        let env = test_env();
+        write_repo_config(&env, "schema_version = 2\n[agent]\nrunner = \"claude\"\n");
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner, &no_launcher);
+        let mut prompter = FakePrompter::new().with_confirm(false);
+        let mut out = Vec::new();
+        run_update(&ctx, false, &mut prompter, &mut out).expect("update should succeed");
+
+        assert!(read_repo_config(&env).contains("runner = \"claude\""));
     }
 
     #[test]
