@@ -775,15 +775,14 @@ Record the detailed review reasoning and any follow-up plan in thatch memory.
 ";
 
 /// Thatch scaffold for `[work.auto_review]` (GitHub issue #124): one review
-/// round of `tm review auto`. `{key}`, `{round}`, `{skill}`, `{prior}` and
-/// `{findings_file}` are substituted per round (see
-/// `crate::work::auto_review::render_prompt`).
+/// round of `tm review auto`. `{key}`, `{round}`, `{skill}` and `{prior}`
+/// are substituted per round, and the completion section naming the
+/// findings file is appended (see `crate::work::auto_review::render_prompt`).
 const AUTO_REVIEW_THATCH_TEMPLATE: &str = "\
 # Auto-review {key}, round {round}
 
 Review the changes on this branch for ticket {key} with the `{skill}` skill.
-This session is unattended: do not ask questions, do not post anything to
-GitHub, and do not change any code.
+Do not post anything to GitHub and do not change any code.
 
 ## Recall thatch memory first
 
@@ -794,22 +793,22 @@ findings agree with prior decisions and deferred work.
 
 {prior}Run `{skill}` against this branch.
 
-## Write the findings file
+## Write the review outcome back to thatch memory
 
-Write every CONFIRMED finding to `{findings_file}` as a JSON array, one object
-per finding:
+Record the detailed review reasoning in thatch memory.
+
+## Findings
+
+Report every CONFIRMED finding as one object in a JSON array:
 
     {\"path\": \"src/lib.rs\", \"start_line\": 10, \"end_line\": 12,
      \"severity\": \"MEDIUM\", \"specialist\": \"state-flow\",
      \"body\": \"What is wrong, why, and what to change.\"}
 
 `path` is repo-relative; lines are 1-based and inclusive, anchored to the head
-SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. Write `[]` when there
-are no findings; always write the file.
-
-## Write the review outcome back to thatch memory
-
-Record the detailed review reasoning in thatch memory.
+SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. tm appends a completion
+signal section after this prompt saying where and how to write the array;
+writing it is the last step.
 
 ## Repo-specific context
 
@@ -3442,10 +3441,14 @@ mod tests {
         let repo_dir = env.paths.repo.as_ref().unwrap().parent().unwrap();
         let path = repo_dir.join(".tskmstr/prompts/auto-review.md");
         let body = std::fs::read_to_string(&path).expect("auto-review.md is scaffolded");
-        for placeholder in ["{key}", "{round}", "{skill}", "{prior}", "{findings_file}"] {
+        for placeholder in ["{key}", "{round}", "{skill}", "{prior}"] {
             assert!(body.contains(placeholder), "{placeholder} missing: {body}");
         }
         assert!(body.contains("thatch memory"), "{body}");
+        // The appended completion section owns the findings file and how
+        // to write it; the window is the user's to steer.
+        assert!(!body.contains("{findings_file}"), "{body}");
+        assert!(!body.contains("unattended"), "{body}");
 
         let config = config::load(&env.paths).expect("written config should load");
         assert!(

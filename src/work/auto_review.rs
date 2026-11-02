@@ -46,19 +46,18 @@ pub const FOLLOWUP_SKILL: &str = "thatch-review-followup";
 /// `prompt` nor `prompt_file`. Placeholders are those of [`render_prompt`].
 pub const DEFAULT_PROMPT: &str = "\
 Review the changes on this branch for {key} (auto-review round {round}) \
-with the `{skill}` skill. This is unattended: do not ask questions, do not \
-post anything to GitHub, and do not change any code.
+with the `{skill}` skill. Do not post anything to GitHub and do not change \
+any code.
 
-{prior}When the review is done, write every CONFIRMED finding to \
-`{findings_file}` as a JSON array, one object per finding:
+{prior}Report every CONFIRMED finding as one object in a JSON array:
 
     {\"path\": \"src/lib.rs\", \"start_line\": 10, \"end_line\": 12,
      \"severity\": \"MEDIUM\", \"specialist\": \"state-flow\",
      \"body\": \"What is wrong, why, and what to change.\"}
 
 `path` is repo-relative; lines are 1-based and inclusive, anchored to the \
-head SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. Write `[]` when \
-there are no findings. Write the file even if the review is clean.
+head SHA. `severity` is one of LOW, MEDIUM, HIGH, BLOCKING. The completion \
+signal section below says where and how to write the array.
 ";
 
 /// Errors from [`run_loop`].
@@ -896,6 +895,12 @@ mod tests {
         assert!(first.contains("`thatch-code-review`"));
         assert!(first.contains("/g/f-1.json"));
         assert!(first.contains("GH-1"));
+        assert!(!first.contains("unattended"));
+        assert_eq!(
+            first.matches("/g/f-1.json`").count(),
+            1,
+            "only the completion section names the file: {first}"
+        );
         assert!(!first.contains("prior round"));
         for placeholder in [
             "{{",
