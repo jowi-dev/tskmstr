@@ -780,6 +780,7 @@ pub fn session(
     sessions_dir: &Path,
     key: &str,
     runner: &dyn AgentRunner,
+    admission: &crate::work::admission::AdmissionDeps<'_>,
     out: &mut dyn Write,
 ) -> Result<(), WorkCliError> {
     let ticket = key.to_uppercase();
@@ -792,8 +793,14 @@ pub fn session(
     // (GitHub issue #64), before the snapshot the plan is built from; the
     // plan then sees them as live and leaves their windows alone.
     let session_name = crate::work::naming::ticket_session_name(&identity.session_slug(), &ticket);
-    for woken in crate::work::hibernate::wake_session(store, ctx.tmux, &session_name, sessions_dir)?
-    {
+    for woken in crate::work::hibernate::wake_session(
+        admission,
+        store,
+        ctx.tmux,
+        &session_name,
+        sessions_dir,
+        out,
+    )? {
         writeln!(
             out,
             "resumed   {session_name}:{} — hibernated run {} picked up where it left off",
@@ -2028,6 +2035,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "proj-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2101,6 +2109,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2179,6 +2188,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2242,6 +2252,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-1",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap();
@@ -2280,6 +2291,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "PROJ-404",
             &ClaudeRunner,
+            &crate::work::admission::AdmissionDeps::off(),
             &mut out,
         )
         .unwrap_err();

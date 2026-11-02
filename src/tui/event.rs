@@ -630,6 +630,7 @@ fn run_cmds<B: Backend>(
                 crate::runs::session::sessions_dir(&deps.home, deps.xdg_data_home.as_deref());
             let message = wake_and_attach(
                 terminal,
+                &deps.admission,
                 deps.store.as_ref(),
                 deps.tmux.as_ref(),
                 &session_name,
@@ -670,6 +671,7 @@ fn run_cmds<B: Backend>(
                     );
                     let message = wake_and_attach(
                         terminal,
+                        &deps.admission,
                         deps.store.as_ref(),
                         deps.tmux.as_ref(),
                         &outcome.session_name,
@@ -915,37 +917,58 @@ fn poll_pending_launches(launches: &mut Vec<PendingLaunch>) -> Vec<Msg> {
 /// it (GitHub issue #64), via [`crate::work::hibernate::wake_session`].
 /// Returns a status-line prefix naming what was resumed, or the failure;
 /// `None` when there was nothing to resume (or no store), in which case no
-/// tmux call is made. A failure never blocks the attach that follows.
+/// tmux call is made. A failure never blocks the attach that follows,
+/// except an admission refusal (GitHub issue #149): that is `Err`, the
+/// status line to show instead of attaching.
 fn wake_hibernated(
+    admission: &crate::work::admission::OwnedAdmission,
     store: Option<&crate::runs::RunStore>,
     tmux: &dyn TmuxOps,
     session_name: &str,
     sessions_dir: &std::path::Path,
-) -> Option<String> {
-    let store = store?;
-    match crate::work::hibernate::wake_session(store, tmux, session_name, sessions_dir) {
-        Ok(woken) if woken.is_empty() => None,
+) -> Result<Option<String>, String> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let mut warning = Vec::new();
+    match crate::work::hibernate::wake_session(
+        &admission.deps(),
+        store,
+        tmux,
+        session_name,
+        sessions_dir,
+        &mut warning,
+    ) {
+        Ok(woken) if woken.is_empty() => Ok(None),
         Ok(woken) => {
             let windows: Vec<String> = woken
                 .iter()
                 .map(|run| format!("{session_name}:{}", run.window))
                 .collect();
-            Some(format!("resumed hibernated run in {}", windows.join(", ")))
+            Ok(Some(with_warning(
+                format!("resumed hibernated run in {}", windows.join(", ")),
+                crate::work::admission::warning_text(&warning),
+            )))
         }
-        Err(err) => Some(format!("resuming hibernated run failed: {err}")),
+        Err(crate::work::hibernate::WakeError::Admission(err)) => Err(err.to_string()),
+        Err(err) => Ok(Some(format!("resuming hibernated run failed: {err}"))),
     }
 }
 
 /// [`attach_session`], preceded by [`wake_hibernated`]; the status line
-/// reports both.
+/// reports both. A wake admission refused does not attach.
 fn wake_and_attach<B: Backend>(
     terminal: &mut Terminal<B>,
+    admission: &crate::work::admission::OwnedAdmission,
     store: Option<&crate::runs::RunStore>,
     tmux: &dyn TmuxOps,
     session_name: &str,
     sessions_dir: &std::path::Path,
 ) -> String {
-    let woke = wake_hibernated(store, tmux, session_name, sessions_dir);
+    let woke = match wake_hibernated(admission, store, tmux, session_name, sessions_dir) {
+        Ok(woke) => woke,
+        Err(refusal) => return refusal,
+    };
     let attached = attach_session(terminal, tmux, session_name);
     match woke {
         Some(woke) => format!("{woke}; {attached}"),
@@ -1272,6 +1295,9 @@ pub struct WatchDeps {
     /// overview hands the host its rows' scopes; `tm runs watch` shares
     /// the loop, so `Tab` keeps ticking whatever the overview last set.
     pub autopilot: AutopilotDeps,
+    /// Memory and usage admission for hibernate wake on attach (GitHub
+    /// issue #149); see [`TuiDeps::admission`].
+    pub admission: crate::work::admission::OwnedAdmission,
 }
 
 /// The autopilot host a board or overview runs (GitHub issue #116).
@@ -1520,6 +1546,7 @@ fn run_watch_cmds<B: Backend>(
             let sessions_dir = crate::runs::session::sessions_dir_from_process_env();
             let message = wake_and_attach(
                 terminal,
+                &deps.admission,
                 Some(&deps.store),
                 deps.tmux.as_ref(),
                 &session_name,
@@ -4536,6 +4563,7 @@ mod tests {
             tmux: Box::new(crate::work::tmux::FakeTmuxOps::new()),
             session_slug: String::new(),
             idle_hibernate_mins: 0,
+            admission: crate::work::admission::OwnedAdmission::off(),
             kill_pid: |_| {},
             launcher: Box::new(crate::tui::launcher::FakeLaneLauncher::new()),
             memory: crate::config::MemoryConfig::default(),
@@ -4598,6 +4626,7 @@ mod tests {
         let tmux = crate::work::tmux::FakeTmuxOps::new();
 
         let message = wake_hibernated(
+            &crate::work::admission::OwnedAdmission::off(),
             Some(&store),
             &tmux,
             "tm-proj-proj-1",
@@ -4605,8 +4634,10 @@ mod tests {
         );
 
         assert_eq!(
-            message.as_deref(),
-            Some("resumed hibernated run in tm-proj-proj-1:work")
+            message,
+            Ok(Some(
+                "resumed hibernated run in tm-proj-proj-1:work".to_string()
+            ))
         );
         assert_eq!(
             store.run_by_id(run_id).unwrap().unwrap().status,
@@ -4615,16 +4646,67 @@ mod tests {
     }
 
     #[test]
+    fn wake_hibernated_refuses_over_the_memory_budget_so_the_attach_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let run_id = store.start_run(&start_params("PROJ-1")).unwrap();
+        store.update_session_id(run_id, "sess-1").unwrap();
+        store.update_tmux_session(run_id, "tm-proj-proj-1").unwrap();
+        crate::work::hibernate::record_launch(
+            &store,
+            run_id,
+            &crate::work::hibernate::LaunchRecord {
+                window: "work".to_string(),
+                resume: crate::agent::ResumeSpec {
+                    program: "agent".to_string(),
+                    resume_flag: "--resume".to_string(),
+                    args: Vec::new(),
+                    env_remove: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        store.hibernate_run(run_id).unwrap();
+        let tmux = crate::work::tmux::FakeTmuxOps::new();
+
+        let mut admission = crate::work::admission::OwnedAdmission::off();
+        admission.memory.budget_bytes = Some(1);
+        let message = wake_hibernated(
+            &admission,
+            Some(&store),
+            &tmux,
+            "tm-proj-proj-1",
+            &dir.path().join("sessions"),
+        );
+
+        let refusal = message.unwrap_err();
+        assert!(
+            refusal.starts_with("not launching: memory budget exceeded"),
+            "{refusal}"
+        );
+        assert_eq!(
+            store.run_by_id(run_id).unwrap().unwrap().status,
+            crate::runs::RunStatus::Hibernated
+        );
+        assert!(!tmux.calls().iter().any(|c| matches!(
+            c,
+            crate::work::tmux::TmuxCall::NewWindowWithCommand { .. }
+                | crate::work::tmux::TmuxCall::NewSessionWithCommand { .. }
+        )));
+    }
+
+    #[test]
     fn wake_hibernated_is_silent_when_nothing_is_hibernated() {
         let tmux = crate::work::tmux::FakeTmuxOps::new();
         assert_eq!(
             wake_hibernated(
+                &crate::work::admission::OwnedAdmission::off(),
                 None,
                 &tmux,
                 "tm-proj-proj-1",
                 std::path::Path::new("/nowhere")
             ),
-            None
+            Ok(None)
         );
         assert!(tmux.calls().is_empty());
     }

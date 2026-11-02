@@ -736,6 +736,8 @@ fn run_work(
             let run_store = tskmstr::runs::RunStore::open(&resolve_run_db_path())?;
             let current_exe = std::env::current_exe()?;
             let identity = backend_identity_or_placeholder(full_config.as_ref());
+            let runner = agent_runner_or_default(full_config.as_ref());
+            let admission = owned_admission(full_config.as_ref(), runner);
             tskmstr::cli::work::session(
                 &ctx,
                 &run_store,
@@ -743,7 +745,8 @@ fn run_work(
                 &current_exe,
                 &tskmstr::runs::session::sessions_dir_from_process_env(),
                 &key,
-                agent_runner_or_default(full_config.as_ref()),
+                runner,
+                &admission.deps(),
                 &mut stdout,
             )?;
         }
@@ -2770,6 +2773,7 @@ fn watch_deps(
                 .flatten()
         })),
         autopilot: autopilot_deps(config, Vec::new()),
+        admission: owned_admission(config, agent_runner_or_default(config)),
     }
 }
 

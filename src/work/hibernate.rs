@@ -98,6 +98,11 @@ pub enum WakeError {
     #[error(transparent)]
     Tmux(#[from] TmuxError),
 
+    /// Memory or usage admission refused the resumed agent (GitHub issue
+    /// #149).
+    #[error(transparent)]
+    Admission(#[from] crate::work::admission::AdmissionError),
+
     /// The session marker could not be written.
     #[error("failed to write session marker {path}: {source}")]
     Marker {
@@ -196,11 +201,20 @@ pub fn sweep_idle(
 ///
 /// A run whose window cannot be created is put back to hibernated before
 /// the error is returned, so a later attach can try again.
+///
+/// Each run is admitted (GitHub issue #149) under its own kind, agent and
+/// repo before it leaves hibernation: a wake is human-started (a board
+/// attach, `tm work session`), so over the memory budget it is refused and
+/// the run stays hibernated, and over a usage ceiling it warns on `out`
+/// and resumes. A hibernated run does not count against the budget, which
+/// is why waking one is checked at all.
 pub fn wake_session(
+    admission: &crate::work::admission::AdmissionDeps<'_>,
     store: &RunStore,
     tmux: &dyn TmuxOps,
     session_name: &str,
     sessions_dir: &Path,
+    out: &mut dyn std::io::Write,
 ) -> Result<Vec<WokenRun>, WakeError> {
     let mut hibernated: Vec<_> = store
         .all_runs()?
@@ -226,6 +240,18 @@ pub fn wake_session(
         let Some(record) = launch_record(store, run.id)? else {
             continue;
         };
+        let admitted = admission.admit(
+            store,
+            &crate::work::admission::LaunchRequest {
+                kind: &run.kind,
+                agent: run.agent.as_deref().unwrap_or_default(),
+                repo: run.repo.as_deref().unwrap_or_default(),
+                own_run: None,
+            },
+            crate::work::admission::LaunchOrigin::Human,
+            out,
+        )?;
+        let _ = &admitted;
         if !store.wake_run(run.id, None)? {
             continue;
         }
@@ -449,7 +475,15 @@ mod tests {
             .with_pane_pid(Ok(Some(9191)));
         let sessions = dir.path().join("sessions");
 
-        let woken = wake_session(&store, &tmux, SESSION, &sessions).unwrap();
+        let woken = wake_session(
+            &crate::work::admission::AdmissionDeps::off(),
+            &store,
+            &tmux,
+            SESSION,
+            &sessions,
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             woken,
@@ -488,7 +522,15 @@ mod tests {
         let id = hibernated_run(&store);
         let tmux = FakeTmuxOps::new();
 
-        wake_session(&store, &tmux, SESSION, &dir.path().join("sessions")).unwrap();
+        wake_session(
+            &crate::work::admission::AdmissionDeps::off(),
+            &store,
+            &tmux,
+            SESSION,
+            &dir.path().join("sessions"),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         assert!(tmux.calls().contains(&TmuxCall::NewSessionWithCommand {
             name: SESSION.to_string(),
@@ -510,9 +552,53 @@ mod tests {
             .unwrap();
         let tmux = FakeTmuxOps::new();
 
-        let woken = wake_session(&store, &tmux, SESSION, &dir.path().join("sessions")).unwrap();
+        let woken = wake_session(
+            &crate::work::admission::AdmissionDeps::off(),
+            &store,
+            &tmux,
+            SESSION,
+            &dir.path().join("sessions"),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         assert!(woken.is_empty());
         assert!(tmux.calls().is_empty(), "nothing to wake touches no tmux");
+    }
+
+    #[test]
+    fn a_wake_over_the_memory_budget_is_refused_and_the_run_stays_hibernated() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = hibernated_run(&store);
+        store.update_agent_repo(id, "claude", "tskmstr").unwrap();
+        let tmux = FakeTmuxOps::new();
+
+        let err = wake_session(
+            &crate::work::admission::AdmissionDeps::with_budget(1),
+            &store,
+            &tmux,
+            SESSION,
+            &dir.path().join("sessions"),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("not launching: memory budget exceeded: tskmstr/claude lanes"),
+            "{err}"
+        );
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Hibernated
+        );
+        assert!(
+            !tmux.calls().iter().any(|c| matches!(
+                c,
+                TmuxCall::NewWindowWithCommand { .. } | TmuxCall::NewSessionWithCommand { .. }
+            )),
+            "no agent window opened"
+        );
     }
 }
