@@ -1443,8 +1443,11 @@ pub fn prepare_run_lane(
 
     // GitHub issue #184: an unattended interactive lane never exits, so its
     // prompt ends by telling the agent to write a done marker, after the
-    // interactive wrapping. Every attempt below shares `prompt`, so
-    // fallbacks signal the same way.
+    // interactive wrapping. An interactive lane has no in-run fallback:
+    // launch-time routing already skips an exhausted runner, but one that
+    // hits its limit mid-run stays at its prompt until the idle sweep
+    // hibernates it. Only the headless `run_agent_and_finish` walks
+    // `fallbacks`.
     let done_marker = (request.done_signal && request.mode == RunMode::Interactive)
         .then(|| paths.state_dir.join(format!("{wt_name}-{timestamp}.done")));
     let prompt = match &done_marker {

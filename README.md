@@ -1211,7 +1211,13 @@ ended past those two minutes, the awaiter stops and leaves the row
 alone. Every dispatch tick restarts the awaiter of a live lane that lost
 its own (a failed spawn, a crash, a reboot while the lane was
 hibernated), from the `<wt>-<ts>.await.json` state file kept beside the
-run's log until the awaiter finishes. Pass `--headless` as well to get the old
+run's log until the awaiter finishes.
+
+An interactive lane has no in-run fallback. The launch still routes past
+an agent already known to be exhausted, but an agent that hits its usage
+limit partway through stays at its prompt, holding its `max_lanes` slot,
+until the idle sweep hibernates it; resume it once the limit resets.
+Headless lanes (`--headless`) still fall back to the next runner mid-run. Pass `--headless` as well to get the old
 supervisor-driven `claude -p` run.
 
 ```toml
