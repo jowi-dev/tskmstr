@@ -2650,11 +2650,22 @@ fn run_runs(
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("~"));
+            // Read a run's transcript with the agent that recorded it, so a
+            // claude run still renders under an opencode config; fall back
+            // to the configured agent for rows with no recorded agent.
+            let transcripts_for = |agent: Option<&str>| {
+                agent
+                    .and_then(AgentKind::parse)
+                    .map(tskmstr::agent::routing::runner_for)
+                    .unwrap_or_else(|| agent_runner_or_default(full_config.as_ref()))
+                    .transcripts(&home)
+            };
             let sleeper = tskmstr::work::review_watch::RealSleeper;
             tskmstr::cli::runs::logs(
                 &store,
                 scope,
                 &home,
+                &transcripts_for,
                 &ticket_or_id,
                 kind.as_deref(),
                 tail,

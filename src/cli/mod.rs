@@ -1161,6 +1161,10 @@ pub enum RunsCmd {
     /// the run has no recorded `log_path` (every run started before that
     /// column existed) -- this is what makes a `tm pr watch` cron's log
     /// viewable even though it predates this feature.
+    ///
+    /// An interactive run with no log prints its Claude Code transcript as
+    /// readable text instead, found via the recorded transcript path or the
+    /// run's session id under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
     Logs {
         /// Jira ticket key or run row id, e.g. `PROJ-123` or `42`.
         ticket_or_id: String,

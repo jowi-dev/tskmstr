@@ -678,6 +678,100 @@ mod tests {
         );
     }
 
+    /// Runs the embedded `tm-session-end.sh` for a registered session with
+    /// a fake `tm` on `PATH` that records its arguments, and returns them
+    /// (one per line). `None` when `jq` is missing (the script exits early
+    /// without it).
+    #[cfg(unix)]
+    fn session_end_tm_args(transcript: &str) -> Option<Vec<String>> {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let jq_found = Command::new("jq")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !jq_found {
+            eprintln!("skipping: jq not on PATH");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("data/tskmstr/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("sess-1"), "42").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let args_file = dir.path().join("args");
+        let fake_tm = bin.join("tm");
+        std::fs::write(
+            &fake_tm,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_, script) = hook_scripts()
+            .iter()
+            .find(|(n, _)| *n == "tm-session-end.sh")
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env_remove("TSKMSTR_RUN_ID")
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = serde_json::json!({ "session_id": "sess-1", "transcript_path": transcript });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        Some(args.lines().map(str::to_string).collect())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_end_records_the_transcript_path_on_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess-1.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
+        let transcript = transcript.to_str().unwrap();
+        let Some(args) = session_end_tm_args(transcript) else {
+            return;
+        };
+        let at = args
+            .iter()
+            .position(|a| a == "--transcript")
+            .unwrap_or_else(|| panic!("no --transcript in {args:?}"));
+        assert_eq!(args[at + 1], transcript);
+        assert_eq!(&args[..3], ["runs", "finish", "42"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_end_omits_the_transcript_when_the_hook_gives_none() {
+        let Some(args) = session_end_tm_args("") else {
+            return;
+        };
+        assert!(!args.iter().any(|a| a == "--transcript"), "{args:?}");
+    }
+
     #[test]
     fn parity_tm_session_state_dispatches_on_hook_event_name_and_keeps_inverted_lane_gate() {
         let (_, contents) = hook_scripts()
