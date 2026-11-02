@@ -278,13 +278,23 @@ impl BackendKind {
 
 /// Raw, partially-specified `[agent]` section as parsed directly from TOML.
 ///
-/// Two mutually exclusive modes (see GitHub issue #54 and
-/// `docs/plans/gh-54-priority-routing.md`): single-runner mode (`runner`
-/// alone, unchanged since issue #17) or priority mode (`strategy =
-/// "priority"` plus `order`). [`merge_agent`] validates which mode applies
-/// and rejects any mixing of the two.
+/// `default` plus `available` (GitHub issue #192) name the runner a launch
+/// prefers and the runners routing may fall back to. The legacy keys still
+/// load: single-runner mode (`runner` alone, GitHub issue #17) or priority
+/// mode (`strategy = "priority"` plus `order`, GitHub issue #54). `tm
+/// check` reports them and `tm update` rewrites them to `default` /
+/// `available`. [`merge_agent`] validates which form applies and rejects
+/// any mixing.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawAgentConfig {
+    /// The runner a launch prefers, e.g. `"claude"`. Must be in
+    /// `available` when both are set ([`ConfigError::DefaultNotAvailable`]).
+    /// Unset with `available` set, it is `available`'s first entry.
+    pub default: Option<String>,
+    /// The runners routing may use, in fallback order, e.g. `["claude",
+    /// "opencode"]`. Unset with `default` set, `default` is the only one.
+    /// Each entry must parse via [`AgentKind::parse`] and appear once.
+    pub available: Option<Vec<String>>,
     /// Which AI coding agent to use: `"claude"` (default) or `"opencode"`.
     /// An unrecognized value is [`ConfigError::InvalidRunner`]. Only legal
     /// when `strategy` is unset — setting it alongside `strategy = "priority"`
@@ -889,16 +899,20 @@ pub struct Config {
     pub work: WorkConfig,
     /// Which AI coding agent this config selects. See [`AgentKind`]; defaults
     /// to [`AgentKind::Claude`] when `[agent]` is absent from both global and
-    /// repo config. In priority mode (`[agent].strategy = "priority"`), this
-    /// is the *preferred* agent — `order[0]` — so every existing call site
+    /// repo config. It is `[agent] default` (GitHub issue #192), or in
+    /// legacy priority mode (`[agent].strategy = "priority"`) `order[0]`:
+    /// the *preferred* agent, so every existing call site
     /// that reads `Config.agent` (interactive sessions, `tm check`, board
     /// display, prompt templates) is unaffected by priority routing. See
     /// GitHub issue #17, GitHub issue #54, and
     /// `docs/plans/gh-54-priority-routing.md`.
     pub agent: AgentKind,
-    /// The remaining agents in priority order after [`Config::agent`], to
-    /// fall back to when the preferred agent's usage window is exhausted.
-    /// Empty in single-runner mode. See GitHub issue #54 and
+    /// The remaining agents in priority order after [`Config::agent`]: the
+    /// rest of `[agent] available`, or of the legacy `order`. Unattended
+    /// launches route to them when the preferred agent is over its usage
+    /// ceiling (GitHub issue #192), and any run falls back to them when the
+    /// preferred agent's usage window is exhausted mid-run. Empty with a
+    /// single runner. See GitHub issue #54 and
     /// `docs/plans/gh-54-priority-routing.md`.
     pub agent_fallbacks: Vec<AgentKind>,
     /// Whether `tm ready` requires a passing audit verdict. See
@@ -1751,6 +1765,42 @@ pub enum ConfigError {
         value: String,
     },
 
+    /// `[agent].default`/`[agent].available` were set alongside a legacy
+    /// key (`runner`, `strategy`, `order`) in one `[agent]` table.
+    #[error(
+        "[agent].default/[agent].available conflict with the legacy [agent].runner/strategy/order keys; \
+         keep default/available and remove the legacy keys (`tm update` rewrites them)"
+    )]
+    LegacyAgentKeysMixed,
+
+    /// `[agent].default` names a runner missing from `[agent].available`.
+    #[error("[agent].default `{value}` is not in [agent].available")]
+    DefaultNotAvailable {
+        /// The default runner as written in config.
+        value: String,
+    },
+
+    /// `[agent].available` was set to an empty list.
+    #[error("[agent].available must list at least one runner")]
+    AvailableEmpty,
+
+    /// An entry in `[agent].available` isn't a recognized runner name.
+    #[error(
+        "invalid entry `{value}` in [agent].available; expected one of {}",
+        agent_runner_names_list()
+    )]
+    InvalidAvailableEntry {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[agent].available` listed the same runner more than once.
+    #[error("[agent].available lists `{value}` more than once")]
+    DuplicateAvailableEntry {
+        /// The duplicated entry.
+        value: String,
+    },
+
     /// `[agent].runner` was set alongside `[agent].strategy`/`[agent].order`
     /// — single-runner mode and priority mode are mutually exclusive.
     #[error(
@@ -2341,7 +2391,7 @@ fn agent_runner_names_list() -> String {
 /// [`merge_backend`]'s per-key merge), then validate and resolve the result
 /// into a preferred agent plus its fallback order.
 ///
-/// Whole-table replacement because the three keys form one mode
+/// Whole-table replacement because the routing keys form one mode
 /// declaration: merging them per key would let a global `runner` leak into
 /// a repo that only set `strategy`/`order` and trip the runner-vs-order
 /// conflict rule across layers — punishing exactly the common setup of a
@@ -2349,6 +2399,10 @@ fn agent_runner_names_list() -> String {
 /// A repo `[agent]` table that sets any key is the sole source; a repo with
 /// no `[agent]` table inherits the global one untouched.
 ///
+/// `default` / `available` (GitHub issue #192) take precedence and must not
+/// share a table with the legacy keys
+/// ([`ConfigError::LegacyAgentKeysMixed`]); see
+/// [`resolve_default_available`]. Otherwise the legacy keys apply.
 /// Absence of `strategy` and `order` in both global and repo config is
 /// single-runner mode: `runner` behaves exactly as before issue #54, and
 /// resolves to [`AgentKind::Claude`] when unset too, so an existing config
@@ -2366,14 +2420,26 @@ fn merge_agent(
     let global = global.unwrap_or_default();
     let repo = repo.unwrap_or_default();
 
-    let repo_declares_mode =
-        repo.runner.is_some() || repo.strategy.is_some() || repo.order.is_some();
+    let repo_declares_mode = repo.runner.is_some()
+        || repo.strategy.is_some()
+        || repo.order.is_some()
+        || repo.default.is_some()
+        || repo.available.is_some();
     let RawAgentConfig {
+        default,
+        available,
         runner,
         strategy,
         order,
         ..
     } = if repo_declares_mode { repo } else { global };
+
+    if default.is_some() || available.is_some() {
+        if runner.is_some() || strategy.is_some() || order.is_some() {
+            return Err(ConfigError::LegacyAgentKeysMixed);
+        }
+        return resolve_default_available(default, available);
+    }
 
     match strategy {
         None => {
@@ -2414,6 +2480,46 @@ fn merge_agent(
         }
         Some(value) => Err(ConfigError::InvalidStrategy { value }),
     }
+}
+
+/// Resolves `[agent] default` / `available` (GitHub issue #192) into the
+/// preferred runner and its fallbacks: `default` first, then the rest of
+/// `available` in order. At least one of the two is `Some`.
+fn resolve_default_available(
+    default: Option<String>,
+    available: Option<Vec<String>>,
+) -> Result<(AgentKind, Vec<AgentKind>), ConfigError> {
+    let default = match default {
+        Some(value) => Some(AgentKind::parse(&value).ok_or(ConfigError::InvalidRunner { value })?),
+        None => None,
+    };
+    let Some(available) = available else {
+        return Ok((default.unwrap_or_default(), Vec::new()));
+    };
+    if available.is_empty() {
+        return Err(ConfigError::AvailableEmpty);
+    }
+    let mut parsed: Vec<AgentKind> = Vec::with_capacity(available.len());
+    for value in available {
+        let kind = AgentKind::parse(&value).ok_or_else(|| ConfigError::InvalidAvailableEntry {
+            value: value.clone(),
+        })?;
+        if parsed.contains(&kind) {
+            return Err(ConfigError::DuplicateAvailableEntry { value });
+        }
+        parsed.push(kind);
+    }
+    let preferred = default.unwrap_or(parsed[0]);
+    if !parsed.contains(&preferred) {
+        return Err(ConfigError::DefaultNotAvailable {
+            value: preferred.as_str().to_string(),
+        });
+    }
+    let fallbacks = parsed
+        .into_iter()
+        .filter(|kind| *kind != preferred)
+        .collect();
+    Ok((preferred, fallbacks))
 }
 
 /// Merge a repo-local `[work]` section on top of a global one, field by
@@ -4799,6 +4905,141 @@ mod tests {
         let cfg = merge(global, Some(repo)).expect("repo single-runner should win cleanly");
         assert_eq!(cfg.agent, AgentKind::Opencode);
         assert_eq!(cfg.agent_fallbacks, Vec::new());
+    }
+
+    fn agent_table(default: Option<&str>, available: Option<&[&str]>) -> RawConfig {
+        RawConfig {
+            agent: Some(RawAgentConfig {
+                default: default.map(str::to_string),
+                available: available.map(|a| a.iter().map(|s| s.to_string()).collect()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        }
+    }
+
+    #[test]
+    fn merge_agent_default_and_available_put_default_first() {
+        let cfg = merge(
+            agent_table(Some("opencode"), Some(&["claude", "opencode"])),
+            None,
+        )
+        .expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Claude]);
+    }
+
+    #[test]
+    fn merge_agent_default_alone_is_its_only_runner() {
+        let cfg = merge(agent_table(Some("opencode"), None), None).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, Vec::new());
+    }
+
+    #[test]
+    fn merge_agent_available_alone_defaults_to_its_first_runner() {
+        let cfg =
+            merge(agent_table(None, Some(&["opencode", "claude"])), None).expect("should merge");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Claude]);
+    }
+
+    #[test]
+    fn merge_agent_default_missing_from_available_errors() {
+        let err =
+            merge(agent_table(Some("opencode"), Some(&["claude"])), None).expect_err("should fail");
+        assert!(
+            matches!(&err, ConfigError::DefaultNotAvailable { value } if value == "opencode"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_agent_available_rejects_bad_empty_and_duplicate_entries() {
+        let err = merge(agent_table(None, Some(&["bogus"])), None).expect_err("bogus");
+        assert!(
+            matches!(&err, ConfigError::InvalidAvailableEntry { value } if value == "bogus"),
+            "{err:?}"
+        );
+        let err = merge(agent_table(None, Some(&[])), None).expect_err("empty");
+        assert!(matches!(err, ConfigError::AvailableEmpty), "{err:?}");
+        let err = merge(agent_table(None, Some(&["claude", "claude"])), None).expect_err("dup");
+        assert!(
+            matches!(&err, ConfigError::DuplicateAvailableEntry { value } if value == "claude"),
+            "{err:?}"
+        );
+        let err = merge(agent_table(Some("bogus"), None), None).expect_err("bad default");
+        assert!(matches!(err, ConfigError::InvalidRunner { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn merge_agent_new_keys_alongside_legacy_keys_conflict() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                default: Some("claude".to_string()),
+                runner: Some("claude".to_string()),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let err = merge(global, None).expect_err("should fail");
+        assert!(matches!(err, ConfigError::LegacyAgentKeysMixed), "{err:?}");
+    }
+
+    #[test]
+    fn merge_agent_repo_default_replaces_global_priority_table() {
+        let global = RawConfig {
+            agent: Some(RawAgentConfig {
+                strategy: Some("priority".to_string()),
+                order: Some(vec!["claude".to_string(), "opencode".to_string()]),
+                ..Default::default()
+            }),
+            ..raw_full()
+        };
+        let repo = RawConfig {
+            agent: Some(RawAgentConfig {
+                default: Some("opencode".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge(global, Some(repo)).expect("repo table wins wholesale");
+        assert_eq!(cfg.agent, AgentKind::Opencode);
+        assert_eq!(cfg.agent_fallbacks, Vec::new());
+    }
+
+    #[test]
+    fn load_parses_default_available_and_per_runner_tables() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://only-global.atlassian.net"
+            jira_email = "only-global@example.com"
+            default_project_key = "ONLY"
+
+            [agent]
+            default = "claude"
+            available = ["claude", "opencode"]
+
+            [agent.opencode]
+            default_model = "venice/z-ai-glm-5-3-flash"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = load(&ConfigPaths {
+            global: global_path,
+            repo: None,
+        })
+        .expect("should load");
+        assert_eq!(cfg.agent, AgentKind::Claude);
+        assert_eq!(cfg.agent_fallbacks, vec![AgentKind::Opencode]);
+        assert_eq!(
+            cfg.models.opencode.default_model.as_deref(),
+            Some("venice/z-ai-glm-5-3-flash")
+        );
     }
 
     #[test]
