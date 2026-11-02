@@ -1988,6 +1988,11 @@ pub fn run_agent_and_finish(
     let mut parsed = None;
     let mut all_attempts_rate_limited = false;
     for (index, attempt) in attempts.iter().enumerate() {
+        // A fallback truncates the output stream and writes another
+        // runner's format into it; the row says which.
+        if index > 0 {
+            run_store.update_agent(prepared.run_id, attempt.runner.name())?;
+        }
         let attempt_status = spawner.spawn(SpawnRequest {
             program: &attempt.invocation.program,
             args: &attempt.invocation.args,
@@ -3448,6 +3453,11 @@ mod tests {
         let run = run_store.run_by_id(prepared.run_id).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Done);
         assert_eq!(run.session_id.as_deref(), Some("ses-opencode"));
+        assert_eq!(
+            run.agent.as_deref(),
+            Some("opencode"),
+            "the row names the agent that actually ran"
+        );
 
         assert_eq!(
             run_store.agent_exhausted_until("claude").unwrap(),
