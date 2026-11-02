@@ -1,20 +1,21 @@
-//! Memory-budget admission for lane launches (GitHub issue #66).
+//! Memory and usage admission for every agent launch (GitHub issues #66,
+//! #114 and #149).
 //!
-//! Before a lane launches, tm estimates its cost as the recent peak
-//! footprint for the same agent and repo (see
-//! [`RunStore::lane_peak_estimate`]), falling back to
-//! [`MemoryConfig::default_lane_estimate_bytes`] with no history. The launch
-//! is admitted when that estimate plus the estimates of every running lane
-//! fits [`MemoryConfig::budget_bytes`], and the kernel is not reporting warn
-//! or critical memory pressure.
+//! Before an agent launches, tm estimates its cost as the recent peak
+//! footprint for the same run kind, agent and repo (see
+//! [`RunStore::peak_estimate`]), falling back to [`default_estimate_bytes`]
+//! with no history. The launch is admitted when that estimate plus the
+//! estimates of every running agent ([`RunStore::running_agents`]) fits
+//! [`MemoryConfig::budget_bytes`], and the kernel is not reporting warn or
+//! critical memory pressure.
 //!
-//! A running lane is counted at the larger of its own peak so far and its
-//! key's estimate, because a lane that is cheap at launch can peak minutes
+//! A running agent is counted at the larger of its own peak so far and its
+//! key's estimate, because a run that is cheap at launch can peak minutes
 //! later when it builds.
 //!
-//! Admission is off unless a budget is configured. Off means no check at
-//! all, the pressure gate included, so launches behave as they did before
-//! this module existed.
+//! Memory admission is off unless a budget is configured. Off means no
+//! check at all, the pressure gate included, so launches behave as they did
+//! before this module existed.
 //!
 //! Usage admission (GitHub issue #114), [`check_usage_admission`], sits
 //! beside it. It refuses a launch while the agent's subscription usage
@@ -24,6 +25,13 @@
 //! whether a refusal only warns (a manual `tm work run`) or blocks
 //! (unattended dispatch). See `docs/plans/gh-113-proactive-usage-signal.md`
 //! and ADR-0008's GH-114 amendment.
+//!
+//! Every launch path runs both checks through one step,
+//! [`AdmissionGate`] (or [`AdmissionDeps::admit`], which picks the
+//! behavior from a [`LaunchOrigin`]): a human launch refuses over the
+//! memory budget and warns over a usage ceiling, and a launch tm starts
+//! with nobody present waits. Admission hands back an [`Admitted`], which
+//! every agent command-line builder requires, so no path can skip it.
 
 use std::collections::HashMap;
 use std::fmt;

@@ -315,7 +315,7 @@ impl AgentRunner for ClaudeRunner {
     ///
     /// Read [`RunMode`] before touching the env-set fork.
     ///
-    /// Delegates to [`ClaudeRunner::invocation`], which the usage probe
+    /// Delegates to `ClaudeRunner::invocation`, which the usage probe
     /// shares: the probe is part of admission, so it has no `Admitted`.
     fn build_invocation(
         &self,
