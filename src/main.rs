@@ -2301,7 +2301,14 @@ const REVIEW_FIX_EXIT_NO_COMMENTS: u8 = 3;
 fn run_review_fix(key: String, dispatch: Dispatch) -> ExitCode {
     let result = with_review_deps(|deps, run_paths, _config| {
         let mut stdout = std::io::stdout();
-        tskmstr::cli::review::fix(deps, run_paths, &key, dispatch, &mut stdout)
+        tskmstr::cli::review::fix(
+            deps,
+            run_paths,
+            &key,
+            dispatch,
+            tskmstr::work::admission::LaunchOrigin::Human,
+            &mut stdout,
+        )
     });
     match result {
         Ok(Ok(tskmstr::cli::review::FixOutcome::Dispatched { succeeded: true })) => {
@@ -2412,22 +2419,54 @@ fn with_review_deps<T>(
     // just degrades the session name to an unscoped slug.
     let full_config = config::load(&default_config_paths()).ok();
     let backend_identity = backend_identity_or_placeholder(full_config.as_ref());
-    let deps = tskmstr::cli::review::ReviewFixDeps {
-        git: &git,
-        gh: &gh,
+    let runner = agent_runner_or_default(full_config.as_ref());
+    Ok(with_admission(full_config.as_ref(), runner, |admission| {
+        let deps = tskmstr::cli::review::ReviewFixDeps {
+            git: &git,
+            gh: &gh,
+            spawner: &spawner,
+            run_store: &run_store,
+            clock: &clock,
+            vdiff: &vdiff,
+            detach: &detach,
+            current_exe: &current_exe,
+            run_db_path: &run_db_path,
+            tmux: &tmux,
+            backend_identity: &backend_identity,
+            runner,
+            config: full_config.as_ref(),
+            admission,
+        };
+        f(&deps, &run_paths, full_config.as_ref())
+    }))
+}
+
+/// Runs `f` with production memory and usage admission (GitHub issue #149)
+/// for launches of `runner`: the loaded config's `[work]` memory and
+/// `[agent.<runner>]` usage settings (the defaults with no config), a
+/// [`tskmstr::work::admission::SpawnUsageProber`], the kernel's memory
+/// pressure, and a real sleeper for unattended waits.
+fn with_admission<T>(
+    config: Option<&tskmstr::config::Config>,
+    runner: &dyn tskmstr::agent::AgentRunner,
+    f: impl FnOnce(tskmstr::work::admission::AdmissionDeps<'_>) -> T,
+) -> T {
+    let memory = config.map(|c| c.work.memory.clone()).unwrap_or_default();
+    let usage = config.map(|c| c.usage.clone()).unwrap_or_default();
+    let models = config.map(|c| c.models.clone()).unwrap_or_default();
+    let spawner = tskmstr::work::runner::StdProcessSpawner;
+    let prober = tskmstr::work::admission::SpawnUsageProber {
+        runners: vec![runner],
+        models: &models,
         spawner: &spawner,
-        run_store: &run_store,
-        clock: &clock,
-        vdiff: &vdiff,
-        detach: &detach,
-        current_exe: &current_exe,
-        run_db_path: &run_db_path,
-        tmux: &tmux,
-        backend_identity: &backend_identity,
-        runner: agent_runner_or_default(full_config.as_ref()),
-        config: full_config.as_ref(),
     };
-    Ok(f(&deps, &run_paths, full_config.as_ref()))
+    f(tskmstr::work::admission::AdmissionDeps {
+        memory: &memory,
+        usage: &usage,
+        prober: &prober,
+        pressure: &tskmstr::runs::footprint::memory_pressure,
+        sleeper: &tskmstr::work::review_watch::RealSleeper,
+    })
 }
 
 /// Dispatch `tm runs`, `tm runs start`, and `tm runs finish`.

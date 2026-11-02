@@ -1611,8 +1611,12 @@ pub enum ReviewFixError {
 /// uses (see `src/work/detach.rs`) — the supervisor only reads back a
 /// [`PreparedRun`], so it has no idea (and no need to know) whether the run
 /// it's supervising is a lane run or a review-fix run.
+///
+/// `admitted` is the caller's proof that the launch passed admission
+/// (GitHub issue #149).
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_review_fix(
+    admitted: &crate::work::admission::Admitted,
     git: &dyn GitOps,
     run_store: &RunStore,
     clock: &dyn Clock,
@@ -1630,6 +1634,7 @@ pub fn prepare_review_fix(
     runner: &dyn AgentRunner,
 ) -> Result<PreparedRun, ReviewFixError> {
     prepare_existing_branch_run(
+        admitted,
         git,
         run_store,
         clock,
@@ -1692,6 +1697,7 @@ pub struct ExistingBranchRun<'a> {
 ///
 /// See [`prepare_review_fix`].
 pub fn prepare_existing_branch_run(
+    _admitted: &crate::work::admission::Admitted,
     git: &dyn GitOps,
     run_store: &RunStore,
     clock: &dyn Clock,
@@ -7930,6 +7936,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
 
         let prepared = prepare_review_fix(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -7982,6 +7989,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
 
         let prepared = prepare_existing_branch_run(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -8020,6 +8028,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
 
         let prepared = prepare_review_fix(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -8054,6 +8063,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
 
         let prepared = prepare_existing_branch_run(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -8108,6 +8118,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
 
         let err = prepare_review_fix(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -8140,6 +8151,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
 
         let prepared = prepare_review_fix(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
@@ -8180,6 +8192,7 @@ mod tests {
         let worktree = tmp.path().join("Worktrees/axiom/proj-1");
 
         let prepared = prepare_review_fix(
+            &crate::work::admission::Admitted::for_test(),
             &git,
             &run_store,
             &clock,
