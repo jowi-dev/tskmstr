@@ -20,6 +20,21 @@
 //!   hooks; it only produces the files they read.
 //! - [`finish_session`] finishes the marker's run and unlinks the marker.
 //!
+//! **One audit run per ticket.** An `audit` session owns at most one run per
+//! ticket, and only for the ticket it is auditing: the first ticket it
+//! registers (or the one a board-launched session was pre-registered for).
+//! An audit run never moves with the marker. The audit skill reads other
+//! tickets for context and re-reads its own ticket after recording the
+//! verdict; neither may start a run, or that run stays `running` with nothing
+//! left to finish it, and the dispatcher treats its ticket as in hand
+//! forever. So for `audit` only, [`register_session`] returns `Ok(None)` for
+//! a ticket the session is not auditing and for one whose verdict is already
+//! recorded (a `done` run), and [`finish_session`] finds the run through
+//! [`RunStore::session_runs`] by ticket rather than through the marker. A
+//! reaped run (`failed`/`interrupted`) does not count as a recorded verdict:
+//! registering its ticket again starts a fresh run. Every other kind keeps
+//! the marker-follows-latest-registration behavior below.
+//!
 //! **Adoption of board-launched sessions.** `docs/plans/board-audits.md`'s
 //! "Adoption" design adds a second way a run can get a marker: a session
 //! [`crate::work::audit::launch_audit`] starts already has a run row
@@ -32,7 +47,10 @@
 //! when known, without ever calling [`RunStore::start_run`]. Any mismatch
 //! (missing run, wrong status, wrong kind/ticket) falls through to the
 //! existing marker-reuse/new-run behavior unchanged — the env var is
-//! advisory, the marker stays the source of truth.
+//! advisory, the marker stays the source of truth. The one exception is an
+//! `audit` row for a different ticket: that session was launched to audit
+//! the other ticket, so the call is a context read (see "One audit run per
+//! ticket" above).
 //!
 //! [`SessionEnv::session_id`]/[`SessionEnv::agent_pid`] are read from
 //! whichever env vars the configured runner's
@@ -216,11 +234,23 @@ fn read_marker(path: &Path) -> Option<i64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Adopts a pre-registered run: creates `dir` if needed, writes the marker
-/// for `session_id` pointing at `run_id`, stamps `run_id`'s `session_id`,
-/// and stamps its `pid` when `agent_pid` is known. Shared by
-/// [`register_session`]'s adoption path; see the module docs' "Adoption of
-/// board-launched sessions" section.
+/// Creates `dir` if needed and writes the marker for `session_id` pointing
+/// at `run_id`.
+fn write_marker(dir: &Path, session_id: &str, run_id: i64) -> Result<(), SessionError> {
+    std::fs::create_dir_all(dir).map_err(|source| SessionError::CreateDir {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    let path = marker_path(dir, session_id);
+    std::fs::write(&path, run_id.to_string())
+        .map_err(|source| SessionError::WriteMarker { path, source })
+}
+
+/// Adopts a pre-registered run: writes the marker for `session_id` pointing
+/// at `run_id`, stamps `run_id`'s `session_id`, and stamps its `pid` when
+/// `agent_pid` is known. Shared by [`register_session`]'s adoption path; see
+/// the module docs' "Adoption of board-launched sessions" section.
 fn adopt_run(
     store: &RunStore,
     dir: &Path,
@@ -228,16 +258,7 @@ fn adopt_run(
     run_id: i64,
     agent_pid: Option<u32>,
 ) -> Result<i64, SessionError> {
-    std::fs::create_dir_all(dir).map_err(|source| SessionError::CreateDir {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    let path = marker_path(dir, session_id);
-    std::fs::write(&path, run_id.to_string()).map_err(|source| SessionError::WriteMarker {
-        path: path.clone(),
-        source,
-    })?;
+    write_marker(dir, session_id, run_id)?;
 
     store.update_session_id(run_id, session_id)?;
     if let Some(pid) = agent_pid {
@@ -247,6 +268,64 @@ fn adopt_run(
     Ok(run_id)
 }
 
+/// The run kind the one-audit-run-per-ticket rule applies to (see the
+/// module docs). Every other kind keeps the marker-follows-latest behavior.
+const AUDIT_KIND: &str = "audit";
+
+/// What [`register_session`] does with an audit registration once adoption
+/// has been ruled out.
+enum AuditClaim {
+    /// Reuse this session's still-running audit run for the ticket.
+    Reuse(i64),
+    /// Register nothing: the ticket is read for context, or its verdict is
+    /// already recorded.
+    Skip,
+    /// No claim either way: fall through to the marker logic.
+    Start,
+}
+
+/// Applies the one-audit-run-per-ticket rule to an audit registration of
+/// `ticket` by `session_id` (see the module docs).
+///
+/// A board-launched session (`env.session_run_id` names an audit row for a
+/// different ticket, whatever its status) is reading `ticket` for context.
+/// Otherwise the session's own audit rows decide: a still-running row for
+/// `ticket` is reused, a `done` one means the verdict is recorded, any other
+/// terminal status (a reaped run) starts fresh, and rows only for other
+/// tickets make this a context read.
+fn audit_claim(
+    store: &RunStore,
+    env: &SessionEnv,
+    session_id: &str,
+    ticket: &str,
+) -> Result<AuditClaim, SessionError> {
+    if let Some(candidate_id) = env.session_run_id
+        && let Some(run) = store.run_by_id(candidate_id)?
+        && run.kind == AUDIT_KIND
+        && !run.ticket.eq_ignore_ascii_case(ticket)
+    {
+        return Ok(AuditClaim::Skip);
+    }
+
+    let owned = store.session_runs(session_id, AUDIT_KIND)?;
+    if let Some(run) = owned
+        .iter()
+        .rev()
+        .find(|run| run.ticket.eq_ignore_ascii_case(ticket))
+    {
+        return Ok(match run.status {
+            RunStatus::Running => AuditClaim::Reuse(run.id),
+            RunStatus::Done => AuditClaim::Skip,
+            _ => AuditClaim::Start,
+        });
+    }
+    if owned.is_empty() {
+        Ok(AuditClaim::Start)
+    } else {
+        Ok(AuditClaim::Skip)
+    }
+}
+
 /// Registers (or reuses, or adopts) a session run for `kind`/`ticket`, per
 /// `docs/plans/session-usage.md`'s "Session registration" design and
 /// `docs/plans/board-audits.md`'s "Adoption" design.
@@ -254,6 +333,15 @@ fn adopt_run(
 /// Returns:
 /// - `Ok(None)` — no-op: `env.session_id` is absent, or `env.lane_run_id` is
 ///   present (a lane run already owns telemetry).
+/// - `Ok(None)` — `kind` is `audit` and `ticket` is not this session's to
+///   register: `env.session_run_id` names an audit run for another ticket,
+///   the session already has audit runs only for other tickets (a context
+///   read), or its run for `ticket` is [`RunStatus::Done`] (the verdict is
+///   recorded). No row is started and the marker is left alone. See the
+///   module docs' "One audit run per ticket".
+/// - `Ok(Some(id))` — `kind` is `audit` and the session's own audit run for
+///   `ticket` is still [`RunStatus::Running`]: reused, and the marker is
+///   rewritten to point at it.
 /// - `Ok(Some(id))` — adopted `env.session_run_id`'s pre-registered run: it
 ///   exists, is [`RunStatus::Running`], and matches `kind` and `ticket`
 ///   (the latter case-insensitively). The
@@ -264,7 +352,9 @@ fn adopt_run(
 /// - `Ok(Some(id))` — started a fresh run and wrote the marker, either
 ///   because there was no marker, the marker's run wasn't running, or it was
 ///   running a *different* `kind`/`ticket` (in which case that old run is
-///   first finished [`RunStatus::Done`]).
+///   first finished [`RunStatus::Done`]). For `audit`, only once the rule
+///   above has allowed it: the session's first audit registration, or its
+///   ticket's previous run was reaped.
 ///
 /// After a fresh start, opportunistically sweeps sibling markers in `dir`
 /// whose run is no longer running (or fails to resolve at all), to keep the
@@ -302,6 +392,17 @@ pub fn register_session(
         && run.ticket.eq_ignore_ascii_case(ticket)
     {
         return adopt_run(store, dir, session_id, candidate_id, env.agent_pid).map(Some);
+    }
+
+    if kind == AUDIT_KIND {
+        match audit_claim(store, env, session_id, ticket)? {
+            AuditClaim::Reuse(run_id) => {
+                write_marker(dir, session_id, run_id)?;
+                return Ok(Some(run_id));
+            }
+            AuditClaim::Skip => return Ok(None),
+            AuditClaim::Start => {}
+        }
     }
 
     let path = marker_path(dir, session_id);
@@ -387,21 +488,23 @@ fn sweep(store: &RunStore, dir: &Path, just_written: &Path) -> Result<(), Sessio
     Ok(())
 }
 
-/// Finishes the session's marker run and unlinks the marker, per
-/// `docs/plans/session-usage.md`'s `finish_session`.
+/// Finishes the session's run for `kind`/`ticket` and unlinks its marker,
+/// per `docs/plans/session-usage.md`'s `finish_session`.
+///
+/// Which run that is depends on `kind`. For `audit`, it is the session's
+/// latest still-running audit run for `ticket` (case-insensitive), found
+/// through [`RunStore::session_runs`] whether or not the marker points at it
+/// (see the module docs' "One audit run per ticket"). For every other kind,
+/// it is the marker's run, and only when that run is for this `kind` and
+/// `ticket`: the marker tracks the session's latest registration, so a
+/// marker pointing at another ticket's run must be left alone.
 ///
 /// Returns `Ok(None)` (a no-op) when `env.session_id` is absent,
-/// `env.lane_run_id` is present, there is no marker (or the marker's
-/// contents don't parse) for the session, or the marker's run is not for
-/// this `kind` and `ticket` — every case where there is no run this call is
-/// responsible for finishing. The kind/ticket match matters because the
-/// marker tracks the session's *latest* registration: a session that audits
-/// PROJ-1, then reads PROJ-2 for context, has its marker pointing at
-/// PROJ-2's run, and recording PROJ-1's verdict must leave that run (and
-/// the marker) alone. Otherwise finishes the marker's run with `status`
-/// (all other [`FinishRun`] fields left `None`, so `finish_run`'s
-/// `COALESCE` semantics preserve whatever was already recorded), unlinks
-/// the marker, and returns `Ok(Some(id))`.
+/// `env.lane_run_id` is present, or there is no such run. Otherwise finishes
+/// the run with `status` (all other [`FinishRun`] fields left `None` unless
+/// usage events roll up into a cost, so `finish_run`'s `COALESCE` semantics
+/// preserve whatever was already recorded), unlinks the marker if it names
+/// that run, and returns `Ok(Some(id))`.
 pub fn finish_session(
     store: &RunStore,
     dir: &Path,
@@ -419,14 +522,23 @@ pub fn finish_session(
     }
 
     let path = marker_path(dir, session_id);
-    let Some(run_id) = read_marker(&path) else {
-        return Ok(None);
+    let run_id = if kind == AUDIT_KIND {
+        let owned = store.session_runs(session_id, kind)?;
+        let Some(run) = owned.iter().rev().find(|run| {
+            run.status == RunStatus::Running && run.ticket.eq_ignore_ascii_case(ticket)
+        }) else {
+            return Ok(None);
+        };
+        run.id
+    } else {
+        let Some(run_id) = read_marker(&path) else {
+            return Ok(None);
+        };
+        match store.run_by_id(run_id)? {
+            Some(run) if run.kind == kind && run.ticket == ticket => run_id,
+            _ => return Ok(None),
+        }
     };
-
-    match store.run_by_id(run_id)? {
-        Some(run) if run.kind == kind && run.ticket == ticket => {}
-        _ => return Ok(None),
-    }
 
     // Interactive sessions have no wrapper process to pass --model-usage the
     // way a lane run's supervisor does, so this rolls up whatever `usage`
@@ -459,10 +571,15 @@ pub fn finish_session(
 
     store.finish_run(run_id, &outcome)?;
 
-    std::fs::remove_file(&path).map_err(|source| SessionError::RemoveMarker {
-        path: path.clone(),
-        source,
-    })?;
+    // An audit run is found by ticket, not through the marker, so the marker
+    // may be missing or point elsewhere; it is only this run's to remove when
+    // it names this run.
+    if read_marker(&path) == Some(run_id) {
+        std::fs::remove_file(&path).map_err(|source| SessionError::RemoveMarker {
+            path: path.clone(),
+            source,
+        })?;
+    }
 
     Ok(Some(run_id))
 }
@@ -672,11 +789,11 @@ mod tests {
             .start_run(&StartRun {
                 scope: String::new(),
                 ticket: "PROJ-2".to_string(),
-                lane: "audit".to_string(),
+                lane: "create".to_string(),
                 worktree: "/repo/axiom".to_string(),
                 branch: None,
                 pid: None,
-                kind: "audit".to_string(),
+                kind: "create".to_string(),
                 log_path: None,
             })
             .unwrap();
@@ -684,7 +801,9 @@ mod tests {
         let mut env = env_with_session("sess-1");
         env.session_run_id = Some(pre_id);
 
-        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+        // Non-audit kinds only; an audit session reading another ticket is a
+        // context read (see the board-launched audit tests below).
+        let id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
             .unwrap()
             .expect("should fall through to a fresh run");
 
@@ -769,10 +888,12 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+        // `create` keeps the marker-follows-latest-registration behavior;
+        // `audit` does not (see the audit tests below).
+        let first = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
             .unwrap()
             .unwrap();
-        let second = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2")
+        let second = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -1019,13 +1140,13 @@ mod tests {
         let store = open_store(db_dir.path());
         let env = env_with_session("sess-1");
 
-        // The session audits PROJ-1, then reads PROJ-2 for context — the
-        // marker now points at PROJ-2's run. Recording PROJ-1's verdict must
-        // not finish PROJ-2's run or delete its marker.
-        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+        // A non-audit session registers PROJ-1, then PROJ-2: the marker now
+        // points at PROJ-2's run, and finishing PROJ-1 must not finish
+        // PROJ-2's run or delete its marker.
+        register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-1")
             .unwrap()
             .unwrap();
-        let b_id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2")
+        let b_id = register_session(&store, None, markers_dir.path(), &env, "create", "PROJ-2")
             .unwrap()
             .unwrap();
 
@@ -1033,7 +1154,7 @@ mod tests {
             &store,
             markers_dir.path(),
             &env,
-            "audit",
+            "create",
             "PROJ-1",
             RunStatus::Done,
             &ClaudeRunner,
@@ -1152,6 +1273,201 @@ mod tests {
 
         assert_eq!(result, None);
         assert!(markers_dir.path().join("sess-1").exists());
+    }
+
+    // --- one audit run per ticket per session ---
+
+    fn finish_audit(store: &RunStore, dir: &Path, env: &SessionEnv, ticket: &str) -> Option<i64> {
+        finish_session(
+            store,
+            dir,
+            env,
+            "audit",
+            ticket,
+            RunStatus::Done,
+            &ClaudeRunner,
+        )
+        .unwrap()
+    }
+
+    fn running_audit_rows(store: &RunStore, ticket: &str) -> usize {
+        store
+            .list_runs()
+            .unwrap()
+            .iter()
+            .filter(|run| {
+                run.kind == "audit" && run.ticket == ticket && run.status == RunStatus::Running
+            })
+            .count()
+    }
+
+    fn preregister_audit(store: &RunStore, ticket: &str) -> i64 {
+        store
+            .start_run(&StartRun {
+                scope: String::new(),
+                ticket: ticket.to_string(),
+                lane: "audit".to_string(),
+                worktree: "/repo/axiom".to_string(),
+                branch: None,
+                pid: None,
+                kind: "audit".to_string(),
+                log_path: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn audit_read_after_the_verdict_is_recorded_starts_no_run() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        finish_audit(&store, markers_dir.path(), &env, "PROJ-1").unwrap();
+
+        let again =
+            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1").unwrap();
+
+        assert_eq!(again, None);
+        assert_eq!(running_audit_rows(&store, "PROJ-1"), 0);
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audit_context_read_starts_no_run_and_the_verdict_finishes_the_audited_ticket() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let a_id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        let b =
+            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+
+        assert_eq!(b, None);
+        assert!(
+            store
+                .list_runs()
+                .unwrap()
+                .iter()
+                .all(|run| run.ticket != "PROJ-2"),
+            "a context read must not start a run"
+        );
+        assert_eq!(
+            store.run_by_id(a_id).unwrap().unwrap().status,
+            RunStatus::Running,
+            "a context read must not finish the audited ticket's run"
+        );
+
+        assert_eq!(
+            finish_audit(&store, markers_dir.path(), &env, "PROJ-1"),
+            Some(a_id)
+        );
+        assert_eq!(
+            store.run_by_id(a_id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+        assert!(!markers_dir.path().join("sess-1").exists());
+    }
+
+    #[test]
+    fn audit_context_read_leaves_the_audited_ticket_run_reusable() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let first = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+        let again = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(again, first);
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(markers_dir.path().join("sess-1")).unwrap(),
+            first.to_string()
+        );
+    }
+
+    #[test]
+    fn board_launched_audit_context_read_before_adoption_starts_no_run() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let pre_id = preregister_audit(&store, "PROJ-1");
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        let b =
+            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+        assert_eq!(b, None);
+        assert_eq!(store.list_runs().unwrap().len(), 1, "no PROJ-2 row");
+
+        let a = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, pre_id);
+
+        assert_eq!(
+            finish_audit(&store, markers_dir.path(), &env, "PROJ-1"),
+            Some(pre_id)
+        );
+        assert_eq!(
+            store.run_by_id(pre_id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
+    }
+
+    #[test]
+    fn board_launched_audit_context_read_after_the_verdict_starts_no_run() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let pre_id = preregister_audit(&store, "PROJ-1");
+        let mut env = env_with_session("sess-1");
+        env.session_run_id = Some(pre_id);
+
+        register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        finish_audit(&store, markers_dir.path(), &env, "PROJ-1").unwrap();
+
+        let b =
+            register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-2").unwrap();
+
+        assert_eq!(b, None);
+        assert_eq!(store.list_runs().unwrap().len(), 1, "no PROJ-2 row");
+    }
+
+    #[test]
+    fn finish_session_finishes_the_audit_run_by_ticket_without_a_marker() {
+        let db_dir = tempdir().unwrap();
+        let markers_dir = tempdir().unwrap();
+        let store = open_store(db_dir.path());
+        let env = env_with_session("sess-1");
+
+        let id = register_session(&store, None, markers_dir.path(), &env, "audit", "PROJ-1")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(markers_dir.path().join("sess-1")).unwrap();
+
+        assert_eq!(
+            finish_audit(&store, markers_dir.path(), &env, "proj-1"),
+            Some(id)
+        );
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Done
+        );
     }
 
     #[test]
