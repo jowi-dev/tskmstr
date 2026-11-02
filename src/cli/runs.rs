@@ -201,9 +201,9 @@ pub struct FinishGuard {
     pub if_running: bool,
     /// Only finish a run of this kind.
     pub if_kind: Option<String>,
-    /// A run that has already ended (`review`, `done`, `failed`,
-    /// `interrupted`) keeps its status; the rest of the outcome (usage,
-    /// session id, ...) is still recorded. The SessionEnd hooks pass this so
+    /// A run that has already ended ([`RunStatus::has_ended`]) keeps its
+    /// status; the rest of the outcome (usage, session id, ...) is still
+    /// recorded. The SessionEnd hooks pass this so
     /// the user exiting a session never turns the auto-review loop's
     /// `review` flag back into `done` (GitHub issue #150).
     pub keep_status: bool,
@@ -226,8 +226,8 @@ pub struct FinishGuard {
 /// guard is checked before the hibernation refusal, so a guarded finish of a
 /// hibernated run is a quiet no-op rather than an error. With
 /// [`FinishGuard::keep_status`] (`--keep-status`), an already-ended run
-/// keeps its status and its first `ended_at`, the rule
-/// [`RunStore::finish_run_from_supervisor`] applies.
+/// keeps its status and its first `ended_at`, in one statement
+/// ([`RunStore::finish_keeping_status`]).
 pub fn finish(
     store: &RunStore,
     run_id: i64,
@@ -262,12 +262,6 @@ pub fn finish(
     }
 
     let mut outcome = outcome.clone();
-    let kept = existing.filter(|status| {
-        guard.keep_status && (status.is_terminal() || *status == RunStatus::Review)
-    });
-    if let Some(status) = kept {
-        outcome.status = status;
-    }
 
     if let Some(model_usage) = &outcome.model_usage {
         let value: serde_json::Value = serde_json::from_str(model_usage)
@@ -297,12 +291,13 @@ pub fn finish(
         }
     }
 
-    if kept.is_some() {
-        store.finish_run_from_supervisor(run_id, &outcome, false)?;
+    let status = if guard.keep_status {
+        store.finish_keeping_status(run_id, &outcome)?
     } else {
         store.finish_run(run_id, &outcome)?;
-    }
-    writeln!(out, "Finished run {run_id}: {}", outcome.status.as_str())?;
+        outcome.status
+    };
+    writeln!(out, "Finished run {run_id}: {}", status.as_str())?;
     Ok(())
 }
 
@@ -1526,6 +1521,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!("Finished run {id}: review\n")
+        );
+    }
+
+    #[test]
+    fn finish_keep_status_keeps_a_blocked_runs_status() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let id = store.start_run(&start_params("PROJ-1")).unwrap();
+        let blocked = FinishRun {
+            status: RunStatus::Blocked,
+            ..FinishRun::default()
+        };
+        store.finish_run(id, &blocked).unwrap();
+        let guard = FinishGuard {
+            keep_status: true,
+            ..FinishGuard::default()
+        };
+        let mut out = Vec::new();
+
+        finish(&store, id, &done(), false, &guard, &ClaudeRunner, &mut out).unwrap();
+
+        assert_eq!(
+            store.run_by_id(id).unwrap().unwrap().status,
+            RunStatus::Blocked
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Finished run {id}: blocked\n")
         );
     }
 

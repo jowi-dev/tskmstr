@@ -440,7 +440,18 @@ impl RunStatus {
             RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted
         )
     }
+
+    /// Whether the run has ended: [`RunStatus::is_terminal`], or set aside
+    /// for a human as [`RunStatus::Blocked`] or [`RunStatus::Review`]. Only
+    /// `queued`, `running` and `hibernated` runs are still in flight. See
+    /// [`ENDED_STATUSES_SQL`] for the same set in SQL.
+    pub fn has_ended(self) -> bool {
+        self.is_terminal() || matches!(self, RunStatus::Blocked | RunStatus::Review)
+    }
 }
+
+/// [`RunStatus::has_ended`]'s statuses, as an SQL list for `status IN (...)`.
+const ENDED_STATUSES_SQL: &str = "('blocked', 'review', 'done', 'failed', 'interrupted')";
 
 /// Parameters for starting a new run.
 #[derive(Debug, Clone)]
@@ -1928,6 +1939,63 @@ impl RunStore {
             return Err(RunStoreError::RunNotFound(run_id));
         }
         Ok(())
+    }
+
+    /// Finishes run `run_id` with `outcome`, except that a run that has
+    /// already ended ([`RunStatus::has_ended`]) keeps its status and its
+    /// first `ended_at`. One `UPDATE`, so a status another writer sets
+    /// between a read and the finish is never overwritten. Returns the
+    /// status the row ends with. `tm runs finish --keep-status` (the
+    /// SessionEnd hooks, GitHub issue #150).
+    ///
+    /// # Errors
+    ///
+    /// [`RunStoreError::RunNotFound`] if `run_id` has no matching row.
+    pub fn finish_keeping_status(
+        &self,
+        run_id: i64,
+        outcome: &FinishRun,
+    ) -> Result<RunStatus, RunStoreError> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE runs SET
+                        status = CASE
+                            WHEN status IN {ENDED_STATUSES_SQL} THEN status
+                            ELSE ?1
+                        END,
+                        ended_at = COALESCE(ended_at, {NOW_SQL}),
+                        exit_code = COALESCE(?2, exit_code),
+                        session_id = COALESCE(?3, session_id),
+                        cost_usd = COALESCE(?4, cost_usd),
+                        num_turns = COALESCE(?5, num_turns),
+                        blocker = COALESCE(?6, blocker),
+                        pr_url = COALESCE(?7, pr_url),
+                        transcript = COALESCE(?8, transcript),
+                        model_usage = COALESCE(?9, model_usage),
+                        findings_count = COALESCE(?10, findings_count)
+                     WHERE id = ?11
+                     RETURNING status"
+                ),
+                params![
+                    outcome.status.as_str(),
+                    outcome.exit_code,
+                    outcome.session_id,
+                    outcome.cost_usd,
+                    outcome.num_turns,
+                    outcome.blocker,
+                    outcome.pr_url,
+                    outcome.transcript,
+                    outcome.model_usage,
+                    outcome.findings_count,
+                    run_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = status.ok_or(RunStoreError::RunNotFound(run_id))?;
+        Ok(RunStatus::parse(&status).unwrap_or(RunStatus::Interrupted))
     }
 
     /// Mark run `run_id` as [`RunStatus::Review`], leaving `ended_at` as it
@@ -4882,6 +4950,52 @@ mod tests {
         let run = store.run_by_id(id).unwrap().expect("expected a run");
         assert_eq!(run.status, RunStatus::Done);
         assert!(run.ended_at.is_some());
+    }
+
+    #[test]
+    fn finish_keeping_status_keeps_every_ended_status_and_finishes_the_rest() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let done = FinishRun {
+            status: RunStatus::Done,
+            session_id: Some("sess".to_string()),
+            ..FinishRun::default()
+        };
+        for status in [
+            RunStatus::Blocked,
+            RunStatus::Review,
+            RunStatus::Done,
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+        ] {
+            assert!(status.has_ended(), "{status:?}");
+            let id = store.start_run(&start_params("PROJ-1")).unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE runs SET status = ?1 WHERE id = ?2",
+                    params![status.as_str(), id],
+                )
+                .unwrap();
+
+            assert_eq!(store.finish_keeping_status(id, &done).unwrap(), status);
+            let run = store.run_by_id(id).unwrap().unwrap();
+            assert_eq!(run.status, status);
+            assert_eq!(run.session_id.as_deref(), Some("sess"));
+            assert!(run.ended_at.is_some());
+        }
+        for status in [RunStatus::Queued, RunStatus::Running, RunStatus::Hibernated] {
+            assert!(!status.has_ended(), "{status:?}");
+        }
+        let running = store.start_run(&start_params("PROJ-2")).unwrap();
+        assert_eq!(
+            store.finish_keeping_status(running, &done).unwrap(),
+            RunStatus::Done
+        );
+        assert!(matches!(
+            store.finish_keeping_status(999, &done),
+            Err(RunStoreError::RunNotFound(999))
+        ));
     }
 
     #[test]

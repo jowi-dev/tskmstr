@@ -137,7 +137,7 @@ pub fn launch_record(store: &RunStore, run_id: i64) -> Result<Option<LaunchRecor
 }
 
 /// The launch windows of tmux session `session_name` whose run has ended
-/// (`review`, `done`, `failed`, `interrupted`): open windows with nothing
+/// ([`RunStatus::has_ended`]): open windows with nothing
 /// running in them, which [`crate::work::interactive::resolve_action_window`]
 /// lets a new action open beside (GitHub issue #150). A window name decides
 /// by its newest run, so a name reused by a still-running run is not ended.
@@ -162,7 +162,7 @@ pub fn ended_launch_windows(
         if seen.contains(&record.window) {
             continue;
         }
-        if run.status.is_terminal() || run.status == RunStatus::Review {
+        if run.status.has_ended() {
             ended.push(record.window.clone());
         }
         seen.push(record.window);
