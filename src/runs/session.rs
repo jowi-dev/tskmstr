@@ -476,6 +476,54 @@ pub fn finish_session(
     Ok(Some(run_id))
 }
 
+/// Removes every marker in `dir` that names `run_id`, returning how many
+/// were removed.
+///
+/// For a supervisor that finishes a session's run itself (`tm merge`'s
+/// conflict sessions, GitHub issue #156): with the marker gone, the
+/// session's later SessionEnd hook finds nothing to finish, so whichever of
+/// the two ends the run first wins and the other is a no-op. Without it the
+/// hook would still find the marker and overwrite the supervisor's
+/// `failed` with `done`.
+///
+/// A missing `dir` means no session ever registered, so it is `Ok(0)`, not
+/// an error. Markers whose contents don't parse are left alone, as are
+/// markers naming other runs.
+///
+/// # Errors
+///
+/// [`SessionError::ReadMarker`] if `dir` exists but cannot be listed;
+/// [`SessionError::RemoveMarker`] if a matching marker cannot be removed
+/// for any reason other than it already being gone.
+pub fn remove_markers_for_run(dir: &Path, run_id: i64) -> Result<usize, SessionError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(SessionError::ReadMarker {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if read_marker(&path) != Some(run_id) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            // The session's own hook got there first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(SessionError::RemoveMarker { path, source }),
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,6 +1209,33 @@ mod tests {
 
         assert_eq!(result, None);
         assert!(markers_dir.path().join("sess-1").exists());
+    }
+
+    // --- remove_markers_for_run ---
+
+    #[test]
+    fn remove_markers_for_run_removes_only_markers_naming_the_run() {
+        let markers_dir = tempdir().unwrap();
+        let dir = markers_dir.path();
+        std::fs::write(dir.join("sess-a"), "7").unwrap();
+        std::fs::write(dir.join("sess-b"), "8").unwrap();
+        std::fs::write(dir.join("sess-c"), "garbage").unwrap();
+
+        let removed = remove_markers_for_run(dir, 7).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!dir.join("sess-a").exists());
+        assert!(dir.join("sess-b").exists());
+        assert!(dir.join("sess-c").exists());
+    }
+
+    #[test]
+    fn remove_markers_for_run_is_a_noop_without_a_sessions_dir() {
+        let parent = tempdir().unwrap();
+
+        let removed = remove_markers_for_run(&parent.path().join("missing"), 7).unwrap();
+
+        assert_eq!(removed, 0);
     }
 
     #[test]
