@@ -568,6 +568,161 @@ pub fn apply_usage_gate(
     }
 }
 
+/// Proof that a launch passed admission (GitHub issue #149). Only this
+/// module can make one, and every builder of an agent command line takes
+/// one: [`AgentRunner::build_invocation`],
+/// [`AgentRunner::interactive_shell_command`] and
+/// [`crate::agent::ResumeSpec::command_line`]. So a new launch path cannot
+/// start an agent without going through [`AdmissionGate`], and the
+/// `admitted_is_only_constructed_by_admission` guard test in
+/// `src/agent/mod.rs` keeps it that way.
+///
+/// The usage probe ([`SpawnUsageProber`]) is part of admission itself and
+/// is built without one.
+#[derive(Debug)]
+pub struct Admitted(());
+
+impl Admitted {
+    /// An `Admitted` for tests that build command lines directly.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Admitted(())
+    }
+}
+
+/// The launch admission is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchRequest<'a> {
+    /// The run kind the launch records, e.g. `lane` or `audit`; one of
+    /// [`crate::runs::AGENT_KINDS`].
+    pub kind: &'a str,
+    /// The agent that will run, `AgentRunner::name()`.
+    pub agent: &'a str,
+    /// The repo key the run is stamped with.
+    pub repo: &'a str,
+}
+
+/// Why [`AdmissionGate`] refused a launch.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionError {
+    /// Over the memory budget, or under memory pressure.
+    #[error(transparent)]
+    Memory(#[from] AdmissionRefusal),
+    /// Over a usage ceiling, enforced.
+    #[error(transparent)]
+    Usage(#[from] UsageRefusal),
+    /// The run store couldn't be read.
+    #[error(transparent)]
+    Store(#[from] RunStoreError),
+}
+
+impl AdmissionError {
+    /// `memory`, `usage` or `store`: the reason an `admission_wait` or
+    /// `admission_timeout` run event names.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            AdmissionError::Memory(_) => "memory",
+            AdmissionError::Usage(_) => "usage",
+            AdmissionError::Store(_) => "store",
+        }
+    }
+}
+
+/// How often an unattended launch rechecks admission while it waits.
+pub const ADMISSION_RECHECK_SECS: u64 = 30;
+
+/// The one admission step every agent launch goes through (GitHub issue
+/// #149): the memory check ([`check_memory_admission`]) and then the usage
+/// check ([`check_usage_admission`]).
+pub struct AdmissionGate<'a> {
+    /// Where running agents, peaks and usage snapshots are read.
+    pub store: &'a RunStore,
+    /// The merged `[work]` memory settings.
+    pub memory: &'a MemoryConfig,
+    /// Every runner's usage settings.
+    pub usage: &'a crate::config::UsageConfig,
+    /// Refreshes a stale usage snapshot.
+    pub prober: &'a dyn UsageProber,
+    /// Reads the kernel's memory pressure.
+    pub pressure: &'a dyn Fn() -> MemoryPressure,
+    /// The usage check's "now".
+    pub clock: &'a dyn crate::work::review_watch::Clock,
+}
+
+impl AdmissionGate<'_> {
+    /// Runs both checks once. A memory refusal always refuses; a usage
+    /// refusal refuses in [`UsageGateMode::Enforce`] and is written to
+    /// `out` as a warning in [`UsageGateMode::Warn`], the way a manual `tm
+    /// work run` treats it.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, or a store error.
+    pub fn admit(
+        &self,
+        request: &LaunchRequest<'_>,
+        mode: UsageGateMode,
+        out: &mut dyn Write,
+    ) -> Result<Admitted, AdmissionError> {
+        if let Some(refusal) = check_memory_admission(
+            self.store,
+            self.memory,
+            request.kind,
+            request.agent,
+            request.repo,
+            self.pressure,
+        )? {
+            return Err(refusal.into());
+        }
+        if let Some(usage) = self.usage.for_agent(request.agent) {
+            let verdict = check_usage_admission(
+                self.store,
+                request.agent,
+                usage,
+                self.clock.now_unix_secs(),
+                self.prober,
+            )?;
+            apply_usage_gate(verdict, mode, out)?;
+        }
+        Ok(Admitted(()))
+    }
+
+    /// Admission for a launch tm starts with no human present: while
+    /// refused, wait, rechecking every [`ADMISSION_RECHECK_SECS`] through
+    /// `sleeper`, for up to `max_wait_mins` minutes. `on_wait` is called
+    /// once, with the first refusal, when the wait starts, so the caller
+    /// can record an `admission_wait` event. Usage is enforced.
+    ///
+    /// # Errors
+    ///
+    /// The last refusal once the wait gives up, or a store error at once.
+    pub fn admit_waiting(
+        &self,
+        request: &LaunchRequest<'_>,
+        sleeper: &dyn crate::work::review_watch::Sleeper,
+        max_wait_mins: u64,
+        on_wait: &mut dyn FnMut(&AdmissionError),
+    ) -> Result<Admitted, AdmissionError> {
+        let max_wait_secs = max_wait_mins * 60;
+        let mut waited = 0u64;
+        loop {
+            match self.admit(request, UsageGateMode::Enforce, &mut std::io::sink()) {
+                Err(err @ (AdmissionError::Memory(_) | AdmissionError::Usage(_))) => {
+                    if waited == 0 {
+                        on_wait(&err);
+                    }
+                    if waited >= max_wait_secs {
+                        return Err(err);
+                    }
+                    sleeper.sleep(ADMISSION_RECHECK_SECS);
+                    waited += ADMISSION_RECHECK_SECS;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +1088,278 @@ mod kind_tests {
         let running = running_agent_estimate(&store, &budget(100)).unwrap();
 
         assert_eq!(running, RunningEstimate { count: 0, bytes: 0 });
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use crate::config::UsageConfig;
+    use crate::runs::footprint::GIB;
+    use crate::runs::{FinishRun, RunStatus, StartRun};
+    use crate::work::review_watch::{Clock, Sleeper};
+    use tempfile::tempdir;
+
+    const NOW: i64 = 1_000_000;
+
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now_unix_secs(&self) -> i64 {
+            NOW
+        }
+    }
+
+    struct NoProbe;
+    impl UsageProber for NoProbe {
+        fn supports(&self, _agent: &str) -> bool {
+            false
+        }
+        fn probe(&self, _agent: &str) -> Result<UsageSnapshot, String> {
+            Err("must not probe".to_string())
+        }
+    }
+
+    /// Records each sleep, and runs `on_sleep` after the `n`th one.
+    struct ScriptedSleeper<'a> {
+        slept: Cell<u64>,
+        calls: RefCell<Vec<u64>>,
+        after: usize,
+        on_sleep: Box<dyn Fn() + 'a>,
+    }
+
+    impl Sleeper for ScriptedSleeper<'_> {
+        fn sleep(&self, secs: u64) {
+            self.slept.set(self.slept.get() + secs);
+            self.calls.borrow_mut().push(secs);
+            if self.calls.borrow().len() == self.after {
+                (self.on_sleep)();
+            }
+        }
+    }
+
+    fn store(dir: &std::path::Path) -> RunStore {
+        RunStore::open(&dir.join("runs.db")).unwrap()
+    }
+
+    fn start(store: &RunStore, kind: &str) -> i64 {
+        let id = store
+            .start_run(&StartRun {
+                ticket: "PROJ-1".to_string(),
+                scope: String::new(),
+                lane: kind.to_string(),
+                worktree: "/tmp/wt".to_string(),
+                branch: None,
+                pid: None,
+                kind: kind.to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store.update_agent_repo(id, "claude", "tskmstr").unwrap();
+        id
+    }
+
+    fn finish(store: &RunStore, id: i64) {
+        store
+            .finish_run(
+                id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+    }
+
+    struct Fixture {
+        memory: MemoryConfig,
+        usage: UsageConfig,
+    }
+
+    impl Fixture {
+        fn with_budget(gb: Option<u64>) -> Self {
+            Fixture {
+                memory: MemoryConfig {
+                    budget_bytes: gb.map(|gb| gb * GIB),
+                    default_lane_estimate_bytes: 2 * GIB,
+                },
+                usage: UsageConfig::default(),
+            }
+        }
+
+        fn gate<'a>(&'a self, store: &'a RunStore) -> AdmissionGate<'a> {
+            AdmissionGate {
+                store,
+                memory: &self.memory,
+                usage: &self.usage,
+                prober: &NoProbe,
+                pressure: &|| MemoryPressure::Normal,
+                clock: &FixedClock,
+            }
+        }
+    }
+
+    fn review_round() -> LaunchRequest<'static> {
+        LaunchRequest {
+            kind: "auto-review",
+            agent: "claude",
+            repo: "tskmstr",
+        }
+    }
+
+    #[test]
+    fn a_human_launch_over_the_memory_budget_is_refused_with_the_work_run_message() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        start(&store, "lane");
+        let fixture = Fixture::with_budget(Some(2));
+        let mut out = Vec::new();
+
+        let err = fixture
+            .gate(&store)
+            .admit(&review_round(), UsageGateMode::Warn, &mut out)
+            .unwrap_err();
+
+        assert_eq!(err.reason(), "memory");
+        assert_eq!(
+            err.to_string(),
+            "not launching: memory budget exceeded: tskmstr/claude auto-review runs have no \
+             recorded peak, assuming ~1.0 GB; 1 running (~2.0 GB); budget 2.0 GB"
+        );
+    }
+
+    #[test]
+    fn a_human_launch_over_the_usage_limit_warns_and_is_admitted() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .set_agent_exhausted_until("claude", NOW + 600)
+            .unwrap();
+        let fixture = Fixture::with_budget(None);
+        let mut out = Vec::new();
+
+        let admitted = fixture
+            .gate(&store)
+            .admit(&review_round(), UsageGateMode::Warn, &mut out);
+
+        assert!(admitted.is_ok());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: not launching: claude usage window exhausted, reopens in 10m \
+             (launching anyway)\n"
+        );
+    }
+
+    #[test]
+    fn an_enforced_launch_over_the_usage_limit_is_refused() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .set_agent_exhausted_until("claude", NOW + 600)
+            .unwrap();
+        let fixture = Fixture::with_budget(None);
+
+        let err = fixture
+            .gate(&store)
+            .admit(&review_round(), UsageGateMode::Enforce, &mut Vec::new())
+            .unwrap_err();
+
+        assert_eq!(err.reason(), "usage");
+    }
+
+    #[test]
+    fn with_no_budget_and_no_refusal_a_launch_is_admitted_silently() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        for _ in 0..20 {
+            start(&store, "lane");
+        }
+        let fixture = Fixture::with_budget(None);
+        let mut out = Vec::new();
+
+        let admitted =
+            fixture
+                .gate(&store)
+                .admit(&review_round(), UsageGateMode::Enforce, &mut out);
+
+        assert!(admitted.is_ok());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_admitted_wait_never_sleeps_or_reports() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let fixture = Fixture::with_budget(Some(10));
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 0,
+            on_sleep: Box::new(|| {}),
+        };
+        let mut waits = Vec::new();
+
+        let admitted = fixture.gate(&store).admit_waiting(
+            &review_round(),
+            &sleeper,
+            60,
+            &mut |err: &AdmissionError| waits.push(err.reason()),
+        );
+
+        assert!(admitted.is_ok());
+        assert!(sleeper.calls.borrow().is_empty());
+        assert!(waits.is_empty());
+    }
+
+    #[test]
+    fn a_refused_unattended_launch_waits_then_starts_once_a_run_finishes() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let lane = start(&store, "lane");
+        let fixture = Fixture::with_budget(Some(2));
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 3,
+            on_sleep: Box::new(|| finish(&store, lane)),
+        };
+        let mut waits = Vec::new();
+
+        let admitted = fixture.gate(&store).admit_waiting(
+            &review_round(),
+            &sleeper,
+            60,
+            &mut |err: &AdmissionError| waits.push(err.reason()),
+        );
+
+        assert!(admitted.is_ok());
+        assert_eq!(*sleeper.calls.borrow(), vec![30, 30, 30]);
+        assert_eq!(waits, vec!["memory"], "reported once, when the wait starts");
+    }
+
+    #[test]
+    fn a_wait_that_nothing_frees_gives_up_after_the_configured_minutes() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .set_agent_exhausted_until("claude", NOW + 99_999)
+            .unwrap();
+        let fixture = Fixture::with_budget(None);
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 0,
+            on_sleep: Box::new(|| {}),
+        };
+
+        let err = fixture
+            .gate(&store)
+            .admit_waiting(&review_round(), &sleeper, 2, &mut |_: &AdmissionError| {})
+            .unwrap_err();
+
+        assert_eq!(err.reason(), "usage");
+        assert_eq!(sleeper.slept.get(), 120, "2 minutes of 30-second rechecks");
     }
 }
 
