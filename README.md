@@ -1207,7 +1207,10 @@ runs finish` is kept, and a marker written up to two minutes after that
 still counts. Until the marker appears, the row stays `running` and
 counts toward `max_lanes`. If the session ends first, or the row stays
 ended past those two minutes, the awaiter stops and leaves the row
-alone. Pass `--headless` as well to get the old
+alone. Every dispatch tick restarts the awaiter of a live lane that lost
+its own (a failed spawn, a crash, a reboot while the lane was
+hibernated), from the `<wt>-<ts>.await.json` state file kept beside the
+run's log until the awaiter finishes. Pass `--headless` as well to get the old
 supervisor-driven `claude -p` run.
 
 ```toml

@@ -511,6 +511,22 @@ impl tskmstr::cli::dispatch::ScopeTicker for RealScopeTicker<'_> {
             memory: &config.work.memory,
             usage: &config.usage,
         };
+        // Before launching: an unattended lane that lost its awaiter would
+        // never finish, and keeps its `max_lanes` slot meanwhile.
+        match tskmstr::work::lane_await::revive_awaiters(
+            self.store,
+            scope,
+            &tskmstr::work::detach::RealDetachSpawner,
+            &self.current_exe,
+            &tskmstr::runs::pid::pid_alive,
+        ) {
+            Ok(revived) => {
+                for run_id in revived {
+                    eprintln!("{scope}: restarted the lane awaiter of run {run_id}");
+                }
+            }
+            Err(err) => eprintln!("{scope}: could not restart lane awaiters: {err}"),
+        }
         tskmstr::work::dispatch::tick(&deps, &cfg).map_err(|err| err.to_string())
     }
 }
@@ -977,11 +993,11 @@ fn run_work(
                 clock: &tskmstr::work::run::SystemClock,
                 watch_armer: tail.watch_armer(full_config.as_ref()),
                 review_starter: Some(&tail.review_starter),
-                pid: std::process::id(),
             };
             tskmstr::cli::work::await_lane(&deps, &state, &mut stdout)?;
-            // One-shot handoff, like `__supervise`'s state file; on a crash
-            // it survives for debugging.
+            // Removed once the awaiter is done with it. On a crash it
+            // survives, and the next dispatch tick restarts the awaiter
+            // from it (`lane_await::revive_awaiters`).
             let _ = std::fs::remove_file(&state_file);
         }
         WorkCmd::Hooks { cmd } => match cmd {
@@ -2979,6 +2995,15 @@ impl AutopilotTicker {
             memory: &config.work.memory,
             usage: &config.usage,
         };
+        // As `tm dispatch tick` does; best-effort, with no terminal to
+        // report to under the TUI.
+        let _ = tskmstr::work::lane_await::revive_awaiters(
+            &store,
+            &scope,
+            &tskmstr::work::detach::RealDetachSpawner,
+            &launcher.program,
+            &tskmstr::runs::pid::pid_alive,
+        );
         Ok(dispatch::tick(&deps, &cfg)?)
     }
 }

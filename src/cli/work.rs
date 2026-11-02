@@ -660,10 +660,13 @@ pub fn run(
 /// --unattended`; GitHub issue #184) is prepared with a
 /// [`crate::work::run::PreparedRun::done_marker`]. Once its window is
 /// launched, a detached `tm work __await-lane` is spawned through
-/// `deps.detach` with a [`crate::work::detach::SupervisorState`] state file:
-/// it waits for the marker and finishes the row, since the agent stays at
-/// its prompt and the SessionEnd hook would only fire when someone exits
-/// the session. Its output goes to the run's log, recorded on the row.
+/// `deps.detach` with a [`crate::work::detach::SupervisorState`] state file
+/// written before the launch: it waits for the marker and finishes the row,
+/// since the agent stays at its prompt and the SessionEnd hook would only
+/// fire when someone exits the session. Its output goes to the run's log,
+/// recorded on the row. A failed spawn is printed rather than returned,
+/// since the agent is already running; the dispatcher's tick restarts the
+/// awaiter ([`crate::work::lane_await::revive_awaiters`]).
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     ctx: &WorkContext<'_>,
@@ -697,6 +700,12 @@ fn run_interactive(
         .run_store
         .update_tmux_session(prepared.run_id, &target.session_name)?;
 
+    // The awaiter's state file goes down before the window, so a launched
+    // lane always has one for `revive_awaiters` to restart from.
+    let awaiter = match prepared.done_marker {
+        Some(_) => Some(write_lane_awaiter_state(deps, paths, &prepared)?),
+        None => None,
+    };
     let prompt_path = paths.state_dir.join(format!(
         "{}-{}.prompt.md",
         prepared.wt_name, prepared.timestamp
@@ -710,8 +719,23 @@ fn run_interactive(
             resume: run_deps.runner.resume_spec(&prepared.invocation),
         },
     )?;
-    if prepared.done_marker.is_some() {
-        spawn_lane_awaiter(deps, paths, &prepared)?;
+    // The agent is already working, so a failed spawn is reported, not
+    // returned: the next dispatch tick restarts the awaiter.
+    if let Some((state_path, log_path)) = &awaiter
+        && let Err(err) = crate::work::lane_await::spawn_awaiter(
+            deps.run_store,
+            deps.detach,
+            deps.current_exe,
+            prepared.run_id,
+            state_path,
+            &prepared.worktree,
+            log_path,
+        )
+    {
+        writeln!(
+            out,
+            "awaiter   not started ({err}); the next dispatch tick restarts it"
+        )?;
     }
 
     writeln!(
@@ -735,36 +759,28 @@ fn run_interactive(
     Ok(true)
 }
 
-/// Spawns the detached `tm work __await-lane` for an unattended interactive
-/// lane (GitHub issue #184; see [`run_interactive`]): records the run's log
-/// path on its row, writes the awaiter's state file next to it, and spawns
-/// the awaiter with its output appended to that log.
-fn spawn_lane_awaiter(
+/// Prepares an unattended interactive lane's awaiter (GitHub issue #184;
+/// see [`run_interactive`]): records the run's log path on its row and
+/// writes the awaiter's state file beside it
+/// ([`crate::work::lane_await::await_state_path`]). Returns the state file
+/// and log paths to spawn the awaiter with.
+fn write_lane_awaiter_state(
     deps: &RunDeps<'_>,
     paths: &crate::work::run::RunLanePaths,
     prepared: &crate::work::run::PreparedRun,
-) -> Result<(), WorkCliError> {
+) -> Result<(PathBuf, PathBuf), WorkCliError> {
     std::fs::create_dir_all(&paths.state_dir)?;
     let log_path =
         crate::work::run::run_log_path(&paths.state_dir, &prepared.wt_name, &prepared.timestamp);
     deps.run_store
         .update_log_path(prepared.run_id, &log_path.to_string_lossy())?;
-    let state_path = paths.state_dir.join(format!(
-        "{}-{}.await.json",
-        prepared.wt_name, prepared.timestamp
-    ));
+    let state_path = crate::work::lane_await::await_state_path(&log_path);
     let state = crate::work::detach::SupervisorState {
         prepared: prepared.clone(),
         run_db_path: deps.run_db_path.to_path_buf(),
     };
     std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-    deps.detach.spawn_detached(
-        deps.current_exe,
-        &crate::work::detach::await_lane_argv(&state_path),
-        &prepared.worktree,
-        &log_path,
-    )?;
-    Ok(())
+    Ok((state_path, log_path))
 }
 
 /// `tm work __supervise --state-file <path>`: the detached run's re-exec'd
@@ -3041,8 +3057,12 @@ mod tests {
         assert!(printed.contains("attach:   tmux attach -t tm-proj-proj-1"));
     }
 
-    #[test]
-    fn run_interactive_with_done_signal_spawns_the_lane_awaiter() {
+    /// An unattended interactive `tm work run` with `detach` as its
+    /// spawner: the temp dir, the run store, whether it succeeded and what
+    /// it printed.
+    fn unattended_interactive_run(
+        detach: &dyn crate::work::detach::DetachSpawner,
+    ) -> (TempDir, RunStore, bool, String) {
         let (tmp, home, repo_root, _prompt_path) = run_setup();
         let mut lanes = BTreeMap::new();
         lanes.insert(
@@ -3067,7 +3087,6 @@ mod tests {
         let spawner = FakeProcessSpawner::success(canned_claude_json());
         let run_store = RunStore::open(&tmp.path().join("runs.db")).unwrap();
         let clock = FakeClock((2026, 8, 6, 9, 5, 3));
-        let detach = FakeDetachSpawner::new(9999);
         let current_exe = PathBuf::from("/usr/local/bin/tm");
         let run_db_path = tmp.path().join("runs.db");
         let deps = RunDeps {
@@ -3075,7 +3094,7 @@ mod tests {
             spawner: &spawner,
             run_store: &run_store,
             clock: &clock,
-            detach: &detach,
+            detach,
             current_exe: &current_exe,
             run_db_path: &run_db_path,
             ticket_provider: None,
@@ -3111,8 +3130,21 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            spawner.recorded.lock().unwrap().is_empty(),
+            "the agent runs in the window, not headless"
+        );
+        (tmp, run_store, succeeded, out_string(&out))
+    }
+
+    #[test]
+    fn run_interactive_with_done_signal_spawns_the_lane_awaiter() {
+        let detach = FakeDetachSpawner::new(9999);
+        let current_exe = PathBuf::from("/usr/local/bin/tm");
+        let (tmp, run_store, succeeded, printed) = unattended_interactive_run(&detach);
+        let run_db_path = tmp.path().join("runs.db");
+
         assert!(succeeded);
-        assert!(spawner.recorded.lock().unwrap().is_empty());
         let state_dir = tmp.path().join("home/.local/state/tskmstr/work");
         let state_path = state_dir.join("proj-1-20260806-090503.await.json");
         let recorded = detach.recorded.lock().unwrap();
@@ -3138,13 +3170,58 @@ mod tests {
             run_row.log_path.as_deref(),
             Some(recorded[0].log_path.to_string_lossy()).as_deref()
         );
+        let pids: Vec<_> = run_store
+            .events_for_run(run_row.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == crate::work::lane_await::LANE_AWAIT_PID_EVENT)
+            .map(|event| event.detail)
+            .collect();
+        assert_eq!(pids, vec![Some("9999".to_string())]);
 
-        let printed = out_string(&out);
         assert!(
             printed.contains(&format!("awaiting  {}", marker.display())),
             "{printed}"
         );
         assert!(printed.contains("window    tm-proj-proj-1:work"));
+    }
+
+    /// A [`crate::work::detach::DetachSpawner`] whose every spawn fails.
+    struct FailingDetach;
+
+    impl crate::work::detach::DetachSpawner for FailingDetach {
+        fn spawn_detached(
+            &self,
+            _program: &Path,
+            _argv: &[String],
+            _working_dir: &Path,
+            _log_path: &Path,
+        ) -> Result<u32, crate::work::detach::DetachError> {
+            Err(crate::work::detach::DetachError::Spawn {
+                program: "tm".to_string(),
+                message: "fork failed".to_string(),
+            })
+        }
+    }
+
+    /// The agent is already working in its window when the awaiter spawn
+    /// fails, so the launch still succeeds, and the state file is left for
+    /// the dispatcher's tick to restart the awaiter from.
+    #[test]
+    fn a_failed_awaiter_spawn_is_reported_and_leaves_the_state_file() {
+        let (tmp, run_store, succeeded, printed) = unattended_interactive_run(&FailingDetach);
+
+        assert!(succeeded);
+        assert!(
+            printed.contains("awaiter   not started") && printed.contains("fork failed"),
+            "{printed}"
+        );
+        let state_path = tmp
+            .path()
+            .join("home/.local/state/tskmstr/work/proj-1-20260806-090503.await.json");
+        assert!(state_path.exists());
+        let run_row = &run_store.all_runs().unwrap()[0];
+        assert_eq!(run_row.status, RunStatus::Running);
     }
 
     #[test]

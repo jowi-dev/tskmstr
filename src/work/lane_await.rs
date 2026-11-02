@@ -10,16 +10,23 @@
 //! run row and runs the same post-PR tail the headless supervisor does
 //! (`crate::work::run::supervise_run`): `status_on_pr`, `tm pr watch` and,
 //! under autopilot, `tm review auto`.
+//!
+//! The awaiter is the only thing that finishes such a lane, so the
+//! dispatcher's tick restarts a lost one ([`revive_awaiters`]): a failed
+//! spawn, an awaiter that exited on an error, or one a reboot killed while
+//! its lane was hibernated. Its state file stays beside the run's log until
+//! the awaiter finishes, which is what makes that possible.
 
 use std::cell::Cell;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::github::gh_cli::GhCli;
 use crate::runs::{FinishRun, RunStatus, RunStore, RunStoreError};
 use crate::ticketing::provider::TicketProvider;
+use crate::work::detach::{DetachError, DetachSpawner, await_lane_argv};
 use crate::work::review_watch::Sleeper;
 use crate::work::run::{
     AutoReviewStarter, Clock, PreparedRun, RunLaneError, WatchArmer, apply_status_on_pr,
@@ -30,9 +37,9 @@ use crate::work::signal::{
 };
 use crate::work::tmux::{TmuxError, TmuxOps};
 
-/// Event kind [`await_lane`] records on the lane's run row when it starts,
-/// its detail the awaiter's own pid. The row's pid is its agent's, so this
-/// is the only record of which process is waiting on the lane.
+/// Event kind [`spawn_awaiter`] records on the lane's run row, its detail
+/// the spawned awaiter's pid. The row's pid is its agent's, so this is the
+/// only record of which process is waiting on the lane.
 pub const LANE_AWAIT_PID_EVENT: &str = "lane_await_pid";
 
 /// Event kind [`await_lane`] records on the lane's run row when it stops
@@ -93,8 +100,6 @@ pub struct AwaitLaneDeps<'a> {
     pub watch_armer: Option<&'a dyn WatchArmer>,
     /// Starts `tm review auto` when the scope's autopilot flag is on.
     pub review_starter: Option<&'a dyn AutoReviewStarter>,
-    /// The awaiter's own pid, recorded as [`LANE_AWAIT_PID_EVENT`].
-    pub pid: u32,
 }
 
 /// How [`await_lane`] stopped waiting.
@@ -134,8 +139,7 @@ pub enum AwaitLaneError {
 /// Waits for an unattended interactive lane's done marker, then finishes
 /// its run row (GitHub issue #184).
 ///
-/// Records [`LANE_AWAIT_PID_EVENT`] first, then polls the marker with no
-/// timeout: an autopilot lane has no deadline, and its row stays `running`
+/// Polls the marker with no timeout: an autopilot lane has no deadline, and its row stays `running`
 /// (counting toward `max_lanes`) until the marker, the row ending, or the
 /// session going away (see [`LaneWatch`]). On the marker the row is
 /// finished `done`, or `blocked` with [`NO_PR_BLOCKER`] for
@@ -153,9 +157,6 @@ pub fn await_lane(
     let Some(marker) = prepared.done_marker.as_deref() else {
         return Err(AwaitLaneError::NoDoneMarker(run_id));
     };
-    deps.run_store
-        .add_event(run_id, LANE_AWAIT_PID_EVENT, Some(&deps.pid.to_string()))?;
-
     let watch = LaneWatch {
         deps,
         ended_since: Cell::new(None),
@@ -220,6 +221,104 @@ pub fn await_lane(
         out,
     )?;
     Ok(AwaitOutcome::Done { succeeded })
+}
+
+/// Errors from [`spawn_awaiter`] and [`revive_awaiters`].
+#[derive(Debug, Error)]
+pub enum SpawnAwaiterError {
+    /// Reading or writing the run store failed.
+    #[error(transparent)]
+    RunStore(#[from] RunStoreError),
+    /// Spawning the awaiter failed.
+    #[error(transparent)]
+    Detach(#[from] DetachError),
+}
+
+/// Where an unattended lane's awaiter state file lives: beside the run's
+/// log, `<wt>-<ts>.await.json` for `<wt>-<ts>.log`.
+pub fn await_state_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("await.json")
+}
+
+/// Spawns a detached `tm work __await-lane` over `state_path` for lane run
+/// `run_id`, its output appended to `log_path`, and records the spawned
+/// pid as [`LANE_AWAIT_PID_EVENT`]. Recording at spawn time, not from the
+/// awaiter, means [`revive_awaiters`] never sees a just-spawned awaiter as
+/// missing.
+pub fn spawn_awaiter(
+    run_store: &RunStore,
+    detach: &dyn DetachSpawner,
+    current_exe: &Path,
+    run_id: i64,
+    state_path: &Path,
+    working_dir: &Path,
+    log_path: &Path,
+) -> Result<u32, SpawnAwaiterError> {
+    let pid = detach.spawn_detached(
+        current_exe,
+        &await_lane_argv(state_path),
+        working_dir,
+        log_path,
+    )?;
+    run_store.add_event(run_id, LANE_AWAIT_PID_EVENT, Some(&pid.to_string()))?;
+    Ok(pid)
+}
+
+/// Restarts the awaiter of every unattended interactive lane in `scope`
+/// that has lost its own, returning the revived run ids. A lane qualifies
+/// when its row is still `running`, `queued` or `hibernated`, its awaiter
+/// state file ([`await_state_path`]) is still there, it has no
+/// [`LANE_DONE_EVENT`], and the pid of its newest [`LANE_AWAIT_PID_EVENT`]
+/// is not `alive` (or it has none). The dispatcher's tick runs this before
+/// launching anything.
+pub fn revive_awaiters(
+    run_store: &RunStore,
+    scope: &str,
+    detach: &dyn DetachSpawner,
+    current_exe: &Path,
+    alive: &dyn Fn(u32) -> bool,
+) -> Result<Vec<i64>, SpawnAwaiterError> {
+    let mut revived = Vec::new();
+    for run in run_store.all_runs()? {
+        let live = matches!(
+            run.status,
+            RunStatus::Running | RunStatus::Queued | RunStatus::Hibernated
+        );
+        if run.kind != "lane" || run.scope != scope || !live {
+            continue;
+        }
+        let Some(log_path) = run.log_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        let state_path = await_state_path(log_path);
+        if !state_path.exists() {
+            continue;
+        }
+        let events = run_store.events_for_run(run.id)?;
+        if events.iter().any(|event| event.kind == LANE_DONE_EVENT) {
+            continue;
+        }
+        let awaiter_alive = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == LANE_AWAIT_PID_EVENT)
+            .and_then(|event| event.detail.as_deref()?.parse::<u32>().ok())
+            .is_some_and(alive);
+        if awaiter_alive {
+            continue;
+        }
+        spawn_awaiter(
+            run_store,
+            detach,
+            current_exe,
+            run.id,
+            &state_path,
+            Path::new(&run.worktree),
+            log_path,
+        )?;
+        revived.push(run.id);
+    }
+    Ok(revived)
 }
 
 /// The [`StepWatch`] [`await_lane`] polls through.
@@ -290,6 +389,7 @@ mod tests {
     use crate::jira::fake::FakeJiraClient;
     use crate::runs::StartRun;
     use crate::ticketing::types::{Issue, IssueFields, Status, StatusCategory, Transition};
+    use crate::work::detach::{FakeDetachSpawner, RecordedDetach};
     use crate::work::tmux::FakeTmuxOps;
 
     const PR_URL: &str = "https://github.com/example/repo/pull/7";
@@ -487,7 +587,6 @@ mod tests {
             clock: &TickingClock::new(),
             watch_armer: Some(&armer),
             review_starter: Some(&starter),
-            pid: 4242,
         };
         let mut out = Vec::new();
         let outcome = await_lane(&deps, &fx.prepared, &mut out).unwrap();
@@ -542,10 +641,6 @@ mod tests {
         );
         assert_eq!(got.armed, vec!["ABC-123".to_string()]);
         assert!(got.reviewed.is_empty(), "autopilot is off for the scope");
-        assert_eq!(
-            events(&fx.store, fx.prepared.run_id, LANE_AWAIT_PID_EVENT),
-            vec![Some("4242".to_string())]
-        );
         assert_eq!(
             events(&fx.store, fx.prepared.run_id, LANE_DONE_EVENT),
             vec![Some("succeeded".to_string())]
@@ -701,12 +796,162 @@ mod tests {
             clock: &TickingClock::new(),
             watch_armer: None,
             review_starter: None,
-            pid: 1,
         };
 
         let err = await_lane(&deps, &fx.prepared, &mut Vec::new()).unwrap_err();
 
         assert!(matches!(err, AwaitLaneError::NoDoneMarker(id) if id == fx.prepared.run_id));
+    }
+
+    /// A lane row with an awaiter state file beside its log, as
+    /// `tm work run --unattended` leaves it.
+    fn awaited_lane(fx: &Fixture) -> (PathBuf, PathBuf) {
+        let log = fx._tmp.path().join("abc-123-20260806-090503.log");
+        fx.store
+            .update_log_path(fx.prepared.run_id, &log.to_string_lossy())
+            .unwrap();
+        let state = await_state_path(&log);
+        std::fs::write(&state, "{}").unwrap();
+        (log, state)
+    }
+
+    fn revive(fx: &Fixture, alive: &dyn Fn(u32) -> bool) -> (Vec<i64>, Vec<RecordedDetach>) {
+        let detach = FakeDetachSpawner::new(5150);
+        let revived = revive_awaiters(
+            &fx.store,
+            SCOPE,
+            &detach,
+            Path::new("/usr/local/bin/tm"),
+            alive,
+        )
+        .unwrap();
+        (revived, detach.recorded.into_inner().unwrap())
+    }
+
+    #[test]
+    fn await_state_path_sits_beside_the_log() {
+        assert_eq!(
+            await_state_path(Path::new("/state/abc-123-20260806-090503.log")),
+            PathBuf::from("/state/abc-123-20260806-090503.await.json")
+        );
+    }
+
+    #[test]
+    fn spawn_awaiter_records_the_spawned_pid() {
+        let fx = fixture();
+        let (log, state) = awaited_lane(&fx);
+        let detach = FakeDetachSpawner::new(5150);
+
+        let pid = spawn_awaiter(
+            &fx.store,
+            &detach,
+            Path::new("/usr/local/bin/tm"),
+            fx.prepared.run_id,
+            &state,
+            Path::new("/wt/abc-123"),
+            &log,
+        )
+        .unwrap();
+
+        assert_eq!(pid, 5150);
+        let recorded = detach.recorded.into_inner().unwrap();
+        assert_eq!(recorded[0].argv, await_lane_argv(&state));
+        assert_eq!(recorded[0].log_path, log);
+        assert_eq!(
+            events(&fx.store, fx.prepared.run_id, LANE_AWAIT_PID_EVENT),
+            vec![Some("5150".to_string())]
+        );
+    }
+
+    #[test]
+    fn revive_respawns_a_lane_whose_awaiter_is_dead_or_was_never_spawned() {
+        let fx = fixture();
+        let (log, state) = awaited_lane(&fx);
+        fx.store
+            .add_event(fx.prepared.run_id, LANE_AWAIT_PID_EVENT, Some("77"))
+            .unwrap();
+
+        let (revived, recorded) = revive(&fx, &|_| false);
+
+        assert_eq!(revived, vec![fx.prepared.run_id]);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].argv, await_lane_argv(&state));
+        assert_eq!(recorded[0].log_path, log);
+        assert_eq!(recorded[0].working_dir, PathBuf::from("/wt/abc-123"));
+        assert_eq!(
+            events(&fx.store, fx.prepared.run_id, LANE_AWAIT_PID_EVENT),
+            vec![Some("77".to_string()), Some("5150".to_string())]
+        );
+    }
+
+    #[test]
+    fn revive_covers_a_hibernated_lane() {
+        let fx = fixture();
+        awaited_lane(&fx);
+        assert!(fx.store.hibernate_run(fx.prepared.run_id).unwrap());
+
+        let (revived, _) = revive(&fx, &|_| false);
+
+        assert_eq!(revived, vec![fx.prepared.run_id]);
+    }
+
+    #[test]
+    fn revive_leaves_a_live_awaiter_alone() {
+        let fx = fixture();
+        awaited_lane(&fx);
+        fx.store
+            .add_event(fx.prepared.run_id, LANE_AWAIT_PID_EVENT, Some("77"))
+            .unwrap();
+
+        let (revived, recorded) = revive(&fx, &|pid| pid == 77);
+
+        assert!(revived.is_empty());
+        assert!(recorded.is_empty());
+    }
+
+    #[test]
+    fn revive_skips_lanes_that_are_done_ended_unawaited_or_in_another_scope() {
+        // Done: the awaiter already stopped.
+        let fx = fixture();
+        awaited_lane(&fx);
+        fx.store
+            .add_event(fx.prepared.run_id, LANE_DONE_EVENT, Some("succeeded"))
+            .unwrap();
+        assert!(revive(&fx, &|_| false).0.is_empty(), "lane_done");
+
+        // Ended row.
+        let fx = fixture();
+        awaited_lane(&fx);
+        fx.store
+            .finish_run(
+                fx.prepared.run_id,
+                &FinishRun {
+                    status: RunStatus::Done,
+                    ..FinishRun::default()
+                },
+            )
+            .unwrap();
+        assert!(revive(&fx, &|_| false).0.is_empty(), "ended");
+
+        // No state file: a headless lane, or an attended one.
+        let fx = fixture();
+        let (_, state) = awaited_lane(&fx);
+        std::fs::remove_file(state).unwrap();
+        assert!(revive(&fx, &|_| false).0.is_empty(), "no state file");
+
+        // Another scope.
+        let fx = fixture();
+        awaited_lane(&fx);
+        let detach = FakeDetachSpawner::new(1);
+        let revived = revive_awaiters(
+            &fx.store,
+            "jira:other",
+            &detach,
+            Path::new("/usr/local/bin/tm"),
+            &|_| false,
+        )
+        .unwrap();
+        assert!(revived.is_empty(), "other scope");
     }
 
     #[test]
