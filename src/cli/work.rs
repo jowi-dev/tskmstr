@@ -2127,7 +2127,9 @@ mod tests {
                     dir: "/wt/proj-1".to_string(),
                     window_name: "work".to_string(),
                     env: Vec::new(),
-                    command: format!("'/usr/local/bin/tm' runs logs {run_id} --follow"),
+                    command: format!(
+                        "'/usr/local/bin/tm' runs logs {run_id} --follow --transcript"
+                    ),
                 },
                 TmuxCall::NewWindow {
                     name: "tm-proj-proj-1".to_string(),
@@ -3631,7 +3633,10 @@ mod tests {
         assert_eq!(window_name, "work");
         assert_eq!(
             command,
-            format!("'/usr/local/bin/tm' runs logs {} --follow", run_row.id),
+            format!(
+                "'/usr/local/bin/tm' runs logs {} --follow --transcript",
+                run_row.id
+            ),
             "the window must follow the log, not host claude"
         );
         assert!(

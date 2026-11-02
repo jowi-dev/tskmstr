@@ -2753,6 +2753,7 @@ fn run_runs(
             kind,
             tail,
             follow,
+            transcript,
         }) => {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -2766,6 +2767,7 @@ fn run_runs(
                 kind.as_deref(),
                 tail,
                 follow,
+                transcript,
                 &sleeper,
                 &mut stdout,
             )?;

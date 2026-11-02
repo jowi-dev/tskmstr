@@ -232,7 +232,7 @@ tm auth status
 | `tm runs register --kind <KIND> <KEY>` | Adopt (or start) a run for `<KEY>` under `<KIND>`, for a skill invoked directly rather than through `tm ticket audit`/`create` (no-op if `CLAUDE_CODE_SESSION_ID` is unset) |
 | `tm runs watch` | Live kanban board of every run, polling the local run db; `s` attaches to a run's session, `f`/`F` filter by kind/scope, and `Tab` switches to `tm overview` |
 | `tm overview` | Cross-project attention queue: one row per ticket with a run, most urgent first, under a per-project counts strip; `c` toggles lifecycle columns, `s` attaches, `v`/`L` show the run detail/log, `B` opens `tm board` for the row's repo in a new tmux window, `V`/`F`/`M`/`Space` review, fix and merge in the row's own repo, `Tab` switches to `tm runs watch` |
-| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file |
+| `tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]` | Print (`--tail`, default 200 lines) or follow (`--follow`, like `tail -f`) a run's detached-process log file; `--transcript` adds the agent's messages and tool calls |
 | `tm runs scrollback <KEY> [--window <NAME>]` | List a ticket's archived tmux scrollback (one line per window: captured-at, window, file), or print one window's newest archive. Written by `tm merge` and `tm work clean` just before they kill the ticket's session; see "Archived scrollback" below |
 | `tm work new <name> [branch] [--from base]` | Provision a lane's worktree (if missing) and start/attach its tmux session |
 | `tm work remove <name>` | Kill the worktree's tmux session (if any) and remove the worktree |
@@ -631,7 +631,7 @@ terminal, which for a detached run is gone the moment its launching shell
 closes. A permanent `gh` failure during that resolution (see below) fails
 the run outright, and that failure is logged here too before it propagates.
 
-`tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow]`
+`tm runs logs <ticket-or-run-id> [--kind <KIND>] [--tail <N>] [--follow] [--transcript]`
 resolves a run the same way `tm runs reopen` does (numeric row id, or ticket
 key optionally disambiguated with `--kind`) and prints its log:
 
@@ -639,7 +639,16 @@ key optionally disambiguated with `--kind`) and prints its log:
 tm runs logs AX-408                    # last 200 lines
 tm runs logs AX-408 --kind review-watch --tail 500
 tm runs logs AX-408 --follow           # like tail -f
+tm runs logs AX-408 --follow --transcript  # plus the agent's tool calls
 ```
+
+A headless run's log holds only tm's own status lines; everything the agent
+does goes to its output stream, the `.json` file beside the log (or the
+run's recorded transcript once it has finished). `--transcript` prints that
+stream too, one readable line per message or tool call (`→ Bash cargo
+test`, `✗ tool error: ...`, `result: ...`), rendered by the run's agent
+adapter. Without `--follow` it prints the last `--tail` rendered lines
+after the log tail; a stream that doesn't exist yet prints nothing extra.
 
 Runs started before the `log_path` column existed have it as `NULL`; for
 `kind = review-watch` specifically, `tm runs logs` falls back to the same
@@ -1530,7 +1539,8 @@ Binding it to a window would make `tmux kill-session` (or a reboot) silently
 kill a run mid-flight.
 
 So a headless run gets a window too, but a **viewer**: it runs
-`tm runs logs <id> --follow` and owns nothing. Kill it, or kill the whole
+`tm runs logs <id> --follow --transcript`, which shows the agent's messages
+and tool calls as they happen, and owns nothing. Kill it, or kill the whole
 session, and the run carries on. If tmux is unavailable the viewer is simply
 skipped, reported as a `window none` line — the run is unaffected either way.
 

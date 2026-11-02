@@ -1241,8 +1241,57 @@ fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
     Ok((buf, len))
 }
 
-/// `tm runs logs <ticket-or-run-id> [--kind <kind>] [--tail <N>] [--follow]`:
-/// print (or follow) a run's detached-process log file.
+/// Where `run`'s agent output stream lives, for `tm runs logs
+/// --transcript` (GitHub issue #184): its recorded `transcript` column when
+/// set (a headless lane records it only at finish), else `log_path` with its
+/// `.log` extension swapped for `.json`. A headless lane names both files
+/// from one `<wt>-<ts>` stem ([`crate::work::run::run_log_path`] and
+/// `PreparedRun::out_json_path`), so that sibling is the stream a running
+/// lane is still writing. `None` when neither applies.
+fn transcript_path(transcript: Option<&str>, log_path: &Path) -> Option<std::path::PathBuf> {
+    match transcript {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => (log_path.extension()? == "log").then(|| log_path.with_extension("json")),
+    }
+}
+
+/// The runner that wrote a run's output stream, from the row's `agent`
+/// column; the default runner when it's unrecorded or names no known agent,
+/// the same default an absent `[agent]` table resolves to.
+fn runner_for_agent(agent: Option<&str>) -> &'static dyn AgentRunner {
+    let kind = agent
+        .and_then(crate::config::AgentKind::parse)
+        .unwrap_or_default();
+    crate::agent::routing::runner_for(kind)
+}
+
+/// Appends `appended` to `pending` and drains every complete (newline
+/// terminated) line from it, leaving any trailing partial line in
+/// `pending` for the next call. A followed stream can be read mid-write,
+/// and half a JSON line renders as nothing, so `tm runs logs --follow
+/// --transcript` only renders a line once its newline has landed.
+fn split_complete_lines(pending: &mut String, appended: &str) -> Vec<String> {
+    pending.push_str(appended);
+    let Some(last_newline) = pending.rfind('\n') else {
+        return Vec::new();
+    };
+    let rest = pending.split_off(last_newline + 1);
+    let complete = std::mem::replace(pending, rest);
+    complete.lines().map(str::to_string).collect()
+}
+
+/// Renders stream `lines` through `runner`'s
+/// [`AgentRunner::progress_lines`].
+fn render_progress(runner: &dyn AgentRunner, lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| runner.progress_lines(line))
+        .collect()
+}
+
+/// `tm runs logs <ticket-or-run-id> [--kind <kind>] [--tail <N>] [--follow]
+/// [--transcript]`: print (or follow) a run's detached-process log file,
+/// and with `transcript` the agent's own output stream too.
 ///
 /// Resolves `ticket_or_id`/`kind` via [`resolve_run`] (same rules as `tm
 /// runs reopen`), then the log path via [`resolve_log_path`] — the recorded
@@ -1261,12 +1310,22 @@ fn read_appended(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
 ///   `Ok`, unless `--follow` is set, in which case it keeps watching for
 ///   content to appear.
 ///
-/// `--follow`'s live loop is real (`sleeper.sleep`/re-reading the file
+/// `transcript` (GitHub issue #184) adds the agent's output stream at
+/// [`transcript_path`], each line rendered through the run's runner's
+/// [`AgentRunner::progress_lines`]: for a headless run, tm's log holds only
+/// its own status lines and the agent's messages and tool calls are all in
+/// that stream. After the log tail it prints the last `tail` rendered
+/// lines. A stream that doesn't exist yet prints nothing rather than
+/// erroring, since a run may not have produced output; under `--follow` it
+/// is polled for until it appears. The headless viewer window runs this
+/// with `--follow --transcript` (`crate::work::viewer::viewer_command`).
+///
+/// `--follow`'s live loop is real (`sleeper.sleep`/re-reading the files
 /// forever) and, like [`crate::work::detach::RealDetachSpawner`]'s actual
 /// process spawn, is not itself unit-tested — only the pure pieces it's
-/// built from ([`read_appended`], [`tail_lines`]) are. It never returns on
-/// its own; the caller (a real terminal) is expected to Ctrl-C out, same as
-/// `tail -f`.
+/// built from ([`read_appended`], [`tail_lines`], [`split_complete_lines`])
+/// are. It never returns on its own; the caller (a real terminal) is
+/// expected to Ctrl-C out, same as `tail -f`.
 #[allow(clippy::too_many_arguments)]
 pub fn logs(
     store: &RunStore,
@@ -1276,6 +1335,7 @@ pub fn logs(
     kind: Option<&str>,
     tail: usize,
     follow: bool,
+    transcript: bool,
     sleeper: &dyn crate::work::review_watch::Sleeper,
     out: &mut dyn Write,
 ) -> Result<(), RunsCliError> {
@@ -1301,11 +1361,29 @@ pub fn logs(
             run.id,
             run.ticket
         )?;
-        if !follow {
-            return Ok(());
-        }
     } else {
         for line in tail_lines(&content, tail) {
+            writeln!(out, "{line}")?;
+        }
+    }
+
+    // The agent's stream, when asked for: its path, its runner, how far it
+    // has been read, and the partial line a mid-write read left behind.
+    let stream = if transcript {
+        transcript_path(run.transcript.as_deref(), &path)
+            .map(|stream_path| (stream_path, runner_for_agent(run.agent.as_deref())))
+    } else {
+        None
+    };
+    let mut stream_offset = 0;
+    let mut pending = String::new();
+    if let Some((stream_path, runner)) = &stream
+        && let Ok(bytes) = std::fs::read(stream_path)
+    {
+        stream_offset = bytes.len() as u64;
+        let lines = split_complete_lines(&mut pending, &String::from_utf8_lossy(&bytes));
+        let rendered = render_progress(*runner, &lines);
+        for line in &rendered[rendered.len().saturating_sub(tail)..] {
             writeln!(out, "{line}")?;
         }
     }
@@ -1317,6 +1395,17 @@ pub fn logs(
             if !appended.is_empty() {
                 write!(out, "{appended}")?;
                 offset = new_offset;
+            }
+            // A stream not written yet, or read mid-way through a multibyte
+            // character, is skipped this tick and retried on the next.
+            if let Some((stream_path, runner)) = &stream
+                && let Ok((appended, new_offset)) = read_appended(stream_path, stream_offset)
+            {
+                stream_offset = new_offset;
+                for line in render_progress(*runner, &split_complete_lines(&mut pending, &appended))
+                {
+                    writeln!(out, "{line}")?;
+                }
             }
         }
     }
@@ -3939,6 +4028,7 @@ mod tests {
             None,
             2,
             false,
+            false,
             &NoopSleeper,
             &mut out,
         )
@@ -3973,6 +4063,7 @@ mod tests {
             None,
             200,
             false,
+            false,
             &NoopSleeper,
             &mut out,
         )
@@ -4003,6 +4094,7 @@ mod tests {
             "ax-408",
             None,
             200,
+            false,
             false,
             &NoopSleeper,
             &mut out,
@@ -4037,6 +4129,7 @@ mod tests {
             None,
             200,
             false,
+            false,
             &NoopSleeper,
             &mut out,
         )
@@ -4065,12 +4158,158 @@ mod tests {
             None,
             200,
             false,
+            false,
             &NoopSleeper,
             &mut out,
         )
         .expect_err("should fail");
 
         assert!(matches!(err, RunsCliError::LogFileMissing { .. }));
+    }
+
+    /// One claude stream-json assistant line carrying a text block, for
+    /// the `--transcript` tests below.
+    fn assistant_text_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    /// A lane row whose log is `<dir>/wt-1.log` holding `log`, with the
+    /// sibling `wt-1.json` holding `transcript` when given, driven by
+    /// `agent`.
+    fn lane_with_transcript(
+        dir: &Path,
+        store: &RunStore,
+        log: &str,
+        transcript: Option<&str>,
+        agent: &str,
+    ) {
+        let log_file = dir.join("wt-1.log");
+        std::fs::write(&log_file, log).unwrap();
+        if let Some(transcript) = transcript {
+            std::fs::write(dir.join("wt-1.json"), transcript).unwrap();
+        }
+        let id = store
+            .start_run(&StartRun {
+                log_path: Some(log_file.to_string_lossy().into_owned()),
+                ..start_params("PROJ-1")
+            })
+            .unwrap();
+        store.update_agent_repo(id, agent, "repo").unwrap();
+    }
+
+    fn logs_output(dir: &Path, store: &RunStore, tail: usize, transcript: bool) -> String {
+        let mut out = Vec::new();
+        logs(
+            store,
+            None,
+            dir,
+            "proj-1",
+            None,
+            tail,
+            false,
+            transcript,
+            &NoopSleeper,
+            &mut out,
+        )
+        .expect("should succeed");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn logs_with_transcript_prints_the_log_tail_then_the_rendered_transcript_tail() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let stream = format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            assistant_text_line("first"),
+            assistant_text_line("second"),
+            assistant_text_line("third"),
+        );
+        lane_with_transcript(dir.path(), &store, "a\nb\nc\n", Some(&stream), "claude");
+
+        assert_eq!(
+            logs_output(dir.path(), &store, 2, true),
+            "b\nc\nsecond\nthird\n"
+        );
+    }
+
+    #[test]
+    fn logs_without_transcript_ignores_the_agent_stream() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let stream = format!("{}\n", assistant_text_line("hidden"));
+        lane_with_transcript(dir.path(), &store, "a\n", Some(&stream), "claude");
+
+        assert_eq!(logs_output(dir.path(), &store, 200, false), "a\n");
+    }
+
+    #[test]
+    fn logs_with_transcript_prints_nothing_extra_when_the_stream_is_missing() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        lane_with_transcript(dir.path(), &store, "a\n", None, "claude");
+
+        assert_eq!(logs_output(dir.path(), &store, 200, true), "a\n");
+    }
+
+    #[test]
+    fn logs_with_transcript_still_shows_the_stream_when_the_log_is_empty() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let stream = format!("{}\n", assistant_text_line("working"));
+        lane_with_transcript(dir.path(), &store, "", Some(&stream), "claude");
+
+        let printed = logs_output(dir.path(), &store, 200, true);
+        assert!(printed.contains("is empty"), "got: {printed:?}");
+        assert!(printed.ends_with("working\n"), "got: {printed:?}");
+    }
+
+    #[test]
+    fn transcript_path_prefers_the_recorded_transcript_column() {
+        assert_eq!(
+            transcript_path(Some("/state/x.jsonl"), Path::new("/state/wt-1.log")),
+            Some(std::path::PathBuf::from("/state/x.jsonl"))
+        );
+    }
+
+    #[test]
+    fn transcript_path_swaps_the_log_extension_for_json() {
+        assert_eq!(
+            transcript_path(None, Path::new("/state/gh-1-20261102-144757.log")),
+            Some(std::path::PathBuf::from("/state/gh-1-20261102-144757.json"))
+        );
+        assert_eq!(transcript_path(None, Path::new("/state/watch")), None);
+    }
+
+    #[test]
+    fn runner_for_agent_parses_the_row_agent_and_falls_back_to_the_default() {
+        assert_eq!(runner_for_agent(Some("opencode")).name(), "opencode");
+        assert_eq!(runner_for_agent(Some("claude")).name(), "claude");
+        let default = crate::agent::routing::runner_for(crate::config::AgentKind::default());
+        assert_eq!(runner_for_agent(Some("nonsense")).name(), default.name());
+        assert_eq!(runner_for_agent(None).name(), default.name());
+    }
+
+    #[test]
+    fn split_complete_lines_buffers_a_trailing_partial_line() {
+        let mut pending = String::new();
+        assert_eq!(
+            split_complete_lines(&mut pending, "one\ntw"),
+            vec!["one".to_string()]
+        );
+        assert_eq!(pending, "tw");
+        assert!(split_complete_lines(&mut pending, "o-and-a-bit").is_empty());
+        assert_eq!(
+            split_complete_lines(&mut pending, "\nthree\n"),
+            vec!["two-and-a-bit".to_string(), "three".to_string()]
+        );
+        assert_eq!(pending, "");
+        assert!(split_complete_lines(&mut pending, "").is_empty());
     }
 
     #[test]

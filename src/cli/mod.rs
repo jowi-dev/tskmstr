@@ -1163,7 +1163,8 @@ pub enum RunsCmd {
     },
     /// Live board of lane runs (polls the local run db).
     Watch,
-    /// Print (or follow) a run's detached-process log file.
+    /// Print (or follow) a run's detached-process log file, and with
+    /// `--transcript` the agent's own output stream.
     ///
     /// Falls back to the by-convention path for `kind = "review-watch"` when
     /// the run has no recorded `log_path` (every run started before that
@@ -1183,6 +1184,12 @@ pub enum RunsCmd {
         /// Keep printing new lines as they're appended, like `tail -f`.
         #[arg(long)]
         follow: bool,
+        /// Also show the agent's own output stream, rendered readably
+        /// through its runner (one line per message or tool call). For a
+        /// headless run that is where the tool calls and messages are; the
+        /// log holds only tm's status lines.
+        #[arg(long)]
+        transcript: bool,
     },
 }
 
