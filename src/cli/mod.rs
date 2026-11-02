@@ -397,13 +397,16 @@ pub enum ReviewCmd {
     },
     /// Run thatch auto-review rounds over KEY's PR branch.
     ///
-    /// Each round reviews the branch headlessly (`thatch-code-review`, then
-    /// `thatch-review-followup`), writes the confirmed findings into the
-    /// worktree's vdiff comment store, and runs `tm review fix` when any
-    /// finding is at or above `[work.auto_review].fix_threshold`. Stops when
-    /// a round is clean, or flags the ticket for review at
-    /// `max_review_rounds`. Detaches by default, logging to
-    /// `~/.local/state/tskmstr/auto-review/<key>.log`.
+    /// Each round is an interactive review (`thatch-code-review`, then
+    /// `thatch-review-followup`) in a `review` window of the ticket's
+    /// `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed
+    /// findings go into the worktree's vdiff comment store, and any finding
+    /// at or above `[work.auto_review].fix_threshold` starts an interactive
+    /// `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for
+    /// each step's signal file for up to `round_timeout_mins` and leaves the
+    /// windows open. Stops when a round is clean, or flags the round for
+    /// review at `max_review_rounds` or when a step never signals. Detaches
+    /// by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`.
     Auto {
         /// Ticket key whose lane-run worktree to review, e.g. `GH-124`
         /// (case-insensitive).
