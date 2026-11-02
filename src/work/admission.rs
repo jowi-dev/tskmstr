@@ -719,6 +719,137 @@ impl AdmissionGate<'_> {
     }
 }
 
+/// Run event recorded when an unattended launch starts waiting for
+/// admission. Its detail is `<reason>: <refusal>`, the reason being
+/// `memory` or `usage`.
+pub const ADMISSION_WAIT_EVENT: &str = "admission_wait";
+
+/// Run event recorded when an unattended launch gives up waiting, after
+/// `[work] admission_wait_mins`. Same detail shape as
+/// [`ADMISSION_WAIT_EVENT`].
+pub const ADMISSION_TIMEOUT_EVENT: &str = "admission_timeout";
+
+/// Who started a launch, which decides what a refusal does (GitHub issue
+/// #149).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchOrigin {
+    /// A human chose to launch: a memory refusal refuses, a usage refusal
+    /// warns and launches, like a manual `tm work run`.
+    Human,
+    /// tm launched with nobody present: wait while refused (see
+    /// [`AdmissionGate::admit_waiting`]), recording
+    /// [`ADMISSION_WAIT_EVENT`] and, on giving up,
+    /// [`ADMISSION_TIMEOUT_EVENT`] on `event_run` when there is one.
+    Unattended {
+        /// The run row the wait is recorded on.
+        event_run: Option<i64>,
+    },
+}
+
+/// Everything a launch path needs for admission besides the run store and
+/// clock it already has, bundled so each path's deps carry one field.
+#[derive(Clone, Copy)]
+pub struct AdmissionDeps<'a> {
+    /// The merged `[work]` memory settings.
+    pub memory: &'a MemoryConfig,
+    /// Every runner's usage settings.
+    pub usage: &'a crate::config::UsageConfig,
+    /// Refreshes a stale usage snapshot; production passes a
+    /// [`SpawnUsageProber`].
+    pub prober: &'a dyn UsageProber,
+    /// Reads the kernel's memory pressure; production passes
+    /// [`crate::runs::footprint::memory_pressure`].
+    pub pressure: &'a dyn Fn() -> MemoryPressure,
+    /// Waits between rechecks of an unattended launch.
+    pub sleeper: &'a dyn crate::work::review_watch::Sleeper,
+}
+
+impl AdmissionDeps<'_> {
+    /// Admission with no budget, the default usage settings, and a prober
+    /// that never probes: every launch is admitted unless a test seeds a
+    /// usage refusal.
+    #[cfg(test)]
+    pub fn off() -> AdmissionDeps<'static> {
+        struct NeverProbe;
+        impl UsageProber for NeverProbe {
+            fn supports(&self, _agent: &str) -> bool {
+                false
+            }
+            fn probe(&self, agent: &str) -> Result<UsageSnapshot, String> {
+                Err(format!("{agent} is never probed in tests"))
+            }
+        }
+        struct NoSleep;
+        impl crate::work::review_watch::Sleeper for NoSleep {
+            fn sleep(&self, _secs: u64) {}
+        }
+        AdmissionDeps {
+            memory: Box::leak(Box::new(MemoryConfig::default())),
+            usage: Box::leak(Box::new(crate::config::UsageConfig::default())),
+            prober: &NeverProbe,
+            pressure: &|| MemoryPressure::Normal,
+            sleeper: &NoSleep,
+        }
+    }
+
+    /// [`AdmissionDeps::off`] with a memory budget of `budget_bytes`.
+    #[cfg(test)]
+    pub fn with_budget(budget_bytes: u64) -> AdmissionDeps<'static> {
+        AdmissionDeps {
+            memory: Box::leak(Box::new(MemoryConfig {
+                budget_bytes: Some(budget_bytes),
+                ..MemoryConfig::default()
+            })),
+            ..AdmissionDeps::off()
+        }
+    }
+
+    /// Admits `request` the way `origin` calls for. See [`LaunchOrigin`].
+    /// Wait events are best-effort: failing to record one never blocks or
+    /// fails the launch.
+    ///
+    /// # Errors
+    ///
+    /// The refusal ([`LaunchOrigin::Human`]) or the last refusal once the
+    /// wait gave up ([`LaunchOrigin::Unattended`]), or a store error.
+    pub fn admit(
+        &self,
+        store: &RunStore,
+        now: &dyn Fn() -> i64,
+        request: &LaunchRequest<'_>,
+        origin: LaunchOrigin,
+        out: &mut dyn Write,
+    ) -> Result<Admitted, AdmissionError> {
+        let gate = AdmissionGate {
+            store,
+            memory: self.memory,
+            usage: self.usage,
+            prober: self.prober,
+            pressure: self.pressure,
+            now,
+        };
+        let LaunchOrigin::Unattended { event_run } = origin else {
+            return gate.admit(request, UsageGateMode::Warn, out);
+        };
+        let record = |kind: &str, err: &AdmissionError| {
+            if let Some(run_id) = event_run {
+                let detail = format!("{}: {err}", err.reason());
+                let _ = store.add_event(run_id, kind, Some(&detail));
+            }
+        };
+        let result = gate.admit_waiting(
+            request,
+            self.sleeper,
+            self.memory.admission_wait_mins,
+            &mut |err| record(ADMISSION_WAIT_EVENT, err),
+        );
+        if let Err(err @ (AdmissionError::Memory(_) | AdmissionError::Usage(_))) = &result {
+            record(ADMISSION_TIMEOUT_EVENT, err);
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,6 +1483,144 @@ mod gate_tests {
 
         assert_eq!(err.reason(), "usage");
         assert_eq!(sleeper.slept.get(), 120, "2 minutes of 30-second rechecks");
+    }
+
+    fn events(store: &RunStore, run_id: i64) -> Vec<(String, Option<String>)> {
+        store
+            .events_for_run(run_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.detail))
+            .collect()
+    }
+
+    #[test]
+    fn an_unattended_launch_records_a_wait_event_on_the_event_run_and_starts_once_admitted() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let lane = start(&store, "lane");
+        let fixture = Fixture::with_budget(Some(2));
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 1,
+            on_sleep: Box::new(|| finish(&store, lane)),
+        };
+        let deps = AdmissionDeps {
+            memory: &fixture.memory,
+            usage: &fixture.usage,
+            prober: &NoProbe,
+            pressure: &|| MemoryPressure::Normal,
+            sleeper: &sleeper,
+        };
+
+        let admitted = deps.admit(
+            &store,
+            &|| NOW,
+            &review_round(),
+            LaunchOrigin::Unattended {
+                event_run: Some(lane),
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(admitted.is_ok());
+        let events = events(&store, lane);
+        let wait: Vec<_> = events
+            .iter()
+            .filter(|(kind, _)| kind == ADMISSION_WAIT_EVENT)
+            .collect();
+        assert_eq!(wait.len(), 1, "{events:?}");
+        assert!(
+            wait[0]
+                .1
+                .as_deref()
+                .unwrap()
+                .starts_with("memory: not launching"),
+            "{wait:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(kind, _)| kind == ADMISSION_TIMEOUT_EVENT),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_unattended_launch_that_times_out_records_a_timeout_event() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        let lane = start(&store, "lane");
+        store
+            .set_agent_exhausted_until("claude", NOW + 99_999)
+            .unwrap();
+        let mut fixture = Fixture::with_budget(None);
+        fixture.memory.admission_wait_mins = 1;
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 0,
+            on_sleep: Box::new(|| {}),
+        };
+        let deps = AdmissionDeps {
+            memory: &fixture.memory,
+            usage: &fixture.usage,
+            prober: &NoProbe,
+            pressure: &|| MemoryPressure::Normal,
+            sleeper: &sleeper,
+        };
+
+        let err = deps
+            .admit(
+                &store,
+                &|| NOW,
+                &review_round(),
+                LaunchOrigin::Unattended {
+                    event_run: Some(lane),
+                },
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.reason(), "usage");
+        assert_eq!(sleeper.slept.get(), 60);
+        let kinds: Vec<String> = events(&store, lane).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, vec![ADMISSION_WAIT_EVENT, ADMISSION_TIMEOUT_EVENT]);
+    }
+
+    #[test]
+    fn a_human_launch_never_waits() {
+        let dir = tempdir().unwrap();
+        let store = store(dir.path());
+        start(&store, "lane");
+        let fixture = Fixture::with_budget(Some(1));
+        let sleeper = ScriptedSleeper {
+            slept: Cell::new(0),
+            calls: RefCell::new(Vec::new()),
+            after: 0,
+            on_sleep: Box::new(|| {}),
+        };
+        let deps = AdmissionDeps {
+            memory: &fixture.memory,
+            usage: &fixture.usage,
+            prober: &NoProbe,
+            pressure: &|| MemoryPressure::Normal,
+            sleeper: &sleeper,
+        };
+
+        let err = deps
+            .admit(
+                &store,
+                &|| NOW,
+                &review_round(),
+                LaunchOrigin::Human,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.reason(), "memory");
+        assert_eq!(sleeper.slept.get(), 0);
     }
 }
 
