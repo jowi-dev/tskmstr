@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::RunningLane;
+use super::RunningAgent;
 use super::cpu::CpuSampler;
 use super::footprint::{MemoryPressure, format_bytes};
 
@@ -58,7 +58,7 @@ pub struct SlotUse {
 /// `now`) and summed latest footprint. Memory is `None` when lanes run but
 /// none has a footprint sample; lanes without one are left out of the sum.
 pub fn lane_totals(
-    lanes: &[RunningLane],
+    lanes: &[RunningAgent],
     sampler: &mut CpuSampler,
     now: Instant,
     cpu_time: &dyn Fn(u32) -> Option<Duration>,
@@ -129,9 +129,10 @@ mod tests {
     use super::*;
     use crate::runs::footprint::GIB;
 
-    fn lane(id: i64, pid: Option<u32>, mem: Option<u64>) -> RunningLane {
-        RunningLane {
+    fn lane(id: i64, pid: Option<u32>, mem: Option<u64>) -> RunningAgent {
+        RunningAgent {
             id,
+            kind: "lane".to_string(),
             agent: None,
             repo: None,
             mem_peak_bytes: mem,
