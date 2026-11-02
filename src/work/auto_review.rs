@@ -159,10 +159,86 @@ pub fn findings_path(git_dir: &Path, round: u32) -> PathBuf {
         .join(format!("findings-{round}.json"))
 }
 
+/// Reads a round's findings file if it is ready: `None` while it is
+/// missing or does not parse yet, so a half-written file reads as "not
+/// done" rather than as a failure (GitHub issue #150).
+pub fn try_read_findings(path: &Path) -> Option<Vec<Finding>> {
+    read_findings(path).ok()
+}
+
+/// Where round `round`'s fix pass writes its completion marker:
+/// `<git_dir>/vdiff/auto-review/fix-<round>.done`, next to the findings
+/// files (GitHub issue #150). It holds `{"succeeded": true}` or
+/// `{"succeeded": false}`; see [`read_fix_marker`].
+pub fn fix_marker_path(git_dir: &Path, round: u32) -> PathBuf {
+    git_dir
+        .join("vdiff")
+        .join("auto-review")
+        .join(format!("fix-{round}.done"))
+}
+
+#[derive(Deserialize)]
+struct FixMarker {
+    succeeded: bool,
+}
+
+/// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
+/// exists and parses, `None` before then.
+pub fn read_fix_marker(path: &Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<FixMarker>(&raw)
+        .ok()
+        .map(|marker| marker.succeeded)
+}
+
+/// The temporary name an agent writes a signal file under before renaming
+/// it into place.
+fn temporary_name(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// The section tm appends to every review round's prompt, whatever the
+/// template says: the loop waits for `findings_file`, so the agent writes
+/// it last, under a temporary name, and renames it into place.
+pub fn review_completion_section(findings_file: &Path) -> String {
+    let tmp = temporary_name(findings_file);
+    format!(
+        "\n\n## Completion signal\n\n\
+         tm is waiting for `{file}` to know this round is done. Once the \
+         review is complete, write the findings JSON array (`[]` when there \
+         are none) to `{tmp}` first, then rename it into place with `mv \
+         '{tmp}' '{file}'`, so tm never reads a half-written file. Write it \
+         even if the review is clean. Then stop and leave this session open.\n",
+        file = findings_file.display(),
+        tmp = tmp.display(),
+    )
+}
+
+/// The section tm appends to an auto-review fix pass's prompt: the loop
+/// waits for `marker` ([`fix_marker_path`]), written last under a
+/// temporary name and renamed into place.
+pub fn fix_completion_section(marker: &Path) -> String {
+    let tmp = temporary_name(marker);
+    format!(
+        "\n\n## Completion signal\n\n\
+         tm is waiting for `{file}` to know this fix pass is done. Once every \
+         comment is addressed and committed, write `{{\"succeeded\": true}}` \
+         to `{tmp}`, or `{{\"succeeded\": false}}` if you could not fix \
+         them, then rename it into place with `mv '{tmp}' '{file}'`, so tm \
+         never reads a half-written file. Then stop and leave this session \
+         open.\n",
+        file = marker.display(),
+        tmp = tmp.display(),
+    )
+}
+
 /// Renders a round's prompt from `template`, replacing `{key}`, `{round}`,
 /// `{skill}`, `{findings_file}`, `{archive}` (empty on round 1) and
 /// `{prior}` (a sentence pointing a follow-up round at `archive`, empty on
-/// round 1).
+/// round 1), then appends [`review_completion_section`], so a custom
+/// template that never mentions the findings file still signals.
 pub fn render_prompt(
     template: &str,
     key: &str,
@@ -196,6 +272,7 @@ pub fn render_prompt(
         .replace("{findings_file}", &findings_file.to_string_lossy())
         .replace("{archive}", &archive_text)
         .replace("{prior}", &prior)
+        + &review_completion_section(findings_file)
 }
 
 /// Everything [`run_loop`] needs done outside the comment store.
@@ -482,6 +559,59 @@ mod tests {
             read_findings(&tmp.path().join("nope.json")),
             Err(AutoReviewError::Findings { .. })
         ));
+    }
+
+    #[test]
+    fn render_prompt_appends_the_completion_section_even_to_a_custom_template() {
+        let findings = Path::new("/g/vdiff/auto-review/findings-1.json");
+
+        let prompt = render_prompt("Review {key} your own way.", "GH-1", 1, findings, None);
+
+        assert!(prompt.starts_with("Review GH-1 your own way."));
+        assert!(prompt.ends_with(&review_completion_section(findings)));
+        assert!(prompt.contains("/g/vdiff/auto-review/findings-1.json.tmp"));
+    }
+
+    #[test]
+    fn the_fix_completion_section_names_the_marker_and_its_temporary_name() {
+        let marker = fix_marker_path(Path::new("/g"), 2);
+        assert_eq!(marker, Path::new("/g/vdiff/auto-review/fix-2.done"));
+
+        let section = fix_completion_section(&marker);
+
+        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done.tmp`"));
+        assert!(section.contains("`/g/vdiff/auto-review/fix-2.done`"));
+        assert!(section.contains(r#"{"succeeded": true}"#));
+        assert!(section.contains(r#"{"succeeded": false}"#));
+    }
+
+    #[test]
+    fn try_read_findings_is_none_until_the_file_parses() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("findings-1.json");
+        assert_eq!(try_read_findings(&path), None);
+
+        std::fs::write(&path, "[{\"path\": \"src/a.rs\"").unwrap();
+        assert_eq!(try_read_findings(&path), None, "half-written");
+
+        std::fs::write(&path, "[]").unwrap();
+        assert_eq!(try_read_findings(&path), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_fix_marker_reads_succeeded_and_is_none_until_it_parses() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fix-1.done");
+        assert_eq!(read_fix_marker(&path), None);
+
+        std::fs::write(&path, "{\"succ").unwrap();
+        assert_eq!(read_fix_marker(&path), None);
+
+        std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
+        assert_eq!(read_fix_marker(&path), Some(false));
+
+        std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
+        assert_eq!(read_fix_marker(&path), Some(true));
     }
 
     #[test]
