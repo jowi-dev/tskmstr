@@ -803,9 +803,7 @@ impl CliAutoReviewOps<'_, '_> {
             event_run: Some(self.lane_run_id),
         }
     }
-}
 
-impl CliAutoReviewOps<'_, '_> {
     /// Records this loop's pid on `run_id`, a row it just created, for the
     /// board's `review:` badge (see [`LOOP_PID_EVENT`]).
     fn record_loop_pid(&self, run_id: i64, step: &'static str) -> Result<(), AutoReviewError> {
