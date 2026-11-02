@@ -110,14 +110,18 @@ pub const fn stage_style(stage: Stage) -> Style {
 
 /// The style for a run's `kind` badge (e.g. `audit`, `create`, `lane`).
 ///
-/// `audit` is yellow, `create` is blue, and anything else (including the
-/// default `lane`) gets the terminal's default color: `lane` runs are the
-/// common case and shouldn't compete visually with the two session kinds
-/// this badge exists to call out.
+/// `audit` is yellow, `create` is blue, `merge-conflict` is light red (the
+/// same red as [`Stage::Conflicted`], since that is the state it resolves),
+/// `setup` is magenta, and anything else (including the default `lane`)
+/// gets the terminal's default color: `lane` runs are the common case and
+/// shouldn't compete visually with the session kinds this badge exists to
+/// call out.
 pub fn kind_style(kind: &str) -> Style {
     match kind {
         "audit" => Style::new().fg(Color::Yellow),
         "create" => Style::new().fg(Color::Blue),
+        "merge-conflict" => Style::new().fg(Color::LightRed),
+        "setup" => Style::new().fg(Color::Magenta),
         _ => Style::new(),
     }
 }
@@ -437,6 +441,18 @@ mod tests {
         assert_eq!(kind_style("create").fg, Some(Color::Blue));
         assert_eq!(kind_style("lane").fg, None);
         assert_eq!(kind_style("something-else").fg, None);
+    }
+
+    #[test]
+    fn kind_style_colors_merge_conflict_and_setup_distinctly() {
+        assert_eq!(kind_style("merge-conflict").fg, Some(Color::LightRed));
+        assert_eq!(kind_style("setup").fg, Some(Color::Magenta));
+        let session_kinds = ["audit", "create", "merge-conflict", "setup"];
+        for (i, a) in session_kinds.iter().enumerate() {
+            for b in &session_kinds[i + 1..] {
+                assert_ne!(kind_style(a), kind_style(b), "{a} vs {b}");
+            }
+        }
     }
 
     #[test]
