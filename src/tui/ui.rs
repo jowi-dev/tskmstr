@@ -2385,6 +2385,7 @@ mod tests {
                         "PROJ-3",
                         Readiness::Blocked {
                             blocker_keys: vec!["PROJ-9".to_string()],
+                            via_epic: None,
                         },
                     ),
                     with("PROJ-4", Readiness::Unknown),
