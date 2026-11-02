@@ -888,12 +888,16 @@ pub fn session(
 
     let windows = ctx.tmux.list_windows()?;
     let viewer = |run_id: i64| crate::work::viewer::viewer_command(current_exe, run_id);
+    let launched = |run_id: i64| {
+        crate::work::hibernate::launch_record(store, run_id).is_ok_and(|record| record.is_some())
+    };
     let plan = crate::work::session::plan_session(
         &identity.session_slug(),
         &ticket,
         &runs,
         &windows,
         &viewer,
+        &launched,
     );
 
     if plan.windows.is_empty() {
