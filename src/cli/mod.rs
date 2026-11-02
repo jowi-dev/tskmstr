@@ -17,6 +17,7 @@ pub mod backend;
 pub mod check;
 pub mod dispatch;
 pub mod drift;
+pub mod graph;
 pub mod init;
 pub mod pr;
 pub mod ready;
@@ -130,6 +131,26 @@ pub enum Command {
         /// warnings) instead of text.
         #[arg(long, conflicts_with = "key")]
         json: bool,
+    },
+    /// Show the epic unlock graph: epics, their tickets, and which epics
+    /// unlock which (`tm ticket link A --blocks B` records that A unlocks
+    /// B).
+    ///
+    /// Prints one line per epic by default. Unlocks cycles are reported
+    /// as warnings on stderr and never change the exit code. The JSON
+    /// format is documented in docs/graph-format.md.
+    Graph {
+        /// Epic key to scope the graph to, e.g. `PROJ-12` (case-insensitive):
+        /// keeps the epics connected to it through unlocks links in either
+        /// direction, plus their children. Omit for every epic.
+        epic: Option<String>,
+        /// Print the versioned JSON document instead of text.
+        #[arg(long, conflicts_with = "mermaid")]
+        json: bool,
+        /// Print a Mermaid flowchart of the epics and unlocks links
+        /// instead of text.
+        #[arg(long)]
+        mermaid: bool,
     },
     /// Open the interactive terminal board.
     Board,
@@ -1148,6 +1169,10 @@ pub enum RunsCmd {
     /// the run has no recorded `log_path` (every run started before that
     /// column existed) -- this is what makes a `tm pr watch` cron's log
     /// viewable even though it predates this feature.
+    ///
+    /// An interactive run with no log prints its Claude Code transcript as
+    /// readable text instead, found via the recorded transcript path or the
+    /// run's session id under `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
     Logs {
         /// Jira ticket key or run row id, e.g. `PROJ-123` or `42`.
         ticket_or_id: String,
@@ -2399,6 +2424,58 @@ mod tests {
     fn parses_ready_json_conflicts_with_key() {
         Cli::try_parse_from(["tm", "ready", "proj-20", "--json"])
             .expect_err("--json is for the list form only");
+    }
+
+    #[test]
+    fn parses_graph_with_no_arguments() {
+        let cli = Cli::try_parse_from(["tm", "graph"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph {
+                epic,
+                json,
+                mermaid,
+            }) => {
+                assert!(epic.is_none());
+                assert!(!json);
+                assert!(!mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_epic_with_json() {
+        let cli = Cli::try_parse_from(["tm", "graph", "PROJ-1", "--json"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph {
+                epic,
+                json,
+                mermaid,
+            }) => {
+                assert_eq!(epic, Some("PROJ-1".to_string()));
+                assert!(json);
+                assert!(!mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_mermaid() {
+        let cli = Cli::try_parse_from(["tm", "graph", "--mermaid"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph { json, mermaid, .. }) => {
+                assert!(!json);
+                assert!(mermaid);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_json_conflicts_with_mermaid() {
+        Cli::try_parse_from(["tm", "graph", "--json", "--mermaid"])
+            .expect_err("--json and --mermaid pick different outputs");
     }
 
     #[test]

@@ -800,6 +800,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opencode_has_no_transcript_reader() {
+        assert!(OpencodeRunner.transcripts(Path::new("/home/u")).is_none());
+    }
+
+    #[test]
     fn opencode_has_no_usage_probe() {
         assert!(
             OpencodeRunner

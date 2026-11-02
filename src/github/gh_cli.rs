@@ -622,6 +622,22 @@ pub trait GhCli {
         numbers: &[u64],
     ) -> Result<HashMap<u64, Vec<IssueRef>>, GhError>;
 
+    /// Fetch both dependency sides of [`GhCli::issue_dependencies`] (the
+    /// issues each one is blocked by, and the issues it blocks) for every
+    /// issue in `numbers` in **one** `gh api graphql` call (one aliased
+    /// `issue(number:)` field per number, see [`issues_dependencies_query`]),
+    /// keyed by issue number. `tm graph` (GitHub issue #154) uses this to
+    /// find which epics unlock which without one call per epic. Each
+    /// result's [`IssueDependencies::parent`] is always `None`: the parent
+    /// is not fetched here (see [`GhCli::issues_parents`]). An empty
+    /// `numbers` makes no call at all. Same 100-per-side single-page limit
+    /// as [`GhCli::issue_dependencies`].
+    fn issues_dependencies(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, IssueDependencies>, GhError>;
+
     // --- Phase 6 additions (GithubProvider write path,
     // docs/plans/github-issues-backend.md) ---
 
@@ -1115,6 +1131,24 @@ fn issues_blocked_by_query(numbers: &[u64]) -> String {
         .map(|n| {
             format!(
                 "    i{n}: issue(number: {n}) {{ blockedBy(first: 100) {{ nodes {{ number title state url }} }} }}\n"
+            )
+        })
+        .collect();
+    format!(
+        "query($owner: String!, $name: String!) {{\n  repository(owner: $owner, name: $name) {{\n{fields}  }}\n}}"
+    )
+}
+
+/// Build [`GhCli::issues_dependencies`]'s batched query, aliased the same
+/// way as [`issues_blocked_by_query`] (see it for why the numbers are
+/// interpolated), each alias selecting both the `blockedBy` and `blocking`
+/// connections [`ISSUE_DEPENDENCIES_QUERY`] does.
+fn issues_dependencies_query(numbers: &[u64]) -> String {
+    let fields: String = numbers
+        .iter()
+        .map(|n| {
+            format!(
+                "    i{n}: issue(number: {n}) {{ blockedBy(first: 100) {{ nodes {{ number title state url }} }} blocking(first: 100) {{ nodes {{ number title state url }} }} }}\n"
             )
         })
         .collect();
@@ -2069,6 +2103,26 @@ impl GhCli for ShellGhCli {
             })?;
 
         interpret_issues_blocked_by_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn issues_dependencies(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, IssueDependencies>, GhError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (owner, name) = split_repo_slug(repo)?;
+        let output = graphql_command(
+            &issues_dependencies_query(numbers),
+            &[("owner", owner), ("name", name)],
+        )?;
+        interpret_issues_dependencies_output(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
@@ -3477,6 +3531,77 @@ fn interpret_issues_blocked_by_output(
     }
 }
 
+/// Raw shape of one aliased `i<number>` field in
+/// [`issues_dependencies_query`]'s response, for deserialization only.
+#[derive(Debug, Deserialize)]
+struct RawBothDependenciesIssue {
+    #[serde(rename = "blockedBy")]
+    blocked_by: RawDependencyConnection,
+    blocking: RawDependencyConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesDependenciesData {
+    repository: Option<HashMap<String, Option<RawBothDependenciesIssue>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssuesDependenciesResponse {
+    data: Option<RawIssuesDependenciesData>,
+}
+
+/// Interpret the result of a `gh api graphql ...` invocation running
+/// [`issues_dependencies_query`], keyed by the issue number parsed back out
+/// of each `i<number>` alias, with [`IssueDependencies::parent`] left
+/// `None`. A null aliased issue is a [`GhError::Parse`] naming it, for the
+/// same reason as [`interpret_issues_blocked_by_output`]: an empty entry
+/// would read as "no dependencies".
+fn interpret_issues_dependencies_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<HashMap<u64, IssueDependencies>, GhError> {
+    let parse_err = |message: String| GhError::Parse {
+        command: "gh api graphql".to_string(),
+        message,
+    };
+    match exit_code {
+        Some(0) => {
+            let response = serde_json::from_str::<RawIssuesDependenciesResponse>(stdout)
+                .map_err(|err| parse_err(err.to_string()))?;
+            let repository = response
+                .data
+                .and_then(|data| data.repository)
+                .ok_or_else(|| parse_err("repository not found".to_string()))?;
+            repository
+                .into_iter()
+                .map(|(alias, issue)| {
+                    let number = alias
+                        .strip_prefix('i')
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| parse_err(format!("unexpected alias `{alias}`")))?;
+                    let issue =
+                        issue.ok_or_else(|| parse_err(format!("issue #{number} not found")))?;
+                    let to_refs = |connection: RawDependencyConnection| {
+                        connection.nodes.into_iter().map(IssueRef::from).collect()
+                    };
+                    let deps = IssueDependencies {
+                        blocked_by: to_refs(issue.blocked_by),
+                        blocking: to_refs(issue.blocking),
+                        parent: None,
+                    };
+                    Ok((number, deps))
+                })
+                .collect()
+        }
+        code => Err(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: code,
+            stderr: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// Raw shape of one aliased `issue(number: ...) { id }` field in
 /// [`ISSUE_NODE_IDS_QUERY`]'s response, for deserialization only.
 #[derive(Debug, Deserialize)]
@@ -3860,6 +3985,13 @@ pub struct FakeGhCli {
     issues_blocked_by_error: RefCell<Option<GhError>>,
     /// Every `(repo, numbers)` passed to `issues_blocked_by`.
     issues_blocked_by_calls: RefCell<Vec<(String, Vec<u64>)>>,
+    /// Per-issue results for `issues_dependencies`; unconfigured numbers
+    /// have no dependencies.
+    issues_dependencies_results: RefCell<HashMap<u64, IssueDependencies>>,
+    /// When set, `issues_dependencies` fails with this instead.
+    issues_dependencies_error: RefCell<Option<GhError>>,
+    /// Every `(repo, numbers)` passed to `issues_dependencies`.
+    issues_dependencies_calls: RefCell<Vec<(String, Vec<u64>)>>,
     create_issue_dependency_result: RefCell<Result<(), GhError>>,
     create_issue_dependency_calls: RefCell<Vec<(String, u64, u64)>>,
     delete_issue_dependency_result: RefCell<Result<(), GhError>>,
@@ -3954,6 +4086,9 @@ impl Default for FakeGhCli {
             issues_blocked_by_results: RefCell::new(HashMap::new()),
             issues_blocked_by_error: RefCell::new(None),
             issues_blocked_by_calls: RefCell::new(Vec::new()),
+            issues_dependencies_results: RefCell::new(HashMap::new()),
+            issues_dependencies_error: RefCell::new(None),
+            issues_dependencies_calls: RefCell::new(Vec::new()),
             create_issue_dependency_result: RefCell::new(Ok(())),
             create_issue_dependency_calls: RefCell::new(Vec::new()),
             delete_issue_dependency_result: RefCell::new(Ok(())),
@@ -4360,6 +4495,29 @@ impl FakeGhCli {
         self.issues_blocked_by_calls.borrow().clone()
     }
 
+    /// Set the dependencies `issues_dependencies` reports for issue
+    /// `number`. Unconfigured numbers report none. Independent of
+    /// [`FakeGhCli::with_issue_dependencies`] (the single-issue method) and
+    /// [`FakeGhCli::with_issue_blocked_by`].
+    pub fn with_issues_dependencies(self, number: u64, deps: IssueDependencies) -> Self {
+        self.issues_dependencies_results
+            .borrow_mut()
+            .insert(number, deps);
+        self
+    }
+
+    /// Make every `issues_dependencies` call fail with `err`.
+    pub fn with_issues_dependencies_error(self, err: GhError) -> Self {
+        *self.issues_dependencies_error.borrow_mut() = Some(err);
+        self
+    }
+
+    /// The `(repo, numbers)` pairs passed to `issues_dependencies`, in call
+    /// order -- one entry per batched `gh api graphql` call.
+    pub fn issues_dependencies_calls(&self) -> Vec<(String, Vec<u64>)> {
+        self.issues_dependencies_calls.borrow().clone()
+    }
+
     /// Set the result `create_issue_dependency` will return.
     pub fn with_create_issue_dependency_result(self, result: Result<(), GhError>) -> Self {
         *self.create_issue_dependency_result.borrow_mut() = result;
@@ -4681,6 +4839,24 @@ impl GhCli for FakeGhCli {
             return Err(err);
         }
         let results = self.issues_blocked_by_results.borrow();
+        Ok(numbers
+            .iter()
+            .map(|n| (*n, results.get(n).cloned().unwrap_or_default()))
+            .collect())
+    }
+
+    fn issues_dependencies(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, IssueDependencies>, GhError> {
+        self.issues_dependencies_calls
+            .borrow_mut()
+            .push((repo.to_string(), numbers.to_vec()));
+        if let Some(err) = self.issues_dependencies_error.borrow().clone() {
+            return Err(err);
+        }
+        let results = self.issues_dependencies_results.borrow();
         Ok(numbers
             .iter()
             .map(|n| (*n, results.get(n).cloned().unwrap_or_default()))
@@ -6619,6 +6795,112 @@ mod tests {
             stderr: "boom".to_string(),
         });
         assert!(fake.issues_blocked_by("jowi-dev/tskmstr", &[3]).is_err());
+    }
+
+    // --- issues_dependencies (batched, both directions, GitHub issue #154) ---
+
+    #[test]
+    fn issues_dependencies_query_aliases_one_issue_field_per_number_with_both_sides() {
+        let query = issues_dependencies_query(&[3, 17]);
+        assert!(query.contains("i3: issue(number: 3)"), "{query}");
+        assert!(query.contains("i17: issue(number: 17)"), "{query}");
+        assert_eq!(query.matches("blockedBy(first: 100)").count(), 2);
+        assert_eq!(query.matches("blocking(first: 100)").count(), 2);
+    }
+
+    #[test]
+    fn issues_dependencies_parses_both_sides_of_each_aliased_issue() {
+        let stdout = r#"{
+            "data": {
+                "repository": {
+                    "i3": {
+                        "blockedBy": {"nodes": [
+                            {"number": 1, "title": "Provider trait", "state": "OPEN", "url": "u1"}
+                        ]},
+                        "blocking": {"nodes": []}
+                    },
+                    "i17": {
+                        "blockedBy": {"nodes": []},
+                        "blocking": {"nodes": [
+                            {"number": 20, "title": "Board", "state": "CLOSED", "url": "u20"}
+                        ]}
+                    }
+                }
+            }
+        }"#;
+        let map = interpret_issues_dependencies_output(Some(0), stdout, "").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&3].blocked_by.len(), 1);
+        assert_eq!(map[&3].blocked_by[0].number, 1);
+        assert!(map[&3].blocking.is_empty());
+        assert!(map[&17].blocked_by.is_empty());
+        assert_eq!(map[&17].blocking.len(), 1);
+        assert_eq!(map[&17].blocking[0].number, 20);
+        assert_eq!(map[&17].blocking[0].state, IssueState::Closed);
+        assert!(map[&3].parent.is_none());
+        assert!(map[&17].parent.is_none());
+    }
+
+    #[test]
+    fn issues_dependencies_null_issue_is_a_parse_error_naming_the_number() {
+        let stdout = r#"{"data": {"repository": {"i3": null}}}"#;
+        let err = interpret_issues_dependencies_output(Some(0), stdout, "").unwrap_err();
+        match err {
+            GhError::Parse { message, .. } => assert!(message.contains("#3"), "{message}"),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issues_dependencies_failure_is_a_command_error() {
+        let err = interpret_issues_dependencies_output(Some(1), "", "gh: rate limit exceeded")
+            .unwrap_err();
+        assert!(matches!(err, GhError::Command { .. }));
+    }
+
+    #[test]
+    fn shell_issues_dependencies_with_no_numbers_makes_no_call() {
+        // An empty alias list would be an invalid GraphQL selection set; the
+        // empty case must short-circuit before ever spawning `gh`.
+        let map = ShellGhCli
+            .issues_dependencies("jowi-dev/tskmstr", &[])
+            .unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_dependencies_defaults_each_number_to_empty_and_logs_one_call() {
+        let deps = IssueDependencies {
+            blocking: vec![IssueRef {
+                number: 9,
+                title: "Unlocked".to_string(),
+                state: IssueState::Open,
+                url: "u9".to_string(),
+            }],
+            ..Default::default()
+        };
+        let fake = FakeGhCli::new().with_issues_dependencies(3, deps.clone());
+
+        let map = fake
+            .issues_dependencies("jowi-dev/tskmstr", &[3, 4])
+            .unwrap();
+
+        assert_eq!(map[&3], deps);
+        assert_eq!(map[&4], IssueDependencies::default());
+        assert_eq!(
+            fake.issues_dependencies_calls(),
+            vec![("jowi-dev/tskmstr".to_string(), vec![3, 4])]
+        );
+    }
+
+    #[test]
+    fn fake_gh_cli_issues_dependencies_returns_configured_error() {
+        let fake = FakeGhCli::new().with_issues_dependencies_error(GhError::Command {
+            command: "gh api graphql".to_string(),
+            exit_code: Some(1),
+            stderr: "boom".to_string(),
+        });
+        assert!(fake.issues_dependencies("jowi-dev/tskmstr", &[3]).is_err());
     }
 
     // --- issue dependency mutations (phase 6) ---

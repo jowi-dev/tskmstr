@@ -215,6 +215,11 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Ticket { key, cmd } => run_ticket(key, cmd, &paths, &keychain, env_token),
         Command::Pr { cmd } => run_pr(cmd, &paths, &keychain, env_token),
         Command::Ready { key, json } => run_ready(key, json, &paths, &keychain, env_token),
+        Command::Graph {
+            epic,
+            json,
+            mermaid,
+        } => run_graph(epic, json, mermaid, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Overview => run_overview(),
         Command::Runs {
@@ -2091,6 +2096,41 @@ fn run_ready(
     Ok(())
 }
 
+/// `tm graph [EPIC]`: build the configured backend's provider and run
+/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json` and
+/// `mermaid` pick the output format (clap keeps them exclusive); neither
+/// means text.
+fn run_graph(
+    epic: Option<String>,
+    json: bool,
+    mermaid: bool,
+    paths: &ConfigPaths,
+    keychain: &dyn KeychainStore,
+    env_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::load(paths)?;
+    let provider = ticket_provider_for(&config, keychain, env_token)?;
+    let identity = tskmstr::config::BackendIdentity::from_config(&config);
+    let format = if json {
+        tskmstr::cli::graph::GraphFormat::Json
+    } else if mermaid {
+        tskmstr::cli::graph::GraphFormat::Mermaid
+    } else {
+        tskmstr::cli::graph::GraphFormat::Text
+    };
+    tskmstr::cli::graph::run(
+        provider.as_ref(),
+        &identity,
+        &config.default_project_key,
+        epic.as_deref(),
+        format,
+        unix_now(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )?;
+    Ok(())
+}
+
 /// Exit code for `tm ready <KEY>` reporting a ticket **stackable**: exactly
 /// one unmerged direct blocker, with an open PR to build on (see
 /// [`tskmstr::cli::ready::ReadyOutcome::Stackable`]) — distinct from `0`
@@ -2636,11 +2676,22 @@ fn run_runs(
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("~"));
+            // Read a run's transcript with the agent that recorded it, so a
+            // claude run still renders under an opencode config; fall back
+            // to the configured agent for rows with no recorded agent.
+            let transcripts_for = |agent: Option<&str>| {
+                agent
+                    .and_then(AgentKind::parse)
+                    .map(tskmstr::agent::routing::runner_for)
+                    .unwrap_or_else(|| agent_runner_or_default(full_config.as_ref()))
+                    .transcripts(&home)
+            };
             let sleeper = tskmstr::work::review_watch::RealSleeper;
             tskmstr::cli::runs::logs(
                 &store,
                 scope,
                 &home,
+                &transcripts_for,
                 &ticket_or_id,
                 kind.as_deref(),
                 tail,

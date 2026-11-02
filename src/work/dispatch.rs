@@ -1464,6 +1464,46 @@ mod tests {
         assert_eq!(busy.get("GH-4"), Some(&InHand::FixRoundCap));
     }
 
+    /// GH-169: an interactive audit session that records its verdict and
+    /// then reads the ticket again (or reads another ticket for context)
+    /// must not leave the ticket in hand.
+    #[test]
+    fn an_interactive_audit_session_leaves_no_ticket_in_hand() {
+        use crate::agent::claude::ClaudeRunner;
+        use crate::runs::session::{SessionEnv, finish_session, register_session};
+
+        let fx = Fixture::new();
+        let markers = fx.dir.path().join("sessions");
+        let env = SessionEnv {
+            session_id: Some("sess-1".to_string()),
+            agent_pid: None,
+            lane_run_id: None,
+            session_run_id: None,
+            cwd: PathBuf::from("/wt"),
+        };
+        let register = |ticket: &str| {
+            register_session(&fx.store, Some(SCOPE), &markers, &env, "audit", ticket).unwrap()
+        };
+
+        register("GH-1");
+        register("GH-2");
+        finish_session(
+            &fx.store,
+            &markers,
+            &env,
+            "audit",
+            "GH-1",
+            RunStatus::Done,
+            &ClaudeRunner,
+        )
+        .unwrap();
+        register("GH-1");
+
+        let busy = in_hand(&fx.store.overview_runs().unwrap(), SCOPE);
+        assert_eq!(busy.get("GH-1"), None);
+        assert_eq!(busy.get("GH-2"), None);
+    }
+
     /// A stand-in `tm` that logs its argv and cwd, then exits `code`.
     fn fake_tm(dir: &Path, code: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
