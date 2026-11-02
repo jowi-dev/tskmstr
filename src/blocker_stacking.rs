@@ -376,27 +376,38 @@ pub struct UnblockCounts {
 /// visited); a member counts the rest of its cycle but never itself, and is
 /// listed in [`UnblockCounts::cycle_members`].
 pub fn unblock_counts(issues: &[Issue]) -> UnblockCounts {
-    let keys: HashSet<&str> = issues.iter().map(|i| i.key.as_str()).collect();
-    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
-    for issue in issues {
-        for blocker in direct_blockers(issue) {
-            if keys.contains(blocker.key.as_str()) {
-                blocks
-                    .entry(blocker.key.as_str())
-                    .or_default()
-                    .push(issue.key.as_str());
-            }
+    let keys: Vec<&str> = issues.iter().map(|i| i.key.as_str()).collect();
+    let links = issues.iter().flat_map(|issue| {
+        direct_blockers(issue)
+            .into_iter()
+            .map(move |blocker| (blocker.key.as_str(), issue.key.as_str()))
+    });
+    unblock_counts_by_key(&keys, links)
+}
+
+/// [`unblock_counts`] over bare keys: `blocks` holds `(blocker, blocked)`
+/// pairs, and only pairs whose ends are both in `keys` count. The epic
+/// graph's downstream counts (`crate::graph::state`) use this, so they
+/// follow the same rule as `tm ready`.
+pub fn unblock_counts_by_key<'a>(
+    keys: &[&'a str],
+    blocks: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> UnblockCounts {
+    let members: HashSet<&str> = keys.iter().copied().collect();
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (blocker, blocked) in blocks {
+        if members.contains(blocker) && members.contains(blocked) {
+            edges.entry(blocker).or_default().push(blocked);
         }
     }
 
     let mut result = UnblockCounts::default();
-    for issue in issues {
-        let start = issue.key.as_str();
+    for &start in keys {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut stack: Vec<&str> = blocks.get(start).cloned().unwrap_or_default();
+        let mut stack: Vec<&str> = edges.get(start).cloned().unwrap_or_default();
         while let Some(key) = stack.pop() {
             if seen.insert(key)
-                && let Some(next) = blocks.get(key)
+                && let Some(next) = edges.get(key)
             {
                 stack.extend(next);
             }
