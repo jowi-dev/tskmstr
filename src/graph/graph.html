@@ -116,31 +116,35 @@
   var byKey = {};
   nodes.forEach(function (n) { byKey[n.key] = n; });
 
-  // Column = longest chain of unlockers ahead. Relaxing at most
-  // nodes.length times keeps a cycle from looping forever.
+  // Column = longest chain of unlockers ahead. A walk that meets a node
+  // already on its path treats it as column 0, so a cycle still ends.
+  var unlockers = {};
+  unlocks.forEach(function (l) {
+    if (byKey[l.from] && byKey[l.to]) (unlockers[l.to] = unlockers[l.to] || []).push(l.from);
+  });
   var column = {};
-  nodes.forEach(function (n) { column[n.key] = 0; });
-  for (var pass = 0; pass < nodes.length; pass++) {
-    var changed = false;
-    unlocks.forEach(function (l) {
-      if (byKey[l.from] && byKey[l.to] && column[l.to] < column[l.from] + 1) {
-        column[l.to] = column[l.from] + 1;
-        changed = true;
-      }
-    });
-    if (!changed) break;
+  var onPath = {};
+  function columnOf(key) {
+    if (key in column) return column[key];
+    if (onPath[key]) return 0;
+    onPath[key] = true;
+    var c = 0;
+    (unlockers[key] || []).forEach(function (u) { c = Math.max(c, columnOf(u) + 1); });
+    delete onPath[key];
+    column[key] = c;
+    return c;
   }
 
   var rows = [];
   var position = {};
   nodes.forEach(function (n) {
-    var c = Math.min(column[n.key], nodes.length);
-    rows[c] = rows[c] || 0;
+    var c = columnOf(n.key);
+    while (rows.length <= c) rows.push(0);
     position[n.key] = { x: PAD + c * (W + GAP_X), y: PAD + rows[c] * (H + GAP_Y) };
     rows[c] += 1;
   });
   var columns = rows.length;
-  var tallest = Math.max.apply(null, rows.concat([0]).map(function (r) { return r || 0; }));
+  var tallest = Math.max.apply(null, rows.concat([0]));
   var svg = document.getElementById("graph");
   var width = PAD * 2 + Math.max(columns, 1) * W + Math.max(columns - 1, 0) * GAP_X;
   var height = PAD * 2 + Math.max(tallest, 1) * H + Math.max(tallest - 1, 0) * GAP_Y;

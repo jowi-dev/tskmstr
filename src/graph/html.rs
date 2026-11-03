@@ -21,10 +21,6 @@ const TEMPLATE: &str = include_str!("graph.html");
 /// Where [`render_html`] puts the embedded data in [`TEMPLATE`].
 const DATA_PLACEHOLDER: &str = "/*GRAPH_DATA*/";
 
-/// The `id` of the `<script type="application/json">` element that holds
-/// the embedded data.
-const DATA_ELEMENT_ID: &str = "graph-data";
-
 /// What the page reads: the JSON document, plus each epic's planning
 /// state by key.
 #[derive(Serialize)]
@@ -89,6 +85,10 @@ mod tests {
     use crate::config::BackendIdentity;
     use crate::graph::state::graph_state;
     use crate::graph::{ChildProgress, Graph, GraphLink, GraphNode, LinkKind};
+
+    /// The `id` of the template's `<script type="application/json">`
+    /// element, where [`DATA_PLACEHOLDER`] sits.
+    const DATA_ELEMENT_ID: &str = "graph-data";
 
     fn node(key: &str, title: &str, category: &str, children: Option<(usize, usize)>) -> GraphNode {
         GraphNode {
