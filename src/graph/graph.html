@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epic graph</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #656d76;
+    --edge: #8c959f;
+    --card: #f6f8fa;
+    --available: #1a7f37;
+    --available-bg: #dafbe1;
+    --locked: #9a6700;
+    --locked-bg: #fff8c5;
+    --done: #8250df;
+    --done-bg: #f3effd;
+    --plain: #656d76;
+    --plain-bg: #f6f8fa;
+    --bar: #d0d7de;
+    --warn: #cf222e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8d96a0;
+      --edge: #6e7681;
+      --card: #161b22;
+      --available: #3fb950;
+      --available-bg: #12261e;
+      --locked: #d29922;
+      --locked-bg: #272115;
+      --done: #a371f7;
+      --done-bg: #221a33;
+      --plain: #8d96a0;
+      --plain-bg: #161b22;
+      --bar: #30363d;
+      --warn: #f85149;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .meta { color: var(--muted); margin: 0 0 12px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 12px; padding: 0; list-style: none; }
+  .legend span { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 2px solid; }
+  .warnings { color: var(--warn); margin: 0 0 12px; padding-left: 20px; }
+  .canvas { overflow: auto; border: 1px solid var(--bar); border-radius: 8px; }
+  svg { display: block; }
+  .edge { stroke: var(--edge); stroke-width: 1.5; fill: none; }
+  .arrow { fill: var(--edge); }
+  .node rect.box { stroke-width: 2; }
+  .node text { fill: var(--fg); }
+  .node .key { font-weight: 600; font-size: 12px; }
+  .node .sub { fill: var(--muted); font-size: 12px; }
+  .node.done text.title { text-decoration: line-through; fill: var(--muted); }
+  .node.done rect.box { stroke-dasharray: 4 3; }
+  .node:hover rect.box { filter: brightness(0.95); }
+  .avail-available rect.box { fill: var(--available-bg); stroke: var(--available); }
+  .avail-locked rect.box { fill: var(--locked-bg); stroke: var(--locked); }
+  .avail-done rect.box { fill: var(--done-bg); stroke: var(--done); }
+  .plain rect.box { fill: var(--plain-bg); stroke: var(--plain); }
+  .avail-available .fill { fill: var(--available); }
+  .avail-locked .fill { fill: var(--locked); }
+  .avail-done .fill { fill: var(--done); }
+  .track { fill: var(--bar); }
+  .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1 id="heading">Epic graph</h1>
+<p class="meta" id="meta"></p>
+<ul class="legend">
+  <li><span style="background: var(--available-bg); border-color: var(--available)"></span>Available: can start now</li>
+  <li><span style="background: var(--locked-bg); border-color: var(--locked)"></span>Locked: waiting on an unlocker</li>
+  <li><span style="background: var(--done-bg); border-color: var(--done)"></span>Done</li>
+  <li><span style="background: var(--plain-bg); border-color: var(--plain)"></span>Plain ticket</li>
+</ul>
+<ul class="warnings" id="warnings"></ul>
+<div class="canvas"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<script type="application/json" id="graph-data">/*GRAPH_DATA*/</script>
+<script>
+(function () {
+  "use strict";
+  var NS = "http://www.w3.org/2000/svg";
+  var W = 240, H = 76, GAP_X = 80, GAP_Y = 20, PAD = 20;
+
+  var data = JSON.parse(document.getElementById("graph-data").textContent);
+  var doc = data.document;
+  var epics = data.epics;
+
+  document.getElementById("heading").textContent = "Epic graph: " + doc.source.project;
+  document.getElementById("meta").textContent =
+    doc.source.provider + " " + doc.source.project + ", generated " + doc.generated_at;
+  var warnings = document.getElementById("warnings");
+  doc.warnings.forEach(function (w) {
+    var li = document.createElement("li");
+    li.textContent = w.message;
+    warnings.appendChild(li);
+  });
+
+  // Draw the epics and the plain tickets at the end of an unlocks link.
+  var unlocks = doc.links.filter(function (l) { return l.kind === "unlocks"; });
+  var endpoint = {};
+  unlocks.forEach(function (l) { endpoint[l.from] = true; endpoint[l.to] = true; });
+  var nodes = doc.nodes.filter(function (n) { return n.children !== null || endpoint[n.key]; });
+  var byKey = {};
+  nodes.forEach(function (n) { byKey[n.key] = n; });
+
+  // Column = longest chain of unlockers ahead. Relaxing at most
+  // nodes.length times keeps a cycle from looping forever.
+  var column = {};
+  nodes.forEach(function (n) { column[n.key] = 0; });
+  for (var pass = 0; pass < nodes.length; pass++) {
+    var changed = false;
+    unlocks.forEach(function (l) {
+      if (byKey[l.from] && byKey[l.to] && column[l.to] < column[l.from] + 1) {
+        column[l.to] = column[l.from] + 1;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+
+  var rows = [];
+  var position = {};
+  nodes.forEach(function (n) {
+    var c = Math.min(column[n.key], nodes.length);
+    rows[c] = rows[c] || 0;
+    position[n.key] = { x: PAD + c * (W + GAP_X), y: PAD + rows[c] * (H + GAP_Y) };
+    rows[c] += 1;
+  });
+  var columns = rows.length;
+  var tallest = Math.max.apply(null, rows.concat([0]).map(function (r) { return r || 0; }));
+  var svg = document.getElementById("graph");
+  var width = PAD * 2 + Math.max(columns, 1) * W + Math.max(columns - 1, 0) * GAP_X;
+  var height = PAD * 2 + Math.max(tallest, 1) * H + Math.max(tallest - 1, 0) * GAP_Y;
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+
+  function el(name, attrs, parent) {
+    var e = document.createElementNS(NS, name);
+    Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function text(parent, x, y, cls, value) {
+    var t = el("text", { x: x, y: y, "class": cls }, parent);
+    t.textContent = value;
+    return t;
+  }
+  function clip(value, max) {
+    return value.length > max ? value.slice(0, max - 1) + "…" : value;
+  }
+
+  var defs = el("defs", {}, svg);
+  var marker = el("marker", {
+    id: "arrow", viewBox: "0 0 10 10", refX: "10", refY: "5",
+    markerWidth: "8", markerHeight: "8", orient: "auto-start-reverse"
+  }, defs);
+  el("path", { d: "M0,0 L10,5 L0,10 z", "class": "arrow" }, marker);
+
+  unlocks.forEach(function (l) {
+    var a = position[l.from], b = position[l.to];
+    if (!a || !b) return;
+    var x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2;
+    if (x2 <= x1) {
+      // A backward edge, only possible in a cycle: loop under the boxes.
+      var low = Math.max(a.y, b.y) + H + GAP_Y / 2;
+      el("path", {
+        d: "M" + (a.x + W / 2) + "," + (a.y + H) + " L" + (a.x + W / 2) + "," + low +
+           " L" + (b.x + W / 2) + "," + low + " L" + (b.x + W / 2) + "," + (b.y + H),
+        "class": "edge", "marker-end": "url(#arrow)"
+      }, svg);
+      return;
+    }
+    var mid = (x1 + x2) / 2;
+    el("path", {
+      d: "M" + x1 + "," + y1 + " C" + mid + "," + y1 + " " + mid + "," + y2 + " " + x2 + "," + y2,
+      "class": "edge", "marker-end": "url(#arrow)"
+    }, svg);
+  });
+
+  nodes.forEach(function (n) {
+    var p = position[n.key];
+    var state = epics[n.key];
+    var cls = state ? "node avail-" + state.availability : "node plain";
+    if (n.status_category === "done") cls += " done";
+    var link = el("a", { href: n.url, target: "_blank", rel: "noopener", "class": cls }, svg);
+    var tip = el("title", {}, link);
+    tip.textContent = n.key + ": " + n.title + " (" + n.status + ")";
+    el("rect", { x: p.x, y: p.y, width: W, height: H, rx: 8, "class": "box" }, link);
+    text(link, p.x + 10, p.y + 18, "key", n.key + "  ·  " + n.status);
+    text(link, p.x + 10, p.y + 37, "title", clip(n.title, 32));
+    if (state && n.children) {
+      var done = n.children.done, total = n.children.total;
+      var label = state.availability === "locked"
+        ? "locked, wave " + state.wave
+        : state.availability;
+      text(link, p.x + 10, p.y + 56, "sub", done + "/" + total + " done  ·  " + label);
+      var barW = W - 20;
+      el("rect", { x: p.x + 10, y: p.y + 63, width: barW, height: 5, rx: 2, "class": "track" }, link);
+      var fillW = total > 0 ? Math.round(barW * done / total) : 0;
+      el("rect", { x: p.x + 10, y: p.y + 63, width: fillW, height: 5, rx: 2, "class": "fill" }, link);
+    } else {
+      text(link, p.x + 10, p.y + 56, "sub", "ticket");
+    }
+  });
+
+  if (nodes.length === 0) {
+    var p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = "No epics in this graph.";
+    document.querySelector(".canvas").replaceWith(p);
+  }
+})();
+</script>
+</body>
+</html>
