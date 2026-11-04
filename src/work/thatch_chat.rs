@@ -227,7 +227,7 @@ fn session_name(rest: &str) -> String {
 }
 
 /// Send `message` to every live session in `project` through `thatch`,
-/// returning the status-line summary of who received it.
+/// returning who received it (see [`BroadcastReport::summary`]).
 pub fn broadcast(
     runner: &dyn ThatchRunner,
     project: &str,
