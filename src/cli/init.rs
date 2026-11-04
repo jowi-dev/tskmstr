@@ -2532,6 +2532,21 @@ mod tests {
     }
 
     #[test]
+    fn every_skill_the_lane_template_names_is_one_tm_check_resolves() {
+        // `tm check` flags a lane prompt's named skills that aren't
+        // installed; a skill phrased any other way would slip past it.
+        assert_eq!(
+            crate::cli::check::named_skills(&lane_prompt_template("widget")),
+            vec![
+                "thatch-code-archaeology",
+                "thatch-coding-workflow",
+                "thatch-pr-description",
+                "thatch-session-reflection",
+            ]
+        );
+    }
+
+    #[test]
     fn lane_step_declined_writes_no_work_section() {
         let env = test_env();
         let gh = FakeGhCli::new();

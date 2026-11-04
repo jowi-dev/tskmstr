@@ -101,7 +101,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
 file, a lane whose `subagent` key names a definition that doesn't exist,
-a configured session's missing skill, a relative `prompt_file` still
+a configured session's missing skill, a skill a lane prompt names (as
+"the `name` skill") that isn't installed, a relative `prompt_file` still
 pointing at the legacy top-level `prompts/` directory instead of the
 canonical `.tskmstr/prompts/`. It also names every expected config key
 (registered in `src/config/manifest.rs`'s `EXPECTED_CONFIG_KEYS`) that is
@@ -113,7 +114,7 @@ with no safe default for the repo's backend (Jira's workflow status names
 are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
-checked (see `docs/decisions/0007-asset-schema-version.md`).
+checked (a lane prompt is read only to learn which skills it names) (see `docs/decisions/0007-asset-schema-version.md`).
 Exit code `0` means up to date, `1` means drift was found, `2` means an
 error (e.g. the repo was never onboarded).
 

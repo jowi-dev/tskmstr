@@ -107,3 +107,19 @@ feature that ships a key registers it there.
   key's presence is checked directly. The keys shipped with this change
   (`status_on_pr`, `status_on_run_start`, both recommended, GitHub defaults
   `In Review` / `In Progress`) predate it and are tagged with schema 2.
+
+## Addendum: skills a lane prompt names (GitHub issue #205)
+
+The starter lane prompt names thatch skills (`thatch-code-archaeology`,
+`thatch-coding-workflow`, `thatch-pr-description`,
+`thatch-session-reflection`), so a machine without thatch runs lanes that
+reference skills that aren't there. `tm check` now reads each configured
+lane's prompt, picks out every skill it names as "the `name` skill", and
+reports a `MissingLaneSkill` finding for each one present neither in the
+lane's repo-local skills directory nor the user-level one.
+
+This is still not a content diff. It asks which skills the prompt
+*currently* references, not whether it reads like the template: a lane
+prompt edited to drop a step drops that skill from the check, and a
+prompt naming a skill of its own gets that one checked too. A missing
+lane skill is drift with no additive fix, since tm doesn't ship the skill.
