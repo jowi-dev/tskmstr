@@ -1632,7 +1632,10 @@ card names it, so `P` can still clear it.
 Pressing `i` or `/` on the board enters search mode. Every key you type then
 goes into the search query rather than running its usual action, so `q`,
 `M`, `?` and the rest are typed as text. Each keystroke narrows the board to
-the cards whose key or summary contains the query, ignoring case. Columns
+the cards whose key or summary contains the query, ignoring case. A card
+also matches when its parent epic's key or title contains the query, so
+typing an epic key like `GH-176` or a word from an epic's title shows that
+epic's children. Columns
 keep their order; a column with no matching cards stays on screen, empty, and
 every column title reads `shown/total` while a query is applied. The status
 line shows `Search: <query>`.
