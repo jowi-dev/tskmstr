@@ -893,6 +893,16 @@ pub struct App {
     pub show_epic_picker: bool,
     /// Index into [`App::epic_options`] of the currently highlighted option.
     pub epic_picker_selected: usize,
+    /// Whether the board's broadcast input is open (GitHub issue #225):
+    /// every printable key edits [`App::broadcast_draft`] until
+    /// [`Msg::BroadcastSubmit`] or [`Msg::BroadcastCancel`].
+    pub board_broadcasting: bool,
+    /// The message being typed into the broadcast input.
+    pub broadcast_draft: String,
+    /// Why the broadcast key can't send (thatch missing from `PATH`, or no
+    /// project to address), shown instead of opening the input. `None` when
+    /// broadcasting is available. Set from `TuiDeps` at construction.
+    pub broadcast_unavailable: Option<String>,
     /// Index into the picker's option list of the currently highlighted
     /// option.
     pub filter_picker_selected: usize,
@@ -1536,6 +1546,21 @@ pub enum Msg {
     SearchSubmit,
     /// Leave search mode and clear the query, showing every card again.
     SearchCancel,
+    /// Open the board's broadcast input (GitHub issue #225), or report
+    /// [`App::broadcast_unavailable`] when broadcasting can't work.
+    StartBroadcast,
+    /// Append `char` to [`App::broadcast_draft`].
+    BroadcastChar(char),
+    /// Remove the last character of [`App::broadcast_draft`].
+    BroadcastBackspace,
+    /// Close the input and send the trimmed draft as [`Cmd::Broadcast`].
+    /// An empty draft sends nothing.
+    BroadcastSubmit,
+    /// Close the input and discard the draft.
+    BroadcastCancel,
+    /// A [`Cmd::Broadcast`] finished; carries the status-line result (who
+    /// received it, or why it failed).
+    BroadcastFinished(String),
     /// Assignable users for the picker finished loading.
     AssignableUsersLoaded(Vec<JiraUser>),
     /// Assignable users failed to load.
@@ -2212,6 +2237,12 @@ pub enum Cmd {
         /// Optional free-text note.
         notes: Option<String>,
     },
+    /// Send `message` to every live agent session in the board's project
+    /// through `thatch chat broadcast` (GitHub issue #225).
+    Broadcast {
+        /// The message to send.
+        message: String,
+    },
 }
 
 /// Which class of network action an [`InFlight`] entry tracks: one variant
@@ -2694,6 +2725,43 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::SearchCancel => {
             app.board_searching = false;
             edit_search_query(&mut app, String::clear);
+            (app, Vec::new())
+        }
+        Msg::StartBroadcast => {
+            if let Some(reason) = &app.broadcast_unavailable {
+                app.status_line = reason.clone();
+            } else {
+                app.board_broadcasting = true;
+                app.broadcast_draft.clear();
+            }
+            (app, Vec::new())
+        }
+        Msg::BroadcastChar(c) => {
+            app.broadcast_draft.push(c);
+            (app, Vec::new())
+        }
+        Msg::BroadcastBackspace => {
+            app.broadcast_draft.pop();
+            (app, Vec::new())
+        }
+        Msg::BroadcastSubmit => {
+            app.board_broadcasting = false;
+            let message = std::mem::take(&mut app.broadcast_draft).trim().to_string();
+            if message.is_empty() {
+                app.status_line = "broadcast cancelled: empty message".to_string();
+                (app, Vec::new())
+            } else {
+                app.status_line = "broadcasting...".to_string();
+                (app, vec![Cmd::Broadcast { message }])
+            }
+        }
+        Msg::BroadcastCancel => {
+            app.board_broadcasting = false;
+            app.broadcast_draft.clear();
+            (app, Vec::new())
+        }
+        Msg::BroadcastFinished(result) => {
+            app.status_line = result;
             (app, Vec::new())
         }
         Msg::FilterPickerClose => {
@@ -5520,6 +5588,89 @@ mod tests {
         let (app, _) = update(app, Msg::OpenFilterPicker);
         let (app, _) = update(app, Msg::FilterPickerSelect);
         assert_eq!(app.epic_filter, EpicFilter::NoEpic);
+    }
+
+    /// Type `text` into the board's broadcast input, one key at a time.
+    fn type_broadcast(mut app: App, text: &str) -> App {
+        for c in text.chars() {
+            (app, _) = update(app, Msg::BroadcastChar(c));
+        }
+        app
+    }
+
+    #[test]
+    fn start_broadcast_opens_an_empty_input() {
+        let mut app = search_board();
+        app.broadcast_draft = "stale".to_string();
+        let (app, cmds) = update(app, Msg::StartBroadcast);
+        assert!(app.board_broadcasting);
+        assert!(app.broadcast_draft.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn start_broadcast_reports_why_when_unavailable() {
+        let mut app = search_board();
+        app.broadcast_unavailable = Some("thatch not found on PATH".to_string());
+        let (app, cmds) = update(app, Msg::StartBroadcast);
+        assert!(!app.board_broadcasting);
+        assert_eq!(app.status_line, "thatch not found on PATH");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn broadcast_typing_edits_the_draft_not_the_search() {
+        let (app, _) = update(search_board(), Msg::StartBroadcast);
+        let app = type_broadcast(app, "main moved");
+        let (app, _) = update(app, Msg::BroadcastBackspace);
+        assert_eq!(app.broadcast_draft, "main move");
+        assert!(app.board_search_query.is_empty());
+    }
+
+    #[test]
+    fn broadcast_submit_sends_the_trimmed_message() {
+        let (app, _) = update(search_board(), Msg::StartBroadcast);
+        let app = type_broadcast(app, "  rebase on main ");
+        let (app, cmds) = update(app, Msg::BroadcastSubmit);
+        assert!(!app.board_broadcasting);
+        assert!(app.broadcast_draft.is_empty());
+        assert_eq!(
+            cmds,
+            vec![Cmd::Broadcast {
+                message: "rebase on main".to_string()
+            }]
+        );
+        assert_eq!(app.status_line, "broadcasting...");
+    }
+
+    #[test]
+    fn broadcast_submit_of_an_empty_message_sends_nothing() {
+        let (app, _) = update(search_board(), Msg::StartBroadcast);
+        let app = type_broadcast(app, "   ");
+        let (app, cmds) = update(app, Msg::BroadcastSubmit);
+        assert!(!app.board_broadcasting);
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "broadcast cancelled: empty message");
+    }
+
+    #[test]
+    fn broadcast_cancel_discards_the_draft() {
+        let (app, _) = update(search_board(), Msg::StartBroadcast);
+        let app = type_broadcast(app, "oops");
+        let (app, cmds) = update(app, Msg::BroadcastCancel);
+        assert!(!app.board_broadcasting);
+        assert!(app.broadcast_draft.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn broadcast_finished_shows_the_result_in_the_status_line() {
+        let (app, cmds) = update(
+            search_board(),
+            Msg::BroadcastFinished("broadcast delivered to 1 session (a)".to_string()),
+        );
+        assert_eq!(app.status_line, "broadcast delivered to 1 session (a)");
+        assert!(cmds.is_empty());
     }
 
     #[test]

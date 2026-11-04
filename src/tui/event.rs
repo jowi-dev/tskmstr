@@ -302,6 +302,27 @@ pub struct TuiDeps {
     /// line. Lane runs, fix passes and merges go through their `tm`
     /// commands' own admission.
     pub admission: crate::work::admission::OwnedAdmission,
+    /// Runs `thatch` for the broadcast key's `thatch chat broadcast`
+    /// (GitHub issue #225).
+    pub thatch: Box<dyn crate::work::thatch_chat::ThatchRunner>,
+    /// The thatch project label broadcasts address: the board repo's
+    /// `owner/name` origin slug (see
+    /// [`crate::work::thatch_chat::detect_project`]). `None` when the repo
+    /// has no GitHub origin remote.
+    pub thatch_project: Option<String>,
+}
+
+/// Why the board's broadcast key can't send, or `None` when it can: thatch
+/// must be on `PATH`, and the repo must have a project for thatch to
+/// address (GitHub issue #225).
+pub fn broadcast_unavailable(thatch_available: bool, project: Option<&str>) -> Option<String> {
+    if !thatch_available {
+        Some("thatch not found on PATH; broadcast unavailable".to_string())
+    } else if project.is_none() {
+        Some("no GitHub origin remote to name a thatch project; broadcast unavailable".to_string())
+    } else {
+        None
+    }
 }
 
 /// One board-launched child (`tm work run`, `tm pr watch`, `tm review fix`,
@@ -407,6 +428,10 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
         session_slug: deps.backend_identity.session_slug(),
         board_column_order: deps.board_column_order.clone(),
         autopilot_scope: Some(deps.backend_identity.scope()),
+        broadcast_unavailable: broadcast_unavailable(
+            deps.thatch.available(),
+            deps.thatch_project.as_deref(),
+        ),
         ..App::new()
     }
     .with_lane_names(deps.lane_names.clone())
@@ -2019,6 +2044,11 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
             severity,
             notes,
         } => record_retro(deps, &key, verdict, severity, notes.as_deref()),
+        Cmd::Broadcast { message } => broadcast_cmd(
+            deps.thatch.as_ref(),
+            deps.thatch_project.as_deref(),
+            &message,
+        ),
         // `Cmd::AttachSession`/`Cmd::ViewDiff` need `&mut Terminal` (to
         // suspend/restore the alternate screen around a blocking call --
         // `tmux attach`/`vdiff`, respectively); `Cmd::LaunchLaneRun`/
@@ -2838,6 +2868,28 @@ pub fn record_audit(deps: &TuiDeps, key: &str) -> Vec<Msg> {
     }
 }
 
+/// Run [`Cmd::Broadcast`]: send `message` to `project`'s live sessions
+/// through `thatch chat broadcast` and report who received it (or why it
+/// wasn't sent) in the status line. `thatch` writes to a local database and
+/// returns at once, so this runs on the event loop rather than the network
+/// worker.
+fn broadcast_cmd(
+    thatch: &dyn crate::work::thatch_chat::ThatchRunner,
+    project: Option<&str>,
+    message: &str,
+) -> Vec<Msg> {
+    let Some(project) = project else {
+        return vec![Msg::BroadcastFinished(
+            broadcast_unavailable(true, None).unwrap_or_default(),
+        )];
+    };
+    let result = match crate::work::thatch_chat::broadcast(thatch, project, message) {
+        Ok(report) => report.summary(),
+        Err(err) => err.to_string(),
+    };
+    vec![Msg::BroadcastFinished(result)]
+}
+
 /// Run `Cmd::RecordRetro`: record a retro verdict via
 /// [`crate::runs::RunStore::record_retro`].
 ///
@@ -3212,6 +3264,8 @@ mod tests {
             status_on_merge: None,
             autopilot: AutopilotDeps::default(),
             admission: crate::work::admission::OwnedAdmission::off(),
+            thatch: Box::new(crate::work::thatch_chat::FakeThatchRunner::missing()),
+            thatch_project: Some("acme/proj".to_string()),
         }
     }
 
@@ -4518,6 +4572,66 @@ mod tests {
             }
             other => panic!("expected RetroTicketsLoaded, got {other:?}"),
         }
+    }
+
+    // --- Cmd::Broadcast / broadcast_cmd ---
+
+    #[test]
+    fn broadcast_cmd_runs_thatch_chat_broadcast_for_the_project() {
+        let thatch = crate::work::thatch_chat::FakeThatchRunner::returning(
+            "Broadcast from me to 1 of 2 registered sessions (projects: acme/proj):\n\
+             \x20 delivered: rex-00001 (acme/proj) [open]\n\
+             \x20 skipped (stale): vera-00002 (acme/proj)\n",
+        );
+        let msgs = broadcast_cmd(&thatch, Some("acme/proj"), "main moved");
+        assert_eq!(
+            thatch.calls.borrow().as_slice(),
+            [vec![
+                "chat".to_string(),
+                "broadcast".to_string(),
+                "--project".to_string(),
+                "acme/proj".to_string(),
+                "--".to_string(),
+                "main moved".to_string(),
+            ]]
+        );
+        assert_eq!(
+            msgs,
+            vec![Msg::BroadcastFinished(
+                "broadcast delivered to 1 session (rex-00001); skipped 1 (vera-00002: stale)"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn broadcast_cmd_reports_a_missing_thatch() {
+        let thatch = crate::work::thatch_chat::FakeThatchRunner::missing();
+        let msgs = broadcast_cmd(&thatch, Some("acme/proj"), "hi");
+        assert_eq!(
+            msgs,
+            vec![Msg::BroadcastFinished(
+                "thatch not found on PATH; broadcast not sent".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn broadcast_cmd_without_a_project_sends_nothing() {
+        let thatch = crate::work::thatch_chat::FakeThatchRunner::returning("");
+        let msgs = broadcast_cmd(&thatch, None, "hi");
+        assert!(thatch.calls.borrow().is_empty());
+        assert!(matches!(&msgs[..], [Msg::BroadcastFinished(m)] if m.contains("no GitHub origin")));
+    }
+
+    #[test]
+    fn broadcast_unavailable_names_the_missing_piece() {
+        assert_eq!(broadcast_unavailable(true, Some("a/b")), None);
+        assert_eq!(
+            broadcast_unavailable(false, Some("a/b")).as_deref(),
+            Some("thatch not found on PATH; broadcast unavailable")
+        );
+        assert!(broadcast_unavailable(true, None).is_some_and(|m| m.contains("origin remote")));
     }
 
     // --- Cmd::RecordRetro / record_retro ---
