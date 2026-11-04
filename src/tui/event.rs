@@ -477,6 +477,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
                     app.confirm_open(),
                     retro_overlay_for(&app),
                     app.board_searching,
+                    app.board_broadcasting,
                     key_event.code,
                 )
             {
@@ -1529,6 +1530,7 @@ fn run_watch_loop(
                     app.show_run_detail,
                     app.confirm_open(),
                     RetroOverlay::None,
+                    false,
                     false,
                     key_event.code,
                 )
