@@ -127,6 +127,13 @@ pub fn find_pr_for_ticket<'a>(
     matches.into_iter().next()
 }
 
+/// The PR number at the end of a GitHub pull-request URL
+/// (`https://github.com/<owner>/<repo>/pull/<number>`), ignoring a trailing
+/// slash. `None` when the last path segment is not a number.
+pub fn pr_number_from_url(url: &str) -> Option<u64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
 /// Prefix `title` with `[KEY]`, replacing any existing key-shaped `[...]`
 /// prefixes rather than stacking a second one: re-associating a PR with a
 /// different ticket (`tm ticket <KEY>` after a wrong scrape, see GitHub
@@ -179,6 +186,15 @@ fn branch_key(branch: &str, accept: &dyn Fn(&str) -> bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_number_from_url_takes_the_trailing_number() {
+        assert_eq!(
+            pr_number_from_url("https://github.com/o/r/pull/131"),
+            Some(131)
+        );
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/"), None);
+    }
 
     fn pr(title: &str, body: &str, branch: &str) -> PrInfo {
         PrInfo {

@@ -44,6 +44,7 @@ use thiserror::Error;
 use crate::agent::{AgentRunner, RunMode};
 use crate::config::AutoReviewConfig;
 use crate::github::gh_cli::GhCli;
+use crate::github::pr::pr_number_from_url;
 use crate::runs::{Run, RunStatus, RunStore, RunStoreError};
 use crate::work::admission::{AdmissionDeps, LaunchOrigin, LaunchRequest};
 use crate::work::auto_review::{
@@ -620,11 +621,6 @@ fn auto_review_loop_alive(store: &RunStore, run: &Run) -> bool {
         None => None,
     };
     pid.is_some_and(crate::runs::pid::pid_alive)
-}
-
-/// The PR number at the end of a GitHub pull-request URL.
-fn pr_number_from_url(url: &str) -> Option<u64> {
-    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
 }
 
 /// `tm review auto <KEY> [--foreground]` (GitHub issue #124): see
@@ -2770,15 +2766,6 @@ mod tests {
             "a round that never started leaves no row"
         );
         assert!(spawner.recorded.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn pr_number_from_url_takes_the_trailing_number() {
-        assert_eq!(
-            pr_number_from_url("https://github.com/o/r/pull/131"),
-            Some(131)
-        );
-        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/"), None);
     }
 
     // --- bugbot threads feeding auto-review fixes (GitHub issue #145) ---
