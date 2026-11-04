@@ -1151,9 +1151,11 @@ pub struct DispatchConfig {
     /// or `F`), but only the automatic triggers stop at it. Defaults to
     /// [`DEFAULT_MAX_FIX_ROUNDS`].
     pub max_fix_rounds: u32,
-    /// The most lane runs the autopilot dispatcher lets run at once
-    /// (`crate::work::dispatch::tick`). Every running lane counts, however
-    /// it was launched. Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
+    /// The most lane runs the autopilot dispatcher lets run at once in one
+    /// scope (`crate::work::dispatch::tick`). Every running lane in the
+    /// ticking scope counts, however it was launched, plus legacy unscoped
+    /// lanes; lanes in other scopes do not (GitHub issue #170, ADR-0011).
+    /// Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
     pub max_lanes: usize,
     /// The most lanes the autopilot dispatcher launches for one scope in
     /// any rolling 24 hours, a backstop against a runaway dispatcher
