@@ -1834,7 +1834,7 @@ fn readiness_lines(readiness: &Readiness) -> Vec<Line<'static>> {
     ])];
     if matches!(readiness, Readiness::NeedsAudit { .. }) {
         lines.push(Line::from(Span::styled(
-            "  a audit session, Y mark audited",
+            "  Esc, then a audit session or Y mark audited",
             theme::DIM,
         )));
     }
@@ -2787,7 +2787,10 @@ mod tests {
             text.contains("Readiness: needs audit (last audit was needs-work)"),
             "{text}"
         );
-        assert!(text.contains("a audit session, Y mark audited"), "{text}");
+        assert!(
+            text.contains("Esc, then a audit session or Y mark audited"),
+            "{text}"
+        );
     }
 
     #[test]
