@@ -248,6 +248,14 @@ pub enum ToolScope {
     /// #208). Overrides the run's permission mode, since a bypass would
     /// re-open every tool the scope exists to close.
     ThatchOnly,
+    /// Read-only investigation plus thatch: file reads and searches, skill
+    /// loading, the read-only `git` and `gh` subcommands, `gh issue create`
+    /// for filing a bug, and thatch's MCP tools. No file edits and no shell
+    /// command outside that list. For untracked sessions that need to read
+    /// code in the operator's own checkout, such as the defect retro session
+    /// `tm ticket retro --defect` starts (GitHub issue #227). Like
+    /// [`ToolScope::ThatchOnly`], it overrides the run's permission mode.
+    ReadOnly,
 }
 
 /// Already-resolved inputs for one run's agent invocation. Everything here

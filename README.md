@@ -3230,10 +3230,18 @@ It runs headless in a `retro` window, at the root of the repo you ran
 `tm ticket retro` in, on your current tmux session (or the ticket's own
 session outside tmux). tm doesn't wait for it: the window closes when the
 agent exits, and its output goes to `retro-<key>-<timestamp>.log` under
-tm's run-state directory. It has a 60-turn budget, no run row, and, because
-the archaeology needs a shell and file reads, the runner's normal tools and
-default permission mode; its prompt bars it from changing code or git
-state.
+tm's run-state directory. It has a 60-turn budget and no run row.
+
+Because it runs in your live checkout rather than an isolated worktree, it
+never gets the permission bypass lanes run with. Under claude it may only
+read and search files, load skills, use thatch's MCP tools, and run
+read-only `git` (`log`, `show`, `diff`, `blame`) and `gh` (`pr view`,
+`pr diff`, `pr list`, `issue view`, `issue list`) commands, plus
+`gh issue create`; every other call is denied. opencode has no CLI flag for
+that allowlist, so under opencode tm passes no bypass and your own
+opencode `permission` config decides, auto-rejecting any ask in a headless
+run. With `defect_session = "start"`, a still-open defect is filed as a
+GitHub issue with nobody confirming it.
 
 The verdict is recorded first and stays recorded whatever happens next: a
 session that fails to start (outside a git repo, say, or refused by memory

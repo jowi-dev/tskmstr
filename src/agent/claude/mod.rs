@@ -166,20 +166,50 @@ pub struct ClaudeRunner;
 /// [`ClaudeRunner`]'s [`AgentRunner::name`].
 pub const NAME: &str = "claude";
 
+/// The built-in tools a [`ToolScope::ReadOnly`] run is offered (`--tools`).
+/// Edit and Write are absent, so the model cannot even ask for them.
+const READ_ONLY_BUILT_IN_TOOLS: &[&str] = &["Bash", "Read", "Grep", "Glob", "Skill"];
+
+/// The calls a [`ToolScope::ReadOnly`] run may make (`--allowedTools`);
+/// under `dontAsk` every other call is denied. The shell is limited to
+/// read-only `git` and `gh` subcommands, plus `gh issue create` so the
+/// defect retro session can file a still-open bug through
+/// thatch-bug-intake.
+const READ_ONLY_ALLOWED_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Skill",
+    "mcp__thatch",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git diff:*)",
+    "Bash(git blame:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh pr diff:*)",
+    "Bash(gh pr list:*)",
+    "Bash(gh issue view:*)",
+    "Bash(gh issue list:*)",
+    "Bash(gh issue create:*)",
+];
+
 impl ClaudeRunner {
     /// [`AgentRunner::build_invocation`] without the admission proof, for
     /// that method and the usage probe, which is part of admission
     /// (GitHub issue #149).
     fn invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
-        // `ThatchOnly` overrides the permission mode: `dontAsk` denies any
-        // tool call not pre-approved, `--tools ""` removes every built-in
-        // tool, and `--allowedTools mcp__thatch` pre-approves thatch's MCP
-        // server and nothing else.
+        // The narrow scopes override the permission mode: `dontAsk` denies
+        // any tool call not pre-approved, `--tools` limits the built-in
+        // tools the model is offered at all, and `--allowedTools`
+        // pre-approves the calls the scope permits. `ThatchOnly` offers no
+        // built-in tool and approves only thatch's MCP server; `ReadOnly`
+        // offers the read tools plus a shell whose approved commands are
+        // the read-only ones in `READ_ONLY_ALLOWED_TOOLS`.
         let permission_mode = match inputs.tool_scope {
             ToolScope::Full => inputs
                 .permission_mode
                 .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string()),
-            ToolScope::ThatchOnly => "dontAsk".to_string(),
+            ToolScope::ThatchOnly | ToolScope::ReadOnly => "dontAsk".to_string(),
         };
 
         let mut args = Vec::new();
@@ -203,11 +233,19 @@ impl ClaudeRunner {
         }
         args.push("--permission-mode".to_string());
         args.push(permission_mode);
-        if inputs.tool_scope == ToolScope::ThatchOnly {
+        let scope_tools = match inputs.tool_scope {
+            ToolScope::Full => None,
+            ToolScope::ThatchOnly => Some((String::new(), "mcp__thatch".to_string())),
+            ToolScope::ReadOnly => Some((
+                READ_ONLY_BUILT_IN_TOOLS.join(","),
+                READ_ONLY_ALLOWED_TOOLS.join(","),
+            )),
+        };
+        if let Some((tools, allowed)) = scope_tools {
             args.push("--tools".to_string());
-            args.push(String::new());
+            args.push(tools);
             args.push("--allowedTools".to_string());
-            args.push("mcp__thatch".to_string());
+            args.push(allowed);
         }
         if inputs.mode == RunMode::Headless {
             let max_turns = inputs
@@ -1135,6 +1173,56 @@ mod tests {
             "the scope overrides a requested bypass"
         );
         assert!(!invocation.args.contains(&"bypassPermissions".to_string()));
+    }
+
+    #[test]
+    fn read_only_scope_allows_reads_and_thatch_and_denies_edits() {
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: Some("bypassPermissions".to_string()),
+                tool_scope: crate::agent::ToolScope::ReadOnly,
+                ..base_inputs()
+            },
+        );
+
+        let flag_value = |flag: &str| {
+            invocation.args[invocation.args.iter().position(|a| a == flag).unwrap() + 1].clone()
+        };
+        assert_eq!(
+            flag_value("--permission-mode"),
+            "dontAsk",
+            "the scope overrides a requested bypass"
+        );
+        let tools = flag_value("--tools");
+        assert!(
+            !tools.contains("Edit") && !tools.contains("Write"),
+            "{tools}"
+        );
+        let allowed: Vec<String> = flag_value("--allowedTools")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        for tool in [
+            "Read",
+            "Grep",
+            "Glob",
+            "Skill",
+            "mcp__thatch",
+            "Bash(git diff:*)",
+        ] {
+            assert!(allowed.iter().any(|a| a == tool), "{tool} in {allowed:?}");
+        }
+        assert!(
+            !allowed.iter().any(|a| a == "Bash"),
+            "no unrestricted shell"
+        );
+        assert!(
+            !allowed
+                .iter()
+                .any(|a| a.contains("git commit") || a.contains("git checkout")),
+            "{allowed:?}"
+        );
     }
 
     #[test]

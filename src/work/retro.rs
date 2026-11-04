@@ -14,9 +14,13 @@
 //! headless, untracked (no run row), opened in a tmux window in the repo
 //! checkout so thatch finds the project store from the repo's remote, with
 //! output going to a log under the state directory. Unlike that session it
-//! needs a shell and file reads for its archaeology, so it runs with
-//! [`ToolScope::Full`](crate::agent::ToolScope::Full) and the runner's
-//! default permission mode.
+//! needs file reads and `git`/`gh` for its archaeology, so it runs with
+//! [`ToolScope::ReadOnly`](crate::agent::ToolScope::ReadOnly) rather than
+//! thatch's tools alone. It never gets the full, permission-bypassing scope
+//! lanes use: a lane is contained by its own worktree, while this session
+//! runs in the operator's live checkout, often with uncommitted work.
+//! Under `defect_session = "start"` it may still file a GitHub issue for a
+//! still-open defect with nobody confirming.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -186,7 +190,7 @@ pub fn start_defect_session(
             settings_path: None,
             run_id: None,
             mode: RunMode::Headless,
-            tool_scope: crate::agent::ToolScope::Full,
+            tool_scope: crate::agent::ToolScope::ReadOnly,
         },
     );
 
@@ -409,8 +413,13 @@ mod tests {
             "{command}"
         );
         assert!(
-            !command.contains("mcp__thatch"),
-            "archaeology needs more than thatch's tools: {command}"
+            command.contains("'--permission-mode' 'dontAsk'"),
+            "the live checkout has no worktree to contain a bypass: {command}"
+        );
+        assert!(!command.contains("bypassPermissions"), "{command}");
+        assert!(
+            command.contains("Bash(git diff:*)"),
+            "archaeology reads git: {command}"
         );
         let log = fx.state_dir.path().join("retro-proj-7-1700000000.log");
         assert!(command.contains(&*log.to_string_lossy()), "{command}");
