@@ -4771,7 +4771,7 @@ mod tests {
         crate::work::autopilot::AutopilotStatus {
             scope: scope.to_string(),
             enabled,
-            running_lanes: 1,
+            running_lanes: vec!["GH-1".to_string()],
             max_lanes: 2,
             last_refusal: refusal.map(str::to_string),
             blocked_age_secs: None,
@@ -4795,7 +4795,7 @@ mod tests {
         assert!(
             alpha
                 .unwrap()
-                .contains("autopilot on · lanes 1/2 · paused: usage 87%"),
+                .contains("autopilot on · lanes 1/2 (GH-1) · paused: usage 87%"),
             "{text}"
         );
         let beta = text.lines().find(|l| l.contains("beta   1 stuck"));
@@ -4835,7 +4835,7 @@ mod tests {
         app.status_line = "loaded".to_string();
         assert_eq!(
             status_line_text(&app),
-            "autopilot on · lanes 1/2 · tick failed: gh: timed out  |  loaded"
+            "autopilot on · lanes 1/2 (GH-1) · tick failed: gh: timed out  |  loaded"
         );
     }
 

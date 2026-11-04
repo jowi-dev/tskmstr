@@ -1305,11 +1305,14 @@ The board's status bar starts with its repo's state. On the overview, a
 project with autopilot on shows it at the end of its strip line:
 
 ```
-autopilot on · lanes 2/2 · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
+autopilot on · lanes 2/2 (GH-7, GH-8) · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
 ```
 
 - **lanes**: this repo's lane runs running now, against `max_lanes` from
-  the config you started the TUI from
+  the config you started the TUI from, followed by their tickets. The
+  count is the one `max_lanes` caps and `tm dispatch status` prints, so a
+  legacy lane without a scope, or one the board's filter hides, is still
+  named.
 - **launched**: how long ago this repo last launched a lane. It is left out
   when the repo has never launched one.
 - the last part is the newest tick's refusal, from `dispatch_events`, and
