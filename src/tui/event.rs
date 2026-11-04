@@ -41,6 +41,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
 use crate::blocker_stacking::{ParentEpics, Readiness, readiness};
+use crate::cli::ready::AuditGate;
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
@@ -163,6 +164,10 @@ pub struct NetDeps {
     /// `[ready] inherit_epic_blockers`: whether [`board_readiness`] marks a
     /// child of a locked epic blocked (GitHub issue #178).
     pub inherit_epic_blockers: bool,
+    /// `[ready] require_audit`: whether [`board_readiness`] applies `tm
+    /// ready`'s audit gate, reading verdicts from [`NetDeps::store`] (GitHub
+    /// issue #193).
+    pub require_audit: bool,
 }
 
 /// Builds the network worker thread's [`NetDeps`] in place on that thread --
@@ -2639,6 +2644,10 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
 /// needs PRs for it), and a failed epic lookup makes that epic's children
 /// unknown.
 ///
+/// A ready or stackable card that fails `tm ready`'s audit gate
+/// ([`board_audit_gate`]) becomes [`Readiness::NeedsAudit`] (GitHub issue
+/// #193): autopilot will skip it, so it must not read as launchable.
+///
 /// [`GhCli::pr_list_all`]: crate::github::gh_cli::GhCli::pr_list_all
 fn board_readiness(
     deps: &NetDeps,
@@ -2675,11 +2684,35 @@ fn board_readiness(
     } else {
         None
     };
+    let gate = board_audit_gate(deps);
     let readiness = issues
         .iter()
-        .map(|issue| readiness(issue, prs.as_deref(), &epics))
+        .map(|issue| match readiness(issue, prs.as_deref(), &epics) {
+            ready @ (Readiness::Ready | Readiness::Stackable { .. }) => {
+                match gate.needs_audit(&issue.key) {
+                    Some(reason) => Readiness::NeedsAudit { reason },
+                    None => ready,
+                }
+            }
+            other => other,
+        })
         .collect();
     (readiness, degraded)
+}
+
+/// `tm ready`'s audit gate over the worker's own runs DB, so a card reads
+/// [`Readiness::NeedsAudit`] exactly when `tm ready` and the dispatcher
+/// would skip it. A runs DB that failed to open fails closed, as it does
+/// for `tm ready`.
+fn board_audit_gate(deps: &NetDeps) -> AuditGate<'_> {
+    match (&deps.store, deps.require_audit) {
+        (_, false) => AuditGate::Off,
+        (Some(store), true) => AuditGate::Store {
+            store,
+            scope: deps.backend_identity.scope(),
+        },
+        (None, true) => AuditGate::Unavailable("run database unavailable".to_string()),
+    }
 }
 
 /// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
@@ -3153,6 +3186,7 @@ mod tests {
             },
             runner: &crate::agent::claude::ClaudeRunner,
             inherit_epic_blockers: true,
+            require_audit: false,
         }
     }
 
@@ -3326,6 +3360,96 @@ mod tests {
             ]
         );
         assert_eq!(msgs.len(), 1, "no degradation note on success: {msgs:?}");
+    }
+
+    /// [`net_deps`] with `[ready] require_audit` on over a fresh runs DB
+    /// holding `audits` (ticket key, verdict) in the board's own scope.
+    fn audit_gated_deps(
+        jira: FakeJiraClient,
+        audits: &[(&str, &str)],
+    ) -> (NetDeps, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = net_deps(jira);
+        let scope = deps.backend_identity.scope();
+        for (key, verdict) in audits {
+            store.record_audit(&scope, key, verdict, None).unwrap();
+        }
+        deps.store = Some(store);
+        deps.require_audit = true;
+        (deps, dir)
+    }
+
+    #[test]
+    fn fetch_tickets_marks_unaudited_ready_and_stackable_tickets_needs_audit() {
+        use crate::github::gh_cli::{FakeGhCli, PrLifecycle};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![
+                issue("PROJ-1", "To Do"),
+                blocked_issue("PROJ-2", "PROJ-8"),
+                blocked_issue("PROJ-3", "PROJ-9"),
+                issue("PROJ-4", "To Do"),
+                issue("PROJ-5", "To Do"),
+            ],
+            next_page_token: None,
+        });
+        let (mut deps, _dir) =
+            audit_gated_deps(jira, &[("PROJ-4", "ready"), ("PROJ-5", "needs-work")]);
+        deps.gh = Box::new(FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            90,
+            "jowi-dev/proj-9-thing",
+            PrLifecycle::Open,
+        )])));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        let not_audited = Readiness::NeedsAudit {
+            reason: "not audited".to_string(),
+        };
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![
+                ("PROJ-1".to_string(), not_audited.clone()),
+                (
+                    "PROJ-2".to_string(),
+                    Readiness::Blocked {
+                        blocker_keys: vec!["PROJ-8".to_string()],
+                        via_epic: None,
+                    }
+                ),
+                ("PROJ-3".to_string(), not_audited),
+                ("PROJ-4".to_string(), Readiness::Ready),
+                (
+                    "PROJ-5".to_string(),
+                    Readiness::NeedsAudit {
+                        reason: "last audit was needs-work".to_string(),
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_tickets_fails_the_audit_gate_closed_without_a_runs_db() {
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do")],
+            next_page_token: None,
+        });
+        let mut deps = net_deps(jira);
+        deps.require_audit = true;
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        match &loaded_readiness(&msgs)[0].1 {
+            Readiness::NeedsAudit { reason } => {
+                assert!(reason.starts_with("audit store unavailable"), "{reason}")
+            }
+            other => panic!("expected NeedsAudit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3656,6 +3780,7 @@ mod tests {
             .with_issue(EPIC, epic_fixture::epic("indeterminate"));
         let deps = NetDeps {
             inherit_epic_blockers: false,
+            require_audit: false,
             ..net_deps(jira)
         };
         let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
