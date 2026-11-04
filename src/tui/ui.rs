@@ -1908,8 +1908,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("Enter/Space grab/drop (rank view)"),
         Line::from("?           toggle this help"),
         Line::from("card key markers:"),
-        Line::from("  ✓ ready ◐ stackable ! audit"),
-        Line::from("  ✗ blocked  ? unknown"),
+        Line::from("  ✓ ready  ✗ blocked  ? unknown"),
+        Line::from("  ◐ stackable  ! needs audit"),
         // The `review:` badge (GitHub issue #153) is the one badge whose
         // states aren't self-explanatory. On a 24-row terminal this column
         // fills all 17 of the overlay's inner rows, so adding a line here
@@ -3637,7 +3637,8 @@ mod tests {
         };
         let text = buffer_text(&render_with_size(&app, 80, 24));
         assert!(text.contains("mark audited"), "{text}");
-        assert!(text.contains("! audit"), "{text}");
+        assert!(text.contains("✓ ready  ✗ blocked  ? unknown"), "{text}");
+        assert!(text.contains("◐ stackable  ! needs audit"), "{text}");
         assert!(text.contains("press any key to close"), "{text}");
     }
 
