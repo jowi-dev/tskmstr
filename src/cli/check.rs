@@ -8,8 +8,9 @@
 //! - **The same structural presence checks `tm init` runs and discards**:
 //!   does every configured lane have a prompt file where a run would look
 //!   for it, does every configured session's `prompt_file` (when set) exist
-//!   where its launcher would read it, and does every configured session's
-//!   leading `/skill` exist somewhere this binary would find it?
+//!   where its launcher would read it, does every configured session's
+//!   leading `/skill` exist somewhere this binary would find it, and does
+//!   every skill a lane prompt names (GitHub issue #205) exist?
 //! - **Expected config keys** ([`manifest::EXPECTED_CONFIG_KEYS`], GitHub
 //!   issue #74): is every key a newer feature registered set in the repo or
 //!   global config? A missing key is named with its suggested value; a
@@ -20,10 +21,19 @@
 //! the runner it would be used with rejects. That check needs the merged
 //! config, so it is skipped with a note when the config doesn't load.
 //!
-//! The first three are presence-only. `tm check` never opens a scaffolded
-//! asset's *contents* — lane prompts and skills are meant to be edited after
-//! `tm init` writes them (GitHub issue #30's agent-assisted setup edits them
-//! on purpose), so a content diff would flag normal customization as drift.
+//! When a configured prompt names a thatch skill, it also reports **thatch's
+//! health** (GitHub issue #207): `thatch` missing from PATH, a `thatch
+//! --version` older than [`MIN_THATCH_VERSION`], and a named skill whose
+//! `SKILL.md` description limits it to an agent other than the runner. These
+//! come from [`run_check`] only, not [`collect_findings`], since `tm update`
+//! has no fix for them.
+//!
+//! The first three are presence-only. `tm check` never diffs a scaffolded
+//! asset's *contents* against its template — lane prompts and skills are
+//! meant to be edited after `tm init` writes them (GitHub issue #30's
+//! agent-assisted setup edits them on purpose), so a content diff would flag
+//! normal customization as drift. It reads a lane prompt only to learn which
+//! skills it names, then checks those are present.
 //! See [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]'s doc comment for
 //! the same point made from the stamp's side.
 //!
@@ -84,6 +94,47 @@ pub struct CheckContext<'a> {
     /// when unconfigured) — resolves default session prompts and skill
     /// directories the same way `tm init` does.
     pub runner: &'a dyn AgentRunner,
+    /// What `thatch --version` reported (GitHub issue #207), probed by the
+    /// caller with [`probe_thatch`] so tests don't depend on the host.
+    pub thatch: ThatchProbe,
+}
+
+/// The thatch install on PATH, as `tm check` sees it from `thatch
+/// --version` alone. tm never links against thatch or reads its database
+/// or config: the CLI's output and the skill files are the whole contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThatchProbe {
+    /// Not probed, so the thatch findings are skipped. `tm update` passes
+    /// this: it has no fix for thatch health and leaves it to `tm check`.
+    Unchecked,
+    /// `thatch` is not on PATH.
+    Missing,
+    /// `thatch` ran. `version` is its trimmed `--version` output, or `None`
+    /// when it failed or printed nothing; an unreadable version is not
+    /// reported, since it says nothing about the floor either way.
+    Installed { version: Option<String> },
+}
+
+/// The oldest thatch whose skills tm's scaffolded prompts are written
+/// against (the `thatch-refine` and `thatch-review-response` era). An older
+/// install is reported as drift, not refused: the prompts still launch.
+pub const MIN_THATCH_VERSION: &str = "0.3.0";
+
+/// Run `thatch --version` to see what is on PATH.
+pub fn probe_thatch() -> ThatchProbe {
+    match std::process::Command::new("thatch")
+        .arg("--version")
+        .output()
+    {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => ThatchProbe::Missing,
+        Err(_) => ThatchProbe::Installed { version: None },
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            ThatchProbe::Installed {
+                version: (output.status.success() && !text.is_empty()).then_some(text),
+            }
+        }
+    }
 }
 
 /// One line of drift between this repo's `.tskmstr.toml` and what the
@@ -122,6 +173,18 @@ pub enum DriftFinding {
         lane: String,
         agent: String,
         path: PathBuf,
+    },
+    /// A configured lane's prompt names a skill (as "the `name` skill", the
+    /// way the starter lane prompt names its thatch skills, GitHub issue
+    /// #205) that exists neither in the lane's repo nor at the user level,
+    /// e.g. because thatch isn't installed. Only skills the prompt still
+    /// names are checked, so removing a step from the prompt clears it.
+    /// `tm update` has no fix for it: the skill has to be installed.
+    MissingLaneSkill {
+        lane: String,
+        name: String,
+        repo_path: PathBuf,
+        home_path: PathBuf,
     },
     /// A configured session's prompt leads with a `/skill` invocation that
     /// exists neither repo-locally nor at the user level. `session` names
@@ -180,6 +243,33 @@ pub enum DriftFinding {
     LegacyAgentKeys {
         default: String,
         available: Option<Vec<String>>,
+    },
+    /// A configured prompt names a thatch skill (`session` is where it
+    /// came from, `skill` the first one named) but `thatch` is not on PATH
+    /// (GitHub issue #207). Reported once, for the first such prompt.
+    ThatchMissing { session: String, skill: String },
+    /// `thatch --version` is older than [`MIN_THATCH_VERSION`]. Reported
+    /// only when some configured prompt names a thatch skill.
+    ThatchOutdated { found: String, minimum: String },
+    /// A thatch skill a configured prompt names says in its description
+    /// that it only works on `host`, a different agent than `runner`, the
+    /// one this repo launches. `path` is the `SKILL.md` it was read from.
+    HostLimitedSkill {
+        session: String,
+        skill: String,
+        host: String,
+        runner: String,
+        path: PathBuf,
+    },
+    /// A `thatch-*` skill a configured prompt names has no `SKILL.md` in
+    /// `runner`'s repo-local or user-level skills dir, though `thatch` is
+    /// installed: `thatch setup` was never run for `runner`, or it installs
+    /// that skill only for another agent (Claude Code gets no
+    /// `thatch-code-review`, which is opencode only).
+    ThatchSkillNotInstalled {
+        session: String,
+        skill: String,
+        runner: String,
     },
 }
 
@@ -257,6 +347,17 @@ impl std::fmt::Display for DriftFinding {
                 repo_path.display(),
                 home_path.display()
             ),
+            DriftFinding::MissingLaneSkill {
+                lane,
+                name,
+                repo_path,
+                home_path,
+            } => write!(
+                f,
+                "lane `{lane}`'s prompt names the `{name}` skill, which exists neither at {} nor {}",
+                repo_path.display(),
+                home_path.display()
+            ),
             DriftFinding::LegacyPromptDir { key, value } => write!(
                 f,
                 "`{key}` = \"{value}\" points at the legacy top-level prompts/ directory; \
@@ -310,6 +411,38 @@ impl std::fmt::Display for DriftFinding {
                 }
                 Ok(())
             }
+            DriftFinding::ThatchMissing { session, skill } => write!(
+                f,
+                "[{session}] uses the thatch skill `{skill}`, but `thatch` is not on PATH; \
+                 install thatch and run `thatch setup` for your agent"
+            ),
+            DriftFinding::ThatchOutdated { found, minimum } => write!(
+                f,
+                "thatch {found} is older than {minimum}, the oldest tskmstr's prompts \
+                 are written against; update thatch"
+            ),
+            DriftFinding::HostLimitedSkill {
+                session,
+                skill,
+                host,
+                runner,
+                path,
+            } => write!(
+                f,
+                "[{session}] uses `{skill}`, which {} marks {host} only, \
+                 but this repo runs {runner}",
+                path.display()
+            ),
+            DriftFinding::ThatchSkillNotInstalled {
+                session,
+                skill,
+                runner,
+            } => write!(
+                f,
+                "[{session}] uses `{skill}`, which is not installed for {runner}; \
+                 run `thatch setup` for {runner}, or point the prompt at a skill \
+                 {runner} has"
+            ),
         }
     }
 }
@@ -332,6 +465,7 @@ pub fn run_check(
         .to_path_buf();
 
     let mut findings = collect_findings(ctx, &doc, &repo_dir);
+    findings.extend(thatch_findings(ctx, &doc, &repo_dir));
     let config = crate::config::load(ctx.paths).ok();
     let report = config.as_ref().map(model_report);
     if let Some((_, model_findings)) = &report {
@@ -747,11 +881,17 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
         .flat_map(|(lane, _)| {
             let mut findings = Vec::new();
             let resolved = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
-            if !resolved.exists() {
-                findings.push(DriftFinding::MissingLanePrompt {
+            match std::fs::read_to_string(&resolved) {
+                Ok(prompt) => {
+                    findings.extend(lane_skill_findings(ctx, doc, lane, repo_dir, &prompt))
+                }
+                Err(_) if !resolved.exists() => findings.push(DriftFinding::MissingLanePrompt {
                     lane: lane.to_string(),
                     path: resolved,
-                });
+                }),
+                // Present but unreadable: the lane run surfaces the error
+                // itself; there is no structural drift to report.
+                Err(_) => {}
             }
             if let Some(value) = str_at(doc, &["work", "lanes", lane, "prompt_file"])
                 && is_legacy_prompt_dir(value)
@@ -776,6 +916,59 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
             findings
         })
         .collect()
+}
+
+/// Flag every skill `prompt` names (see [`named_skills`]) that exists
+/// neither in the lane's repo (its `repo` key, resolved like a
+/// `prompt_file`, else the onboarded repo) nor at the user level.
+fn lane_skill_findings(
+    ctx: &CheckContext,
+    doc: &DocumentMut,
+    lane: &str,
+    repo_dir: &Path,
+    prompt: &str,
+) -> Vec<DriftFinding> {
+    let lane_repo = str_at(doc, &["work", "lanes", lane, "repo"])
+        .map(|value| resolve_repo_relative(value, repo_dir, ctx.home))
+        .unwrap_or_else(|| repo_dir.to_path_buf());
+    named_skills(prompt)
+        .into_iter()
+        .filter_map(|name| {
+            let repo_path = ctx.runner.skills_dir(&lane_repo).join(name);
+            let home_path = ctx.runner.skills_dir(ctx.home).join(name);
+            if repo_path.exists() || home_path.exists() {
+                return None;
+            }
+            Some(DriftFinding::MissingLaneSkill {
+                lane: lane.to_string(),
+                name: name.to_string(),
+                repo_path,
+                home_path,
+            })
+        })
+        .collect()
+}
+
+/// The skills a lane prompt names, in first-mention order without
+/// duplicates: every backticked name followed by the word "skill" (line
+/// breaks between them allowed), e.g. "the `thatch-pr-description` skill".
+/// This reads which assets a prompt references, not whether its wording
+/// matches a template, so customizing the prompt is never drift.
+///
+/// `pub(crate)`: `tm update`'s tests install the skills the starter lane
+/// prompt names with it.
+pub(crate) fn named_skills(prompt: &str) -> Vec<&str> {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"`([A-Za-z0-9][A-Za-z0-9_.:-]*)`\s+skill\b").expect("valid regex")
+    });
+    let mut names: Vec<&str> = Vec::new();
+    for capture in PATTERN.captures_iter(prompt) {
+        let name = capture.get(1).expect("group 1").as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// The three `[work.*]` session sections that carry a `prompt_file`: audit,
@@ -915,6 +1108,247 @@ fn session_finding(
     })
 }
 
+/// One configured prompt's text, labelled with the `[work.*]` section it
+/// came from, for the thatch scan.
+struct PromptText {
+    session: String,
+    text: String,
+}
+
+/// Every prompt a configured surface would launch with, as far as the
+/// config alone says: each lane's prompt file, and the `[work.audit]`,
+/// `[work.create]`, `[work.review_watch]` and `[work.auto_review]`
+/// sections' `prompt_file` contents, `prompt`, or built-in default. An
+/// absent section still counts, since those surfaces launch with their
+/// built-in defaults without one (`tm review auto` runs with
+/// `AutoReviewConfig::default()`); `[work.create]` has no default here, so
+/// it counts only when set. An unreadable file is skipped; the
+/// missing-file findings already cover it. `[work.auto_review]`'s `{skill}` placeholder
+/// is expanded once per round skill, so its built-in skills are scanned too.
+fn configured_prompts(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<PromptText> {
+    let mut prompts = Vec::new();
+    if let Some(lanes) = doc
+        .get("work")
+        .and_then(Item::as_table_like)
+        .and_then(|work| work.get("lanes"))
+        .and_then(Item::as_table_like)
+    {
+        for (lane, _) in lanes.iter() {
+            let path = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
+            if let Ok(text) = std::fs::read_to_string(path) {
+                prompts.push(PromptText {
+                    session: format!("work.lanes.{lane}"),
+                    text,
+                });
+            }
+        }
+    }
+
+    let sessions: [(&str, Option<&str>); 4] = [
+        ("audit", Some(ctx.runner.default_audit_prompt_template())),
+        ("create", None),
+        (
+            "review_watch",
+            Some(ctx.runner.default_cleanup_prompt_template()),
+        ),
+        (
+            "auto_review",
+            Some(crate::work::auto_review::DEFAULT_PROMPT),
+        ),
+    ];
+    for (table, default) in sessions {
+        let text = match str_at(doc, &["work", table, "prompt_file"]) {
+            Some(raw) => {
+                std::fs::read_to_string(resolve_repo_relative(raw, repo_dir, ctx.home)).ok()
+            }
+            None => str_at(doc, &["work", table, "prompt"])
+                .or(default)
+                .map(str::to_string),
+        };
+        let Some(text) = text else { continue };
+        let session = format!("work.{table}");
+        if table == "auto_review" {
+            for skill in [
+                crate::work::auto_review::FIRST_ROUND_SKILL,
+                crate::work::auto_review::FOLLOWUP_SKILL,
+            ] {
+                prompts.push(PromptText {
+                    session: session.clone(),
+                    text: text.replace("{skill}", skill),
+                });
+            }
+        } else {
+            prompts.push(PromptText { session, text });
+        }
+    }
+    prompts
+}
+
+/// The thatch skills `text` names, in order, without duplicates: every
+/// `thatch-<name>` token (not part of a longer word) and every
+/// `/thatch:<name>` plugin command, kept with its leading slash. Plain
+/// prose like "thatch memory" names no skill.
+fn thatch_skill_refs(text: &str) -> Vec<String> {
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    let mut refs: Vec<String> = Vec::new();
+    for (start, _) in text.match_indices("thatch") {
+        let before = text[..start].chars().next_back();
+        let rest = &text[start + "thatch".len()..];
+        let (prefix, sep) = match before {
+            Some('/') if rest.starts_with(':') => (start - 1, ':'),
+            Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => continue,
+            _ if rest.starts_with('-') => (start, '-'),
+            _ => continue,
+        };
+        let name_len = rest[1..]
+            .find(|c: char| !is_name_char(c))
+            .unwrap_or(rest.len() - 1);
+        let name = rest[1..1 + name_len].trim_end_matches('-');
+        if name.is_empty() {
+            continue;
+        }
+        let token = format!("{}{sep}{name}", &text[prefix..start + "thatch".len()]);
+        if !refs.contains(&token) {
+            refs.push(token);
+        }
+    }
+    refs
+}
+
+/// Parse a `thatch --version` line ("0.3.4", "thatch v0.3.4",
+/// "0.3.0-beta.1") into major/minor/patch: the last whitespace-separated
+/// word, minus a leading `v`, with any pre-release suffix dropped. `None`
+/// when that word doesn't start with a number.
+fn parse_version(raw: &str) -> Option<[u64; 3]> {
+    let word = raw.split_whitespace().next_back()?.trim_start_matches('v');
+    let core = word.split(['-', '+']).next()?;
+    let mut parts = [0u64; 3];
+    for (slot, part) in parts.iter_mut().zip(core.split('.')) {
+        *slot = part.parse().ok()?;
+    }
+    Some(parts)
+}
+
+/// The host a skill description limits the skill to, when that host is a
+/// known agent other than `runner`: a sentence that opens with "<host>
+/// only", where `<host>` is a runner's name or display name, compared
+/// without case. Only known hosts count, so "Informational only" is not a
+/// limit, and a mid-sentence "is opencode-only" (a note about one part of
+/// a skill that runs everywhere) is not either.
+fn host_limit(description: &str, runner: &dyn AgentRunner) -> Option<&'static str> {
+    let hosts: Vec<&'static dyn AgentRunner> = crate::config::AgentKind::names()
+        .iter()
+        .filter_map(|name| crate::config::AgentKind::parse(name))
+        .map(crate::agent::routing::runner_for)
+        .collect();
+    description.split('.').find_map(|sentence| {
+        let sentence = sentence.trim().to_lowercase();
+        hosts.iter().find_map(|host| {
+            let named = [host.name(), host.display_name()].into_iter().any(|label| {
+                sentence
+                    .strip_prefix(&label.to_lowercase())
+                    .is_some_and(|rest| rest.trim_start().starts_with("only"))
+            });
+            (named && host.name() != runner.name()).then(|| host.display_name())
+        })
+    })
+}
+
+/// The `description` value in a `SKILL.md`'s frontmatter, unquoted.
+fn skill_description(contents: &str) -> Option<String> {
+    let mut lines = contents.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    lines
+        .take_while(|line| line.trim() != "---")
+        .find_map(|line| line.strip_prefix("description:"))
+        .map(|value| value.trim().trim_matches(['"', '\'']).to_string())
+}
+
+/// The thatch half of the report (GitHub issue #207), run only when some
+/// configured prompt names a thatch skill: `thatch` missing from PATH or
+/// older than [`MIN_THATCH_VERSION`], and every named skill whose
+/// `SKILL.md` (repo-local first, then user-level, in the runner's skills
+/// dir) limits it to another agent. A skill found in neither place is
+/// reported as not installed when `thatch` itself is, since thatch setup
+/// leaves a host-limited skill out for the hosts it doesn't support.
+fn thatch_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<DriftFinding> {
+    if ctx.thatch == ThatchProbe::Unchecked {
+        return Vec::new();
+    }
+    let refs: Vec<(String, String)> = configured_prompts(ctx, doc, repo_dir)
+        .into_iter()
+        .flat_map(|prompt| {
+            thatch_skill_refs(&prompt.text)
+                .into_iter()
+                .map(move |skill| (prompt.session.clone(), skill))
+        })
+        .fold(Vec::new(), |mut acc, pair| {
+            if !acc.contains(&pair) {
+                acc.push(pair);
+            }
+            acc
+        });
+    let Some((session, skill)) = refs.first() else {
+        return Vec::new();
+    };
+
+    let mut findings = Vec::new();
+    match &ctx.thatch {
+        ThatchProbe::Missing => findings.push(DriftFinding::ThatchMissing {
+            session: session.clone(),
+            skill: skill.clone(),
+        }),
+        ThatchProbe::Installed {
+            version: Some(found),
+        } => {
+            let floor = parse_version(MIN_THATCH_VERSION);
+            if parse_version(found).is_some_and(|version| Some(version) < floor) {
+                findings.push(DriftFinding::ThatchOutdated {
+                    found: found.clone(),
+                    minimum: MIN_THATCH_VERSION.to_string(),
+                });
+            }
+        }
+        ThatchProbe::Installed { version: None } | ThatchProbe::Unchecked => {}
+    }
+
+    for (session, skill) in &refs {
+        if skill.starts_with('/') {
+            continue;
+        }
+        let candidates = [repo_dir, ctx.home]
+            .map(|base| ctx.runner.skills_dir(base).join(skill).join("SKILL.md"));
+        let Some((path, contents)) = candidates
+            .into_iter()
+            .find_map(|path| std::fs::read_to_string(&path).ok().map(|c| (path, c)))
+        else {
+            if matches!(ctx.thatch, ThatchProbe::Installed { .. }) {
+                findings.push(DriftFinding::ThatchSkillNotInstalled {
+                    session: session.clone(),
+                    skill: skill.clone(),
+                    runner: ctx.runner.display_name().to_string(),
+                });
+            }
+            continue;
+        };
+        if let Some(host) = skill_description(&contents)
+            .as_deref()
+            .and_then(|description| host_limit(description, ctx.runner))
+        {
+            findings.push(DriftFinding::HostLimitedSkill {
+                session: session.clone(),
+                skill: skill.clone(),
+                host: host.to_string(),
+                runner: ctx.runner.display_name().to_string(),
+                path,
+            });
+        }
+    }
+    findings
+}
+
 /// Render the report: one line per finding, then a blank line and a closing
 /// hint when drift exists, or a single "up to date" line when clean.
 fn render(findings: &[DriftFinding], out: &mut dyn Write) -> io::Result<()> {
@@ -974,11 +1408,23 @@ mod tests {
         }
     }
 
+    /// A context that skips the thatch probe: the default auto-review
+    /// prompt names thatch skills in every repo, so tests about other
+    /// findings would otherwise see thatch findings too.
     fn ctx<'a>(env: &'a TestEnv, runner: &'a dyn AgentRunner) -> CheckContext<'a> {
+        ctx_with_thatch(env, runner, ThatchProbe::Unchecked)
+    }
+
+    fn ctx_with_thatch<'a>(
+        env: &'a TestEnv,
+        runner: &'a dyn AgentRunner,
+        thatch: ThatchProbe,
+    ) -> CheckContext<'a> {
         CheckContext {
             paths: &env.paths,
             home: &env.home,
             runner,
+            thatch,
         }
     }
 
@@ -1062,6 +1508,80 @@ mod tests {
             rendered.contains("up to date (schema_version 2)"),
             "clean report in: {rendered}"
         );
+    }
+
+    #[test]
+    fn named_skills_finds_backticked_skill_references_in_order() {
+        let text = "Use the `thatch-code-archaeology` skill, then the\n\
+                    `thatch-coding-workflow`\n   skill. Run `tm ready` first.\n\
+                    Again the `thatch-code-archaeology` skill; `cargo` skills.";
+        assert_eq!(
+            named_skills(text),
+            vec!["thatch-code-archaeology", "thatch-coding-workflow"]
+        );
+        assert!(named_skills("no skills here, just `tm pr create`").is_empty());
+    }
+
+    fn write_lane_prompt(env: &TestEnv, body: &str) {
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, body).expect("write lane prompt");
+        write_repo_config(
+            env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             repo = \".\"\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+    }
+
+    #[test]
+    fn lane_prompt_naming_an_uninstalled_skill_is_reported() {
+        let env = test_env();
+        write_lane_prompt(
+            &env,
+            "Draft the body with the `thatch-pr-description` skill.\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::MissingLaneSkill {
+                lane: "widget".to_string(),
+                name: "thatch-pr-description".to_string(),
+                repo_path: env.repo_dir.join(".claude/skills/thatch-pr-description"),
+                home_path: env.home.join(".claude/skills/thatch-pr-description"),
+            }]
+        );
+        assert!(has_drift(&findings), "a missing lane skill is drift");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("lane `widget`") && rendered.contains("thatch-pr-description"),
+            "finding rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_prompt_skill_installed_at_home_or_in_repo_is_clean() {
+        let env = test_env();
+        write_lane_prompt(
+            &env,
+            "Use the `thatch-code-archaeology` skill and the `local-gates` skill.\n",
+        );
+        std::fs::create_dir_all(env.home.join(".claude/skills/thatch-code-archaeology"))
+            .expect("mkdir home skill");
+        std::fs::create_dir_all(env.repo_dir.join(".claude/skills/local-gates"))
+            .expect("mkdir repo skill");
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let findings = run_check(&ctx, &mut Vec::new()).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
     }
 
     #[test]
@@ -1267,7 +1787,7 @@ mod tests {
                 session: "work.audit".to_string(),
                 repo_path: env.repo_dir.join(".claude/skills/ticket-audit"),
                 home_path: env.home.join(".claude/skills/ticket-audit"),
-                prompt: "/ticket-audit {key}".to_string(),
+                prompt: ClaudeRunner.default_audit_prompt_template().to_string(),
             }]
         );
     }
@@ -2013,6 +2533,295 @@ mod tests {
         assert!(
             rendered.contains("opencode lane widget: venice/z-ai-glm-5-3-flash (built-in default)"),
             "{rendered}"
+        );
+    }
+
+    /// A repo whose one lane prompt names the `thatch-coding-workflow` skill,
+    /// with that skill and the default auto-review skills installed at the
+    /// user level.
+    fn thatch_lane_repo(env: &TestEnv) {
+        for skill in [
+            "thatch-coding-workflow",
+            crate::work::auto_review::FIRST_ROUND_SKILL,
+            crate::work::auto_review::FOLLOWUP_SKILL,
+        ] {
+            write_home_skill(env, skill, "A thatch skill.");
+        }
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &lane_prompt,
+            "Plan the change with the `thatch-coding-workflow` skill.\n",
+        )
+        .expect("write lane prompt");
+        write_repo_config(
+            env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+    }
+
+    fn check_with(env: &TestEnv, thatch: ThatchProbe) -> (Vec<DriftFinding>, String) {
+        let runner = ClaudeRunner;
+        let ctx = ctx_with_thatch(env, &runner, thatch);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+        (findings, String::from_utf8(out).expect("utf8"))
+    }
+
+    #[test]
+    fn thatch_missing_from_path_is_reported_when_a_prompt_names_a_thatch_skill() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+
+        let (findings, rendered) = check_with(&env, ThatchProbe::Missing);
+
+        let expected = DriftFinding::ThatchMissing {
+            session: "work.lanes.widget".to_string(),
+            skill: "thatch-coding-workflow".to_string(),
+        };
+        assert_eq!(findings, vec![expected.clone()]);
+        assert!(!expected.is_advisory());
+        assert!(
+            rendered.contains("`thatch` is not on PATH")
+                && rendered.contains("thatch-coding-workflow")
+                && rendered.contains("thatch setup"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn default_auto_review_prompt_is_scanned_without_its_table() {
+        let env = test_env();
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, _) = check_with(&env, ThatchProbe::Missing);
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::ThatchMissing {
+                session: "work.auto_review".to_string(),
+                skill: crate::work::auto_review::FIRST_ROUND_SKILL.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn thatch_missing_is_silent_when_no_prompt_names_a_thatch_skill() {
+        let env = test_env();
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, "Recall thatch memory, then work.\n").expect("write");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             [work.auto_review]\n\
+             prompt = \"Review {key} with /review.\"\n",
+        );
+
+        let (findings, _) = check_with(&env, ThatchProbe::Missing);
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn unchecked_thatch_probe_reports_nothing() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+
+        let (findings, _) = check_with(&env, ThatchProbe::Unchecked);
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn thatch_older_than_the_floor_is_drift() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+
+        let (findings, rendered) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some("0.2.9".to_string()),
+            },
+        );
+
+        let expected = DriftFinding::ThatchOutdated {
+            found: "0.2.9".to_string(),
+            minimum: MIN_THATCH_VERSION.to_string(),
+        };
+        assert_eq!(findings, vec![expected.clone()]);
+        assert!(!expected.is_advisory());
+        assert!(
+            rendered.contains("0.2.9") && rendered.contains(MIN_THATCH_VERSION),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn thatch_at_or_above_the_floor_is_clean_whatever_the_prefix() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+
+        for version in ["thatch v0.3.4", "1.0.0", "0.3.0-beta.1"] {
+            let (findings, _) = check_with(
+                &env,
+                ThatchProbe::Installed {
+                    version: Some(version.to_string()),
+                },
+            );
+            assert!(findings.is_empty(), "{version}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn unreadable_thatch_version_is_not_reported() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+
+        let (findings, _) = check_with(&env, ThatchProbe::Installed { version: None });
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// Writes a `SKILL.md` under the user-level Claude Code skills dir with
+    /// `description` as its frontmatter description.
+    fn write_home_skill(env: &TestEnv, name: &str, description: &str) {
+        let dir = env.home.join(".claude/skills").join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir skill");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody.\n"),
+        )
+        .expect("write skill");
+    }
+
+    #[test]
+    fn host_limited_skill_is_reported_with_session_skill_and_runner() {
+        let env = test_env();
+        write_home_skill(
+            &env,
+            "thatch-code-review",
+            "Multi-agent code review coordinator. opencode only (requires sub-agent support).",
+        );
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        write_repo_config(
+            &env,
+            "schema_version = 2\n\
+             [work.auto_review]\n\
+             fix_threshold = \"medium\"\n",
+        );
+
+        let (findings, rendered) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        let expected = DriftFinding::HostLimitedSkill {
+            session: "work.auto_review".to_string(),
+            skill: "thatch-code-review".to_string(),
+            host: "opencode".to_string(),
+            runner: "Claude Code".to_string(),
+            path: env.home.join(".claude/skills/thatch-code-review/SKILL.md"),
+        };
+        assert_eq!(findings, vec![expected.clone()]);
+        assert!(!expected.is_advisory());
+        assert!(
+            rendered.contains("[work.auto_review]")
+                && rendered.contains("thatch-code-review")
+                && rendered.contains("opencode only")
+                && rendered.contains("Claude Code"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn named_skill_absent_from_the_runners_skills_dirs_is_reported() {
+        let env = test_env();
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, rendered) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        let expected = DriftFinding::ThatchSkillNotInstalled {
+            session: "work.auto_review".to_string(),
+            skill: "thatch-code-review".to_string(),
+            runner: "Claude Code".to_string(),
+        };
+        assert_eq!(findings, vec![expected.clone()]);
+        assert!(!expected.is_advisory());
+        assert!(
+            rendered.contains("[work.auto_review]")
+                && rendered.contains("thatch-code-review")
+                && rendered.contains("Claude Code")
+                && rendered.contains("thatch setup"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn skill_limited_to_the_running_host_is_clean() {
+        let env = test_env();
+        thatch_lane_repo(&env);
+        write_home_skill(
+            &env,
+            "thatch-coding-workflow",
+            "Workflow. Claude Code only.",
+        );
+
+        let (findings, _) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn only_in_other_phrasings_is_not_a_host_limit() {
+        for description in [
+            "Teaching notes. Informational only, never blocking.",
+            "The lens fan-out is opencode-only; on Claude Code the lenses run inline.",
+            "Runs everywhere, not opencode only.",
+        ] {
+            assert_eq!(
+                host_limit(description, &ClaudeRunner),
+                None,
+                "{description}"
+            );
+        }
+        assert_eq!(
+            host_limit(
+                "Coordinator. opencode only (needs sub-agents).",
+                &ClaudeRunner
+            ),
+            Some("opencode")
+        );
+    }
+
+    #[test]
+    fn thatch_skill_refs_finds_skill_names_and_plugin_commands() {
+        let text = "Use `thatch-review-pedantic`, thatch-review-economy, and \
+                    /thatch:refine. Recall thatch memory. Not mythatch-x.";
+        assert_eq!(
+            thatch_skill_refs(text),
+            vec![
+                "thatch-review-pedantic".to_string(),
+                "thatch-review-economy".to_string(),
+                "/thatch:refine".to_string(),
+            ]
         );
     }
 }

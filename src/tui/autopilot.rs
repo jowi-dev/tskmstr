@@ -66,7 +66,7 @@ pub fn toggled(
         None => app.autopilot.push(AutopilotStatus {
             scope: scope.clone(),
             enabled,
-            running_lanes: 0,
+            running_lanes: Vec::new(),
             max_lanes: 0,
             last_refusal: None,
             blocked_age_secs: None,
@@ -142,7 +142,7 @@ pub fn status_for<'a>(app: &'a App, scope: &str) -> Option<&'a AutopilotStatus> 
     app.autopilot.iter().find(|status| status.scope == scope)
 }
 
-/// `scope`'s status line, e.g. `autopilot on · lanes 1/2`, or `None` before
+/// `scope`'s status line, e.g. `autopilot on · lanes 1/2 (GH-1)`, or `None` before
 /// its first status load.
 pub fn summary_for(app: &App, scope: &str) -> Option<String> {
     status_for(app, scope)
@@ -230,7 +230,7 @@ mod tests {
         AutopilotStatus {
             scope: scope.to_string(),
             enabled,
-            running_lanes: 1,
+            running_lanes: vec!["GH-1".to_string()],
             max_lanes: 2,
             last_refusal: None,
             blocked_age_secs: None,
@@ -369,7 +369,7 @@ mod tests {
         );
         assert_eq!(
             summary_for(&app, "s").unwrap(),
-            "autopilot on · lanes 1/2 · tick failed: gh: timed out"
+            "autopilot on · lanes 1/2 (GH-1) · tick failed: gh: timed out"
         );
 
         let (app, _) = update(

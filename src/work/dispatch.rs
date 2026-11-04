@@ -19,7 +19,8 @@
 //! 4. Orders them by how many other candidates each unblocks, most first,
 //!    keeping the tracker's rank order within a tie.
 //! 5. Launches them in that order through a [`Launcher`] while the running
-//!    lane count is under `max_lanes`, the scope launched fewer than
+//!    lane count is under `max_lanes` (counted per scope, ADR-0011), the
+//!    scope launched fewer than
 //!    `max_launches_per_day` lanes in the last 24 hours, and memory and
 //!    usage admission pass.
 //!    The first refusal ends the tick; a failed launch is recorded and the
@@ -276,10 +277,12 @@ pub enum Skip {
 /// one ticket).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
-    /// `max_lanes` lanes are already running.
+    /// `max_lanes` lanes are already running in the scope.
     MaxLanes {
-        /// Lanes running now, across every scope.
-        running: usize,
+        /// Tickets of the lanes counted: the scope's running lanes plus
+        /// legacy unscoped ones, oldest first (see
+        /// [`RunStore::running_lane_tickets`]).
+        running: Vec<String>,
         /// `[dispatch] max_lanes`.
         max: usize,
     },
@@ -316,7 +319,9 @@ impl fmt::Display for Refusal {
         match self {
             Refusal::MaxLanes { running, max } => write!(
                 f,
-                "not launching: {running} lanes running, [dispatch] max_lanes is {max}"
+                "not launching: {} lanes running ({}), [dispatch] max_lanes is {max}",
+                running.len(),
+                running.join(", ")
             ),
             Refusal::DailyCap { launched, max } => write!(
                 f,
@@ -452,9 +457,9 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
 
     let mut report = TickReport::default();
     let mut refused_ticket = None;
-    let mut running = deps.store.running_lanes()?.len();
+    let mut running = deps.store.running_lane_tickets(cfg.scope)?;
     for candidate in queue {
-        match admit(deps, cfg, running)? {
+        match admit(deps, cfg, &running)? {
             Ok((lane, runner)) => match deps.launcher.launch(&lane.name, &candidate.key) {
                 Ok(()) => {
                     let stacked_on = match candidate.decision {
@@ -471,13 +476,13 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
                         LAUNCH_EVENT,
                         &detail,
                     )?;
+                    running.push(candidate.key.clone());
                     report.launched.push(Launch {
                         ticket: candidate.key,
                         lane: lane.name.clone(),
                         runner: runner.to_string(),
                         stacked_on,
                     });
-                    running += 1;
                 }
                 Err(error) => {
                     if report.refused.is_none() {
@@ -526,7 +531,7 @@ fn skipped(skip: Skip) -> TickReport {
     }
 }
 
-/// Whether one more lane may launch now, with `running` lanes running:
+/// Whether one more lane may launch now, with the scope's `running` lanes:
 /// the lane to launch into and the runner to launch it on, or the first
 /// gate that refuses. Gates run cheapest first, so a full machine never
 /// spawns a usage probe. Memory and usage admission run per runner
@@ -535,11 +540,11 @@ fn skipped(skip: Skip) -> TickReport {
 fn admit<'c>(
     deps: &TickDeps,
     cfg: &'c TickConfig,
-    running: usize,
+    running: &[String],
 ) -> Result<Result<(&'c LaneChoice, &'c str), Refusal>, DispatchError> {
-    if running >= cfg.max_lanes {
+    if running.len() >= cfg.max_lanes {
         return Ok(Err(Refusal::MaxLanes {
-            running,
+            running: running.to_vec(),
             max: cfg.max_lanes,
         }));
     }
@@ -1167,16 +1172,44 @@ mod tests {
         assert_eq!(launcher.tickets(), vec!["GH-1"]);
         assert_eq!(
             report.refused,
-            Some(Refusal::MaxLanes { running: 2, max: 2 })
+            Some(Refusal::MaxLanes {
+                running: vec!["GH-OTHER".to_string(), "GH-1".to_string()],
+                max: 2
+            })
         );
         assert_eq!(
             fx.events().last().unwrap(),
             &(
                 Some("GH-2".to_string()),
                 REFUSED_EVENT.to_string(),
-                "not launching: 2 lanes running, [dispatch] max_lanes is 2".to_string()
+                "not launching: 2 lanes running (GH-OTHER, GH-1), [dispatch] max_lanes is 2"
+                    .to_string()
             )
         );
+    }
+
+    #[test]
+    fn max_lanes_counts_only_the_ticking_scopes_lanes() {
+        let mut fx = Fixture::new();
+        fx.max_lanes = 1;
+        fx.store
+            .start_run(&StartRun {
+                ticket: "AX-809".to_string(),
+                scope: "jira:AX".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/wt/ax-809".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        let report = fx.tick(&[ready("GH-1", 0)], &launcher);
+
+        assert_eq!(launcher.tickets(), vec!["GH-1"]);
+        assert_eq!(report.refused, None);
     }
 
     #[test]

@@ -7,13 +7,13 @@ document, meant for scripts and for a future tskmstr GUI that reads the
 export instead of calling Jira or GitHub itself.
 
 ```
-tm graph [EPIC] [--json | --mermaid]
+tm graph [EPIC] [--json | --mermaid | --html]
 ```
 
 With no flag, `tm graph` prints one line per epic, `KEY  STATUS  TITLE
 (done/total)`, followed by indented `unlocks:` and `unlocked by:` lines when
-the epic has any. `--json` and `--mermaid` pick the other two views and
-cannot be combined.
+the epic has any. `--json`, `--mermaid`, and `--html` pick the other three
+views, and only one can be given.
 
 ## Recording an unlocks link
 
@@ -254,3 +254,34 @@ viewers render. It draws epics and unlocks links only:
   digit replaced by `_` (`owner/repo#12` becomes `owner_repo_12`). Labels
   are double-quoted, with `#` written as `#35;` and `"` as `#quot;`, so
   titles with quotes, brackets, or pipes render.
+
+## HTML output
+
+`tm graph --html` prints one self-contained HTML page, for sharing the plan
+with people who do not run tm:
+
+```
+tm graph --html > plan.html
+```
+
+The page loads nothing from the network: its styles and drawing script are
+inline, so it opens offline from a file or an email attachment. It is
+read-only and does not refresh; run the command again for a new snapshot.
+
+- It draws the same nodes as the Mermaid view: every epic, and each plain
+  ticket at the end of an unlocks link, with an arrow per unlocks link.
+  Children appear only as each epic's `done/total` count and progress bar.
+- Each epic is colored by its availability: **available** (green, can
+  start now), **locked** (amber, waiting on an unfinished unlocker, with
+  its wave), or **done** (purple, dashed border, title struck through).
+  Plain tickets are gray.
+- Columns follow the unlocks links left to right: an epic sits one column
+  after its furthest unlocker.
+- Clicking a node opens its ticket URL. Graph warnings, such as unlocks
+  cycles, are listed above the drawing.
+
+The page embeds the JSON document above, unchanged, as `document` inside a
+`<script type="application/json" id="graph-data">` element, next to an
+`epics` object that maps each epic key to its `availability` (`available`,
+`locked`, or `done`) and `wave`. The embedded copy is not a separate format:
+read `tm graph --json` instead of scraping the page.

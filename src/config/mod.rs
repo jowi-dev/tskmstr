@@ -577,8 +577,9 @@ pub struct RawAuditConfig {
     /// responsibility. Required to enable launching at all.
     pub dir: Option<String>,
     /// Prompt template fed to `claude` on launch, with `{key}` replaced by
-    /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to
-    /// `/ticket-audit {key}` when unset.
+    /// the ticket key, e.g. `/ticket-audit {key}`. Defaults to the agent
+    /// runner's audit template when unset (see
+    /// [`crate::agent::AgentRunner::default_audit_prompt_template`]).
     pub prompt: Option<String>,
     /// Model the launched session passes as `--model`, e.g. `opus`. Takes
     /// precedence over [`RawWorkConfig::default_model`] for audits: an
@@ -679,6 +680,10 @@ pub struct RawMergeConfig {
     /// setting this alongside either is not a
     /// [`ConfigError::PromptSourceConflict`].
     pub batch_conflict_prompt: Option<String>,
+    /// Whether a successful `tm merge` starts a short headless agent
+    /// session that consolidates the merged branches' thatch memories into
+    /// an archived record (GitHub issue #208). Defaults to `true` when unset.
+    pub consolidate_memories: Option<bool>,
 }
 
 /// Raw, partially-specified `[work.manual]` subsection as parsed directly
@@ -1151,9 +1156,11 @@ pub struct DispatchConfig {
     /// or `F`), but only the automatic triggers stop at it. Defaults to
     /// [`DEFAULT_MAX_FIX_ROUNDS`].
     pub max_fix_rounds: u32,
-    /// The most lane runs the autopilot dispatcher lets run at once
-    /// (`crate::work::dispatch::tick`). Every running lane counts, however
-    /// it was launched. Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
+    /// The most lane runs the autopilot dispatcher lets run at once in one
+    /// scope (`crate::work::dispatch::tick`). Every running lane in the
+    /// ticking scope counts, however it was launched, plus legacy unscoped
+    /// lanes; lanes in other scopes do not (GitHub issue #170, ADR-0011).
+    /// Defaults to [`DEFAULT_DISPATCH_MAX_LANES`].
     pub max_lanes: usize,
     /// The most lanes the autopilot dispatcher launches for one scope in
     /// any rolling 24 hours, a backstop against a runaway dispatcher
@@ -1364,9 +1371,11 @@ pub struct CreateConfig {
 /// key, ahead of `[work] default_model` (see `crate::work::model`).
 /// `batch_conflict_prompt` overrides the built-in template for the combined
 /// session a multi-key `tm merge` opens (its one placeholder is
-/// `{ticket_list}`). All fields are optional: an absent section falls back
-/// to the built-in prompts and the rest of the model chain.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `{ticket_list}`). `consolidate_memories` turns the post-merge
+/// memory-consolidation session on or off. All fields are optional: an
+/// absent section falls back to the built-in prompts, the rest of the model
+/// chain, and consolidation on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeConfig {
     /// See [`RawMergeConfig::prompt`].
     pub prompt: Option<String>,
@@ -1376,6 +1385,20 @@ pub struct MergeConfig {
     pub model: Option<String>,
     /// See [`RawMergeConfig::batch_conflict_prompt`].
     pub batch_conflict_prompt: Option<String>,
+    /// See [`RawMergeConfig::consolidate_memories`]; `true` when unset.
+    pub consolidate_memories: bool,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        MergeConfig {
+            prompt: None,
+            prompt_file: None,
+            model: None,
+            batch_conflict_prompt: None,
+            consolidate_memories: true,
+        }
+    }
 }
 
 /// Fully validated `[work.manual]` subsection.
@@ -2829,6 +2852,10 @@ fn merge_merge_section(
         prompt_file,
         model: repo.model.or(global.model),
         batch_conflict_prompt: repo.batch_conflict_prompt.or(global.batch_conflict_prompt),
+        consolidate_memories: repo
+            .consolidate_memories
+            .or(global.consolidate_memories)
+            .unwrap_or(true),
     })
 }
 
@@ -6224,6 +6251,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_work_consolidate_memories_defaults_on() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert!(cfg.merge.consolidate_memories);
+    }
+
+    #[test]
+    fn merge_work_consolidate_memories_repo_overrides_global() {
+        let section = |on: bool| RawWorkConfig {
+            merge: Some(RawMergeConfig {
+                consolidate_memories: Some(on),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(section(true)), Some(section(false)), None).expect("merge");
+        assert!(!cfg.merge.consolidate_memories);
+
+        let cfg = merge_work(Some(section(false)), None, None).expect("merge");
+        assert!(!cfg.merge.consolidate_memories);
+    }
+
+    #[test]
     fn merge_work_batch_conflict_prompt_repo_overrides_global() {
         let global = RawWorkConfig {
             merge: Some(RawMergeConfig {
@@ -6312,6 +6361,7 @@ mod tests {
                 prompt_file: None,
                 model: Some("opus".to_string()),
                 batch_conflict_prompt: None,
+                consolidate_memories: None,
             }),
             ..Default::default()
         };
@@ -6321,6 +6371,7 @@ mod tests {
                 prompt_file: None,
                 model: Some("sonnet".to_string()),
                 batch_conflict_prompt: None,
+                consolidate_memories: None,
             }),
             ..Default::default()
         };
