@@ -1,4 +1,4 @@
-# ADR-0011: tm Is the Control Plane, thatch Is the Agent Plane
+# ADR-0012: tm Is the Control Plane, thatch Is the Agent Plane
 
 **Status:** Accepted
 **Date:** 2026-11-04

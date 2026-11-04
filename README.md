@@ -20,7 +20,7 @@ memory, planning, review and session coordination. tm itself owns tickets,
 dispatch, admission, processes, worktrees and merges. The split, and the
 rule that agent-side features check thatch before tm builds them, is
 recorded in
-[ADR-0011](docs/decisions/0011-tm-control-plane-thatch-agent-plane.md).
+[ADR-0012](docs/decisions/0012-tm-control-plane-thatch-agent-plane.md).
 
 ## Setup
 
