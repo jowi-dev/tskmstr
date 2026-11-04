@@ -1011,11 +1011,14 @@ struct PromptText {
 }
 
 /// Every prompt a configured surface would launch with, as far as the
-/// config alone says: each lane's prompt file, and each present
-/// `[work.audit]`, `[work.create]`, `[work.review_watch]` and
-/// `[work.auto_review]` section's `prompt_file` contents, `prompt`, or
-/// built-in default. An unreadable file is skipped; the missing-file
-/// findings already cover it. `[work.auto_review]`'s `{skill}` placeholder
+/// config alone says: each lane's prompt file, and the `[work.audit]`,
+/// `[work.create]`, `[work.review_watch]` and `[work.auto_review]`
+/// sections' `prompt_file` contents, `prompt`, or built-in default. An
+/// absent section still counts, since those surfaces launch with their
+/// built-in defaults without one (`tm review auto` runs with
+/// `AutoReviewConfig::default()`); `[work.create]` has no default here, so
+/// it counts only when set. An unreadable file is skipped; the
+/// missing-file findings already cover it. `[work.auto_review]`'s `{skill}` placeholder
 /// is expanded once per round skill, so its built-in skills are scanned too.
 fn configured_prompts(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<PromptText> {
     let mut prompts = Vec::new();
@@ -1049,13 +1052,6 @@ fn configured_prompts(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) ->
         ),
     ];
     for (table, default) in sessions {
-        let present = doc
-            .get("work")
-            .and_then(Item::as_table_like)
-            .is_some_and(|work| work.contains_key(table));
-        if !present {
-            continue;
-        }
         let text = match str_at(doc, &["work", table, "prompt_file"]) {
             Some(raw) => {
                 std::fs::read_to_string(resolve_repo_relative(raw, repo_dir, ctx.home)).ok()
@@ -1299,14 +1295,11 @@ mod tests {
         }
     }
 
+    /// A context that skips the thatch probe: the default auto-review
+    /// prompt names thatch skills in every repo, so tests about other
+    /// findings would otherwise see thatch findings too.
     fn ctx<'a>(env: &'a TestEnv, runner: &'a dyn AgentRunner) -> CheckContext<'a> {
-        ctx_with_thatch(
-            env,
-            runner,
-            ThatchProbe::Installed {
-                version: Some(MIN_THATCH_VERSION.to_string()),
-            },
-        )
+        ctx_with_thatch(env, runner, ThatchProbe::Unchecked)
     }
 
     fn ctx_with_thatch<'a>(
@@ -2403,6 +2396,22 @@ mod tests {
     }
 
     #[test]
+    fn default_auto_review_prompt_is_scanned_without_its_table() {
+        let env = test_env();
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, _) = check_with(&env, ThatchProbe::Missing);
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::ThatchMissing {
+                session: "work.auto_review".to_string(),
+                skill: crate::work::auto_review::FIRST_ROUND_SKILL.to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn thatch_missing_is_silent_when_no_prompt_names_a_thatch_skill() {
         let env = test_env();
         let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
@@ -2412,7 +2421,9 @@ mod tests {
             &env,
             "schema_version = 2\n\
              [work.lanes.widget]\n\
-             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n\
+             [work.auto_review]\n\
+             prompt = \"Review {key} with /review.\"\n",
         );
 
         let (findings, _) = check_with(&env, ThatchProbe::Missing);

@@ -118,8 +118,9 @@ checked (see `docs/decisions/0007-asset-schema-version.md`).
 When any configured prompt names a thatch skill (a `thatch-<name>` token
 or a `/thatch:<name>` command in a lane prompt file, or in the
 `[work.audit]`, `[work.create]`, `[work.review_watch]` or
-`[work.auto_review]` prompt, built-in defaults included), `tm check`
-also reports thatch's health as drift:
+`[work.auto_review]` prompt, built-in defaults included even when the
+section is absent; the default auto-review prompt names
+`thatch-code-review`), `tm check` also reports thatch's health as drift:
 
 - **thatch missing**: `thatch` is not on PATH. Install it and run
   `thatch setup` for your agent (e.g. `thatch setup --claude --global`);
