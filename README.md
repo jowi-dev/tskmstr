@@ -260,7 +260,7 @@ tm auth status
 | `tm ticket audit <KEY>` | Print `<KEY>`'s summary, status, assignee, links, last recorded audit (plus its usage, if any), and description — the material for an audit conversation |
 | `tm ticket audit <KEY> --record <ready\|needs-work> [--notes]` | Record an audit verdict for `<KEY>` (offline; never touches Jira) |
 | `tm ticket retro <KEY> --clean` | Record that `<KEY>` shipped clean, with no known production defect (offline; never touches Jira) |
-| `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity |
+| `tm ticket retro <KEY> --defect --severity <minor\|major\|critical> [--note]` | Record that `<KEY>` shipped a production defect, with its severity, then offer a session that saves the lesson as a thatch memory (see `[work.retro]`) |
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
@@ -986,7 +986,8 @@ config" below.
 
 Every agent tm launches gets an explicit `--model`: lane runs and their
 usage-limit fallbacks, `tm review fix`/`auto`, `tm merge` conflict sessions
-(single and batch), the `tm init`/`tm update` setup session, the board's
+(single and batch), the `tm ticket retro --defect` session, the
+`tm init`/`tm update` setup session, the board's
 audit, create and review_watch cleanup sessions, and the usage probe. None
 of them falls through to the agent CLI's own default, so an
 enterprise-pinned claude model is overridden too. A launch on runner R
@@ -994,7 +995,8 @@ takes the first of these that R accepts (GitHub issue #143):
 
 1. `tm work run --model` (lane runs only);
 2. the surface's own key: the lane's `model` (lane runs, review fix/auto),
-   `[work.merge] model`, `[work.audit] model`, `[work.create] model`, or
+   `[work.merge] model`, `[work.retro] model`, `[work.audit] model`,
+   `[work.create] model`, or
    `[work.review_watch] model` (which falls back to `[work.audit] model`).
    The setup session has no key of its own;
 3. `[work] default_model`;
@@ -3206,6 +3208,57 @@ across the rest, and total/average cost over those runs. A ticket with a
 verdict but no run (common — not all shipped work goes through a lane)
 contributes to the ticket count but is excluded from the cost columns
 entirely, rather than counted as a `$0` run.
+
+#### Saving a defect's lesson as a thatch memory
+
+A defect recorded only in runs.db is invisible to the next agent that
+changes the same code. So once `tm ticket retro <KEY> --defect` has
+recorded its verdict, tm offers a short agent session that saves the lesson
+where lanes already look: a thatch project memory (GitHub issue #227).
+`--clean` retros never start one.
+
+The session gets the ticket, its PR (the latest PR URL tm recorded for the
+ticket's runs, or a hint to find it with `gh` when none was recorded), the
+severity, and the note. It uses the `thatch-code-archaeology` skill to find
+what in the shipped change caused the defect, then saves exactly one
+unscoped memory in the repo's project store naming the area of the code,
+the cause, and the warning sign a future change there should watch for. If
+the defect is still open, it hands it to the `thatch-bug-intake` skill to
+file rather than fixing it.
+
+It runs headless in a `retro` window, at the root of the repo you ran
+`tm ticket retro` in, on your current tmux session (or the ticket's own
+session outside tmux). tm doesn't wait for it: the window closes when the
+agent exits, and its output goes to `retro-<key>-<timestamp>.log` under
+tm's run-state directory. It has a 60-turn budget and no run row.
+
+Because it runs in your live checkout rather than an isolated worktree, it
+never gets the permission bypass lanes run with. Under claude it may only
+read and search files, load skills, use thatch's MCP tools, and run
+read-only `git` (`log`, `show`, `diff`, `blame`) and `gh` (`pr view`,
+`pr diff`, `pr list`, `issue view`, `issue list`) commands, plus
+`gh issue create`; every other call is denied. opencode has no CLI flag for
+that allowlist, so under opencode tm passes no bypass and your own
+opencode `permission` config decides, auto-rejecting any ask in a headless
+run. With `defect_session = "start"`, a still-open defect is filed as a
+GitHub issue with nobody confirming it.
+
+The verdict is recorded first and stays recorded whatever happens next: a
+session that fails to start (outside a git repo, say, or refused by memory
+admission) only prints a warning, and the command still exits `0`.
+
+Configure it with `[work.retro]`:
+
+```toml
+[work.retro]
+# defect_session = "ask"   # optional; "ask" (default), "start", or "off"
+# model = "opus"           # optional; see "Which model a launch uses"
+```
+
+`"ask"` confirms on the terminal before starting; with no terminal (a
+script or an agent running the command), it starts nothing and prints how
+to turn on `"start"`. `"start"` starts the session without asking, and
+`"off"` never starts it. Any other value is a config error.
 
 ### Commenting
 

@@ -248,6 +248,14 @@ pub enum ToolScope {
     /// #208). Overrides the run's permission mode, since a bypass would
     /// re-open every tool the scope exists to close.
     ThatchOnly,
+    /// Read-only investigation plus thatch: file reads and searches, skill
+    /// loading, the read-only `git` and `gh` subcommands, `gh issue create`
+    /// for filing a bug, and thatch's MCP tools. No file edits and no shell
+    /// command outside that list. For untracked sessions that need to read
+    /// code in the operator's own checkout, such as the defect retro session
+    /// `tm ticket retro --defect` starts (GitHub issue #227). Like
+    /// [`ToolScope::ThatchOnly`], it overrides the run's permission mode.
+    ReadOnly,
 }
 
 /// Already-resolved inputs for one run's agent invocation. Everything here
@@ -931,6 +939,34 @@ pub trait AgentRunner: Sync {
          not change code, git state, or tickets."
     }
 
+    /// Prompt for the short headless session `tm ticket retro --defect`
+    /// starts to save the defect's lesson as a thatch project memory
+    /// (GitHub issue #227). Its placeholders are substituted by the caller
+    /// (`crate::work::retro`): `{key}` (the ticket), `{severity}`, `{pr}`
+    /// (the ticket's PR URL as runs.db recorded it, or a fallback line
+    /// telling the agent to find it), and `{note}` (the retro's note, or
+    /// `none`).
+    ///
+    /// Runner-neutral for the same reason as
+    /// [`AgentRunner::default_memory_consolidation_prompt_template`]: it
+    /// names thatch's skills and MCP tools, which every runner reaches the
+    /// same way.
+    fn default_defect_retro_prompt_template(&self) -> &'static str {
+        "Ticket {key} shipped and later caused a production defect.\n\n\
+         - Severity: {severity}\n\
+         - Pull request: {pr}\n\
+         - Operator's note: {note}\n\n\
+         Your job is bounded: work out what went wrong and save the lesson where future \
+         agents will find it. Use the thatch-code-archaeology skill to find what in the \
+         shipped change caused the defect: read the pull request's diff and the code it \
+         touched in this repository. Then save exactly one thatch memory in this repository's \
+         project store with memory_remember, with no branch. It must name the area of the \
+         code, the cause of the defect, and the warning sign a future change in that area \
+         should watch for. If the defect is still open (not yet fixed on the default branch), \
+         hand it to the thatch-bug-intake skill to file it; do not fix it yourself. Do not \
+         change code or git state."
+    }
+
     /// Deploy this runner's telemetry artifacts (hook scripts + a settings
     /// file, for `claude`) into `deploy_dir`, returning the settings path
     /// [`InvocationInputs::settings_path`] should carry, or `Ok(None)` for a
@@ -1076,6 +1112,38 @@ mod tests {
             claude.contains("{ticket_list}"),
             "expected {{ticket_list}} in the default batch merge conflict prompt template, got: {claude:?}"
         );
+    }
+
+    /// Both adapters inherit [`AgentRunner::default_defect_retro_prompt_template`]
+    /// (GitHub issue #227). It carries every placeholder
+    /// `crate::work::retro` substitutes, and requires exactly one
+    /// project-store thatch memory naming the area, the cause, and the
+    /// warning sign, found with code archaeology, with any still-open
+    /// defect handed to bug intake.
+    #[test]
+    fn both_runners_inherit_the_default_defect_retro_prompt_template() {
+        let claude = ClaudeRunner.default_defect_retro_prompt_template();
+        let opencode = OpencodeRunner.default_defect_retro_prompt_template();
+        assert_eq!(claude, opencode);
+        for needle in [
+            "{key}",
+            "{severity}",
+            "{pr}",
+            "{note}",
+            "thatch-code-archaeology",
+            "exactly one",
+            "project store",
+            "memory_remember",
+            "area",
+            "cause",
+            "warning sign",
+            "thatch-bug-intake",
+        ] {
+            assert!(
+                claude.contains(needle),
+                "expected {needle:?} in the default defect retro prompt template, got: {claude:?}"
+            );
+        }
     }
 
     #[test]

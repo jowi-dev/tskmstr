@@ -314,10 +314,11 @@ impl AgentRunner for OpencodeRunner {
         // `permission` config governs, and a headless run auto-rejects
         // any ask it isn't configured to allow rather than hanging.
         //
-        // `ToolScope::ThatchOnly` never bypasses: opencode has no CLI flag
-        // that limits a run to one MCP server, so the strongest confinement
-        // this adapter can give is to leave every ask to the user's own
-        // `permission` config, which auto-rejects headless.
+        // `ToolScope::ThatchOnly` and `ToolScope::ReadOnly` never bypass:
+        // opencode has no CLI flag that limits a run to one MCP server or to
+        // read-only tools, so the strongest confinement this adapter can give
+        // is to leave every ask to the user's own `permission` config, which
+        // auto-rejects headless.
         let bypass = inputs.tool_scope == ToolScope::Full
             && matches!(
                 inputs.permission_mode.as_deref(),
@@ -1245,6 +1246,26 @@ mod tests {
             InvocationInputs {
                 permission_mode: None,
                 tool_scope: crate::agent::ToolScope::ThatchOnly,
+                ..base_inputs()
+            },
+        );
+        assert!(
+            !headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto"),
+            "{:?}",
+            headless.args
+        );
+    }
+
+    #[test]
+    fn read_only_scope_never_passes_the_bypass_flag() {
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: None,
+                tool_scope: crate::agent::ToolScope::ReadOnly,
                 ..base_inputs()
             },
         );

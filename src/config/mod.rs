@@ -536,6 +536,12 @@ pub struct RawWorkConfig {
     /// When unset in both global and repo config, `tm merge` falls back to
     /// its built-in conflict prompt and the runner's default model.
     pub merge: Option<RawMergeConfig>,
+    /// `[work.retro]` settings for the session `tm ticket retro --defect`
+    /// offers or starts (GitHub issue #227). See [`RawRetroConfig`].
+    ///
+    /// When unset in both global and repo config, recording a defect asks
+    /// before starting the session.
+    pub retro: Option<RawRetroConfig>,
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
@@ -684,6 +690,22 @@ pub struct RawMergeConfig {
     /// session that consolidates the merged branches' thatch memories into
     /// an archived record (GitHub issue #208). Defaults to `true` when unset.
     pub consolidate_memories: Option<bool>,
+}
+
+/// Raw, partially-specified `[work.retro]` subsection as parsed directly
+/// from TOML (GitHub issue #227): configures the short headless session
+/// `tm ticket retro --defect` uses to save the defect's lesson as a thatch
+/// project memory.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawRetroConfig {
+    /// Whether recording a `--defect` retro starts the session: `"ask"`
+    /// (the default) confirms first, `"start"` starts it without asking,
+    /// and `"off"` never starts it. Any other value is a
+    /// [`ConfigError::InvalidDefectSession`].
+    pub defect_session: Option<String>,
+    /// Model the session passes as `--model`, ahead of `[work]
+    /// default_model` (see `crate::work::model`).
+    pub model: Option<String>,
 }
 
 /// Raw, partially-specified `[work.manual]` subsection as parsed directly
@@ -1246,6 +1268,8 @@ pub struct WorkConfig {
     /// the built-in conflict prompt and the rest of the model chain when the
     /// `[work.merge]` section is absent from both global and repo config.
     pub merge: MergeConfig,
+    /// Validated `[work.retro]` settings. See [`RetroConfig`].
+    pub retro: RetroConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
     /// Validated `[work.auto_review]` settings. See [`AutoReviewConfig`].
@@ -1403,6 +1427,44 @@ impl Default for MergeConfig {
             model: None,
             batch_conflict_prompt: None,
             consolidate_memories: true,
+        }
+    }
+}
+
+/// Fully validated `[work.retro]` subsection (GitHub issue #227). An absent
+/// section asks before starting the defect session and uses the rest of
+/// the model chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetroConfig {
+    /// See [`RawRetroConfig::defect_session`]; [`DefectSession::Ask`] when
+    /// unset.
+    pub defect_session: DefectSession,
+    /// See [`RawRetroConfig::model`].
+    pub model: Option<String>,
+}
+
+/// Whether `tm ticket retro --defect` starts the session that saves the
+/// defect's lesson as a thatch memory. See
+/// [`RawRetroConfig::defect_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefectSession {
+    /// Ask on the terminal first; with no terminal to ask on, start nothing.
+    #[default]
+    Ask,
+    /// Start the session without asking.
+    Start,
+    /// Never start the session.
+    Off,
+}
+
+impl DefectSession {
+    /// Parses a config string. Returns `None` for unrecognized values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ask" => Some(DefectSession::Ask),
+            "start" => Some(DefectSession::Start),
+            "off" => Some(DefectSession::Off),
+            _ => None,
         }
     }
 }
@@ -1681,6 +1743,16 @@ pub enum ConfigError {
         "invalid [work.review_watch].on_bots_done value `{value}`; expected \"notify\" or \"launch\""
     )]
     InvalidOnBotsDone {
+        /// The unrecognized value as written in config.
+        value: String,
+    },
+
+    /// `[work.retro].defect_session` was set to something other than
+    /// `"ask"`, `"start"`, or `"off"`.
+    #[error(
+        "invalid [work.retro].defect_session value `{value}`; expected \"ask\", \"start\" or \"off\""
+    )]
+    InvalidDefectSession {
         /// The unrecognized value as written in config.
         value: String,
     },
@@ -2601,6 +2673,7 @@ fn merge_work(
     let audit = merge_audit(global.audit, repo.audit.clone(), repo_dir)?;
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
+    let retro = merge_retro(global.retro, repo.retro.clone())?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
     let auto_review = merge_auto_review(global.auto_review, repo.auto_review, repo_dir)?;
@@ -2669,6 +2742,7 @@ fn merge_work(
         audit,
         create,
         merge,
+        retro,
         review_watch,
         auto_review,
         manual,
@@ -2866,6 +2940,30 @@ fn merge_merge_section(
             .consolidate_memories
             .or(global.consolidate_memories)
             .unwrap_or(true),
+    })
+}
+
+/// Merge a repo-local `[work.retro]` section on top of a global one, field
+/// by field. An unrecognized `defect_session` is a
+/// [`ConfigError::InvalidDefectSession`], like `on_bots_done` in
+/// [`merge_review_watch`].
+fn merge_retro(
+    global: Option<RawRetroConfig>,
+    repo: Option<RawRetroConfig>,
+) -> Result<RetroConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let defect_session = match repo.defect_session.or(global.defect_session) {
+        Some(value) => {
+            DefectSession::parse(&value).ok_or(ConfigError::InvalidDefectSession { value })?
+        }
+        None => DefectSession::default(),
+    };
+
+    Ok(RetroConfig {
+        defect_session,
+        model: repo.model.or(global.model),
     })
 }
 
@@ -5548,6 +5646,7 @@ mod tests {
             audit: None,
             create: None,
             merge: None,
+            retro: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -5568,6 +5667,7 @@ mod tests {
             audit: None,
             create: None,
             merge: None,
+            retro: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -6254,6 +6354,53 @@ mod tests {
             }
             other => panic!("expected PromptSourceConflict, got {other:?}"),
         }
+    }
+
+    // --- `[work.retro]` (GitHub issue #227) ---
+
+    #[test]
+    fn retro_absent_from_both_asks() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.retro, RetroConfig::default());
+        assert_eq!(cfg.retro.defect_session, DefectSession::Ask);
+        assert_eq!(cfg.retro.model, None);
+    }
+
+    #[test]
+    fn retro_repo_overrides_global_field_by_field() {
+        let global = RawWorkConfig {
+            retro: Some(RawRetroConfig {
+                defect_session: Some("off".to_string()),
+                model: Some("fable".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            retro: Some(RawRetroConfig {
+                defect_session: Some("start".to_string()),
+                model: None,
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert_eq!(cfg.retro.defect_session, DefectSession::Start);
+        assert_eq!(cfg.retro.model.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn load_retro_section_parses_defect_session() {
+        let cfg = load_global_toml("[work.retro]\ndefect_session = \"off\"\n").expect("load");
+        assert_eq!(cfg.work.retro.defect_session, DefectSession::Off);
+    }
+
+    #[test]
+    fn load_retro_bad_defect_session_is_a_config_error() {
+        let err = load_global_toml("[work.retro]\ndefect_session = \"sometimes\"\n")
+            .expect_err("should reject bad defect_session value");
+        assert!(
+            matches!(err, ConfigError::InvalidDefectSession { ref value } if value == "sometimes"),
+            "{err:?}"
+        );
     }
 
     // --- `[work.merge]` (GitHub issue #55) ---

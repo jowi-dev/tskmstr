@@ -1384,6 +1384,7 @@ mod tests {
             audit: crate::config::AuditConfig::default(),
             create: crate::config::CreateConfig::default(),
             merge: crate::config::MergeConfig::default(),
+            retro: crate::config::RetroConfig::default(),
             review_watch: crate::config::ReviewWatchConfig::default(),
             auto_review: crate::config::AutoReviewConfig::default(),
             manual: crate::config::ManualConfig::default(),

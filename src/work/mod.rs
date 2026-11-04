@@ -26,6 +26,7 @@ pub mod model;
 pub mod naming;
 pub mod notify;
 pub mod prompt;
+pub mod retro;
 pub mod review_import;
 pub mod review_watch;
 pub mod run;

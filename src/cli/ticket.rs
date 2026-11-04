@@ -9,7 +9,7 @@ use std::path::Path;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::config::Config;
+use crate::config::{Config, DefectSession};
 use crate::jira::client::RankAnchor;
 use crate::runs::session::{SessionEnv, finish_session, register_session};
 use crate::runs::{RunStore, RunStoreError};
@@ -962,6 +962,53 @@ pub fn retro(
         None => writeln!(out, "Recorded retro for {normalized}: {}", verdict.as_str())?,
     }
 
+    Ok(())
+}
+
+/// After a retro for `key` is recorded, offers or starts the session that
+/// saves a defect's lesson as a thatch project memory (GitHub issue #227).
+///
+/// A [`RetroVerdict::Clean`](crate::runs::RetroVerdict::Clean) retro or
+/// [`DefectSession::Off`] does nothing. [`DefectSession::Start`] calls
+/// `start` straight away. [`DefectSession::Ask`] confirms through
+/// `prompter` first when `interactive` (stdin is a terminal), and without
+/// a terminal prints how to start the session automatically instead of
+/// asking.
+///
+/// Call it only after [`retro`] has recorded the verdict: a `start` error
+/// is written to `out` as a warning and never returned, so a session that
+/// fails to start leaves the recorded verdict and the exit code alone.
+/// Only a failure to prompt or to write `out` is an error.
+pub fn offer_defect_session(
+    verdict: crate::runs::RetroVerdict,
+    key: &str,
+    mode: DefectSession,
+    interactive: bool,
+    prompter: &mut dyn crate::cli::Prompter,
+    start: &mut dyn FnMut(&mut dyn Write) -> Result<(), crate::work::retro::RetroSessionError>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    if verdict == crate::runs::RetroVerdict::Clean {
+        return Ok(());
+    }
+    let go = match mode {
+        DefectSession::Off => false,
+        DefectSession::Start => true,
+        DefectSession::Ask if interactive => prompter.confirm(&format!(
+            "Start a session to save the lesson from {key}'s defect as a thatch memory?"
+        ))?,
+        DefectSession::Ask => {
+            writeln!(
+                out,
+                "Not starting the defect retro session: no terminal to ask on. Set \
+                 [work.retro] defect_session = \"start\" to start it without asking."
+            )?;
+            false
+        }
+    };
+    if go && let Err(err) = start(out) {
+        writeln!(out, "warning: defect retro session not started: {err}")?;
+    }
     Ok(())
 }
 
@@ -3360,6 +3407,184 @@ mod tests {
             TicketCliError::RunStore(RunStoreError::RetroSeverityRequired) => {}
             other => panic!("expected RetroSeverityRequired, got {other:?}"),
         }
+    }
+
+    // --- defect retro session offer (GitHub issue #227) ---
+
+    /// Runs [`offer_defect_session`] with a `start` that records its calls
+    /// and returns `start_result`, yielding `(starts, prompts, output)`.
+    fn offer(
+        verdict: crate::runs::RetroVerdict,
+        mode: DefectSession,
+        interactive: bool,
+        prompter: crate::cli::FakePrompter,
+        start_result: fn() -> Result<(), crate::work::retro::RetroSessionError>,
+    ) -> (usize, Vec<String>, String) {
+        let mut prompter = prompter;
+        let mut starts = 0;
+        let mut out = Vec::new();
+        offer_defect_session(
+            verdict,
+            "PROJ-372",
+            mode,
+            interactive,
+            &mut prompter,
+            &mut |_out| {
+                starts += 1;
+                start_result()
+            },
+            &mut out,
+        )
+        .expect("offer never fails on a session error");
+        (starts, prompter.messages, String::from_utf8(out).unwrap())
+    }
+
+    fn started() -> Result<(), crate::work::retro::RetroSessionError> {
+        Ok(())
+    }
+
+    fn start_failed() -> Result<(), crate::work::retro::RetroSessionError> {
+        Err(crate::work::retro::RetroSessionError::Io(io::Error::other(
+            "boom",
+        )))
+    }
+
+    #[test]
+    fn clean_retro_starts_nothing_and_asks_nothing() {
+        for mode in [DefectSession::Ask, DefectSession::Start] {
+            let (starts, prompts, out) = offer(
+                crate::runs::RetroVerdict::Clean,
+                mode,
+                true,
+                crate::cli::FakePrompter::new().with_confirm(true),
+                started,
+            );
+            assert_eq!(starts, 0);
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(out.is_empty(), "{out}");
+        }
+    }
+
+    #[test]
+    fn defect_with_start_mode_starts_without_asking() {
+        let (starts, prompts, _) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Start,
+            false,
+            crate::cli::FakePrompter::new(),
+            started,
+        );
+        assert_eq!(starts, 1);
+        assert!(prompts.is_empty(), "{prompts:?}");
+    }
+
+    #[test]
+    fn defect_with_ask_mode_starts_once_confirmed() {
+        let (starts, prompts, _) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Ask,
+            true,
+            crate::cli::FakePrompter::new().with_confirm(true),
+            started,
+        );
+        assert_eq!(starts, 1);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("PROJ-372"), "{prompts:?}");
+        assert!(prompts[0].contains("thatch memory"), "{prompts:?}");
+    }
+
+    #[test]
+    fn defect_with_ask_mode_declined_starts_nothing() {
+        let (starts, prompts, _) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Ask,
+            true,
+            crate::cli::FakePrompter::new().with_confirm(false),
+            started,
+        );
+        assert_eq!(starts, 0);
+        assert_eq!(prompts.len(), 1);
+    }
+
+    #[test]
+    fn defect_with_ask_mode_and_no_terminal_says_how_to_start_it() {
+        let (starts, prompts, out) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Ask,
+            false,
+            crate::cli::FakePrompter::new().with_confirm(true),
+            started,
+        );
+        assert_eq!(starts, 0);
+        assert!(prompts.is_empty(), "never prompts without a terminal");
+        assert!(
+            out.contains("defect_session = \"start\""),
+            "names the config key: {out}"
+        );
+    }
+
+    #[test]
+    fn defect_with_off_mode_starts_nothing_and_says_nothing() {
+        let (starts, prompts, out) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Off,
+            true,
+            crate::cli::FakePrompter::new().with_confirm(true),
+            started,
+        );
+        assert_eq!(starts, 0);
+        assert!(prompts.is_empty());
+        assert!(out.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn a_failed_session_start_is_only_a_warning() {
+        let (starts, _, out) = offer(
+            crate::runs::RetroVerdict::Defect,
+            DefectSession::Start,
+            false,
+            crate::cli::FakePrompter::new(),
+            start_failed,
+        );
+        assert_eq!(starts, 1);
+        assert!(
+            out.contains("warning: defect retro session not started: boom"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_verdict_stays_recorded_when_the_session_fails_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_run_store(dir.path());
+        let mut out = Vec::new();
+
+        retro(
+            &store,
+            "",
+            "PROJ-372",
+            crate::runs::RetroVerdict::Defect,
+            Some(crate::runs::RetroSeverity::Major),
+            Some("logins failed"),
+            &mut out,
+        )
+        .expect("recorded");
+        offer_defect_session(
+            crate::runs::RetroVerdict::Defect,
+            "PROJ-372",
+            DefectSession::Start,
+            false,
+            &mut crate::cli::FakePrompter::new(),
+            &mut |_out| start_failed(),
+            &mut out,
+        )
+        .expect("offer never fails on a session error");
+
+        let latest = store
+            .latest_retro_for_ticket(None, "PROJ-372")
+            .unwrap()
+            .expect("the verdict is still recorded");
+        assert_eq!(latest.verdict, crate::runs::RetroVerdict::Defect);
     }
 
     #[test]

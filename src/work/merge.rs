@@ -600,14 +600,14 @@ fn finish_conflict_run(deps: &MergeDeps<'_>, run_id: Option<i64>, failure: Optio
 }
 
 /// Where [`open_agent_window`] opened a conflict-resolution session.
-struct AgentWindow {
+pub(crate) struct AgentWindow {
     /// The tmux session the window lives in.
-    target: String,
+    pub(crate) target: String,
     /// The window's name within `target`.
-    window: String,
+    pub(crate) window: String,
     /// Whether `target` is the invoking process's own tmux session (so no
     /// attach hint is needed).
-    inside_tmux: bool,
+    pub(crate) inside_tmux: bool,
 }
 
 /// Writes `prompt` to `merge-<prompt_stem>-<timestamp>.prompt.md` under
@@ -679,7 +679,8 @@ fn open_agent_window(
     })?;
     let command = deps.runner.tmux_command_line(&invocation, &prompt_path);
     let opened = open_command_window(
-        deps,
+        deps.tmux,
+        deps.identity,
         session_key,
         MERGE_WINDOW_BASE,
         dir,
@@ -702,32 +703,32 @@ fn open_agent_window(
 /// Opens a tmux window named after `window_base` in `dir` running
 /// `command`: on the current tmux session when there is one, otherwise on
 /// `session_key`'s ticket session, created if needed. Shared by the
-/// conflict sessions ([`open_agent_window`]) and the memory-consolidation
-/// session ([`start_memory_session`]).
-fn open_command_window(
-    deps: &MergeDeps<'_>,
+/// conflict sessions ([`open_agent_window`]), the memory-consolidation
+/// session ([`start_memory_session`]), and the defect retro session
+/// ([`crate::work::retro::start_defect_session`]).
+pub(crate) fn open_command_window(
+    tmux: &dyn TmuxOps,
+    identity: &BackendIdentity,
     session_key: &str,
     window_base: &str,
     dir: &Path,
     env: &[(String, String)],
     command: &str,
-) -> Result<AgentWindow, MergeError> {
-    let current_session = deps.tmux.current_session_name()?;
+) -> Result<AgentWindow, TmuxError> {
+    let current_session = tmux.current_session_name()?;
     let inside_tmux = current_session.is_some();
     let target = current_session
-        .unwrap_or_else(|| ticket_session_name(&deps.identity.session_slug(), session_key));
+        .unwrap_or_else(|| ticket_session_name(&identity.session_slug(), session_key));
 
-    let windows = deps.tmux.list_windows()?;
+    let windows = tmux.list_windows()?;
     let existing = session_window_names(&windows, &target);
     let window = unique_window_name(window_base, &existing);
     let dir_str = dir.to_string_lossy().into_owned();
 
     if existing.is_empty() {
-        deps.tmux
-            .new_session_with_command(&target, &dir_str, &window, env, command)?;
+        tmux.new_session_with_command(&target, &dir_str, &window, env, command)?;
     } else {
-        deps.tmux
-            .new_window_with_command(&target, &window, &dir_str, env, command)?;
+        tmux.new_window_with_command(&target, &window, &dir_str, env, command)?;
     }
 
     Ok(AgentWindow {
@@ -839,7 +840,8 @@ fn start_memory_session(
     ));
     let command = headless_command_line(&invocation, &log_path);
     let opened = open_command_window(
-        deps,
+        deps.tmux,
+        deps.identity,
         session_key,
         MERGE_MEMORY_WINDOW_BASE,
         repo_root,
@@ -864,7 +866,7 @@ fn start_memory_session(
 /// [`AgentInvocation::env_remove`]'s billing-safety stripping, which tmux
 /// cannot express itself (see [`AgentRunner::tmux_command_line`]), and
 /// `exec` lets the window close as soon as the agent exits.
-fn headless_command_line(invocation: &AgentInvocation, log_path: &Path) -> String {
+pub(crate) fn headless_command_line(invocation: &AgentInvocation, log_path: &Path) -> String {
     let mut parts = vec!["exec".to_string(), "env".to_string()];
     for var in &invocation.env_remove {
         parts.push("-u".to_string());
