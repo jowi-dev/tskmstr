@@ -327,6 +327,7 @@ pub fn map_key(
         }
         KeyCode::Char('c') if *screen == Screen::Board => Some(Msg::CreateAction),
         KeyCode::Char('C') if *screen == Screen::Board => Some(Msg::StartBroadcast),
+        KeyCode::Char('W') if *screen == Screen::Board => Some(Msg::WalkthroughAction),
         KeyCode::Char('R') if *screen == Screen::Board => Some(Msg::OpenRetro),
         KeyCode::Char('Y') if *screen == Screen::Board => Some(Msg::MarkAuditedAction),
         KeyCode::Char('E') if *screen == Screen::Board => Some(Msg::ToggleEpicsView),
@@ -3397,6 +3398,18 @@ mod tests {
             plain_key(&Screen::Overview, KeyCode::Char('F')),
             Some(Msg::CycleRunScopeFilter)
         );
+    }
+
+    /// GitHub issue #210: `W` opens a change walkthrough, board only.
+    #[test]
+    fn w_upper_triggers_walkthrough_action_on_board_only() {
+        assert_eq!(
+            plain_key(&Screen::Board, KeyCode::Char('W')),
+            Some(Msg::WalkthroughAction)
+        );
+        for screen in [Screen::Detail, Screen::Runs, Screen::Overview, Screen::Rank] {
+            assert_eq!(plain_key(&screen, KeyCode::Char('W')), None);
+        }
     }
 
     /// GitHub issue #88: the board's write actions `V`/`F`/`M`/`Space`

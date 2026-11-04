@@ -544,6 +544,13 @@ pub struct RawWorkConfig {
     /// When unset in both global and repo config, recording a defect asks
     /// before starting the session.
     pub retro: Option<RawRetroConfig>,
+    /// `[work.walkthrough]` settings for the board's change-walkthrough
+    /// session (GitHub issue #210). See [`RawWalkthroughConfig`].
+    ///
+    /// When unset in both global and repo config, the walkthrough key still
+    /// works: it falls back to the runner's built-in walkthrough prompt and
+    /// the rest of the model chain.
+    pub walkthrough: Option<RawWalkthroughConfig>,
     /// `[work.review_watch]` settings for the bugbot-follow-through watcher
     /// and cleanup session. See [`RawReviewWatchConfig`].
     pub review_watch: Option<RawReviewWatchConfig>,
@@ -707,6 +714,31 @@ pub struct RawRetroConfig {
     pub defect_session: Option<String>,
     /// Model the session passes as `--model`, ahead of `[work]
     /// default_model` (see `crate::work::model`).
+    pub model: Option<String>,
+}
+
+/// Raw, partially-specified `[work.walkthrough]` subsection as parsed
+/// directly from TOML. Mirrors [`RawMergeConfig`]'s shape minus the batch
+/// template (GitHub issue #210): configures the interactive session the
+/// board's walkthrough key opens in a lane's worktree to explain its PR.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RawWalkthroughConfig {
+    /// Prompt fed to the launched walkthrough session. Defaults to the
+    /// runner's built-in walkthrough prompt when unset. Supports `{key}` and
+    /// `{pr}` placeholders, substituted with the ticket key and the lane
+    /// run's PR URL.
+    pub prompt: Option<String>,
+    /// Path to a prompt file whose contents become the session's opening
+    /// prompt in place of [`RawWalkthroughConfig::prompt`], with the same
+    /// placeholders. Setting both `prompt` and `prompt_file` in the merged
+    /// section is a [`ConfigError::PromptSourceConflict`].
+    ///
+    /// A relative path is resolved at merge time against the defining repo
+    /// directory via [`resolve_repo_path`], matching
+    /// [`RawMergeConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// Model the launched walkthrough session passes as `--model`. Same
+    /// precedence and fallback as [`RawAuditConfig::model`].
     pub model: Option<String>,
 }
 
@@ -1277,6 +1309,11 @@ pub struct WorkConfig {
     pub merge: MergeConfig,
     /// Validated `[work.retro]` settings. See [`RetroConfig`].
     pub retro: RetroConfig,
+    /// Validated `[work.walkthrough]` settings. See [`WalkthroughConfig`];
+    /// falls back to the runner's built-in walkthrough prompt and the rest of
+    /// the model chain when the section is absent from both global and repo
+    /// config.
+    pub walkthrough: WalkthroughConfig,
     /// Validated `[work.review_watch]` settings. See [`ReviewWatchConfig`].
     pub review_watch: ReviewWatchConfig,
     /// Validated `[work.auto_review]` settings. See [`AutoReviewConfig`].
@@ -1474,6 +1511,22 @@ impl DefectSession {
             _ => None,
         }
     }
+}
+
+/// Fully validated `[work.walkthrough]` subsection (GitHub issue #210).
+///
+/// Every field is optional: the walkthrough session runs in the lane's
+/// existing worktree, so there is no launch directory to require, and an
+/// unset prompt falls back to
+/// [`crate::agent::AgentRunner::default_walkthrough_prompt_template`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkthroughConfig {
+    /// See [`RawWalkthroughConfig::prompt`].
+    pub prompt: Option<String>,
+    /// See [`RawWalkthroughConfig::prompt_file`].
+    pub prompt_file: Option<String>,
+    /// See [`RawWalkthroughConfig::model`].
+    pub model: Option<String>,
 }
 
 /// Fully validated `[work.manual]` subsection.
@@ -2687,6 +2740,7 @@ fn merge_work(
     let create = merge_create(global.create, repo.create.clone(), repo_dir)?;
     let merge = merge_merge_section(global.merge, repo.merge.clone(), repo_dir)?;
     let retro = merge_retro(global.retro, repo.retro.clone())?;
+    let walkthrough = merge_walkthrough(global.walkthrough, repo.walkthrough.clone(), repo_dir)?;
     let manual = merge_manual(global.manual, repo.manual.clone(), repo_dir)?;
     let mut review_watch = merge_review_watch(global.review_watch, repo.review_watch, repo_dir)?;
     let auto_review = merge_auto_review(global.auto_review, repo.auto_review, repo_dir)?;
@@ -2756,6 +2810,7 @@ fn merge_work(
         create,
         merge,
         retro,
+        walkthrough,
         review_watch,
         auto_review,
         manual,
@@ -2976,6 +3031,46 @@ fn merge_retro(
 
     Ok(RetroConfig {
         defect_session,
+        model: repo.model.or(global.model),
+    })
+}
+
+/// Merge a repo-local `[work.walkthrough]` section on top of a global one,
+/// field by field, exactly like [`merge_merge_section`] (GitHub issue #210):
+/// the same `repo_dir` relative-path resolution rule for `prompt_file`, and
+/// the same [`ConfigError::PromptSourceConflict`] check when both `prompt`
+/// and `prompt_file` end up set.
+fn merge_walkthrough(
+    global: Option<RawWalkthroughConfig>,
+    repo: Option<RawWalkthroughConfig>,
+    repo_dir: Option<&Path>,
+) -> Result<WalkthroughConfig, ConfigError> {
+    let global = global.unwrap_or_default();
+    let repo = repo.unwrap_or_default();
+
+    let (prompt_file, prompt_file_dir) = match repo.prompt_file {
+        Some(value) => (Some(value), repo_dir),
+        None => (global.prompt_file, None),
+    };
+    let prompt_file = match prompt_file {
+        Some(value) => Some(resolve_repo_path(
+            &value,
+            prompt_file_dir,
+            "work.walkthrough.prompt_file",
+        )?),
+        None => None,
+    };
+
+    let prompt = repo.prompt.or(global.prompt);
+    if prompt.is_some() && prompt_file.is_some() {
+        return Err(ConfigError::PromptSourceConflict {
+            section: "work.walkthrough",
+        });
+    }
+
+    Ok(WalkthroughConfig {
+        prompt,
+        prompt_file,
         model: repo.model.or(global.model),
     })
 }
@@ -5660,6 +5755,7 @@ mod tests {
             create: None,
             merge: None,
             retro: None,
+            walkthrough: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -5681,6 +5777,7 @@ mod tests {
             create: None,
             merge: None,
             retro: None,
+            walkthrough: None,
             review_watch: None,
             auto_review: None,
             manual: None,
@@ -6414,6 +6511,105 @@ mod tests {
             matches!(err, ConfigError::InvalidDefectSession { ref value } if value == "sometimes"),
             "{err:?}"
         );
+    }
+
+    // --- `[work.walkthrough]` (GitHub issue #210) ---
+
+    #[test]
+    fn merge_work_walkthrough_absent_from_both_is_default() {
+        let cfg = merge_work(None, None, None).expect("should merge");
+        assert_eq!(cfg.walkthrough, WalkthroughConfig::default());
+    }
+
+    #[test]
+    fn merge_work_repo_overrides_walkthrough_field_by_field() {
+        let global = RawWorkConfig {
+            walkthrough: Some(RawWalkthroughConfig {
+                prompt: Some("walk {key} through {pr}".to_string()),
+                prompt_file: None,
+                model: Some("opus".to_string()),
+            }),
+            ..Default::default()
+        };
+        let repo = RawWorkConfig {
+            walkthrough: Some(RawWalkthroughConfig {
+                prompt: None,
+                prompt_file: None,
+                model: Some("sonnet".to_string()),
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(Some(global), Some(repo), None).expect("should merge");
+        assert_eq!(cfg.walkthrough.model, Some("sonnet".to_string()));
+        assert_eq!(
+            cfg.walkthrough.prompt,
+            Some("walk {key} through {pr}".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_work_walkthrough_prompt_and_prompt_file_conflict() {
+        let repo = RawWorkConfig {
+            walkthrough: Some(RawWalkthroughConfig {
+                prompt: Some("walk {key}".to_string()),
+                prompt_file: Some("/abs/walkthrough.md".to_string()),
+                model: None,
+            }),
+            ..Default::default()
+        };
+        let err = merge_work(None, Some(repo), None).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::PromptSourceConflict {
+                section: "work.walkthrough"
+            }
+        ));
+    }
+
+    #[test]
+    fn merge_work_walkthrough_relative_prompt_file_resolves_against_repo_dir() {
+        let repo = RawWorkConfig {
+            walkthrough: Some(RawWalkthroughConfig {
+                prompt_file: Some("prompts/walkthrough.md".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = merge_work(None, Some(repo), Some(Path::new("/repo"))).expect("should merge");
+        assert_eq!(
+            cfg.walkthrough.prompt_file,
+            Some("/repo/prompts/walkthrough.md".to_string())
+        );
+    }
+
+    #[test]
+    fn load_work_walkthrough_section_parses() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        fs::write(
+            &global_path,
+            r#"
+            jira_base_url = "https://global.atlassian.net"
+            jira_email = "global@example.com"
+            default_project_key = "GLOBAL"
+
+            [work.walkthrough]
+            prompt = "walk me through {pr}"
+            model = "sonnet"
+            "#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            global: global_path,
+            repo: None,
+        };
+        let cfg = load(&paths).expect("should load");
+        assert_eq!(
+            cfg.work.walkthrough.prompt,
+            Some("walk me through {pr}".to_string())
+        );
+        assert_eq!(cfg.work.walkthrough.model, Some("sonnet".to_string()));
     }
 
     // --- `[work.merge]` (GitHub issue #55) ---

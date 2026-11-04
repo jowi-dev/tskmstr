@@ -1781,6 +1781,15 @@ pub enum Msg {
     /// than a dedicated success/failure pair, since every outcome is purely
     /// a status-line update from `update`'s point of view.
     AuditActionResult(String),
+    /// The `W` key was pressed on [`Screen::Board`]: open a change
+    /// walkthrough of the selected ticket's lane PR (GitHub issue #210). See
+    /// [`walkthrough_action`].
+    WalkthroughAction,
+    /// The outcome of [`Cmd::LaunchWalkthrough`], already rendered as the
+    /// status-line text: the launch, or why there was nothing to walk
+    /// through. Single-string for the same reason [`Msg::AuditActionResult`]
+    /// is.
+    WalkthroughActionResult(String),
     /// The `c` key was pressed on [`Screen::Board`]: launch (or re-attach to)
     /// the scope's single ticket-creation session (GitHub issue #15).
     ///
@@ -2082,6 +2091,15 @@ pub enum Cmd {
     /// newest `kind = "auto-review"` run per ticket and its latest round
     /// event, mapped through [`auto_review_indicator`]).
     LoadAutoReviewStatus,
+    /// Launch a change-walkthrough session in `key`'s lane worktree (see
+    /// [`crate::work::walkthrough::launch_walkthrough`]). Executed
+    /// in-process like [`Cmd::LaunchAudit`]: the lane run, worktree, and PR
+    /// all come from the local runs DB, and the launch only starts a tmux
+    /// window.
+    LaunchWalkthrough {
+        /// Ticket key to walk through.
+        key: String,
+    },
     /// Launch a bugbot-cleanup session for `key` (see
     /// [`crate::work::bugbot::launch_cleanup`]). Executed in-process, exactly
     /// like [`Cmd::LaunchAudit`]: the launch only pre-registers a run row and
@@ -2969,6 +2987,11 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             app.status_line = message;
             (app, Vec::new())
         }
+        Msg::WalkthroughAction => walkthrough_action(app),
+        Msg::WalkthroughActionResult(message) => {
+            app.status_line = message;
+            (app, Vec::new())
+        }
         // Keyless and map-free by design -- see Msg::CreateAction's doc
         // comment for why there is no attach-or-launch split here.
         Msg::CreateAction => (app, vec![Cmd::LaunchCreate]),
@@ -3547,6 +3570,22 @@ fn audit_action(app: App) -> (App, Vec<Cmd>) {
         Cmd::LaunchAudit { key }
     };
     (app, vec![cmd])
+}
+
+/// Handle [`Msg::WalkthroughAction`]: launch a change walkthrough for the
+/// selected board ticket. A no-op when no ticket is selected.
+///
+/// No gating here: whether the ticket has a lane run, a PR, and a worktree
+/// is read from the runs DB by
+/// [`crate::work::walkthrough::launch_walkthrough`], whose refusal becomes
+/// the status line. Unlike [`audit_action`] there is no attach-if-live
+/// branch; a second press reports the live window and points at `s`.
+fn walkthrough_action(app: App) -> (App, Vec<Cmd>) {
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    let key = ticket.key.clone();
+    (app, vec![Cmd::LaunchWalkthrough { key }])
 }
 
 /// Handle [`Msg::SessionAction`]: attach to the selected board ticket's
@@ -9022,6 +9061,37 @@ mod tests {
             app.status_line,
             "launched audit for PROJ-1 -- press a to attach"
         );
+        assert!(cmds.is_empty());
+    }
+
+    // --- Msg::WalkthroughAction (GitHub issue #210) ---
+
+    #[test]
+    fn walkthrough_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (_app, cmds) = update(app, Msg::WalkthroughAction);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn walkthrough_action_launches_for_the_selected_ticket() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (_app, cmds) = update(app, Msg::WalkthroughAction);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LaunchWalkthrough {
+                key: "PROJ-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn walkthrough_action_result_sets_status_line() {
+        let (app, cmds) = update(
+            App::new(),
+            Msg::WalkthroughActionResult("no lane run for PROJ-1 -- press w first".to_string()),
+        );
+        assert_eq!(app.status_line, "no lane run for PROJ-1 -- press w first");
         assert!(cmds.is_empty());
     }
 

@@ -229,6 +229,10 @@ pub struct TuiDeps {
     /// cleanup session is disabled (a status-line error) when `dir` is unset;
     /// see [`crate::work::bugbot::launch_cleanup`].
     pub review_watch: crate::config::ReviewWatchConfig,
+    /// Validated `[work.walkthrough]` settings for the board's `W` key (see
+    /// [`crate::work::walkthrough::launch_walkthrough`]). Every field is
+    /// optional; an empty section uses the runner's built-in prompt.
+    pub walkthrough: crate::config::WalkthroughConfig,
     /// `[work] default_model`, which the audit, create and cleanup sessions'
     /// models fall back to after their own `model` keys (GitHub issue
     /// #143).
@@ -2027,6 +2031,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         Cmd::ReapRuns => reap_lane_runs(deps),
         Cmd::LoadAuditStatus => load_audit_status(deps),
         Cmd::LaunchAudit { key } => launch_audit_cmd(deps, &key),
+        Cmd::LaunchWalkthrough { key } => launch_walkthrough_cmd(deps, &key),
         Cmd::LoadLaneRunStatus => load_lane_run_status(deps),
         Cmd::LoadBotWatchStatus => load_bot_watch_status(deps),
         Cmd::LoadCleanupStatus => load_cleanup_status(deps),
@@ -2492,6 +2497,48 @@ fn launch_audit_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
         Err(err) => err.to_string(),
     };
     vec![Msg::AuditActionResult(message)]
+}
+
+/// Run `Cmd::LaunchWalkthrough`: launch a change-walkthrough session for
+/// `key` via [`crate::work::walkthrough::launch_walkthrough`], mapping the
+/// outcome to a status-line message. `deps.store` being `None` surfaces as
+/// `runs db unavailable`, as in [`launch_audit_cmd`]: the lane run the
+/// walkthrough needs is read from it.
+fn launch_walkthrough_cmd(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let Some(store) = &deps.store else {
+        return vec![Msg::WalkthroughActionResult(
+            "runs db unavailable".to_string(),
+        )];
+    };
+
+    let launch_deps = crate::work::walkthrough::WalkthroughLaunchDeps {
+        store,
+        tmux: deps.tmux.as_ref(),
+        runner: deps.runner,
+        model_defaults: model_defaults(deps),
+        admission: deps.admission.deps(),
+    };
+    let request = crate::work::walkthrough::WalkthroughLaunchRequest {
+        cfg: &deps.walkthrough,
+        home: &deps.home,
+        identity: &deps.backend_identity,
+        key,
+    };
+
+    let message = match crate::work::walkthrough::launch_walkthrough(&launch_deps, &request) {
+        Ok(outcome) => with_warning(
+            format!("launched walkthrough for {key} -- press s to attach"),
+            outcome.warning,
+        ),
+        Err(crate::work::walkthrough::WalkthroughLaunchError::AlreadyRunning {
+            session_name,
+            window_name,
+        }) => format!(
+            "walkthrough already running ({session_name}:{window_name}) -- press s to attach"
+        ),
+        Err(err) => err.to_string(),
+    };
+    vec![Msg::WalkthroughActionResult(message)]
 }
 
 /// Run `Cmd::LaunchCreate`: launch the scope's ticket-creation session via
@@ -3248,6 +3295,7 @@ mod tests {
             manual: crate::config::ManualConfig::default(),
             home: std::path::PathBuf::from("/home/test"),
             review_watch: crate::config::ReviewWatchConfig::default(),
+            walkthrough: crate::config::WalkthroughConfig::default(),
             work_default_model: None,
             models: crate::config::ModelsConfig::default(),
             xdg_data_home: None,
@@ -6184,6 +6232,119 @@ mod tests {
             [Msg::RunDetailLoaded(detail)] => assert_eq!(detail.kind, "audit"),
             other => panic!("expected RunDetailLoaded, got {other:?}"),
         }
+    }
+
+    // --- Cmd::LaunchWalkthrough / launch_walkthrough_cmd (GitHub issue #210) ---
+
+    #[test]
+    fn launch_walkthrough_cmd_with_no_store_reports_unavailable() {
+        let mut deps = deps();
+        deps.store = None;
+        assert_eq!(
+            launch_walkthrough_cmd(&deps, "PROJ-1"),
+            vec![Msg::WalkthroughActionResult(
+                "runs db unavailable".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_walkthrough_cmd_without_a_lane_run_reports_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = deps();
+        deps.store = Some(crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap());
+        assert_eq!(
+            launch_walkthrough_cmd(&deps, "PROJ-1"),
+            vec![Msg::WalkthroughActionResult(
+                "no lane run for PROJ-1 -- press w first".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_walkthrough_cmd_success_reports_launched_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        let id = store
+            .start_run(&crate::runs::StartRun {
+                scope: deps.backend_identity.scope(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: worktree.path().to_string_lossy().into_owned(),
+                branch: Some("proj-1".to_string()),
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    pr_url: Some("https://github.com/a/b/pull/7".to_string()),
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+        deps.store = Some(store);
+
+        assert_eq!(
+            launch_walkthrough_cmd(&deps, "PROJ-1"),
+            vec![Msg::WalkthroughActionResult(
+                "launched walkthrough for PROJ-1 -- press s to attach".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_walkthrough_cmd_already_running_reports_attach_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        let id = store
+            .start_run(&crate::runs::StartRun {
+                scope: deps.backend_identity.scope(),
+                ticket: "PROJ-1".to_string(),
+                lane: "backend".to_string(),
+                worktree: worktree.path().to_string_lossy().into_owned(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+        store
+            .finish_run(
+                id,
+                &crate::runs::FinishRun {
+                    status: crate::runs::RunStatus::Done,
+                    pr_url: Some("https://github.com/a/b/pull/7".to_string()),
+                    ..crate::runs::FinishRun::default()
+                },
+            )
+            .unwrap();
+        deps.store = Some(store);
+        deps.tmux = Box::new(
+            crate::work::tmux::FakeTmuxOps::new().with_list_windows(Ok(vec![
+                crate::work::tmux::TmuxWindow {
+                    session: "tm-proj-proj-1".to_string(),
+                    name: "walkthrough".to_string(),
+                    dead: false,
+                },
+            ])),
+        );
+
+        assert_eq!(
+            launch_walkthrough_cmd(&deps, "PROJ-1"),
+            vec![Msg::WalkthroughActionResult(
+                "walkthrough already running (tm-proj-proj-1:walkthrough) -- press s to attach"
+                    .to_string()
+            )]
+        );
     }
 
     // --- Cmd::LaunchAudit / launch_audit_cmd ---

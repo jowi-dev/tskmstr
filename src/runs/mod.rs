@@ -299,6 +299,7 @@ pub const AGENT_KINDS: &[&str] = &[
     "bugbot-cleanup",
     "merge-conflict",
     "setup",
+    "walkthrough",
 ];
 
 /// A handle to the run-state SQLite database.
@@ -10153,7 +10154,8 @@ mod tests {
                 "create",
                 "bugbot-cleanup",
                 "merge-conflict",
-                "setup"
+                "setup",
+                "walkthrough"
             ]
         );
     }
