@@ -886,6 +886,22 @@ pub trait AgentRunner: Sync {
          resolved safely, run `git rebase --abort` and explain why."
     }
 
+    /// Default prompt template used when `[work.walkthrough].prompt`/
+    /// `prompt_file` are both unset, handed to the interactive session the
+    /// board's walkthrough key opens in a lane's worktree (GitHub issue
+    /// #210). Placeholders `{key}` (the ticket key) and `{pr}` (the lane
+    /// run's PR URL) are substituted by the caller
+    /// (`crate::work::walkthrough`), not here.
+    ///
+    /// Runner-neutral for the same reason as
+    /// [`AgentRunner::default_merge_conflict_prompt_template`]: it names the
+    /// skill in prose rather than through a runner-specific slash command.
+    fn default_walkthrough_prompt_template(&self) -> &'static str {
+        "Use the thatch-change-walkthrough skill to walk me through the change in pull request \
+         {pr} for ticket {key}: the diff of this worktree's branch against the pull request's \
+         base branch."
+    }
+
     /// Default prompt template used when `[work.merge].batch_conflict_prompt`
     /// is unset, handed to the single interactive agent session a batch
     /// `tm merge KEY1 KEY2 ...` opens when two or more of its tickets stop on
