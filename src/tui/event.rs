@@ -140,9 +140,11 @@ pub struct NetDeps {
     /// wraps a single SQLite connection, so the event loop's
     /// [`TuiDeps::store`] cannot be shared across threads), used by
     /// [`resolve_repo_root_for_pr_lookup`] and [`fetch_retro_tickets`].
-    /// `None` when the runs DB failed to open, with the same leniency
-    /// stance as [`TuiDeps::store`].
-    pub store: Option<crate::runs::RunStore>,
+    /// The open error's text when the runs DB failed to open, with the
+    /// same leniency stance as [`TuiDeps::store`]; kept (not dropped to
+    /// `None`) so the board's needs-audit reason names the real failure,
+    /// as `tm ready` does.
+    pub store: Result<crate::runs::RunStore, String>,
     /// `config.work.lanes`, kept in full so
     /// [`resolve_repo_root_for_pr_lookup`] can look up a lane's `repo` the
     /// same way `tm pr watch`'s `crate::cli::pr::resolve_watch_repo_root`
@@ -2704,15 +2706,15 @@ fn board_readiness(
 /// `tm ready`'s audit gate over the worker's own runs DB, so a card reads
 /// [`Readiness::NeedsAudit`] exactly when `tm ready` and the dispatcher
 /// would skip it. A runs DB that failed to open fails closed, as it does
-/// for `tm ready`.
+/// for `tm ready`, with the open error as the reason.
 fn board_audit_gate(deps: &NetDeps) -> AuditGate<'_> {
     match (&deps.store, deps.require_audit) {
         (_, false) => AuditGate::Off,
-        (Some(store), true) => AuditGate::Store {
+        (Ok(store), true) => AuditGate::Store {
             store,
             scope: deps.backend_identity.scope(),
         },
-        (None, true) => AuditGate::Unavailable("run database unavailable".to_string()),
+        (Err(err), true) => AuditGate::Unavailable(err.clone()),
     }
 }
 
@@ -2752,7 +2754,7 @@ pub fn fetch_retro_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
         Ok(page) => page.tickets,
         Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
     };
-    let Some(store) = &deps.store else {
+    let Ok(store) = &deps.store else {
         return vec![Msg::RetroTicketsFailed(
             "run database unavailable".to_string(),
         )];
@@ -3013,7 +3015,7 @@ fn resolve_pr_for_ticket(deps: &NetDeps, key: String, jira_url: String) -> Vec<M
 /// ordinary case of running `tm board` from inside the repo.
 fn resolve_repo_root_for_pr_lookup(deps: &NetDeps, key: &str) -> Option<std::path::PathBuf> {
     match &deps.store {
-        Some(store) => crate::cli::pr::resolve_watch_repo_root(
+        Ok(store) => crate::cli::pr::resolve_watch_repo_root(
             Some(&deps.backend_identity.scope()),
             &deps.lanes,
             store,
@@ -3022,7 +3024,7 @@ fn resolve_repo_root_for_pr_lookup(deps: &NetDeps, key: &str) -> Option<std::pat
             key,
         )
         .ok(),
-        None => deps.git.repo_root(&deps.cwd).ok(),
+        Err(_) => deps.git.repo_root(&deps.cwd).ok(),
     }
 }
 
@@ -3205,7 +3207,7 @@ mod tests {
             jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
             git: Box::new(crate::work::git::FakeGitOps::new()),
-            store: None,
+            store: Err("no runs db in this test".to_string()),
             lanes: std::collections::BTreeMap::new(),
             cwd: std::path::PathBuf::from("/repo"),
             backend_identity: crate::config::BackendIdentity::Jira {
@@ -3403,7 +3405,7 @@ mod tests {
         for (key, verdict) in audits {
             store.record_audit(&scope, key, verdict, None).unwrap();
         }
-        deps.store = Some(store);
+        deps.store = Ok(store);
         deps.require_audit = true;
         (deps, dir)
     }
@@ -3469,13 +3471,16 @@ mod tests {
         });
         let mut deps = net_deps(jira);
         deps.require_audit = true;
+        deps.store = Err("unable to open database file".to_string());
 
         let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
 
+        // The open error itself, as `tm ready` prints it.
         match &loaded_readiness(&msgs)[0].1 {
-            Readiness::NeedsAudit { reason } => {
-                assert!(reason.starts_with("audit store unavailable"), "{reason}")
-            }
+            Readiness::NeedsAudit { reason } => assert_eq!(
+                reason,
+                "audit store unavailable: unable to open database file"
+            ),
             other => panic!("expected NeedsAudit, got {other:?}"),
         }
     }
@@ -4359,7 +4364,7 @@ mod tests {
             next_page_token: None,
         });
         let mut deps = net_deps(jira);
-        deps.store = None;
+        deps.store = Err("unopenable".to_string());
         let msgs = fetch_retro_tickets(
             &deps,
             &TicketQuery::ShippedAwaitingRetro {
@@ -4380,7 +4385,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
         let msgs = fetch_retro_tickets(
             &deps,
             &TicketQuery::ShippedAwaitingRetro {
@@ -4409,7 +4414,7 @@ mod tests {
             .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
@@ -4437,7 +4442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
@@ -4480,7 +4485,7 @@ mod tests {
             )
             .unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
