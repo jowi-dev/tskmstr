@@ -550,8 +550,9 @@ fn setup_session_prompt(tasks: &SetupTasks) -> String {
         }
         prompt.push_str(
             "\nKeep the skeleton's shape — single-ticket scope, run `tm ready <KEY>` \
-             first and stop when blocked, test-driven changes, small imperative-mood \
-             commits — and replace the placeholder \"Before finishing\" comment with \
+             first and stop when blocked, the thatch recall, archaeology, \
+             PR-description and reflection steps, test-driven changes, small \
+             imperative-mood commits — and replace the placeholder \"Before finishing\" comment with \
              the verified gate commands in the order a run must leave them green.\n",
         );
     }
@@ -1682,26 +1683,43 @@ pub(crate) fn resolve_repo_relative(value: &str, repo_dir: &Path, home: &Path) -
 /// missing.
 pub(crate) fn lane_prompt_template(lane: &str) -> String {
     format!(
-        "# {lane} work lane\n\
-         \n\
-         Autonomous work session for a single ticket in this repository. Do\n\
-         not scope-creep beyond the named ticket.\n\
-         \n\
-         ## Start\n\
-         \n\
-         1. Run `tm ready <KEY>` and stop if it reports the ticket blocked.\n\
-         2. Work only `<KEY>`. Note unrelated bugs or cleanup as follow-ups\n\
-            instead of fixing them here.\n\
-         \n\
-         ## Workflow\n\
-         \n\
-         - Write a failing test before the implementation that makes it pass.\n\
-         - Keep commits small and focused, one logical change per commit.\n\
-         \n\
-         ## Before finishing\n\
-         \n\
-         <!-- List the checks a run must leave green, e.g. your formatter,\n\
-              linter, and test suite. -->\n"
+        r#"# {lane} work lane
+
+Autonomous work session for a single ticket in this repository. Do
+not scope-creep beyond the named ticket.
+
+## Start
+
+1. Run `tm ready <KEY>` and stop if it reports the ticket blocked.
+2. Work only `<KEY>`. Note unrelated bugs or cleanup as follow-ups
+   instead of fixing them here.
+3. Before reading code, run thatch `memory_recall` for `<KEY>`, for the
+   area it touches, and for this lane's branch name. Prior sessions may
+   already have investigated it.
+
+## Workflow
+
+- Investigate with the `thatch-code-archaeology` skill, then plan and
+  keep a checklist with the `thatch-coding-workflow` skill.
+- Write work-in-progress notes (decisions, gotchas, status) as thatch
+  memories scoped to this lane's branch.
+- Write a failing test before the implementation that makes it pass.
+- Keep commits small and focused, one logical change per commit.
+
+## Before finishing
+
+<!-- List the checks a run must leave green, e.g. your formatter,
+     linter, and test suite. -->
+
+## Open the pull request
+
+Draft the `tm pr create` body with the `thatch-pr-description` skill.
+
+## Wrap up
+
+Before the final message, record what this session learned with the
+`thatch-session-reflection` skill.
+"#
     )
 }
 
@@ -2480,6 +2498,52 @@ mod tests {
         let prompt_path = repo_dir.join(".tskmstr/prompts/repo-lane.md");
         let template = std::fs::read_to_string(&prompt_path).expect("starter prompt scaffolded");
         assert!(template.contains("work lane"), "template body: {template}");
+        assert_thatch_steps(&template);
+    }
+
+    /// The five thatch steps GitHub issue #205 adds to the starter lane
+    /// prompt: recall, archaeology + plan, branch-scoped notes, PR
+    /// description, reflect.
+    fn assert_thatch_steps(template: &str) {
+        for step in [
+            "memory_recall",
+            "`thatch-code-archaeology` skill",
+            "`thatch-coding-workflow` skill",
+            "scoped to this lane's branch",
+            "`thatch-pr-description` skill",
+            "`thatch-session-reflection` skill",
+        ] {
+            assert!(template.contains(step), "missing `{step}` in: {template}");
+        }
+    }
+
+    #[test]
+    fn lane_prompt_template_names_the_thatch_steps_in_order() {
+        let template = lane_prompt_template("widget");
+        assert_thatch_steps(&template);
+        let position = |needle: &str| template.find(needle).expect(needle);
+        assert!(position("memory_recall") < position("thatch-code-archaeology"));
+        assert!(position("thatch-coding-workflow") < position("thatch-pr-description"));
+        assert!(position("thatch-pr-description") < position("thatch-session-reflection"));
+        assert!(
+            !template.contains("self-review"),
+            "self-review is interactive and stays out of lanes: {template}"
+        );
+    }
+
+    #[test]
+    fn every_skill_the_lane_template_names_is_one_tm_check_resolves() {
+        // `tm check` flags a lane prompt's named skills that aren't
+        // installed; a skill phrased any other way would slip past it.
+        assert_eq!(
+            crate::cli::check::named_skills(&lane_prompt_template("widget")),
+            vec![
+                "thatch-code-archaeology",
+                "thatch-coding-workflow",
+                "thatch-pr-description",
+                "thatch-session-reflection",
+            ]
+        );
     }
 
     #[test]

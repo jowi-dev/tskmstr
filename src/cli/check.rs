@@ -8,8 +8,9 @@
 //! - **The same structural presence checks `tm init` runs and discards**:
 //!   does every configured lane have a prompt file where a run would look
 //!   for it, does every configured session's `prompt_file` (when set) exist
-//!   where its launcher would read it, and does every configured session's
-//!   leading `/skill` exist somewhere this binary would find it?
+//!   where its launcher would read it, does every configured session's
+//!   leading `/skill` exist somewhere this binary would find it, and does
+//!   every skill a lane prompt names (GitHub issue #205) exist?
 //! - **Expected config keys** ([`manifest::EXPECTED_CONFIG_KEYS`], GitHub
 //!   issue #74): is every key a newer feature registered set in the repo or
 //!   global config? A missing key is named with its suggested value; a
@@ -20,10 +21,12 @@
 //! the runner it would be used with rejects. That check needs the merged
 //! config, so it is skipped with a note when the config doesn't load.
 //!
-//! The first three are presence-only. `tm check` never opens a scaffolded
-//! asset's *contents* — lane prompts and skills are meant to be edited after
-//! `tm init` writes them (GitHub issue #30's agent-assisted setup edits them
-//! on purpose), so a content diff would flag normal customization as drift.
+//! The first three are presence-only. `tm check` never diffs a scaffolded
+//! asset's *contents* against its template — lane prompts and skills are
+//! meant to be edited after `tm init` writes them (GitHub issue #30's
+//! agent-assisted setup edits them on purpose), so a content diff would flag
+//! normal customization as drift. It reads a lane prompt only to learn which
+//! skills it names, then checks those are present.
 //! See [`crate::config::manifest::CURRENT_SCHEMA_VERSION`]'s doc comment for
 //! the same point made from the stamp's side.
 //!
@@ -122,6 +125,18 @@ pub enum DriftFinding {
         lane: String,
         agent: String,
         path: PathBuf,
+    },
+    /// A configured lane's prompt names a skill (as "the `name` skill", the
+    /// way the starter lane prompt names its thatch skills, GitHub issue
+    /// #205) that exists neither in the lane's repo nor at the user level,
+    /// e.g. because thatch isn't installed. Only skills the prompt still
+    /// names are checked, so removing a step from the prompt clears it.
+    /// `tm update` has no fix for it: the skill has to be installed.
+    MissingLaneSkill {
+        lane: String,
+        name: String,
+        repo_path: PathBuf,
+        home_path: PathBuf,
     },
     /// A configured session's prompt leads with a `/skill` invocation that
     /// exists neither repo-locally nor at the user level. `session` names
@@ -254,6 +269,17 @@ impl std::fmt::Display for DriftFinding {
             } => write!(
                 f,
                 "[{session}]'s /{name} skill exists neither at {} nor {}",
+                repo_path.display(),
+                home_path.display()
+            ),
+            DriftFinding::MissingLaneSkill {
+                lane,
+                name,
+                repo_path,
+                home_path,
+            } => write!(
+                f,
+                "lane `{lane}`'s prompt names the `{name}` skill, which exists neither at {} nor {}",
                 repo_path.display(),
                 home_path.display()
             ),
@@ -747,11 +773,17 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
         .flat_map(|(lane, _)| {
             let mut findings = Vec::new();
             let resolved = existing_lane_prompt_path(ctx.runner, ctx.home, doc, lane, repo_dir);
-            if !resolved.exists() {
-                findings.push(DriftFinding::MissingLanePrompt {
+            match std::fs::read_to_string(&resolved) {
+                Ok(prompt) => {
+                    findings.extend(lane_skill_findings(ctx, doc, lane, repo_dir, &prompt))
+                }
+                Err(_) if !resolved.exists() => findings.push(DriftFinding::MissingLanePrompt {
                     lane: lane.to_string(),
                     path: resolved,
-                });
+                }),
+                // Present but unreadable: the lane run surfaces the error
+                // itself; there is no structural drift to report.
+                Err(_) => {}
             }
             if let Some(value) = str_at(doc, &["work", "lanes", lane, "prompt_file"])
                 && is_legacy_prompt_dir(value)
@@ -776,6 +808,59 @@ fn lane_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<
             findings
         })
         .collect()
+}
+
+/// Flag every skill `prompt` names (see [`named_skills`]) that exists
+/// neither in the lane's repo (its `repo` key, resolved like a
+/// `prompt_file`, else the onboarded repo) nor at the user level.
+fn lane_skill_findings(
+    ctx: &CheckContext,
+    doc: &DocumentMut,
+    lane: &str,
+    repo_dir: &Path,
+    prompt: &str,
+) -> Vec<DriftFinding> {
+    let lane_repo = str_at(doc, &["work", "lanes", lane, "repo"])
+        .map(|value| resolve_repo_relative(value, repo_dir, ctx.home))
+        .unwrap_or_else(|| repo_dir.to_path_buf());
+    named_skills(prompt)
+        .into_iter()
+        .filter_map(|name| {
+            let repo_path = ctx.runner.skills_dir(&lane_repo).join(name);
+            let home_path = ctx.runner.skills_dir(ctx.home).join(name);
+            if repo_path.exists() || home_path.exists() {
+                return None;
+            }
+            Some(DriftFinding::MissingLaneSkill {
+                lane: lane.to_string(),
+                name: name.to_string(),
+                repo_path,
+                home_path,
+            })
+        })
+        .collect()
+}
+
+/// The skills a lane prompt names, in first-mention order without
+/// duplicates: every backticked name followed by the word "skill" (line
+/// breaks between them allowed), e.g. "the `thatch-pr-description` skill".
+/// This reads which assets a prompt references, not whether its wording
+/// matches a template, so customizing the prompt is never drift.
+///
+/// `pub(crate)`: `tm update`'s tests install the skills the starter lane
+/// prompt names with it.
+pub(crate) fn named_skills(prompt: &str) -> Vec<&str> {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"`([A-Za-z0-9][A-Za-z0-9_.:-]*)`\s+skill\b").expect("valid regex")
+    });
+    let mut names: Vec<&str> = Vec::new();
+    for capture in PATTERN.captures_iter(prompt) {
+        let name = capture.get(1).expect("group 1").as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// The three `[work.*]` session sections that carry a `prompt_file`: audit,
@@ -1062,6 +1147,80 @@ mod tests {
             rendered.contains("up to date (schema_version 2)"),
             "clean report in: {rendered}"
         );
+    }
+
+    #[test]
+    fn named_skills_finds_backticked_skill_references_in_order() {
+        let text = "Use the `thatch-code-archaeology` skill, then the\n\
+                    `thatch-coding-workflow`\n   skill. Run `tm ready` first.\n\
+                    Again the `thatch-code-archaeology` skill; `cargo` skills.";
+        assert_eq!(
+            named_skills(text),
+            vec!["thatch-code-archaeology", "thatch-coding-workflow"]
+        );
+        assert!(named_skills("no skills here, just `tm pr create`").is_empty());
+    }
+
+    fn write_lane_prompt(env: &TestEnv, body: &str) {
+        let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
+        std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
+        std::fs::write(&lane_prompt, body).expect("write lane prompt");
+        write_repo_config(
+            env,
+            "schema_version = 2\n\
+             [work.lanes.widget]\n\
+             repo = \".\"\n\
+             prompt_file = \".tskmstr/prompts/widget-lane.md\"\n",
+        );
+    }
+
+    #[test]
+    fn lane_prompt_naming_an_uninstalled_skill_is_reported() {
+        let env = test_env();
+        write_lane_prompt(
+            &env,
+            "Draft the body with the `thatch-pr-description` skill.\n",
+        );
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let mut out = Vec::new();
+        let findings = run_check(&ctx, &mut out).expect("check should succeed");
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::MissingLaneSkill {
+                lane: "widget".to_string(),
+                name: "thatch-pr-description".to_string(),
+                repo_path: env.repo_dir.join(".claude/skills/thatch-pr-description"),
+                home_path: env.home.join(".claude/skills/thatch-pr-description"),
+            }]
+        );
+        assert!(has_drift(&findings), "a missing lane skill is drift");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(
+            rendered.contains("lane `widget`") && rendered.contains("thatch-pr-description"),
+            "finding rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lane_prompt_skill_installed_at_home_or_in_repo_is_clean() {
+        let env = test_env();
+        write_lane_prompt(
+            &env,
+            "Use the `thatch-code-archaeology` skill and the `local-gates` skill.\n",
+        );
+        std::fs::create_dir_all(env.home.join(".claude/skills/thatch-code-archaeology"))
+            .expect("mkdir home skill");
+        std::fs::create_dir_all(env.repo_dir.join(".claude/skills/local-gates"))
+            .expect("mkdir repo skill");
+
+        let runner = ClaudeRunner;
+        let ctx = ctx(&env, &runner);
+        let findings = run_check(&ctx, &mut Vec::new()).expect("check should succeed");
+
+        assert!(findings.is_empty(), "expected no findings: {findings:?}");
     }
 
     #[test]

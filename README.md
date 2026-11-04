@@ -57,10 +57,23 @@ runner's built-in default model (`opus` for claude,
 leaves the key unset, and runs then resolve their model through the rest of
 the chain described in "Which model a launch uses".
 
-The scaffolded lane prompt is a generic skeleton, so after everything is
-written the wizard offers to launch an agent-assisted setup session
-(GitHub issue #30): an interactive session, in the repo root, prompted to
-explore the repo, verify the build/test/lint/format gates that actually
+The scaffolded lane prompt gives lane runs the same thatch session shape
+the create, audit and review prompts have (GitHub issue #205): recall
+project and branch-scoped memory for the ticket before reading code,
+investigate with the `thatch-code-archaeology` skill and plan with
+`thatch-coding-workflow`, keep work-in-progress notes as memories scoped
+to the lane's branch, draft the `tm pr create` body with
+`thatch-pr-description`, and record what the session learned with
+`thatch-session-reflection` before the final message. There is no
+self-review step: `/thatch:self-review` is interactive, and the post-PR
+review loop covers review. `tm check` reports any of those skills that
+isn't installed. Existing lane prompts are never rewritten, so a repo
+onboarded earlier adopts the steps by hand or through the setup session.
+
+Beyond that, the scaffolded lane prompt is a generic skeleton, so after
+everything is written the wizard offers to launch an agent-assisted setup
+session (GitHub issue #30): an interactive session, in the repo root,
+prompted to explore the repo, verify the build/test/lint/format gates that actually
 exist here, fill the scaffolded lane and thatch session prompts out in
 place, and author any session skills the config references but that exist
 nowhere on disk —
@@ -101,7 +114,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
 file, a lane whose `subagent` key names a definition that doesn't exist,
-a configured session's missing skill, a relative `prompt_file` still
+a configured session's missing skill, a skill a lane prompt names (as
+"the `name` skill") that isn't installed, a relative `prompt_file` still
 pointing at the legacy top-level `prompts/` directory instead of the
 canonical `.tskmstr/prompts/`. It also names every expected config key
 (registered in `src/config/manifest.rs`'s `EXPECTED_CONFIG_KEYS`) that is
@@ -113,7 +127,7 @@ with no safe default for the repo's backend (Jira's workflow status names
 are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
-checked (see `docs/decisions/0007-asset-schema-version.md`).
+checked (a lane prompt is read only to learn which skills it names) (see `docs/decisions/0007-asset-schema-version.md`).
 Exit code `0` means up to date, `1` means drift was found, `2` means an
 error (e.g. the repo was never onboarded).
 
