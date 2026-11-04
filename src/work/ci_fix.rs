@@ -254,6 +254,8 @@ pub enum CiFixAction {
 
 /// One dispatch tick's CI-fix pass over `scope`: starts a fix for each
 /// ticket whose lane PR is open and red on a head commit not yet handled.
+/// A lane PR `gh` reports merged or closed gets a `pr_closed` event on its
+/// lane run, so later sweeps skip the ticket without asking `gh` again.
 ///
 /// `runs` is [`RunStore::overview_runs`] output, newest first. A ticket is
 /// skipped while any of its runs is live (a lane still working, or a fix
@@ -310,7 +312,21 @@ pub fn sweep(
                 continue;
             }
         };
-        let red = checks.lifecycle == PrLifecycle::Open && ready_to_fix(&checks);
+        let reason = match checks.lifecycle {
+            PrLifecycle::Open => None,
+            PrLifecycle::Merged => Some("merged"),
+            PrLifecycle::Closed => Some("closed"),
+        };
+        if let Some(reason) = reason {
+            // Only `tm merge` and the review watcher record `pr_closed`
+            // otherwise, so a PR merged or closed on GitHub would cost a
+            // `gh` call on every later tick. Recording it here skips the
+            // ticket from the next tick on.
+            let detail = serde_json::json!({ "reason": reason }).to_string();
+            deps.store.add_event(lane.id, "pr_closed", Some(&detail))?;
+            continue;
+        }
+        let red = ready_to_fix(&checks);
         let sha = checks.head_sha;
         // An empty SHA would make every event look unhandled.
         if !red || sha.is_empty() || handled(&deps.store.events_for_run(lane.id)?, &sha) {
@@ -910,6 +926,46 @@ mod tests {
 
         assert!(fx.sweep(&gh, &launcher, 3).is_empty());
         assert!(launcher.launched().is_empty());
+    }
+
+    #[test]
+    fn a_pr_github_reports_merged_or_closed_is_recorded_and_not_polled_again() {
+        let fx = Fixture::new();
+        let merged_lane = fx.lane(SCOPE, "GH-1", 7);
+        let closed_lane = fx.lane(SCOPE, "GH-2", 8);
+        let gh = FakeGhCli::new()
+            .with_pr_checks(
+                7,
+                Ok(PrChecks {
+                    lifecycle: PrLifecycle::Merged,
+                    ..red("abc")
+                }),
+            )
+            .with_pr_checks(
+                8,
+                Ok(PrChecks {
+                    lifecycle: PrLifecycle::Closed,
+                    ..red("def")
+                }),
+            );
+        let launcher = FakeLauncher::new();
+
+        assert!(fx.sweep(&gh, &launcher, 3).is_empty());
+        assert_eq!(gh.pr_checks_calls(), vec![8, 7]);
+        let closed_detail = |run_id| {
+            fx.store
+                .events_for_run(run_id)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "pr_closed")
+                .filter_map(|e| e.detail)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(closed_detail(merged_lane), vec![r#"{"reason":"merged"}"#]);
+        assert_eq!(closed_detail(closed_lane), vec![r#"{"reason":"closed"}"#]);
+
+        assert!(fx.sweep(&gh, &launcher, 3).is_empty());
+        assert_eq!(gh.pr_checks_calls(), vec![8, 7]);
     }
 
     #[test]
