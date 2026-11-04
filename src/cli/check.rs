@@ -262,7 +262,8 @@ pub enum DriftFinding {
         path: PathBuf,
     },
     /// A `thatch-*` skill a configured prompt names has no `SKILL.md` in
-    /// `runner`'s repo-local or user-level skills dir, though `thatch` is
+    /// `runner`'s repo-local or user-level skills dir (for a `thatch:<name>`
+    /// command, no `thatch/<name>.md` in its commands dir), though `thatch` is
     /// installed: `thatch setup` was never run for `runner`, or it installs
     /// that skill only for another agent (Claude Code gets no
     /// `thatch-code-review`, which is opencode only).
@@ -1186,9 +1187,9 @@ fn configured_prompts(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) ->
 }
 
 /// The thatch skills `text` names, in order, without duplicates: every
-/// `thatch-<name>` token (not part of a longer word) and every
-/// `/thatch:<name>` plugin command, kept with its leading slash. Plain
-/// prose like "thatch memory" names no skill.
+/// `thatch-<name>` token and every `thatch:<name>` command (neither part
+/// of a longer word), a `/thatch:<name>` kept with its leading slash.
+/// Plain prose like "thatch memory" names no skill.
 fn thatch_skill_refs(text: &str) -> Vec<String> {
     let is_name_char = |c: char| c.is_ascii_alphanumeric() || c == '-';
     let mut refs: Vec<String> = Vec::new();
@@ -1199,6 +1200,7 @@ fn thatch_skill_refs(text: &str) -> Vec<String> {
             Some('/') if rest.starts_with(':') => (start - 1, ':'),
             Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => continue,
             _ if rest.starts_with('-') => (start, '-'),
+            _ if rest.starts_with(':') => (start, ':'),
             _ => continue,
         };
         let name_len = rest[1..]
@@ -1271,7 +1273,10 @@ fn skill_description(contents: &str) -> Option<String> {
 /// configured prompt names a thatch skill: `thatch` missing from PATH or
 /// older than [`MIN_THATCH_VERSION`], and every named skill whose
 /// `SKILL.md` (repo-local first, then user-level, in the runner's skills
-/// dir) limits it to another agent. A skill found in neither place is
+/// dir) limits it to another agent. A bare `thatch:<name>` command is
+/// looked up as `thatch/<name>.md` in the runner's commands dir instead,
+/// where thatch setup installs it (GitHub issue #231); a `/thatch:<name>`
+/// reference is not looked up. A skill found in neither place is
 /// reported as not installed when `thatch` itself is, since thatch setup
 /// leaves a host-limited skill out for the hosts it doesn't support.
 fn thatch_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Vec<DriftFinding> {
@@ -1319,8 +1324,14 @@ fn thatch_findings(ctx: &CheckContext, doc: &DocumentMut, repo_dir: &Path) -> Ve
         if skill.starts_with('/') {
             continue;
         }
-        let candidates = [repo_dir, ctx.home]
-            .map(|base| ctx.runner.skills_dir(base).join(skill).join("SKILL.md"));
+        let candidates = [repo_dir, ctx.home].map(|base| match skill.strip_prefix("thatch:") {
+            Some(name) => ctx
+                .runner
+                .commands_dir(base)
+                .join("thatch")
+                .join(format!("{name}.md")),
+            None => ctx.runner.skills_dir(base).join(skill).join("SKILL.md"),
+        });
         let Some((path, contents)) = candidates
             .into_iter()
             .find_map(|path| std::fs::read_to_string(&path).ok().map(|c| (path, c)))
@@ -2543,11 +2554,11 @@ mod tests {
     fn thatch_lane_repo(env: &TestEnv) {
         for skill in [
             "thatch-coding-workflow",
-            ClaudeRunner.auto_review_skill(),
             crate::work::auto_review::FOLLOWUP_SKILL,
         ] {
             write_home_skill(env, skill, "A thatch skill.");
         }
+        write_home_thatch_command(env, "peer-review", "A thatch command.");
         let lane_prompt = env.repo_dir.join(".tskmstr/prompts/widget-lane.md");
         std::fs::create_dir_all(lane_prompt.parent().unwrap()).expect("mkdir");
         std::fs::write(
@@ -2603,7 +2614,7 @@ mod tests {
             findings,
             vec![DriftFinding::ThatchMissing {
                 session: "work.auto_review".to_string(),
-                skill: crate::work::auto_review::FOLLOWUP_SKILL.to_string(),
+                skill: ClaudeRunner.auto_review_skill().to_string(),
             }]
         );
     }
@@ -2698,6 +2709,79 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n\nBody.\n"),
         )
         .expect("write skill");
+    }
+
+    /// Writes `<name>.md` under the user-level Claude Code `thatch`
+    /// command namespace, where thatch installs its `thatch:<name>`
+    /// commands, with `description` as its frontmatter description.
+    fn write_home_thatch_command(env: &TestEnv, name: &str, description: &str) {
+        let dir = env.home.join(".claude/commands/thatch");
+        std::fs::create_dir_all(&dir).expect("mkdir commands");
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\ndescription: {description}\n---\n\nBody.\n"),
+        )
+        .expect("write command");
+    }
+
+    #[test]
+    fn default_claude_auto_review_command_missing_is_reported() {
+        let env = test_env();
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, rendered) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        assert_eq!(
+            findings,
+            vec![DriftFinding::ThatchSkillNotInstalled {
+                session: "work.auto_review".to_string(),
+                skill: "thatch:peer-review".to_string(),
+                runner: "Claude Code".to_string(),
+            }]
+        );
+        assert!(rendered.contains("thatch:peer-review"), "{rendered}");
+    }
+
+    #[test]
+    fn default_claude_auto_review_command_installed_is_clean() {
+        let env = test_env();
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        write_home_thatch_command(&env, "peer-review", "Review another author's change.");
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, _) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn repo_local_thatch_command_counts_as_installed() {
+        let env = test_env();
+        write_home_skill(&env, "thatch-review-followup", "Follow-up review rounds.");
+        let dir = env.repo_dir.join(".claude/commands/thatch");
+        std::fs::create_dir_all(&dir).expect("mkdir commands");
+        std::fs::write(dir.join("peer-review.md"), "Review.\n").expect("write command");
+        write_repo_config(&env, "schema_version = 2\n");
+
+        let (findings, _) = check_with(
+            &env,
+            ThatchProbe::Installed {
+                version: Some(MIN_THATCH_VERSION.to_string()),
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]
@@ -2820,14 +2904,16 @@ mod tests {
 
     #[test]
     fn thatch_skill_refs_finds_skill_names_and_plugin_commands() {
-        let text = "Use `thatch-review-pedantic`, thatch-review-economy, and \
-                    /thatch:refine. Recall thatch memory. Not mythatch-x.";
+        let text = "Use `thatch-review-pedantic`, thatch-review-economy, \
+                    /thatch:refine, and `thatch:peer-review`. Recall thatch \
+                    memory. Not mythatch-x or my-thatch:y. Ratio thatch: 3.";
         assert_eq!(
             thatch_skill_refs(text),
             vec![
                 "thatch-review-pedantic".to_string(),
                 "thatch-review-economy".to_string(),
                 "/thatch:refine".to_string(),
+                "thatch:peer-review".to_string(),
             ]
         );
     }
