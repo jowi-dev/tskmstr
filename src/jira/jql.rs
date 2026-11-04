@@ -1,40 +1,77 @@
 //! JQL query construction.
 
-/// The JQL query used to list the current user's open tickets on the board.
+/// The JQL clause that keeps epics out of a board query: an issue type other
+/// than `epic_issue_type` ([`crate::config::Config::epic_issue_type`]),
+/// quoted and escaped via [`escape_jql_string`] since it comes from config.
+/// An epic groups tickets rather than being worked itself, so no board
+/// column, rank list, or `tm ready` candidate list shows one (GitHub issue
+/// #200); [`open_epics_jql`] lists them for the board's epics view instead.
+fn not_epic_clause(epic_issue_type: &str) -> String {
+    format!("issuetype != \"{}\"", escape_jql_string(epic_issue_type))
+}
+
+/// The JQL query used to list the current user's open tickets on the board,
+/// epics excluded (see [`not_epic_clause`]).
 ///
 /// Pinned to an exact string: any change to this query is a deliberate,
 /// reviewable change to what the board shows.
-pub fn my_open_tickets_jql() -> String {
-    "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC".to_string()
+pub fn my_open_tickets_jql(epic_issue_type: &str) -> String {
+    format!(
+        "assignee = currentUser() AND {} AND statusCategory != Done ORDER BY updated DESC",
+        not_epic_clause(epic_issue_type)
+    )
 }
 
 /// The JQL query used by the board's assignee filter to list every unassigned
-/// open ticket in `project_key`.
-pub fn unassigned_tickets_jql(project_key: &str) -> String {
+/// open ticket in `project_key`, epics excluded (see [`not_epic_clause`]).
+pub fn unassigned_tickets_jql(project_key: &str, epic_issue_type: &str) -> String {
     format!(
-        "project = {project_key} AND assignee is EMPTY AND statusCategory != Done ORDER BY updated DESC"
+        "project = {project_key} AND assignee is EMPTY AND {} AND statusCategory != Done ORDER BY updated DESC",
+        not_epic_clause(epic_issue_type)
     )
 }
 
 /// The JQL query used by the board's assignee filter to list every open
-/// ticket in `project_key`, regardless of assignee.
-pub fn everyone_tickets_jql(project_key: &str) -> String {
-    format!("project = {project_key} AND statusCategory != Done ORDER BY updated DESC")
-}
-
-/// The JQL query used by the board's assignee filter to list every open
-/// ticket in `project_key` assigned to `account_id`.
-pub fn assignee_tickets_jql(project_key: &str, account_id: &str) -> String {
+/// ticket in `project_key`, regardless of assignee, epics excluded (see
+/// [`not_epic_clause`]).
+pub fn everyone_tickets_jql(project_key: &str, epic_issue_type: &str) -> String {
     format!(
-        "project = {project_key} AND assignee = \"{account_id}\" AND statusCategory != Done ORDER BY updated DESC"
+        "project = {project_key} AND {} AND statusCategory != Done ORDER BY updated DESC",
+        not_epic_clause(epic_issue_type)
     )
 }
 
-/// The JQL query used by `tm ticket rank` (and, in future, a stack-rank TUI
-/// screen) to list `project_key`'s open tickets in Jira's native backlog
-/// rank order, driven by the same `Rank` field [`JiraClient::rank`] moves.
-pub fn ranked_tickets_jql(project_key: &str) -> String {
-    format!("project = {project_key} AND statusCategory != Done ORDER BY Rank ASC")
+/// The JQL query used by the board's assignee filter to list every open
+/// ticket in `project_key` assigned to `account_id`, epics excluded (see
+/// [`not_epic_clause`]).
+pub fn assignee_tickets_jql(project_key: &str, account_id: &str, epic_issue_type: &str) -> String {
+    format!(
+        "project = {project_key} AND assignee = \"{account_id}\" AND {} AND statusCategory != Done ORDER BY updated DESC",
+        not_epic_clause(epic_issue_type)
+    )
+}
+
+/// The JQL query used by `tm ticket rank` and the board's Rank screen to
+/// list `project_key`'s open tickets in Jira's native backlog rank order,
+/// driven by the same `Rank` field [`JiraClient::rank`] moves. Epics are
+/// excluded (see [`not_epic_clause`]).
+pub fn ranked_tickets_jql(project_key: &str, epic_issue_type: &str) -> String {
+    format!(
+        "project = {project_key} AND {} AND statusCategory != Done ORDER BY Rank ASC",
+        not_epic_clause(epic_issue_type)
+    )
+}
+
+/// The JQL query used by the board's epics view (GitHub issue #200) to list
+/// `project_key`'s open epics, the ones [`not_epic_clause`] keeps off every
+/// other board query. Unlike [`epics_jql`], Done epics are left out, the
+/// same way the board hides done tickets. Ordered by `updated DESC`, like
+/// [`everyone_tickets_jql`].
+pub fn open_epics_jql(project_key: &str, epic_issue_type: &str) -> String {
+    let escaped = escape_jql_string(epic_issue_type);
+    format!(
+        "project = {project_key} AND issuetype = \"{escaped}\" AND statusCategory != Done ORDER BY updated DESC"
+    )
 }
 
 /// The JQL query the cross-project overview's background poller uses to
@@ -51,9 +88,13 @@ pub fn keys_jql(keys: &[String]) -> String {
 /// [`my_open_tickets_jql`]'s `statusCategory != Done`) because a ticket
 /// already `In Progress` has already been picked up, not "ready to be picked
 /// up". Ordered by `Rank ASC` so the caller can filter out blocked tickets
-/// client-side while preserving backlog order.
-pub fn ready_candidates_jql() -> String {
-    "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC".to_string()
+/// client-side while preserving backlog order. Epics are excluded (see
+/// [`not_epic_clause`]): a lane never launches on one.
+pub fn ready_candidates_jql(epic_issue_type: &str) -> String {
+    format!(
+        "assignee = currentUser() AND {} AND statusCategory = \"To Do\" ORDER BY Rank ASC",
+        not_epic_clause(epic_issue_type)
+    )
 }
 
 /// The lookback window, in days, for [`shipped_awaiting_retro_jql`]: how far
@@ -130,8 +171,8 @@ pub fn epics_jql(project_key: &str, epic_issue_type: &str) -> String {
 mod tests {
     use super::{
         assignee_tickets_jql, children_jql, epics_jql, everyone_tickets_jql, keys_jql,
-        my_open_tickets_jql, ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql,
-        ticket_search_jql, unassigned_tickets_jql,
+        my_open_tickets_jql, open_epics_jql, ranked_tickets_jql, ready_candidates_jql,
+        shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
     };
 
     #[test]
@@ -167,6 +208,22 @@ mod tests {
     }
 
     #[test]
+    fn open_epics_jql_lists_the_projects_open_epics_newest_first() {
+        assert_eq!(
+            open_epics_jql("PROJ", "Epic"),
+            "project = PROJ AND issuetype = \"Epic\" AND statusCategory != Done ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn board_queries_escape_the_epic_issue_type() {
+        assert_eq!(
+            everyone_tickets_jql("PROJ", r#"Big "Epic""#),
+            r#"project = PROJ AND issuetype != "Big \"Epic\"" AND statusCategory != Done ORDER BY updated DESC"#
+        );
+    }
+
+    #[test]
     fn keys_jql_lists_every_key_in_one_clause() {
         assert_eq!(
             keys_jql(&["PROJ-1".to_string(), "PROJ-22".to_string()]),
@@ -177,48 +234,48 @@ mod tests {
     #[test]
     fn returns_exact_pinned_jql() {
         assert_eq!(
-            my_open_tickets_jql(),
-            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+            my_open_tickets_jql("Epic"),
+            "assignee = currentUser() AND issuetype != \"Epic\" AND statusCategory != Done ORDER BY updated DESC"
         );
     }
 
     #[test]
     fn unassigned_tickets_jql_scopes_to_project_and_excludes_assignee() {
         assert_eq!(
-            unassigned_tickets_jql("PROJ"),
-            "project = PROJ AND assignee is EMPTY AND statusCategory != Done ORDER BY updated DESC"
+            unassigned_tickets_jql("PROJ", "Epic"),
+            "project = PROJ AND assignee is EMPTY AND issuetype != \"Epic\" AND statusCategory != Done ORDER BY updated DESC"
         );
     }
 
     #[test]
     fn everyone_tickets_jql_scopes_to_project_with_no_assignee_clause() {
         assert_eq!(
-            everyone_tickets_jql("PROJ"),
-            "project = PROJ AND statusCategory != Done ORDER BY updated DESC"
+            everyone_tickets_jql("PROJ", "Epic"),
+            "project = PROJ AND issuetype != \"Epic\" AND statusCategory != Done ORDER BY updated DESC"
         );
     }
 
     #[test]
     fn assignee_tickets_jql_scopes_to_project_and_account_id() {
         assert_eq!(
-            assignee_tickets_jql("PROJ", "acct-1"),
-            "project = PROJ AND assignee = \"acct-1\" AND statusCategory != Done ORDER BY updated DESC"
+            assignee_tickets_jql("PROJ", "acct-1", "Epic"),
+            "project = PROJ AND assignee = \"acct-1\" AND issuetype != \"Epic\" AND statusCategory != Done ORDER BY updated DESC"
         );
     }
 
     #[test]
     fn ranked_tickets_jql_scopes_to_project_and_orders_by_rank() {
         assert_eq!(
-            ranked_tickets_jql("PROJ"),
-            "project = PROJ AND statusCategory != Done ORDER BY Rank ASC"
+            ranked_tickets_jql("PROJ", "Epic"),
+            "project = PROJ AND issuetype != \"Epic\" AND statusCategory != Done ORDER BY Rank ASC"
         );
     }
 
     #[test]
     fn ready_candidates_jql_scopes_to_current_user_and_to_do_category() {
         assert_eq!(
-            ready_candidates_jql(),
-            "assignee = currentUser() AND statusCategory = \"To Do\" ORDER BY Rank ASC"
+            ready_candidates_jql("Epic"),
+            "assignee = currentUser() AND issuetype != \"Epic\" AND statusCategory = \"To Do\" ORDER BY Rank ASC"
         );
     }
 

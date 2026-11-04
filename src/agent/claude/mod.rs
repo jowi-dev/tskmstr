@@ -71,8 +71,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, UsageSnapshot, UsageWindow, one_line,
-    shell_quote, tool_call_line, tool_input_summary,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, ToolScope, UsageSnapshot, UsageWindow,
+    one_line, shell_quote, tool_call_line, tool_input_summary,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -171,9 +171,16 @@ impl ClaudeRunner {
     /// that method and the usage probe, which is part of admission
     /// (GitHub issue #149).
     fn invocation(&self, inputs: InvocationInputs) -> AgentInvocation {
-        let permission_mode = inputs
-            .permission_mode
-            .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string());
+        // `ThatchOnly` overrides the permission mode: `dontAsk` denies any
+        // tool call not pre-approved, `--tools ""` removes every built-in
+        // tool, and `--allowedTools mcp__thatch` pre-approves thatch's MCP
+        // server and nothing else.
+        let permission_mode = match inputs.tool_scope {
+            ToolScope::Full => inputs
+                .permission_mode
+                .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string()),
+            ToolScope::ThatchOnly => "dontAsk".to_string(),
+        };
 
         let mut args = Vec::new();
         match inputs.mode {
@@ -196,6 +203,12 @@ impl ClaudeRunner {
         }
         args.push("--permission-mode".to_string());
         args.push(permission_mode);
+        if inputs.tool_scope == ToolScope::ThatchOnly {
+            args.push("--tools".to_string());
+            args.push(String::new());
+            args.push("--allowedTools".to_string());
+            args.push("mcp__thatch".to_string());
+        }
         if inputs.mode == RunMode::Headless {
             let max_turns = inputs
                 .max_turns
@@ -276,6 +289,7 @@ impl AgentRunner for ClaudeRunner {
             settings_path: None,
             run_id: None,
             mode: RunMode::Headless,
+            tool_scope: crate::agent::ToolScope::Full,
         }))
     }
 
@@ -873,6 +887,7 @@ mod tests {
             )),
             run_id: Some("run-123".to_string()),
             mode: RunMode::Headless,
+            tool_scope: crate::agent::ToolScope::Full,
         }
     }
 
@@ -1012,6 +1027,7 @@ mod tests {
                 settings_path: Some(PathBuf::from("/hooks/settings.json")),
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
 
@@ -1042,6 +1058,7 @@ mod tests {
                 settings_path: Some(PathBuf::from("/hooks/settings.json")),
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
 
@@ -1075,6 +1092,39 @@ mod tests {
                 "300",
             ]
         );
+    }
+
+    #[test]
+    fn thatch_only_scope_drops_built_in_tools_and_denies_anything_unlisted() {
+        let invocation = ClaudeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: Some("bypassPermissions".to_string()),
+                tool_scope: crate::agent::ToolScope::ThatchOnly,
+                ..base_inputs()
+            },
+        );
+
+        let flag_value = |flag: &str| {
+            invocation.args[invocation.args.iter().position(|a| a == flag).unwrap() + 1].clone()
+        };
+        assert_eq!(flag_value("--tools"), "");
+        assert_eq!(flag_value("--allowedTools"), "mcp__thatch");
+        assert_eq!(
+            flag_value("--permission-mode"),
+            "dontAsk",
+            "the scope overrides a requested bypass"
+        );
+        assert!(!invocation.args.contains(&"bypassPermissions".to_string()));
+    }
+
+    #[test]
+    fn full_scope_passes_no_tool_flags() {
+        let invocation = ClaudeRunner
+            .build_invocation(&crate::work::admission::Admitted::for_test(), base_inputs());
+
+        assert!(!invocation.args.contains(&"--tools".to_string()));
+        assert!(!invocation.args.contains(&"--allowedTools".to_string()));
     }
 
     #[test]

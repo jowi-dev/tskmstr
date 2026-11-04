@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::cli::runs::format_age;
 use crate::config::{BackendIdentity, BackendIdentityResolver, Config, compatible_lane_names};
-use crate::runs::{AutopilotScope, RunStatus, RunStore, RunStoreError};
+use crate::runs::{AutopilotScope, RunStore, RunStoreError};
 use crate::work::dispatch::{LaneChoice, Skip, TickReport, dispatch_state};
 
 /// Which scopes a `tm dispatch` command acts on.
@@ -299,7 +299,8 @@ pub fn set(
 }
 
 /// `tm dispatch status`: one line per scope with an `autopilot` row: on or
-/// off, its running lanes, when it last ticked, and how long ago it last
+/// off, its running lanes (the ones `max_lanes` caps, named by ticket; see
+/// [`RunStore::running_lane_tickets`]), when it last ticked, and how long ago it last
 /// launched. A scope whose newest tick refused also gets the refusal and how
 /// long refusals for that reason have lasted. `now` is unix seconds.
 pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), DispatchCliError> {
@@ -309,11 +310,7 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
         return Ok(());
     }
     for row in rows {
-        let running = store
-            .list_runs_filtered(Some(&row.scope), Some("lane"))?
-            .iter()
-            .filter(|run| run.status == RunStatus::Running)
-            .count();
+        let running = running_lanes_text(&store.running_lane_tickets(&row.scope)?);
         let state = if row.enabled { "on" } else { "off" };
         let last_tick = row
             .last_tick_at
@@ -327,7 +324,7 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
         };
         writeln!(
             out,
-            "{}: {state}, {running} lanes running, last tick {last_tick}, {last_launch}",
+            "{}: {state}, {running}, last tick {last_tick}, {last_launch}",
             row.scope
         )?;
         if let Some(repo_dir) = &row.repo_dir {
@@ -343,6 +340,16 @@ pub fn status(store: &RunStore, now: i64, out: &mut dyn Write) -> Result<(), Dis
         }
     }
     Ok(())
+}
+
+/// `N lanes running`, then the counted lanes' tickets in parentheses when
+/// there are any: `2 lanes running (GH-1, GH-2)`.
+fn running_lanes_text(tickets: &[String]) -> String {
+    if tickets.is_empty() {
+        "0 lanes running".to_string()
+    } else {
+        format!("{} lanes running ({})", tickets.len(), tickets.join(", "))
+    }
 }
 
 /// A runs.db timestamp (`2026-10-18T14:03:22.123Z`) without its fraction
@@ -547,7 +554,10 @@ mod tests {
                     stacked_on: Some("gh-1-branch".to_string()),
                 },
             ],
-            refused: Some(Refusal::MaxLanes { running: 2, max: 2 }),
+            refused: Some(Refusal::MaxLanes {
+                running: vec!["GH-7".to_string(), "GH-8".to_string()],
+                max: 2,
+            }),
             skipped: None,
             notified: vec!["tm: GH-0 is awaiting your review".to_string()],
         }
@@ -586,7 +596,7 @@ mod tests {
             out,
             "github:o/one: launched GH-1 in lane backend on claude\n\
              github:o/one: launched GH-2 in lane backend on opencode (stacked on gh-1-branch)\n\
-             github:o/one: not launching: 2 lanes running, [dispatch] max_lanes is 2\n\
+             github:o/one: not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2\n\
              github:o/one: notified: tm: GH-0 is awaiting your review\n\
              github:o/two: skipped: another host is ticking this scope\n\
              github:o/idle: nothing to launch\n\
@@ -648,7 +658,7 @@ mod tests {
                         {"ticket": "GH-1", "lane": "backend", "runner": "claude", "stacked_on": null},
                         {"ticket": "GH-2", "lane": "backend", "runner": "opencode", "stacked_on": "gh-1-branch"},
                     ],
-                    "refused": "not launching: 2 lanes running, [dispatch] max_lanes is 2",
+                    "refused": "not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2",
                     "skipped": null,
                     "notified": ["tm: GH-0 is awaiting your review"],
                     "error": null,
@@ -941,7 +951,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 4, "{out}");
         assert!(
-            lines[0].starts_with("github:o/one: on, 1 lanes running, last tick 20"),
+            lines[0].starts_with("github:o/one: on, 1 lanes running (GH-1), last tick 20"),
             "{out}"
         );
         assert!(lines[0].ends_with(", last launch 5m ago"), "{out}");
@@ -954,6 +964,36 @@ mod tests {
         assert_eq!(
             lines[3],
             "github:o/two: off, 0 lanes running, last tick never, never launched"
+        );
+    }
+
+    #[test]
+    fn status_counts_the_lanes_max_lanes_caps() {
+        let (_dir, store) = store();
+        store.set_autopilot(ONE, true).unwrap();
+        let lane = |ticket: &str, scope: &str| {
+            store
+                .start_run(&StartRun {
+                    ticket: ticket.to_string(),
+                    scope: scope.to_string(),
+                    lane: "backend".to_string(),
+                    worktree: format!("/wt/{ticket}"),
+                    branch: None,
+                    pid: None,
+                    kind: "lane".to_string(),
+                    log_path: None,
+                })
+                .unwrap()
+        };
+        lane("GH-1", ONE);
+        lane("AX-809", "jira:AX");
+        lane("GH-OLD", "");
+
+        let out = text(|out| status(&store, 0, out).unwrap());
+
+        assert!(
+            out.starts_with("github:o/one: on, 2 lanes running (GH-1, GH-OLD), "),
+            "{out}"
         );
     }
 

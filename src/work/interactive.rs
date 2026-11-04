@@ -305,6 +305,7 @@ mod tests {
                 settings_path: Some(PathBuf::from("/hooks/settings.json")),
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         )
     }
@@ -341,6 +342,7 @@ mod tests {
                 settings_path: None,
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
         PreparedRun {

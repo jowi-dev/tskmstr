@@ -204,7 +204,8 @@ pub fn try_read_findings(path: &Path) -> Result<Option<Vec<Finding>>, AutoReview
 /// Where round `round`'s fix pass in loop `loop_id` writes its completion
 /// marker: `<git_dir>/vdiff/auto-review/fix-<loop_id>-<round>.done`, next to
 /// the findings files and keyed the same way (GitHub issue #150). It holds
-/// `{"succeeded": true}` or `{"succeeded": false}`; see [`read_fix_marker`].
+/// `{"succeeded": true}` or `{"succeeded": false}`, plus the comments the
+/// pass declined (GitHub issue #204); see [`read_fix_marker`].
 pub fn fix_marker_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
     git_dir
         .join("vdiff")
@@ -212,20 +213,56 @@ pub fn fix_marker_path(git_dir: &Path, loop_id: &str, round: u32) -> PathBuf {
         .join(format!("fix-{loop_id}-{round}.done"))
 }
 
-#[derive(Deserialize)]
-struct FixMarker {
-    succeeded: bool,
+/// A fix pass's completion marker, as [`fix_completion_section`] asks the
+/// agent to write it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FixMarker {
+    /// Whether the pass fixed what it set out to fix.
+    pub succeeded: bool,
+    /// The comments the pass triaged as not needing a change (GitHub issue
+    /// #204). Absent from an older agent's marker, so it defaults to empty.
+    /// Only advisory context for the next round, so it parses leniently
+    /// ([`lenient_declines`]): a malformed list never fails the loop.
+    #[serde(default, deserialize_with = "lenient_declines")]
+    pub declined: Vec<Decline>,
 }
 
-/// A fix pass's marker: `Some(succeeded)` once [`fix_marker_path`]'s file
-/// exists and parses, `None` before then; see [`read_signal`].
+/// Deserializes [`FixMarker::declined`] from any JSON, keeping the entries
+/// that are a [`Decline`] and dropping the rest; anything but an array
+/// reads as no declines.
+fn lenient_declines<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Decline>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Array(entries) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
+}
+
+/// One review comment a fix pass declined, which [`run_loop`] hands the
+/// next round so `thatch-review-followup` checks the reason instead of
+/// re-raising the finding as unaddressed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Decline {
+    /// The comment's `path:start-end` anchor.
+    pub comment: String,
+    /// Why no change was made, in one line.
+    pub reason: String,
+}
+
+/// A fix pass's marker: `Some` once [`fix_marker_path`]'s file exists and
+/// parses, `None` before then; see [`read_signal`].
 ///
 /// # Errors
 ///
 /// [`AutoReviewError::Findings`] if the file is complete JSON but not a
 /// marker.
-pub fn read_fix_marker(path: &Path) -> Result<Option<bool>, AutoReviewError> {
-    Ok(read_signal::<FixMarker>(path)?.map(|marker| marker.succeeded))
+pub fn read_fix_marker(path: &Path) -> Result<Option<FixMarker>, AutoReviewError> {
+    read_signal(path)
 }
 
 /// The temporary name an agent writes a signal file under before renaming
@@ -255,17 +292,24 @@ pub fn review_completion_section(findings_file: &Path) -> String {
 
 /// The section tm appends to an auto-review fix pass's prompt: the loop
 /// waits for `marker` ([`fix_marker_path`]), written last under a
-/// temporary name and renamed into place.
+/// temporary name and renamed into place, carrying every comment the pass
+/// made no code change for, merged ones included ([`FixMarker`]).
 pub fn fix_completion_section(marker: &Path) -> String {
     let tmp = temporary_name(marker);
     format!(
         "\n\n## Completion signal\n\n\
          tm is waiting for `{file}` to know this fix pass is done. Once every \
-         comment is addressed and committed, write `{{\"succeeded\": true}}` \
-         to `{tmp}`, or `{{\"succeeded\": false}}` if you could not fix \
-         them, then rename it into place with `mv '{tmp}' '{file}'`, so tm \
-         never reads a half-written file. Then stop and leave this session \
-         open.\n",
+         comment is triaged and every fix committed, write \
+         `{{\"succeeded\": true}}` to `{tmp}`, or `{{\"succeeded\": false}}` \
+         if you could not fix the legitimate ones. List every comment that \
+         got no code change under `declined` in the same object, so the next \
+         review round checks your reason instead of re-raising it. That \
+         includes a comment you merged with another: give it a reason like \
+         `same root cause as <anchor>: ...`.\n\n\
+         \x20   {{\"succeeded\": true, \"declined\": [{{\"comment\": \"src/lib.rs:10-12\",\n\
+         \x20     \"reason\": \"One line on why no change is needed.\"}}]}}\n\n\
+         Then rename it into place with `mv '{tmp}' '{file}'`, so tm never \
+         reads a half-written file. Then stop and leave this session open.\n",
         file = marker.display(),
         tmp = tmp.display(),
     )
@@ -274,8 +318,9 @@ pub fn fix_completion_section(marker: &Path) -> String {
 /// Renders a round's prompt from `template`, replacing `{key}`, `{round}`,
 /// `{skill}` (`first_round_skill` on round 1, [`FOLLOWUP_SKILL`] after),
 /// `{findings_file}`, `{archive}` (empty on round 1) and
-/// `{prior}` (a sentence pointing a follow-up round at `archive`, empty on
-/// round 1), then appends [`review_completion_section`], so a custom
+/// `{prior}` (empty on round 1: a sentence pointing a follow-up round at
+/// `archive`, then the previous fix pass's `declined` comments with their
+/// reasons), then appends [`review_completion_section`], so a custom
 /// template that never mentions the findings file still signals.
 pub fn render_prompt(
     template: &str,
@@ -284,6 +329,7 @@ pub fn render_prompt(
     first_round_skill: &str,
     findings_file: &Path,
     archive: Option<&Path>,
+    declined: &[Decline],
 ) -> String {
     let skill = if round <= 1 {
         first_round_skill
@@ -299,8 +345,9 @@ pub fn render_prompt(
              JSON; yours are the entries whose `text` starts with \
              `[auto-review · ...]`, any others are a human's). They were never \
              posted to GitHub: use this file, not the PR, as your prior review \
-             comments, and verify whether each was addressed since.\n\n",
-            path.display()
+             comments, and verify whether each was addressed since.\n\n{}",
+            path.display(),
+            declined_section(declined),
         ),
         None => String::new(),
     };
@@ -312,6 +359,24 @@ pub fn render_prompt(
         .replace("{archive}", &archive_text)
         .replace("{prior}", &prior)
         + &review_completion_section(findings_file)
+}
+
+/// The part of a follow-up round's `{prior}` listing what the previous fix
+/// pass declined, empty when it declined nothing.
+fn declined_section(declined: &[Decline]) -> String {
+    if declined.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "The fix pass declined these comments without changing code. Check \
+         each reason: re-report a finding only if its reason does not hold, \
+         and do not count it as unaddressed otherwise.\n\n",
+    );
+    for decline in declined {
+        section.push_str(&format!("- `{}`: {}\n", decline.comment, decline.reason));
+    }
+    section.push('\n');
+    section
 }
 
 /// Seconds between two checks for a step's signal file.
@@ -501,6 +566,7 @@ pub fn run_loop(
     };
     let first_skill = first_round_skill(cfg, ops.runner_review_skill());
     let mut archive: Option<PathBuf> = None;
+    let mut declined: Vec<Decline> = Vec::new();
     for round in 1..=max {
         let findings_file = findings_path(git_dir, loop_id, round);
         let marker = fix_marker_path(git_dir, loop_id, round);
@@ -515,6 +581,7 @@ pub fn run_loop(
             first_skill,
             &findings_file,
             archive.as_deref(),
+            &declined,
         );
         let run_id = ops.review(round, prompt)?;
         let stopped = |verdict: RoundVerdict| -> Result<LoopOutcome, AutoReviewError> {
@@ -563,16 +630,18 @@ pub fn run_loop(
         // Review bots' comments ride along with a fix but never start one:
         // only this round's own findings decided `verdict` above.
         ops.import_bot_comments()?;
+        declined.clear();
         let fixed = match ops.fix(round, fix_completion_section(&marker))? {
             None => true,
             Some(fix_run) => {
                 match wait_for_signal(ops, fix_run, timeout_secs, || read_fix_marker(&marker))? {
-                    Signal::Received(succeeded) => {
+                    Signal::Received(marker) => {
                         ops.mark_signalled(fix_run, "fix")?;
-                        if !succeeded {
+                        if !marker.succeeded {
                             ops.flag(fix_run)?;
                         }
-                        succeeded
+                        declined = marker.declined;
+                        marker.succeeded
                     }
                     Signal::Stuck => {
                         ops.flag(fix_run)?;
@@ -638,6 +707,8 @@ mod tests {
         fix_signals: bool,
         /// Whether `fix` reports an empty store (`None`).
         nothing_to_fix: bool,
+        /// The `declined` array every fix pass writes into its marker.
+        declined: &'static str,
     }
 
     impl FakeOps {
@@ -662,6 +733,7 @@ mod tests {
                 completions: RefCell::new(Vec::new()),
                 fix_signals: true,
                 nothing_to_fix: false,
+                declined: "[]",
             }
         }
 
@@ -711,7 +783,10 @@ mod tests {
             if self.fix_signals {
                 self.signal(
                     fix_marker_path(&self.git_dir, LOOP_ID, round),
-                    format!(r#"{{"succeeded": {succeeded}}}"#),
+                    format!(
+                        r#"{{"succeeded": {succeeded}, "declined": {}}}"#,
+                        self.declined
+                    ),
                 );
             }
             Ok(Some(200 + i64::from(round)))
@@ -873,6 +948,7 @@ mod tests {
             "thatch-code-review",
             findings,
             None,
+            &[],
         );
 
         assert!(prompt.starts_with("Review GH-1 your own way."));
@@ -891,6 +967,51 @@ mod tests {
         assert!(section.contains("`/g/vdiff/auto-review/fix-7-9-2.done`"));
         assert!(section.contains(r#"{"succeeded": true}"#));
         assert!(section.contains(r#"{"succeeded": false}"#));
+        assert!(section.contains(r#""declined""#), "{section}");
+        assert!(section.contains(r#""reason""#), "{section}");
+    }
+
+    #[test]
+    fn the_fix_completion_section_asks_for_merged_comments_as_declines() {
+        let section = fix_completion_section(Path::new("/g/fix.done"));
+
+        assert!(section.contains("merged"), "{section}");
+        assert!(section.contains("same root cause as"), "{section}");
+    }
+
+    #[test]
+    fn a_malformed_declined_list_reads_as_no_declines_and_keeps_good_entries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fix-1.done");
+        for malformed in [
+            r#"{"succeeded": true, "declined": ["src/a.rs:4-6"]}"#,
+            r#"{"succeeded": true, "declined": "src/a.rs:4-6"}"#,
+            r#"{"succeeded": true, "declined": [{"comment": "src/a.rs:4-6"}]}"#,
+            r#"{"succeeded": true, "declined": null}"#,
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            assert_eq!(
+                read_fix_marker(&path).unwrap(),
+                Some(FixMarker {
+                    succeeded: true,
+                    declined: Vec::new()
+                }),
+                "{malformed}"
+            );
+        }
+
+        std::fs::write(
+            &path,
+            r#"{"succeeded": true, "declined": ["x", {"comment": "a:1-2", "reason": "dup"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_fix_marker(&path).unwrap().unwrap().declined,
+            vec![Decline {
+                comment: "a:1-2".to_string(),
+                reason: "dup".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -916,10 +1037,29 @@ mod tests {
         assert_eq!(read_fix_marker(&path).unwrap(), None);
 
         std::fs::write(&path, r#"{"succeeded": false}"#).unwrap();
-        assert_eq!(read_fix_marker(&path).unwrap(), Some(false));
+        assert_eq!(
+            read_fix_marker(&path).unwrap(),
+            Some(FixMarker {
+                succeeded: false,
+                declined: Vec::new()
+            })
+        );
 
-        std::fs::write(&path, r#"{"succeeded": true}"#).unwrap();
-        assert_eq!(read_fix_marker(&path).unwrap(), Some(true));
+        std::fs::write(
+            &path,
+            r#"{"succeeded": true, "declined": [{"comment": "src/a.rs:4-6", "reason": "intended"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_fix_marker(&path).unwrap(),
+            Some(FixMarker {
+                succeeded: true,
+                declined: vec![Decline {
+                    comment: "src/a.rs:4-6".to_string(),
+                    reason: "intended".to_string(),
+                }]
+            })
+        );
     }
 
     #[test]
@@ -931,6 +1071,7 @@ mod tests {
             "thatch-code-review",
             Path::new("/g/f-1.json"),
             None,
+            &[],
         );
         assert!(first.contains("`thatch-code-review`"));
         assert!(first.contains("/g/f-1.json"));
@@ -963,9 +1104,36 @@ mod tests {
             "thatch-code-review",
             Path::new("/g/f-2.json"),
             Some(Path::new("/g/archive/1.json")),
+            &[],
         );
         assert!(second.contains("`thatch-review-followup`"));
         assert!(second.contains("/g/archive/1.json"));
+        assert!(!second.contains("declined"), "{second}");
+    }
+
+    #[test]
+    fn a_followup_prompt_lists_the_fix_pass_declines_with_their_reasons() {
+        let declined = [Decline {
+            comment: "src/a.rs:4-6".to_string(),
+            reason: "the lock is held by the caller".to_string(),
+        }];
+
+        let second = render_prompt(
+            DEFAULT_PROMPT,
+            "GH-1",
+            2,
+            "thatch-code-review",
+            Path::new("/g/f-2.json"),
+            Some(Path::new("/g/archive/1.json")),
+            &declined,
+        );
+
+        assert!(second.contains("declined"), "{second}");
+        assert!(
+            second.contains("`src/a.rs:4-6`: the lock is held by the caller"),
+            "{second}"
+        );
+        assert!(second.contains("re-report"), "{second}");
     }
 
     #[test]
@@ -1066,6 +1234,23 @@ mod tests {
         assert!(prompts[1].contains(FOLLOWUP_SKILL));
         assert!(
             prompts[1].contains(&*comment_store::archive_path(tmp.path(), 1).to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn the_next_round_is_told_what_the_fix_pass_declined() {
+        let tmp = TempDir::new().unwrap();
+        let mut ops = FakeOps::new(tmp.path(), vec![MEDIUM, "[]"]);
+        ops.declined = r#"[{"comment": "src/a.rs:4-6", "reason": "no race: single-threaded"}]"#;
+
+        run_loop(&ops, &cfg(), DEFAULT_PROMPT, "GH-1", tmp.path(), LOOP_ID).unwrap();
+
+        let prompts = ops.prompts.borrow();
+        assert!(!prompts[0].contains("single-threaded"));
+        assert!(
+            prompts[1].contains("`src/a.rs:4-6`: no race: single-threaded"),
+            "{}",
+            prompts[1]
         );
     }
 

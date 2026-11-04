@@ -46,6 +46,21 @@ pub struct TicketSummary {
     pub epic: Option<ParentRef>,
 }
 
+/// Which kind of card [`Screen::Board`] shows (GitHub issue #200). Epics are
+/// kept off the ticket board's queries, since nobody works an epic directly,
+/// so the epics view is the board's place to see and move them. Toggled by
+/// [`Msg::ToggleEpicsView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardView {
+    /// Workable tickets under the active [`AssigneeFilter`].
+    #[default]
+    Tickets,
+    /// The project's open epics ([`TicketQuery::OpenEpics`]), whatever the
+    /// assignee filter. Ticket-only actions are refused here; see
+    /// [`is_ticket_only_action`].
+    Epics,
+}
+
 /// The board's assignee filter: which subset of tickets to show.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AssigneeFilter {
@@ -89,6 +104,41 @@ pub fn query_for_filter(filter: &AssigneeFilter, project_key: &str) -> TicketQue
             project_key: project_key.to_string(),
             account_id: user.account_id.clone(),
         },
+    }
+}
+
+/// The board's epic filter (GitHub issue #199): which epic's cards to show.
+/// Applied client-side in [`App::tickets_in_col`], alongside the search
+/// query, against each card's [`TicketSummary::epic`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EpicFilter {
+    /// Every card, whatever its epic (no filter).
+    #[default]
+    All,
+    /// Only cards with no parent epic.
+    NoEpic,
+    /// Only the children of this epic.
+    Epic(ParentRef),
+}
+
+impl EpicFilter {
+    /// The human-readable label for this choice, used both in the picker
+    /// list and the board's status line: an epic shows as `KEY  Title`.
+    pub fn label(&self) -> String {
+        match self {
+            EpicFilter::All => "All epics".to_string(),
+            EpicFilter::NoEpic => "No epic".to_string(),
+            EpicFilter::Epic(epic) => format!("{}  {}", epic.key, epic.summary),
+        }
+    }
+
+    /// Whether `ticket` passes this filter.
+    fn matches(&self, ticket: &TicketSummary) -> bool {
+        match self {
+            EpicFilter::All => true,
+            EpicFilter::NoEpic => ticket.epic.is_none(),
+            EpicFilter::Epic(epic) => ticket.epic.as_ref().is_some_and(|e| e.key == epic.key),
+        }
     }
 }
 
@@ -813,8 +863,12 @@ pub struct App {
     /// sort first, in this order; unlisted columns keep the default
     /// category-then-name ordering and sort after. Empty when unconfigured.
     pub board_column_order: Vec<String>,
-    /// The board's active assignee filter.
+    /// The board's active assignee filter. Kept as is while
+    /// [`App::board_view`] is [`BoardView::Epics`], so toggling back
+    /// restores the same ticket board.
     pub filter: AssigneeFilter,
+    /// Whether the board shows tickets or epics.
+    pub board_view: BoardView,
     /// Assignable users for `project_key`, fetched lazily the first time the
     /// filter picker opens and cached for the rest of the session. `None`
     /// until a fetch has succeeded at least once.
@@ -830,6 +884,15 @@ pub struct App {
     /// [`App::tickets_in_col`]). Kept separate from [`App::filter`], so it
     /// survives `r` refreshes and `f` refetches.
     pub board_search_query: String,
+    /// The board's epic filter (GitHub issue #199), applied client-side in
+    /// [`App::tickets_in_col`] together with [`App::board_search_query`].
+    /// Like the search query, it survives `r` refreshes and `f` refetches,
+    /// even when a refetch leaves the chosen epic with no cards.
+    pub epic_filter: EpicFilter,
+    /// Whether the epic filter picker overlay is shown.
+    pub show_epic_picker: bool,
+    /// Index into [`App::epic_options`] of the currently highlighted option.
+    pub epic_picker_selected: usize,
     /// Index into the picker's option list of the currently highlighted
     /// option.
     pub filter_picker_selected: usize,
@@ -1027,6 +1090,10 @@ pub struct App {
     /// are never open at once, since each overlay makes every other key
     /// inert.
     pub lane_confirm: Option<LaneConfirm>,
+    /// The mark-audited confirmation overlay's ticket key (`Y` on a board
+    /// card, GitHub issue #193), or `None` when closed. Shares the
+    /// confirm/cancel keys with the other confirmation overlays.
+    pub audit_mark_confirm: Option<String>,
     /// Tickets queued on [`Screen::Overview`] for a batch merge (`Space`,
     /// GitHub issue #88), each with the repo root its `tm merge` runs in.
     /// Separate from the board's [`App::merge_queue`]: the overview spans
@@ -1082,6 +1149,18 @@ impl App {
         Self::default()
     }
 
+    /// The query [`Screen::Board`] fetches its cards with: the active
+    /// [`AssigneeFilter`]'s ([`query_for_filter`]) in the ticket view, or
+    /// every open epic in the epics view.
+    pub fn board_query(&self) -> TicketQuery {
+        match self.board_view {
+            BoardView::Tickets => query_for_filter(&self.filter, &self.project_key),
+            BoardView::Epics => TicketQuery::OpenEpics {
+                project_key: self.project_key.clone(),
+            },
+        }
+    }
+
     /// Set `lane_names`, for threading the board's repo-compatible
     /// `[work.lanes]` names into the board at construction (see
     /// [`App::lane_names`]'s doc comment). Called from `tui::event::run`.
@@ -1106,13 +1185,14 @@ impl App {
         self
     }
 
-    /// Whether any confirmation overlay -- single merge, batch merge, or
-    /// blocked lane launch -- is open, which is what gates
+    /// Whether any confirmation overlay -- single merge, batch merge,
+    /// blocked lane launch, or mark audited -- is open, which is what gates
     /// [`crate::tui::keymap::map_key`] down to its confirm/cancel keys.
     pub fn confirm_open(&self) -> bool {
         self.merge_confirm.is_some()
             || self.batch_merge_confirm.is_some()
             || self.lane_confirm.is_some()
+            || self.audit_mark_confirm.is_some()
             || self.overview_merge_confirm.is_some()
     }
 
@@ -1124,9 +1204,10 @@ impl App {
             .copied()
     }
 
-    /// The tickets of board column `col` that match
-    /// [`App::board_search_query`] (GitHub issue #152): every ticket when the
-    /// query is empty, otherwise those whose key or summary contains it,
+    /// The tickets of board column `col` that pass [`App::epic_filter`]
+    /// (GitHub issue #199; ignored in [`BoardView::Epics`]) and match [`App::board_search_query`] (GitHub
+    /// issue #152): with an empty query, every ticket the epic filter keeps,
+    /// otherwise those whose key or summary also contains the query,
     /// case-insensitive, in column order. Empty (rather than panicking) if
     /// `col` is out of bounds. `columns` stays the unfiltered source of
     /// truth; selection, movement and rendering all go through this view.
@@ -1138,6 +1219,7 @@ impl App {
         column
             .tickets
             .iter()
+            .filter(|t| self.board_view == BoardView::Epics || self.epic_filter.matches(t))
             .filter(|t| {
                 query.is_empty()
                     || t.key.to_lowercase().contains(&query)
@@ -1172,6 +1254,30 @@ impl App {
         if let Some(users) = &self.assignable_users {
             options.extend(users.iter().cloned().map(AssigneeFilter::User));
         }
+        options
+    }
+
+    /// The epic filter picker's options, in display order: `All epics`, `No
+    /// epic`, then each distinct epic among the loaded cards, sorted by key.
+    /// Built from the loaded cards (not an epics query) so it never offers
+    /// an epic with no cards on the board; the one exception is the active
+    /// epic, kept even after a refetch empties it so the picker can still
+    /// mark it.
+    pub fn epic_options(&self) -> Vec<EpicFilter> {
+        let mut epics: Vec<&ParentRef> = self
+            .columns
+            .iter()
+            .flat_map(|c| &c.tickets)
+            .filter_map(|t| t.epic.as_ref())
+            .collect();
+        if let EpicFilter::Epic(active) = &self.epic_filter {
+            epics.push(active);
+        }
+        epics.sort_by(|a, b| a.key.cmp(&b.key));
+        epics.dedup_by(|a, b| a.key == b.key);
+
+        let mut options = vec![EpicFilter::All, EpicFilter::NoEpic];
+        options.extend(epics.into_iter().cloned().map(EpicFilter::Epic));
         options
     }
 
@@ -1385,6 +1491,18 @@ pub enum Msg {
     FilterPickerSelect,
     /// Close the filter picker without changing the active filter.
     FilterPickerClose,
+    /// Open the epic filter picker overlay (GitHub issue #199). Only
+    /// meaningful on [`Screen::Board`]; [`crate::tui::keymap::map_key`] only
+    /// ever emits this from there.
+    OpenEpicPicker,
+    /// Move the epic picker's highlighted option up.
+    EpicPickerUp,
+    /// Move the epic picker's highlighted option down.
+    EpicPickerDown,
+    /// Apply the epic picker's highlighted option and close the picker.
+    EpicPickerSelect,
+    /// Close the epic picker without changing the active epic filter.
+    EpicPickerClose,
     /// Enter board search mode (GitHub issue #152): every printable key now
     /// edits [`App::board_search_query`] until [`Msg::SearchSubmit`] or
     /// [`Msg::SearchCancel`]. Only meaningful on [`Screen::Board`];
@@ -1627,6 +1745,18 @@ pub enum Msg {
     /// launch a lane run for it, per [`lane_run_action`]'s precedence rule
     /// (already-active guard, zero/one/many configured lanes).
     LaneRunAction,
+    /// The `Y` key was pressed on [`Screen::Board`] for the selected ticket:
+    /// ask to record a passing audit verdict for it by hand, with no audit
+    /// session (GitHub issue #193). See [`mark_audited_action`].
+    MarkAuditedAction,
+    /// [`Cmd::RecordAudit`] succeeded: report it and refresh the board so
+    /// the card's readiness marker reflects the new verdict.
+    AuditMarked {
+        /// Ticket key the verdict was recorded for.
+        key: String,
+    },
+    /// [`Cmd::RecordAudit`] failed, with the status-line message.
+    AuditMarkFailed(String),
     /// Move the lane picker's highlighted lane up.
     LanePickerUp,
     /// Move the lane picker's highlighted lane down.
@@ -1679,6 +1809,10 @@ pub enum Msg {
         /// stderr otherwise (e.g. no open PR, or already watching).
         result: Result<(), String>,
     },
+    /// Switch [`Screen::Board`] between [`BoardView::Tickets`] and
+    /// [`BoardView::Epics`], clearing the shown cards and refetching under
+    /// the new view.
+    ToggleEpicsView,
     /// Open the retro board. Only meaningful on [`Screen::Board`];
     /// [`crate::tui::keymap::map_key`] only ever emits this from there.
     OpenRetro,
@@ -1738,8 +1872,8 @@ pub enum Msg {
 /// resulting `Msg` back through `update`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// Fetch tickets matching `query`, built by [`query_for_filter`] from the
-    /// board's active [`AssigneeFilter`].
+    /// Fetch tickets matching `query`, built by [`App::board_query`] from the
+    /// board's active [`BoardView`] and [`AssigneeFilter`].
     FetchTickets {
         /// The query to search with.
         query: TicketQuery,
@@ -2023,6 +2157,12 @@ pub enum Cmd {
         /// The query to search with.
         query: TicketQuery,
     },
+    /// Record a passing audit verdict for `key`, the same row `tm ticket
+    /// audit KEY --record ready` writes (GitHub issue #193).
+    RecordAudit {
+        /// Ticket key to record the verdict for.
+        key: String,
+    },
     /// Record a retro verdict for `key`.
     RecordRetro {
         /// Ticket key to record a verdict for.
@@ -2211,6 +2351,24 @@ pub fn admit_net_cmds(app: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
     admitted
 }
 
+/// Whether `msg` is a board action that only makes sense on a workable
+/// ticket, and so is refused in [`BoardView::Epics`]: launching a lane or a
+/// manual session, auditing or marking audited, merging, queueing a merge, and the assignee
+/// and epic filters, which the epics view ignores.
+fn is_ticket_only_action(msg: &Msg) -> bool {
+    matches!(
+        msg,
+        Msg::LaneRunAction
+            | Msg::ManualSessionAction
+            | Msg::AuditAction
+            | Msg::MarkAuditedAction
+            | Msg::MergePrAction
+            | Msg::ToggleMergeQueue
+            | Msg::OpenFilterPicker
+            | Msg::OpenEpicPicker
+    )
+}
+
 /// Advance `app` in response to `msg`, returning the new state and any
 /// commands the caller should execute.
 ///
@@ -2231,6 +2389,13 @@ pub fn update(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
 /// The per-[`Msg`] reducer arms of [`update`], which see already-cleared
 /// in-flight state and whose emitted `Cmd`s the wrapper gates afterward.
 fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
+    if app.screen == Screen::Board
+        && app.board_view == BoardView::Epics
+        && is_ticket_only_action(&msg)
+    {
+        app.status_line = "not available in the epics view; press E for tickets".to_string();
+        return (app, Vec::new());
+    }
     match msg {
         Msg::Up => {
             move_up(&mut app);
@@ -2266,7 +2431,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 };
                 (app, vec![Cmd::FetchRankTickets { query }])
             } else {
-                let query = query_for_filter(&app.filter, &app.project_key);
+                let query = app.board_query();
                 (app, vec![Cmd::FetchTickets { query }])
             }
         }
@@ -2317,6 +2482,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmAccept => {
             if let Some(confirm) = app.lane_confirm.take() {
                 launch_lane(app, confirm.key)
+            } else if let Some(key) = app.audit_mark_confirm.take() {
+                (app, vec![Cmd::RecordAudit { key }])
             } else if let Some(confirm) = app.overview_merge_confirm.take() {
                 crate::tui::overview_actions::confirm_accept(app, confirm)
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
@@ -2328,6 +2495,8 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
         Msg::ConfirmCancel => {
             if let Some(confirm) = app.lane_confirm.take() {
                 app.status_line = format!("lane run for {} cancelled", confirm.key);
+            } else if let Some(key) = app.audit_mark_confirm.take() {
+                app.status_line = format!("mark audited for {key} cancelled");
             } else if let Some(confirm) = app.overview_merge_confirm.take() {
                 app.status_line = format!("merge of {} cancelled", confirm.label());
             } else if let Some(confirm) = app.batch_merge_confirm.take() {
@@ -2350,7 +2519,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             }
             app.status_line = message;
             if merged {
-                let query = query_for_filter(&app.filter, &app.project_key);
+                let query = app.board_query();
                 (app, vec![Cmd::FetchTickets { query }])
             } else {
                 (app, Vec::new())
@@ -2436,6 +2605,37 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::FilterPickerSelect => filter_picker_select(app),
+        Msg::OpenEpicPicker => {
+            app.show_epic_picker = true;
+            app.epic_picker_selected = app
+                .epic_options()
+                .iter()
+                .position(|option| option == &app.epic_filter)
+                .unwrap_or(0);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerUp => {
+            app.epic_picker_selected = app.epic_picker_selected.saturating_sub(1);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerDown => {
+            let count = app.epic_options().len();
+            app.epic_picker_selected = (app.epic_picker_selected + 1).min(count - 1);
+            (app, Vec::new())
+        }
+        Msg::EpicPickerSelect => {
+            if let Some(choice) = app.epic_options().get(app.epic_picker_selected).cloned() {
+                let preferred_key = app.selected_ticket().map(|t| t.key.clone());
+                app.epic_filter = choice;
+                reselect(&mut app, preferred_key);
+            }
+            app.show_epic_picker = false;
+            (app, Vec::new())
+        }
+        Msg::EpicPickerClose => {
+            app.show_epic_picker = false;
+            (app, Vec::new())
+        }
         Msg::StartSearch => {
             app.board_searching = true;
             (app, Vec::new())
@@ -2518,7 +2718,7 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             // now-non-matching card doesn't linger until a manual `r`; the
             // local patch above still keeps the card visually correct in the
             // meantime.
-            let query = query_for_filter(&app.filter, &app.project_key);
+            let query = app.board_query();
             (app, vec![Cmd::FetchTickets { query }])
         }
         Msg::AssignFailed(err) => {
@@ -2667,6 +2867,19 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
             (app, Vec::new())
         }
         Msg::LaneRunAction => lane_run_action(app),
+        Msg::MarkAuditedAction => mark_audited_action(app),
+        Msg::AuditMarked { key } => {
+            app.status_line = format!(
+                "Recorded audit for {key}: {}",
+                crate::cli::ready::PASSING_AUDIT_VERDICT
+            );
+            let query = query_for_filter(&app.filter, &app.project_key);
+            (app, vec![Cmd::FetchTickets { query }])
+        }
+        Msg::AuditMarkFailed(err) => {
+            app.status_line = err;
+            (app, Vec::new())
+        }
         Msg::LanePickerUp => {
             app.lane_picker_selected = app.lane_picker_selected.saturating_sub(1);
             (app, Vec::new())
@@ -2730,6 +2943,18 @@ fn update_inner(mut app: App, msg: Msg) -> (App, Vec<Cmd>) {
                 Err(err) => format!("PR watch failed for {key}: {err}"),
             };
             (app, Vec::new())
+        }
+        Msg::ToggleEpicsView => {
+            app.board_view = match app.board_view {
+                BoardView::Tickets => BoardView::Epics,
+                BoardView::Epics => BoardView::Tickets,
+            };
+            app.columns.clear();
+            app.selected_col = 0;
+            app.selected_row = 0;
+            app.status_line = "Refreshing...".to_string();
+            let query = app.board_query();
+            (app, vec![Cmd::FetchTickets { query }])
         }
         Msg::OpenRetro => open_retro(app),
         Msg::RetroTicketsLoaded(tickets) => {
@@ -3136,6 +3361,21 @@ fn lane_run_action(mut app: App) -> (App, Vec<Cmd>) {
         return (app, Vec::new());
     }
     launch_lane(app, key)
+}
+
+/// Handle [`Msg::MarkAuditedAction`]: open the mark-audited confirmation
+/// for the selected ticket (GitHub issue #193). Only [`Msg::ConfirmAccept`]
+/// goes on to [`Cmd::RecordAudit`], so a stray `Y` records nothing. A no-op
+/// with no selection or while another confirmation is open.
+fn mark_audited_action(mut app: App) -> (App, Vec<Cmd>) {
+    if app.confirm_open() {
+        return (app, Vec::new());
+    }
+    let Some(ticket) = app.selected_ticket() else {
+        return (app, Vec::new());
+    };
+    app.audit_mark_confirm = Some(ticket.key.clone());
+    (app, Vec::new())
 }
 
 /// Launch a lane run for `key` past [`lane_run_action`]'s guards (and, for
@@ -4007,7 +4247,7 @@ fn filter_picker_select(mut app: App) -> (App, Vec<Cmd>) {
     app.filter = filter;
     app.show_filter_picker = false;
     app.status_line = "Refreshing...".to_string();
-    let query = query_for_filter(&app.filter, &app.project_key);
+    let query = app.board_query();
     (app, vec![Cmd::FetchTickets { query }])
 }
 
@@ -4694,6 +4934,333 @@ mod tests {
         app.merge_queue.insert("PROJ-1".to_string());
         app.board_search_query = "login".to_string();
         assert_eq!(merge_queue_in_board_order(&app), ["PROJ-1", "PROJ-2"]);
+    }
+
+    fn everyone_board() -> App {
+        App {
+            project_key: "PROJ".to_string(),
+            filter: AssigneeFilter::Everyone,
+            ..board_with(vec![ticket("PROJ-1"), ticket("PROJ-2")], 1)
+        }
+    }
+
+    fn open_epics() -> Cmd {
+        Cmd::FetchTickets {
+            query: TicketQuery::OpenEpics {
+                project_key: "PROJ".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn toggle_epics_view_clears_the_board_and_fetches_open_epics() {
+        let (app, cmds) = update(everyone_board(), Msg::ToggleEpicsView);
+        assert_eq!(app.board_view, BoardView::Epics);
+        assert!(app.columns.is_empty(), "ticket cards must not linger");
+        assert_eq!((app.selected_col, app.selected_row), (0, 0));
+        assert_eq!(cmds, vec![open_epics()]);
+    }
+
+    #[test]
+    fn toggling_back_refetches_tickets_under_the_kept_filter() {
+        let (app, _) = update(everyone_board(), Msg::ToggleEpicsView);
+        let (app, cmds) = update(app, Msg::ToggleEpicsView);
+        assert_eq!(app.board_view, BoardView::Tickets);
+        assert_eq!(app.filter, AssigneeFilter::Everyone);
+        assert_eq!(
+            cmds,
+            vec![Cmd::FetchTickets {
+                query: TicketQuery::Everyone {
+                    project_key: "PROJ".to_string()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn refresh_in_the_epics_view_refetches_open_epics() {
+        let app = App {
+            board_view: BoardView::Epics,
+            ..everyone_board()
+        };
+        let (_, cmds) = update(app, Msg::Refresh);
+        assert_eq!(cmds, vec![open_epics()]);
+    }
+
+    #[test]
+    fn transition_moves_an_epic_into_its_new_column_in_the_epics_view() {
+        let app = App {
+            board_view: BoardView::Epics,
+            screen: Screen::TransitionMenu,
+            ..board_with(
+                vec![ticket("PROJ-9"), ticket_with("PROJ-8", "Done", "done")],
+                0,
+            )
+        };
+        let (app, _) = update(
+            app,
+            Msg::TransitionApplied {
+                key: "PROJ-9".to_string(),
+                status: "In Progress".to_string(),
+                status_category: "indeterminate".to_string(),
+            },
+        );
+        assert_eq!(app.board_view, BoardView::Epics);
+        let moved = app.selected_ticket().expect("the epic stays selected");
+        assert_eq!(
+            (moved.key.as_str(), moved.status.as_str()),
+            ("PROJ-9", "In Progress")
+        );
+    }
+
+    #[test]
+    fn ticket_only_actions_do_nothing_in_the_epics_view() {
+        for msg in [
+            Msg::LaneRunAction,
+            Msg::ManualSessionAction,
+            Msg::AuditAction,
+            Msg::MarkAuditedAction,
+            Msg::MergePrAction,
+            Msg::ToggleMergeQueue,
+            Msg::OpenFilterPicker,
+            Msg::OpenEpicPicker,
+        ] {
+            let app = App {
+                board_view: BoardView::Epics,
+                lane_names: vec!["main".to_string()],
+                ..everyone_board()
+            };
+            let (app, cmds) = update(app, msg.clone());
+            assert!(cmds.is_empty(), "{msg:?} must not dispatch: {cmds:?}");
+            assert!(app.merge_queue.is_empty(), "{msg:?}");
+            assert!(
+                !app.show_filter_picker && !app.show_epic_picker && !app.show_lane_picker,
+                "{msg:?}"
+            );
+            assert!(
+                app.merge_confirm.is_none() && app.lane_confirm.is_none(),
+                "{msg:?}"
+            );
+            assert!(
+                app.status_line.contains("epics view"),
+                "{msg:?} should explain itself: {:?}",
+                app.status_line
+            );
+        }
+    }
+
+    #[test]
+    fn merge_action_on_the_overview_ignores_the_board_view() {
+        let app = App {
+            board_view: BoardView::Epics,
+            screen: Screen::Overview,
+            ..App::new()
+        };
+        let (app, _) = update(app, Msg::MergePrAction);
+        assert!(!app.status_line.contains("epics view"));
+    }
+
+    fn epic(key: &str, summary: &str) -> ParentRef {
+        ParentRef {
+            key: key.to_string(),
+            summary: summary.to_string(),
+        }
+    }
+
+    fn under(epic_ref: &ParentRef, ticket: TicketSummary) -> TicketSummary {
+        TicketSummary {
+            epic: Some(epic_ref.clone()),
+            ..ticket
+        }
+    }
+
+    /// A two-column board for the epic filter tests (GitHub issue #199). To
+    /// Do: PROJ-1 "Fix login" (epic PROJ-90), PROJ-2 "Add search" (no epic),
+    /// PROJ-3 "Login copy" (epic PROJ-80); Done: PROJ-4 "Search docs" (epic
+    /// PROJ-90).
+    fn epic_board() -> App {
+        let auth = epic("PROJ-90", "Auth revamp");
+        let copy = epic("PROJ-80", "Copy pass");
+        board_with(
+            vec![
+                under(&auth, titled("PROJ-1", "To Do", "Fix login")),
+                titled("PROJ-2", "To Do", "Add search"),
+                under(&copy, titled("PROJ-3", "To Do", "Login copy")),
+                under(&auth, titled("PROJ-4", "Done", "Search docs")),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn epic_options_list_all_none_then_each_loaded_epic_once_by_key() {
+        let app = epic_board();
+        assert_eq!(
+            app.epic_options(),
+            [
+                EpicFilter::All,
+                EpicFilter::NoEpic,
+                EpicFilter::Epic(epic("PROJ-80", "Copy pass")),
+                EpicFilter::Epic(epic("PROJ-90", "Auth revamp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn epic_options_on_an_empty_board_are_all_and_none() {
+        let app = board_with(vec![], 0);
+        assert_eq!(app.epic_options(), [EpicFilter::All, EpicFilter::NoEpic]);
+    }
+
+    #[test]
+    fn epic_options_keep_an_active_epic_with_no_loaded_cards() {
+        let mut app = board_with(vec![titled("PROJ-2", "To Do", "Add search")], 0);
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        assert_eq!(
+            app.epic_options(),
+            [
+                EpicFilter::All,
+                EpicFilter::NoEpic,
+                EpicFilter::Epic(epic("PROJ-90", "Auth revamp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn epic_filter_labels_show_key_and_title() {
+        assert_eq!(EpicFilter::All.label(), "All epics");
+        assert_eq!(EpicFilter::NoEpic.label(), "No epic");
+        assert_eq!(
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp")).label(),
+            "PROJ-90  Auth revamp"
+        );
+    }
+
+    #[test]
+    fn epic_filter_narrows_every_column_to_the_epics_children() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1"]);
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+    }
+
+    #[test]
+    fn no_epic_filter_shows_only_cards_without_a_parent() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-2"]);
+        assert!(keys_in_col(&app, 1).is_empty());
+    }
+
+    #[test]
+    fn epic_filter_combines_with_the_search_query() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        app.board_search_query = "search".to_string();
+        assert!(keys_in_col(&app, 0).is_empty());
+        assert_eq!(keys_in_col(&app, 1), ["PROJ-4"]);
+    }
+
+    #[test]
+    fn open_epic_picker_highlights_the_active_choice() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        let (app, cmds) = update(app, Msg::OpenEpicPicker);
+        assert!(app.show_epic_picker);
+        assert_eq!(app.epic_picker_selected, 3);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn epic_picker_up_and_down_navigate_and_clamp() {
+        let (app, _) = update(epic_board(), Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerUp);
+        assert_eq!(app.epic_picker_selected, 0);
+        let mut app = app;
+        for _ in 0..10 {
+            (app, _) = update(app, Msg::EpicPickerDown);
+        }
+        assert_eq!(app.epic_picker_selected, 3);
+    }
+
+    #[test]
+    fn epic_picker_select_applies_the_choice_and_reselects_a_visible_card() {
+        let mut app = epic_board();
+        app.selected_row = 1; // PROJ-2, which has no epic
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerDown);
+        let (app, _) = update(app, Msg::EpicPickerDown); // PROJ-80
+        let (app, cmds) = update(app, Msg::EpicPickerSelect);
+        assert!(!app.show_epic_picker);
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-80", "Copy pass"))
+        );
+        assert_eq!(
+            app.selected_ticket().map(|t| t.key.as_str()),
+            Some("PROJ-3")
+        );
+        assert!(cmds.is_empty(), "the epic filter is client-side");
+    }
+
+    #[test]
+    fn epic_picker_select_all_clears_the_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerUp);
+        let (app, _) = update(app, Msg::EpicPickerSelect);
+        assert_eq!(app.epic_filter, EpicFilter::All);
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-2", "PROJ-3"]);
+    }
+
+    #[test]
+    fn epic_picker_close_keeps_the_active_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenEpicPicker);
+        let (app, _) = update(app, Msg::EpicPickerDown);
+        let (app, _) = update(app, Msg::EpicPickerClose);
+        assert!(!app.show_epic_picker);
+        assert_eq!(app.epic_filter, EpicFilter::NoEpic);
+    }
+
+    #[test]
+    fn epic_filter_survives_a_refetch_that_leaves_it_empty() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::Epic(epic("PROJ-90", "Auth revamp"));
+        let (app, _) = update(app, Msg::Refresh);
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp"))
+        );
+        let (app, _) = update(
+            app,
+            Msg::TicketsLoaded(vec![titled("PROJ-2", "To Do", "Add search")]),
+        );
+        assert_eq!(
+            app.epic_filter,
+            EpicFilter::Epic(epic("PROJ-90", "Auth revamp"))
+        );
+        assert!(keys_in_col(&app, 0).is_empty());
+        assert!(app.selected_ticket().is_none());
+    }
+
+    #[test]
+    fn epics_view_ignores_the_epic_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        app.board_view = BoardView::Epics;
+        assert_eq!(keys_in_col(&app, 0), ["PROJ-1", "PROJ-2", "PROJ-3"]);
+    }
+
+    #[test]
+    fn assignee_filter_change_keeps_the_epic_filter() {
+        let mut app = epic_board();
+        app.epic_filter = EpicFilter::NoEpic;
+        let (app, _) = update(app, Msg::OpenFilterPicker);
+        let (app, _) = update(app, Msg::FilterPickerSelect);
+        assert_eq!(app.epic_filter, EpicFilter::NoEpic);
     }
 
     #[test]
@@ -8482,6 +9049,71 @@ mod tests {
             assert!(app.lane_confirm.is_none(), "{readiness:?}");
             assert_eq!(cmds.len(), 1, "{readiness:?} should launch directly");
         }
+    }
+
+    #[test]
+    fn mark_audited_action_asks_before_recording_anything() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::MarkAuditedAction);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(app.audit_mark_confirm.as_deref(), Some("PROJ-1"));
+        assert!(app.confirm_open());
+    }
+
+    #[test]
+    fn confirming_mark_audited_records_a_ready_verdict_and_starts_no_session() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, _) = update(app, Msg::MarkAuditedAction);
+        let (app, cmds) = update(app, Msg::ConfirmAccept);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RecordAudit {
+                key: "PROJ-1".to_string()
+            }]
+        );
+        assert!(app.audit_mark_confirm.is_none());
+    }
+
+    #[test]
+    fn cancelling_mark_audited_records_nothing() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, _) = update(app, Msg::MarkAuditedAction);
+        let (app, cmds) = update(app, Msg::ConfirmCancel);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(app.audit_mark_confirm.is_none());
+        assert_eq!(app.status_line, "mark audited for PROJ-1 cancelled");
+    }
+
+    #[test]
+    fn mark_audited_action_with_no_selected_ticket_is_a_noop() {
+        let app = board_with(vec![], 0);
+        let (app, cmds) = update(app, Msg::MarkAuditedAction);
+        assert!(cmds.is_empty());
+        assert!(app.audit_mark_confirm.is_none());
+    }
+
+    #[test]
+    fn audit_marked_reports_it_and_refreshes_the_board() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(
+            app,
+            Msg::AuditMarked {
+                key: "PROJ-1".to_string(),
+            },
+        );
+        assert_eq!(app.status_line, "Recorded audit for PROJ-1: ready");
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::FetchTickets { .. }]),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn audit_mark_failed_reports_the_error() {
+        let app = board_with(vec![ticket("PROJ-1")], 0);
+        let (app, cmds) = update(app, Msg::AuditMarkFailed("disk full".to_string()));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status_line, "disk full");
     }
 
     #[test]

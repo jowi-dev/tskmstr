@@ -1513,6 +1513,7 @@ pub fn prepare_run_lane(
             settings_path,
             run_id: Some(run_id.to_string()),
             mode: request.mode,
+            tool_scope: crate::agent::ToolScope::Full,
         },
     );
 
@@ -1536,6 +1537,7 @@ pub fn prepare_run_lane(
                 settings_path: fallback_settings_path,
                 run_id: Some(run_id.to_string()),
                 mode: request.mode,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
         fallbacks.push(PlannedFallback {
@@ -1840,6 +1842,7 @@ pub fn prepare_existing_branch_run(
             settings_path,
             run_id: Some(run_id.to_string()),
             mode,
+            tool_scope: crate::agent::ToolScope::Full,
         },
     );
 

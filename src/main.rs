@@ -221,7 +221,8 @@ fn dispatch(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             epic,
             json,
             mermaid,
-        } => run_graph(epic, json, mermaid, &paths, &keychain, env_token),
+            html,
+        } => run_graph(epic, json, mermaid, html, &paths, &keychain, env_token),
         Command::Board => run_board(&paths, &keychain, env_token),
         Command::Overview => run_overview(),
         Command::Runs {
@@ -1202,6 +1203,7 @@ fn net_deps_builder(
 ) -> Result<NetDepsBuilder, Box<dyn std::error::Error>> {
     let db_path = run_db_path_from_config(config);
     let inherit_epic_blockers = config.inherit_epic_blockers;
+    let require_audit = config.require_audit;
     match config.backend {
         BackendKind::Jira => {
             let token = resolve_token(keychain, env_token)?;
@@ -1219,12 +1221,13 @@ fn net_deps_builder(
                 ),
                 gh: Box::new(ShellGhCli::new()),
                 git: Box::new(ShellGitOps::new()),
-                store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                store: tskmstr::runs::RunStore::open(&db_path).map_err(|e| e.to_string()),
                 lanes: ctx.lanes,
                 cwd: ctx.cwd,
                 backend_identity: ctx.backend_identity,
                 runner: ctx.runner,
                 inherit_epic_blockers,
+                require_audit,
             }))
         }
         BackendKind::Github => {
@@ -1246,12 +1249,13 @@ fn net_deps_builder(
                     jira: Box::new(provider),
                     gh: Box::new(ShellGhCli::new()),
                     git: Box::new(ShellGitOps::new()),
-                    store: tskmstr::runs::RunStore::open(&db_path).ok(),
+                    store: tskmstr::runs::RunStore::open(&db_path).map_err(|e| e.to_string()),
                     lanes: ctx.lanes,
                     cwd: ctx.cwd,
                     backend_identity: ctx.backend_identity,
                     runner: ctx.runner,
                     inherit_epic_blockers,
+                    require_audit,
                 }
             }))
         }
@@ -1692,6 +1696,7 @@ fn run_check_cmd(quiet: bool) -> ExitCode {
             paths: &paths,
             home: &home,
             runner,
+            thatch: tskmstr::cli::check::probe_thatch(),
         };
         tskmstr::cli::check::run_check(&ctx, &mut stdout)
     };
@@ -2215,13 +2220,14 @@ fn run_ready(
 }
 
 /// `tm graph [EPIC]`: build the configured backend's provider and run
-/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json` and
-/// `mermaid` pick the output format (clap keeps them exclusive); neither
-/// means text.
+/// [`tskmstr::cli::graph::run`] against stdout and stderr. `json`,
+/// `mermaid`, and `html` pick the output format (clap keeps them
+/// exclusive); none means text.
 fn run_graph(
     epic: Option<String>,
     json: bool,
     mermaid: bool,
+    html: bool,
     paths: &ConfigPaths,
     keychain: &dyn KeychainStore,
     env_token: Option<String>,
@@ -2233,6 +2239,8 @@ fn run_graph(
         tskmstr::cli::graph::GraphFormat::Json
     } else if mermaid {
         tskmstr::cli::graph::GraphFormat::Mermaid
+    } else if html {
+        tskmstr::cli::graph::GraphFormat::Html
     } else {
         tskmstr::cli::graph::GraphFormat::Text
     };
@@ -2833,7 +2841,16 @@ fn run_runs(
             )?;
         }
         Some(RunsCmd::Register { kind, key }) => {
-            let runner = agent_runner_or_default(full_config.as_ref());
+            // The env vars to read belong to the runner hosting this
+            // session, which a routed lane records on its row; see
+            // `hosting_runner`.
+            let default_runner = agent_runner_or_default(full_config.as_ref());
+            let session_run_id = tskmstr::runs::session::SessionEnv::from_process_env(
+                &default_runner.session_env_vars(),
+            )
+            .session_run_id;
+            let runner =
+                tskmstr::runs::session::hosting_runner(&store, session_run_id, default_runner);
             let session_env =
                 tskmstr::runs::session::SessionEnv::from_process_env(&runner.session_env_vars());
             let sessions_dir = tskmstr::runs::session::sessions_dir_from_process_env();

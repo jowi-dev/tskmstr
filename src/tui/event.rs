@@ -41,15 +41,16 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use thiserror::Error;
 
 use crate::blocker_stacking::{ParentEpics, Readiness, readiness};
+use crate::cli::ready::AuditGate;
 use crate::jira::client::RankAnchor;
 use crate::ticketing::error::ProviderError;
 use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::Issue;
+use crate::tui::app::update;
 use crate::tui::app::{
     App, AssignChoice, AuditStatusEntry, Cmd, Msg, TicketSummary, audit_indicator,
     auto_review_indicator, bot_watch_indicator, lane_run_indicator,
 };
-use crate::tui::app::{query_for_filter, update};
 use crate::tui::keymap::{RetroOverlay, map_key};
 use crate::tui::launcher::LaneLauncher;
 use crate::tui::ui::draw;
@@ -139,9 +140,11 @@ pub struct NetDeps {
     /// wraps a single SQLite connection, so the event loop's
     /// [`TuiDeps::store`] cannot be shared across threads), used by
     /// [`resolve_repo_root_for_pr_lookup`] and [`fetch_retro_tickets`].
-    /// `None` when the runs DB failed to open, with the same leniency
-    /// stance as [`TuiDeps::store`].
-    pub store: Option<crate::runs::RunStore>,
+    /// The open error's text when the runs DB failed to open, with the
+    /// same leniency stance as [`TuiDeps::store`]; kept (not dropped to
+    /// `None`) so the board's needs-audit reason names the real failure,
+    /// as `tm ready` does.
+    pub store: Result<crate::runs::RunStore, String>,
     /// `config.work.lanes`, kept in full so
     /// [`resolve_repo_root_for_pr_lookup`] can look up a lane's `repo` the
     /// same way `tm pr watch`'s `crate::cli::pr::resolve_watch_repo_root`
@@ -163,6 +166,10 @@ pub struct NetDeps {
     /// `[ready] inherit_epic_blockers`: whether [`board_readiness`] marks a
     /// child of a locked epic blocked (GitHub issue #178).
     pub inherit_epic_blockers: bool,
+    /// `[ready] require_audit`: whether [`board_readiness`] applies `tm
+    /// ready`'s audit gate, reading verdicts from [`NetDeps::store`] (GitHub
+    /// issue #193).
+    pub require_audit: bool,
 }
 
 /// Builds the network worker thread's [`NetDeps`] in place on that thread --
@@ -405,7 +412,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
     .with_lane_names(deps.lane_names.clone())
     .with_hidden_lane_count(deps.hidden_lane_count)
     .with_status_on_merge(deps.status_on_merge.clone());
-    let query = query_for_filter(&app.filter, &app.project_key);
+    let query = app.board_query();
     // Registered through `admit_net_cmds` like every `update`-emitted
     // command, so the initial fetch shows the pending indicator and can't
     // be doubled by an early `r` press.
@@ -436,6 +443,7 @@ pub fn run(deps: TuiDeps, net: NetDepsBuilder) -> Result<(), TuiError> {
                     &app.screen,
                     app.show_help,
                     app.show_filter_picker,
+                    app.show_epic_picker,
                     app.show_assign_picker,
                     app.show_lane_picker,
                     app.show_browser_picker,
@@ -1475,6 +1483,7 @@ fn run_watch_loop(
                     &app.screen,
                     app.show_help,
                     app.show_filter_picker,
+                    app.show_epic_picker,
                     app.show_assign_picker,
                     app.show_lane_picker,
                     app.show_browser_picker,
@@ -1988,6 +1997,7 @@ fn execute(deps: &TuiDeps, cmd: Cmd) -> Vec<Msg> {
         }
         Cmd::LaunchCleanup { key } => launch_cleanup_cmd(deps, &key),
         Cmd::LoadTicketRunDetail { key } => load_ticket_run_detail(deps, &key),
+        Cmd::RecordAudit { key } => record_audit(deps, &key),
         Cmd::RecordRetro {
             key,
             verdict,
@@ -2639,6 +2649,10 @@ fn fetch_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
 /// needs PRs for it), and a failed epic lookup makes that epic's children
 /// unknown.
 ///
+/// A ready or stackable card that fails `tm ready`'s audit gate
+/// ([`board_audit_gate`]) becomes [`Readiness::NeedsAudit`] (GitHub issue
+/// #193): autopilot will skip it, so it must not read as launchable.
+///
 /// [`GhCli::pr_list_all`]: crate::github::gh_cli::GhCli::pr_list_all
 fn board_readiness(
     deps: &NetDeps,
@@ -2675,11 +2689,35 @@ fn board_readiness(
     } else {
         None
     };
+    let gate = board_audit_gate(deps);
     let readiness = issues
         .iter()
-        .map(|issue| readiness(issue, prs.as_deref(), &epics))
+        .map(|issue| match readiness(issue, prs.as_deref(), &epics) {
+            ready @ (Readiness::Ready | Readiness::Stackable { .. }) => {
+                match gate.needs_audit(&issue.key) {
+                    Some(reason) => Readiness::NeedsAudit { reason },
+                    None => ready,
+                }
+            }
+            other => other,
+        })
         .collect();
     (readiness, degraded)
+}
+
+/// `tm ready`'s audit gate over the worker's own runs DB, so a card reads
+/// [`Readiness::NeedsAudit`] exactly when `tm ready` and the dispatcher
+/// would skip it. A runs DB that failed to open fails closed, as it does
+/// for `tm ready`, with the open error as the reason.
+fn board_audit_gate(deps: &NetDeps) -> AuditGate<'_> {
+    match (&deps.store, deps.require_audit) {
+        (_, false) => AuditGate::Off,
+        (Ok(store), true) => AuditGate::Store {
+            store,
+            scope: deps.backend_identity.scope(),
+        },
+        (Err(err), true) => AuditGate::Unavailable(err.clone()),
+    }
 }
 
 /// Run `Cmd::FetchRankTickets`: search for the project's full ranked ticket
@@ -2718,7 +2756,7 @@ pub fn fetch_retro_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
         Ok(page) => page.tickets,
         Err(err) => return vec![Msg::RetroTicketsFailed(err.to_string())],
     };
-    let Some(store) = &deps.store else {
+    let Ok(store) = &deps.store else {
         return vec![Msg::RetroTicketsFailed(
             "run database unavailable".to_string(),
         )];
@@ -2756,6 +2794,33 @@ pub fn fetch_retro_tickets(deps: &NetDeps, query: &TicketQuery) -> Vec<Msg> {
         });
     }
     vec![Msg::RetroTicketsLoaded(rows)]
+}
+
+/// Run `Cmd::RecordAudit`: record a passing audit verdict for `key` in the
+/// board's scope, the same row `tm ticket audit KEY --record ready` writes,
+/// so the next refresh and the next dispatcher tick both see it pass the
+/// audit gate. `deps.store` being unavailable degrades to
+/// [`Msg::AuditMarkFailed`], like [`record_retro`].
+pub fn record_audit(deps: &TuiDeps, key: &str) -> Vec<Msg> {
+    let failed = |err: &dyn std::fmt::Display| {
+        vec![Msg::AuditMarkFailed(format!(
+            "could not record audit for {key}: {err}"
+        ))]
+    };
+    let Some(store) = &deps.store else {
+        return failed(&"run database unavailable");
+    };
+    match store.record_audit(
+        &deps.backend_identity.scope(),
+        key,
+        crate::cli::ready::PASSING_AUDIT_VERDICT,
+        None,
+    ) {
+        Ok(()) => vec![Msg::AuditMarked {
+            key: key.to_string(),
+        }],
+        Err(err) => failed(&err),
+    }
 }
 
 /// Run `Cmd::RecordRetro`: record a retro verdict via
@@ -2952,7 +3017,7 @@ fn resolve_pr_for_ticket(deps: &NetDeps, key: String, jira_url: String) -> Vec<M
 /// ordinary case of running `tm board` from inside the repo.
 fn resolve_repo_root_for_pr_lookup(deps: &NetDeps, key: &str) -> Option<std::path::PathBuf> {
     match &deps.store {
-        Some(store) => crate::cli::pr::resolve_watch_repo_root(
+        Ok(store) => crate::cli::pr::resolve_watch_repo_root(
             Some(&deps.backend_identity.scope()),
             &deps.lanes,
             store,
@@ -2961,7 +3026,7 @@ fn resolve_repo_root_for_pr_lookup(deps: &NetDeps, key: &str) -> Option<std::pat
             key,
         )
         .ok(),
-        None => deps.git.repo_root(&deps.cwd).ok(),
+        Err(_) => deps.git.repo_root(&deps.cwd).ok(),
     }
 }
 
@@ -3144,7 +3209,7 @@ mod tests {
             jira: Box::new(JiraProvider::new(jira, "https://example.atlassian.net")),
             gh: Box::new(crate::github::gh_cli::FakeGhCli::new()),
             git: Box::new(crate::work::git::FakeGitOps::new()),
-            store: None,
+            store: Err("no runs db in this test".to_string()),
             lanes: std::collections::BTreeMap::new(),
             cwd: std::path::PathBuf::from("/repo"),
             backend_identity: crate::config::BackendIdentity::Jira {
@@ -3153,6 +3218,7 @@ mod tests {
             },
             runner: &crate::agent::claude::ClaudeRunner,
             inherit_epic_blockers: true,
+            require_audit: false,
         }
     }
 
@@ -3326,6 +3392,99 @@ mod tests {
             ]
         );
         assert_eq!(msgs.len(), 1, "no degradation note on success: {msgs:?}");
+    }
+
+    /// [`net_deps`] with `[ready] require_audit` on over a fresh runs DB
+    /// holding `audits` (ticket key, verdict) in the board's own scope.
+    fn audit_gated_deps(
+        jira: FakeJiraClient,
+        audits: &[(&str, &str)],
+    ) -> (NetDeps, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = net_deps(jira);
+        let scope = deps.backend_identity.scope();
+        for (key, verdict) in audits {
+            store.record_audit(&scope, key, verdict, None).unwrap();
+        }
+        deps.store = Ok(store);
+        deps.require_audit = true;
+        (deps, dir)
+    }
+
+    #[test]
+    fn fetch_tickets_marks_unaudited_ready_and_stackable_tickets_needs_audit() {
+        use crate::github::gh_cli::{FakeGhCli, PrLifecycle};
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![
+                issue("PROJ-1", "To Do"),
+                blocked_issue("PROJ-2", "PROJ-8"),
+                blocked_issue("PROJ-3", "PROJ-9"),
+                issue("PROJ-4", "To Do"),
+                issue("PROJ-5", "To Do"),
+            ],
+            next_page_token: None,
+        });
+        let (mut deps, _dir) =
+            audit_gated_deps(jira, &[("PROJ-4", "ready"), ("PROJ-5", "needs-work")]);
+        deps.gh = Box::new(FakeGhCli::new().with_pr_list_all(Ok(vec![pr_summary(
+            90,
+            "jowi-dev/proj-9-thing",
+            PrLifecycle::Open,
+        )])));
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        let not_audited = Readiness::NeedsAudit {
+            reason: "not audited".to_string(),
+        };
+        assert_eq!(
+            loaded_readiness(&msgs),
+            vec![
+                ("PROJ-1".to_string(), not_audited.clone()),
+                (
+                    "PROJ-2".to_string(),
+                    Readiness::Blocked {
+                        blocker_keys: vec!["PROJ-8".to_string()],
+                        via_epic: None,
+                    }
+                ),
+                ("PROJ-3".to_string(), not_audited),
+                ("PROJ-4".to_string(), Readiness::Ready),
+                (
+                    "PROJ-5".to_string(),
+                    Readiness::NeedsAudit {
+                        reason: "last audit was needs-work".to_string(),
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_tickets_fails_the_audit_gate_closed_without_a_runs_db() {
+        use crate::ticketing::types::SearchResult;
+
+        let jira = FakeJiraClient::new().with_search_result(SearchResult {
+            issues: vec![issue("PROJ-1", "To Do")],
+            next_page_token: None,
+        });
+        let mut deps = net_deps(jira);
+        deps.require_audit = true;
+        deps.store = Err("unable to open database file".to_string());
+
+        let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
+
+        // The open error itself, as `tm ready` prints it.
+        match &loaded_readiness(&msgs)[0].1 {
+            Readiness::NeedsAudit { reason } => assert_eq!(
+                reason,
+                "audit store unavailable: unable to open database file"
+            ),
+            other => panic!("expected NeedsAudit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3656,6 +3815,7 @@ mod tests {
             .with_issue(EPIC, epic_fixture::epic("indeterminate"));
         let deps = NetDeps {
             inherit_epic_blockers: false,
+            require_audit: false,
             ..net_deps(jira)
         };
         let msgs = fetch_tickets(&deps, &TicketQuery::MyOpen);
@@ -4206,7 +4366,7 @@ mod tests {
             next_page_token: None,
         });
         let mut deps = net_deps(jira);
-        deps.store = None;
+        deps.store = Err("unopenable".to_string());
         let msgs = fetch_retro_tickets(
             &deps,
             &TicketQuery::ShippedAwaitingRetro {
@@ -4227,7 +4387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
         let msgs = fetch_retro_tickets(
             &deps,
             &TicketQuery::ShippedAwaitingRetro {
@@ -4256,7 +4416,7 @@ mod tests {
             .record_retro("", "PROJ-1", crate::runs::RetroVerdict::Clean, None, None)
             .unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
@@ -4284,7 +4444,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
@@ -4327,7 +4487,7 @@ mod tests {
             )
             .unwrap();
         let mut deps = net_deps(jira);
-        deps.store = Some(store);
+        deps.store = Ok(store);
 
         let msgs = fetch_retro_tickets(
             &deps,
@@ -4346,6 +4506,40 @@ mod tests {
     }
 
     // --- Cmd::RecordRetro / record_retro ---
+
+    #[test]
+    fn record_audit_writes_the_verdict_tm_ready_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runs::RunStore::open(&dir.path().join("runs.db")).unwrap();
+        let mut deps = deps();
+        deps.store = Some(store);
+
+        let msgs = record_audit(&deps, "PROJ-1");
+
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditMarked {
+                key: "PROJ-1".to_string()
+            }]
+        );
+        let scope = deps.backend_identity.scope();
+        let gate = AuditGate::Store {
+            store: deps.store.as_ref().unwrap(),
+            scope,
+        };
+        assert_eq!(gate.needs_audit("PROJ-1"), None);
+    }
+
+    #[test]
+    fn record_audit_with_no_store_reports_unavailable() {
+        let msgs = record_audit(&deps(), "PROJ-1");
+        assert_eq!(
+            msgs,
+            vec![Msg::AuditMarkFailed(
+                "could not record audit for PROJ-1: run database unavailable".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn record_retro_clean_success_emits_retro_recorded() {

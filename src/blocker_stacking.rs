@@ -619,6 +619,8 @@ pub fn unblock_counts_by_key<'a>(
 /// A ticket's worker-lane readiness as the board reports it (GitHub issue
 /// #62): [`decide`]'s verdict collapsed to what a card glyph needs, plus an
 /// `Unknown` state for when the inputs `decide` needs couldn't be fetched.
+/// The board then applies `tm ready`'s audit gate on top, turning a ready or
+/// stackable ticket that fails it into `NeedsAudit` (GitHub issue #193).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Readiness {
     /// [`StackDecision::Ready`].
@@ -627,6 +629,13 @@ pub enum Readiness {
     Stackable {
         /// The one unmerged blocker whose open PR a run would stack on.
         blocker_key: String,
+    },
+    /// Would be `Ready` or `Stackable`, but fails `tm ready`'s audit gate
+    /// ([`crate::cli::ready::AuditGate`]), so autopilot skips it.
+    NeedsAudit {
+        /// Why, in `tm ready`'s words, e.g. `not audited` or `last audit
+        /// was needs-work`.
+        reason: String,
     },
     /// [`StackDecision::BlockedNoPr`], [`StackDecision::WaitingOnInFlight`],
     /// [`StackDecision::BlockedMultiple`], or

@@ -57,10 +57,23 @@ runner's built-in default model (`opus` for claude,
 leaves the key unset, and runs then resolve their model through the rest of
 the chain described in "Which model a launch uses".
 
-The scaffolded lane prompt is a generic skeleton, so after everything is
-written the wizard offers to launch an agent-assisted setup session
-(GitHub issue #30): an interactive session, in the repo root, prompted to
-explore the repo, verify the build/test/lint/format gates that actually
+The scaffolded lane prompt gives lane runs the same thatch session shape
+the create, audit and review prompts have (GitHub issue #205): recall
+project and branch-scoped memory for the ticket before reading code,
+investigate with the `thatch-code-archaeology` skill and plan with
+`thatch-coding-workflow`, keep work-in-progress notes as memories scoped
+to the lane's branch, draft the `tm pr create` body with
+`thatch-pr-description`, and record what the session learned with
+`thatch-session-reflection` before the final message. There is no
+self-review step: `/thatch:self-review` is interactive, and the post-PR
+review loop covers review. `tm check` reports any of those skills that
+isn't installed. Existing lane prompts are never rewritten, so a repo
+onboarded earlier adopts the steps by hand or through the setup session.
+
+Beyond that, the scaffolded lane prompt is a generic skeleton, so after
+everything is written the wizard offers to launch an agent-assisted setup
+session (GitHub issue #30): an interactive session, in the repo root,
+prompted to explore the repo, verify the build/test/lint/format gates that actually
 exist here, fill the scaffolded lane and thatch session prompts out in
 place, and author any session skills the config references but that exist
 nowhere on disk —
@@ -101,7 +114,8 @@ the read-only counterpart: it reports whether a repo already onboarded by
 newer than this binary expects) and the same structural presence checks
 `tm init` re-runs on every visit — a configured lane's missing prompt
 file, a lane whose `subagent` key names a definition that doesn't exist,
-a configured session's missing skill, a relative `prompt_file` still
+a configured session's missing skill, a skill a lane prompt names (as
+"the `name` skill") that isn't installed, a relative `prompt_file` still
 pointing at the legacy top-level `prompts/` directory instead of the
 canonical `.tskmstr/prompts/`. It also names every expected config key
 (registered in `src/config/manifest.rs`'s `EXPECTED_CONFIG_KEYS`) that is
@@ -113,7 +127,37 @@ with no safe default for the repo's backend (Jira's workflow status names
 are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
-checked (see `docs/decisions/0007-asset-schema-version.md`).
+checked (a lane prompt is read only to learn which skills it names; see
+`docs/decisions/0007-asset-schema-version.md`).
+
+When any configured prompt names a thatch skill (a `thatch-<name>` token
+or a `/thatch:<name>` command in a lane prompt file, or in the
+`[work.audit]`, `[work.create]`, `[work.review_watch]` or
+`[work.auto_review]` prompt, built-in defaults included even when the
+section is absent; the default auto-review prompt names the runner's
+review skill, or `first_round_skill`, then `thatch-review-followup`),
+`tm check` also reports thatch's health as drift:
+
+- **thatch missing**: `thatch` is not on PATH. Install it and run
+  `thatch setup` for your agent (e.g. `thatch setup --claude --global`);
+  `tm update` does not install it.
+- **thatch outdated**: `thatch --version` is older than the minimum
+  tskmstr's prompts are written against (`MIN_THATCH_VERSION` in
+  `src/cli/check.rs`).
+- **host-limited skill**: a named skill's `SKILL.md` description says it
+  only works on another agent (a sentence opening "opencode only" while
+  this repo runs Claude Code, say). The line names the `[work.*]` section,
+  the skill, and both agents.
+- **skill not installed**: `thatch` is installed, but a named
+  `thatch-*` skill has no `SKILL.md` in the runner's repo-local or
+  user-level skills dir. Either `thatch setup` was never run for this
+  agent, or thatch leaves that skill out for it (on Claude Code there is
+  no `thatch-code-review`, which is opencode only). Run `thatch setup`
+  for the agent, or point the prompt at a skill it has.
+
+tm reads only thatch's `--version` output and the skill files, never its
+database or config.
+
 Exit code `0` means up to date, `1` means drift was found, `2` means an
 error (e.g. the repo was never onboarded).
 
@@ -175,7 +219,7 @@ tm auth status
 | Command | What it does |
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
-| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp, asset presence, and expected config keys match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-and-required-keys fast path for direnv: silent when current, one nudge line per finding when not. Exits `0` up to date (recommended keys are advisory), `1` drift found, `2` error |
+| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp, asset presence, and expected config keys match what the running tskmstr expects, and is thatch installed, current, and suited to the runner when prompts name its skills? Never writes anything or diffs asset content. `--quiet` is a stamp-and-required-keys fast path for direnv: silent when current, one nudge line per finding when not. Exits `0` up to date (recommended keys are advisory), `1` drift found, `2` error |
 | `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, write suggested values for missing config keys (one confirmation), bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
@@ -207,11 +251,11 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
-| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
+| `tm graph [EPIC] [--json \| --mermaid \| --html]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart, and `--html` a self-contained page that colors each epic by availability and shows its child progress (`tm graph --html > plan.html` to share it; it needs no network). Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
-| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
+| `tm merge <KEY>...` | Rebase, merge, and locally sync `<KEY>`'s open PR (fetch, auto-rebase onto its base, agent-assisted conflict resolution if needed, `gh pr merge`, local base fast-forward, worktree/branch cleanup, finishing the ticket's live runs, archive-then-kill of the `tm-<scope>-<key>` tmux session, `status_on_merge`, stale `tm:status/*` label sweep on a closed GitHub issue, then the same for stacked PRs already merged into its branch, then a short headless agent session that archives the merged branch's thatch memories). Several keys merge as a batch sharing one conflict session. Exits `0` (merged), `2` (a conflict session never resolved — rebase left in progress), or `1` (error). See "Merging a ticket's PR" below |
 | `tm drift [KEY...] [--fix] [--stall-hours <N>]` | List tickets whose tracker status has drifted from what their lane runs and PRs did, across every project the run store has lane runs for: finished work still in To Do, merged PRs whose ticket isn't done, running lanes on a To Do ticket, and in-progress tickets with no live run or open PR for more than `N` hours (default 24). Read-only by default; `--fix` applies each finding's `status_on_*` transition (stalled tickets are never moved), and `KEY...` restricts listing and fixing to those tickets. See "Ticket/run status drift" below |
 | `tm usage` | Print the stored usage snapshots (5-hour / 7-day utilization per agent) with their source, age and reset time — what the usage gate sees. See "Usage snapshots" below |
 | `tm usage statusline [-- <command...>]` | Claude Code statusline shim: save the stdin payload's `rate_limits` as usage snapshots (at most every 30s), then run `<command...>` with the same stdin and print its output unchanged. Recording errors never change the output or exit code (`TM_DEBUG=1` prints them on stderr). See "Usage snapshots" below |
@@ -244,7 +288,7 @@ tm auth status
 | `tm work start [<dir>]` | Attach to (or create) the tmux session for `<dir>`, defaulting to `cwd` |
 | `tm work run <lane> [ticket] [--from] [--model] [--max-turns] [--permission-mode] [--prompt] [--headless] [--fg]` | Provision (if needed) and run one Claude Code session for a configured lane, tracked in `tm runs`; interactive in a `work` window of the ticket's `tm-<scope>-<key>` tmux session by default, `--headless` runs the autonomous `claude -p` pass under a detached supervisor, `--fg` runs that headless pass synchronously |
 | `tm work hooks install --user [--dry-run]` | Install tm's `Stop`/`SubagentStop`/`SessionEnd` telemetry hooks into your own Claude Code settings, so interactive `tm ticket audit`/`tm ticket create` sessions get usage tracking too (see below) |
-| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
+| `tm review fix <KEY> [--headless] [--fg]` | Dispatch a Claude fix pass over the `vdiff` review comments captured for `<KEY>`'s lane-run worktree, tracked as a `review-fix` run on that same worktree and branch. The agent triages the comments with `thatch-review-response`, fixes the ones that hold up, declines the rest with a one-line reason, and posts nothing to GitHub; interactive in a `fix` window of the ticket's `tm-<scope>-<key>` session by default (a repeat pass becomes `fix-2`), `--headless` uses the detached supervisor, `--fg` runs synchronously. Exits `0` (dispatched), `3` (no comments captured, no run created), or `1` (error) |
 | `tm review auto <KEY> [--foreground]` | Run thatch auto-review rounds over `<KEY>`'s lane-run branch: each round is an interactive `auto-review` run in a `review` window of the ticket's `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed findings are appended to the worktree's vdiff comment store, and findings at or above `[work.auto_review].fix_threshold` start an interactive `tm review fix` pass in a `fix` / `fix-N` window. The loop waits for each step's signal file for up to `round_timeout_mins` and leaves the windows open. Stops on a clean round, or flags the round for review at `max_review_rounds` or when a step never signals. Detaches by default, logging to `~/.local/state/tskmstr/auto-review/<key>.log`; see "Auto-review" below |
 | `tm review import <KEY> [--fix]` | Import the unresolved human review threads on `<KEY>`'s PR into the worktree's vdiff comment store, once each, skipping review bots and comments tm or vdiff posted. `--fix` then runs `tm review fix <KEY> --fg` unless the ticket is at `[dispatch] max_fix_rounds`; see "Importing a GitHub review" below |
 
@@ -1207,8 +1251,9 @@ it. A tick:
    --unattended <lane> <KEY>`. The lane is the first one the board would
    offer for this repo. A stackable ticket is stacked by `tm work run`
    itself. Launching stops at the first of these refusals:
-   - `max_lanes` lanes are running (every running lane counts, however it
-     was launched);
+   - `max_lanes` lanes are running in this repo's scope (every running
+     lane in the scope counts, however it was launched; lanes in other
+     repos do not, ADR-0011). The refusal names the lanes it counted;
    - the repo launched `max_launches_per_day` lanes in the last 24 hours, a
      backstop against a runaway dispatcher;
    - no lane matches the repo;
@@ -1275,7 +1320,7 @@ supervisor-driven `claude -p` run.
 
 ```toml
 [dispatch]
-max_lanes = 1               # default; the most lane runs at once
+max_lanes = 1               # default; the most lane runs at once in this repo's scope
 allow_paid_fallback = false # default; see "Usage admission" above
 tick_secs = 60              # default; how often an open TUI ticks (10 minimum)
 max_launches_per_day = 20   # default; launches per repo in any rolling 24 hours
@@ -1304,11 +1349,14 @@ The board's status bar starts with its repo's state. On the overview, a
 project with autopilot on shows it at the end of its strip line:
 
 ```
-autopilot on · lanes 1/2 · launched 12m ago · not launching: 2 lanes running, [dispatch] max_lanes is 2 (5m)
+autopilot on · lanes 2/2 (GH-7, GH-8) · launched 12m ago · not launching: 2 lanes running (GH-7, GH-8), [dispatch] max_lanes is 2 (5m)
 ```
 
-- **lanes**: lane runs running now, across every repo, against `max_lanes`
-  from the config you started the TUI from
+- **lanes**: this repo's lane runs running now, against `max_lanes` from
+  the config you started the TUI from, followed by their tickets. The
+  count is the one `max_lanes` caps and `tm dispatch status` prints, so a
+  legacy lane without a scope, or one the board's filter hides, is still
+  named.
 - **launched**: how long ago this repo last launched a lane. It is left out
   when the repo has never launched one.
 - the last part is the newest tick's refusal, from `dispatch_events`, and
@@ -1337,10 +1385,14 @@ tm dispatch off --all       # kill switch: the next tick launches nothing
 `status` prints, for example:
 
 ```
-github:o/r: on, 1 lanes running, last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
+github:o/r: on, 1 lanes running (GH-5), last tick 2026-10-19T14:03:22Z, last launch 2h10m ago
   repo: /home/me/r
-  blocked for 45m: not launching: 1 lanes running, [dispatch] max_lanes is 1
+  blocked for 45m: not launching: 1 lanes running (GH-5), [dispatch] max_lanes is 1
 ```
+
+The lane count is the one `max_lanes` caps: this scope's running lanes,
+plus legacy lanes recorded before runs carried a scope. The board's
+`lanes` count reads the same rows, so the two always agree.
 
 The `blocked` line appears only while the newest tick refused.
 `tick` prints one line per launch, naming the runner the lane landed on,
@@ -1444,6 +1496,11 @@ status. Tickets without a parent epic render without either line, and
 their cards keep their usual height. If the epics can't be loaded, the
 board still loads, without epic lines, and the status line says why.
 
+Epics themselves never appear as cards on the ticket board, under any
+assignee filter: nobody works an epic directly, so the board, the priority
+view, `tm ready`, and `tm dispatch` all leave them out. Press `E` to see and
+move them in the epics view instead; see "The epics view" below.
+
 | Key | Action |
 |---|---|
 | `j` / `Down` | Move selection down |
@@ -1455,10 +1512,13 @@ board still loads, without epic lines, and the status line says why.
 | `r` | Refresh from Jira |
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
+| `E` | Switch between the ticket board and the epics view (board only); see "The epics view" below |
+| `e` | Open the epic filter picker; see "Filtering the board by epic" below (board only) |
 | `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
 | `a` | Launch a ticket-audit session for the selected ticket, or attach to it if one is live (board only) |
+| `Y` | Record a `ready` audit verdict for the selected ticket after a confirmation prompt, without starting an audit session: the same row `tm ticket audit <KEY> --record ready` writes (board only); see "Readiness glyphs" below |
 | `w` | Launch a lane run for the selected ticket: zero backend-compatible lanes sets a status-line message, exactly one launches it directly, more than one opens a lane picker; a ticket whose readiness glyph shows blocked asks for confirmation first, naming its blockers (board only); see "Board-launched lane runs" below |
 | `s` | Attach to the selected ticket's `tm-<scope>-<key>` tmux session — its whole action history, whatever is in it (board only). Unlike `a`, it never launches anything; if the ticket has no session yet, the status line says so |
 | `m` | Ensure the selected ticket's session holds your configured `[work.manual]` window layout, then attach (board only); see "Board-opened manual sessions" below |
@@ -1484,6 +1544,43 @@ cached for the rest of the session). `j`/`k` navigate the list, `Enter`
 applies the highlighted filter and refetches the board, `Esc`/`q` closes the
 picker without changing anything. The currently active filter is marked with
 a leading `*`.
+
+### The epics view
+
+Pressing `E` on the board swaps its cards for every open epic in
+`default_project_key` (Jira issues of the `epic_issue_type`, GitHub issues
+labeled `tm:epic`), in the same status columns. The status line reads
+`View: Epics`. `h`/`j`/`k`/`l`, `Enter`, the "Move to" transition window,
+`r`, `o`, and search all work as they do on tickets, so moving an epic as
+its children finish is the same as moving a ticket. Done epics are hidden,
+the same way the board hides done tickets; `tm graph` still shows them.
+
+Keys that only make sense on a workable ticket do nothing in the epics view
+except set a status-line message: `w` (lane run), `m` (manual session), `a`
+and `Y` (audit), `M` and `Space` (merge), and `f` and `e` (the assignee and epic
+filters do not apply to epics). Press `E` again to return to the ticket
+board under the assignee and epic filters you left it with.
+
+### Filtering the board by epic
+
+Pressing `e` on the board opens a floating picker listing `All epics`, `No
+epic`, and each epic that the loaded cards belong to, shown as `KEY  Title`
+and sorted by key. `j`/`k` navigate, `Enter` applies the highlighted choice,
+`Esc`/`q` closes the picker without changing anything. The active choice is
+marked with a leading `*`.
+
+Choosing an epic narrows every column to that epic's child cards; `No epic`
+shows only cards with no parent, and `All epics` clears the filter. Columns
+keep their order and stay on screen when empty, every column title reads
+`shown/total` while the filter is applied, and the status line shows `Epic:
+KEY  Title`.
+
+Like the search, the epic filter works on the cards the board has already
+loaded, so it combines with the `f` assignee filter and the `i`/`/` search
+and survives `r` refreshes and `f` refetches. The picker only offers epics
+with at least one loaded card. The one exception is the active epic: if a
+refetch leaves it with no cards, the board shows empty columns and the
+picker keeps the epic listed, rather than clearing the filter.
 
 ### Searching the board
 
@@ -1724,11 +1821,20 @@ below.
 #### Readiness glyphs
 
 Each card's title shows a one-column glyph beside the key: `✓` ready, `◐`
-stackable, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
+stackable, `!` needs audit, `✗` blocked, `?` unknown (GitHub issue #62). It is the same
 classification `tm ready <KEY>` reports, computed by the same rule
 (`blocker_stacking::decide`) from the ticket's direct `Blocks` links and the
 board repo's PR list, plus the blockers a card inherits from a locked
 parent epic (see [Inherited blockers](#inherited-blockers-children-of-a-locked-epic)).
+
+With `[ready] require_audit` on, a ticket that would be ready or stackable
+but has no passing audit verdict shows a yellow `!` instead (GitHub issue
+#193): `tm ready` lists it as needs audit and autopilot skips it. The
+detail overlay (`Enter`) gives the reason in `tm ready`'s words, such as
+`Readiness: needs audit (not audited)` or `(last audit was needs-work)`,
+and for a blocked ticket names its blockers. Two keys clear the gate: `a`
+starts an audit session, and `Y` records a `ready` verdict directly after a
+confirmation, with no session, then refreshes the board.
 Pressing `w` on a blocked ticket opens a confirmation listing the blocking
 keys, an inherited one as `PROJ-12 (via epic PROJ-30)`; `y`/`Enter`
 launches anyway, `n`/`Esc` launches nothing. Ready, stackable, and unknown tickets launch without a prompt.
@@ -1788,6 +1894,18 @@ runner's default (see "Which model a launch uses"). The session always
 passes `--model`, so an enterprise-managed claude model pin never applies.
 Since an audit is where digging quality matters most, it is worth setting
 deliberately.
+
+The audit's investigation step is `/thatch:refine` run on the ticket's
+PROPOSED APPROACH, so the approach's premises are checked against the code
+before a lane runs it (GitHub issue #206). The `.tskmstr/prompts/audit.md`
+scaffold `tm init` writes carries this step. The plain default prompt,
+`/ticket-audit {key}`, does not name refine, because tm only checks that the
+prompt's leading skill is installed and refine comes from the thatch plugin.
+The audit still checks links, blockers and lane size itself, writes refine's
+revisions back to the ticket body, and only then records a verdict with `tm
+ticket audit <KEY> --record`. If you use your own `ticket-audit` skill, add a
+`/thatch:refine` step on the ticket's PROPOSED APPROACH so the default or a
+custom `prompt` gets the same investigation.
 
 Each card with a live `audit` window (or a live audit run) shows a badge:
 `audit: starting` (window up, run not registered yet), `audit: running`, `audit:
@@ -1996,7 +2114,14 @@ Pressing `F` dispatches `tm review fix <KEY>` as a watched-child launch, the
 same shape as `w`/`b`: `tm review fix` resolves the ticket's lane run,
 renders its captured `vdiff` comments via `vdiff --export-comments`, and
 dispatches a tracked run in the ticket's existing worktree and branch — no
-new worktree, no new branch. The pass itself runs interactively in a `fix`
+new worktree, no new branch. The agent does not fix every comment blindly:
+it triages them with thatch's `thatch-review-response` skill (legitimate,
+intentional, false positive, unlikely edge case), merges comments that share
+a root cause, fixes and commits the legitimate ones, and ends with each
+comment's outcome: fixed, declined with a one-line reason, or merged with
+another. It uses only the skill's triage and fix steps: it never replies to
+a review thread or posts a summary comment, since vdiff owns the comment
+state. The pass itself runs interactively in a `fix`
 window of the ticket's `tm-<scope>-<key>` session (`fix-2` for a second pass), so
 `tmux attach -t tm-<scope>-<key>` shows it alongside the ticket's other actions. Its run rows
 use `kind = "review-fix"`, so they never shadow the lane run and show up
@@ -2036,9 +2161,13 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 5. Otherwise starts an interactive `tm review fix <KEY>` pass in a `fix`
    window (`fix-2` for round 2). The pass is done once the agent writes
    `<git-dir>/vdiff/auto-review/fix-<loop>-<round>.done`, holding
-   `{"succeeded": true}` or `{"succeeded": false}`. Then tm moves the
+   `{"succeeded": true}` or `{"succeeded": false}`, plus a `declined`
+   array of `{"comment": "<path:start-end>", "reason": "..."}` for each
+   comment the pass triaged as not needing a change. Then tm moves the
    consumed store to `<git-dir>/vdiff/archive/<round>.json` so the next
-   round never re-reads comments with stale line anchors.
+   round never re-reads comments with stale line anchors. The next round's
+   prompt lists the declines with their reasons, so `thatch-review-followup`
+   checks each reason instead of re-reporting the finding as unaddressed.
 
 **The windows are yours to watch and steer.** Attach to the ticket's
 session to read a round or type into it. The loop does not wait for claude
@@ -2110,7 +2239,7 @@ so the badge stays at `needs you` until another round runs.
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,
 `{findings_file}`, `{archive}` and `{prior}` (a sentence pointing a
-follow-up round at the archive). With `auto = true`, a `tm pr watch` that
+follow-up round at the archive, then the previous fix pass's declines). With `auto = true`, a `tm pr watch` that
 finds every bot done with nothing unresolved launches `tm review auto` for
 the ticket. A watch that hands off to a bugbot cleanup session does not
 chain, because tm can't see that interactive session finish.
@@ -2307,8 +2436,25 @@ these stages:
    branch, so nothing else closes those issues. Already-done tickets are
    reported, not moved. A failure here only warns; `tm drift` still finds
    any left behind.
+10. **Branch memory consolidation.** tm starts a short headless agent
+    session in a `memory` window, at the repo root, on the same tmux
+    session a conflict session would use. The agent lists the thatch
+    memories scoped to the merged branch in the project store and exits
+    straight away if there are none. Otherwise it folds them into one
+    unscoped archived record and forgets the originals, so branch-scoped
+    memories don't go stale once their branch is deleted. tm doesn't
+    wait for it: the window closes when the agent exits, and its output
+    goes to `merge-memory-<key>-<timestamp>.log` under tm's run-state
+    directory. The session has no run row, so it is confined instead:
+    it can call thatch's MCP tools and nothing else (no shell, no file
+    edits), and it gets a 30-turn budget. Under opencode, which has no
+    flag for that, it runs without the permission bypass and your own
+    opencode `permission` config decides. A merge that fails or is
+    handed back starts no session. A failure to start one only warns and
+    never changes the exit code. Turn it off with `[work.merge]
+    consolidate_memories = false`.
 
-Exit codes: `0` merged (steps 4-9 all attempted; cleanup/base-sync
+Exit codes: `0` merged (steps 4-10 all attempted; cleanup/base-sync
 warnings don't change this), `2` a conflict session never resolved (step
 3, or the step 4 retry), `1` any other error (no open PR, a diverged branch, a dirty worktree,
 a `gh`/`git` failure).
@@ -2357,6 +2503,10 @@ or more keys, tm works in two phases:
    shared window lives in a merged ticket's session (the case outside tmux),
    that session is also kept while any ticket is still handed back to it.
 
+The batch ends with one memory-consolidation session (stage 10) naming
+every branch it merged, not one session per branch. A batch spanning
+several repos gets one session per repo.
+
 The batch ends with a summary of what merged, what was handed back, and
 what failed. The exit code is `1` if any ticket failed, else `2` if any was
 handed back, else `0`.
@@ -2377,9 +2527,9 @@ Two boundaries worth knowing:
 
 ### `[work.merge]`: conflict-resolution session settings
 
-Both the board's `M` key and `tm merge <KEY>` share this section — it only
-configures the agent session a rebase conflict opens (stage 3 above); it
-never gates whether merging is available at all, unlike `[work.audit]`'s
+Both the board's `M` key and `tm merge <KEY>` share this section. It
+configures the agent session a rebase conflict opens (stage 3 above) and
+the post-merge memory session (stage 10); it never gates whether merging is available at all, unlike `[work.audit]`'s
 `dir`. Every field is optional:
 
 ```toml
@@ -2388,6 +2538,7 @@ never gates whether merging is available at all, unlike `[work.audit]`'s
 # prompt_file = ".tskmstr/prompts/merge.md"    # optional; see [work.audit]'s prompt_file above
 # model = "opus"                               # optional; see "Which model a launch uses"
 # batch_conflict_prompt = "..."               # optional; combined session for `tm merge KEY1 KEY2 ...`
+# consolidate_memories = false                # optional; default true, see stage 10
 ```
 
 `prompt_file` and `prompt` are mutually exclusive — setting both is a
@@ -2407,6 +2558,10 @@ multi-key `tm merge` opens when its tickets stop on conflicts (see
 its key, branch, base, and checkout directory. Leave it unset and tm ships
 a built-in batch prompt. It is independent of `prompt`/`prompt_file`,
 which stay single-ticket only, so setting it alongside either is fine.
+
+`consolidate_memories` turns off the post-merge memory-consolidation
+session (stage 10). It is on by default. That session uses `model` the
+same way the conflict sessions do.
 
 ### Retro board
 
