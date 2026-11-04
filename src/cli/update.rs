@@ -452,6 +452,10 @@ mod tests {
             "starter template: {prompt}"
         );
         assert!(
+            prompt.contains("`thatch-pr-description` skill"),
+            "same template as tm init, thatch steps included: {prompt}"
+        );
+        assert!(
             read_repo_config(&env).contains("schema_version = 2"),
             "stamp bumped: {}",
             read_repo_config(&env)
