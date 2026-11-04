@@ -203,21 +203,30 @@ pub struct AutopilotStatus {
     /// How long ago the scope last launched a lane when the status was
     /// loaded, in seconds. `None` when it never has.
     pub last_launch_age_secs: Option<i64>,
+    /// The epic whose tickets the scope's ticks launch first (GitHub issue
+    /// #237), or `None` when none is set.
+    pub priority_epic: Option<String>,
 }
 
 impl AutopilotStatus {
-    /// One line for a status bar or header, e.g. `autopilot on · lanes 1/2
-    /// (AX-809) · launched 12m ago · not launching: … (5m)`. The lanes count
+    /// One line for a status bar or header, e.g. `autopilot on · epic AX-1 ·
+    /// lanes 1/2 (AX-809) · launched 12m ago · not launching: … (5m)`. The
+    /// priority epic shows whether autopilot is on or off, since it is set
+    /// independently of the flag. The lanes count
     /// names the tickets it counts, so a lane the view doesn't list (a
     /// legacy unscoped one, or one the board's filter hides) is not a
     /// phantom (GitHub issue #171). The trailing age is how long the refusal
     /// has lasted. A tick error, when given, replaces the refusal.
     pub fn summary(&self, tick_error: Option<&str>) -> String {
+        let epic = match &self.priority_epic {
+            Some(epic) => format!(" · epic {epic}"),
+            None => String::new(),
+        };
         if !self.enabled {
-            return "autopilot off".to_string();
+            return format!("autopilot off{epic}");
         }
         let mut line = format!(
-            "autopilot on · lanes {}/{}",
+            "autopilot on{epic} · lanes {}/{}",
             self.running_lanes.len(),
             self.max_lanes
         );
@@ -263,6 +272,7 @@ pub fn load_status(
                 blocked_age_secs: state.blocked.as_ref().map(|b| now - b.since_unix),
                 last_refusal: state.blocked.map(|b| b.detail),
                 last_launch_age_secs: state.last_launch_unix.map(|at| now - at),
+                priority_epic: store.autopilot_epic(scope)?,
             })
         })
         .collect()
@@ -434,6 +444,7 @@ mod tests {
                     last_refusal: Some("paused: usage 87%".to_string()),
                     blocked_age_secs: Some(90),
                     last_launch_age_secs: None,
+                    priority_epic: None,
                 },
                 AutopilotStatus {
                     scope: "github:o/off".to_string(),
@@ -443,6 +454,7 @@ mod tests {
                     last_refusal: None,
                     blocked_age_secs: None,
                     last_launch_age_secs: None,
+                    priority_epic: None,
                 },
             ]
         );
@@ -506,6 +518,7 @@ mod tests {
             last_refusal: Some("paused: usage 87% ≥ 85%".to_string()),
             blocked_age_secs: Some(300),
             last_launch_age_secs: Some(720),
+            priority_epic: None,
         };
         assert_eq!(status.summary(None), "autopilot off");
 
@@ -526,5 +539,38 @@ mod tests {
 
         status.running_lanes.clear();
         assert_eq!(status.summary(None), "autopilot on · lanes 0/2");
+    }
+
+    #[test]
+    fn summary_names_the_priority_epic_on_or_off() {
+        let mut status = AutopilotStatus {
+            scope: "s".to_string(),
+            enabled: false,
+            running_lanes: Vec::new(),
+            max_lanes: 2,
+            last_refusal: None,
+            blocked_age_secs: None,
+            last_launch_age_secs: None,
+            priority_epic: Some("GH-176".to_string()),
+        };
+        assert_eq!(status.summary(None), "autopilot off · epic GH-176");
+
+        status.enabled = true;
+        assert_eq!(
+            status.summary(None),
+            "autopilot on · epic GH-176 · lanes 0/2"
+        );
+    }
+
+    #[test]
+    fn status_reads_the_scopes_priority_epic() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store.set_autopilot_epic("s", Some("GH-176")).unwrap();
+
+        let status = load_status(&store, &["s".to_string(), "t".to_string()], 1, 0).unwrap();
+
+        assert_eq!(status[0].priority_epic.as_deref(), Some("GH-176"));
+        assert_eq!(status[1].priority_epic, None);
     }
 }

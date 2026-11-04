@@ -71,6 +71,7 @@ pub fn toggled(
             last_refusal: None,
             blocked_age_secs: None,
             last_launch_age_secs: None,
+            priority_epic: None,
         }),
     }
     if !enabled {
@@ -235,6 +236,7 @@ mod tests {
             last_refusal: None,
             blocked_age_secs: None,
             last_launch_age_secs: None,
+            priority_epic: None,
         }
     }
 
