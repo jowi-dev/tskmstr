@@ -2015,9 +2015,13 @@ worktree's vdiff comment store, `<git-dir>/vdiff/comments.json`. Each round:
 
 1. Runs an interactive `auto-review` agent in a `review` window of the
    ticket's `tm-<scope>-<key>` session, rooted in the ticket's lane worktree
-   (`review-2` for round 2). Round 1 uses the `thatch-code-review` skill.
-   Later rounds use `thatch-review-followup` and are pointed at the previous
-   round's archived comments. The agent writes its confirmed findings to
+   (`review-2` for round 2). Round 1 uses thatch's review entry point for
+   the lane's runner: `thatch-code-review` on opencode, which fans out
+   sub-agents, and the `/thatch:peer-review` command on Claude Code, which
+   runs the same specialists in-session. `first_round_skill` pins one
+   entry point for every runner. Later rounds use `thatch-review-followup`
+   on both runners and are pointed at the previous round's archived
+   comments. The agent writes its confirmed findings to
    `<git-dir>/vdiff/auto-review/findings-<loop>-<round>.json`, and the
    round is done once that file exists and parses. `<loop>` is the loop's
    pid and start time, so an agent left over from an earlier loop can never
@@ -2101,6 +2105,7 @@ so the badge stays at `needs you` until another round runs.
 # publish = false                 # post each round with vdiff --publish-comments
 # auto = false                    # chain from a clean tm pr watch
 # round_timeout_mins = 60         # per round and per fix pass, then flag and stop; 0 = no timeout
+# first_round_skill = "thatch-code-review"  # round 1's {skill}; unset = the runner's default
 ```
 
 The prompt is rendered per round with `{key}`, `{round}`, `{skill}`,

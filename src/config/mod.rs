@@ -763,7 +763,8 @@ pub struct RawReviewWatchConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct RawAutoReviewConfig {
     /// Prompt template for each review round, with `{key}`, `{round}`,
-    /// `{skill}`, `{findings_file}` and `{archive}` replaced. Defaults to
+    /// `{skill}` (see [`RawAutoReviewConfig::first_round_skill`]),
+    /// `{findings_file}` and `{archive}` replaced. Defaults to
     /// the built-in `crate::work::auto_review::DEFAULT_PROMPT` when unset.
     pub prompt: Option<String>,
     /// File form of [`RawAutoReviewConfig::prompt`], resolved like
