@@ -1926,7 +1926,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("h/l ←/→     prev / next column"),
         Line::from("Enter       open / apply"),
         Line::from("Esc / q     back / quit"),
-        Line::from("i or /      search cards"),
+        Line::from("i or /      search cards+epics"),
         Line::from("  Enter keep, Esc clear"),
         Line::from("r           refresh tickets"),
         Line::from("o           open in browser"),
