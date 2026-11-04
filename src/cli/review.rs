@@ -3346,6 +3346,11 @@ mod tests {
                     state: *state,
                     run_id: Some(9),
                     details_url: Some("https://github.com/o/r/actions/runs/9".to_string()),
+                    conclusion: match state {
+                        crate::github::gh_cli::ChecksState::Failing => Some("FAILURE".to_string()),
+                        crate::github::gh_cli::ChecksState::Pending => None,
+                        _ => Some("SUCCESS".to_string()),
+                    },
                 })
                 .collect(),
         }

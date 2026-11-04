@@ -881,6 +881,26 @@ pub struct CheckResult {
     /// The check's link: a `CheckRun`'s `detailsUrl` or a `StatusContext`'s
     /// `targetUrl`.
     pub details_url: Option<String>,
+    /// The raw verdict `gh` reported: a `CheckRun`'s `conclusion` or a
+    /// `StatusContext`'s `state`, such as `FAILURE` or `CANCELLED`. `None`
+    /// while a check run has no conclusion yet.
+    pub conclusion: Option<String>,
+}
+
+impl CheckResult {
+    /// Whether this check failed in a way a code fix can address: its
+    /// conclusion is `FAILURE`, `ERROR`, `TIMED_OUT`, or `STARTUP_FAILURE`.
+    ///
+    /// Narrower than [`ChecksState::Failing`], which also counts `CANCELLED`
+    /// and `ACTION_REQUIRED`. A cancelled run or one waiting for approval
+    /// is red on the overview, but its log holds no error to fix.
+    pub fn failed_for_fix(&self) -> bool {
+        self.state == ChecksState::Failing
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("FAILURE" | "ERROR" | "TIMED_OUT" | "STARTUP_FAILURE")
+            )
+    }
 }
 
 /// The open/closed state of a GitHub issue, as reported by `state` in `gh
@@ -2982,6 +3002,11 @@ impl RawCheck {
     /// [`RawCheck::verdict`] and its run id from [`actions_run_id`].
     fn into_result(self) -> CheckResult {
         let state = self.verdict();
+        let conclusion = self
+            .state
+            .clone()
+            .or(self.conclusion.clone())
+            .filter(|value| !value.is_empty());
         let details_url = self
             .details_url
             .or(self.target_url)
@@ -2991,6 +3016,7 @@ impl RawCheck {
             state,
             run_id: details_url.as_deref().and_then(actions_run_id),
             details_url,
+            conclusion,
         }
     }
 
@@ -5344,6 +5370,7 @@ mod tests {
                 state: ChecksState::Failing,
                 run_id: Some(123456),
                 details_url: Some("https://github.com/o/r/actions/runs/123456/job/789".to_string()),
+                conclusion: Some("FAILURE".to_string()),
             }]
         );
     }
@@ -5358,7 +5385,32 @@ mod tests {
 
         assert_eq!(checks.checks[0].state, ChecksState::Pending);
         assert_eq!(checks.checks[0].run_id, Some(5));
+        assert_eq!(checks.checks[0].conclusion, None);
         assert_eq!(checks.failing().count(), 0);
+    }
+
+    #[test]
+    fn failed_for_fix_excludes_cancelled_and_approval_waits() {
+        let rollup = r#"[
+            {"__typename":"CheckRun","name":"a","status":"COMPLETED","conclusion":"FAILURE"},
+            {"__typename":"CheckRun","name":"b","status":"COMPLETED","conclusion":"TIMED_OUT"},
+            {"__typename":"CheckRun","name":"c","status":"COMPLETED","conclusion":"STARTUP_FAILURE"},
+            {"__typename":"StatusContext","context":"d","state":"ERROR"},
+            {"__typename":"CheckRun","name":"e","status":"COMPLETED","conclusion":"CANCELLED"},
+            {"__typename":"CheckRun","name":"f","status":"COMPLETED","conclusion":"ACTION_REQUIRED"},
+            {"__typename":"CheckRun","name":"g","status":"COMPLETED","conclusion":"SUCCESS"}]"#;
+
+        let checks =
+            interpret_pr_checks_output(Some(0), &pr_checks_json("OPEN", rollup), "").unwrap();
+
+        let fixable: Vec<&str> = checks
+            .checks
+            .iter()
+            .filter(|check| check.failed_for_fix())
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(fixable, vec!["a", "b", "c", "d"]);
+        assert_eq!(checks.failing().count(), 6);
     }
 
     #[test]
@@ -5376,6 +5428,7 @@ mod tests {
                 state: ChecksState::Passing,
                 run_id: None,
                 details_url: Some("https://ci.example.com/build/9".to_string()),
+                conclusion: Some("SUCCESS".to_string()),
             }]
         );
     }

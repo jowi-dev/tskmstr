@@ -39,17 +39,18 @@ pub const CI_FIX_EVENT: &str = "ci_fix";
 /// check.
 pub const LOG_LIMIT_BYTES: usize = 24_000;
 
-/// Whether `checks` call for a CI fix: at least one check failed and none
-/// is still pending. A re-run in progress, or checks that pass, never
+/// Whether `checks` call for a CI fix: at least one check failed in a way
+/// a code fix can address ([`crate::github::gh_cli::CheckResult::failed_for_fix`]) and none is
+/// still pending. A re-run in progress, checks that pass, and checks that
+/// are red only because they were cancelled or wait for approval never
 /// trigger. The PR's lifecycle is not considered here.
 pub fn ready_to_fix(checks: &PrChecks) -> bool {
     let mut failing = false;
     for check in &checks.checks {
-        match check.state {
-            ChecksState::Pending => return false,
-            ChecksState::Failing => failing = true,
-            ChecksState::None | ChecksState::Passing => {}
+        if check.state == ChecksState::Pending {
+            return false;
         }
+        failing |= check.failed_for_fix();
     }
     failing
 }
@@ -147,7 +148,8 @@ fn fence_for(text: &str) -> String {
     "`".repeat((longest + 1).max(3))
 }
 
-/// One [`FailedCheck`] per failing check in `checks`, with its log from
+/// One [`FailedCheck`] per check in `checks` that
+/// [`crate::github::gh_cli::CheckResult::failed_for_fix`], with its log from
 /// [`GhCli::run_failed_log`] run in `dir`.
 ///
 /// Several checks often share one GitHub Actions run, so each run's log is
@@ -156,7 +158,9 @@ fn fence_for(text: &str) -> String {
 pub fn collect_failures(gh: &dyn GhCli, dir: &Path, checks: &PrChecks) -> Vec<FailedCheck> {
     let mut logs: HashMap<u64, Result<String, String>> = HashMap::new();
     checks
-        .failing()
+        .checks
+        .iter()
+        .filter(|check| check.failed_for_fix())
         .map(|check| {
             let log = match check.run_id {
                 Some(run_id) => logs
@@ -359,6 +363,18 @@ mod tests {
             state,
             run_id,
             details_url: run_id.map(|id| format!("https://github.com/o/r/actions/runs/{id}")),
+            conclusion: match state {
+                ChecksState::Failing => Some("FAILURE".to_string()),
+                ChecksState::Passing => Some("SUCCESS".to_string()),
+                ChecksState::Pending | ChecksState::None => None,
+            },
+        }
+    }
+
+    fn concluded(name: &str, conclusion: &str, run_id: u64) -> CheckResult {
+        CheckResult {
+            conclusion: Some(conclusion.to_string()),
+            ..check(name, ChecksState::Failing, Some(run_id))
         }
     }
 
@@ -413,6 +429,31 @@ mod tests {
         let passing = pr_checks("abc", vec![check("test", ChecksState::Passing, Some(2))]);
         assert!(!ready_to_fix(&passing));
         assert!(!ready_to_fix(&pr_checks("abc", Vec::new())));
+    }
+
+    #[test]
+    fn not_ready_when_the_only_red_checks_were_cancelled_or_await_approval() {
+        let checks = pr_checks(
+            "abc",
+            vec![
+                check("lint", ChecksState::Passing, Some(1)),
+                concluded("test", "CANCELLED", 2),
+                concluded("deploy", "ACTION_REQUIRED", 3),
+            ],
+        );
+        assert!(!ready_to_fix(&checks));
+    }
+
+    #[test]
+    fn ready_when_a_real_failure_sits_beside_a_cancelled_check() {
+        let checks = pr_checks(
+            "abc",
+            vec![
+                concluded("test", "CANCELLED", 2),
+                concluded("build", "TIMED_OUT", 3),
+            ],
+        );
+        assert!(ready_to_fix(&checks));
     }
 
     // --- handled ---
@@ -548,7 +589,9 @@ mod tests {
                     state: ChecksState::Failing,
                     run_id: None,
                     details_url: Some("https://ci.example.com/9".to_string()),
+                    conclusion: Some("FAILURE".to_string()),
                 },
+                concluded("cancelled", "CANCELLED", 4),
             ],
         );
 

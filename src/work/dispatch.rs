@@ -1056,6 +1056,7 @@ mod tests {
                     state: ChecksState::Failing,
                     run_id: Some(2),
                     details_url: None,
+                    conclusion: Some("FAILURE".to_string()),
                 }],
             }),
         )
