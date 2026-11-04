@@ -97,6 +97,11 @@ pub enum RetroSessionError {
     #[error(transparent)]
     Tmux(#[from] TmuxError),
 
+    /// The repo checkout to run the session in could not be found, e.g.
+    /// `tm ticket retro` ran outside a git repository.
+    #[error(transparent)]
+    Git(#[from] crate::work::git::GitError),
+
     /// `state_dir` could not be created to hold the session's log.
     #[error("failed to create {path}: {source}", path = path.display())]
     StateDir {

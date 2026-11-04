@@ -2056,6 +2056,12 @@ fn run_ticket_audit(
 /// run), then opens the runs DB and delegates to
 /// [`tskmstr::cli::ticket::retro`], which does the actual validation and
 /// persistence.
+///
+/// Once the verdict is recorded, a `--defect` retro goes on to
+/// [`tskmstr::cli::ticket::offer_defect_session`] (GitHub issue #227),
+/// which offers or starts the session that saves the lesson as a thatch
+/// memory per `[work.retro] defect_session`. Its dependencies are built
+/// only if it starts, by [`start_defect_retro_session`].
 fn run_ticket_retro(
     key: String,
     clean: bool,
@@ -2085,7 +2091,69 @@ fn run_ticket_retro(
         note.as_deref(),
         &mut stdout,
     )?;
+
+    // `retro` rejects a defect without a severity, so a defect has one here.
+    let Some(severity) = severity else {
+        return Ok(());
+    };
+    let key = key.to_uppercase();
+    let mut start = |out: &mut dyn Write| {
+        let pr_url = tskmstr::work::retro::ticket_pr_url(&store, &scope, &key);
+        let retro = tskmstr::work::retro::DefectRetro {
+            key: &key,
+            severity,
+            note: note.as_deref(),
+            pr_url: pr_url.as_deref(),
+        };
+        start_defect_retro_session(&config, &store, &retro, out)
+    };
+    tskmstr::cli::ticket::offer_defect_session(
+        verdict,
+        &key,
+        config.work.retro.defect_session,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        &mut tskmstr::cli::RealPrompter,
+        &mut start,
+        &mut stdout,
+    )?;
     Ok(())
+}
+
+/// Builds the real dependencies for, and starts,
+/// [`tskmstr::work::retro::start_defect_session`] in the current
+/// directory's repo checkout.
+fn start_defect_retro_session(
+    config: &Config,
+    store: &tskmstr::runs::RunStore,
+    retro: &tskmstr::work::retro::DefectRetro<'_>,
+    out: &mut dyn Write,
+) -> Result<(), tskmstr::work::retro::RetroSessionError> {
+    use tskmstr::work::git::GitOps;
+
+    let repo_root = ShellGitOps::new().repo_root(&std::env::current_dir()?)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let state_dir = home.join(".local/state/tskmstr/work");
+    let tmux = ShellTmuxOps::new();
+    let clock = tskmstr::work::review_watch::SystemClock;
+    let identity = tskmstr::config::BackendIdentity::from_config(config);
+    let runner = agent_runner_for(config);
+    with_admission(Some(config), runner, |admission| {
+        let deps = tskmstr::work::retro::RetroSessionDeps {
+            tmux: &tmux,
+            runner,
+            run_store: Some(store),
+            identity: &identity,
+            admission,
+            model_defaults: tskmstr::work::model::ModelDefaults::from_config(config),
+            retro_cfg: &config.work.retro,
+            clock: &clock,
+            state_dir: &state_dir,
+            repo_root: &repo_root,
+        };
+        tskmstr::work::retro::start_defect_session(&deps, retro, out)
+    })
 }
 
 /// Resolve the run database path from an already-loaded [`Config`]: the
