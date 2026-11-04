@@ -114,6 +114,27 @@ are the board's own) isn't reported. It never writes anything and
 never diffs a scaffolded asset's *content*: lane prompts and skills are
 meant to be edited after `tm init` writes them, so only their presence is
 checked (see `docs/decisions/0007-asset-schema-version.md`).
+
+When any configured prompt names a thatch skill (a `thatch-<name>` token
+or a `/thatch:<name>` command in a lane prompt file, or in the
+`[work.audit]`, `[work.create]`, `[work.review_watch]` or
+`[work.auto_review]` prompt, built-in defaults included), `tm check`
+also reports thatch's health as drift:
+
+- **thatch missing**: `thatch` is not on PATH. Install it and run
+  `thatch setup` for your agent (e.g. `thatch setup --claude --global`);
+  `tm update` does not install it.
+- **thatch outdated**: `thatch --version` is older than the minimum
+  tskmstr's prompts are written against (`MIN_THATCH_VERSION` in
+  `src/cli/check.rs`).
+- **host-limited skill**: a named skill's `SKILL.md` description says it
+  only works on another agent (a sentence opening "opencode only" while
+  this repo runs Claude Code, say). The line names the `[work.*]` section,
+  the skill, and both agents.
+
+tm reads only thatch's `--version` output and the skill files, never its
+database or config.
+
 Exit code `0` means up to date, `1` means drift was found, `2` means an
 error (e.g. the repo was never onboarded).
 
@@ -175,7 +196,7 @@ tm auth status
 | Command | What it does |
 |---|---|
 | `tm init [--yes]` | Interactive wizard onboarding the current repo: backend choice, `.tskmstr.toml`, a work lane, status labels, and session assets, so `tm board` works immediately after; `--yes` accepts every default |
-| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp, asset presence, and expected config keys match what the running tskmstr expects? Never writes anything or diffs asset content. `--quiet` is a stamp-and-required-keys fast path for direnv: silent when current, one nudge line per finding when not. Exits `0` up to date (recommended keys are advisory), `1` drift found, `2` error |
+| `tm check [--quiet]` | Read-only drift report: does this onboarded repo's `schema_version` stamp, asset presence, and expected config keys match what the running tskmstr expects, and is thatch installed, current, and suited to the runner when prompts name its skills? Never writes anything or diffs asset content. `--quiet` is a stamp-and-required-keys fast path for direnv: silent when current, one nudge line per finding when not. Exits `0` up to date (recommended keys are advisory), `1` drift found, `2` error |
 | `tm update [--yes]` | Apply `tm check`'s additive fixes: scaffold missing lane prompts and subagent definitions, write suggested values for missing config keys (one confirmation), bump the `schema_version` stamp, and offer the agent-assisted setup session for only the new assets (`--yes` skips it). Never overwrites existing files or config values; unfixable drift is reported with `tm check`'s exit codes |
 | `tm auth login` | Bootstrap config if needed, validate a Jira API token, store it in the keychain |
 | `tm auth status` | Report config, token source, and whether Jira auth + the default project resolve |
