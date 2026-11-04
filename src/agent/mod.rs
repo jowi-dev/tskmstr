@@ -686,6 +686,13 @@ pub trait AgentRunner: Sync {
     /// probes, once against the repo dir and once against `home`.
     fn skills_dir(&self, base: &Path) -> PathBuf;
 
+    /// Where this runner discovers slash commands under a repo checkout or
+    /// a home directory, e.g. `<base>/.claude/commands`. A command in a
+    /// subdirectory is namespaced by it: thatch setup installs its
+    /// `thatch:<name>` commands as `thatch/<name>.md` here. Used by
+    /// `tm check`'s thatch skill probe (GitHub issue #231).
+    fn commands_dir(&self, base: &Path) -> PathBuf;
+
     /// Where this runner discovers a named subagent *definition* under a
     /// repo checkout (or a home directory), e.g.
     /// `<base>/.opencode/agent/<name>.md` for opencode or
