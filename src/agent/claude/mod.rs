@@ -278,10 +278,14 @@ impl AgentRunner for ClaudeRunner {
     /// the built-in probe model, when measured), whose `rate_limit_event`
     /// is the snapshot. Built through
     /// [`ClaudeRunner::build_invocation`] so it keeps the billing-safety env
-    /// stripping. No settings, so no telemetry hooks fire, and no run id, so
-    /// it is untracked. See `docs/plans/gh-113-proactive-usage-signal.md`.
+    /// stripping. `--setting-sources project,local` leaves out the user's
+    /// `~/.claude/settings.json`, and the probe's empty tempdir has no
+    /// project or local settings, so none of the user's hooks fire. It
+    /// passes no `--settings`, so tm's telemetry hooks stay out too, and no
+    /// run id, so it is untracked. See
+    /// `docs/plans/gh-113-proactive-usage-signal.md`.
     fn usage_probe_invocation(&self, model: &str) -> Option<AgentInvocation> {
-        Some(self.invocation(InvocationInputs {
+        let mut probe = self.invocation(InvocationInputs {
             prompt: "ok".to_string(),
             model: model.to_string(),
             max_turns: Some("1".to_string()),
@@ -290,7 +294,10 @@ impl AgentRunner for ClaudeRunner {
             run_id: None,
             mode: RunMode::Headless,
             tool_scope: crate::agent::ToolScope::Full,
-        }))
+        });
+        probe.args.push("--setting-sources".to_string());
+        probe.args.push("project,local".to_string());
+        Some(probe)
     }
 
     fn skills_dir(&self, base: &Path) -> PathBuf {
@@ -1368,6 +1375,8 @@ mod tests {
                 "--verbose",
                 "--max-turns",
                 "1",
+                "--setting-sources",
+                "project,local",
             ]
         );
         assert!(probe.env_set.is_empty(), "an untracked run");
