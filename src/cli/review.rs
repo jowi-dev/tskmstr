@@ -17,7 +17,8 @@
 //!    its own outcome ([`FixOutcome::NoComments`]) rather than dispatching a
 //!    no-op run; no run row is created for it.
 //! 4. Otherwise, wrap the exported markdown in fix-pass instructions
-//!    ([`build_fix_prompt`]) and hand it to
+//!    ([`build_fix_prompt`]: triage with `thatch-review-response`, fix what
+//!    holds up, post nothing to GitHub) and hand it to
 //!    [`crate::work::run::prepare_review_fix`], which starts a tracked
 //!    `kind = "review-fix"` run on the *existing* worktree/branch — no new
 //!    worktree, no new branch.
@@ -288,18 +289,34 @@ fn review_run_repo(config: Option<&crate::config::Config>, lane_run: &crate::run
 
 /// Wrap `export` — the markdown [`VdiffOps::export_comments`] rendered,
 /// grouped by file with `path:start-end` anchors — in instructions for the
-/// fix-pass agent: address every comment, on the current branch, and commit
-/// the result. The agent is deliberately told not to branch or re-worktree
-/// itself: [`prepare_review_fix`] has already put it on the ticket's
-/// existing branch, in its existing worktree, on purpose.
+/// fix-pass agent: triage the comments with `thatch-review-response`, fix
+/// and commit the ones that hold up, and report each comment's outcome
+/// (GitHub issue #204). Review comments, bot findings especially, include
+/// false positives and deliberate designs, so the agent may decline one
+/// with a reason rather than change code for it.
+///
+/// The skill's GitHub half (thread replies, a summary comment) is
+/// forbidden: vdiff owns the comment state, and `tm review auto` carries
+/// declines to its next round itself. The agent is also told not to branch
+/// or re-worktree: [`prepare_review_fix`] has already put it on the
+/// ticket's existing branch, in its existing worktree, on purpose.
 fn build_fix_prompt(export: &str) -> String {
     format!(
-        "Address every review comment below on the current branch. Each \
-         comment is anchored to a file and line range in the form \
-         `path:start-end`. For each one, make the corresponding code \
-         change and commit it — you are already on the branch these \
-         comments were left against; do not create a new branch or \
-         worktree.\n\n{export}"
+        "Respond to the review comments below with the \
+         `thatch-review-response` skill. Each comment is anchored to a file \
+         and line range in the form `path:start-end`.\n\n\
+         Triage every comment before changing code: legitimate, \
+         intentional, false positive or unlikely edge case. Merge comments \
+         that share a root cause. Fix the legitimate ones one at a time and \
+         commit each fix. Leave the rest of the code alone.\n\n\
+         Use only the skill's triage and fix steps. Do not reply to any \
+         review thread, and do not post a summary comment or any other \
+         comment to GitHub. You are already on the branch these comments \
+         were left against; do not create a new branch or worktree.\n\n\
+         When you are done, list every comment's outcome by its \
+         `path:start-end` anchor: fixed, declined with a one-line reason, \
+         or merged with the anchor of the comment it shares a root cause \
+         with.\n\n{export}"
     )
 }
 
@@ -1820,7 +1837,7 @@ mod tests {
             recorded[0]
                 .args
                 .iter()
-                .any(|arg| arg.contains("Address every review comment"))
+                .any(|arg| arg.contains("thatch-review-response"))
         );
 
         let review_fix_run = run_store
@@ -1832,6 +1849,25 @@ mod tests {
         // config is loaded, so the fix row keys on the lane name.
         assert_eq!(review_fix_run.agent.as_deref(), Some("claude"));
         assert_eq!(review_fix_run.repo.as_deref(), Some("mylane"));
+    }
+
+    #[test]
+    fn the_fix_prompt_triages_with_review_response_and_forbids_github_writes() {
+        let prompt = build_fix_prompt("## src/a.rs\n\n- `src/a.rs:4-6` race\n");
+
+        assert!(prompt.contains("`thatch-review-response`"), "{prompt}");
+        for outcome in ["fixed", "declined", "merged"] {
+            assert!(prompt.contains(outcome), "{outcome} missing: {prompt}");
+        }
+        assert!(prompt.contains("one-line reason"), "{prompt}");
+        assert!(
+            prompt.contains("Do not reply to any review thread"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("summary comment"), "{prompt}");
+        assert!(prompt.contains("do not create a new branch"), "{prompt}");
+        assert!(!prompt.contains("Address every review comment"), "{prompt}");
+        assert!(prompt.ends_with("- `src/a.rs:4-6` race\n"), "{prompt}");
     }
 
     /// The lane run `seed_lane_run` recorded, read back from `run_store`.
