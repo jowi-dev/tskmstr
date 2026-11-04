@@ -342,20 +342,33 @@ pub fn fix(
     origin: LaunchOrigin,
     out: &mut dyn Write,
 ) -> Result<FixOutcome, ReviewCliError> {
-    dispatch_fix(deps, paths, key, dispatch, origin, None, out).map(|(outcome, _)| outcome)
+    let prompt = FixPrompt::Comments { completion: None };
+    dispatch_fix(deps, paths, key, dispatch, origin, prompt, out).map(|(outcome, _)| outcome)
 }
 
-/// [`fix`], with `completion` appended to the fix prompt when set (`tm
-/// review auto`'s [`crate::work::auto_review::fix_completion_section`]),
-/// also returning the dispatched run's id (`None` for
-/// [`FixOutcome::NoComments`]).
+/// Where a fix pass's prompt comes from.
+enum FixPrompt<'a> {
+    /// The review comments `vdiff` exports for the worktree, wrapped by
+    /// [`build_fix_prompt`], with `completion` appended when set (`tm
+    /// review auto`'s [`crate::work::auto_review::fix_completion_section`]).
+    /// An empty comment store dispatches nothing ([`FixOutcome::NoComments`]).
+    Comments {
+        /// Text appended after the wrapped comments.
+        completion: Option<&'a str>,
+    },
+    /// A ready prompt, used as is (`tm review ci-fix`'s failing checks).
+    Text(String),
+}
+
+/// [`fix`], with the prompt taken from `prompt`, also returning the
+/// dispatched run's id (`None` for [`FixOutcome::NoComments`]).
 fn dispatch_fix(
     deps: &ReviewFixDeps<'_>,
     paths: &RunLanePaths,
     key: &str,
     dispatch: Dispatch,
     origin: LaunchOrigin,
-    completion: Option<&str>,
+    prompt: FixPrompt<'_>,
     out: &mut dyn Write,
 ) -> Result<(FixOutcome, Option<i64>), ReviewCliError> {
     let scope = deps.backend_identity.scope();
@@ -368,12 +381,16 @@ fn dispatch_fix(
         })?;
     let worktree = PathBuf::from(&run.worktree);
 
-    let export = deps.vdiff.export_comments(&worktree)?;
-    if export.trim() == NO_COMMENTS {
-        return Ok((FixOutcome::NoComments, None));
-    }
-
-    let prompt = build_fix_prompt(&export) + completion.unwrap_or_default();
+    let prompt = match prompt {
+        FixPrompt::Comments { completion } => {
+            let export = deps.vdiff.export_comments(&worktree)?;
+            if export.trim() == NO_COMMENTS {
+                return Ok((FixOutcome::NoComments, None));
+            }
+            build_fix_prompt(&export) + completion.unwrap_or_default()
+        }
+        FixPrompt::Text(prompt) => prompt,
+    };
     let pid = match dispatch {
         Dispatch::HeadlessForeground => Some(std::process::id()),
         Dispatch::Headless | Dispatch::Interactive => None,
@@ -901,7 +918,9 @@ impl AutoReviewOps for CliAutoReviewOps<'_, '_> {
             self.ticket,
             Dispatch::Interactive,
             self.unattended(),
-            Some(&completion),
+            FixPrompt::Comments {
+                completion: Some(&completion),
+            },
             &mut **out,
         )
         .map_err(|e| AutoReviewError::step("fix", e))?;
