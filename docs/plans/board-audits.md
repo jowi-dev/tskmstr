@@ -89,6 +89,30 @@ New module `src/work/audit.rs`:
 New `TmuxOps` op: `new_session_with_command(name, dir, window_name,
 env: &[(String, String)], command: &str)`, faked like the rest.
 
+### Investigation: `/thatch:refine` runs inside the audit (GitHub issue #206)
+
+An audit checks more than completeness: the session runs `/thatch:refine`
+on the ticket's PROPOSED APPROACH as its investigation step, so a plan
+built on a wrong premise is caught before a lane finds out mid-run.
+Refine is called **as-is and never modified**. The tm-specific process
+stays in the audit around it: refine does not check links, blockers or
+lane size, which the verdict depends on, so the audit keeps its gap list,
+user Q&A, ticket write-back and `tm ticket audit --record` verdict.
+Refine's revisions are written back to the ticket body before a verdict is
+recorded; `ready` still requires that write-back, and `tm ready` is
+unchanged.
+
+The `tm init` thatch scaffold (`AUDIT_THATCH_TEMPLATE` in
+`src/cli/init.rs`) carries the step. The runners' default `[work.audit]`
+prompt stays `/ticket-audit {key}`: `tm init` and `tm check` only verify
+the prompt's leading `/skill`, so a default naming `/thatch:refine` would
+send users without the thatch plugin to a missing command with no drift
+warning. The user-level `~/.claude/skills/ticket-audit` skill is outside
+this repo and needs the matching edit.
+
+Declined: replacing the audit with refine, which would make refine absorb
+tm's verdict rules.
+
 ### Adoption: the in-session `tm ticket audit` claims the launched run
 
 `SessionEnv` gains `session_run_id: Option<i64>` read from

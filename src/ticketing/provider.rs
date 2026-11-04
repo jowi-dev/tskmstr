@@ -42,8 +42,8 @@ use crate::jira::client::{JiraClient, RankAnchor};
 use crate::jira::fake::FakeJiraClient;
 use crate::jira::jql::{
     assignee_tickets_jql, children_jql, epics_jql, everyone_tickets_jql, keys_jql,
-    my_open_tickets_jql, ranked_tickets_jql, ready_candidates_jql, shipped_awaiting_retro_jql,
-    ticket_search_jql, unassigned_tickets_jql,
+    my_open_tickets_jql, open_epics_jql, ranked_tickets_jql, ready_candidates_jql,
+    shipped_awaiting_retro_jql, ticket_search_jql, unassigned_tickets_jql,
 };
 use crate::jira::types::CreateIssueRequest;
 use crate::ticketing::error::ProviderError;
@@ -129,31 +129,42 @@ pub enum TicketQuery {
         /// Project to scope the search to.
         project_key: String,
     },
+    /// Every open epic in `project_key`: what the board's epics view shows
+    /// (GitHub issue #200), since every other board query leaves epics out.
+    /// See [`open_epics_jql`].
+    OpenEpics {
+        /// Project to scope the search to.
+        project_key: String,
+    },
 }
 
 /// Render `query` into the JQL string [`JiraProvider::search`] (and
 /// [`FakeJiraClient`]'s [`TicketProvider`] impl, so tests configured against
 /// a fixed JQL string keep working unchanged) send to Jira.
-/// `epic_issue_type` is the project's epic type name, used only by
-/// [`TicketQuery::Epics`]: [`JiraProvider`] passes its configured one,
+/// `epic_issue_type` is the project's epic type name, which the board
+/// queries exclude and [`TicketQuery::Epics`]/[`TicketQuery::OpenEpics`]
+/// select: [`JiraProvider`] passes its configured one,
 /// [`FakeJiraClient`] passes [`DEFAULT_EPIC_ISSUE_TYPE`].
 fn render_jql(query: &TicketQuery, epic_issue_type: &str) -> String {
     match query {
-        TicketQuery::MyOpen => my_open_tickets_jql(),
-        TicketQuery::Unassigned { project_key } => unassigned_tickets_jql(project_key),
-        TicketQuery::Everyone { project_key } => everyone_tickets_jql(project_key),
+        TicketQuery::MyOpen => my_open_tickets_jql(epic_issue_type),
+        TicketQuery::Unassigned { project_key } => {
+            unassigned_tickets_jql(project_key, epic_issue_type)
+        }
+        TicketQuery::Everyone { project_key } => everyone_tickets_jql(project_key, epic_issue_type),
         TicketQuery::Assignee {
             project_key,
             account_id,
-        } => assignee_tickets_jql(project_key, account_id),
-        TicketQuery::Ranked { project_key } => ranked_tickets_jql(project_key),
+        } => assignee_tickets_jql(project_key, account_id, epic_issue_type),
+        TicketQuery::Ranked { project_key } => ranked_tickets_jql(project_key, epic_issue_type),
         TicketQuery::Search { project_key, text } => ticket_search_jql(project_key, text),
         TicketQuery::ShippedAwaitingRetro { project_key } => {
             shipped_awaiting_retro_jql(project_key)
         }
-        TicketQuery::ReadyCandidates => ready_candidates_jql(),
+        TicketQuery::ReadyCandidates => ready_candidates_jql(epic_issue_type),
         TicketQuery::Keys { keys } => keys_jql(keys),
         TicketQuery::Epics { project_key } => epics_jql(project_key, epic_issue_type),
+        TicketQuery::OpenEpics { project_key } => open_epics_jql(project_key, epic_issue_type),
     }
 }
 
@@ -815,87 +826,97 @@ mod tests {
 
     #[test]
     fn render_jql_covers_every_variant() {
+        let project = || "PROJ".to_string();
         assert_eq!(
-            render_jql(&TicketQuery::MyOpen, "Epic"),
-            crate::jira::jql::my_open_tickets_jql()
+            render_jql(&TicketQuery::MyOpen, "Initiative"),
+            crate::jira::jql::my_open_tickets_jql("Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Unassigned {
-                    project_key: "PROJ".to_string()
+                    project_key: project()
                 },
-                "Epic"
+                "Initiative"
             ),
-            crate::jira::jql::unassigned_tickets_jql("PROJ")
+            crate::jira::jql::unassigned_tickets_jql("PROJ", "Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Everyone {
-                    project_key: "PROJ".to_string()
+                    project_key: project()
                 },
-                "Epic"
+                "Initiative"
             ),
-            crate::jira::jql::everyone_tickets_jql("PROJ")
+            crate::jira::jql::everyone_tickets_jql("PROJ", "Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Assignee {
-                    project_key: "PROJ".to_string(),
+                    project_key: project(),
                     account_id: "acct-1".to_string()
                 },
-                "Epic"
+                "Initiative"
             ),
-            crate::jira::jql::assignee_tickets_jql("PROJ", "acct-1")
+            crate::jira::jql::assignee_tickets_jql("PROJ", "acct-1", "Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Ranked {
-                    project_key: "PROJ".to_string()
+                    project_key: project()
                 },
-                "Epic"
+                "Initiative"
             ),
-            crate::jira::jql::ranked_tickets_jql("PROJ")
+            crate::jira::jql::ranked_tickets_jql("PROJ", "Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Search {
-                    project_key: "PROJ".to_string(),
+                    project_key: project(),
                     text: "login bug".to_string()
                 },
-                "Epic"
+                "Initiative"
             ),
             crate::jira::jql::ticket_search_jql("PROJ", "login bug")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::ShippedAwaitingRetro {
-                    project_key: "PROJ".to_string()
+                    project_key: project()
                 },
-                "Epic"
+                "Initiative"
             ),
             crate::jira::jql::shipped_awaiting_retro_jql("PROJ")
         );
         assert_eq!(
-            render_jql(&TicketQuery::ReadyCandidates, "Epic"),
-            crate::jira::jql::ready_candidates_jql()
+            render_jql(&TicketQuery::ReadyCandidates, "Initiative"),
+            crate::jira::jql::ready_candidates_jql("Initiative")
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Keys {
                     keys: vec!["PROJ-1".to_string()]
                 },
-                "Epic"
+                "Initiative"
             ),
             crate::jira::jql::keys_jql(&["PROJ-1".to_string()])
         );
         assert_eq!(
             render_jql(
                 &TicketQuery::Epics {
-                    project_key: "PROJ".to_string()
+                    project_key: project()
                 },
                 "Initiative"
             ),
             crate::jira::jql::epics_jql("PROJ", "Initiative")
+        );
+        assert_eq!(
+            render_jql(
+                &TicketQuery::OpenEpics {
+                    project_key: project()
+                },
+                "Initiative"
+            ),
+            crate::jira::jql::open_epics_jql("PROJ", "Initiative")
         );
     }
 

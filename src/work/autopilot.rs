@@ -14,7 +14,7 @@
 //! flag is off returns [`crate::work::dispatch::Skip::Disabled`] at once.
 //!
 //! [`load_status`] builds what the views show for each scope from runs.db:
-//! the flag, the running lane count against `max_lanes`, and the reason the
+//! the flag, the running lanes counted against `max_lanes`, and the reason the
 //! newest tick stopped short, if it did.
 
 use std::any::Any;
@@ -188,8 +188,10 @@ pub struct AutopilotStatus {
     pub scope: String,
     /// The scope's runs.db autopilot flag.
     pub enabled: bool,
-    /// Lane runs running now, across every scope (what `max_lanes` caps).
-    pub running_lanes: usize,
+    /// The tickets of the scope's lane runs running now, legacy unscoped
+    /// ones included, oldest first: what `max_lanes` caps and what `tm
+    /// dispatch status` counts (see [`RunStore::running_lane_tickets`]).
+    pub running_lanes: Vec<String>,
     /// `[dispatch] max_lanes`.
     pub max_lanes: usize,
     /// The refusal reason of the scope's newest dispatch event, when that
@@ -205,17 +207,23 @@ pub struct AutopilotStatus {
 
 impl AutopilotStatus {
     /// One line for a status bar or header, e.g. `autopilot on · lanes 1/2
-    /// · launched 12m ago · not launching: … (5m)`, where the trailing age is
-    /// how long the refusal has lasted. A tick error, when given, replaces
-    /// the refusal.
+    /// (AX-809) · launched 12m ago · not launching: … (5m)`. The lanes count
+    /// names the tickets it counts, so a lane the view doesn't list (a
+    /// legacy unscoped one, or one the board's filter hides) is not a
+    /// phantom (GitHub issue #171). The trailing age is how long the refusal
+    /// has lasted. A tick error, when given, replaces the refusal.
     pub fn summary(&self, tick_error: Option<&str>) -> String {
         if !self.enabled {
             return "autopilot off".to_string();
         }
         let mut line = format!(
             "autopilot on · lanes {}/{}",
-            self.running_lanes, self.max_lanes
+            self.running_lanes.len(),
+            self.max_lanes
         );
+        if !self.running_lanes.is_empty() {
+            line.push_str(&format!(" ({})", self.running_lanes.join(", ")));
+        }
         if let Some(age) = self.last_launch_age_secs {
             line.push_str(&format!(" · launched {} ago", format_age(age)));
         }
@@ -243,7 +251,6 @@ pub fn load_status(
     max_lanes: usize,
     now: i64,
 ) -> Result<Vec<AutopilotStatus>, RunStoreError> {
-    let running_lanes = store.running_lanes()?.len();
     scopes
         .iter()
         .map(|scope| {
@@ -251,7 +258,7 @@ pub fn load_status(
             Ok(AutopilotStatus {
                 scope: scope.clone(),
                 enabled: store.autopilot_enabled(scope)?,
-                running_lanes,
+                running_lanes: store.running_lane_tickets(scope)?,
                 max_lanes,
                 blocked_age_secs: state.blocked.as_ref().map(|b| now - b.since_unix),
                 last_refusal: state.blocked.map(|b| b.detail),
@@ -422,7 +429,7 @@ mod tests {
                 AutopilotStatus {
                     scope: "github:o/r".to_string(),
                     enabled: true,
-                    running_lanes: 0,
+                    running_lanes: Vec::new(),
                     max_lanes: 2,
                     last_refusal: Some("paused: usage 87%".to_string()),
                     blocked_age_secs: Some(90),
@@ -431,7 +438,7 @@ mod tests {
                 AutopilotStatus {
                     scope: "github:o/off".to_string(),
                     enabled: false,
-                    running_lanes: 0,
+                    running_lanes: Vec::new(),
                     max_lanes: 2,
                     last_refusal: None,
                     blocked_age_secs: None,
@@ -439,6 +446,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn status_counts_each_scopes_own_running_lanes() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        store
+            .start_run(&crate::runs::StartRun {
+                scope: "jira:AX".to_string(),
+                ticket: "AX-809".to_string(),
+                lane: "backend".to_string(),
+                worktree: "/wt/ax-809".to_string(),
+                branch: None,
+                pid: None,
+                kind: "lane".to_string(),
+                log_path: None,
+            })
+            .unwrap();
+
+        let status = load_status(
+            &store,
+            &["jira:AX".to_string(), "github:o/r".to_string()],
+            1,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(status[0].running_lanes, ["AX-809"]);
+        assert!(status[1].running_lanes.is_empty());
     }
 
     #[test]
@@ -465,7 +501,7 @@ mod tests {
         let mut status = AutopilotStatus {
             scope: "s".to_string(),
             enabled: false,
-            running_lanes: 1,
+            running_lanes: vec!["AX-809".to_string()],
             max_lanes: 2,
             last_refusal: Some("paused: usage 87% ≥ 85%".to_string()),
             blocked_age_secs: Some(300),
@@ -476,16 +512,19 @@ mod tests {
         status.enabled = true;
         assert_eq!(
             status.summary(None),
-            "autopilot on · lanes 1/2 · launched 12m ago · paused: usage 87% ≥ 85% (5m)"
+            "autopilot on · lanes 1/2 (AX-809) · launched 12m ago · paused: usage 87% ≥ 85% (5m)"
         );
         assert_eq!(
             status.summary(Some("gh: timed out")),
-            "autopilot on · lanes 1/2 · launched 12m ago · tick failed: gh: timed out"
+            "autopilot on · lanes 1/2 (AX-809) · launched 12m ago · tick failed: gh: timed out"
         );
 
         status.last_refusal = None;
         status.blocked_age_secs = None;
         status.last_launch_age_secs = None;
-        assert_eq!(status.summary(None), "autopilot on · lanes 1/2");
+        assert_eq!(status.summary(None), "autopilot on · lanes 1/2 (AX-809)");
+
+        status.running_lanes.clear();
+        assert_eq!(status.summary(None), "autopilot on · lanes 0/2");
     }
 }

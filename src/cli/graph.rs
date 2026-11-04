@@ -1,5 +1,5 @@
 //! `tm graph`: print the epic unlock graph built by
-//! [`crate::graph::build_graph`] as text, JSON, or Mermaid.
+//! [`crate::graph::build_graph`] as text, JSON, Mermaid, or an HTML page.
 //!
 //! Every format writes each graph warning (such as an unlocks cycle) to
 //! stderr as `warning: <message>`. Warnings never fail the command.
@@ -9,7 +9,10 @@ use std::io::{self, Write};
 use thiserror::Error;
 
 use crate::config::BackendIdentity;
-use crate::graph::{GraphDocument, GraphError, build_graph, render_mermaid, render_text};
+use crate::graph::state::graph_state;
+use crate::graph::{
+    GraphDocument, GraphError, build_graph, render_html, render_mermaid, render_text,
+};
 use crate::ticketing::provider::TicketProvider;
 
 /// Which view of the graph [`run`] prints.
@@ -21,6 +24,8 @@ pub enum GraphFormat {
     Json,
     /// A Mermaid flowchart ([`render_mermaid`]).
     Mermaid,
+    /// A self-contained HTML page that draws the graph ([`render_html`]).
+    Html,
 }
 
 /// Errors from [`run`].
@@ -34,7 +39,8 @@ pub enum GraphCliError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    /// Serializing the JSON document failed.
+    /// Serializing the JSON document, or the HTML page's embedded data,
+    /// failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -42,7 +48,8 @@ pub enum GraphCliError {
 /// `tm graph [EPIC]`: build the graph for `project_key` from `provider`,
 /// scoped to `epic` when given, and write it to `out` in `format`. Each
 /// warning goes to `err` first. `now_secs` (seconds since the Unix epoch)
-/// stamps the JSON document's `generated_at`.
+/// stamps the JSON document's `generated_at`, in the JSON and HTML
+/// formats.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     provider: &dyn TicketProvider,
@@ -65,6 +72,11 @@ pub fn run(
             let document = GraphDocument::new(graph, identity, now_secs);
             serde_json::to_writer_pretty(&mut *out, &document)?;
             writeln!(out)?;
+        }
+        GraphFormat::Html => {
+            let state = graph_state(&graph);
+            let document = GraphDocument::new(graph, identity, now_secs);
+            out.write_all(render_html(&document, &state)?.as_bytes())?;
         }
     }
     Ok(())
@@ -238,6 +250,20 @@ mod tests {
 
         result.unwrap();
         assert!(out.starts_with("flowchart LR"), "got: {out}");
+    }
+
+    #[test]
+    fn html_output_is_a_page_embedding_the_graph() {
+        let fake = fake_with_epics(vec![
+            issue("PROJ-1", vec![blocks("PROJ-2")]),
+            issue("PROJ-2", vec![]),
+        ]);
+
+        let (result, out, _) = run_graph(&fake, None, GraphFormat::Html);
+
+        result.unwrap();
+        assert!(out.starts_with("<!DOCTYPE html>"), "got: {out}");
+        assert!(out.contains("\"PROJ-2\":{\"availability\":\"locked\""));
     }
 
     #[test]

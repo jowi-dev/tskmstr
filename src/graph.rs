@@ -11,6 +11,7 @@
 //! fetch, then one [`TicketProvider::children`] call per epic in the graph.
 //! It never follows links one fetch at a time.
 
+mod html;
 mod render;
 pub mod state;
 
@@ -25,6 +26,7 @@ use crate::ticketing::provider::{TicketProvider, TicketQuery};
 use crate::ticketing::types::{Issue, LinkedIssue, Status, UserRef};
 use crate::work::comment_store::iso8601_utc;
 
+pub use html::render_html;
 pub use render::{render_mermaid, render_text};
 
 /// The status category key for finished work.

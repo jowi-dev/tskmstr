@@ -84,6 +84,7 @@ pub fn run_update(
         paths: ctx.paths,
         home: ctx.home,
         runner: ctx.runner,
+        thatch: check::ThatchProbe::Unchecked,
     };
 
     let findings = check::collect_findings(&check_ctx, &doc, &repo_dir);
@@ -148,6 +149,8 @@ pub fn run_update(
             // and rewriting the `prompt_file` key is a content decision, not
             // an additive fix; reported as remaining drift only (GitHub
             // issue #53).
+            // Installing a skill tm doesn't ship isn't an additive fix.
+            DriftFinding::MissingLaneSkill { .. } => {}
             DriftFinding::LegacyPromptDir { .. } => {}
             // Collected below and written in one confirmed batch.
             DriftFinding::MissingConfigKey { .. } => {}
@@ -156,6 +159,11 @@ pub fn run_update(
             DriftFinding::RejectedModel { .. } => {}
             // A content rewrite, so confirmed separately below.
             DriftFinding::LegacyAgentKeys { .. } => {}
+            // Thatch health comes from `tm check` alone, never from here.
+            DriftFinding::ThatchMissing { .. }
+            | DriftFinding::ThatchOutdated { .. }
+            | DriftFinding::HostLimitedSkill { .. }
+            | DriftFinding::ThatchSkillNotInstalled { .. } => {}
         }
     }
 
@@ -388,6 +396,12 @@ mod tests {
         let repo_dir = root.path().join("repo");
         std::fs::create_dir_all(&home).expect("create home");
         std::fs::create_dir_all(&repo_dir).expect("create repo");
+        // Install the skills the starter lane prompt names, so a freshly
+        // scaffolded prompt is clean rather than reporting them missing.
+        let template = crate::cli::init::lane_prompt_template("any");
+        for skill in crate::cli::check::named_skills(&template) {
+            std::fs::create_dir_all(home.join(".claude/skills").join(skill)).expect("create skill");
+        }
         let paths = ConfigPaths {
             global: home.join(".config/tskmstr/config.toml"),
             repo: Some(repo_dir.join(".tskmstr.toml")),
@@ -450,6 +464,10 @@ mod tests {
         assert!(
             prompt.contains("widget work lane"),
             "starter template: {prompt}"
+        );
+        assert!(
+            prompt.contains("`thatch-pr-description` skill"),
+            "same template as tm init, thatch steps included: {prompt}"
         );
         assert!(
             read_repo_config(&env).contains("schema_version = 2"),

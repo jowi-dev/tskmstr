@@ -145,12 +145,17 @@ pub enum Command {
         /// direction, plus their children. Omit for every epic.
         epic: Option<String>,
         /// Print the versioned JSON document instead of text.
-        #[arg(long, conflicts_with = "mermaid")]
+        #[arg(long, conflicts_with_all = ["mermaid", "html"])]
         json: bool,
         /// Print a Mermaid flowchart of the epics and unlocks links
         /// instead of text.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "html")]
         mermaid: bool,
+        /// Print a self-contained HTML page of the epics and unlocks
+        /// links, colored by availability, instead of text. Needs no
+        /// network: `tm graph --html > plan.html` and share the file.
+        #[arg(long)]
+        html: bool,
     },
     /// Open the interactive terminal board.
     Board,
@@ -418,7 +423,8 @@ pub enum ReviewCmd {
     },
     /// Run thatch auto-review rounds over KEY's PR branch.
     ///
-    /// Each round is an interactive review (`thatch-code-review`, then
+    /// Each round is an interactive review (the runner's thatch review
+    /// entry point or `[work.auto_review].first_round_skill`, then
     /// `thatch-review-followup`) in a `review` window of the ticket's
     /// `tm-<scope>-<key>` session (`review-2` for round 2). Its confirmed
     /// findings go into the worktree's vdiff comment store, and any finding
@@ -2465,10 +2471,12 @@ mod tests {
                 epic,
                 json,
                 mermaid,
+                html,
             }) => {
                 assert!(epic.is_none());
                 assert!(!json);
                 assert!(!mermaid);
+                assert!(!html);
             }
             other => panic!("expected Graph, got {other:?}"),
         }
@@ -2482,10 +2490,12 @@ mod tests {
                 epic,
                 json,
                 mermaid,
+                html,
             }) => {
                 assert_eq!(epic, Some("PROJ-1".to_string()));
                 assert!(json);
                 assert!(!mermaid);
+                assert!(!html);
             }
             other => panic!("expected Graph, got {other:?}"),
         }
@@ -2507,6 +2517,32 @@ mod tests {
     fn parses_graph_json_conflicts_with_mermaid() {
         Cli::try_parse_from(["tm", "graph", "--json", "--mermaid"])
             .expect_err("--json and --mermaid pick different outputs");
+    }
+
+    #[test]
+    fn parses_graph_html() {
+        let cli = Cli::try_parse_from(["tm", "graph", "--html"]).expect("should parse");
+        match cli.command {
+            Some(Command::Graph {
+                json,
+                mermaid,
+                html,
+                ..
+            }) => {
+                assert!(!json);
+                assert!(!mermaid);
+                assert!(html);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_graph_html_conflicts_with_json_and_mermaid() {
+        Cli::try_parse_from(["tm", "graph", "--html", "--json"])
+            .expect_err("--html and --json pick different outputs");
+        Cli::try_parse_from(["tm", "graph", "--mermaid", "--html"])
+            .expect_err("--html and --mermaid pick different outputs");
     }
 
     #[test]

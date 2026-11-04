@@ -79,8 +79,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentError, AgentInvocation, AgentRunner, InstallReport, InvocationInputs, OutcomeParseError,
-    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, one_line, shell_quote, tool_call_line,
-    tool_input_summary,
+    RateLimitInfo, RunMode, RunOutcome, SessionEnvVars, ToolScope, one_line, shell_quote,
+    tool_call_line, tool_input_summary,
 };
 use crate::runs::pricing::ModelPrice;
 use crate::work::naming::expand_tilde;
@@ -249,6 +249,12 @@ impl AgentRunner for OpencodeRunner {
         "opencode"
     }
 
+    /// thatch's coordinator skill, which fans the review out to specialist
+    /// sub-agents.
+    fn auto_review_skill(&self) -> &'static str {
+        "thatch-code-review"
+    }
+
     /// opencode's native skills dir. It also discovers `skill/` (singular)
     /// and Claude-format `.claude/skills`, so `tm init`'s advisory probe
     /// (which only checks this one path) may under-detect skills opencode
@@ -300,10 +306,16 @@ impl AgentRunner for OpencodeRunner {
         // value is documented-ignored in both modes; opencode's own
         // `permission` config governs, and a headless run auto-rejects
         // any ask it isn't configured to allow rather than hanging.
-        let bypass = matches!(
-            inputs.permission_mode.as_deref(),
-            None | Some("bypassPermissions")
-        );
+        //
+        // `ToolScope::ThatchOnly` never bypasses: opencode has no CLI flag
+        // that limits a run to one MCP server, so the strongest confinement
+        // this adapter can give is to leave every ask to the user's own
+        // `permission` config, which auto-rejects headless.
+        let bypass = inputs.tool_scope == ToolScope::Full
+            && matches!(
+                inputs.permission_mode.as_deref(),
+                None | Some("bypassPermissions")
+            );
 
         let mut args = Vec::new();
         match inputs.mode {
@@ -862,6 +874,7 @@ mod tests {
             settings_path: None,
             run_id: Some("run-123".to_string()),
             mode: RunMode::Headless,
+            tool_scope: crate::agent::ToolScope::Full,
         }
     }
 
@@ -875,6 +888,11 @@ mod tests {
     #[test]
     fn display_name_is_lowercase_opencode() {
         assert_eq!(OpencodeRunner.display_name(), "opencode");
+    }
+
+    #[test]
+    fn auto_review_skill_is_thatch_code_review() {
+        assert_eq!(OpencodeRunner.auto_review_skill(), "thatch-code-review");
     }
 
     #[test]
@@ -929,6 +947,7 @@ mod tests {
                 settings_path: None,
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
 
@@ -1201,6 +1220,26 @@ mod tests {
                 "--model",
                 "anthropic/claude-sonnet-4-5",
             ]
+        );
+    }
+
+    #[test]
+    fn thatch_only_scope_never_passes_the_bypass_flag() {
+        let headless = OpencodeRunner.build_invocation(
+            &crate::work::admission::Admitted::for_test(),
+            InvocationInputs {
+                permission_mode: None,
+                tool_scope: crate::agent::ToolScope::ThatchOnly,
+                ..base_inputs()
+            },
+        );
+        assert!(
+            !headless
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions" || a == "--auto"),
+            "{:?}",
+            headless.args
         );
     }
 
@@ -1615,6 +1654,7 @@ mod tests {
                 settings_path: None,
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
 
@@ -1648,6 +1688,7 @@ mod tests {
                 settings_path: None,
                 run_id: Some("7".to_string()),
                 mode: RunMode::Interactive,
+                tool_scope: crate::agent::ToolScope::Full,
             },
         );
 
