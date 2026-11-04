@@ -1760,8 +1760,9 @@ fn draw_events_panel(
 
 /// A centered floating window (~80% wide, ~70% tall) showing the selected
 /// ticket's full detail, drawn over the board: its status, its parent epic
-/// (`Epic: <KEY>  <summary>`, omitted when it has none), its URL, then its
-/// description.
+/// (`Epic: <KEY>  <summary>`, omitted when it has none), its `Readiness:`
+/// line (plus a hint naming the board's audit keys when it needs audit),
+/// its URL, then its description.
 fn draw_detail_window(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
