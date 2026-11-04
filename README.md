@@ -207,7 +207,7 @@ tm auth status
 | `tm ticket search <TEXT>` | Search the configured default project for open (non-`Done`) tickets matching `<TEXT>`, most recently updated first |
 | `tm ready [--json]` | List your To Do tickets in rank order, each marked ready, stackable (on which branch), needs audit, waiting (on a blocker's live lane run), or blocked (and why), with how many others each unblocks; `--json` for scripts |
 | `tm ready <KEY>` | Check whether ticket `<KEY>` (any assignee, any status) is ready, stackable, not audited, waiting, or blocked. Exits `0` (ready), `3` (stackable), `4` (not audited), or `1` (waiting/blocked/error) |
-| `tm graph [EPIC] [--json \| --mermaid]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart. Unlocks cycles warn on stderr and still exit `0` |
+| `tm graph [EPIC] [--json \| --mermaid \| --html]` | Show the epic unlock graph: every open epic (plus Done epics linked to one) with its `(done/total)` child progress and which epics it unlocks or is unlocked by. Record "A unlocks B" with `tm ticket link A --blocks B`. `EPIC` scopes it to the epics connected to that one; `--json` prints the versioned document described in [docs/graph-format.md](docs/graph-format.md), `--mermaid` a flowchart, and `--html` a self-contained page that colors each epic by availability and shows its child progress (`tm graph --html > plan.html` to share it; it needs no network). Unlocks cycles warn on stderr and still exit `0` |
 | `tm pr create [--title] [--body] [--base] [--auto-ticket]` | Open a PR for the current branch and associate a ticket |
 | `tm pr status [--auto-ticket]` | Report the PR open for the current branch and its associated ticket |
 | `tm pr watch <KEY> [--foreground]` | Poll `<KEY>`'s open PR until its review bots have posted (or the PR merges/closes), detached by default; `--foreground` runs the poll loop in this process |
@@ -1461,6 +1461,7 @@ move them in the epics view instead; see "The epics view" below.
 | `o` | Open the selected ticket in the browser |
 | `f` | Open the assignee filter picker (board only) |
 | `E` | Switch between the ticket board and the epics view (board only); see "The epics view" below |
+| `e` | Open the epic filter picker; see "Filtering the board by epic" below (board only) |
 | `i` / `/` | Start searching the board's cards; see "Searching the board" below (board only) |
 | `A` | Open the assign picker for the selected ticket (board only) |
 | `p` | Open the priority (stack-rank) view (board only) |
@@ -1503,9 +1504,30 @@ the same way the board hides done tickets; `tm graph` still shows them.
 
 Keys that only make sense on a workable ticket do nothing in the epics view
 except set a status-line message: `w` (lane run), `m` (manual session), `a`
-(audit), `M` and `Space` (merge), and `f` (the assignee filter does not
-apply to epics). Press `E` again to return to the ticket board under the
-assignee filter you left it with.
+(audit), `M` and `Space` (merge), and `f` and `e` (the assignee and epic
+filters do not apply to epics). Press `E` again to return to the ticket
+board under the assignee and epic filters you left it with.
+
+### Filtering the board by epic
+
+Pressing `e` on the board opens a floating picker listing `All epics`, `No
+epic`, and each epic that the loaded cards belong to, shown as `KEY  Title`
+and sorted by key. `j`/`k` navigate, `Enter` applies the highlighted choice,
+`Esc`/`q` closes the picker without changing anything. The active choice is
+marked with a leading `*`.
+
+Choosing an epic narrows every column to that epic's child cards; `No epic`
+shows only cards with no parent, and `All epics` clears the filter. Columns
+keep their order and stay on screen when empty, every column title reads
+`shown/total` while the filter is applied, and the status line shows `Epic:
+KEY  Title`.
+
+Like the search, the epic filter works on the cards the board has already
+loaded, so it combines with the `f` assignee filter and the `i`/`/` search
+and survives `r` refreshes and `f` refetches. The picker only offers epics
+with at least one loaded card. The one exception is the active epic: if a
+refetch leaves it with no cards, the board shows empty columns and the
+picker keeps the epic listed, rather than clearing the filter.
 
 ### Searching the board
 
