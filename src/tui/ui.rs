@@ -2787,10 +2787,7 @@ mod tests {
             text.contains("Readiness: needs audit (last audit was needs-work)"),
             "{text}"
         );
-        assert!(
-            text.contains("a audit session, Y mark audited"),
-            "{text}"
-        );
+        assert!(text.contains("a audit session, Y mark audited"), "{text}");
     }
 
     #[test]
