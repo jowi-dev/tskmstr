@@ -17,7 +17,10 @@
 //!    from a [`CandidateSource`], and drops every ticket the run store says
 //!    is already in hand ([`in_hand`]).
 //! 4. Orders them by how many other candidates each unblocks, most first,
-//!    keeping the tracker's rank order within a tie.
+//!    keeping the tracker's rank order within a tie. When the scope has a
+//!    priority epic ([`RunStore::autopilot_epic`], GitHub issue #237), that
+//!    epic's tickets come first, each group in that same order; tickets
+//!    outside it stay eligible.
 //! 5. Launches them in that order through a [`Launcher`] while the running
 //!    lane count is under `max_lanes` (counted per scope, ADR-0011), the
 //!    scope launched fewer than
@@ -73,21 +76,29 @@ pub struct Candidate {
     pub decision: ListDecision,
     /// How many other candidates it blocks, transitively.
     pub unblocks: usize,
+    /// Its parent epic's key. Only filled when the tick asked for epics
+    /// ([`CandidateSource::candidates`]); `None` otherwise, or when it has
+    /// no parent.
+    pub epic: Option<String>,
 }
 
 /// Where a tick's candidates come from: `tm ready`'s classification in
 /// production, a fixed list in tests. Candidates arrive in tracker rank
 /// order.
 pub trait CandidateSource {
-    /// The scope's candidates, or why they couldn't be read.
-    fn candidates(&self) -> Result<Vec<Candidate>, String>;
+    /// The scope's candidates, or why they couldn't be read. With
+    /// `with_epics`, each one's [`Candidate::epic`] is filled, whatever
+    /// `[ready] inherit_epic_blockers` says; the tick asks only when the
+    /// scope has a priority epic, so a scope without one pays no extra
+    /// tracker call.
+    fn candidates(&self, with_epics: bool) -> Result<Vec<Candidate>, String>;
 }
 
 /// Production: `tm ready`'s own classification
 /// ([`crate::cli::ready::dispatch_candidates`]).
 impl CandidateSource for crate::cli::ready::ReadyContext<'_> {
-    fn candidates(&self) -> Result<Vec<Candidate>, String> {
-        crate::cli::ready::dispatch_candidates(self).map_err(|err| err.to_string())
+    fn candidates(&self, with_epics: bool) -> Result<Vec<Candidate>, String> {
+        crate::cli::ready::dispatch_candidates(self, with_epics).map_err(|err| err.to_string())
     }
 }
 
@@ -437,12 +448,13 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         return Ok(skipped(Skip::Disabled));
     }
     deps.store.stamp_autopilot_tick(cfg.scope)?;
+    let priority_epic = deps.store.autopilot_epic(cfg.scope)?;
 
     let runs = deps.store.overview_runs()?;
     let busy = in_hand(&runs, cfg.scope);
     let mut queue: Vec<Candidate> = deps
         .candidates
-        .candidates()
+        .candidates(priority_epic.is_some())
         .map_err(DispatchError::Candidates)?
         .into_iter()
         .filter(|c| {
@@ -453,7 +465,11 @@ pub fn tick(deps: &TickDeps, cfg: &TickConfig) -> Result<TickReport, DispatchErr
         })
         .filter(|c| !busy.contains_key(&c.key))
         .collect();
-    queue.sort_by_key(|c| std::cmp::Reverse(c.unblocks));
+    // A stable sort: rank order survives within each (epic, unblocks) tie.
+    queue.sort_by_key(|c| {
+        let outside_epic = priority_epic.is_none() || c.epic != priority_epic;
+        (outside_epic, std::cmp::Reverse(c.unblocks))
+    });
 
     let mut report = TickReport::default();
     let mut refused_ticket = None;
@@ -694,7 +710,7 @@ pub fn in_hand(runs: &[OverviewRun], scope: &str) -> HashMap<String, InHand> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
     use crate::agent::UsageSnapshot;
@@ -716,11 +732,13 @@ mod tests {
     const SCOPE: &str = "github:o/r";
     const NOW: i64 = 1_000_000;
 
-    /// Candidates handed back verbatim.
-    struct FakeCandidates(Vec<Candidate>);
+    /// Candidates handed back verbatim, recording whether the tick asked
+    /// for their parent epics.
+    struct FakeCandidates(Vec<Candidate>, Cell<Option<bool>>);
 
     impl CandidateSource for FakeCandidates {
-        fn candidates(&self) -> Result<Vec<Candidate>, String> {
+        fn candidates(&self, with_epics: bool) -> Result<Vec<Candidate>, String> {
+            self.1.set(Some(with_epics));
             Ok(self.0.clone())
         }
     }
@@ -825,8 +843,18 @@ mod tests {
         }
 
         fn tick(&self, candidates: &[Candidate], launcher: &dyn Launcher) -> TickReport {
+            self.tick_asking(candidates, launcher).0
+        }
+
+        /// [`Fixture::tick`], also returning whether the tick asked its
+        /// candidate source for parent epics (`None` when it never asked).
+        fn tick_asking(
+            &self,
+            candidates: &[Candidate],
+            launcher: &dyn Launcher,
+        ) -> (TickReport, Option<bool>) {
             let lock = self.lock();
-            let source = FakeCandidates(candidates.to_vec());
+            let source = FakeCandidates(candidates.to_vec(), Cell::new(None));
             let pressure = self.pressure;
             let pressure_fn = move || pressure;
             let deps = TickDeps {
@@ -850,7 +878,8 @@ mod tests {
                 memory: &self.memory,
                 usage: &self.usage,
             };
-            tick(&deps, &cfg).unwrap()
+            let report = tick(&deps, &cfg).unwrap();
+            (report, source.1.get())
         }
 
         fn events(&self) -> Vec<(Option<String>, String, String)> {
@@ -869,6 +898,15 @@ mod tests {
             key: key.to_string(),
             decision: ListDecision::Ready,
             unblocks,
+            epic: None,
+        }
+    }
+
+    /// A ready candidate whose parent epic is `epic`.
+    fn ready_in(key: &str, unblocks: usize, epic: &str) -> Candidate {
+        Candidate {
+            epic: Some(epic.to_string()),
+            ..ready(key, unblocks)
         }
     }
 
@@ -921,6 +959,72 @@ mod tests {
         assert_eq!(report.launched.len(), 3);
         assert_eq!(report.refused, None);
         assert_eq!(report.skipped, None);
+    }
+
+    // --- priority epic (GitHub issue #237) ---
+
+    #[test]
+    fn the_priority_epics_tickets_launch_first() {
+        let mut fx = Fixture::new();
+        fx.max_lanes = 1;
+        fx.store.set_autopilot_epic(SCOPE, Some("GH-100")).unwrap();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(
+            &[ready("GH-1", 3), ready_in("GH-2", 0, "GH-100")],
+            &launcher,
+        );
+
+        assert_eq!(launcher.tickets(), vec!["GH-2"]);
+    }
+
+    #[test]
+    fn each_group_keeps_unblock_then_rank_order() {
+        let fx = Fixture::new();
+        fx.store.set_autopilot_epic(SCOPE, Some("GH-100")).unwrap();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(
+            &[
+                ready("GH-1", 0),
+                ready_in("GH-2", 0, "GH-100"),
+                ready("GH-3", 2),
+                ready_in("GH-4", 1, "GH-100"),
+                ready_in("GH-5", 0, "GH-200"),
+            ],
+            &launcher,
+        );
+
+        assert_eq!(
+            launcher.tickets(),
+            vec!["GH-4", "GH-2", "GH-3", "GH-1", "GH-5"]
+        );
+    }
+
+    #[test]
+    fn with_no_ready_epic_ticket_the_rest_launch_as_before() {
+        let fx = Fixture::new();
+        fx.store.set_autopilot_epic(SCOPE, Some("GH-100")).unwrap();
+        let launcher = FakeLauncher::new(&fx.store);
+
+        fx.tick(
+            &[ready("GH-1", 0), ready("GH-2", 2), ready("GH-3", 0)],
+            &launcher,
+        );
+
+        assert_eq!(launcher.tickets(), vec!["GH-2", "GH-1", "GH-3"]);
+    }
+
+    #[test]
+    fn parent_epics_are_fetched_only_when_an_epic_is_set() {
+        let fx = Fixture::new();
+        let launcher = FakeLauncher::new(&fx.store);
+        let (_, asked) = fx.tick_asking(&[], &launcher);
+        assert_eq!(asked, Some(false));
+
+        fx.store.set_autopilot_epic(SCOPE, Some("GH-100")).unwrap();
+        let (_, asked) = fx.tick_asking(&[], &launcher);
+        assert_eq!(asked, Some(true));
     }
 
     #[test]
@@ -1116,6 +1220,7 @@ mod tests {
                 pr_number: 7,
             },
             unblocks: 0,
+            epic: None,
         };
         let waiting = Candidate {
             key: "GH-3".to_string(),
@@ -1126,6 +1231,7 @@ mod tests {
                 reason: "waiting on GH-9 (running)".to_string(),
             },
             unblocks: 5,
+            epic: None,
         };
         let blocked = Candidate {
             key: "GH-4".to_string(),
@@ -1134,6 +1240,7 @@ mod tests {
                 reason: "blocked".to_string(),
             },
             unblocks: 5,
+            epic: None,
         };
         let needs_audit = Candidate {
             key: "GH-5".to_string(),
@@ -1141,6 +1248,7 @@ mod tests {
                 reason: "not audited".to_string(),
             },
             unblocks: 5,
+            epic: None,
         };
 
         let report = fx.tick(&[stackable, waiting, blocked, needs_audit], &launcher);

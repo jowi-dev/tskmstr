@@ -168,6 +168,7 @@ pub fn map_key(
             KeyCode::Char('j') | KeyCode::Down => Some(Msg::EpicPickerDown),
             KeyCode::Char('k') | KeyCode::Up => Some(Msg::EpicPickerUp),
             KeyCode::Enter => Some(Msg::EpicPickerSelect),
+            KeyCode::Char('P') => Some(Msg::EpicPickerPrioritize),
             KeyCode::Esc | KeyCode::Char('q') => Some(Msg::EpicPickerClose),
             _ => None,
         };
@@ -3209,6 +3210,7 @@ mod tests {
             (KeyCode::Enter, Msg::EpicPickerSelect),
             (KeyCode::Esc, Msg::EpicPickerClose),
             (KeyCode::Char('q'), Msg::EpicPickerClose),
+            (KeyCode::Char('P'), Msg::EpicPickerPrioritize),
         ];
         for (key, msg) in cases {
             assert_eq!(epic_picker_key(key), Some(msg));

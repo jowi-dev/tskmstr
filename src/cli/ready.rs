@@ -345,14 +345,16 @@ pub fn list_json(ctx: &ReadyContext, out: &mut dyn Write) -> Result<(), ReadyCli
 /// tickets to blocked rather than ready.
 pub fn dispatch_candidates(
     ctx: &ReadyContext,
+    with_epics: bool,
 ) -> Result<Vec<crate::work::dispatch::Candidate>, ReadyCliError> {
-    Ok(list_report(ctx)?
+    Ok(list_report_with(ctx, with_epics)?
         .tickets
         .into_iter()
         .map(|entry| crate::work::dispatch::Candidate {
             key: entry.key,
             decision: entry.decision,
             unblocks: entry.unblocks,
+            epic: if with_epics { entry.epic } else { None },
         })
         .collect())
 }
@@ -414,6 +416,10 @@ struct ListEntry {
     unresolved_bot_findings: Option<usize>,
     /// How many other candidates this one blocks, transitively.
     unblocks: usize,
+    /// The parent epic's key, when the parents were fetched. Kept out of
+    /// `tm ready --json`; only the dispatcher reads it.
+    #[serde(skip)]
+    epic: Option<String>,
 }
 
 /// What both [`list`] and [`list_json`] render.
@@ -433,8 +439,15 @@ struct ListReport {
 /// fallback does: a `gh` hiccup must never mislabel a blocked ticket as
 /// pickable, and failing the whole listing would be disproportionate.
 fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
+    list_report_with(ctx, false)
+}
+
+/// [`list_report`], also fetching every candidate's parent epic when
+/// `with_parents` is set, whatever `[ready] inherit_epic_blockers` says
+/// (the autopilot priority epic, GitHub issue #237).
+fn list_report_with(ctx: &ReadyContext, with_parents: bool) -> Result<ListReport, ReadyCliError> {
     let mut candidates = ready_candidates(ctx.jira)?;
-    if ctx.epics.enabled() {
+    if with_parents || ctx.epics.enabled() {
         ctx.jira
             .hydrate_parents(&mut candidates)
             .map_err(TicketingError::Provider)?;
@@ -498,6 +511,7 @@ fn list_report(ctx: &ReadyContext) -> Result<ListReport, ReadyCliError> {
         .map(|(issue, decision)| ListEntry {
             unresolved_bot_findings: annotations.get(&issue.key).copied(),
             unblocks: unblocks.counts.get(&issue.key).copied().unwrap_or(0),
+            epic: issue.fields.parent.map(|parent| parent.key),
             key: issue.key,
             summary: issue.fields.summary,
             decision,
@@ -1228,7 +1242,8 @@ mod tests {
         let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
         let bots = cursor_bot();
 
-        let candidates = dispatch_candidates(&ready_ctx(&jira, &gh, &bots)).expect("classified");
+        let candidates =
+            dispatch_candidates(&ready_ctx(&jira, &gh, &bots), false).expect("classified");
 
         assert_eq!(
             candidates,
@@ -1237,6 +1252,7 @@ mod tests {
                     key: "PROJ-1".to_string(),
                     decision: ListDecision::Ready,
                     unblocks: 1,
+                    epic: None,
                 },
                 crate::work::dispatch::Candidate {
                     key: "PROJ-2".to_string(),
@@ -1245,9 +1261,78 @@ mod tests {
                         reason: "blocked by PROJ-1 (To Do), no PR yet".to_string(),
                     },
                     unblocks: 0,
+                    epic: None,
                 },
             ]
         );
+    }
+
+    // --- Parent epics for the autopilot priority epic (GitHub issue #237) ---
+
+    /// A GitHub provider whose one ready candidate, GH-1, sits under the
+    /// epic GH-9, which only [`TicketProvider::hydrate_parents`] reveals.
+    fn gh_with_parented_candidate() -> FakeGhCli {
+        use crate::github::gh_cli::{IssueInfo, IssueParent, IssueState};
+        FakeGhCli::new()
+            .with_current_user_login(Ok(Some("jowi-dev".to_string())))
+            .with_issue_list(Ok(vec![IssueInfo {
+                number: 1,
+                url: "https://github.com/o/r/issues/1".to_string(),
+                title: "Child".to_string(),
+                body: String::new(),
+                state: IssueState::Open,
+                labels: vec!["tm:status/todo".to_string()],
+                assignees: Vec::new(),
+            }]))
+            .with_issue_parent(
+                1,
+                IssueParent {
+                    node_id: "I_9".to_string(),
+                    repo: "o/r".to_string(),
+                    number: 9,
+                    title: "The epic".to_string(),
+                },
+            )
+    }
+
+    #[test]
+    fn dispatch_candidates_fetch_parent_epics_when_asked_even_with_inheritance_off() {
+        let fake = gh_with_parented_candidate();
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&fake, "o/r".to_string());
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let unused = FakeJiraClient::new();
+        let ctx = ReadyContext {
+            jira: &provider,
+            epics: blocker_stacking::ParentEpics::from_provider(&provider, false),
+            ..ready_ctx(&unused, &gh, &bots)
+        };
+
+        let candidates = dispatch_candidates(&ctx, true).expect("classified");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].epic.as_deref(), Some("GH-9"));
+    }
+
+    #[test]
+    fn dispatch_candidates_skip_the_parent_fetch_when_not_asked() {
+        let fake = gh_with_parented_candidate();
+        let provider =
+            crate::ticketing::github_provider::GithubProvider::new(&fake, "o/r".to_string());
+        let gh = FakeGhCli::new().with_pr_list_all(Ok(vec![]));
+        let bots = cursor_bot();
+        let unused = FakeJiraClient::new();
+        let ctx = ReadyContext {
+            jira: &provider,
+            epics: blocker_stacking::ParentEpics::from_provider(&provider, false),
+            ..ready_ctx(&unused, &gh, &bots)
+        };
+
+        let candidates = dispatch_candidates(&ctx, false).expect("classified");
+
+        assert_eq!(candidates[0].epic, None);
+        assert!(fake.issues_parents_calls().is_empty());
     }
 
     #[test]
@@ -1260,7 +1345,7 @@ mod tests {
             ..ready_ctx(&jira, &gh, &bots)
         };
 
-        let candidates = dispatch_candidates(&ctx).expect("classified");
+        let candidates = dispatch_candidates(&ctx, false).expect("classified");
 
         assert_eq!(
             candidates[0].decision,

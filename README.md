@@ -1255,7 +1255,12 @@ it. A tick:
    - a run recorded a PR that no run recorded merged or closed;
    - its newest auto-review round hit the round cap.
 4. **Orders them** by how many other candidates each one unblocks, most
-   first. Ties keep the tracker's rank order.
+   first. Ties keep the tracker's rank order. When the scope has a
+   **priority epic** (GitHub issue #237, set from the board's `e` picker),
+   that epic's tickets come first, each group in this same order. Tickets
+   outside the epic still launch once the epic's ready tickets are
+   launched. The tick asks the tracker for parent epics only when a
+   priority epic is set, whatever `[ready] inherit_epic_blockers` says.
 5. **Launches them in that order.** Each launch runs `tm work run
    --unattended <lane> <KEY>`. The lane is the first one the board would
    offer for this repo. A stackable ticket is stacked by `tm work run`
@@ -1375,6 +1380,29 @@ autopilot on · lanes 2/2 (GH-7, GH-8) · launched 12m ago · not launching: 2 l
   tick succeeds. The thread keeps ticking either way.
 
 When a tick launches lanes, the status line names them.
+
+#### Choosing an epic for autopilot to launch first
+
+In the board's `e` epic picker, `P` marks the highlighted epic as the
+repo's **priority epic**: autopilot launches that epic's ready tickets
+before any others (GitHub issue #237). `P` on the marked epic, or on `All
+epics`, clears it. The marked epic shows `(autopilot)` in the picker.
+
+The choice is saved per scope in runs.db's `autopilot` table, next to the
+on/off flag, so a second board, `tm overview` and the `tm dispatch` timer
+all follow it, and it survives a restart. It is separate from the view
+filter: `Enter` in the picker still only filters the board, and `P` never
+filters it. Setting the epic doesn't turn autopilot on or off; it only
+matters while autopilot is on.
+
+The status line names the epic, on or off:
+
+```
+autopilot on · epic GH-176 · lanes 1/2 (GH-177) · launched 3m ago
+```
+
+When the epic has no ready tickets left, ticks launch from the rest as
+they would without one.
 
 ### Running autopilot without a TUI (`tm dispatch`)
 
@@ -1576,7 +1604,9 @@ Pressing `e` on the board opens a floating picker listing `All epics`, `No
 epic`, and each epic that the loaded cards belong to, shown as `KEY  Title`
 and sorted by key. `j`/`k` navigate, `Enter` applies the highlighted choice,
 `Esc`/`q` closes the picker without changing anything. The active choice is
-marked with a leading `*`.
+marked with a leading `*`. `P` sets or clears the autopilot priority epic
+instead of filtering; see "Choosing an epic for autopilot to launch first"
+above.
 
 Choosing an epic narrows every column to that epic's child cards; `No epic`
 shows only cards with no parent, and `All epics` clears the filter. Columns
@@ -1589,7 +1619,9 @@ loaded, so it combines with the `f` assignee filter and the `i`/`/` search
 and survives `r` refreshes and `f` refetches. The picker only offers epics
 with at least one loaded card. The one exception is the active epic: if a
 refetch leaves it with no cards, the board shows empty columns and the
-picker keeps the epic listed, rather than clearing the filter.
+picker keeps the epic listed, rather than clearing the filter. The
+autopilot priority epic is also always listed, by key alone when no loaded
+card names it, so `P` can still clear it.
 
 ### Searching the board
 

@@ -10,13 +10,17 @@
 //! the scope's next good tick, and launches are announced in the status
 //! line.
 //!
+//! `P` in the board's epic picker sets or clears the scope's autopilot
+//! priority epic ([`prioritize_epic`], GitHub issue #237), which the
+//! status line names.
+//!
 //! Pure like the rest of [`crate::tui::app`]: handlers take and return
 //! [`App`] plus the [`Cmd`]s to run.
 //!
 //! [`Msg::AutopilotTicked`]: crate::tui::app::Msg::AutopilotTicked
 
 use crate::runs::overview::OverviewRow;
-use crate::tui::app::{App, Cmd, Screen};
+use crate::tui::app::{App, Cmd, EpicFilter, Screen};
 use crate::work::autopilot::{AutopilotStatus, AutopilotTarget, TickOutcome};
 
 /// `P`: ask to flip autopilot for the board's scope or the highlighted
@@ -71,10 +75,56 @@ pub fn toggled(
             last_refusal: None,
             blocked_age_secs: None,
             last_launch_age_secs: None,
+            priority_epic: None,
         }),
     }
     if !enabled {
         app.autopilot_errors.remove(&scope);
+    }
+    let cmds = status_cmd(&app).into_iter().collect();
+    (app, cmds)
+}
+
+/// `P` in the board's epic picker (GitHub issue #237): mark the
+/// highlighted epic as the scope's autopilot priority epic, or clear it
+/// when the highlighted row is the marked epic or `All epics`. The picker
+/// stays open and the view filter is untouched.
+pub fn prioritize_epic(mut app: App) -> (App, Vec<Cmd>) {
+    let Some(scope) = app.autopilot_scope.clone() else {
+        app.status_line = "autopilot needs this repo's config to load".to_string();
+        return (app, Vec::new());
+    };
+    let epic = match app.epic_options().get(app.epic_picker_selected) {
+        Some(EpicFilter::Epic(epic)) if app.autopilot_epic() != Some(epic.key.as_str()) => {
+            Some(epic.key.clone())
+        }
+        Some(EpicFilter::Epic(_) | EpicFilter::All) => None,
+        Some(EpicFilter::NoEpic) | None => {
+            app.status_line = "autopilot: pick an epic, or All epics to clear".to_string();
+            return (app, Vec::new());
+        }
+    };
+    (app, vec![Cmd::SetAutopilotEpic { scope, epic }])
+}
+
+/// [`Cmd::SetAutopilotEpic`] finished: say so, show the new epic at once,
+/// and reload the status.
+pub fn epic_set(
+    mut app: App,
+    scope: String,
+    epic: Option<String>,
+    result: Result<(), String>,
+) -> (App, Vec<Cmd>) {
+    if let Err(err) = result {
+        app.status_line = format!("could not set the autopilot epic for {scope}: {err}");
+        return (app, Vec::new());
+    }
+    app.status_line = match &epic {
+        Some(key) => format!("autopilot epic {key} for {scope}"),
+        None => format!("autopilot epic cleared for {scope}"),
+    };
+    if let Some(status) = app.autopilot.iter_mut().find(|s| s.scope == scope) {
+        status.priority_epic = epic;
     }
     let cmds = status_cmd(&app).into_iter().collect();
     (app, cmds)
@@ -235,6 +285,7 @@ mod tests {
             last_refusal: None,
             blocked_age_secs: None,
             last_launch_age_secs: None,
+            priority_epic: None,
         }
     }
 

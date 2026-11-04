@@ -273,6 +273,12 @@ const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (scope, ticket, reason)
     );
     "#,
+    // GitHub issue #237: the epic autopilot launches first, per scope, so
+    // every host of the scope (both TUIs and the `tm dispatch` timer)
+    // orders its candidates the same way. NULL when none is chosen.
+    r#"
+    ALTER TABLE autopilot ADD COLUMN priority_epic TEXT;
+    "#,
 ];
 
 /// How many recent finished lane runs [`RunStore::lane_peak_estimate`] looks
@@ -3745,6 +3751,36 @@ impl RunStore {
             .unwrap_or(false))
     }
 
+    /// Sets or, with `None`, clears the epic whose tickets `scope`'s
+    /// autopilot launches first (GitHub issue #237). Never changes the
+    /// scope's on/off flag: a scope with no `autopilot` row gets one that
+    /// is off.
+    pub fn set_autopilot_epic(&self, scope: &str, epic: Option<&str>) -> Result<(), RunStoreError> {
+        self.conn.execute(
+            &format!(
+                "INSERT INTO autopilot (scope, enabled, updated_at, priority_epic)
+                 VALUES (?1, 0, {NOW_SQL}, ?2)
+                 ON CONFLICT(scope) DO UPDATE SET priority_epic = excluded.priority_epic"
+            ),
+            params![scope, epic],
+        )?;
+        Ok(())
+    }
+
+    /// The epic `scope`'s autopilot launches first, or `None` when none is
+    /// set (GitHub issue #237).
+    pub fn autopilot_epic(&self, scope: &str) -> Result<Option<String>, RunStoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT priority_epic FROM autopilot WHERE scope = ?1",
+                params![scope],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Appends one `dispatch_events` row for `scope` (GitHub issue #115).
     pub fn record_dispatch_event(
         &self,
@@ -4155,7 +4191,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_19() {
+    fn open_migrates_a_fresh_db_to_user_version_20() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path());
 
@@ -4163,7 +4199,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
     }
 
     /// Builds a database at schema version 8 (the last pre-scope version)
@@ -7596,6 +7632,70 @@ mod tests {
 
         store.set_autopilot("github:o/r", false).unwrap();
         assert!(!store.autopilot_enabled("github:o/r").unwrap());
+    }
+
+    // --- autopilot priority epic (GitHub issue #237) ---
+
+    #[test]
+    fn a_scope_never_given_an_epic_has_none() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        assert_eq!(store.autopilot_epic("github:o/r").unwrap(), None);
+    }
+
+    #[test]
+    fn set_autopilot_epic_sets_and_clears_one_scope_only() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_autopilot_epic("github:o/r", Some("GH-176"))
+            .unwrap();
+        assert_eq!(
+            store.autopilot_epic("github:o/r").unwrap().as_deref(),
+            Some("GH-176")
+        );
+        assert_eq!(store.autopilot_epic("github:o/other").unwrap(), None);
+
+        store.set_autopilot_epic("github:o/r", None).unwrap();
+        assert_eq!(store.autopilot_epic("github:o/r").unwrap(), None);
+    }
+
+    #[test]
+    fn setting_the_epic_never_changes_the_autopilot_flag() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_autopilot_epic("github:o/new", Some("GH-1"))
+            .unwrap();
+        assert!(!store.autopilot_enabled("github:o/new").unwrap());
+
+        store.set_autopilot("github:o/on", true).unwrap();
+        store
+            .set_autopilot_epic("github:o/on", Some("GH-1"))
+            .unwrap();
+        assert!(store.autopilot_enabled("github:o/on").unwrap());
+        store.set_autopilot_epic("github:o/on", None).unwrap();
+        assert!(store.autopilot_enabled("github:o/on").unwrap());
+    }
+
+    #[test]
+    fn toggling_autopilot_keeps_the_epic() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        store
+            .set_autopilot_epic("github:o/r", Some("GH-176"))
+            .unwrap();
+        store.set_autopilot("github:o/r", true).unwrap();
+        store.set_autopilot("github:o/r", false).unwrap();
+
+        assert_eq!(
+            store.autopilot_epic("github:o/r").unwrap().as_deref(),
+            Some("GH-176")
+        );
     }
 
     #[test]
